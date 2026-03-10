@@ -1,0 +1,64 @@
+export interface Session {
+  sessionId: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  status: 'active' | 'closed';
+  createdAt: string;
+  closedAt?: string;
+  pid?: number;
+}
+
+export interface LarkAttachment {
+  type: 'image' | 'file';
+  path: string;       // 本地文件绝对路径
+  name: string;       // 文件名
+}
+
+export interface LarkMessage {
+  messageId: string;
+  rootId: string;
+  senderId: string;
+  senderType: string;
+  msgType: string;
+  content: string;
+  createTime: string;
+  reactionId?: string;
+  attachments?: LarkAttachment[];
+}
+
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  type: 'cron' | 'interval' | 'once';
+  schedule: string;       // cron expression, milliseconds, or ISO datetime
+  prompt: string;
+  workingDir: string;
+  chatId: string;
+  enabled: boolean;
+  createdAt: string;
+  lastRunAt?: string;
+}
+
+// ─── Worker IPC Messages ─────────────────────────────────────────────────────
+
+/** Messages sent from Daemon to Worker */
+export type DaemonToWorker =
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; model: string; claudePath: string; prompt: string; resume?: boolean }
+  | { type: 'message'; content: string }
+  | { type: 'close' }
+  | { type: 'restart' };
+
+/** Messages sent from Worker to Daemon */
+export type WorkerToDaemon =
+  | { type: 'ready'; port: number; token: string }
+  | { type: 'claude_exit'; code: number | null; signal: string | null }
+  | { type: 'prompt_ready' }
+  | { type: 'screen_update'; content: string; status: 'working' | 'idle' }
+  | { type: 'error'; message: string };
+
+export const TOOL_NAMES = {
+  SEND_TO_THREAD: 'send_to_thread',
+  GET_THREAD_MESSAGES: 'get_thread_messages',
+  REACT_TO_MESSAGE: 'react_to_message',
+} as const;
