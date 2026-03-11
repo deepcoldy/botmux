@@ -23,6 +23,8 @@
     "daemon:restart": "pm2 restart claude-code-robot",
     "daemon:logs": "pm2 logs claude-code-robot",
     "daemon:status": "pm2 status claude-code-robot",
+    "test": "vitest run",
+    "test:codex": "vitest run test/codex-input.e2e.ts",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -41,7 +43,8 @@
     "@types/node": "^20.0.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.20.5",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "vitest": "^4.0.18"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
