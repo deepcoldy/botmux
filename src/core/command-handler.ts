@@ -297,7 +297,6 @@ export async function handleCommand(
               `Output tokens: ${formatNumber(cost.outputTokens)}`,
               `Cache read: ${formatNumber(cost.cacheReadTokens)}`,
               `Cache creation: ${formatNumber(cost.cacheCreateTokens)}`,
-              `Estimated cost: $${cost.costUSD.toFixed(2)}`,
             ];
             await sessionReply(rootId, lines.join('\n'));
           } else {
