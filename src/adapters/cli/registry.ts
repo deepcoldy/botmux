@@ -1,6 +1,10 @@
 import { execSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import type { CliAdapter, CliId } from './types.js';
+import { createClaudeCodeAdapter } from './claude-code.js';
+import { createAidenAdapter } from './aiden.js';
+import { createCocoAdapter } from './coco.js';
+import { createCodexAdapter } from './codex.js';
 
 /** Resolve a command name to its absolute path via login-shell `which`. */
 export function resolveCommand(cmd: string): string {
@@ -15,34 +19,20 @@ export function resolveCommand(cmd: string): string {
   return cmd;
 }
 
-// Lazy-loaded adapter modules to avoid circular deps
-const adapterFactories: Record<CliId, () => Promise<{ create: (pathOverride?: string) => CliAdapter }>> = {
-  'claude-code': () => import('./claude-code.js'),
-  'aiden': () => import('./aiden.js'),
-  'coco': () => import('./coco.js'),
-  'codex': () => import('./codex.js'),
-};
-
 const adapterCache = new Map<string, CliAdapter>();
 
+/** Async adapter factory (uses dynamic import for lazy loading in daemon process). */
 export async function createCliAdapter(id: CliId, pathOverride?: string): Promise<CliAdapter> {
   const key = `${id}:${pathOverride ?? ''}`;
   if (adapterCache.has(key)) return adapterCache.get(key)!;
-  const factory = adapterFactories[id];
-  if (!factory) throw new Error(`Unknown CLI adapter: ${id}`);
-  const mod = await factory();
-  const adapter = mod.create(pathOverride);
+  const adapter = createCliAdapterSync(id, pathOverride);
   adapterCache.set(key, adapter);
   return adapter;
 }
 
-/** Synchronous version for use in worker process (adapters already imported). */
-import { createClaudeCodeAdapter } from './claude-code.js';
-import { createAidenAdapter } from './aiden.js';
-import { createCocoAdapter } from './coco.js';
-import { createCodexAdapter } from './codex.js';
 export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter };
 
+/** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
   switch (id) {
     case 'claude-code': return createClaudeCodeAdapter(pathOverride);
