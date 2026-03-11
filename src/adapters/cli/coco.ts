@@ -39,8 +39,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         args: entry.args,
         env: entry.env,
       };
-      mkdirSync(dirname(configPath), { recursive: true });
-      writeFileSync(configPath, JSON.stringify(data, null, 2) + '\n');
+      try {
+        mkdirSync(dirname(configPath), { recursive: true });
+        writeFileSync(configPath, JSON.stringify(data, null, 2) + '\n');
+      } catch (err: any) {
+        console.warn(`[coco] Failed to write MCP config: ${err.message}`);
+      }
     },
 
     completionPattern: undefined,
