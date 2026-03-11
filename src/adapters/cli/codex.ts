@@ -8,15 +8,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     id: 'codex',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume }) {
-      // Codex uses subcommand pattern: `codex resume <id>` for resume, plain `codex` for new
-      const args: string[] = [];
-      if (resume) {
-        args.push('resume', sessionId);
-      }
-      args.push('--dangerously-bypass-approvals-and-sandbox');
-      args.push('--no-alt-screen');   // inline mode for PTY capture
-      return args;
+    buildArgs() {
+      // Codex manages its own session IDs internally — we cannot pass ours.
+      // Resume is not supported; daemon always starts a fresh Codex session.
+      return [
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--no-alt-screen',
+      ];
     },
 
     async writeInput(pty: PtyHandle, content: string) {
