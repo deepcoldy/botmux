@@ -2,17 +2,18 @@
 
 [中文](README.md) | English
 
-Bridge between Lark (Feishu) topic groups and Claude Code / Aiden CLI. The daemon listens for Lark messages and automatically spawns an independent Claude Code or Aiden process for each new topic thread, with live streaming cards and a web-based terminal.
+Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens for Lark messages and automatically spawns an independent CLI process (supporting Claude Code, Aiden, CoCo, Codex) for each new topic thread, with live streaming cards and a web-based terminal.
 
 ## Features
 
-- **One topic = one Claude Code session** — each Lark thread gets its own isolated Claude Code process
+- **One topic = one AI coding session** — each Lark thread gets its own isolated CLI process
+- **Multi-CLI support** — adapter architecture supports Claude Code, Aiden, CoCo, Codex, and is extensible
 - **Live streaming cards** — real-time terminal output rendered in Feishu cards with markdown support, per-turn card lifecycle
 - **Web terminal (xterm.js)** — full PTY output in the browser with optional write access via on-demand DM link
 - **Session persistence** — sessions survive daemon restarts and resume automatically
 - **Scheduled tasks** — cron-based recurring prompts with natural language scheduling (Chinese supported)
 - **Project management** — interactive repo selector, per-session working directory
-- **MCP integration** — Claude Code can reply to Lark threads, read message history, and add reactions via MCP tools
+- **MCP integration** — CLI can reply to Lark threads, read message history, and add reactions via MCP tools
 - **Access control** — allowlist for users, token-based write access for terminals, button restrictions on cards
 
 ## Architecture
@@ -20,18 +21,23 @@ Bridge between Lark (Feishu) topic groups and Claude Code / Aiden CLI. The daemo
 ```
 Lark WebSocket Events
     |
-Daemon (daemon.ts)
-    |-- Event: im.message.receive_v1 (new topics & thread replies)
-    |-- Event: card.action.trigger (repo select, restart, close)
-    |-- Scheduler (cron tasks)
+Daemon (daemon.ts → core/ modules)
+    |-- im/lark/event-dispatcher: Lark event routing
+    |-- im/lark/card-handler: card interaction handling
+    |-- core/worker-pool: worker process pool management
+    |-- core/command-handler: slash command processing
+    |-- core/session-manager: session lifecycle
+    |-- core/scheduler: cron task scheduling
     |
 Worker (worker.ts) -- forked child process per session
-    |-- node-pty: spawns Claude Code / Aiden CLI in a pseudo-terminal
+    |-- adapters/cli/*: CLI adapters (Claude Code / Aiden / CoCo / Codex)
+    |-- adapters/backend/pty-backend: pseudo-terminal management (node-pty)
+    |-- utils/idle-detector: idle detection (quiescence + spinner + completion marker)
     |-- HTTP + WebSocket server: serves xterm.js web terminal
     |-- Headless xterm: captures screen for streaming cards
     |-- IPC: communicates with daemon
     |
-Claude Code / Aiden CLI (interactive TTY mode)
+AI Coding CLI (interactive TTY mode)
     |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
     |
 Lark API
@@ -41,7 +47,7 @@ Lark API
 ## Prerequisites
 
 - **Node.js** >= 20
-- **Claude Code CLI or Aiden CLI** installed and authenticated (`claude` or `aiden` in PATH)
+- **AI coding CLI** installed and authenticated (`claude`, `aiden`, `coco`, or `codex` in PATH)
 - **Lark app** with Bot and Message permissions (WebSocket event subscription)
 
 ## Installation
@@ -94,7 +100,9 @@ Configuration is stored at `~/.claude-code-robot/.env`. Run `claude-code-robot s
 |----------|---------|-------------|
 | `LARK_BRIDGE_MODEL` | `opus` | Claude model (`opus`, `sonnet`, `haiku`) |
 | `LARK_BRIDGE_MAX_TURNS` | `500` | Max conversation turns per session |
-| `CLAUDE_PATH` | `claude` | Path to CLI binary (`claude` or `aiden`) |
+| `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`) |
+| `CLAUDE_PATH` | _(auto-detect)_ | CLI binary path override |
+| `BACKEND_TYPE` | `pty` | Session backend (`pty`, `tmux`) |
 | `CLAUDE_WORKING_DIR` | `~` | Default working directory |
 | `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated email prefixes or Lark open_ids |
 | `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
@@ -207,28 +215,53 @@ pnpm daemon:logs
 
 ```
 src/
-  cli.ts                 # CLI entry point (setup/start/stop/restart/logs)
-  daemon.ts              # Main daemon: event handling, session lifecycle, commands
-  worker.ts              # Worker process: PTY, HTTP/WS server, prompt detection
-  scheduler.ts           # Cron scheduling with natural language parsing
-  config.ts              # Configuration from environment variables
-  server.ts              # MCP server setup
-  types.ts               # IPC message types
-  services/
-    lark-client.ts       # Lark API wrapper
-    session-store.ts     # Session persistence (JSON)
-    schedule-store.ts    # Scheduled task persistence
-    message-queue.ts     # Per-thread JSONL message queue
-    project-scanner.ts   # Git repo/worktree discovery
+  cli.ts                    # CLI entry point (setup/start/stop/restart/logs)
+  daemon.ts                 # Daemon orchestrator (~400 lines, wires modules together)
+  worker.ts                 # Worker process: uses adapters to manage CLI + PTY
+  config.ts                 # Configuration from environment variables
+  server.ts                 # MCP server setup
+  types.ts                  # IPC message types
+  adapters/
+    cli/
+      types.ts              # CliAdapter interface, CliId type
+      registry.ts           # Adapter factory + resolveCommand
+      claude-code.ts        # Claude Code adapter
+      aiden.ts              # Aiden adapter
+      coco.ts               # CoCo adapter
+      codex.ts              # Codex adapter
+    backend/
+      types.ts              # SessionBackend interface
+      pty-backend.ts        # node-pty backend
+      tmux-backend.ts       # tmux backend (stub)
+  core/
+    types.ts                # DaemonSession core type
+    worker-pool.ts          # Worker process pool management
+    command-handler.ts      # Slash command processing
+    session-manager.ts      # Session lifecycle + path resolution
+    cost-calculator.ts      # Token usage & cost estimation
+    scheduler.ts            # Cron scheduling with natural language parsing
+  im/
+    types.ts                # ImAdapter interface definitions (multi-IM abstraction)
+    lark/
+      client.ts             # Lark API wrapper
+      event-dispatcher.ts   # Lark WebSocket event routing
+      card-handler.ts       # Lark card interaction handling
+      card-builder.ts       # Lark interactive card builders
+      message-parser.ts     # Lark event message parsing
   tools/
-    send-to-thread.ts    # MCP tool: send message
-    get-thread-messages.ts # MCP tool: read messages
-    react-to-message.ts  # MCP tool: emoji reactions
+    index.ts                # MCP tool registry
+    send-to-thread.ts       # MCP tool: send message
+    get-thread-messages.ts  # MCP tool: read messages
+    react-to-message.ts     # MCP tool: emoji reactions
+  services/
+    session-store.ts        # Session persistence (JSON)
+    schedule-store.ts       # Scheduled task persistence
+    message-queue.ts        # Per-thread JSONL message queue
+    project-scanner.ts      # Git repo/worktree discovery
   utils/
-    card-builder.ts      # Lark interactive card builders (session, streaming, repo-select)
-    terminal-renderer.ts # Headless xterm renderer for screen capture & TUI filtering
-    message-parser.ts    # Lark event message parsing
-    logger.ts            # Logging utility
+    idle-detector.ts        # CLI idle detection (quiescence + spinner + completion marker)
+    terminal-renderer.ts    # Headless xterm renderer for screen capture & TUI filtering
+    logger.ts               # Logging utility
 ```
 
 ## License

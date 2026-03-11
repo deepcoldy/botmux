@@ -2,17 +2,18 @@
 
 中文 | [English](README.en.md)
 
-飞书话题群与 Claude Code / Aiden CLI 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 Claude Code 或 Aiden 进程，提供实时流式卡片和 Web 终端。
+飞书话题群与 AI 编程 CLI 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 CLI 进程（支持 Claude Code、Aiden、CoCo、Codex），提供实时流式卡片和 Web 终端。
 
 ## 功能特性
 
-- **一个话题 = 一个 Claude Code 会话** — 每个飞书话题线程对应一个独立的 Claude Code 进程
+- **一个话题 = 一个 AI 编程会话** — 每个飞书话题线程对应一个独立的 CLI 进程
+- **多 CLI 支持** — 通过适配器架构支持 Claude Code、Aiden、CoCo、Codex，可扩展
 - **实时流式卡片** — 终端输出实时渲染到飞书卡片中，支持 Markdown 格式，每轮对话独立卡片
 - **Web 终端 (xterm.js)** — 浏览器查看完整 PTY 输出，按需获取可操作链接
 - **会话持久化** — 会话在 Daemon 重启后自动恢复
 - **定时任务** — 基于 Cron 的周期性任务，支持中文自然语言配置
 - **项目管理** — 交互式仓库选择器，每个会话独立工作目录
-- **MCP 集成** — Claude Code 可通过 MCP 工具回复飞书话题、读取消息历史、添加表情回应
+- **MCP 集成** — CLI 可通过 MCP 工具回复飞书话题、读取消息历史、添加表情回应
 - **权限控制** — 用户白名单、终端 Token 写入权限、卡片按钮操作限制
 
 ## 架构
@@ -20,18 +21,23 @@
 ```
 飞书 WebSocket 事件
     |
-Daemon (daemon.ts)
-    |-- 事件: im.message.receive_v1 (新话题 & 话题回复)
-    |-- 事件: card.action.trigger (选择仓库、重启、关闭)
-    |-- 定时任务调度器
+Daemon (daemon.ts → core/ 模块)
+    |-- im/lark/event-dispatcher: 飞书事件路由
+    |-- im/lark/card-handler: 卡片交互处理
+    |-- core/worker-pool: Worker 进程池管理
+    |-- core/command-handler: 斜杠命令处理
+    |-- core/session-manager: 会话生命周期
+    |-- core/scheduler: 定时任务调度
     |
 Worker (worker.ts) -- 每个会话 fork 一个子进程
-    |-- node-pty: 在伪终端中启动 Claude Code / Aiden CLI
+    |-- adapters/cli/*: CLI 适配器 (Claude Code / Aiden / CoCo / Codex)
+    |-- adapters/backend/pty-backend: 伪终端管理 (node-pty)
+    |-- utils/idle-detector: 空闲检测（静默 + Spinner + 完成标记）
     |-- HTTP + WebSocket: 提供 xterm.js Web 终端
     |-- Headless xterm: 捕获屏幕内容用于流式卡片
     |-- IPC: 与 Daemon 通信
     |
-Claude Code / Aiden CLI (交互式 TTY 模式)
+AI 编程 CLI (交互式 TTY 模式)
     |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
     |
 飞书 API
@@ -41,7 +47,7 @@ Claude Code / Aiden CLI (交互式 TTY 模式)
 ## 前置要求
 
 - **Node.js** >= 20
-- **Claude Code CLI 或 Aiden CLI** 已安装并完成认证（`claude` 或 `aiden` 在 PATH 中）
+- **AI 编程 CLI** 已安装并完成认证（`claude`、`aiden`、`coco` 或 `codex` 在 PATH 中）
 - **飞书应用** 具备机器人和消息权限（WebSocket 事件订阅）
 
 ## 安装
@@ -94,7 +100,9 @@ claude-code-robot start
 |------|--------|------|
 | `LARK_BRIDGE_MODEL` | `opus` | Claude 模型（`opus`、`sonnet`、`haiku`） |
 | `LARK_BRIDGE_MAX_TURNS` | `500` | 每个会话的最大对话轮数 |
-| `CLAUDE_PATH` | `claude` | CLI 路径（`claude` 或 `aiden`） |
+| `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`） |
+| `CLAUDE_PATH` | _(自动检测)_ | CLI 可执行文件路径覆盖 |
+| `BACKEND_TYPE` | `pty` | 会话后端（`pty`、`tmux`） |
 | `CLAUDE_WORKING_DIR` | `~` | 默认工作目录 |
 | `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的用户，邮箱前缀或 open_id，逗号分隔 |
 | `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
@@ -207,28 +215,53 @@ pnpm daemon:logs
 
 ```
 src/
-  cli.ts                 # CLI 入口（setup/start/stop/restart/logs）
-  daemon.ts              # 主进程：事件处理、会话生命周期、命令
-  worker.ts              # Worker 进程：PTY、HTTP/WS 服务、Prompt 检测
-  scheduler.ts           # 定时任务调度（自然语言解析）
-  config.ts              # 环境变量配置
-  server.ts              # MCP Server
-  types.ts               # IPC 消息类型
-  services/
-    lark-client.ts       # 飞书 API 封装
-    session-store.ts     # 会话持久化 (JSON)
-    schedule-store.ts    # 定时任务持久化
-    message-queue.ts     # 话题消息队列 (JSONL)
-    project-scanner.ts   # Git 仓库/Worktree 扫描
+  cli.ts                    # CLI 入口（setup/start/stop/restart/logs）
+  daemon.ts                 # Daemon 编排入口（~400 行，调用各模块）
+  worker.ts                 # Worker 进程：使用适配器管理 CLI + PTY
+  config.ts                 # 环境变量配置
+  server.ts                 # MCP Server
+  types.ts                  # IPC 消息类型
+  adapters/
+    cli/
+      types.ts              # CliAdapter 接口、CliId 类型
+      registry.ts           # 适配器工厂 + resolveCommand
+      claude-code.ts        # Claude Code 适配器
+      aiden.ts              # Aiden 适配器
+      coco.ts               # CoCo 适配器
+      codex.ts              # Codex 适配器
+    backend/
+      types.ts              # SessionBackend 接口
+      pty-backend.ts        # node-pty 后端
+      tmux-backend.ts       # tmux 后端（stub）
+  core/
+    types.ts                # DaemonSession 核心类型
+    worker-pool.ts          # Worker 进程池管理
+    command-handler.ts      # 斜杠命令处理
+    session-manager.ts      # 会话生命周期 + 路径解析
+    cost-calculator.ts      # Token 用量 & 费用估算
+    scheduler.ts            # 定时任务调度（自然语言解析）
+  im/
+    types.ts                # ImAdapter 接口定义（多 IM 抽象）
+    lark/
+      client.ts             # 飞书 API 封装
+      event-dispatcher.ts   # 飞书 WebSocket 事件路由
+      card-handler.ts       # 飞书卡片交互处理
+      card-builder.ts       # 飞书交互卡片构建
+      message-parser.ts     # 飞书事件消息解析
   tools/
-    send-to-thread.ts    # MCP 工具：发送消息
-    get-thread-messages.ts # MCP 工具：读取消息
-    react-to-message.ts  # MCP 工具：表情回应
+    index.ts                # MCP 工具注册表
+    send-to-thread.ts       # MCP 工具：发送消息
+    get-thread-messages.ts  # MCP 工具：读取消息
+    react-to-message.ts     # MCP 工具：表情回应
+  services/
+    session-store.ts        # 会话持久化 (JSON)
+    schedule-store.ts       # 定时任务持久化
+    message-queue.ts        # 话题消息队列 (JSONL)
+    project-scanner.ts      # Git 仓库/Worktree 扫描
   utils/
-    card-builder.ts      # 飞书交互卡片构建（会话卡片、流式卡片、仓库选择卡片）
-    terminal-renderer.ts # Headless xterm 渲染器（屏幕捕获 & TUI 过滤）
-    message-parser.ts    # 飞书事件消息解析
-    logger.ts            # 日志工具
+    idle-detector.ts        # CLI 空闲检测（静默 + Spinner + 完成标记）
+    terminal-renderer.ts    # Headless xterm 渲染器（屏幕捕获 & TUI 过滤）
+    logger.ts               # 日志工具
 ```
 
 ## 许可证
