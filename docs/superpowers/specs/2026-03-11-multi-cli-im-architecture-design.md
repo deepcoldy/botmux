@@ -221,6 +221,11 @@ interface ImAdapter {
   downloadAttachment(messageId: string, resourceKey: string): Promise<string>;
   getThreadMessages(threadId: string, limit: number): Promise<ImMessage[]>;
 
+  /** Add a reaction emoji to a message. Returns the reaction ID. */
+  addReaction(messageId: string, emojiType: string): Promise<string>;
+  /** Remove a reaction by its reaction ID (not emoji type). */
+  removeReaction(messageId: string, reactionId: string): Promise<void>;
+
   /** Get bot's own user ID (for filtering self-messages) */
   getBotUserId(): string | undefined;
 }
