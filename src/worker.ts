@@ -20,6 +20,7 @@ import { TerminalRenderer } from './utils/terminal-renderer.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import type { CliAdapter } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
+import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { IdleDetector } from './utils/idle-detector.js';
 
@@ -161,7 +162,9 @@ function stopScreenUpdates(): void {
 
 function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
-  backend = new PtyBackend();
+  const useTmux = cfg.backendType === 'tmux';
+  const tmuxBe = useTmux ? new TmuxBackend(TmuxBackend.sessionName(cfg.sessionId)) : null;
+  backend = tmuxBe ?? new PtyBackend();
 
   const args = cliAdapter.buildArgs({
     sessionId: cfg.sessionId,
@@ -180,6 +183,12 @@ function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     rows: PTY_ROWS,
     env: { ...process.env, CLAUDECODE: undefined } as unknown as Record<string, string>,
   });
+
+  // On tmux re-attach, CLI is already running — don't suppress first prompt
+  if (tmuxBe?.isReattach) {
+    awaitingFirstPrompt = false;
+    log('Re-attached to existing tmux session');
+  }
 
   // Set up idle detection
   idleDetector = new IdleDetector(cliAdapter);
@@ -420,6 +429,8 @@ process.on('message', async (raw: unknown) => {
 
     case 'close': {
       log('Close requested');
+      // destroySession kills tmux session permanently; kill() only detaches
+      backend?.destroySession?.();
       killClaude();
       cleanup();
       process.exit(0);
