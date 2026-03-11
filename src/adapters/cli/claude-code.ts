@@ -35,7 +35,8 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       }
       if (!data.mcpServers) data.mcpServers = {};
       const existing = data.mcpServers[entry.name];
-      if (existing && existing.args?.[0] === entry.args[0]) return;
+      const envMatch = existing && JSON.stringify(existing.env) === JSON.stringify(entry.env);
+      if (existing && existing.args?.[0] === entry.args[0] && envMatch) return;
       data.mcpServers[entry.name] = {
         command: entry.command,
         args: entry.args,

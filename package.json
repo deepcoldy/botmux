@@ -26,6 +26,7 @@
     "test": "vitest run",
     "test:codex": "vitest run test/codex-input.e2e.ts",
     "test:mcp": "vitest run test/codex-mcp.e2e.ts",
+    "test:claude-mcp": "vitest run test/claude-code-mcp.e2e.ts",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
