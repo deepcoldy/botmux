@@ -31,20 +31,20 @@ function cleanBoxDrawing(line: string): string {
 
 // ─── Line Filters ────────────────────────────────────────────────────────────
 
-/** Bare prompt line: ❯ (with optional trailing whitespace, no content) */
-const BARE_PROMPT_RE = /^❯\s*$/;
+/** Bare prompt line: ❯ (Claude) or > (Aiden) with optional trailing whitespace */
+const BARE_PROMPT_RE = /^[❯>]\s*$/;
 
-/** Input echo: ❯ followed by user text */
-const INPUT_ECHO_RE = /^❯\s+\S/;
+/** Input echo: ❯ or > followed by user text */
+const INPUT_ECHO_RE = /^[❯>]\s+\S/;
 
-/** Status bar: "bypass permissions", "⏵⏵", "/model", "shift+tab" */
-const STATUS_BAR_RE = /bypass permissions|⏵⏵|shift\+tab|\/model|auto-update/;
+/** Status bar: Claude ("bypass permissions", "⏵⏵", "/model") or Aiden ("agent full mode") */
+const STATUS_BAR_RE = /bypass permissions|⏵⏵|shift\+tab|\/model|auto-update|agent full mode|IDE: \w+/;
 
 /** Claude Code logo — block drawing characters used in the ASCII art splash */
 const LOGO_RE = /[▐▛█▜▝▘]{2,}/;
 
-/** Claude Code version / model info lines */
-const VERSION_RE = /Claude Code v\d|^\s*(Opus|Sonnet|Haiku)\s+\d/;
+/** Claude Code / Aiden version info lines */
+const VERSION_RE = /Claude Code v\d|^\s*(Opus|Sonnet|Haiku)\s+\d|>_ Aiden \(v[\d.]+\)/;
 
 /** Empty or whitespace-only */
 const BLANK_RE = /^\s*$/;

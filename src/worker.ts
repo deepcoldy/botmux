@@ -55,15 +55,10 @@ let scrollback = '';
 
 // ─── Prompt & Trust Dialog Detection ────────────────────────────────────────
 
-// Claude Code TUI status detection.
-// Always runs in TUI mode (PTY), so ❯ prompt is rendered via cursor positioning
-// and never appears at the end of the data stream.
-//
+// Claude Code / Aiden TUI idle detection.
 // Detection strategies (in priority order):
-//   1. "✻ Worked for" completion marker → idle after 500ms
-//   2. Spinner stops + quiescence → idle after QUIESCENCE_MS
-const PROMPT_ANYWHERE = /❯/;
-const TUI_STATUS_PATTERN = /bypass permissions|\/model/;
+//   1. Completion marker ("✻ Worked for ...") → idle after 500ms
+//   2. PTY silence + no recent spinner → idle after QUIESCENCE_MS
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder/;
 /** Claude Code spinner frames — these animate while Claude is actively working */
 const SPINNER_CHARS_RE = /[·✢✳✶✻✽]/;
@@ -79,6 +74,18 @@ let trustHandled = false;
 let quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
 /** Timestamp of last spinner character seen — used to prevent premature idle detection */
 let lastSpinnerAt = 0;
+/** Whether the CLI is Aiden (multi-line paste needs extra Enter to confirm) */
+let useAiden = false;
+
+function writeToPty(content: string): void {
+  if (!ptyProcess) return;
+  ptyProcess.write(content + '\r');
+  // Aiden shows "[Pasted text]" for multi-line input and waits for Enter.
+  // Send an extra \r after a short delay to confirm the paste.
+  if (useAiden && content.includes('\n')) {
+    setTimeout(() => { ptyProcess?.write('\r'); }, 200);
+  }
+}
 
 function markPromptReady(): void {
   if (isPromptReady) return;
@@ -152,27 +159,25 @@ function onPtyData(data: string): void {
     return;
   }
 
-  // Strategy 2 — quiescence: TUI renders ❯ via cursor positioning so it's not
-  // at the end of the data stream.  Wait for PTY silence, then check for ❯ or
-  // known status-bar markers anywhere in the output tail.
-  // Also require that the spinner hasn't been seen recently — spinner animation
-  // means Claude is still actively working even if the PTY goes briefly silent.
+  // Strategy 2 — quiescence: PTY goes silent and no spinner activity.
+  // In TUI mode both Claude Code and Aiden render the prompt via cursor
+  // positioning, so we can't rely on seeing a specific prompt char at line end.
+  // Instead, once PTY is silent for QUIESCENCE_MS and no spinner was seen
+  // recently (3s guard), we assume the CLI is waiting for input.
   if (quiescenceTimer) clearTimeout(quiescenceTimer);
   if (!isPromptReady) {
     quiescenceTimer = setTimeout(function quiescenceCheck() {
       quiescenceTimer = null;
       if (isPromptReady) return;
-      // If spinner was seen within the last 3s, Claude is still working —
+      // If spinner was seen within the last 3s, CLI is still working —
       // reschedule to check again after the guard expires (don't get stuck)
       const sinceSpinner = Date.now() - lastSpinnerAt;
       if (sinceSpinner < 3_000) {
         quiescenceTimer = setTimeout(quiescenceCheck, 3_000 - sinceSpinner + 200);
         return;
       }
-      if (PROMPT_ANYWHERE.test(outputTail) || TUI_STATUS_PATTERN.test(outputTail)) {
-        log('Prompt detected (quiescence)');
-        markPromptReady();
-      }
+      log('Prompt detected (quiescence)');
+      markPromptReady();
     }, QUIESCENCE_MS);
   }
 }
@@ -187,11 +192,14 @@ function stripAnsi(str: string): string {
 }
 
 function flushPending(): void {
+  log(`flushPending: ${pendingMessages.length} pending, promptReady=${isPromptReady}, hasPty=${!!ptyProcess}`);
   while (pendingMessages.length > 0 && isPromptReady && ptyProcess) {
     const msg = pendingMessages.shift()!;
     isPromptReady = false;
     outputTail = '';
-    ptyProcess.write(msg + '\r');
+    lastSpinnerAt = Date.now();
+    log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
+    writeToPty(msg);
   }
 }
 
@@ -203,7 +211,7 @@ function sendToPty(content: string): void {
     outputTail = '';
     lastSpinnerAt = Date.now(); // Assume working immediately after sending input
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
-    ptyProcess.write(content + '\r');
+    writeToPty(content);
   } else {
     pendingMessages.push(content);
     log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — Claude is busy`);
@@ -230,16 +238,27 @@ function stopScreenUpdates(): void {
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
+function isAidenCli(claudePath: string): boolean {
+  return /\baiden\b/.test(claudePath);
+}
+
 function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const args: string[] = [];
+  const aiden = isAidenCli(cfg.claudePath);
+  useAiden = aiden;
 
   if (cfg.resume) {
     args.push('--resume', cfg.sessionId);
-  } else {
+  } else if (!aiden) {
+    // Claude Code supports --session-id for new sessions; Aiden auto-generates
     args.push('--session-id', cfg.sessionId);
   }
 
-  args.push('--model', cfg.model, '--dangerously-skip-permissions');
+  if (aiden) {
+    args.push('--permission-mode', 'agentFull');
+  } else {
+    args.push('--dangerously-skip-permissions');
+  }
 
   log(`Spawning: ${cfg.claudePath} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
 
@@ -254,7 +273,7 @@ function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   ptyProcess.onData(onPtyData);
 
   ptyProcess.onExit(({ exitCode, signal }) => {
-    log(`Claude exited (code: ${exitCode}, signal: ${signal})`);
+    log(`Claude exited (code: ${exitCode}, signal: ${signal}), last output: ${JSON.stringify(outputTail.slice(-200))}`);
     ptyProcess = null;
     isPromptReady = false;
     send({ type: 'claude_exit', code: exitCode, signal: signal !== undefined ? String(signal) : null });

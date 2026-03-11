@@ -232,10 +232,61 @@ Session ID: ${sessionId}
 
 const restartCounts = new Map<string, { count: number; lastAt: number }>();
 
+/**
+ * Ensure the claude-code-robot MCP server is registered globally.
+ * Checks both Claude Code (~/.claude.json) and Aiden (~/.aiden/.mcp.json).
+ * Only writes if the entry is missing or the script path has changed.
+ */
+function ensureMcpConfig(): void {
+  const serverScript = join(__dirname, 'index.js');
+  const serverEntry = {
+    command: 'node',
+    args: [serverScript],
+    env: {
+      LARK_APP_ID: config.lark.appId,
+      LARK_APP_SECRET: config.lark.appSecret,
+    },
+  };
+  const serverName = 'claude-code-robot';
+  const isAiden = /\baiden\b/.test(config.daemon.claudePath);
+
+  // Determine global config path based on CLI type
+  // Claude Code: ~/.claude.json (mcpServers at top level)
+  // Aiden: ~/.aiden/.mcp.json (mcpServers at top level)
+  const globalPath = isAiden
+    ? join(homedir(), '.aiden', '.mcp.json')
+    : join(homedir(), '.claude.json');
+
+  try {
+    let data: any = {};
+    if (existsSync(globalPath)) {
+      data = JSON.parse(readFileSync(globalPath, 'utf-8'));
+    }
+    if (!data.mcpServers) data.mcpServers = {};
+
+    const existing = data.mcpServers[serverName];
+    if (existing && existing.args?.[0] === serverScript) return; // already up to date
+
+    data.mcpServers[serverName] = serverEntry;
+    writeFileSync(globalPath, JSON.stringify(data, null, 2) + '\n');
+    logger.info(`Installed MCP server "${serverName}" to ${globalPath}`);
+  } catch (err: any) {
+    logger.warn(`Failed to install MCP config to ${globalPath}: ${err.message}`);
+  }
+}
+
+/** Track whether ensureMcpConfig has run this daemon lifecycle */
+let mcpConfigDone = false;
+
 function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const workerPath = join(__dirname, 'worker.js');
   const cwd = getSessionWorkingDir(ds);
   const t = tag(ds);
+
+  if (!mcpConfigDone) {
+    ensureMcpConfig();
+    mcpConfigDone = true;
+  }
 
   const worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -264,7 +315,6 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
     workingDir: cwd,
-    model: config.daemon.model,
     claudePath: config.daemon.claudePath,
     prompt,
     resume,
