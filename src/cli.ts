@@ -127,8 +127,7 @@ async function cmdSetup(): Promise<void> {
   const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex' };
   const cliId = cliIdMap[cliChoice] ?? (cliChoice || 'claude-code');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
-  const allowedUsers = await ask(rl, '允许的用户 (邮箱前缀或 open_id，逗号分隔，留空=不限制): ');
-  const externalHost = await ask(rl, '外部 IP/域名 (终端链接用，留空=自动检测): ');
+  const allowedUsers = await ask(rl, '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ');
   rl.close();
 
   const lines: string[] = [
@@ -145,7 +144,6 @@ async function cmdSetup(): Promise<void> {
   ];
 
   if (allowedUsers) lines.push(`ALLOWED_USERS=${allowedUsers}`);
-  if (externalHost) lines.push(`WEB_EXTERNAL_HOST=${externalHost}`);
 
   writeFileSync(ENV_FILE, lines.join('\n') + '\n');
   console.log(`\n✅ 配置已写入: ${ENV_FILE}`);

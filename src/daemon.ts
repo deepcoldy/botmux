@@ -355,9 +355,13 @@ export async function startDaemon(): Promise<void> {
     logger.warn('Could not detect CLI version at startup');
   }
 
-  // Resolve email prefixes in ALLOWED_USERS to open_ids
+  // Validate and resolve ALLOWED_USERS
   if (config.daemon.allowedUsers.length > 0) {
-    const hasEmails = config.daemon.allowedUsers.some(u => !u.startsWith('ou_'));
+    const invalid = config.daemon.allowedUsers.filter(u => !u.startsWith('ou_') && !u.includes('@'));
+    if (invalid.length > 0) {
+      logger.warn(`ALLOWED_USERS contains invalid entries (expected email or ou_ open_id): ${invalid.join(', ')}`);
+    }
+    const hasEmails = config.daemon.allowedUsers.some(u => u.includes('@'));
     if (hasEmails) {
       try {
         config.daemon.allowedUsers = await resolveAllowedUsers(config.daemon.allowedUsers);

@@ -2,21 +2,31 @@ function timestamp(): string {
   return new Date().toISOString();
 }
 
-// All log levels write to stderr. stdout is reserved for data protocols
-// (e.g. MCP stdio transport) and must never be polluted with log text.
+function fmt(msg: string, args: unknown[]): string {
+  const extra = args.length ? ' ' + args.map(a => JSON.stringify(a)).join(' ') : '';
+  return `[${timestamp()}] ${msg}${extra}\n`;
+}
+
+// MCP server (index.ts) uses stdio transport — stdout must stay clean.
+// Daemon (index-daemon.ts) can safely use stdout for info/debug logs.
+// Detect which mode we're in: if stderr is the only safe channel, use it for all.
+const isMcpMode = !process.env.SESSION_DATA_DIR && !process.env.PM2_HOME;
+
+const out = isMcpMode ? process.stderr : process.stdout;
+
 export const logger = {
   info(msg: string, ...args: unknown[]): void {
-    process.stderr.write(`[${timestamp()}] [INFO] ${msg} ${args.map(a => JSON.stringify(a)).join(' ')}\n`);
+    out.write(fmt(`[INFO] ${msg}`, args));
   },
   warn(msg: string, ...args: unknown[]): void {
-    process.stderr.write(`[${timestamp()}] [WARN] ${msg} ${args.map(a => JSON.stringify(a)).join(' ')}\n`);
+    process.stderr.write(fmt(`[WARN] ${msg}`, args));
   },
   error(msg: string, ...args: unknown[]): void {
-    process.stderr.write(`[${timestamp()}] [ERROR] ${msg} ${args.map(a => JSON.stringify(a)).join(' ')}\n`);
+    process.stderr.write(fmt(`[ERROR] ${msg}`, args));
   },
   debug(msg: string, ...args: unknown[]): void {
     if (process.env.DEBUG) {
-      process.stderr.write(`[${timestamp()}] [DEBUG] ${msg} ${args.map(a => JSON.stringify(a)).join(' ')}\n`);
+      out.write(fmt(`[DEBUG] ${msg}`, args));
     }
   },
 };
