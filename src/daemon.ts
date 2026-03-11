@@ -234,7 +234,7 @@ const restartCounts = new Map<string, { count: number; lastAt: number }>();
 
 /**
  * Ensure the claude-code-robot MCP server is registered globally.
- * Checks both Claude Code (~/.claude.json) and Aiden (~/.aiden/.mcp.json).
+ * Checks Claude Code (~/.claude.json), Aiden (~/.aiden/.mcp.json), and Trae (~/.trae/.mcp.json).
  * Only writes if the entry is missing or the script path has changed.
  */
 function ensureMcpConfig(): void {
@@ -248,14 +248,19 @@ function ensureMcpConfig(): void {
     },
   };
   const serverName = 'claude-code-robot';
-  const isAiden = /\baiden\b/.test(config.daemon.claudePath);
+  const p = config.daemon.claudePath.toLowerCase();
+  const isAiden = /\baiden\b/.test(p);
+  const isTrae = /\btrae\b|traecli|trae-cli/.test(p);
 
   // Determine global config path based on CLI type
   // Claude Code: ~/.claude.json (mcpServers at top level)
   // Aiden: ~/.aiden/.mcp.json (mcpServers at top level)
+  // Trae: ~/.trae/.mcp.json (mcpServers at top level)
   const globalPath = isAiden
     ? join(homedir(), '.aiden', '.mcp.json')
-    : join(homedir(), '.claude.json');
+    : isTrae
+      ? join(homedir(), '.trae', '.mcp.json')
+      : join(homedir(), '.claude.json');
 
   try {
     let data: any = {};
@@ -266,6 +271,10 @@ function ensureMcpConfig(): void {
 
     const existing = data.mcpServers[serverName];
     if (existing && existing.args?.[0] === serverScript) return; // already up to date
+
+    // Ensure parent directory exists for nested config locations (e.g. ~/.aiden, ~/.trae)
+    const parent = dirname(globalPath);
+    if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
 
     data.mcpServers[serverName] = serverEntry;
     writeFileSync(globalPath, JSON.stringify(data, null, 2) + '\n');

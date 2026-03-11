@@ -77,6 +77,17 @@ let lastSpinnerAt = 0;
 /** Whether the CLI is Aiden (multi-line paste needs extra Enter to confirm) */
 let useAiden = false;
 
+type CliKind = 'claude' | 'aiden' | 'trae' | 'unknown';
+
+function detectCliKind(cliPath: string): CliKind {
+  const p = cliPath.toLowerCase();
+  if (/\baiden\b/.test(p)) return 'aiden';
+  // Common names: trae / traecli / trae-cli
+  if (/\btrae\b|traecli|trae-cli/.test(p)) return 'trae';
+  if (/\bclaude\b/.test(p)) return 'claude';
+  return 'unknown';
+}
+
 function writeToPty(content: string): void {
   if (!ptyProcess) return;
   if (useAiden) {
@@ -247,26 +258,40 @@ function stopScreenUpdates(): void {
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
-function isAidenCli(claudePath: string): boolean {
-  return /\baiden\b/.test(claudePath);
-}
-
 function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const args: string[] = [];
-  const aiden = isAidenCli(cfg.claudePath);
-  useAiden = aiden;
+  const kind = detectCliKind(cfg.claudePath);
+  useAiden = kind === 'aiden';
 
-  if (cfg.resume) {
-    args.push('--resume', cfg.sessionId);
-  } else if (!aiden) {
-    // Claude Code supports --session-id for new sessions; Aiden auto-generates
-    args.push('--session-id', cfg.sessionId);
+  // Default args are tuned for Claude Code / Aiden. For other CLIs (e.g. Trae),
+  // keep args minimal to avoid passing unsupported flags.
+  const disableDefaultArgs = process.env.CLI_DISABLE_DEFAULT_ARGS === '1';
+
+  if (!disableDefaultArgs) {
+    if (cfg.resume) {
+      // Known CLIs that support --resume
+      if (kind === 'claude' || kind === 'aiden') {
+        args.push('--resume', cfg.sessionId);
+      }
+    } else {
+      if (kind === 'claude') {
+        // Claude Code supports --session-id for new sessions
+        args.push('--session-id', cfg.sessionId);
+      }
+      // Aiden auto-generates session id; Trae/unknown: do nothing by default
+    }
+
+    if (kind === 'aiden') {
+      args.push('--permission-mode', 'agentFull');
+    } else if (kind === 'claude') {
+      args.push('--dangerously-skip-permissions');
+    }
   }
 
-  if (aiden) {
-    args.push('--permission-mode', 'agentFull');
-  } else {
-    args.push('--dangerously-skip-permissions');
+  // Extra args for any CLI (simple whitespace split; avoid complex shell parsing)
+  const extra = (process.env.CLI_EXTRA_ARGS ?? '').trim();
+  if (extra) {
+    args.push(...extra.split(/\s+/).filter(Boolean));
   }
 
   log(`Spawning: ${cfg.claudePath} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
