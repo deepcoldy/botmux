@@ -45,7 +45,7 @@ export interface ScheduledTask {
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; claudePath: string; prompt: string; resume?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; claudePath: string; prompt: string; resume?: boolean; ownerOpenId?: string }
   | { type: 'message'; content: string }
   | { type: 'close' }
   | { type: 'restart' };

@@ -318,6 +318,7 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
     claudePath: config.daemon.claudePath,
     prompt,
     resume,
+    ownerOpenId: ds.ownerOpenId,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

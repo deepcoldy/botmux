@@ -475,6 +475,7 @@ process.on('message', async (raw: unknown) => {
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
       sessionId = msg.sessionId;
+      if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}`);
 
       try {

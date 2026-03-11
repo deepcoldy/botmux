@@ -50,7 +50,10 @@ export async function execute(args: z.infer<typeof schema>) {
   }
 
   try {
-    const mentionUser = config.daemon.allowedUsers[0];
+    // Prefer the session owner's open_id (set by worker from init message),
+    // fall back to first configured allowed user if it looks like an open_id.
+    const mentionUser = process.env.__OWNER_OPEN_ID
+      || (config.daemon.allowedUsers[0]?.startsWith('ou_') ? config.daemon.allowedUsers[0] : undefined);
 
     // If Claude sent post JSON as content, extract the plain text from it
     let text = args.content;
