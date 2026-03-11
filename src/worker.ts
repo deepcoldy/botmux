@@ -62,10 +62,14 @@ const PROMPT_PATTERN = /❯\s*$/;
 const PROMPT_ANYWHERE = /❯/;
 const TUI_STATUS_PATTERN = /bypass permissions|\/model/;
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder/;
+/** Claude Code spinner frames — these animate while Claude is actively working */
+const SPINNER_CHARS_RE = /[·✢✳✶✻✽]/;
 const QUIESCENCE_MS = 2_000;
 let outputTail = '';
 let trustHandled = false;
 let quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
+/** Timestamp of last spinner character seen — used to prevent premature idle detection */
+let lastSpinnerAt = 0;
 
 function markPromptReady(): void {
   if (isPromptReady) return;
@@ -100,7 +104,13 @@ function onPtyData(data: string): void {
 
   // Track the tail of output for prompt/dialog detection.
   // We strip ANSI escape codes for reliable matching.
-  outputTail = (outputTail + stripAnsi(data)).slice(-500);
+  const stripped = stripAnsi(data);
+  outputTail = (outputTail + stripped).slice(-500);
+
+  // Track spinner animation — spinner chars mean Claude is actively working
+  if (SPINNER_CHARS_RE.test(stripped)) {
+    lastSpinnerAt = Date.now();
+  }
 
   // Auto-accept "trust this folder" dialog by sending Enter
   if (!trustHandled && TRUST_DIALOG_PATTERN.test(outputTail)) {
@@ -120,11 +130,15 @@ function onPtyData(data: string): void {
   // Strategy 2 — quiescence: TUI renders ❯ via cursor positioning so it's not
   // at the end of the data stream.  Wait for PTY silence, then check for ❯ or
   // known status-bar markers anywhere in the output tail.
+  // Also require that the spinner hasn't been seen recently — spinner animation
+  // means Claude is still actively working even if the PTY goes briefly silent.
   if (quiescenceTimer) clearTimeout(quiescenceTimer);
   if (!isPromptReady) {
     quiescenceTimer = setTimeout(() => {
       quiescenceTimer = null;
       if (isPromptReady) return;
+      // If spinner was seen within the last 3s, Claude is still working — skip
+      if (Date.now() - lastSpinnerAt < 3_000) return;
       if (PROMPT_ANYWHERE.test(outputTail) || TUI_STATUS_PATTERN.test(outputTail)) {
         log('Prompt detected (quiescence)');
         markPromptReady();
@@ -157,6 +171,7 @@ function sendToPty(content: string): void {
   if (isPromptReady) {
     isPromptReady = false;
     outputTail = '';
+    lastSpinnerAt = Date.now(); // Assume working immediately after sending input
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     ptyProcess.write(content + '\r');
   } else {
