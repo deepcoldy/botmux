@@ -25,6 +25,7 @@
     "daemon:status": "pm2 status claude-code-robot",
     "test": "vitest run",
     "test:codex": "vitest run test/codex-input.e2e.ts",
+    "test:mcp": "vitest run test/codex-mcp.e2e.ts",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

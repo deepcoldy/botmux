@@ -8,9 +8,20 @@ let client: Lark.Client;
 
 export function getLarkClient(): Lark.Client {
   if (!client) {
+    // Provide a custom logger that writes to stderr.
+    // The default Lark SDK logger uses console.log (stdout), which corrupts
+    // MCP stdio protocol when the server is spawned as an MCP child process.
+    const stderrLogger = {
+      error: (...msg: any[]) => { process.stderr.write(`[lark:error] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
+      warn:  (...msg: any[]) => { process.stderr.write(`[lark:warn] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
+      info:  (...msg: any[]) => { process.stderr.write(`[lark:info] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
+      debug: (...msg: any[]) => { process.stderr.write(`[lark:debug] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
+      trace: (...msg: any[]) => { process.stderr.write(`[lark:trace] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
+    };
     client = new Lark.Client({
       appId: config.lark.appId,
       appSecret: config.lark.appSecret,
+      logger: stderrLogger,
     });
   }
   return client;

@@ -28,7 +28,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     ensureMcpConfig(entry: McpServerEntry) {
-      // Use `codex mcp add` CLI to register MCP server
+      // Remove first so re-registration picks up env changes (e.g. new SESSION_DATA_DIR)
+      try {
+        execSync(`${bin} mcp remove ${entry.name}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
+      } catch { /* not registered yet — fine */ }
+
       const envArgs = Object.entries(entry.env)
         .map(([k, v]) => `--env ${k}=${v}`)
         .join(' ');
@@ -36,7 +40,6 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       try {
         execSync(cmd, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
       } catch (err: any) {
-        // May fail if already registered — not critical
         console.warn(`[codex] Failed to add MCP config: ${err.message}`);
       }
     },

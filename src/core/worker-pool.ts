@@ -72,6 +72,7 @@ export function ensureMcpConfig(): void {
     env: {
       LARK_APP_ID: config.lark.appId,
       LARK_APP_SECRET: config.lark.appSecret,
+      SESSION_DATA_DIR: config.session.dataDir,
     },
   });
 }

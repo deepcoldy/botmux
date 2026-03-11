@@ -50,6 +50,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: COMPLETION_RE,
+    readyPattern: /❯/,
     altScreen: false,
   };
 }
