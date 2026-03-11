@@ -79,11 +79,20 @@ let useAiden = false;
 
 function writeToPty(content: string): void {
   if (!ptyProcess) return;
-  ptyProcess.write(content + '\r');
-  // Aiden shows "[Pasted text]" for multi-line input and waits for Enter.
-  // Send an extra \r after a short delay to confirm the paste.
-  if (useAiden && content.includes('\n')) {
-    setTimeout(() => { ptyProcess?.write('\r'); }, 200);
+  if (useAiden) {
+    // Aiden TUI treats a single write("content\r") as a paste where \r is just
+    // a newline.  To actually submit, we must send \r as a separate write after
+    // a short delay so it's interpreted as the Enter key.
+    ptyProcess.write(content);
+    setTimeout(() => {
+      ptyProcess?.write('\r');
+      // Multi-line pastes show "[Pasted text]" and need an extra Enter to confirm.
+      if (content.includes('\n')) {
+        setTimeout(() => { ptyProcess?.write('\r'); }, 200);
+      }
+    }, 200);
+  } else {
+    ptyProcess.write(content + '\r');
   }
 }
 
