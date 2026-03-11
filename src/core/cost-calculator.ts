@@ -1,6 +1,5 @@
 /**
- * Session cost calculator — computes token usage and estimated cost from JSONL logs.
- * Extracted from daemon.ts for modularity.
+ * Session cost calculator — computes token usage from JSONL logs.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -16,19 +15,8 @@ export interface SessionCost {
   cacheReadTokens: number;
   cacheCreateTokens: number;
   model: string;
-  costUSD: number;
   turns: number;
 }
-
-// ─── Pricing ─────────────────────────────────────────────────────────────────
-
-// Pricing per 1M tokens (USD) — Opus 4
-const MODEL_PRICING: Record<string, { input: number; output: number; cacheRead: number; cacheCreate: number }> = {
-  'claude-opus-4-6':           { input: 15, output: 75, cacheRead: 1.875, cacheCreate: 18.75 },
-  'claude-opus-4-5-20251101':  { input: 15, output: 75, cacheRead: 1.875, cacheCreate: 18.75 },
-  'claude-sonnet-4-5-20250929':{ input: 3,  output: 15, cacheRead: 0.30,  cacheCreate: 3.75 },
-  'claude-haiku-4-5-20251001': { input: 0.8,output: 4,  cacheRead: 0.08,  cacheCreate: 1 },
-};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -75,14 +63,7 @@ export function getSessionCost(sessionId: string, cwd: string): SessionCost | nu
     return null;
   }
 
-  const pricing = MODEL_PRICING[model] ?? MODEL_PRICING['claude-opus-4-6'];
-  const costUSD =
-    (inputTokens / 1_000_000) * pricing.input +
-    (outputTokens / 1_000_000) * pricing.output +
-    (cacheReadTokens / 1_000_000) * pricing.cacheRead +
-    (cacheCreateTokens / 1_000_000) * pricing.cacheCreate;
-
-  return { inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, model, costUSD, turns };
+  return { inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, model, turns };
 }
 
 export function formatNumber(n: number): string {
