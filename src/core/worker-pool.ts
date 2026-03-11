@@ -11,6 +11,7 @@ import { updateMessage } from '../im/lark/client.js';
 import { buildStreamingCard, buildSessionCard } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import type { DaemonToWorker, WorkerToDaemon, Session } from '../types.js';
 import type { DaemonSession } from './types.js';
 
@@ -90,6 +91,12 @@ export function killWorker(ds: DaemonSession): void {
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+
+  // Also kill tmux session directly as a safety net:
+  // if worker is dead or doesn't handle 'close' in time, this ensures cleanup.
+  if (config.daemon.backendType === 'tmux') {
+    TmuxBackend.killSession(TmuxBackend.sessionName(ds.session.sessionId));
+  }
 }
 
 // ─── Fork worker ────────────────────────────────────────────────────────────
@@ -294,6 +301,19 @@ export function killStalePids(activeSessions_: Session[]): void {
       }
     } catch {
       // Process doesn't exist, nothing to clean up
+    }
+  }
+
+  // Clean orphaned tmux sessions: kill bmx-* sessions not in active set
+  if (config.daemon.backendType === 'tmux') {
+    const activeNames = new Set(
+      activeSessions_.map(s => TmuxBackend.sessionName(s.sessionId)),
+    );
+    for (const name of TmuxBackend.listBotmuxSessions()) {
+      if (!activeNames.has(name)) {
+        logger.info(`Killing orphaned tmux session: ${name}`);
+        TmuxBackend.killSession(name);
+      }
     }
   }
 }
