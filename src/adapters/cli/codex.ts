@@ -46,6 +46,9 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /›/,  // prompt indicator — present when Codex's input box is rendered
+    systemHints: [
+      '消息可能包含 attachments，每个有 path 字段，用 file_read 工具查看',
+    ],
     altScreen: false,   // --no-alt-screen disables alternate screen
   };
 }

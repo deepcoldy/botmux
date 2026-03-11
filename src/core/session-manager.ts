@@ -12,6 +12,7 @@ import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, killStalePids, getCurrentClaudeVersion } from './worker-pool.js';
+import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { LarkAttachment, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { DaemonSession } from './types.js';
@@ -69,6 +70,15 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
 }
 
 export function buildNewTopicPrompt(userMessage: string, sessionId: string, attachments?: LarkAttachment[]): string {
+  const adapter = createCliAdapterSync(config.daemon.cliId, config.daemon.cliPathOverride);
+  const hints = adapter.systemHints;
+
+  const noteLines = [
+    '- 回复使用 send_to_thread（重要结论、方案确认、最终结果）',
+    '- 对于代码修改任务，先通过 send_to_thread 发送执行方案给用户确认后再执行',
+    ...hints.map(h => `- ${h}`),
+  ];
+
   return `你已连接到飞书话题，用户发送了：
 ---
 ${userMessage}${formatAttachmentsHint(attachments)}
@@ -79,10 +89,7 @@ Session ID: ${sessionId}
 请处理用户的请求，通过 send_to_thread 回复用户（session_id: "${sessionId}"）。
 
 注意：
-- 回复使用 send_to_thread（重要结论、方案确认、最终结果）
-- 对于代码修改任务，先通过 send_to_thread 发送执行方案给用户确认后再执行
-- 消息可能包含 attachments，每个有 path 字段，用 Read 工具查看
-- 不要使用 EnterPlanMode / ExitPlanMode 工具`;
+${noteLines.join('\n')}`;
 }
 
 // ─── Session restore ─────────────────────────────────────────────────────────

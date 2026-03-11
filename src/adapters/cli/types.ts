@@ -41,6 +41,10 @@ export interface CliAdapter {
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
 
+  /** CLI-specific system hints injected into the initial prompt.
+   *  e.g. "use Read tool for attachments", "don't use PlanMode" */
+  readonly systemHints: string[];
+
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 }

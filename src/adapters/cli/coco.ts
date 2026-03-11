@@ -16,6 +16,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       args.push('--yolo');
+      args.push('--disallowed-tool', 'EnterPlanMode', '--disallowed-tool', 'ExitPlanMode');
       return args;
     },
 
@@ -43,6 +44,10 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /⏵⏵/,   // status bar indicator — present when CoCo's TUI is rendered
+    systemHints: [
+      '消息可能包含 attachments，每个有 path 字段，用 Read 工具查看',
+      '不要使用 EnterPlanMode / ExitPlanMode 工具',
+    ],
     altScreen: false,
   };
 }
