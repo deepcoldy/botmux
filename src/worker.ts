@@ -33,6 +33,13 @@ let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let isPromptReady = false;
 const pendingMessages: string[] = [];
 
+// ─── PTY Dimensions ──────────────────────────────────────────────────────────
+// Wide PTY so Claude Code positions right-aligned TUI overlays (timer, timeout)
+// far to the right. The snapshot reader only reads the first 160 columns,
+// cleanly excluding overlays without any regex hacking.
+const PTY_COLS = 300;
+const PTY_ROWS = 50;
+
 // ─── Headless Terminal for Screen Capture ────────────────────────────────────
 
 let renderer: TerminalRenderer | null = null;
@@ -161,7 +168,7 @@ function sendToPty(content: string): void {
 // ─── Screen Update Timer ─────────────────────────────────────────────────────
 
 function startScreenUpdates(): void {
-  renderer = new TerminalRenderer(160, 50);
+  renderer = new TerminalRenderer(PTY_COLS, PTY_ROWS);
   screenUpdateTimer = setInterval(() => {
     if (!renderer) return;
     const { content, changed } = renderer.snapshot();
@@ -193,8 +200,8 @@ function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
   ptyProcess = pty.spawn(cfg.claudePath, args, {
     name: 'xterm-256color',
-    cols: 160,
-    rows: 50,
+    cols: PTY_COLS,
+    rows: PTY_ROWS,
     cwd: cfg.workingDir,
     env: { ...process.env, CLAUDECODE: undefined } as unknown as Record<string, string>,
   });

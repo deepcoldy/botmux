@@ -7,6 +7,11 @@
  *
  * Also strips box-drawing characters (─ ━ │ etc.) that leak from the TUI's
  * split-panel borders when the headless terminal captures overlapping layers.
+ *
+ * Timer overlay avoidance: The PTY is intentionally wider than normal so that
+ * right-aligned TUI overlays (elapsed time, timeout counters) are rendered
+ * far to the right. Snapshots only read the first `contentCols` columns,
+ * cleanly excluding the overlay area — no fragile regex stripping needed.
  */
 import xtermHeadless from '@xterm/headless';
 const { Terminal } = xtermHeadless;
@@ -61,13 +66,20 @@ function shouldSkipLine(line: string): boolean {
 /** Claude output markers — lines starting with these indicate real work output */
 const OUTPUT_MARKER_RE = /^[●·⎿✓⚠★☐☑⏵✽✻]|^\s+⎿/;
 
+/**
+ * How many columns to read from each line for the Feishu card snapshot.
+ * Content beyond this is ignored — this is where TUI overlays (timer, timeout)
+ * live when the PTY is wider than this value.
+ */
+const SNAPSHOT_COLS = 160;
+
 export class TerminalRenderer {
   private terminal: InstanceType<typeof Terminal>;
   private lastHash = '';
   /** Absolute line index where the current turn starts. */
   private turnBaselineY = 0;
 
-  constructor(cols = 160, rows = 50) {
+  constructor(cols: number, rows: number) {
     this.terminal = new Terminal({ cols, rows, allowProposedApi: true });
   }
 
@@ -102,12 +114,15 @@ export class TerminalRenderer {
   /**
    * Snapshot the current screen content (from the turn baseline onward).
    * Strips box-drawing characters, filters TUI chrome and preamble.
+   * Only reads the first SNAPSHOT_COLS columns so right-aligned TUI overlays
+   * (timer, timeout) that sit beyond that range are excluded.
    * Returns only Claude's actual work output.
    */
   snapshot(): { content: string; changed: boolean } {
     const buffer = this.terminal.buffer.active;
     const baseY = buffer.baseY;
     const rows = this.terminal.rows;
+    const readCols = Math.min(SNAPSHOT_COLS, this.terminal.cols);
 
     // Start from the turn baseline (including scrollback) to capture all output
     const startY = this.turnBaselineY;
@@ -117,8 +132,8 @@ export class TerminalRenderer {
     for (let y = startY; y < endY; y++) {
       const line = buffer.getLine(y);
       if (!line) continue;
-      // Clean box-drawing characters leaked from TUI panel borders
-      rawLines.push(cleanBoxDrawing(line.translateToString(true)));
+      // Read only the content columns — TUI overlays beyond readCols are excluded
+      rawLines.push(cleanBoxDrawing(line.translateToString(true, 0, readCols)));
     }
 
     // Phase 1: Skip lines until we see actual Claude output

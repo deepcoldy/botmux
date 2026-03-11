@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { config, validateConfig } from './config.js';
-import { sendMessage, replyMessage, downloadMessageResource, sendUserMessage, updateMessage } from './services/lark-client.js';
+import { sendMessage, replyMessage, downloadMessageResource, sendUserMessage, updateMessage, getChatInfo, getMessageDetail } from './services/lark-client.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage } from './utils/message-parser.js';
@@ -41,6 +41,7 @@ interface DaemonSession {
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   currentTurnTitle?: string;      // title for the current turn's streaming card
 }
 
@@ -315,6 +316,7 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
 
       case 'screen_update': {
         if (!ds.workerPort) break;
+        ds.lastScreenContent = msg.content;
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
         const cardJson = buildStreamingCard(
@@ -990,26 +992,98 @@ async function handleCardAction(data: any): Promise<void> {
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
+// Cache group user counts to avoid API calls on every message
+const chatUserCountCache = new Map<string, { count: number; fetchedAt: number }>();
+const CHAT_CACHE_TTL = 5 * 60_000; // 5 minutes
+
+async function getGroupUserCount(chatId: string): Promise<number> {
+  const cached = chatUserCountCache.get(chatId);
+  if (cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
+    return cached.count;
+  }
+  try {
+    const info = await getChatInfo(chatId);
+    chatUserCountCache.set(chatId, { count: info.userCount, fetchedAt: Date.now() });
+    return info.userCount;
+  } catch (err) {
+    logger.debug(`Failed to get chat user count for ${chatId}: ${err}`);
+    return cached?.count ?? 999; // fallback: assume multi-person
+  }
+}
+
 /**
- * Check if a group message is addressed to the bot.
- * - If bot was @mentioned → true
- * - If allowedUsers has exactly 1 entry and sender matches → true (solo mode, no @ needed)
- * - Otherwise → false
+ * Probe the bot's own open_id at startup by sending a message and reading it back.
+ * Sends a brief status DM to the first allowed user, then inspects the message
+ * metadata to learn the bot's sender open_id.
  */
-function isMessageAddressedToBot(message: any, senderOpenId: string | undefined): boolean {
-  // Check @mention
+async function probeBotOpenId(): Promise<void> {
+  if (botOpenId) return; // already known
+
+  const targetUser = config.daemon.allowedUsers[0];
+  if (!targetUser) {
+    logger.info('No allowed users configured, skipping bot open_id probe');
+    return;
+  }
+
+  try {
+    const msgId = await sendUserMessage(targetUser, '🤖 Bot started');
+    const detail = await getMessageDetail(msgId);
+    // detail is { items: [{ sender: { sender_type, sender_id: { open_id, ... } }, ... }] }
+    // or directly the message object depending on API version
+    const item = detail?.items?.[0] ?? detail;
+    const senderOpenId = item?.sender?.sender_id?.open_id;
+    if (senderOpenId) {
+      botOpenId = senderOpenId;
+      logger.info(`Probed bot open_id: ${botOpenId}`);
+    } else {
+      logger.warn('Bot open_id probe: no sender info in message detail');
+    }
+  } catch (err: any) {
+    throw err;
+  }
+}
+
+/** Check if the bot was @mentioned in this message */
+function isBotMentioned(message: any, _senderOpenId: string | undefined): boolean {
   const mentions: any[] = message.mentions ?? [];
-  if (botOpenId && mentions.some((m: any) => m.id?.open_id === botOpenId)) {
-    return true;
+  if (mentions.length === 0) return false;
+
+  if (!botOpenId) {
+    // Bot open_id unknown — cannot reliably detect @bot mentions.
+    // Will be resolved once probeBotOpenId() completes or first bot message event arrives.
+    logger.warn('Bot open_id unknown, cannot check @mentions');
+    return false;
   }
 
-  // Solo mode: only one allowed user, and sender is that user
+  return mentions.some((m: any) => m.id?.open_id === botOpenId);
+}
+
+/**
+ * Check group message addressing:
+ * - 'allowed'     → sender is allowed, bot was @mentioned or solo group
+ * - 'not_allowed' → bot was @mentioned but sender is not in allowlist
+ * - 'ignore'      → not addressed to bot at all
+ */
+async function checkGroupMessageAccess(
+  message: any, chatId: string, senderOpenId: string | undefined,
+): Promise<'allowed' | 'not_allowed' | 'ignore'> {
+  const mentioned = isBotMentioned(message, senderOpenId);
   const allowedUsers = config.daemon.allowedUsers;
-  if (allowedUsers.length === 1 && senderOpenId && allowedUsers[0] === senderOpenId) {
-    return true;
+  const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
+
+  if (mentioned) {
+    return isAllowed ? 'allowed' : 'not_allowed';
   }
 
-  return false;
+  // No @mention — only allow if sender is the sole human in the group
+  if (isAllowed) {
+    const userCount = await getGroupUserCount(chatId);
+    if (userCount <= 1) {
+      return 'allowed';
+    }
+  }
+
+  return 'ignore';
 }
 
 async function handleNewTopic(data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p' = 'group'): Promise<void> {
@@ -1162,6 +1236,16 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
     const msgContent = attachments.length > 0
       ? `${parsed.content}${formatAttachmentsHint(attachments)}`
       : parsed.content;
+    // Freeze the previous turn's card at "idle" before starting a new turn
+    if (ds.streamCardId && ds.workerPort) {
+      const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+      const prevTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
+      const frozenCard = buildStreamingCard(
+        ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
+        ds.lastScreenContent ?? '', 'idle',
+      );
+      updateMessage(ds.streamCardId, frozenCard).catch(() => {});
+    }
     // Mark new turn — next screen_update will create a fresh streaming card
     ds.streamCardPending = true;
     ds.currentTurnTitle = parsed.content.substring(0, 50);
@@ -1185,21 +1269,10 @@ export async function startDaemon(): Promise<void> {
   logger.info(`Claude version: ${currentClaudeVersion}`);
   lastVersionCheckAt = Date.now();
 
-  // Fetch bot open_id (used for @mention detection in groups)
-  try {
-    const { getLarkClient } = await import('./services/lark-client.js');
-    const client = getLarkClient();
-    const res = await (client as any).contact.v3.user.get({
-      params: { user_id_type: 'open_id' },
-      path: { user_id: 'me' },
-    });
-    if (res.code === 0 && res.data?.user?.open_id) {
-      botOpenId = res.data.user.open_id;
-      logger.info(`Bot open_id: ${botOpenId}`);
-    }
-  } catch (e) {
-    logger.debug(`Bot open_id fetch skipped: ${e}`);
-  }
+  // Probe bot open_id at startup (non-blocking)
+  probeBotOpenId().catch(err => {
+    logger.warn(`Bot open_id probe failed (will learn from events): ${err.message}`);
+  });
 
   // Restore active sessions from previous run
   restoreActiveSessions();
@@ -1219,14 +1292,19 @@ export async function startDaemon(): Promise<void> {
       // Return undefined so WSClient sends no response body (avoids error 200672)
       return undefined;
     },
-    'im.message.receive_v1': (data: any) => {
+    'im.message.receive_v1': async (data: any) => {
       try {
         const message = data.message;
         const sender = data.sender;
         if (!message) return;
 
-        // Allow bot's own messages only if they are /close commands in threads
+        // Learn bot's own open_id from its outgoing messages
         if (sender?.sender_type === 'app') {
+          if (!botOpenId && sender.sender_id?.open_id) {
+            botOpenId = sender.sender_id.open_id;
+            logger.info(`Learned bot open_id from message event: ${botOpenId}`);
+          }
+          // Allow bot's own messages only if they are /close commands in threads
           const rootId = message.root_id;
           if (!rootId) return;
           try {
@@ -1239,28 +1317,30 @@ export async function startDaemon(): Promise<void> {
           return;
         }
 
-        // Check user allowlist (skip if not configured)
-        const allowedUsers = config.daemon.allowedUsers;
-        if (allowedUsers.length > 0) {
-          const senderOpenId = sender?.sender_id?.open_id;
-          if (!senderOpenId || !allowedUsers.includes(senderOpenId)) {
-            logger.debug(`Ignoring message from non-allowed user: ${senderOpenId}`);
-            return;
-          }
-        }
-
         const rootId = message.root_id;
         const chatId = message.chat_id;
         const chatType = message.chat_type;  // 'group' or 'p2p'
         const messageId = message.message_id;
         const senderOpenId = sender?.sender_id?.open_id as string | undefined;
+        const allowedUsers = config.daemon.allowedUsers;
+        const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
 
-        // For group new topics (no rootId): require @bot or solo mode
+        // Group new topics (no rootId): check @mention + permissions
         if (chatType === 'group' && !rootId) {
-          if (!isMessageAddressedToBot(message, senderOpenId)) {
+          const access = await checkGroupMessageAccess(message, chatId, senderOpenId);
+          if (access === 'not_allowed') {
+            replyMessage(messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
+              .catch(err => logger.debug(`Failed to send permission denied: ${err}`));
+            return;
+          }
+          if (access === 'ignore') {
             logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
             return;
           }
+        } else if (!isAllowed) {
+          // Thread replies and DMs: still check allowlist
+          logger.debug(`Ignoring message from non-allowed user: ${senderOpenId}`);
+          return;
         }
 
         // p2p messages without rootId → create session directly in the DM chat

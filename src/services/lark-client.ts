@@ -110,6 +110,18 @@ export async function sendUserMessage(openId: string, content: string, msgType: 
   return messageId;
 }
 
+export async function getChatInfo(chatId: string): Promise<{ userCount: number }> {
+  const c = getLarkClient();
+  const res = await (c as any).im.v1.chat.get({
+    path: { chat_id: chatId },
+  });
+  if (res.code !== 0) {
+    throw new Error(`Failed to get chat info: ${res.msg} (code: ${res.code})`);
+  }
+  // user_count excludes bots, only real users
+  return { userCount: Number(res.data?.user_count ?? 0) };
+}
+
 export async function updateMessage(messageId: string, cardJson: string): Promise<void> {
   const c = getLarkClient();
   const res = await c.im.v1.message.patch({

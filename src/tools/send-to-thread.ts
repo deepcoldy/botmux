@@ -6,22 +6,38 @@ import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
   session_id: z.string().describe('Session ID for the active session'),
-  content: z.string().describe('Message content to send'),
-  msg_type: z.enum(['text', 'post']).default('text').describe('Message type: text or post (rich text)'),
+  content: z.string().describe('Message content to send (plain text)'),
 });
 
-export const description = 'Send a message to the Lark thread associated with a session.';
+export const description = 'Send a plain text message to the Lark thread associated with a session. Just send plain text — formatting is handled automatically.';
 
 /** Build a post content block from plain text, splitting by newlines into paragraphs */
 function textToPostContent(text: string): any[][] {
   return text.split('\n').map(line => [{ tag: 'text', text: line }]);
 }
 
-/** Append an @mention node to the last paragraph of post content blocks */
-function appendMention(blocks: any[][], openId: string): any[][] {
-  if (blocks.length === 0) blocks.push([]);
-  blocks[blocks.length - 1].push({ tag: 'at', user_id: openId });
-  return blocks;
+/** Try to extract plain text from post JSON that Claude sometimes generates */
+function extractTextFromPostJson(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw);
+    const inner = parsed.zh_cn ?? parsed.en_us ?? parsed;
+    if (!Array.isArray(inner.content)) return null;
+    // Flatten post blocks back to plain text
+    const lines: string[] = [];
+    for (const paragraph of inner.content) {
+      if (!Array.isArray(paragraph)) continue;
+      const parts: string[] = [];
+      for (const node of paragraph) {
+        if (node.tag === 'text' && typeof node.text === 'string') {
+          parts.push(node.text);
+        }
+      }
+      lines.push(parts.join(''));
+    }
+    return lines.join('\n').trim();
+  } catch {
+    return null;
+  }
 }
 
 export async function execute(args: z.infer<typeof schema>) {
@@ -36,33 +52,27 @@ export async function execute(args: z.infer<typeof schema>) {
   try {
     const mentionUser = config.daemon.allowedUsers[0];
 
-    // Always send as post format to support @mentions
-    let postContent: any[][];
-
-    if (args.msg_type === 'post') {
-      // Already post format — parse and extract content blocks
-      try {
-        const parsed = JSON.parse(args.content);
-        // Handle wrapped {"zh_cn": {title, content}} or unwrapped {title, content}
-        const inner = parsed.zh_cn ?? parsed.en_us ?? parsed;
-        postContent = Array.isArray(inner.content) ? inner.content : textToPostContent(args.content);
-      } catch {
-        postContent = textToPostContent(args.content);
-      }
-    } else {
-      postContent = textToPostContent(args.content);
+    // If Claude sent post JSON as content, extract the plain text from it
+    let text = args.content;
+    const extracted = extractTextFromPostJson(text);
+    if (extracted) {
+      text = extracted;
     }
+
+    const postContent = textToPostContent(text);
 
     // Append @mention if we have a user to mention
     if (mentionUser) {
-      appendMention(postContent, mentionUser);
+      if (postContent.length === 0) postContent.push([]);
+      postContent[postContent.length - 1].push({ tag: 'at', user_id: mentionUser });
     }
 
     const content = JSON.stringify({
       zh_cn: { title: '', content: postContent },
     });
 
-    const messageId = await replyMessage(session.rootMessageId, content, 'post');
+    const replyInThread = session.chatType === 'p2p';
+    const messageId = await replyMessage(session.rootMessageId, content, 'post', replyInThread);
 
     return {
       success: true,
