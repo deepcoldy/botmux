@@ -2,6 +2,10 @@ import { execSync } from 'node:child_process';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle, McpServerEntry } from './types.js';
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'codex');
   return {
@@ -18,7 +22,9 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      pty.write(content + '\r');
+      pty.write(content);
+      await delay(200);
+      pty.write('\r');
     },
 
     ensureMcpConfig(entry: McpServerEntry) {

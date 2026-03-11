@@ -1,6 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle, McpServerEntry } from './types.js';
 
@@ -26,24 +24,20 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     },
 
     ensureMcpConfig(entry: McpServerEntry) {
-      const configPath = join(homedir(), '.trae', '.mcp.json');
-      let data: any = {};
-      if (existsSync(configPath)) {
-        try { data = JSON.parse(readFileSync(configPath, 'utf-8')); } catch { /* fresh */ }
-      }
-      if (!data.mcpServers) data.mcpServers = {};
-      const existing = data.mcpServers[entry.name];
-      if (existing && existing.args?.[0] === entry.args[0]) return;
-      data.mcpServers[entry.name] = {
+      // Use `coco mcp add-json` CLI — coco stores config in ~/.trae/traecli.yaml
+      const json = JSON.stringify({
         command: entry.command,
         args: entry.args,
         env: entry.env,
-      };
+      });
       try {
-        mkdirSync(dirname(configPath), { recursive: true });
-        writeFileSync(configPath, JSON.stringify(data, null, 2) + '\n');
+        execSync(`${bin} mcp add-json ${entry.name} ${JSON.stringify(json)}`, {
+          encoding: 'utf-8',
+          timeout: 10_000,
+          stdio: 'ignore',
+        });
       } catch (err: any) {
-        console.warn(`[coco] Failed to write MCP config: ${err.message}`);
+        console.warn(`[coco] Failed to add MCP config: ${err.message}`);
       }
     },
 
