@@ -1213,7 +1213,7 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
   messageQueue.appendMessage(rootId, parsed);
 
   if (!ds) {
-    // No active session for this thread — auto-create one so the message is not lost
+    // No active session for this thread — auto-create with repo selection
     const chatId: string = data?.message?.chat_id ?? '';
     const chatType = (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     logger.info(`No active session for thread ${rootId}, auto-creating new session...`);
@@ -1223,19 +1223,39 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
       session,
       worker: null,
       workerPort: null,
-    workerToken: null,
+      workerToken: null,
       chatId,
       chatType,
       spawnedAt: Date.now(),
       claudeVersion: currentClaudeVersion,
       lastMessageAt: Date.now(),
       hasHistory: false,
+      pendingRepo: true,
+      pendingPrompt: parsed.content,
+      pendingAttachments: attachments.length > 0 ? attachments : undefined,
       ownerOpenId: data.sender?.sender_id?.open_id,
+      currentTurnTitle: parsed.content.substring(0, 50),
     };
     activeSessions.set(rootId, newDs);
 
-    const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, attachments);
-    forkWorker(newDs, prompt);
+    // Show repo selection card (same as handleNewTopic)
+    const scanDir = getProjectScanDir(newDs);
+    let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
+    if (existsSync(scanDir)) {
+      projects = scanProjects(scanDir);
+    }
+    if (projects.length > 0) {
+      lastRepoScan.set(chatId, projects);
+      const currentCwd = getSessionWorkingDir(newDs);
+      const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
+      await sessionReply(rootId, cardJson, 'interactive');
+      logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
+    } else {
+      // No projects found — skip repo selection, spawn directly
+      newDs.pendingRepo = false;
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, attachments);
+      forkWorker(newDs, prompt);
+    }
 
     return;
   }
