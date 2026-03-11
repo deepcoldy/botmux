@@ -6,7 +6,7 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 
 ## Demo
 
-https://github.com/user-attachments/assets/840d3bb6-3b98-465a-8662-b4beadeb48ce
+<video src="https://github.com/user-attachments/assets/840d3bb6-3b98-465a-8662-b4beadeb48ce" width="100%" controls></video>
 
 ## Features
 
