@@ -39,7 +39,10 @@ export const config = {
   daemon: {
     model: process.env.LARK_BRIDGE_MODEL ?? 'opus',
     maxTurns: Number(process.env.LARK_BRIDGE_MAX_TURNS ?? '500'),
-    claudePath: resolveCommand(process.env.CLAUDE_PATH ?? 'claude'),
+    cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
+    cliPathOverride: process.env.CLAUDE_PATH,
+    backendType: (process.env.BACKEND_TYPE ?? 'pty') as 'pty' | 'tmux',
+    claudePath: resolveCommand(process.env.CLAUDE_PATH ?? 'claude'),  // kept for backward compat
     workingDir: process.env.CLAUDE_WORKING_DIR ?? '~',
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
     projectScanDir: process.env.PROJECT_SCAN_DIR ?? '',
