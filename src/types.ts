@@ -8,6 +8,7 @@ export interface Session {
   createdAt: string;
   closedAt?: string;
   pid?: number;
+  workingDir?: string;
 }
 
 export interface LarkAttachment {

@@ -676,6 +676,8 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
         if (ds) {
           killWorker(ds);
           ds.workingDir = targetPath;
+          ds.session.workingDir = targetPath;
+          sessionStore.updateSession(ds.session);
           await sessionReply(rootId, `工作目录已切换到 ${resolvedPath}，下次发消息时将在新目录下恢复。`);
           logger.info(`[${t}] Working directory changed to ${resolvedPath} by /cd command`);
         } else {
@@ -839,13 +841,14 @@ function restoreActiveSessions(): void {
       session,
       worker: null,
       workerPort: null,
-    workerToken: null,
+      workerToken: null,
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
       spawnedAt: Date.now(),
       claudeVersion: currentClaudeVersion,
       lastMessageAt: Date.now(),
       hasHistory: true,  // restored sessions have prior Claude history
+      workingDir: session.workingDir,
     });
 
     logger.debug(`Registered session ${session.sessionId} (thread: ${session.rootMessageId})`);
@@ -963,6 +966,8 @@ async function handleCardAction(data: any): Promise<void> {
   const displayName = project ? `${project.name} (${project.branch})` : selectedPath;
 
   targetDs.workingDir = selectedPath;
+  targetDs.session.workingDir = selectedPath;
+  sessionStore.updateSession(targetDs.session);
 
   if (targetDs.pendingRepo) {
     // First-time repo selection — now spawn Claude with the original prompt

@@ -90,6 +90,12 @@ export function updateSessionPid(sessionId: string, pid: number | null): void {
   }
 }
 
+export function updateSession(session: Session): void {
+  load();
+  sessions.set(session.sessionId, session);
+  save();
+}
+
 export function listSessions(): Session[] {
   load();
   return [...sessions.values()];
