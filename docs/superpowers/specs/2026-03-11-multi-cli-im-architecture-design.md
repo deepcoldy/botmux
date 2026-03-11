@@ -47,22 +47,28 @@ interface CliAdapter {
   /** Unique identifier: 'claude-code' | 'aiden' | 'coco' | 'codex' */
   id: string;
 
-  /** Build spawn arguments for the CLI */
+  /** Default binary name (e.g. 'claude', 'aiden', 'coco', 'codex').
+   *  Resolved to absolute path via login-shell `which` at construction time.
+   *  Overridden by CLAUDE_PATH env var if set. */
+  resolvedBin: string;
+
+  /** Build spawn arguments for the CLI (bin comes from resolvedBin) */
   buildArgs(opts: {
     sessionId: string;
     resume: boolean;
     workingDir: string;
-  }): { bin: string; args: string[] };
+  }): string[];
 
-  /** Write user input to PTY, handling CLI-specific paste behavior */
-  writeInput(pty: PtyHandle, content: string): void;
+  /** Write user input to PTY, handling CLI-specific paste behavior.
+   *  MAY fire writes asynchronously (e.g. Aiden's delayed Enter).
+   *  Caller must not assume input is fully written when this returns.
+   *  Returns a Promise that resolves when all writes are complete. */
+  writeInput(pty: PtyHandle, content: string): Promise<void>;
 
-  /** MCP server config: where to register and in what format */
-  mcpConfig: {
-    path: string;              // e.g. ~/.claude.json
-    format: 'json' | 'toml';
-    key: string;               // JSON path to mcpServers object
-  };
+  /** Install MCP server config for this CLI.
+   *  Each adapter handles its own config format (JSON, TOML, etc.)
+   *  and file location. Idempotent — skips if already up to date. */
+  ensureMcpConfig(serverEntry: McpServerEntry): void;
 
   /** Additional completion marker regex (beyond generic quiescence) */
   completionPattern?: RegExp;
@@ -70,9 +76,22 @@ interface CliAdapter {
   /** Whether the CLI uses alternate screen buffer */
   altScreen: boolean;
 }
+
+interface McpServerEntry {
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
 ```
 
-Each CLI gets its own file exporting a `CliAdapter` object:
+**Binary resolution**: Each adapter has a default binary name (e.g. `'claude'`).
+At construction time, the factory calls `resolveCommand()` (login-shell `which`)
+to find the absolute path. The `CLAUDE_PATH` env var, if set, overrides the
+default name before resolution. This keeps binary resolution in the adapter layer,
+not the config layer.
+
+Each CLI gets its own file exporting an adapter factory:
 
 | CLI | File | Key differences |
 |-----|------|-----------------|
@@ -144,12 +163,6 @@ interface ImCard {
   payload: unknown;
 }
 
-interface ImEventHandler {
-  onNewTopic(msg: ImMessage, chatId: string, chatType: 'group' | 'p2p'): Promise<void>;
-  onThreadReply(msg: ImMessage, threadId: string): Promise<void>;
-  onCardAction(action: ImCardAction): Promise<void>;
-}
-
 interface ImCardAction {
   actionType: string;
   threadId: string;
@@ -157,9 +170,44 @@ interface ImCardAction {
   value?: Record<string, unknown>;
 }
 
+interface ImEventHandler {
+  onNewTopic(msg: ImMessage, chatId: string, chatType: 'group' | 'p2p'): Promise<void>;
+  onThreadReply(msg: ImMessage, threadId: string): Promise<void>;
+  onCardAction(action: ImCardAction): Promise<void>;
+}
+
+/** Card builder — each IM provides its own implementation.
+ *  Core modules call these methods; the IM adapter provides the factory. */
+interface ImCardBuilder {
+  buildSessionCard(opts: {
+    sessionId: string;
+    rootMessageId: string;
+    terminalUrl: string;
+    title: string;
+  }): ImCard;
+
+  buildStreamingCard(opts: {
+    sessionId: string;
+    rootMessageId: string;
+    terminalUrl: string;
+    title: string;
+    content: string;
+    status: 'starting' | 'working' | 'idle';
+  }): ImCard;
+
+  buildRepoSelectCard(opts: {
+    projects: Array<{ name: string; path: string; description: string }>;
+    currentCwd: string;
+    rootMessageId: string;
+  }): ImCard;
+}
+
 interface ImAdapter {
   start(handler: ImEventHandler): Promise<void>;
   stop(): Promise<void>;
+
+  /** Card builder for this IM platform */
+  cards: ImCardBuilder;
 
   sendMessage(threadId: string, content: string, format: 'text' | 'rich'): Promise<string>;
   replyMessage(messageId: string, content: string, format: 'text' | 'rich'): Promise<string>;
@@ -178,8 +226,8 @@ interface ImAdapter {
 }
 ```
 
-Only `LarkImAdapter` is implemented. Core modules depend on `ImAdapter`, never on
-Lark-specific types directly.
+Only `LarkImAdapter` is implemented. Core modules depend on `ImAdapter` and
+`ImCardBuilder`, never on Lark-specific types directly.
 
 ---
 
@@ -189,8 +237,8 @@ Lark-specific types directly.
 src/
   adapters/
     cli/
-      types.ts              # CliAdapter interface
-      registry.ts           # id -> adapter mapping + factory + ensureMcpConfig
+      types.ts              # CliAdapter + McpServerEntry interfaces
+      registry.ts           # id -> adapter factory + createCliAdapter()
       claude-code.ts
       aiden.ts
       coco.ts
@@ -200,18 +248,20 @@ src/
       pty-backend.ts        # node-pty implementation
       tmux-backend.ts       # stub (future)
   im/
-    types.ts                # ImAdapter + ImEventHandler + ImMessage interfaces
+    types.ts                # ImAdapter + ImCardBuilder + ImEventHandler + ImMessage
     lark/
       adapter.ts            # LarkImAdapter implements ImAdapter
       client.ts             # Lark HTTP API calls (renamed from lark-client.ts)
       event-dispatcher.ts   # Lark WSClient + event routing
-      card-builder.ts       # Lark card JSON generation
+      card-builder.ts       # LarkCardBuilder implements ImCardBuilder
       card-handler.ts       # Card button interaction logic
       message-parser.ts     # Lark event -> ImMessage normalization
   core/
+    types.ts                # DaemonSession type definition (see below)
     session-manager.ts      # Session CRUD, activeSessions Map, topic/reply handling
     worker-pool.ts          # Worker fork, IPC, restart, double-fork guard
     command-handler.ts      # /close /status /cost /schedule daemon commands
+    cost-calculator.ts      # MODEL_PRICING, getSessionCost, formatNumber
     scheduler.ts            # Cron task management (moved from src/)
   tools/
     index.ts                # MCP tool registry
@@ -236,6 +286,46 @@ src/
   cli.ts                    # CLI commands (unchanged)
 ```
 
+### DaemonSession type
+
+The `DaemonSession` interface (currently daemon.ts lines 25-46, 16 fields) is split:
+
+```typescript
+// src/core/types.ts
+
+/** Core session state — IM-agnostic */
+interface DaemonSession {
+  session: Session;
+  worker: ChildProcess | null;
+  workerPort: number | null;
+  workerToken: string | null;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  spawnedAt: number;
+  claudeVersion: string;
+  lastMessageAt: number;
+  hasHistory: boolean;
+  workingDir?: string;
+  initConfig?: DaemonToWorker;
+  pendingRepo?: boolean;
+  pendingPrompt?: string;
+  pendingAttachments?: ImAttachment[];
+  ownerUserId?: string;        // renamed from ownerOpenId (IM-agnostic)
+  currentTurnTitle?: string;
+}
+
+/** IM-specific rendering state — managed by ImAdapter, opaque to core */
+interface ImRenderState {
+  streamCardId?: string;       // message_id of live streaming card
+  streamCardPending?: boolean; // next screen_update creates a new card
+  lastScreenContent?: string;  // frozen at idle for card update
+}
+```
+
+`SessionManager` stores `DaemonSession`. `ImRenderState` is stored alongside
+(e.g. as `Map<string, ImRenderState>` in `LarkImAdapter` or passed through).
+This keeps IM-specific rendering concerns out of the core type.
+
 ### daemon.ts decomposition mapping
 
 | Current daemon.ts content | Moves to |
@@ -246,40 +336,50 @@ src/
 | `card.action.trigger` handling | `im/lark/card-handler.ts` |
 | `buildSessionCard()` etc. | `im/lark/card-builder.ts` |
 | `/close`, `/status`, `/cost` commands | `core/command-handler.ts` |
+| `getSessionCost()`, `MODEL_PRICING`, `formatNumber` | `core/cost-calculator.ts` |
 | `buildNewTopicPrompt()`, permission checks | `core/session-manager.ts` |
-| `ensureMcpConfig()` | `adapters/cli/registry.ts` |
+| `ensureMcpConfig()` | each CliAdapter's `ensureMcpConfig()` method |
+| `downloadResources()`, `getAttachmentsDir()` | `core/session-manager.ts` (calls `im.downloadAttachment()`) |
+| `probeBotOpenId()`, `isBotMentioned()` | `im/lark/event-dispatcher.ts` |
+| `checkGroupMessageAccess()`, user count cache | `im/lark/event-dispatcher.ts` |
+| `getClaudeVersion()`, `refreshClaudeVersion()` | `adapters/cli/registry.ts` |
 | Startup/shutdown glue | `daemon.ts` (~80-100 lines) |
 
 ### Thin daemon.ts sketch
 
 ```typescript
 import { config } from './config.js';
-import { getCliAdapter } from './adapters/cli/registry.js';
+import { createCliAdapter } from './adapters/cli/registry.js';
 import { LarkImAdapter } from './im/lark/adapter.js';
 import { SessionManager } from './core/session-manager.js';
 import { WorkerPool } from './core/worker-pool.js';
 import { Scheduler } from './core/scheduler.js';
 
 export async function startDaemon() {
-  const cli = getCliAdapter(config.daemon.cliId);
+  const cli = createCliAdapter(config.daemon.cliId);
   const im = new LarkImAdapter(config.lark);
-  const sessions = new SessionManager(config.session);
+  const sessions = new SessionManager(im, config);
   const workers = new WorkerPool(cli, config);
   const scheduler = new Scheduler(sessions, workers);
 
+  // IM events -> core logic
   await im.start({
     onNewTopic: (msg, chatId, chatType) =>
-      sessions.handleNewTopic(msg, chatId, chatType, workers, im),
+      sessions.handleNewTopic(msg, chatId, chatType, workers),
     onThreadReply: (msg, threadId) =>
-      sessions.handleThreadReply(msg, threadId, workers, im),
+      sessions.handleThreadReply(msg, threadId, workers),
     onCardAction: (action) =>
-      sessions.handleCardAction(action, workers, im),
+      sessions.handleCardAction(action, workers),
   });
 
   scheduler.start();
   // graceful shutdown handlers...
 }
 ```
+
+Note: `SessionManager` receives `ImAdapter` as a constructor dependency (not per-method
+parameter). `WorkerPool` is passed per-method since session manager needs it only for
+fork/send operations.
 
 ---
 
@@ -292,11 +392,13 @@ adapter from the registry, and delegates all CLI-specific behavior:
 
 ```typescript
 // Spawn
-const { bin, args } = cli.buildArgs({ sessionId, resume, workingDir });
-backend.spawn(bin, args, { cwd, cols, rows, env });
+const cli = createCliAdapter(msg.cliId);
+const args = cli.buildArgs({ sessionId, resume, workingDir });
+backend.spawn(cli.resolvedBin, args, { cwd, cols, rows, env });
 
-// Input
-cli.writeInput(backend, content);  // adapter handles paste quirks
+// Input (async — caller awaits before resetting idle detector)
+await cli.writeInput(backend, content);
+detector.reset();
 
 // Idle detection
 const detector = new IdleDetector(cli);
@@ -306,6 +408,14 @@ backend.onData((data) => {
 });
 detector.onIdle(() => markPromptReady());
 ```
+
+### writeInput async contract
+
+`writeInput` returns `Promise<void>`. For CLIs that need delayed writes (Aiden),
+the promise resolves after all writes complete. For CLIs with synchronous writes
+(Claude Code), the promise resolves immediately. The worker awaits the promise
+before calling `detector.reset()`, ensuring idle detection is not prematurely
+restarted.
 
 ### IPC protocol changes
 
@@ -345,7 +455,7 @@ class IdleDetector {
   /** Register idle callback */
   onIdle(cb: () => void): void;
 
-  /** Reset state (call when new input is sent) */
+  /** Reset state (call after writeInput resolves) */
   reset(): void;
 
   /** Cleanup timers */
@@ -365,19 +475,24 @@ moves here.
 
 | CLI | Behavior |
 |-----|----------|
-| Claude Code | `pty.write(content + '\r')` |
-| Aiden | `pty.write(content)` → 200ms delay → `pty.write('\r')` → if multiline: 200ms → `pty.write('\r')` |
-| CoCo | `pty.write(content + '\r')` (to be verified) |
-| Codex | `pty.write(content + '\r')` (alt-screen handling TBD) |
+| Claude Code | `pty.write(content + '\r')` — resolves immediately |
+| Aiden | `pty.write(content)` → 200ms delay → `pty.write('\r')` → if multiline: 200ms → `pty.write('\r')` — resolves after all writes |
+| CoCo | `pty.write(content + '\r')` — resolves immediately (to be verified) |
+| Codex | `pty.write(content + '\r')` — resolves immediately (alt-screen handling TBD) |
 
-### MCP config locations
+### ensureMcpConfig implementations
 
-| CLI | Path | Format |
-|-----|------|--------|
-| Claude Code | `~/.claude.json` | JSON, key `mcpServers` |
-| Aiden | `~/.aiden/.mcp.json` | JSON, key `mcpServers` |
-| CoCo | `~/.trae/.mcp.json` | JSON, key `mcpServers` |
-| Codex | `~/.codex/config.toml` | TOML, section `[mcp_servers]` |
+Each adapter handles its own config file format:
+
+| CLI | Path | Format | Logic |
+|-----|------|--------|-------|
+| Claude Code | `~/.claude.json` | JSON | Read file, set `mcpServers[name]`, write back |
+| Aiden | `~/.aiden/.mcp.json` | JSON | Same as Claude Code |
+| CoCo | `~/.trae/.mcp.json` | JSON | Same as Claude Code |
+| Codex | `~/.codex/config.toml` | TOML | Read TOML, set `[mcp_servers.<name>]`, write back (requires TOML dependency) |
+
+The Codex adapter stub will skip TOML writing and log a warning until a TOML
+library is added.
 
 ### Spawn args
 
@@ -397,7 +512,8 @@ Incremental on master, 7 phases. Each phase produces runnable code.
 ### Phase 1: Extract CliAdapter interface + implementations
 - New files: `adapters/cli/types.ts`, `registry.ts`, `claude-code.ts`, `aiden.ts`,
   `coco.ts`, `codex.ts`
-- Pure additions, no existing code modified.
+- `resolveCommand()` moves from `config.ts` to `adapters/cli/registry.ts`.
+- Pure additions, no existing code modified yet.
 
 ### Phase 2: Extract SessionBackend interface + PtyBackend
 - New files: `adapters/backend/types.ts`, `pty-backend.ts`
@@ -408,28 +524,38 @@ Incremental on master, 7 phases. Each phase produces runnable code.
   Use CliAdapter + PtyBackend.
 - Extract `utils/idle-detector.ts` from `onPtyData()` logic.
 - IPC `init` message adds `cliId`, `backendType`.
-- `config.ts` adds `cliId` config.
+- `config.ts` adds `cliId` config, keeps `claudePath` as `CLAUDE_PATH` override.
 - **Verify**: build + restart, test Claude Code and Aiden sessions via Lark.
 
 ### Phase 4: Define ImAdapter + decompose daemon.ts core
-- New file: `im/types.ts` (ImAdapter interface).
+- New files: `im/types.ts` (ImAdapter + ImCardBuilder interfaces), `core/types.ts`
+  (DaemonSession).
 - Extract from daemon.ts: `core/session-manager.ts`, `core/worker-pool.ts`,
-  `core/command-handler.ts`.
+  `core/command-handler.ts`, `core/cost-calculator.ts`.
 - Move `scheduler.ts` → `core/scheduler.ts`.
 - daemon.ts becomes thin entry (~80-100 lines).
+- **Note**: In this phase, `SessionManager` temporarily imports Lark client
+  directly. This coupling is removed in Phase 5 when `LarkImAdapter` is created.
 - **Verify**: functionality unchanged, code is reorganized.
 
 ### Phase 5: Extract Lark layer
-- Extract: `im/lark/event-dispatcher.ts`, `im/lark/card-handler.ts`.
+- Extract: `im/lark/event-dispatcher.ts` (includes `probeBotOpenId`,
+  `isBotMentioned`, `checkGroupMessageAccess`, user count cache),
+  `im/lark/card-handler.ts`.
 - Move: `lark-client.ts` → `im/lark/client.ts`,
-  `card-builder.ts` → `im/lark/card-builder.ts`,
+  `card-builder.ts` → `im/lark/card-builder.ts` (implements `ImCardBuilder`),
   `message-parser.ts` → `im/lark/message-parser.ts`.
-- New: `im/lark/adapter.ts` (LarkImAdapter).
+- New: `im/lark/adapter.ts` (LarkImAdapter implements ImAdapter).
+- Refactor `SessionManager` to depend on `ImAdapter` instead of Lark client.
+  `getThreadMessages()` returns `ImMessage[]` directly, eliminating the need
+  for MCP tools to import message-parser.
 - **Verify**: build + restart, full regression.
 
 ### Phase 6: MCP tools use ImAdapter
-- MCP tools call ImAdapter methods instead of importing lark client directly.
+- MCP tools call `ImAdapter` methods instead of importing lark client directly.
 - MCP server process instantiates the correct IM adapter from config.
+- `get-thread-messages` uses `im.getThreadMessages()` which returns `ImMessage[]`,
+  no parser import needed.
 - **Verify**: send_to_thread, get_thread_messages, react_to_message all work.
 
 ### Phase 7: CoCo full support + TmuxBackend stub
@@ -458,19 +584,24 @@ Phase 1 and 2 are independent and can be done in parallel.
 # .env additions
 CLI_ID=claude-code          # claude-code | aiden | coco | codex
 BACKEND_TYPE=pty             # pty | tmux (default: pty)
+# CLAUDE_PATH is kept as optional binary override (passed to adapter factory)
 ```
 
 ```typescript
-// config.ts additions
+// config.ts
 daemon: {
   cliId: process.env.CLI_ID ?? 'claude-code',
   backendType: (process.env.BACKEND_TYPE ?? 'pty') as 'pty' | 'tmux',
-  // claudePath removed — CLI adapter resolves binary path internally
+  cliPathOverride: process.env.CLAUDE_PATH,  // optional, overrides adapter default
+  workingDir: process.env.CLAUDE_WORKING_DIR ?? '~',
+  allowedUsers: ...,
+  projectScanDir: ...,
 }
 ```
 
-`CLAUDE_PATH` is kept as an optional override: if set, the resolved CLI adapter
-uses it instead of its default binary name.
+The `claudePath` field is replaced by `cliId` (which adapter to use) and
+`cliPathOverride` (optional binary path override). The adapter factory uses
+`cliPathOverride ?? defaultBinaryName` and resolves via `resolveCommand()`.
 
 ---
 
@@ -479,7 +610,9 @@ uses it instead of its default binary name.
 | Risk | Mitigation |
 |------|------------|
 | daemon.ts split introduces subtle bugs | Each phase verified with build + restart + Lark test |
+| Phase 4 `SessionManager` temporarily imports Lark directly | Explicit in plan; cleaned up in Phase 5 |
 | Import path changes break MCP server | Phase 6 is isolated; MCP server is a separate entry point |
 | CoCo PTY behavior differs from assumed | coco.ts adapter is verified empirically in Phase 7 |
 | Codex alt-screen breaks terminal renderer | Codex adapter is a stub; full support deferred until tested |
+| Codex TOML config requires new dependency | Stub logs warning; TOML support added when Codex is actively used |
 | TmuxBackend complexity | Stub only in Phase 7; full implementation is a separate project |
