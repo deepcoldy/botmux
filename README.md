@@ -2,7 +2,7 @@
 
 中文 | [English](README.en.md)
 
-飞书话题群与 Claude Code 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 Claude Code 进程，提供实时流式卡片和 Web 终端。
+飞书话题群与 Claude Code / Aiden CLI 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 Claude Code 或 Aiden 进程，提供实时流式卡片和 Web 终端。
 
 ## 功能特性
 
@@ -26,12 +26,12 @@ Daemon (daemon.ts)
     |-- 定时任务调度器
     |
 Worker (worker.ts) -- 每个会话 fork 一个子进程
-    |-- node-pty: 在伪终端中启动 Claude Code CLI
+    |-- node-pty: 在伪终端中启动 Claude Code / Aiden CLI
     |-- HTTP + WebSocket: 提供 xterm.js Web 终端
     |-- Headless xterm: 捕获屏幕内容用于流式卡片
     |-- IPC: 与 Daemon 通信
     |
-Claude Code CLI (交互式 TTY 模式)
+Claude Code / Aiden CLI (交互式 TTY 模式)
     |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
     |
 飞书 API
@@ -41,7 +41,7 @@ Claude Code CLI (交互式 TTY 模式)
 ## 前置要求
 
 - **Node.js** >= 20
-- **Claude Code CLI** 已安装并完成认证（`claude` 在 PATH 中）
+- **Claude Code CLI 或 Aiden CLI** 已安装并完成认证（`claude` 或 `aiden` 在 PATH 中）
 - **飞书应用** 具备机器人和消息权限（WebSocket 事件订阅）
 
 ## 安装
@@ -94,7 +94,7 @@ claude-code-robot start
 |------|--------|------|
 | `LARK_BRIDGE_MODEL` | `opus` | Claude 模型（`opus`、`sonnet`、`haiku`） |
 | `LARK_BRIDGE_MAX_TURNS` | `500` | 每个会话的最大对话轮数 |
-| `CLAUDE_PATH` | `claude` | Claude Code CLI 路径 |
+| `CLAUDE_PATH` | `claude` | CLI 路径（`claude` 或 `aiden`） |
 | `CLAUDE_WORKING_DIR` | `~` | 默认工作目录 |
 | `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的飞书用户 open_id，逗号分隔 |
 | `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |

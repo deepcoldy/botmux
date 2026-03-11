@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-Bridge between Lark (Feishu) topic groups and Claude Code. The daemon listens for Lark messages and automatically spawns an independent Claude Code process for each new topic thread, with live streaming cards and a web-based terminal.
+Bridge between Lark (Feishu) topic groups and Claude Code / Aiden CLI. The daemon listens for Lark messages and automatically spawns an independent Claude Code or Aiden process for each new topic thread, with live streaming cards and a web-based terminal.
 
 ## Features
 
@@ -26,12 +26,12 @@ Daemon (daemon.ts)
     |-- Scheduler (cron tasks)
     |
 Worker (worker.ts) -- forked child process per session
-    |-- node-pty: spawns Claude Code CLI in a pseudo-terminal
+    |-- node-pty: spawns Claude Code / Aiden CLI in a pseudo-terminal
     |-- HTTP + WebSocket server: serves xterm.js web terminal
     |-- Headless xterm: captures screen for streaming cards
     |-- IPC: communicates with daemon
     |
-Claude Code CLI (interactive TTY mode)
+Claude Code / Aiden CLI (interactive TTY mode)
     |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
     |
 Lark API
@@ -41,7 +41,7 @@ Lark API
 ## Prerequisites
 
 - **Node.js** >= 20
-- **Claude Code CLI** installed and authenticated (`claude` in PATH)
+- **Claude Code CLI or Aiden CLI** installed and authenticated (`claude` or `aiden` in PATH)
 - **Lark app** with Bot and Message permissions (WebSocket event subscription)
 
 ## Installation
@@ -94,7 +94,7 @@ Configuration is stored at `~/.claude-code-robot/.env`. Run `claude-code-robot s
 |----------|---------|-------------|
 | `LARK_BRIDGE_MODEL` | `opus` | Claude model (`opus`, `sonnet`, `haiku`) |
 | `LARK_BRIDGE_MAX_TURNS` | `500` | Max conversation turns per session |
-| `CLAUDE_PATH` | `claude` | Path to Claude Code CLI binary |
+| `CLAUDE_PATH` | `claude` | Path to CLI binary (`claude` or `aiden`) |
 | `CLAUDE_WORKING_DIR` | `~` | Default working directory |
 | `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated Lark open_ids |
 | `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
