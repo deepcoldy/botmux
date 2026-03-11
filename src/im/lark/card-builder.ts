@@ -1,4 +1,4 @@
-import type { ProjectInfo } from '../services/project-scanner.js';
+import type { ProjectInfo } from '../../services/project-scanner.js';
 
 /** Escape Lark markdown special characters in user-controlled strings. */
 function escapeMd(s: string): string {

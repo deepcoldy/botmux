@@ -10,7 +10,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects } from '../services/project-scanner.js';
-import { buildRepoSelectCard } from '../utils/card-builder.js';
+import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentClaudeVersion } from './worker-pool.js';

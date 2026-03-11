@@ -1,8 +1,8 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { config } from '../config.js';
-import { logger } from '../utils/logger.js';
+import { config } from '../../config.js';
+import { logger } from '../../utils/logger.js';
 
 let client: Lark.Client;
 

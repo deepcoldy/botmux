@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import * as sessionStore from '../services/session-store.js';
-import { listThreadMessages } from '../services/lark-client.js';
-import { parseApiMessage } from '../utils/message-parser.js';
+import { listThreadMessages } from '../im/lark/client.js';
+import { parseApiMessage } from '../im/lark/message-parser.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({

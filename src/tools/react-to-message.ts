@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { addReaction, removeReaction } from '../services/lark-client.js';
+import { addReaction, removeReaction } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({

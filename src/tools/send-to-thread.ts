@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { replyMessage } from '../services/lark-client.js';
+import { replyMessage } from '../im/lark/client.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';

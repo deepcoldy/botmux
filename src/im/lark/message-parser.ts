@@ -1,5 +1,5 @@
-import type { LarkMessage } from '../types.js';
-import { logger } from './logger.js';
+import type { LarkMessage } from '../../types.js';
+import { logger } from '../../utils/logger.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message

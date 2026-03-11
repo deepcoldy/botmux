@@ -9,11 +9,11 @@ import { homedir } from 'node:os';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
-import { downloadMessageResource } from '../services/lark-client.js';
+import { downloadMessageResource } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, killStalePids, getCurrentClaudeVersion } from './worker-pool.js';
 import type { LarkAttachment, ScheduledTask } from '../types.js';
-import type { MessageResource } from '../utils/message-parser.js';
+import type { MessageResource } from '../im/lark/message-parser.js';
 import type { DaemonSession } from '../daemon.js';
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -131,7 +131,7 @@ export async function executeScheduledTask(
   activeSessions: Map<string, DaemonSession>,
   refreshClaudeVersion: () => boolean,
 ): Promise<void> {
-  const { sendMessage } = await import('../services/lark-client.js');
+  const { sendMessage } = await import('../im/lark/client.js');
 
   // Send a top-level message to create a thread
   const rootMessageId = await sendMessage(
