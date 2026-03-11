@@ -1,4 +1,4 @@
-import { fork, ChildProcess, execFileSync } from 'node:child_process';
+import { ChildProcess, execFileSync } from 'node:child_process';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync, readFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -11,19 +11,27 @@ import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage } from './utils/message-parser.js';
 import type { MessageResource } from './utils/message-parser.js';
 import { logger } from './utils/logger.js';
-import type { Session, LarkMessage, LarkAttachment, ScheduledTask, DaemonToWorker, WorkerToDaemon } from './types.js';
+import type { Session, LarkMessage, LarkAttachment, ScheduledTask, DaemonToWorker } from './types.js';
 import * as scheduler from './scheduler.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { scanProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildSessionCard, buildStreamingCard } from './utils/card-builder.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import {
+  initWorkerPool,
+  forkWorker,
+  killWorker,
+  killStalePids,
+  setCurrentClaudeVersion,
+  getCurrentClaudeVersion,
+} from './core/worker-pool.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface DaemonSession {
+export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
   workerPort: number | null;     // HTTP port for xterm.js
@@ -51,7 +59,6 @@ interface DaemonSession {
 const activeSessions = new Map<string, DaemonSession>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
-let currentClaudeVersion: string = 'unknown';
 let lastVersionCheckAt = 0;
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 let botOpenId: string | undefined;  // filled at startup, used for @mention detection
@@ -111,15 +118,15 @@ function refreshClaudeVersion(): boolean {
 
     if (newVersion === 'unknown' || !newVersion) return false;
 
-    if (currentClaudeVersion !== 'unknown' && newVersion !== currentClaudeVersion) {
-      const old = currentClaudeVersion;
-      currentClaudeVersion = newVersion;
-      logger.info(`CLI version updated: ${old} → ${newVersion} (${adapter.id})`);
+    const curVer = getCurrentClaudeVersion();
+    if (curVer !== 'unknown' && newVersion !== curVer) {
+      setCurrentClaudeVersion(newVersion);
+      logger.info(`CLI version updated: ${curVer} → ${newVersion} (${adapter.id})`);
       return true;
     }
 
-    currentClaudeVersion = newVersion;
-    logger.info(`CLI version: ${currentClaudeVersion} (${adapter.id})`);
+    setCurrentClaudeVersion(newVersion);
+    logger.info(`CLI version: ${getCurrentClaudeVersion()} (${adapter.id})`);
     return false;
   } catch (err: any) {
     logger.warn(`Failed to get CLI version: ${err.message}`);
@@ -158,18 +165,7 @@ function getActiveCount(): number {
   return count;
 }
 
-function killWorker(ds: DaemonSession): void {
-  if (!ds.worker || ds.worker.killed) return;
-  try {
-    ds.worker.send({ type: 'close' } as DaemonToWorker);
-  } catch { /* IPC already closed */ }
-  // Give worker 2s to clean up, then force kill
-  const w = ds.worker;
-  setTimeout(() => { if (!w.killed) w.kill('SIGTERM'); }, 2000);
-  ds.worker = null;
-  ds.workerPort = null;
-  ds.workerToken = null;
-}
+// killWorker() — moved to core/worker-pool.ts
 
 function formatUptime(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -231,209 +227,7 @@ Session ID: ${sessionId}
 }
 
 // ─── Worker management ──────────────────────────────────────────────────────
-
-const restartCounts = new Map<string, { count: number; lastAt: number }>();
-
-/**
- * Ensure the claude-code-robot MCP server is registered globally.
- * Delegates to the CLI adapter which knows the correct config file location.
- */
-function ensureMcpConfig(): void {
-  const adapter = createCliAdapterSync(
-    config.daemon.cliId,
-    config.daemon.cliPathOverride,
-  );
-  const serverScript = join(__dirname, 'index.js');
-  adapter.ensureMcpConfig({
-    name: 'claude-code-robot',
-    command: 'node',
-    args: [serverScript],
-    env: {
-      LARK_APP_ID: config.lark.appId,
-      LARK_APP_SECRET: config.lark.appSecret,
-    },
-  });
-}
-
-/** Track whether ensureMcpConfig has run this daemon lifecycle */
-let mcpConfigDone = false;
-
-function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
-  const workerPath = join(__dirname, 'worker.js');
-  const cwd = getSessionWorkingDir(ds);
-  const t = tag(ds);
-
-  // Guard against double-fork: if a worker is already running, kill it first
-  if (ds.worker && !ds.worker.killed) {
-    logger.warn(`[${t}] Worker already running (pid: ${ds.worker.pid}), killing before re-fork`);
-    try { ds.worker.send({ type: 'close' } as DaemonToWorker); } catch { /* ignore */ }
-    try { ds.worker.kill(); } catch { /* ignore */ }
-    ds.worker = null;
-    ds.workerPort = null;
-    ds.workerToken = null;
-  }
-
-  if (!mcpConfigDone) {
-    ensureMcpConfig();
-    mcpConfigDone = true;
-  }
-
-  const worker = fork(workerPath, [], {
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    cwd,
-    env: { ...process.env, CLAUDECODE: undefined },
-  });
-
-  // Pipe worker stdout/stderr to daemon logger
-  worker.stdout?.on('data', (data: Buffer) => {
-    for (const line of data.toString().split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed) logger.info(`[${t}:out] ${trimmed}`);
-    }
-  });
-  worker.stderr?.on('data', (data: Buffer) => {
-    for (const line of data.toString().split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed) logger.error(`[${t}:worker] ${trimmed}`);
-    }
-  });
-
-  // Send init config
-  const initMsg: DaemonToWorker = {
-    type: 'init',
-    sessionId: ds.session.sessionId,
-    chatId: ds.chatId,
-    rootMessageId: ds.session.rootMessageId,
-    workingDir: cwd,
-    cliId: config.daemon.cliId,
-    backendType: config.daemon.backendType,
-    prompt,
-    resume,
-    ownerOpenId: ds.ownerOpenId,
-  };
-  worker.send(initMsg);
-  ds.initConfig = initMsg;
-
-  // Handle IPC messages from worker
-  worker.on('message', async (msg: WorkerToDaemon) => {
-    switch (msg.type) {
-      case 'ready': {
-        ds.workerPort = msg.port;
-        ds.workerToken = msg.token;
-        const readOnlyUrl = `http://${config.web.externalHost}:${msg.port}`;
-        const writeUrl = `${readOnlyUrl}?token=${msg.token}`;
-        logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
-
-        // Send streaming card to group thread (read-only link, will be PATCHed with live output)
-        try {
-          const initTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
-          const streamCardJson = buildStreamingCard(
-            ds.session.sessionId,
-            ds.session.rootMessageId,
-            readOnlyUrl,
-            initTitle,
-            '',
-            'starting',
-          );
-          ds.streamCardId = await sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive');
-        } catch (err) {
-          logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
-          // Fallback: send static session card
-          const cardJson = buildSessionCard(
-            ds.session.sessionId,
-            ds.session.rootMessageId,
-            readOnlyUrl,
-            ds.session.title || 'Claude Code',
-          );
-          await sessionReply(ds.session.rootMessageId, cardJson, 'interactive');
-        }
-
-        break;
-      }
-
-      case 'prompt_ready': {
-        logger.info(`[${t}] Claude is ready for input`);
-        break;
-      }
-
-      case 'screen_update': {
-        if (!ds.workerPort) break;
-        ds.lastScreenContent = msg.content;
-        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
-        const cardJson = buildStreamingCard(
-          ds.session.sessionId,
-          ds.session.rootMessageId,
-          readUrl,
-          turnTitle,
-          msg.content,
-          msg.status,
-        );
-
-        if (ds.streamCardPending || !ds.streamCardId) {
-          // New turn — create a fresh card, old card freezes at its last state
-          ds.streamCardPending = false;
-          sessionReply(ds.session.rootMessageId, cardJson, 'interactive')
-            .then(msgId => { ds.streamCardId = msgId; })
-            .catch(err => logger.debug(`[${t}] Failed to create streaming card: ${err}`));
-        } else {
-          // Same turn — PATCH existing card
-          updateMessage(ds.streamCardId, cardJson).catch(err => {
-            logger.debug(`[${t}] Failed to update streaming card: ${err}`);
-            ds.streamCardId = undefined;
-          });
-        }
-        break;
-      }
-
-      case 'claude_exit': {
-        logger.info(`[${t}] Claude exited (code: ${msg.code}, signal: ${msg.signal})`);
-        ds.hasHistory = true;
-
-        // Rate-limit auto-restart to prevent crash loops
-        const key = ds.session.sessionId;
-        const rc = restartCounts.get(key) ?? { count: 0, lastAt: 0 };
-        const now = Date.now();
-        if (now - rc.lastAt > 60_000) rc.count = 0; // reset after 1 min
-        rc.count++;
-        rc.lastAt = now;
-        restartCounts.set(key, rc);
-
-        if (rc.count > 3) {
-          logger.warn(`[${t}] Claude crashed ${rc.count} times in 1 min, not auto-restarting`);
-          // Kill the worker process to free resources
-          killWorker(ds);
-          await sessionReply(ds.session.rootMessageId, `⚠️ Claude 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`);
-          break;
-        }
-
-        // Auto-restart Claude within the same worker
-        if (ds.worker && !ds.worker.killed) {
-          logger.info(`[${t}] Auto-restarting Claude...`);
-          ds.worker.send({ type: 'restart' } as DaemonToWorker);
-        }
-        break;
-      }
-
-      case 'error': {
-        logger.error(`[${t}] Worker error: ${msg.message}`);
-        break;
-      }
-    }
-  });
-
-  worker.on('exit', (code) => {
-    logger.info(`[${t}] Worker process exited (code: ${code})`);
-    ds.worker = null;
-    ds.workerPort = null;
-  });
-
-  ds.worker = worker;
-  ds.spawnedAt = Date.now();
-  ds.claudeVersion = currentClaudeVersion;
-  sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
-  logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${getActiveCount()})`);
-}
+// forkWorker(), killWorker(), ensureMcpConfig(), restartCounts — moved to core/worker-pool.ts
 
 // ─── Session cost ───────────────────────────────────────────────────────────
 
@@ -538,7 +332,7 @@ async function executeScheduledTask(task: ScheduledTask): Promise<void> {
     chatId: task.chatId,
     chatType: 'group',
     spawnedAt: Date.now(),
-    claudeVersion: currentClaudeVersion,
+    claudeVersion: getCurrentClaudeVersion(),
     lastMessageAt: Date.now(),
     hasHistory: false,
     workingDir: task.workingDir,
@@ -672,7 +466,7 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
           sessionStore.closeSession(ds.session.sessionId);
           const newSession = sessionStore.createSession(ds.chatId, rootId, ds.session.title, ds.chatType);
           ds.session = newSession;
-          ds.claudeVersion = currentClaudeVersion;
+          ds.claudeVersion = getCurrentClaudeVersion();
           ds.hasHistory = false;
           await sessionReply(rootId, `上下文已清除，下次发消息时将使用新会话。\nNew Session: ${newSession.sessionId}`);
           logger.info(`[${t}] Context cleared by /clear command, new session: ${newSession.sessionId}`);
@@ -763,14 +557,14 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
             `Status: ${alive ? '运行中' : '等待中'}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
-            `Claude: v${ds.claudeVersion}${ds.claudeVersion !== currentClaudeVersion ? ` (latest: v${currentClaudeVersion})` : ''}`,
+            `Claude: v${ds.claudeVersion}${ds.claudeVersion !== getCurrentClaudeVersion() ? ` (latest: v${getCurrentClaudeVersion()})` : ''}`,
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {
-          await sessionReply(rootId, `当前话题没有活跃的会话。\nDaemon active sessions: ${getActiveCount()}\nClaude: v${currentClaudeVersion}`);
+          await sessionReply(rootId, `当前话题没有活跃的会话。\nDaemon active sessions: ${getActiveCount()}\nClaude: v${getCurrentClaudeVersion()}`);
         }
         break;
       }
@@ -843,24 +637,7 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
 
 // ─── Session restore ─────────────────────────────────────────────────────────
 
-function killStalePids(activeSessions_: Session[]): void {
-  for (const session of activeSessions_) {
-    if (!session.pid) continue;
-    try {
-      // Check if process exists (signal 0 doesn't kill, just checks)
-      process.kill(session.pid, 0);
-      // Process exists — kill its process group
-      logger.info(`Killing stale Claude process (pid: ${session.pid}, session: ${session.sessionId})`);
-      try {
-        process.kill(-session.pid, 'SIGTERM');
-      } catch {
-        try { process.kill(session.pid, 'SIGTERM'); } catch { /* already gone */ }
-      }
-    } catch {
-      // Process doesn't exist, nothing to clean up
-    }
-  }
-}
+// killStalePids() — moved to core/worker-pool.ts
 
 function restoreActiveSessions(): void {
   const sessions = sessionStore.listSessions();
@@ -887,7 +664,7 @@ function restoreActiveSessions(): void {
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
       spawnedAt: Date.now(),
-      claudeVersion: currentClaudeVersion,
+      claudeVersion: getCurrentClaudeVersion(),
       lastMessageAt: Date.now(),
       hasHistory: true,  // restored sessions have prior Claude history
       workingDir: session.workingDir,
@@ -1156,7 +933,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         chatId,
         chatType,
         spawnedAt: Date.now(),
-        claudeVersion: currentClaudeVersion,
+        claudeVersion: getCurrentClaudeVersion(),
         lastMessageAt: Date.now(),
         hasHistory: false,
         ownerOpenId: senderOpenId,
@@ -1187,7 +964,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     chatId,
     chatType,
     spawnedAt: Date.now(),
-    claudeVersion: currentClaudeVersion,
+    claudeVersion: getCurrentClaudeVersion(),
     lastMessageAt: Date.now(),
     hasHistory: false,
     pendingRepo: true,
@@ -1269,7 +1046,7 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
       chatId,
       chatType,
       spawnedAt: Date.now(),
-      claudeVersion: currentClaudeVersion,
+      claudeVersion: getCurrentClaudeVersion(),
       lastMessageAt: Date.now(),
       hasHistory: false,
       pendingRepo: true,
@@ -1335,9 +1112,16 @@ export async function startDaemon(): Promise<void> {
   validateConfig();
   writePidFile();
 
+  // Initialise worker pool with daemon callbacks
+  initWorkerPool({
+    sessionReply,
+    getSessionWorkingDir,
+    getActiveCount,
+  });
+
   // Get initial CLI version
   refreshClaudeVersion();
-  if (currentClaudeVersion === 'unknown') {
+  if (getCurrentClaudeVersion() === 'unknown') {
     logger.warn('Could not detect CLI version at startup');
   }
 
