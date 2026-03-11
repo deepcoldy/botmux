@@ -61,7 +61,11 @@ let scrollback = '';
 
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
-const TRUST_DIALOG_PATTERN = /Yes, I trust this folder/;
+// Claude Code: "Yes, I trust this folder"
+// Codex:       "› 1. Yes, continue  2. No, quit" (ANSI cursor codes strip spaces from
+//               longer phrases like "Do you trust…", but "Yes, continue" survives intact
+//               in a single PTY chunk)
+const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
 let trustHandled = false;
 
 // ─── Prompt Detection ────────────────────────────────────────────────────────
