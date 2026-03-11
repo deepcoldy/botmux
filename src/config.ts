@@ -20,9 +20,9 @@ export const config = {
   },
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
-    cliPathOverride: process.env.CLI_PATH ?? process.env.CLAUDE_PATH,  // CLAUDE_PATH kept for backward compat
+    cliPathOverride: process.env.CLI_PATH,
     backendType: (process.env.BACKEND_TYPE ?? 'pty') as 'pty' | 'tmux',
-    workingDir: process.env.WORKING_DIR ?? process.env.CLAUDE_WORKING_DIR ?? '~',  // CLAUDE_WORKING_DIR kept for backward compat
+    workingDir: process.env.WORKING_DIR ?? '~',
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
     projectScanDir: process.env.PROJECT_SCAN_DIR ?? '',
   },
