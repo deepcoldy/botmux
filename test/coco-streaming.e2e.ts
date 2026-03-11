@@ -176,7 +176,7 @@ describe('CoCo streaming: snapshot captures response', () => {
     }
   });
 
-  it('snapshot() should capture CoCo response but returns empty (TUI redraw)', async () => {
+  it('snapshot() captures CoCo response via viewport fallback + peak retention', async () => {
     /**
      * Reproduces the streaming message loss:
      * - Spawn CoCo with real TerminalRenderer (same PTY_COLS/ROWS as production)
@@ -250,7 +250,7 @@ describe('CoCo streaming: snapshot captures response', () => {
     expect(cocoDidRespond, 'CoCo should have generated output').toBe(true);
     expect(
       nonEmpty.length,
-      'BUG: All snapshots empty despite CoCo generating output. TUI redraws wipe response from buffer.',
+      'Snapshots should capture CoCo output via viewport fallback + peak retention',
     ).toBeGreaterThan(0);
 
     detector.dispose();
@@ -270,7 +270,7 @@ describe('CoCo streaming: response text in snapshot', () => {
     }
   });
 
-  it('raw PTY has response text but snapshot does not (content filtering)', async () => {
+  it('response text appears in both raw PTY and snapshot', async () => {
     /**
      * Sends a prompt with a distinctive marker string and checks whether
      * it appears in:
@@ -365,7 +365,7 @@ describe('CoCo streaming: response text in snapshot', () => {
     // This assertion documents the bug — should pass after fix
     expect(
       finalContent.includes('HELLO_WORLD_TEST_STRING') || snapWithText.length > 0,
-      'BUG: Response text in raw PTY but never captured by TerminalRenderer snapshot',
+      'Response text should appear in snapshot or rapid captures',
     ).toBe(true);
 
     detector.dispose();
@@ -385,7 +385,7 @@ describe('CoCo streaming: daemon simulation', () => {
     }
   });
 
-  it('production flow: all screen_update IPC messages have empty content', async () => {
+  it('production flow: screen_update IPC messages contain CoCo response', async () => {
     /**
      * Simulates the exact production worker.ts flow:
      *   spawnClaude → startScreenUpdates → awaitingFirstPrompt → idle →
@@ -486,7 +486,7 @@ describe('CoCo streaming: daemon simulation', () => {
     if (cocoResponded) {
       expect(
         nonEmpty.length,
-        'BUG: CoCo responded but all screen_update messages are empty → Lark card blank',
+        'Screen updates should contain CoCo response content for Lark card',
       ).toBeGreaterThan(0);
     }
 
@@ -507,7 +507,7 @@ describe('CoCo streaming: TUI redraw behavior', () => {
     }
   });
 
-  it('screen state reverts to empty input after CoCo finishes responding', async () => {
+  it('peak retention preserves response after CoCo TUI redraws to idle', async () => {
     /**
      * Proves the root cause: CoCo's TUI redraws the screen when the response
      * completes, replacing the response content with the empty input prompt.
@@ -616,7 +616,7 @@ describe('CoCo streaming: TUI redraw behavior', () => {
     expect(rawHasMarker, 'CoCo should respond with marker text').toBe(true);
     expect(
       hasMarkerDuring || hasMarkerAfter,
-      'BUG: Response never captured by snapshot — TUI redraws wipe it before snapshot fires',
+      'Peak retention should preserve response after TUI redraws',
     ).toBe(true);
 
     detector.dispose();
