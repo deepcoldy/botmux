@@ -46,9 +46,6 @@ const LOGO_RE = /[▐▛█▜▝▘]{2,}/;
 /** Claude Code version / model info lines */
 const VERSION_RE = /Claude Code v\d|^\s*(Opus|Sonnet|Haiku)\s+\d/;
 
-/** System prompt identifiable phrases */
-const SYSTEM_PROMPT_RE = /send_to_thread|EnterPlanMode|ExitPlanMode|你已连接到飞书话题|Session ID:|请处理用户的请求|你的会话是持久的|attachments.*path|不要使用.*工具$/;
-
 /** Empty or whitespace-only */
 const BLANK_RE = /^\s*$/;
 
@@ -58,8 +55,7 @@ function shouldSkipLine(line: string): boolean {
     INPUT_ECHO_RE.test(line) ||
     STATUS_BAR_RE.test(line) ||
     LOGO_RE.test(line) ||
-    VERSION_RE.test(line) ||
-    SYSTEM_PROMPT_RE.test(line)
+    VERSION_RE.test(line)
   );
 }
 
