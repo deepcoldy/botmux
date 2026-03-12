@@ -106,7 +106,7 @@ botmux start
 | `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`） |
 | `CLI_PATH` | _(按 CLI_ID 自动检测)_ | CLI 可执行文件路径覆盖 |
 | `BACKEND_TYPE` | _(自动检测)_ | 会话后端：有 tmux 则用 `tmux`，否则 `pty` |
-| `WORKING_DIR` | `~` | 默认工作目录 |
+| `WORKING_DIR` | `~` | 默认工作目录，支持逗号分隔多个目录（如 `~/a,~/b`），`/repo` 会扫描所有目录 |
 | `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的用户，邮箱前缀或 open_id，逗号分隔 |
 | `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
 | `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |

@@ -106,7 +106,7 @@ Configuration is stored at `~/.botmux/.env`. Run `botmux setup` to create it int
 | `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`) |
 | `CLI_PATH` | _(auto-detect by CLI_ID)_ | CLI binary path override |
 | `BACKEND_TYPE` | _(auto-detect)_ | Session backend: `tmux` if available, otherwise `pty` |
-| `WORKING_DIR` | `~` | Default working directory |
+| `WORKING_DIR` | `~` | Default working directory; supports comma-separated multiple dirs (e.g. `~/a,~/b`), `/repo` scans all |
 | `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated email prefixes or Lark open_ids |
 | `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
 | `WEB_HOST` | `0.0.0.0` | HTTP server bind address |

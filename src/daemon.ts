@@ -11,7 +11,7 @@ import type { DaemonToWorker } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import * as scheduler from './core/scheduler.js';
-import { scanProjects } from './services/project-scanner.js';
+import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildStreamingCard } from './im/lark/card-builder.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -26,6 +26,7 @@ import type { CommandHandlerDeps } from './core/command-handler.js';
 import {
   getSessionWorkingDir,
   getProjectScanDir,
+  getProjectScanDirs,
   downloadResources,
   formatAttachmentsHint,
   buildNewTopicPrompt,
@@ -206,10 +207,10 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   activeSessions.set(messageId, ds);
 
   // Show repo selection card
-  const scanDir = getProjectScanDir(ds);
+  const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
-  if (existsSync(scanDir)) {
-    projects = scanProjects(scanDir);
+  if (scanDirs.length > 0) {
+    projects = scanMultipleProjects(scanDirs);
   }
   if (projects.length > 0) {
     lastRepoScan.set(chatId, projects);
@@ -288,10 +289,10 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
     activeSessions.set(rootId, newDs);
 
     // Show repo selection card (same as handleNewTopic)
-    const scanDir = getProjectScanDir(newDs);
+    const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
     let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
-    if (existsSync(scanDir)) {
-      projects = scanProjects(scanDir);
+    if (scanDirs2.length > 0) {
+      projects = scanMultipleProjects(scanDirs2);
     }
     if (projects.length > 0) {
       lastRepoScan.set(chatId, projects);

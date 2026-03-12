@@ -117,3 +117,28 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
   logger.info(`Scanned ${baseDir}: found ${projects.length} project(s)`);
   return projects;
 }
+
+/**
+ * Scan multiple directories for git repositories, merge and deduplicate results.
+ */
+export function scanMultipleProjects(baseDirs: string[], maxDepth: number = 3): ProjectInfo[] {
+  const seen = new Set<string>();
+  const merged: ProjectInfo[] = [];
+
+  for (const dir of baseDirs) {
+    for (const project of scanProjects(dir, maxDepth)) {
+      if (!seen.has(project.path)) {
+        seen.add(project.path);
+        merged.push(project);
+      }
+    }
+  }
+
+  // Sort: repos first, then worktrees, alphabetically within each group
+  merged.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'repo' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  return merged;
+}

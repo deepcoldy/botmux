@@ -9,12 +9,12 @@ import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
-import { scanProjects } from '../services/project-scanner.js';
+import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentClaudeVersion } from './worker-pool.js';
-import { expandHome, getSessionWorkingDir, getProjectScanDir } from './session-manager.js';
+import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import type { DaemonSession } from './types.js';
 
@@ -246,14 +246,15 @@ export async function handleCommand(
         }
 
         // Show project list card (works both for pending-repo and mid-session switch)
-        const scanDir = getProjectScanDir(ds);
-        if (!existsSync(scanDir)) {
-          await sessionReply(rootId, `扫描目录不存在：${scanDir}\n请设置 PROJECT_SCAN_DIR 环境变量。`);
+        const scanDirs = getProjectScanDirs(ds);
+        const validDirs = scanDirs.filter(d => existsSync(d));
+        if (validDirs.length === 0) {
+          await sessionReply(rootId, `扫描目录不存在：${scanDirs.join(', ')}\n请设置 PROJECT_SCAN_DIR 或 WORKING_DIR 环境变量。`);
           break;
         }
-        const projects = scanProjects(scanDir);
+        const projects = scanMultipleProjects(validDirs);
         if (projects.length === 0) {
-          await sessionReply(rootId, `在 ${scanDir} 下未找到 git 仓库。`);
+          await sessionReply(rootId, `在 ${validDirs.join(', ')} 下未找到 git 仓库。`);
           break;
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);

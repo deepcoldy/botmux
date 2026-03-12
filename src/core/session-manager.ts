@@ -37,6 +37,23 @@ export function getProjectScanDir(ds?: DaemonSession): string {
   return resolve(cwd, '..');
 }
 
+/** Return all directories to scan for projects (supports multi-dir WORKING_DIR). */
+export function getProjectScanDirs(ds?: DaemonSession): string[] {
+  if (config.daemon.projectScanDir) {
+    return [expandHome(config.daemon.projectScanDir)];
+  }
+  // Deduplicate parent dirs from all configured working dirs
+  const dirs = new Set<string>();
+  for (const wd of config.daemon.workingDirs) {
+    dirs.add(resolve(expandHome(wd), '..'));
+  }
+  // If session has its own workingDir, include its parent too
+  if (ds?.workingDir) {
+    dirs.add(resolve(expandHome(ds.workingDir), '..'));
+  }
+  return [...dirs];
+}
+
 // ─── Attachment download ─────────────────────────────────────────────────────
 
 export function getAttachmentsDir(messageId: string): string {
