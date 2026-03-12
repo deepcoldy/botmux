@@ -55,7 +55,6 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /❯/,
     systemHints: [
       '消息可能包含 attachments，每个有 path 字段，用 Read 工具查看',
-      '不要使用 EnterPlanMode / ExitPlanMode 工具',
     ],
     altScreen: false,
   };
