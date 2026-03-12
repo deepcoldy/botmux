@@ -14,6 +14,8 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, killStalePids, getCurrentClaudeVersion } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
+import { getBot, getAllBots } from '../bot-registry.js';
+import type { CliId } from '../adapters/cli/types.js';
 import type { LarkAttachment, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { DaemonSession } from './types.js';
@@ -25,7 +27,13 @@ export function expandHome(p: string): string {
 }
 
 export function getSessionWorkingDir(ds?: DaemonSession): string {
-  return expandHome(ds?.workingDir ?? config.daemon.workingDir);
+  if (ds?.workingDir) return expandHome(ds.workingDir);
+  if (ds?.larkAppId) {
+    const bot = getBot(ds.larkAppId);
+    return expandHome(bot.config.workingDir ?? '~');
+  }
+  // Fallback for calls without a session (e.g. during restore)
+  return expandHome(config.daemon.workingDir);
 }
 
 export function getProjectScanDir(ds?: DaemonSession): string {
@@ -39,15 +47,28 @@ export function getProjectScanDir(ds?: DaemonSession): string {
 
 /** Return all directories to scan for projects (supports multi-dir WORKING_DIR). */
 export function getProjectScanDirs(ds?: DaemonSession): string[] {
+  if (ds?.larkAppId) {
+    const bot = getBot(ds.larkAppId);
+    if (bot.config.projectScanDir) {
+      return [expandHome(bot.config.projectScanDir)];
+    }
+    const dirs = new Set<string>();
+    for (const wd of bot.config.workingDirs ?? [bot.config.workingDir ?? '~']) {
+      dirs.add(resolve(expandHome(wd), '..'));
+    }
+    if (ds.workingDir) {
+      dirs.add(resolve(expandHome(ds.workingDir), '..'));
+    }
+    return [...dirs];
+  }
+  // Fallback to global config
   if (config.daemon.projectScanDir) {
     return [expandHome(config.daemon.projectScanDir)];
   }
-  // Deduplicate parent dirs from all configured working dirs
   const dirs = new Set<string>();
   for (const wd of config.daemon.workingDirs) {
     dirs.add(resolve(expandHome(wd), '..'));
   }
-  // If session has its own workingDir, include its parent too
   if (ds?.workingDir) {
     dirs.add(resolve(expandHome(ds.workingDir), '..'));
   }
@@ -60,7 +81,7 @@ export function getAttachmentsDir(messageId: string): string {
   return join(resolve(config.session.dataDir), 'attachments', messageId);
 }
 
-export async function downloadResources(messageId: string, resources: MessageResource[]): Promise<LarkAttachment[]> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<LarkAttachment[]> {
   if (resources.length === 0) return [];
 
   const attachments: LarkAttachment[] = [];
@@ -69,7 +90,7 @@ export async function downloadResources(messageId: string, resources: MessageRes
   for (const res of resources) {
     const savePath = join(dir, res.name);
     try {
-      await downloadMessageResource(messageId, res.key, res.type, savePath);
+      await downloadMessageResource(larkAppId, messageId, res.key, res.type, savePath);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       logger.warn(`Failed to download ${res.type} ${res.key}: ${err.message}`);
@@ -87,8 +108,14 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
   return `\n\n附件（使用 Read 工具查看）：\n${lines.join('\n')}`;
 }
 
-export function buildNewTopicPrompt(userMessage: string, sessionId: string, attachments?: LarkAttachment[]): string {
-  const adapter = createCliAdapterSync(config.daemon.cliId, config.daemon.cliPathOverride);
+export function buildNewTopicPrompt(
+  userMessage: string,
+  sessionId: string,
+  cliId: CliId,
+  cliPathOverride?: string,
+  attachments?: LarkAttachment[],
+): string {
+  const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
 
   const noteLines = [
@@ -129,11 +156,13 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   for (const session of active) {
     messageQueue.ensureQueue(session.rootMessageId);
 
+    const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
     activeSessions.set(session.rootMessageId, {
       session,
       worker: null,
       workerPort: null,
       workerToken: null,
+      larkAppId,
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
       spawnedAt: Date.now(),
@@ -165,28 +194,36 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
-  refreshClaudeVersion: () => boolean,
+  refreshClaudeVersion: (...args: any[]) => boolean,
 ): Promise<void> {
+  const defaultBot = getAllBots()[0];
+  if (!defaultBot) { logger.warn('No bots configured, skipping scheduled task'); return; }
+  const larkAppId = defaultBot.config.larkAppId;
+
   const { sendMessage } = await import('../im/lark/client.js');
 
   // Send a top-level message to create a thread
   const rootMessageId = await sendMessage(
+    larkAppId,
     task.chatId,
     `🕐 定时任务「${task.name}」开始执行`,
   );
 
   // Create a session for this thread
-  refreshClaudeVersion();
+  refreshClaudeVersion(defaultBot.config.cliId, defaultBot.config.cliPathOverride);
   const session = sessionStore.createSession(task.chatId, rootMessageId, `[定时] ${task.name}`);
+  session.larkAppId = larkAppId;
+  sessionStore.updateSession(session);
   messageQueue.ensureQueue(rootMessageId);
 
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId);
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, defaultBot.config.cliId, defaultBot.config.cliPathOverride);
 
   const ds: DaemonSession = {
     session,
     worker: null,
     workerPort: null,
     workerToken: null,
+    larkAppId,
     chatId: task.chatId,
     chatType: 'group',
     spawnedAt: Date.now(),

@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { config, validateConfig } from './config.js';
+import { config } from './config.js';
 import { replyMessage, updateMessage, resolveAllowedUsers } from './im/lark/client.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage } from './im/lark/message-parser.js';
@@ -10,6 +11,7 @@ import { logger } from './utils/logger.js';
 import type { DaemonToWorker } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
+import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildStreamingCard } from './im/lark/card-builder.js';
@@ -42,7 +44,7 @@ import { probeBotOpenId, startLarkEventDispatcher } from './im/lark/event-dispat
 const activeSessions = new Map<string, DaemonSession>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
-let lastVersionCheckAt = 0;
+const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 
 /**
@@ -51,8 +53,10 @@ const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
  */
 async function sessionReply(rootId: string, content: string, msgType: string = 'text'): Promise<string> {
   const ds = activeSessions.get(rootId);
+  const appId = ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
+  if (!appId) throw new Error('No bot configured');
   const inThread = ds?.chatType === 'p2p';
-  return replyMessage(rootId, content, msgType, inThread);
+  return replyMessage(appId, rootId, content, msgType, inThread);
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -80,16 +84,13 @@ function removePidFile(): void {
 
 // ─── Version tracking ────────────────────────────────────────────────────────
 
-function refreshClaudeVersion(): boolean {
+function refreshClaudeVersion(cliId: CliId, cliPathOverride?: string): boolean {
   const now = Date.now();
-  if (now - lastVersionCheckAt < VERSION_CHECK_INTERVAL) return false;
-  lastVersionCheckAt = now;
+  const cached = cliVersionCache.get(cliId);
+  if (cached && now - cached.lastCheckAt < VERSION_CHECK_INTERVAL) return false;
 
   try {
-    const adapter = createCliAdapterSync(
-      config.daemon.cliId,
-      config.daemon.cliPathOverride,
-    );
+    const adapter = createCliAdapterSync(cliId, cliPathOverride);
     const raw = execFileSync(adapter.resolvedBin, ['--version'], {
       encoding: 'utf-8',
       timeout: 5_000,
@@ -98,18 +99,20 @@ function refreshClaudeVersion(): boolean {
 
     if (newVersion === 'unknown' || !newVersion) return false;
 
-    const curVer = getCurrentClaudeVersion();
-    if (curVer !== 'unknown' && newVersion !== curVer) {
-      setCurrentClaudeVersion(newVersion);
-      logger.info(`CLI version updated: ${curVer} → ${newVersion} (${adapter.id})`);
+    const oldVersion = cached?.version;
+    cliVersionCache.set(cliId, { version: newVersion, lastCheckAt: now });
+    // Also update the shared version (used by forkWorker for ds.claudeVersion)
+    setCurrentClaudeVersion(newVersion);
+
+    if (oldVersion && oldVersion !== newVersion) {
+      logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${adapter.id})`);
       return true;
     }
 
-    setCurrentClaudeVersion(newVersion);
-    logger.info(`CLI version: ${getCurrentClaudeVersion()} (${adapter.id})`);
+    logger.info(`CLI version: ${newVersion} (${adapter.id})`);
     return false;
   } catch (err: any) {
-    logger.warn(`Failed to get CLI version: ${err.message}`);
+    logger.warn(`Failed to get CLI version for ${cliId}: ${err.message}`);
     return false;
   }
 }
@@ -145,10 +148,11 @@ const cardDeps: CardHandlerDeps = {
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
-async function handleNewTopic(data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p' = 'group'): Promise<void> {
+async function handleNewTopic(data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p' = 'group', larkAppId: string): Promise<void> {
   const { parsed, resources } = parseEventMessage(data);
   const content = parsed.content.trim();
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
+  const botCfg = getBot(larkAppId).config;
   logger.info(`New topic: ${messageId} "${content.substring(0, 60)}" (resources: ${resources.length}, active: ${getActiveCount()})`);
 
   // Intercept daemon commands in new topics (no session needed for some commands)
@@ -156,15 +160,18 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     const cmd = content.split(/\s+/)[0].toLowerCase();
     if (DAEMON_COMMANDS.has(cmd)) {
       const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
+      session.larkAppId = larkAppId;
+      sessionStore.updateSession(session);
       activeSessions.set(messageId, {
         session,
         worker: null,
         workerPort: null,
         workerToken: null,
+        larkAppId,
         chatId,
         chatType,
         spawnedAt: Date.now(),
-        claudeVersion: getCurrentClaudeVersion(),
+        claudeVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
         lastMessageAt: Date.now(),
         hasHistory: false,
         ownerOpenId: senderOpenId,
@@ -175,15 +182,17 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   }
 
   // Download attachments
-  const attachments = await downloadResources(messageId, resources);
+  const attachments = await downloadResources(larkAppId, messageId, resources);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
 
-  refreshClaudeVersion();
+  refreshClaudeVersion(botCfg.cliId, botCfg.cliPathOverride);
 
   // Create session in pending-repo state — don't spawn Claude yet
   const session = sessionStore.createSession(chatId, messageId, parsed.content.substring(0, 50), chatType);
+  session.larkAppId = larkAppId;
+  sessionStore.updateSession(session);
   messageQueue.ensureQueue(messageId);
   messageQueue.appendMessage(messageId, parsed);
 
@@ -192,10 +201,11 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     worker: null,
     workerPort: null,
     workerToken: null,
+    larkAppId,
     chatId,
     chatType,
     spawnedAt: Date.now(),
-    claudeVersion: getCurrentClaudeVersion(),
+    claudeVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
     lastMessageAt: Date.now(),
     hasHistory: false,
     pendingRepo: true,
@@ -221,13 +231,13 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   } else {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
-    const prompt = buildNewTopicPrompt(content, session.sessionId, attachments);
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
 
-async function handleThreadReply(data: any, rootId: string): Promise<void> {
+async function handleThreadReply(data: any, rootId: string, larkAppId: string): Promise<void> {
   const { parsed, resources } = parseEventMessage(data);
   const content = parsed.content.trim();
 
@@ -242,14 +252,15 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
 
   logger.info(`Thread reply in ${rootId}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
-  // Download attachments
-  const attachments = await downloadResources(parsed.messageId, resources);
+  // Download attachments — use larkAppId from existing session if available, otherwise from event
+  const ds = activeSessions.get(rootId);
+  const effectiveAppId = ds?.larkAppId ?? larkAppId;
+  const attachments = await downloadResources(effectiveAppId, parsed.messageId, resources);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
 
   // Update last message time
-  const ds = activeSessions.get(rootId);
   if (ds) ds.lastMessageAt = Date.now();
 
   // If waiting for repo selection, remind user
@@ -266,18 +277,22 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
     // No active session for this thread — auto-create with repo selection
     const chatId: string = data?.message?.chat_id ?? '';
     const chatType = (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
+    const botCfg = getBot(larkAppId).config;
     logger.info(`No active session for thread ${rootId}, auto-creating new session...`);
-    refreshClaudeVersion();
+    refreshClaudeVersion(botCfg.cliId, botCfg.cliPathOverride);
     const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50), chatType);
+    session.larkAppId = larkAppId;
+    sessionStore.updateSession(session);
     const newDs: DaemonSession = {
       session,
       worker: null,
       workerPort: null,
       workerToken: null,
+      larkAppId,
       chatId,
       chatType,
       spawnedAt: Date.now(),
-      claudeVersion: getCurrentClaudeVersion(),
+      claudeVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
       lastMessageAt: Date.now(),
       hasHistory: false,
       pendingRepo: true,
@@ -303,7 +318,7 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
     } else {
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, attachments);
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments);
       forkWorker(newDs, prompt);
     }
 
@@ -319,11 +334,12 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
     if (ds.streamCardId && ds.workerPort) {
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
       const prevTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
+      const dsBotCfg = getBot(ds.larkAppId).config;
       const frozenCard = buildStreamingCard(
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
-        ds.lastScreenContent ?? '', 'idle', config.daemon.cliId, ds.streamExpanded,
+        ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId, ds.streamExpanded,
       );
-      updateMessage(ds.streamCardId, frozenCard).catch(() => {});
+      updateMessage(ds.larkAppId, ds.streamCardId, frozenCard).catch(() => {});
     }
     // Mark new turn — next screen_update will create a fresh streaming card
     ds.streamCardPending = true;
@@ -340,7 +356,12 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function startDaemon(): Promise<void> {
-  validateConfig();
+  // Load and register all bots
+  const botConfigs = loadBotConfigs();
+  for (const cfg of botConfigs) {
+    registerBot(cfg);
+  }
+
   writePidFile();
 
   // Initialise worker pool with daemon callbacks
@@ -350,33 +371,40 @@ export async function startDaemon(): Promise<void> {
     getActiveCount,
   });
 
-  // Get initial CLI version
-  refreshClaudeVersion();
-  if (getCurrentClaudeVersion() === 'unknown') {
-    logger.warn('Could not detect CLI version at startup');
-  }
+  // Per-bot initialization
+  for (const bot of getAllBots()) {
+    const cfg = bot.config;
 
-  // Validate and resolve ALLOWED_USERS
-  if (config.daemon.allowedUsers.length > 0) {
-    const invalid = config.daemon.allowedUsers.filter(u => !u.startsWith('ou_') && !u.includes('@'));
-    if (invalid.length > 0) {
-      logger.warn(`ALLOWED_USERS contains invalid entries (expected email or ou_ open_id): ${invalid.join(', ')}`);
-    }
-    const hasEmails = config.daemon.allowedUsers.some(u => u.includes('@'));
-    if (hasEmails) {
-      try {
-        config.daemon.allowedUsers = await resolveAllowedUsers(config.daemon.allowedUsers);
-        logger.info(`Resolved allowedUsers: ${config.daemon.allowedUsers.join(', ')}`);
-      } catch (err: any) {
-        logger.warn(`Failed to resolve allowedUsers: ${err.message}`);
+    // Refresh CLI version per bot's cliId
+    refreshClaudeVersion(cfg.cliId, cfg.cliPathOverride);
+
+    // Resolve allowed users per bot
+    if (bot.resolvedAllowedUsers.length > 0) {
+      const hasEmails = bot.resolvedAllowedUsers.some(u => u.includes('@'));
+      if (hasEmails) {
+        try {
+          bot.resolvedAllowedUsers = await resolveAllowedUsers(cfg.larkAppId, bot.resolvedAllowedUsers);
+          logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
+        } catch (err: any) {
+          logger.warn(`[${cfg.larkAppId}] Failed to resolve allowedUsers: ${err.message}`);
+        }
       }
     }
-  }
 
-  // Probe bot open_id at startup (non-blocking)
-  probeBotOpenId().catch(err => {
-    logger.warn(`Bot open_id probe failed (will learn from events): ${err.message}`);
-  });
+    // Probe bot open_id
+    probeBotOpenId(cfg.larkAppId).catch(err => {
+      logger.warn(`[${cfg.larkAppId}] Bot open_id probe failed: ${err.message}`);
+    });
+
+    // Start event dispatcher for this bot
+    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
+      handleCardAction: (data, appId) => handleCardAction(data, cardDeps),
+      handleNewTopic: (data, chatId, messageId, chatType, appId) =>
+        handleNewTopic(data, chatId, messageId, chatType, appId),
+      handleThreadReply: (data, rootId, appId) =>
+        handleThreadReply(data, rootId, appId),
+    });
+  }
 
   // Restore active sessions from previous run
   restoreActiveSessions(activeSessions);
@@ -385,13 +413,6 @@ export async function startDaemon(): Promise<void> {
   scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshClaudeVersion));
   scheduler.startScheduler();
 
-  // Start Lark event dispatcher
-  startLarkEventDispatcher({
-    handleCardAction: (data) => handleCardAction(data, cardDeps),
-    handleNewTopic,
-    handleThreadReply,
-  });
-
   // Graceful shutdown
   const shutdown = () => {
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
@@ -399,7 +420,10 @@ export async function startDaemon(): Promise<void> {
     for (const [, ds] of activeSessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
-        if (config.daemon.backendType === 'tmux') {
+        const backendType = ds.larkAppId
+          ? (getBot(ds.larkAppId).config.backendType ?? config.daemon.backendType)
+          : config.daemon.backendType;
+        if (backendType === 'tmux') {
           // Tmux mode: just kill the worker process — tmux session survives for re-attach.
           // Worker's SIGTERM handler calls backend.kill() which only detaches.
           try { ds.worker.kill('SIGTERM'); } catch { /* ignore */ }

@@ -13,6 +13,8 @@ import { buildStreamingCard, buildSessionCard } from '../im/lark/card-builder.js
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
+import { getBot, getAllBots } from '../bot-registry.js';
+import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session } from '../types.js';
 import type { DaemonSession } from './types.js';
 
@@ -53,18 +55,16 @@ export const restartCounts = new Map<string, { count: number; lastAt: number }>(
 
 // ─── MCP config ─────────────────────────────────────────────────────────────
 
-/** Track whether ensureMcpConfig has run this daemon lifecycle */
-let mcpConfigDone = false;
+/** Track which CLI adapters have had MCP config ensured this daemon lifecycle */
+const mcpConfiguredCliIds = new Set<string>();
 
 /**
- * Ensure the botmux MCP server is registered globally.
+ * Ensure the botmux MCP server is registered globally for a given CLI.
  * Delegates to the CLI adapter which knows the correct config file location.
  */
-export function ensureMcpConfig(): void {
-  const adapter = createCliAdapterSync(
-    config.daemon.cliId,
-    config.daemon.cliPathOverride,
-  );
+export function ensureMcpConfig(cliId: CliId, cliPathOverride?: string): void {
+  if (mcpConfiguredCliIds.has(cliId)) return;
+  const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Resolve path relative to src/ (one level up from core/)
   const serverScript = join(__dirname, '..', 'index.js');
   adapter.ensureMcpConfig({
@@ -72,11 +72,11 @@ export function ensureMcpConfig(): void {
     command: 'node',
     args: [serverScript],
     env: {
-      LARK_APP_ID: config.lark.appId,
-      LARK_APP_SECRET: config.lark.appSecret,
       SESSION_DATA_DIR: config.session.dataDir,
+      // LARK_APP_ID/SECRET come from worker process env at runtime
     },
   });
+  mcpConfiguredCliIds.add(cliId);
 }
 
 // ─── Kill worker ────────────────────────────────────────────────────────────
@@ -98,6 +98,8 @@ export function killWorker(ds: DaemonSession): void {
 
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const cb = requireCallbacks();
+  const bot = getBot(ds.larkAppId);
+  const botCfg = bot.config;
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
   const cwd = cb.getSessionWorkingDir(ds);
@@ -113,15 +115,17 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     ds.workerToken = null;
   }
 
-  if (!mcpConfigDone) {
-    ensureMcpConfig();
-    mcpConfigDone = true;
-  }
+  ensureMcpConfig(botCfg.cliId, botCfg.cliPathOverride);
 
   const worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
-    env: { ...process.env, CLAUDECODE: undefined },
+    env: {
+      ...process.env,
+      CLAUDECODE: undefined,
+      LARK_APP_ID: botCfg.larkAppId,
+      LARK_APP_SECRET: botCfg.larkAppSecret,
+    },
   });
 
   // Pipe worker stdout/stderr to daemon logger
@@ -138,20 +142,22 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     }
   });
 
-  // Send init config
+  // Send init config — use per-bot settings
   const initMsg: DaemonToWorker = {
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
     workingDir: cwd,
-    cliId: config.daemon.cliId,
-    cliPathOverride: config.daemon.cliPathOverride,
-    backendType: config.daemon.backendType,
+    cliId: botCfg.cliId,
+    cliPathOverride: botCfg.cliPathOverride,
+    backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
+    larkAppId: botCfg.larkAppId,
+    larkAppSecret: botCfg.larkAppSecret,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -179,7 +185,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             initTitle,
             '',
             'starting',
-            config.daemon.cliId,
+            botCfg.cliId,
             ds.streamExpanded,
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive');
@@ -191,7 +197,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.session.rootMessageId,
             readOnlyUrl,
             ds.session.title || 'Claude Code',
-            config.daemon.cliId,
+            botCfg.cliId,
           );
           await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive');
         }
@@ -217,7 +223,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           turnTitle,
           msg.content,
           msg.status,
-          config.daemon.cliId,
+          botCfg.cliId,
           ds.streamExpanded,
         );
 
@@ -229,7 +235,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             .catch(err => logger.debug(`[${t}] Failed to create streaming card: ${err}`));
         } else {
           // Same turn — PATCH existing card
-          updateMessage(ds.streamCardId, cardJson).catch(err => {
+          updateMessage(ds.larkAppId, ds.streamCardId, cardJson).catch(err => {
             logger.debug(`[${t}] Failed to update streaming card: ${err}`);
             ds.streamCardId = undefined;
           });
@@ -306,21 +312,25 @@ export function killStalePids(activeSessions_: Session[]): void {
     }
   }
 
-  // Tmux cleanup
-  if (config.daemon.backendType === 'tmux') {
-    // If CLI_ID changed since last run, kill ALL tmux sessions (old CLI patterns won't match)
+  // Tmux cleanup — check if any bot uses tmux (or the global default is tmux)
+  const anyTmux = getAllBots().some(b => (b.config.backendType ?? config.daemon.backendType) === 'tmux')
+    || config.daemon.backendType === 'tmux';
+  if (anyTmux) {
+    const multiBot = getAllBots().length > 1;
     const cliIdFile = join(config.session.dataDir, 'last-cli-id');
     let lastCliId: string | undefined;
     try { lastCliId = readFileSync(cliIdFile, 'utf-8').trim(); } catch { /* first run */ }
+    // For tmux cleanup: use global cliId for single-bot compat
     const currentCliId = config.daemon.cliId;
 
-    if (lastCliId && lastCliId !== currentCliId) {
+    if (!multiBot && lastCliId && lastCliId !== currentCliId) {
+      // Single-bot mode: CLI_ID changed since last run, kill ALL tmux sessions
       logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all tmux sessions`);
       for (const name of TmuxBackend.listBotmuxSessions()) {
         TmuxBackend.killSession(name);
       }
     } else {
-      // Clean orphaned tmux sessions: kill bmx-* sessions not in active set
+      // Multi-bot or same CLI_ID: clean orphaned tmux sessions not in active set
       const activeNames = new Set(
         activeSessions_.map(s => TmuxBackend.sessionName(s.sessionId)),
       );
@@ -332,7 +342,7 @@ export function killStalePids(activeSessions_: Session[]): void {
       }
     }
 
-    // Persist current CLI_ID for next restart
+    // Persist current CLI_ID for next restart (best-effort, single-bot compat)
     try {
       mkdirSync(config.session.dataDir, { recursive: true });
       writeFileSync(cliIdFile, currentCliId);
