@@ -25,7 +25,16 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty, content) {
-      pty.write(content + '\r');
+      if (content.includes('\n')) {
+        // Multi-line content triggers Claude Code's "Pasted text" mode.
+        // The trailing \r must arrive AFTER the paste is fully processed,
+        // otherwise it gets swallowed. 150ms is the minimum reliable delay.
+        pty.write(content);
+        await new Promise(r => setTimeout(r, 150));
+        pty.write('\r');
+      } else {
+        pty.write(content + '\r');
+      }
     },
 
     ensureMcpConfig(entry) {
