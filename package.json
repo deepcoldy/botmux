@@ -1,6 +1,6 @@
 {
   "name": "botmux",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Bridge between IM platforms and AI coding CLIs — one topic, one CLI session with live streaming",
   "type": "module",
   "main": "dist/index-daemon.js",
