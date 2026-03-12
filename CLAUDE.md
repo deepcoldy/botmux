@@ -20,7 +20,7 @@ pnpm daemon:logs          # 查看日志
 - `daemon.ts` — 薄编排层（~400 行），组装各模块并启动
 - `worker.ts` — Worker 子进程，通过适配器管理 CLI + PTY
 - `adapters/cli/` — CLI 适配器：每种 CLI 的参数构建、输入写入、MCP 配置。通过 `CLI_ID` 环境变量选择
-- `adapters/backend/` — 会话后端：`PtyBackend`（node-pty）、`TmuxBackend`（stub）
+- `adapters/backend/` — 会话后端：`PtyBackend`（node-pty）、`TmuxBackend`（tmux + node-pty，会话常驻）
 - `core/` — 核心逻辑：`worker-pool`（进程池）、`command-handler`（斜杠命令）、`session-manager`（会话生命周期）、`cost-calculator`、`scheduler`
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
 - `im/lark/` — 飞书专属：事件路由、卡片交互、API 封装、消息解析

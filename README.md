@@ -14,7 +14,7 @@
 - **多 CLI 支持** — 通过适配器架构支持 Claude Code、Aiden、CoCo、Codex，可扩展
 - **实时流式卡片** — 终端输出实时渲染到飞书卡片中，支持 Markdown 格式，每轮对话独立卡片
 - **Web 终端 (xterm.js)** — 浏览器查看完整 PTY 输出，按需获取可操作链接
-- **会话持久化** — 会话在 Daemon 重启后自动恢复
+- **会话持久化** — 会话在 Daemon 重启后自动恢复；tmux 后端下 CLI 进程常驻，重启零中断
 - **定时任务** — 基于 Cron 的周期性任务，支持中文自然语言配置
 - **项目管理** — 交互式仓库选择器，每个会话独立工作目录
 - **MCP 集成** — CLI 可通过 MCP 工具回复飞书话题、读取消息历史、添加表情回应
@@ -35,7 +35,7 @@ Daemon (daemon.ts → core/ 模块)
     |
 Worker (worker.ts) -- 每个会话 fork 一个子进程
     |-- adapters/cli/*: CLI 适配器 (Claude Code / Aiden / CoCo / Codex)
-    |-- adapters/backend/pty-backend: 伪终端管理 (node-pty)
+    |-- adapters/backend: PtyBackend (node-pty) 或 TmuxBackend (tmux + node-pty)
     |-- utils/idle-detector: 空闲检测（静默 + Spinner + 完成标记）
     |-- HTTP + WebSocket: 提供 xterm.js Web 终端
     |-- Headless xterm: 捕获屏幕内容用于流式卡片
@@ -53,6 +53,7 @@ AI 编程 CLI (交互式 TTY 模式)
 - **Node.js** >= 20
 - **AI 编程 CLI** 已安装并完成认证（`claude`、`aiden`、`coco` 或 `codex` 在 PATH 中）
 - **飞书应用** 具备机器人和消息权限（WebSocket 事件订阅）
+- **tmux** >= 3.x（可选，安装后自动启用会话常驻）
 
 ## 安装
 
@@ -104,7 +105,7 @@ botmux start
 |------|--------|------|
 | `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`） |
 | `CLI_PATH` | _(按 CLI_ID 自动检测)_ | CLI 可执行文件路径覆盖 |
-| `BACKEND_TYPE` | `pty` | 会话后端（`pty`、`tmux`） |
+| `BACKEND_TYPE` | _(自动检测)_ | 会话后端：有 tmux 则用 `tmux`，否则 `pty` |
 | `WORKING_DIR` | `~` | 默认工作目录 |
 | `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的用户，邮箱前缀或 open_id，逗号分隔 |
 | `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
@@ -187,6 +188,40 @@ botmux start
 
 特性：xterm.js + fit/unicode11/web-links 插件、TokyoNight 主题、滚动缓冲区、移动端适配。
 
+### Tmux 会话常驻
+
+安装 tmux 后，botmux 自动使用 tmux 后端（`pty-under-tmux` 架构）。CLI 进程运行在 tmux session 内，daemon 通过 node-pty attach 到 tmux 来捕获输出，现有的流式卡片、空闲检测、Web 终端等功能全部不受影响。
+
+**核心收益：Daemon 重启不中断 CLI。** `botmux restart` 时 worker 进程退出，但 tmux session（及其中的 CLI 进程）保持运行。下次收到消息时 worker 自动 re-attach，无需 `--resume` 重载上下文。
+
+```bash
+# 查看活跃的 botmux tmux 会话
+tmux list-sessions | grep bmx-
+
+# 手动 attach 调试（实时观察 CLI 终端）
+tmux attach -t bmx-<session-id-前8位>
+# Ctrl+B, D 退出 attach，不影响 CLI 继续运行
+
+# 强制回退到纯 pty 模式（不使用 tmux）
+BACKEND_TYPE=pty botmux start
+```
+
+**tmux 会话命名规则：** `bmx-<sessionId 前 8 位>`，由 session UUID 确定性派生。
+
+**生命周期：**
+
+| 事件 | tmux session | CLI 进程 |
+|------|-------------|---------|
+| `botmux restart` | 存活 | 存活（下次消息 re-attach） |
+| `/close` 或关闭按钮 | 销毁 | 终止（SIGHUP） |
+| CLI 自行退出 / 崩溃 | 随之关闭 | 已退出（自动重启用新 session） |
+| 切换 `CLI_ID` 后重启 | 全部销毁 | 全部终止（防止 pattern 不匹配） |
+
+**注意事项：**
+- 切换 `CLI_ID`（如 `claude-code` → `coco`）后重启 daemon，所有旧 tmux session 会被自动清理，因为旧 CLI 的 idle detection pattern 与新适配器不兼容
+- 孤儿 tmux session（不在 active session 列表中的）会在 daemon 启动时自动清理
+- 如果不需要 tmux 常驻特性，设置 `BACKEND_TYPE=pty` 即可回退
+
 ## MCP 工具
 
 Claude Code 可使用三个 MCP 工具与飞书交互：
@@ -234,7 +269,7 @@ src/
     backend/
       types.ts              # SessionBackend 接口
       pty-backend.ts        # node-pty 后端
-      tmux-backend.ts       # tmux 后端（stub）
+      tmux-backend.ts       # tmux 后端（pty-under-tmux，会话常驻）
   core/
     types.ts                # DaemonSession 核心类型
     worker-pool.ts          # Worker 进程池管理

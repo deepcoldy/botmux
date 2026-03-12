@@ -14,7 +14,7 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 - **Multi-CLI support** — adapter architecture supports Claude Code, Aiden, CoCo, Codex, and is extensible
 - **Live streaming cards** — real-time terminal output rendered in Feishu cards with markdown support, per-turn card lifecycle
 - **Web terminal (xterm.js)** — full PTY output in the browser with optional write access via on-demand DM link
-- **Session persistence** — sessions survive daemon restarts and resume automatically
+- **Session persistence** — sessions survive daemon restarts; with tmux backend, CLI processes persist across restarts with zero interruption
 - **Scheduled tasks** — cron-based recurring prompts with natural language scheduling (Chinese supported)
 - **Project management** — interactive repo selector, per-session working directory
 - **MCP integration** — CLI can reply to Lark threads, read message history, and add reactions via MCP tools
@@ -35,7 +35,7 @@ Daemon (daemon.ts → core/ modules)
     |
 Worker (worker.ts) -- forked child process per session
     |-- adapters/cli/*: CLI adapters (Claude Code / Aiden / CoCo / Codex)
-    |-- adapters/backend/pty-backend: pseudo-terminal management (node-pty)
+    |-- adapters/backend: PtyBackend (node-pty) or TmuxBackend (tmux + node-pty)
     |-- utils/idle-detector: idle detection (quiescence + spinner + completion marker)
     |-- HTTP + WebSocket server: serves xterm.js web terminal
     |-- Headless xterm: captures screen for streaming cards
@@ -53,6 +53,7 @@ Lark API
 - **Node.js** >= 20
 - **AI coding CLI** installed and authenticated (`claude`, `aiden`, `coco`, or `codex` in PATH)
 - **Lark app** with Bot and Message permissions (WebSocket event subscription)
+- **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 
 ## Installation
 
@@ -104,7 +105,7 @@ Configuration is stored at `~/.botmux/.env`. Run `botmux setup` to create it int
 |----------|---------|-------------|
 | `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`) |
 | `CLI_PATH` | _(auto-detect by CLI_ID)_ | CLI binary path override |
-| `BACKEND_TYPE` | `pty` | Session backend (`pty`, `tmux`) |
+| `BACKEND_TYPE` | _(auto-detect)_ | Session backend: `tmux` if available, otherwise `pty` |
 | `WORKING_DIR` | `~` | Default working directory |
 | `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated email prefixes or Lark open_ids |
 | `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
@@ -187,6 +188,40 @@ Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
 
 Features: xterm.js with fit/unicode11/web-links addons, TokyoNight theme, scrollback buffer, mobile-friendly viewport.
 
+### Tmux Persistent Sessions
+
+When tmux is installed, botmux automatically uses the tmux backend (pty-under-tmux architecture). CLI processes run inside tmux sessions while the daemon attaches via node-pty to capture output — streaming cards, idle detection, and web terminal all work unchanged.
+
+**Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
+
+```bash
+# List active botmux tmux sessions
+tmux list-sessions | grep bmx-
+
+# Manually attach for debugging (observe CLI in real time)
+tmux attach -t bmx-<first-8-chars-of-session-id>
+# Ctrl+B, D to detach — CLI keeps running
+
+# Force pure pty mode (disable tmux)
+BACKEND_TYPE=pty botmux start
+```
+
+**Session naming:** `bmx-<first 8 chars of session UUID>`, deterministically derived.
+
+**Lifecycle:**
+
+| Event | tmux session | CLI process |
+|-------|-------------|-------------|
+| `botmux restart` | Survives | Survives (re-attaches on next message) |
+| `/close` or close button | Destroyed | Terminated (SIGHUP) |
+| CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
+| `CLI_ID` changed + restart | All destroyed | All terminated (prevents pattern mismatch) |
+
+**Notes:**
+- Switching `CLI_ID` (e.g. `claude-code` → `coco`) and restarting the daemon will kill all existing tmux sessions, since the old CLI's idle detection patterns are incompatible with the new adapter
+- Orphaned tmux sessions (not in the active session list) are cleaned up automatically on daemon startup
+- Set `BACKEND_TYPE=pty` to opt out of tmux persistence
+
 ## MCP Tools
 
 Claude Code has access to three MCP tools for interacting with Lark:
@@ -234,7 +269,7 @@ src/
     backend/
       types.ts              # SessionBackend interface
       pty-backend.ts        # node-pty backend
-      tmux-backend.ts       # tmux backend (stub)
+      tmux-backend.ts       # tmux backend (pty-under-tmux, persistent sessions)
   core/
     types.ts                # DaemonSession core type
     worker-pool.ts          # Worker process pool management
