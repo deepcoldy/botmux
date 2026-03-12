@@ -189,8 +189,20 @@ export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient
             logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
             return;
           }
+        } else if (chatType === 'group' && rootId) {
+          // Group thread replies: require @mention or solo group (same as new topics)
+          const access = await checkGroupMessageAccess(message, chatId, senderOpenId);
+          if (access === 'not_allowed') {
+            // @mentioned but not in allowlist — silently ignore in threads
+            logger.debug(`Ignoring thread reply from non-allowed user: ${senderOpenId}`);
+            return;
+          }
+          if (access === 'ignore') {
+            logger.debug(`Ignoring group thread reply not addressed to bot: ${messageId}`);
+            return;
+          }
         } else if (!isAllowed) {
-          // Thread replies and DMs: still check allowlist
+          // P2P thread replies and DMs: still check allowlist
           logger.debug(`Ignoring message from non-allowed user: ${senderOpenId}`);
           return;
         }
