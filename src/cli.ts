@@ -10,9 +10,12 @@
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade        — upgrade to latest version
+ *   botmux list           — list all active sessions
+ *   botmux delete <id>    — close a session by ID prefix
+ *   botmux delete all     — close all active sessions
  */
 import { execSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -215,6 +218,230 @@ function cmdUpgrade(): void {
   }
 }
 
+// ─── Session helpers ──────────────────────────────────────────────────────────
+
+interface SessionData {
+  sessionId: string;
+  chatId: string;
+  chatType?: 'group' | 'p2p';
+  rootMessageId: string;
+  title: string;
+  status: 'active' | 'closed';
+  createdAt: string;
+  closedAt?: string;
+  pid?: number;
+  workingDir?: string;
+  webPort?: number;
+}
+
+function getSessionsFilePath(): string {
+  // Check env first, then fallback to default
+  const dataDir = process.env.SESSION_DATA_DIR ?? DATA_DIR;
+  return join(dataDir, 'sessions.json');
+}
+
+function loadSessions(): Map<string, SessionData> {
+  const fp = getSessionsFilePath();
+  if (!existsSync(fp)) return new Map();
+  try {
+    const data = JSON.parse(readFileSync(fp, 'utf-8'));
+    return new Map(Object.entries(data));
+  } catch {
+    console.error(`❌ 无法读取会话文件: ${fp}`);
+    return new Map();
+  }
+}
+
+function saveSessions(sessions: Map<string, SessionData>): void {
+  const fp = getSessionsFilePath();
+  const tmpFp = fp + '.tmp';
+  const obj: Record<string, SessionData> = {};
+  for (const [k, v] of sessions) {
+    obj[k] = v;
+  }
+  writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
+  renameSync(tmpFp, fp);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killProcess(pid: number): boolean {
+  try {
+    process.kill(pid, 'SIGTERM');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d${hours % 24}h`;
+}
+
+/** Get display width of a string, accounting for CJK double-width characters. */
+function displayWidth(str: string): number {
+  let width = 0;
+  for (const ch of str) {
+    const code = ch.codePointAt(0)!;
+    // CJK Unified Ideographs, CJK Compatibility, Fullwidth forms, Hangul, Kana, etc.
+    if (
+      (code >= 0x1100 && code <= 0x115f) ||   // Hangul Jamo
+      (code >= 0x2e80 && code <= 0x303e) ||   // CJK Radicals, Kangxi, CJK Symbols
+      (code >= 0x3040 && code <= 0x33bf) ||   // Hiragana, Katakana, Bopomofo, CJK Compat
+      (code >= 0x3400 && code <= 0x4dbf) ||   // CJK Unified Ext A
+      (code >= 0x4e00 && code <= 0xa4cf) ||   // CJK Unified, Yi
+      (code >= 0xac00 && code <= 0xd7af) ||   // Hangul Syllables
+      (code >= 0xf900 && code <= 0xfaff) ||   // CJK Compat Ideographs
+      (code >= 0xfe30 && code <= 0xfe6f) ||   // CJK Compat Forms
+      (code >= 0xff01 && code <= 0xff60) ||   // Fullwidth Forms
+      (code >= 0xffe0 && code <= 0xffe6) ||   // Fullwidth Signs
+      (code >= 0x20000 && code <= 0x2fa1f)    // CJK Unified Ext B-F, Compat Supplement
+    ) {
+      width += 2;
+    } else {
+      width += 1;
+    }
+  }
+  return width;
+}
+
+/** Truncate string to fit within maxWidth display columns, append '…' if truncated. */
+function truncate(str: string, maxWidth: number): string {
+  let width = 0;
+  let i = 0;
+  const chars = [...str];
+  for (; i < chars.length; i++) {
+    const cw = displayWidth(chars[i]);
+    if (width + cw > maxWidth - 1) {  // reserve 1 col for '…'
+      return chars.slice(0, i).join('') + '…';
+    }
+    width += cw;
+  }
+  return str;
+}
+
+/** Pad string to exact display width with trailing spaces. */
+function padEndDisplay(str: string, targetWidth: number): string {
+  const w = displayWidth(str);
+  return w >= targetWidth ? str : str + ' '.repeat(targetWidth - w);
+}
+
+function cmdList(): void {
+  const sessions = loadSessions();
+  const active = [...sessions.values()].filter(s => s.status === 'active');
+
+  if (active.length === 0) {
+    console.log('没有活跃会话。');
+    return;
+  }
+
+  const cols = { id: 10, title: 30, dir: 30, pid: 8, uptime: 8, status: 8 };
+
+  const header = [
+    'id'.padEnd(cols.id),
+    'title'.padEnd(cols.title),
+    'working dir'.padEnd(cols.dir),
+    'pid'.padEnd(cols.pid),
+    'uptime'.padEnd(cols.uptime),
+    'status'.padEnd(cols.status),
+  ].join(' │ ');
+
+  const separator = '─'.repeat(displayWidth(header));
+
+  console.log(separator);
+  console.log(header);
+  console.log(separator);
+
+  for (const s of active) {
+    const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
+    const title = padEndDisplay(truncate(s.title || '(untitled)', cols.title), cols.title);
+    const dir = padEndDisplay(truncate(s.workingDir || '-', cols.dir), cols.dir);
+    const pid = s.pid ? String(s.pid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
+    const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
+    const alive = s.pid && isProcessAlive(s.pid);
+    const status = (alive ? 'online' : s.pid ? 'stopped' : 'idle').padEnd(cols.status);
+
+    console.log([id, title, dir, pid, uptime, status].join(' │ '));
+  }
+
+  console.log(separator);
+  console.log(`共 ${active.length} 个活跃会话`);
+}
+
+function cmdDelete(): void {
+  const target = process.argv[3];
+  if (!target) {
+    console.error('用法: botmux delete <session-id|all>');
+    process.exit(1);
+  }
+
+  const sessions = loadSessions();
+  const active = [...sessions.values()].filter(s => s.status === 'active');
+
+  if (active.length === 0) {
+    console.log('没有活跃会话。');
+    return;
+  }
+
+  let toDelete: SessionData[];
+
+  if (target === 'all') {
+    toDelete = active;
+  } else if (target === 'stopped') {
+    toDelete = active.filter(s => s.pid && !isProcessAlive(s.pid));
+    if (toDelete.length === 0) {
+      console.log('没有 stopped 状态的会话。');
+      return;
+    }
+  } else {
+    // Match by session ID prefix
+    toDelete = active.filter(s => s.sessionId.startsWith(target));
+    if (toDelete.length === 0) {
+      console.error(`❌ 未找到匹配 "${target}" 的活跃会话`);
+      console.error('   使用 botmux list 查看所有会话');
+      process.exit(1);
+    }
+    if (toDelete.length > 1) {
+      console.error(`❌ "${target}" 匹配了 ${toDelete.length} 个会话，请提供更长的 ID 前缀：`);
+      for (const s of toDelete) {
+        console.error(`   ${s.sessionId.substring(0, 8)}  ${s.title}`);
+      }
+      process.exit(1);
+    }
+  }
+
+  for (const s of toDelete) {
+    // Kill CLI process if running
+    if (s.pid && isProcessAlive(s.pid)) {
+      killProcess(s.pid);
+      console.log(`  killed pid ${s.pid}`);
+    }
+
+    // Mark session as closed
+    s.status = 'closed';
+    s.closedAt = new Date().toISOString();
+    sessions.set(s.sessionId, s);
+    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}`);
+  }
+
+  saveSessions(sessions);
+  console.log(`\n已关闭 ${toDelete.length} 个会话`);
+}
+
 function showHelp(): void {
   console.log(`
 botmux — IM ↔ AI 编程 CLI 桥接
@@ -227,6 +454,10 @@ botmux — IM ↔ AI 编程 CLI 桥接
   logs        查看 daemon 日志（--lines N）
   status      查看 daemon 状态
   upgrade     升级到最新版本
+  list        列出所有活跃会话
+  delete <id>      关闭指定会话（支持 ID 前缀匹配）
+  delete all       关闭所有活跃会话
+  delete stopped   清理所有进程已退出的僵尸会话
 
 配置目录: ~/.botmux/
 文档: https://github.com/deepcoldy/botmux
@@ -245,5 +476,10 @@ switch (command) {
   case 'logs':    cmdLogs(); break;
   case 'status':  cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
+  case 'list':
+  case 'ls':      cmdList(); break;
+  case 'delete':
+  case 'del':
+  case 'rm':      cmdDelete(); break;
   default:        showHelp(); break;
 }
