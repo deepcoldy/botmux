@@ -87,6 +87,10 @@ botmux start
 | `botmux logs` | 查看日志（`--lines N`） |
 | `botmux status` | 查看 daemon 状态 |
 | `botmux upgrade` | 升级到最新版本 |
+| `botmux list` | 列出所有活跃会话（别名 `ls`） |
+| `botmux delete <id>` | 关闭指定会话，支持 ID 前缀匹配（别名 `del`/`rm`） |
+| `botmux delete all` | 关闭所有活跃会话 |
+| `botmux delete stopped` | 清理所有进程已退出的僵尸会话 |
 
 ## 配置
 
@@ -252,7 +256,7 @@ pnpm daemon:logs
 
 ```
 src/
-  cli.ts                    # CLI 入口（setup/start/stop/restart/logs）
+  cli.ts                    # CLI 入口（setup/start/stop/restart/logs/list/delete）
   daemon.ts                 # Daemon 编排入口（~400 行，调用各模块）
   worker.ts                 # Worker 进程：使用适配器管理 CLI + PTY
   config.ts                 # 环境变量配置

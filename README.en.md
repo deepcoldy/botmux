@@ -87,6 +87,10 @@ The `setup` command will guide you through:
 | `botmux logs` | View daemon logs (`--lines N` for more) |
 | `botmux status` | Show daemon status |
 | `botmux upgrade` | Upgrade to latest version |
+| `botmux list` | List all active sessions (alias: `ls`) |
+| `botmux delete <id>` | Close a session by ID prefix (alias: `del`/`rm`) |
+| `botmux delete all` | Close all active sessions |
+| `botmux delete stopped` | Clean up zombie sessions with dead processes |
 
 ## Configuration
 
@@ -252,7 +256,7 @@ pnpm daemon:logs
 
 ```
 src/
-  cli.ts                    # CLI entry point (setup/start/stop/restart/logs)
+  cli.ts                    # CLI entry point (setup/start/stop/restart/logs/list/delete)
   daemon.ts                 # Daemon orchestrator (~400 lines, wires modules together)
   worker.ts                 # Worker process: uses adapters to manage CLI + PTY
   config.ts                 # Configuration from environment variables
