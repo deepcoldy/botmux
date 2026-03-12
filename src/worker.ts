@@ -57,7 +57,7 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
 // ─── Scrollback Buffer (replay to late-connecting WS clients) ───────────────
 
-const MAX_SCROLLBACK = 100_000; // chars
+const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
 
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
