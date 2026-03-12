@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { addReaction, removeReaction } from '../im/lark/client.js';
+import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
@@ -14,13 +15,13 @@ export const description = 'Add or remove an emoji reaction on a message. Use "a
 export async function execute(args: z.infer<typeof schema>) {
   try {
     if (args.action === 'add') {
-      const reactionId = await addReaction(args.message_id, args.emoji_type);
+      const reactionId = await addReaction(config.lark.appId, args.message_id, args.emoji_type);
       return { success: true, reactionId, messageId: args.message_id, emoji: args.emoji_type };
     } else {
       if (!args.reaction_id) {
         return { error: 'reaction_id is required for remove action' };
       }
-      await removeReaction(args.message_id, args.reaction_id);
+      await removeReaction(config.lark.appId, args.message_id, args.reaction_id);
       return { success: true, messageId: args.message_id, removed: args.reaction_id };
     }
   } catch (err: any) {

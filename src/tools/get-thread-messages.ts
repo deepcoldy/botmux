@@ -2,6 +2,7 @@ import { z } from 'zod';
 import * as sessionStore from '../services/session-store.js';
 import { listThreadMessages } from '../im/lark/client.js';
 import { parseApiMessage } from '../im/lark/message-parser.js';
+import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
@@ -19,7 +20,7 @@ export async function execute(args: z.infer<typeof schema>) {
 
   try {
     // List chat messages and filter by root_id to get thread messages
-    const rawMessages = await listThreadMessages(session.chatId, session.rootMessageId, args.limit);
+    const rawMessages = await listThreadMessages(config.lark.appId, session.chatId, session.rootMessageId, args.limit);
     const messages = rawMessages.map(parseApiMessage);
 
     logger.info(`Retrieved ${messages.length} messages for session ${args.session_id}`);

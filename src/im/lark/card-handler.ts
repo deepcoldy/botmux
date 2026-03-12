@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { config } from '../../config.js';
+import { getBot, getAllBots } from '../../bot-registry.js';
 import { sendUserMessage, updateMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
@@ -37,12 +38,22 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
 
   // Check ALLOWED_USERS for sensitive actions
   const operatorOpenId: string | undefined = data?.operator?.open_id;
-  const allowedUsers = config.daemon.allowedUsers;
   const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link'].includes(value.action);
-  if (isSensitive && allowedUsers.length > 0) {
-    if (!operatorOpenId || !allowedUsers.includes(operatorOpenId)) {
-      logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
-      return;
+  if (isSensitive) {
+    const rootId = value?.root_id;
+    const ds = rootId ? activeSessions.get(rootId) : undefined;
+    let allowedUsers: string[];
+    if (ds) {
+      allowedUsers = getBot(ds.larkAppId).resolvedAllowedUsers;
+    } else {
+      // No session yet — merge allowedUsers from all bots
+      allowedUsers = getAllBots().flatMap(b => b.resolvedAllowedUsers);
+    }
+    if (allowedUsers.length > 0) {
+      if (!operatorOpenId || !allowedUsers.includes(operatorOpenId)) {
+        logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
+        return;
+      }
     }
   }
 
@@ -52,17 +63,18 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
     const ds = activeSessions.get(rootId);
 
     if (actionType === 'restart' && ds) {
+      const botCfg = getBot(ds.larkAppId).config;
       if (ds.worker) {
         // Worker alive — tell it to restart Claude
         logger.info(`[${tag(ds)}] Restart via card button`);
         ds.worker.send({ type: 'restart' } as DaemonToWorker);
-        const cliName = getCliDisplayName(config.daemon.cliId);
+        const cliName = getCliDisplayName(botCfg.cliId);
         await sessionReply(rootId, `🔄 已重启 ${cliName}`);
       } else {
         // Worker gone (e.g. after daemon restart) — re-fork
         logger.info(`[${tag(ds)}] Re-forking worker via card button`);
         forkWorker(ds, '', ds.hasHistory);
-        const cliName = getCliDisplayName(config.daemon.cliId);
+        const cliName = getCliDisplayName(botCfg.cliId);
         await sessionReply(rootId, `🔄 已重新启动 ${cliName}`);
         // DM card will be sent by the ready handler when worker starts
       }
@@ -77,6 +89,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
+      const botCfg = getBot(ds.larkAppId).config;
       if (ds.workerPort && ds.workerToken) {
         const writeUrl = `http://${config.web.externalHost}:${ds.workerPort}?token=${ds.workerToken}`;
         const dmCardJson = buildSessionCard(
@@ -84,9 +97,9 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
           ds.session.rootMessageId,
           writeUrl,
           ds.session.title || 'Claude Code',
-          config.daemon.cliId,
+          botCfg.cliId,
         );
-        sendUserMessage(operatorOpenId, dmCardJson, 'interactive').catch(err =>
+        sendUserMessage(ds.larkAppId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
           logger.warn(`[${tag(ds)}] Failed to DM write link: ${err}`),
         );
         logger.info(`[${tag(ds)}] Sent write link via DM to ${operatorOpenId}`);
@@ -96,6 +109,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
     }
 
     if (actionType === 'toggle_stream' && ds) {
+      const botCfg = getBot(ds.larkAppId).config;
       ds.streamExpanded = !ds.streamExpanded;
       // Immediately rebuild and PATCH the current streaming card
       if (ds.streamCardId && ds.workerPort) {
@@ -108,10 +122,10 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
           turnTitle,
           ds.lastScreenContent || '',
           ds.lastScreenStatus || 'working',
-          config.daemon.cliId,
+          botCfg.cliId,
           ds.streamExpanded,
         );
-        updateMessage(ds.streamCardId, cardJson).catch(err =>
+        updateMessage(ds.larkAppId, ds.streamCardId, cardJson).catch(err =>
           logger.warn(`[${tag(ds)}] Failed to update card on toggle: ${err}`),
         );
       }
@@ -119,11 +133,14 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
     }
 
     if (actionType === 'skip_repo' && ds && ds.pendingRepo) {
+      const botCfg = getBot(ds.larkAppId).config;
       // Skip repo selection — spawn Claude with default working dir
       ds.pendingRepo = false;
       const prompt = buildNewTopicPrompt(
         ds.pendingPrompt ?? '',
         ds.session.sessionId,
+        botCfg.cliId,
+        botCfg.cliPathOverride,
         ds.pendingAttachments,
       );
       ds.pendingPrompt = undefined;
@@ -168,11 +185,14 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
   sessionStore.updateSession(targetDs.session);
 
   if (targetDs.pendingRepo) {
+    const botCfg = getBot(targetDs.larkAppId).config;
     // First-time repo selection — now spawn Claude with the original prompt
     targetDs.pendingRepo = false;
     const prompt = buildNewTopicPrompt(
       targetDs.pendingPrompt ?? '',
       targetDs.session.sessionId,
+      botCfg.cliId,
+      botCfg.cliPathOverride,
       targetDs.pendingAttachments,
     );
     targetDs.pendingPrompt = undefined;
