@@ -29,6 +29,7 @@ import { IdleDetector } from './utils/idle-detector.js';
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
 let idleDetector: IdleDetector | null = null;
+let isTmuxMode = false;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
@@ -163,6 +164,7 @@ function stopScreenUpdates(): void {
 function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
   const useTmux = cfg.backendType === 'tmux';
+  isTmuxMode = useTmux;
   const tmuxBe = useTmux ? new TmuxBackend(TmuxBackend.sessionName(cfg.sessionId)) : null;
   backend = tmuxBe ?? new PtyBackend();
 
@@ -247,7 +249,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         try {
           const msg = JSON.parse(String(raw));
           if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-            backend?.resize(msg.cols, msg.rows);
+            // In tmux mode, skip browser resize — tmux redraws on resize
+            // which can send alt-screen sequences that break xterm.js scrollback.
+            // Keep PTY at fixed 300×50 so scrollback stays intact.
+            if (!isTmuxMode) backend?.resize(msg.cols, msg.rows);
           } else if (msg.type === 'input' && typeof msg.data === 'string') {
             if (!authedClients.has(ws)) return; // read-only
             backend?.write(msg.data);
