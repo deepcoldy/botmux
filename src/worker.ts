@@ -57,7 +57,7 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
 // ─── Scrollback Buffer (replay to late-connecting WS clients) ───────────────
 
-const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
+const MAX_SCROLLBACK = 100_000; // chars
 let scrollback = '';
 
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
@@ -336,7 +336,7 @@ var term=new Terminal({
     green:'#9ece6a',yellow:'#e0af68',blue:'#7aa2f7',magenta:'#bb9af7',
     cyan:'#7dcfff',white:'#a9b1d6'},
   fontSize:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
-  cursorBlink:!isTouch,disableStdin:isTouch,scrollback:100000,allowProposedApi:true
+  cursorBlink:!isTouch,disableStdin:isTouch,scrollback:50000,allowProposedApi:true
 });
 var fit=new FitAddon.FitAddon();
 term.loadAddon(fit);
