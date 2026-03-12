@@ -4,8 +4,8 @@
  * Extracted from daemon.ts for modularity.
  */
 import { config } from '../../config.js';
-import { sendUserMessage } from './client.js';
-import { buildSessionCard, getCliDisplayName } from './card-builder.js';
+import { sendUserMessage, updateMessage } from './client.js';
+import { buildSessionCard, buildStreamingCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { forkWorker, killWorker } from '../../core/worker-pool.js';
@@ -93,6 +93,29 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
       } else {
         await sessionReply(rootId, '⚠️ 终端尚未就绪，请稍后再试。');
       }
+    }
+
+    if (actionType === 'toggle_stream' && ds) {
+      ds.streamExpanded = !ds.streamExpanded;
+      // Immediately rebuild and PATCH the current streaming card
+      if (ds.streamCardId && ds.workerPort) {
+        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const turnTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          ds.session.rootMessageId,
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          ds.lastScreenStatus || 'working',
+          config.daemon.cliId,
+          ds.streamExpanded,
+        );
+        updateMessage(ds.streamCardId, cardJson).catch(err =>
+          logger.warn(`[${tag(ds)}] Failed to update card on toggle: ${err}`),
+        );
+      }
+      logger.info(`[${tag(ds)}] Stream display toggled: ${ds.streamExpanded ? 'expanded' : 'collapsed'}`);
     }
 
     if (actionType === 'skip_repo' && ds && ds.pendingRepo) {

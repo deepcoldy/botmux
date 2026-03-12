@@ -180,6 +180,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             '',
             'starting',
             config.daemon.cliId,
+            ds.streamExpanded,
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive');
         } catch (err) {
@@ -206,6 +207,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       case 'screen_update': {
         if (!ds.workerPort) break;
         ds.lastScreenContent = msg.content;
+        ds.lastScreenStatus = msg.status;
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
         const cardJson = buildStreamingCard(
@@ -216,6 +218,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           msg.content,
           msg.status,
           config.daemon.cliId,
+          ds.streamExpanded,
         );
 
         if (ds.streamCardPending || !ds.streamCardId) {

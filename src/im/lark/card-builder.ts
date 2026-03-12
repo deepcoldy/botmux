@@ -93,12 +93,67 @@ export function buildStreamingCard(
   screenContent: string,
   status: 'starting' | 'working' | 'idle',
   cliId?: CliId,
+  expanded?: boolean,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const templateMap = { starting: 'yellow', working: 'blue', idle: 'green' } as const;
   const statusMap = { starting: '启动中…', working: '工作中', idle: '就绪' } as const;
 
-  const displayContent = screenContent || '(等待输出…)';
+  const elements: any[] = [];
+
+  if (expanded) {
+    const displayContent = screenContent || '(等待输出…)';
+    elements.push({ tag: 'markdown', content: displayContent });
+    elements.push({ tag: 'hr' });
+  }
+
+  elements.push({
+    tag: 'markdown',
+    content: `**终端：** [${terminalUrl}](${terminalUrl})`,
+  });
+
+  const toggleBtn = {
+    tag: 'button',
+    text: { tag: 'plain_text', content: expanded ? '📕 收起输出' : '📖 展开输出' },
+    type: 'default' as const,
+    value: { action: 'toggle_stream', root_id: rootId, session_id: sessionId },
+  };
+
+  elements.push({
+    tag: 'action',
+    actions: [
+      toggleBtn,
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '🖥️ 打开终端' },
+        type: 'primary',
+        multi_url: {
+          url: terminalUrl,
+          pc_url: terminalUrl,
+          android_url: terminalUrl,
+          ios_url: terminalUrl,
+        },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '🔑 获取操作链接' },
+        type: 'default',
+        value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
+        type: 'default',
+        value: { action: 'restart', root_id: rootId, session_id: sessionId },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '❌ 关闭会话' },
+        type: 'danger',
+        value: { action: 'close', root_id: rootId, session_id: sessionId },
+      },
+    ],
+  });
 
   const card = {
     config: { wide_screen_mode: true },
@@ -106,51 +161,7 @@ export function buildStreamingCard(
       title: { tag: 'plain_text', content: `🖥️ ${escapeMd(title)} — ${statusMap[status]}` },
       template: templateMap[status],
     },
-    elements: [
-      {
-        tag: 'markdown',
-        content: displayContent,
-      },
-      { tag: 'hr' },
-      {
-        tag: 'markdown',
-        content: `**终端：** [${terminalUrl}](${terminalUrl})`,
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '🖥️ 打开终端' },
-            type: 'primary',
-            multi_url: {
-              url: terminalUrl,
-              pc_url: terminalUrl,
-              android_url: terminalUrl,
-              ios_url: terminalUrl,
-            },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '🔑 获取操作链接' },
-            type: 'default',
-            value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
-            type: 'default',
-            value: { action: 'restart', root_id: rootId, session_id: sessionId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '❌ 关闭会话' },
-            type: 'danger',
-            value: { action: 'close', root_id: rootId, session_id: sessionId },
-          },
-        ],
-      },
-    ],
+    elements,
   };
   return JSON.stringify(card);
 }

@@ -24,6 +24,8 @@ export interface DaemonSession {
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  streamExpanded?: boolean;       // whether streaming output is visible in card (default: collapsed)
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
+  lastScreenStatus?: 'starting' | 'working' | 'idle';  // last screen_update status
   currentTurnTitle?: string;      // title for the current turn's streaming card
 }
