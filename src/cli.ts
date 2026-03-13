@@ -618,8 +618,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
   }
 
   const header = buildHeader();
-  const tableWidth = displayWidth(header) + PREFIX;
-  const separator = '─'.repeat(tableWidth);
+  const separator = '─'.repeat(displayWidth(header));
 
   let cursor = 0;
   let confirmDelete = false;  // true when waiting for y/n confirmation
@@ -631,13 +630,13 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${rows.length})\x1b[0m\n\n`);
 
     // Header + separator — use same 4-char prefix as rows
-    process.stdout.write(`  ${separator}\n`);
+    process.stdout.write(`    ${separator}\n`);
     process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
-    process.stdout.write(`  ${separator}\n`);
+    process.stdout.write(`    ${separator}\n`);
 
     if (rows.length === 0) {
       process.stdout.write(`\n    \x1b[2m没有活跃会话\x1b[0m\n`);
-      process.stdout.write(`  ${separator}\n`);
+      process.stdout.write(`    ${separator}\n`);
       process.stdout.write(`\n  \x1b[2mq 退出\x1b[0m\n`);
       return;
     }
@@ -652,7 +651,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       }
     }
 
-    process.stdout.write(`  ${separator}\n`);
+    process.stdout.write(`    ${separator}\n`);
 
     // Footer info
     const selected = rows[cursor];
