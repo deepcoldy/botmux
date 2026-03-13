@@ -135,9 +135,10 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
           botCfg.cliId,
           ds.streamExpanded,
         );
-        updateMessage(ds.larkAppId, ds.streamCardId, cardJson).catch(err =>
-          logger.warn(`[${tag(ds)}] Failed to update card on toggle: ${err}`),
-        );
+        ds.cardPatchInFlight = true;
+        updateMessage(ds.larkAppId, ds.streamCardId, cardJson)
+          .catch(err => logger.warn(`[${tag(ds)}] Failed to update card on toggle: ${err}`))
+          .finally(() => { ds.cardPatchInFlight = false; });
       }
       logger.info(`[${tag(ds)}] Stream display toggled: ${ds.streamExpanded ? 'expanded' : 'collapsed'}`);
     }

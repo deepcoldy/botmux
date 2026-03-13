@@ -232,6 +232,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         if (!ds.workerPort) break;
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = msg.status;
+
+        // Skip PATCH if another card update is in-flight (e.g. toggle_stream)
+        // to avoid concurrent PATCHes on the same message. Next tick will catch up.
+        if (ds.cardPatchInFlight && ds.streamCardId && !ds.streamCardPending) break;
+
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const cardJson = buildStreamingCard(
@@ -261,15 +266,18 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             });
         } else {
           // Same turn — PATCH existing card
-          updateMessage(ds.larkAppId, ds.streamCardId, cardJson).catch(err => {
-            if (err instanceof MessageWithdrawnError) {
-              logger.warn(`[${t}] Stream card message withdrawn, clearing card reference`);
+          ds.cardPatchInFlight = true;
+          updateMessage(ds.larkAppId, ds.streamCardId, cardJson)
+            .catch(err => {
+              if (err instanceof MessageWithdrawnError) {
+                logger.warn(`[${t}] Stream card message withdrawn, clearing card reference`);
+                ds.streamCardId = undefined;
+                return;
+              }
+              logger.debug(`[${t}] Failed to update streaming card: ${err}`);
               ds.streamCardId = undefined;
-              return;
-            }
-            logger.debug(`[${t}] Failed to update streaming card: ${err}`);
-            ds.streamCardId = undefined;
-          });
+            })
+            .finally(() => { ds.cardPatchInFlight = false; });
         }
         break;
       }

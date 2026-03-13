@@ -29,6 +29,7 @@ export interface DaemonSession {
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: 'starting' | 'working' | 'idle';  // last screen_update status
   currentTurnTitle?: string;      // title for the current turn's streaming card
+  cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight — screen_update skips to avoid concurrent PATCHes
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent sessions for the same thread. */

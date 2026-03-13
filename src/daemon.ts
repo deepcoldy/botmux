@@ -375,7 +375,10 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
         ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId, ds.streamExpanded,
       );
-      updateMessage(ds.larkAppId, ds.streamCardId, frozenCard).catch(() => {});
+      ds.cardPatchInFlight = true;
+      updateMessage(ds.larkAppId, ds.streamCardId, frozenCard)
+        .catch(() => {})
+        .finally(() => { ds.cardPatchInFlight = false; });
     }
     // Mark new turn — next screen_update will create a fresh streaming card
     ds.streamCardPending = true;
