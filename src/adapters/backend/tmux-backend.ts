@@ -111,11 +111,16 @@ export class TmuxBackend implements SessionBackend {
         env: opts.env,
       });
 
-      // Disable status bar to avoid cursor-positioning noise that can
-      // interfere with xterm.js rendering in the web terminal.
+      // Configure tmux session for web terminal use:
+      //  - status off: avoid cursor-positioning noise in xterm.js
+      //  - mouse on: let tmux handle scroll wheel → copy mode for scrollback
+      //  - history-limit: large scrollback buffer (tmux default is 2000)
       setTimeout(() => {
         try {
-          execSync(`tmux set-option -t ${shellescape(this.sessionName)} status off`, { stdio: 'ignore' });
+          const t = shellescape(this.sessionName);
+          execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore' });
+          execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore' });
+          execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore' });
         } catch { /* session may not be ready yet — benign */ }
       }, 500);
     }

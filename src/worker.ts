@@ -23,6 +23,7 @@ import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { IdleDetector } from './utils/idle-detector.js';
+import * as pty from 'node-pty';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,8 @@ let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
 const authedClients = new WeakSet<WebSocket>();
+/** Per-WS-client tmux attach PTYs (tmux mode only). */
+const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
@@ -77,20 +80,16 @@ let trustHandled = false;
 function onPtyData(data: string): void {
   renderer?.write(data);
 
-  // In tmux mode, strip alternate screen sequences so xterm.js stays in
-  // normal screen mode (where scrollback works).  The headless renderer
-  // above still gets raw data for accurate screen capture.
-  const relayData = isTmuxMode
-    ? data.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, '')
-    : data;
-
-  scrollback += relayData;
-  if (scrollback.length > MAX_SCROLLBACK) {
-    scrollback = scrollback.slice(-MAX_SCROLLBACK);
-  }
-
-  for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(relayData);
+  // In tmux mode, web clients have their own tmux attach — no relay needed.
+  // In non-tmux mode, broadcast to all WS clients via shared scrollback.
+  if (!isTmuxMode) {
+    scrollback += data;
+    if (scrollback.length > MAX_SCROLLBACK) {
+      scrollback = scrollback.slice(-MAX_SCROLLBACK);
+    }
+    for (const ws of wsClients) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    }
   }
 
   // Trust dialog auto-accept
@@ -249,26 +248,73 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
-      // Replay scrollback buffer so late-connecting clients see existing output
-      if (scrollback.length > 0) {
-        ws.send(scrollback);
-      }
+      if (isTmuxMode && sessionId) {
+        // ── Tmux mode: per-client attach ──
+        // Each WS client gets its own `tmux attach-session` PTY.
+        // Scrollback is handled natively by tmux (history-limit).
+        const tmuxName = TmuxBackend.sessionName(sessionId);
+        const cp = pty.spawn('tmux', ['attach-session', '-t', tmuxName], {
+          name: 'xterm-256color',
+          cols: 80,
+          rows: 24,
+        });
+        clientPtys.set(ws, cp);
 
-      ws.on('message', (raw) => {
-        try {
-          const msg = JSON.parse(String(raw));
-          if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-            backend?.resize(msg.cols, msg.rows);
-          } else if (msg.type === 'input' && typeof msg.data === 'string') {
-            if (!authedClients.has(ws)) return; // read-only
-            backend?.write(msg.data);
+        cp.onData((d: string) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(d);
+        });
+        cp.onExit(() => {
+          clientPtys.delete(ws);
+          if (ws.readyState === WebSocket.OPEN) ws.close();
+        });
+
+        ws.on('message', (raw) => {
+          try {
+            const msg = JSON.parse(String(raw));
+            if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
+              cp.resize(msg.cols, msg.rows);
+            } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!authedClients.has(ws)) {
+                // Read-only: allow mouse events through (scroll/click are
+                // non-destructive in tmux — just views history / selects text).
+                // SGR mouse: \x1b[<...  X10 mouse: \x1b[M...
+                if (!/^\x1b\[([<M])/.test(msg.data)) return;
+              }
+              cp.write(msg.data);
+            }
+          } catch { /* ignore non-JSON or bad messages */ }
+        });
+
+        ws.on('close', () => {
+          wsClients.delete(ws);
+          const existing = clientPtys.get(ws);
+          if (existing) {
+            try { existing.kill(); } catch { /* already dead */ }
+            clientPtys.delete(ws);
           }
-        } catch { /* ignore non-JSON or bad messages */ }
-      });
+        });
+      } else {
+        // ── Non-tmux mode: shared scrollback relay ──
+        if (scrollback.length > 0) {
+          ws.send(scrollback);
+        }
 
-      ws.on('close', () => {
-        wsClients.delete(ws);
-      });
+        ws.on('message', (raw) => {
+          try {
+            const msg = JSON.parse(String(raw));
+            if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
+              backend?.resize(msg.cols, msg.rows);
+            } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!authedClients.has(ws)) return; // read-only
+              backend?.write(msg.data);
+            }
+          } catch { /* ignore non-JSON or bad messages */ }
+        });
+
+        ws.on('close', () => {
+          wsClients.delete(ws);
+        });
+      }
     });
 
     const listenPort = preferredPort ?? 0;
@@ -372,6 +418,15 @@ window.addEventListener('resize',function(){fit.fit();sendResize()});
   ws.onerror=function(){ws.close()};
 })();
 
+// ── Read-only scroll handling ──
+var hasToken=!!new URLSearchParams(location.search).get('token');
+if(!hasToken&&!${isTmuxMode}){
+  // Non-tmux read-only: CLI mouse mode blocks local scroll, override with scrollLines
+  document.getElementById('terminal').addEventListener('wheel',function(e){
+    e.preventDefault();term.scrollLines(e.deltaY>0?3:-3);
+  },{passive:false});
+}
+
 // ── Mobile input bar (top) ──
 if(isTouch){
   var bar=document.getElementById('input-bar'),mi=document.getElementById('mi'),ms=document.getElementById('ms');
@@ -466,6 +521,10 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  for (const [, cp] of clientPtys) {
+    try { cp.kill(); } catch { /* already dead */ }
+  }
+  clientPtys.clear();
   for (const ws of wsClients) ws.close();
   wsClients.clear();
   if (wss) { wss.close(); wss = null; }
