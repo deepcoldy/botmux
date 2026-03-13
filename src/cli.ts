@@ -539,6 +539,12 @@ function tmuxSessionExists(name: string): boolean {
   }
 }
 
+/** Shorten path for display: replace $HOME with ~. */
+function shortenPath(p: string): string {
+  const home = homedir();
+  return p.startsWith(home) ? '~' + p.slice(home.length) : p;
+}
+
 /** Interactive TUI session picker — returns a promise that resolves when done. */
 function interactiveSessionPicker(active: SessionData[]): Promise<void> {
   const botConfigs = loadBotConfigsForDisplay();
@@ -549,50 +555,96 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     botLabels.set(b.larkAppId, `bot${i + 1} (${b.cliId ?? 'claude-code'})`);
   }
 
-  const cols = { id: 10, ...(multiBot ? { bot: 22 } : {}), title: 28, dir: 28, pid: 8, uptime: 8, status: 8 };
+  // Responsive column widths based on terminal width
+  const termWidth = process.stdout.columns || 100;
+  const PREFIX = 4;    // "  ❯ " or "    "
+  const SEP_W = 3;     // " │ "
+  const fixedCols = { id: 10, pid: 8, uptime: 7, status: 7 };
+  const botW = multiBot ? 18 : 0;
+  const numSeps = (multiBot ? 7 : 6) - 1;  // separators between columns
+  const fixedTotal = PREFIX + fixedCols.id + botW + fixedCols.pid + fixedCols.uptime + fixedCols.status + numSeps * SEP_W;
+  const flexTotal = Math.max(20, termWidth - fixedTotal);
+  const titleW = Math.floor(flexTotal * 0.4);
+  const dirW = flexTotal - titleW;
 
-  // Pre-render all rows
-  const rows = active.map(s => {
-    const { text, alive } = formatSessionRow(s, multiBot, botLabels, cols);
-    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    const hasTmux = tmuxSessionExists(tmuxName);
-    return { session: s, text, alive, tmuxName, hasTmux };
-  });
+  const cols = {
+    id: fixedCols.id,
+    ...(multiBot ? { bot: botW } : {}),
+    title: titleW,
+    dir: dirW,
+    pid: fixedCols.pid,
+    uptime: fixedCols.uptime,
+    status: fixedCols.status,
+  };
 
-  // Build header
-  const headerParts = ['   ', 'id'.padEnd(cols.id)];
-  if (multiBot) headerParts.push('bot'.padEnd(cols.bot!));
-  headerParts.push(
-    'title'.padEnd(cols.title),
-    'working dir'.padEnd(cols.dir),
-    'pid'.padEnd(cols.pid),
-    'uptime'.padEnd(cols.uptime),
-    'status'.padEnd(cols.status),
-  );
-  const header = headerParts.join(' │ ');
-  const totalWidth = displayWidth(header);
-  const separator = '─'.repeat(totalWidth);
+  // Build row data — use shortened paths for TUI
+  function buildRows(): Array<{ session: SessionData; text: string; alive: boolean; tmuxName: string; hasTmux: boolean }> {
+    return active.map(s => {
+      // Build row text with shortened dir
+      const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
+      const parts = [id];
+      if (multiBot) {
+        const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
+        parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
+      }
+      const title = padEndDisplay(truncate(s.title || '(untitled)', cols.title), cols.title);
+      const dir = padEndDisplay(truncate(shortenPath(s.workingDir || '-'), cols.dir), cols.dir);
+      const pid = s.pid ? String(s.pid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
+      const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
+      const alive = !!(s.pid && isProcessAlive(s.pid));
+      const status = (alive ? 'online' : s.pid ? 'stopped' : 'idle').padEnd(cols.status);
+      parts.push(title, dir, pid, uptime, status);
+
+      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+      const hasTmux = tmuxSessionExists(tmuxName);
+      return { session: s, text: parts.join(' │ '), alive, tmuxName, hasTmux };
+    });
+  }
+
+  let rows = buildRows();
+
+  // Build header (same column layout as rows, no extra prefix in join)
+  function buildHeader(): string {
+    const hParts = ['id'.padEnd(cols.id)];
+    if (multiBot) hParts.push('bot'.padEnd(cols.bot!));
+    hParts.push(
+      'title'.padEnd(cols.title),
+      'working dir'.padEnd(cols.dir),
+      'pid'.padEnd(cols.pid),
+      'uptime'.padEnd(cols.uptime),
+      'status'.padEnd(cols.status),
+    );
+    return hParts.join(' │ ');
+  }
+
+  const header = buildHeader();
+  const tableWidth = displayWidth(header) + PREFIX;
+  const separator = '─'.repeat(tableWidth);
 
   let cursor = 0;
+  let confirmDelete = false;  // true when waiting for y/n confirmation
+  let flashMsg = '';
 
   function render(): void {
-    // Move cursor to top and clear
     process.stdout.write('\x1b[H\x1b[J');
 
-    // Title
-    process.stdout.write('\x1b[1m botmux sessions\x1b[0m\n\n');
+    process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${rows.length})\x1b[0m\n\n`);
 
-    // Header
+    // Header + separator — use same 4-char prefix as rows
     process.stdout.write(`  ${separator}\n`);
-    process.stdout.write(`  \x1b[2m${header}\x1b[0m\n`);
+    process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
     process.stdout.write(`  ${separator}\n`);
 
-    // Rows
+    if (rows.length === 0) {
+      process.stdout.write(`\n    \x1b[2m没有活跃会话\x1b[0m\n`);
+      process.stdout.write(`  ${separator}\n`);
+      process.stdout.write(`\n  \x1b[2mq 退出\x1b[0m\n`);
+      return;
+    }
+
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const pointer = i === cursor ? '\x1b[36m❯\x1b[0m' : ' ';
-      const tmuxIcon = r.hasTmux ? '\x1b[32m⬤\x1b[0m' : '\x1b[2m○\x1b[0m';
-
       if (i === cursor) {
         process.stdout.write(`  ${pointer} \x1b[7m${r.text}\x1b[0m\n`);
       } else {
@@ -602,42 +654,99 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
 
     process.stdout.write(`  ${separator}\n`);
 
-    // Footer
+    // Footer info
     const selected = rows[cursor];
     const tmuxHint = selected.hasTmux
       ? `\x1b[32mtmux: ${selected.tmuxName}\x1b[0m`
       : `\x1b[2mtmux: 无会话\x1b[0m`;
     process.stdout.write(`\n  ${tmuxHint}\n`);
-    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ 连接tmux  q 退出\x1b[0m\n`);
+
+    // Flash message or confirmation prompt
+    if (confirmDelete) {
+      const s = selected.session;
+      process.stdout.write(`\n  \x1b[33m确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)\x1b[0m\n`);
+    } else if (flashMsg) {
+      process.stdout.write(`\n  ${flashMsg}\n`);
+    } else {
+      process.stdout.write('\n');
+    }
+
+    // Keybinding hints
+    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ 连接  d 删除  q 退出\x1b[0m\n`);
   }
 
   return new Promise<void>((resolve) => {
-    // Enter raw mode
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf-8');
 
-    // Hide cursor
-    process.stdout.write('\x1b[?25l');
-    // Switch to alt screen
-    process.stdout.write('\x1b[?1049h');
+    process.stdout.write('\x1b[?25l');   // hide cursor
+    process.stdout.write('\x1b[?1049h'); // alt screen
 
     render();
 
     function cleanup(): void {
       process.stdin.setRawMode(false);
       process.stdin.pause();
-      // Show cursor
-      process.stdout.write('\x1b[?25h');
-      // Leave alt screen
-      process.stdout.write('\x1b[?1049l');
+      process.stdout.write('\x1b[?25h');   // show cursor
+      process.stdout.write('\x1b[?1049l'); // leave alt screen
+    }
+
+    function deleteSession(idx: number): void {
+      const r = rows[idx];
+      const s = r.session;
+      const sessions = loadSessions();
+
+      // Kill CLI process
+      if (s.pid && isProcessAlive(s.pid)) {
+        killProcess(s.pid);
+      }
+
+      // Kill tmux session
+      if (r.hasTmux) {
+        try { execSync(`tmux kill-session -t '${r.tmuxName}' 2>/dev/null`, { stdio: 'ignore' }); } catch { /* */ }
+      }
+
+      // Mark closed & persist
+      s.status = 'closed';
+      s.closedAt = new Date().toISOString();
+      sessions.set(s.sessionId, s);
+      saveSessions(sessions);
+
+      // Remove from active list and TUI rows
+      const activeIdx = active.indexOf(s);
+      if (activeIdx >= 0) active.splice(activeIdx, 1);
+      rows.splice(idx, 1);
+
+      if (cursor >= rows.length) cursor = Math.max(0, rows.length - 1);
+      flashMsg = `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
     }
 
     process.stdin.on('data', (key: string) => {
+      // Delete confirmation mode
+      if (confirmDelete) {
+        confirmDelete = false;
+        if (key === 'y' || key === 'Y') {
+          deleteSession(cursor);
+        } else {
+          flashMsg = '\x1b[2m取消删除\x1b[0m';
+        }
+        render();
+        return;
+      }
+
+      flashMsg = '';
+
       // Ctrl-C or q or Esc
       if (key === '\x03' || key === 'q' || key === '\x1b') {
         cleanup();
         resolve();
+        return;
+      }
+
+      if (rows.length === 0) {
+        // No sessions left, only q works
+        render();
         return;
       }
 
@@ -655,17 +764,22 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
         return;
       }
 
+      // d or x — delete session
+      if (key === 'd' || key === 'x') {
+        confirmDelete = true;
+        render();
+        return;
+      }
+
       // Enter — attach to tmux
       if (key === '\r' || key === '\n') {
         const selected = rows[cursor];
         if (!selected.hasTmux) {
-          // Flash a message on the footer area
-          process.stdout.write(`\x1b[${rows.length + 8};1H`);
-          process.stdout.write(`  \x1b[33m该会话没有 tmux 进程，无法连接\x1b[0m   `);
+          flashMsg = '\x1b[33m该会话没有 tmux，无法连接\x1b[0m';
+          render();
           return;
         }
         cleanup();
-        // Attach to tmux — this replaces our terminal
         spawnSync('tmux', ['attach-session', '-t', selected.tmuxName], {
           stdio: 'inherit',
         });
