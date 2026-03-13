@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { config } from './config.js';
 import { replyMessage, updateMessage, resolveAllowedUsers } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
@@ -11,6 +12,7 @@ import { logger } from './utils/logger.js';
 import type { DaemonToWorker } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
+import { sessionKey } from './core/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
@@ -51,9 +53,16 @@ const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
  * Reply to a message, automatically using reply_in_thread for p2p sessions.
  * In p2p chats, Lark needs reply_in_thread=true to create/continue a thread.
  */
-async function sessionReply(rootId: string, content: string, msgType: string = 'text'): Promise<string> {
-  const ds = activeSessions.get(rootId);
-  const appId = ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
+async function sessionReply(rootId: string, content: string, msgType: string = 'text', larkAppId?: string): Promise<string> {
+  let ds: DaemonSession | undefined;
+  if (larkAppId) {
+    ds = activeSessions.get(sessionKey(rootId, larkAppId));
+  } else {
+    for (const s of activeSessions.values()) {
+      if (s.session.rootMessageId === rootId) { ds = s; break; }
+    }
+  }
+  const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
   const inThread = ds?.chatType === 'p2p';
   return replyMessage(appId, rootId, content, msgType, inThread);
@@ -71,6 +80,12 @@ function writePidFile(): void {
     mkdirSync(dir, { recursive: true });
   }
   writeFileSync(getPidFile(), String(process.pid), 'utf-8');
+  // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir
+  const breadcrumb = join(homedir(), '.botmux', '.data-dir');
+  try {
+    mkdirSync(join(homedir(), '.botmux'), { recursive: true });
+    writeFileSync(breadcrumb, config.session.dataDir, 'utf-8');
+  } catch { /* best effort */ }
   logger.info(`PID file written: ${getPidFile()} (pid: ${process.pid})`);
 }
 
@@ -162,7 +177,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
       const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
       session.larkAppId = larkAppId;
       sessionStore.updateSession(session);
-      activeSessions.set(messageId, {
+      activeSessions.set(sessionKey(messageId, larkAppId), {
         session,
         worker: null,
         workerPort: null,
@@ -176,7 +191,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         hasHistory: false,
         ownerOpenId: senderOpenId,
       });
-      await handleCommand(cmd, messageId, parsed, commandDeps);
+      await handleCommand(cmd, messageId, parsed, commandDeps, larkAppId);
       return;
     }
   }
@@ -214,7 +229,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
   };
-  activeSessions.set(messageId, ds);
+  activeSessions.set(sessionKey(messageId, larkAppId), ds);
 
   // Show repo selection card
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
@@ -226,7 +241,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     lastRepoScan.set(chatId, projects);
     const currentCwd = getSessionWorkingDir(ds);
     const cardJson = buildRepoSelectCard(projects, currentCwd, messageId);
-    await sessionReply(messageId, cardJson, 'interactive');
+    await sessionReply(messageId, cardJson, 'interactive', larkAppId);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
     // No projects found — skip repo selection, spawn directly
@@ -245,15 +260,31 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   if (content.startsWith('/')) {
     const cmd = content.split(/\s+/)[0].toLowerCase();
     if (DAEMON_COMMANDS.has(cmd)) {
-      handleCommand(cmd, rootId, parsed, commandDeps);
+      handleCommand(cmd, rootId, parsed, commandDeps, larkAppId);
       return;
     }
   }
 
   logger.info(`Thread reply in ${rootId}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
-  // Download attachments — use larkAppId from existing session if available, otherwise from event
-  const ds = activeSessions.get(rootId);
+  let ds = activeSessions.get(sessionKey(rootId, larkAppId));
+
+  // If a different bot is @mentioned in this thread, take over the session.
+  // The event dispatcher only routes here if the bot was @mentioned or owns the session,
+  // so reaching this point without an existing session means an explicit @mention takeover.
+  if (!ds) {
+    for (const [key, otherDs] of activeSessions) {
+      if (otherDs.session.rootMessageId === rootId && otherDs.larkAppId !== larkAppId) {
+        logger.info(`[${larkAppId}] Taking over thread ${rootId} from ${otherDs.larkAppId}`);
+        killWorker(otherDs);
+        sessionStore.closeSession(otherDs.session.sessionId);
+        activeSessions.delete(key);
+        break;
+      }
+    }
+  }
+
+  // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
   const attachments = await downloadResources(effectiveAppId, parsed.messageId, resources);
   if (attachments.length > 0) {
@@ -265,7 +296,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // If waiting for repo selection, remind user
   if (ds?.pendingRepo) {
-    await sessionReply(rootId, '请先在上方卡片中选择仓库，再发送消息。');
+    await sessionReply(rootId, '请先在上方卡片中选择仓库，再发送消息。', 'text', larkAppId);
     return;
   }
 
@@ -275,6 +306,11 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   if (!ds) {
     // No active session for this thread — auto-create with repo selection
+    if (activeSessions.has(sessionKey(rootId, larkAppId))) {
+      logger.info(`[${larkAppId}] Session already exists for thread ${rootId}, skipping auto-create`);
+      return;
+    }
+
     const chatId: string = data?.message?.chat_id ?? '';
     const chatType = (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     const botCfg = getBot(larkAppId).config;
@@ -301,7 +337,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       ownerOpenId: data.sender?.sender_id?.open_id,
       currentTurnTitle: parsed.content.substring(0, 50),
     };
-    activeSessions.set(rootId, newDs);
+    activeSessions.set(sessionKey(rootId, larkAppId), newDs);
 
     // Show repo selection card (same as handleNewTopic)
     const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
@@ -313,7 +349,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       lastRepoScan.set(chatId, projects);
       const currentCwd = getSessionWorkingDir(newDs);
       const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
-      await sessionReply(rootId, cardJson, 'interactive');
+      await sessionReply(rootId, cardJson, 'interactive', larkAppId);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {
       // No projects found — skip repo selection, spawn directly
@@ -398,11 +434,19 @@ export async function startDaemon(): Promise<void> {
 
     // Start event dispatcher for this bot
     startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
-      handleCardAction: (data, appId) => handleCardAction(data, cardDeps),
+      handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
       handleNewTopic: (data, chatId, messageId, chatType, appId) =>
         handleNewTopic(data, chatId, messageId, chatType, appId),
       handleThreadReply: (data, rootId, appId) =>
         handleThreadReply(data, rootId, appId),
+      isSessionOwner: (rootId, appId) => {
+        if (!activeSessions.has(sessionKey(rootId, appId))) return false;
+        // Only grant shortcut if no other bot also has a session for this rootId
+        for (const s of activeSessions.values()) {
+          if (s.session.rootMessageId === rootId && s.larkAppId !== appId) return false;
+        }
+        return true;
+      },
     });
   }
 

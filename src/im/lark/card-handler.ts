@@ -12,6 +12,7 @@ import * as sessionStore from '../../services/session-store.js';
 import { forkWorker, killWorker } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt } from '../../core/session-manager.js';
 import type { DaemonToWorker } from '../../types.js';
+import { sessionKey } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 
@@ -19,7 +20,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 
 export interface CardHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
   lastRepoScan: Map<string, ProjectInfo[]>;
 }
 
@@ -31,22 +32,30 @@ function tag(ds: DaemonSession): string {
 
 // ─── Main handler ─────────────────────────────────────────────────────────
 
-export async function handleCardAction(data: any, deps: CardHandlerDeps): Promise<void> {
-  const { activeSessions, sessionReply, lastRepoScan } = deps;
+export async function handleCardAction(data: any, deps: CardHandlerDeps, larkAppId?: string): Promise<void> {
+  const { activeSessions, lastRepoScan } = deps;
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
   const action = data?.action;
   const value = action?.value;
 
-  // Check ALLOWED_USERS for sensitive actions
+  // Check ALLOWED_USERS for sensitive actions.
+  // Use the receiving bot's allowedUsers — the operator open_id in card actions
+  // is scoped to the app that received the callback.
   const operatorOpenId: string | undefined = data?.operator?.open_id;
   const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     const ds = rootId ? activeSessions.get(rootId) : undefined;
+    // Determine which bot's allowedUsers to check:
+    // 1. Use the receiving bot (larkAppId from event dispatcher) — most accurate
+    // 2. Fall back to session's bot
+    // 3. Fall back to merging all bots
+    const effectiveAppId = larkAppId ?? ds?.larkAppId;
     let allowedUsers: string[];
-    if (ds) {
-      allowedUsers = getBot(ds.larkAppId).resolvedAllowedUsers;
+    if (effectiveAppId) {
+      allowedUsers = getBot(effectiveAppId).resolvedAllowedUsers;
     } else {
-      // No session yet — merge allowedUsers from all bots
       allowedUsers = getAllBots().flatMap(b => b.resolvedAllowedUsers);
     }
     if (allowedUsers.length > 0) {
@@ -60,7 +69,8 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
   // Handle session card button actions (restart/close)
   if (value?.action) {
     const { action: actionType, root_id: rootId } = value;
-    const ds = activeSessions.get(rootId);
+    const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
+    const ds = activeSessions.get(sKey);
 
     if (actionType === 'restart' && ds) {
       const botCfg = getBot(ds.larkAppId).config;
@@ -83,7 +93,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
     if (actionType === 'close' && ds) {
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
-      activeSessions.delete(rootId);
+      activeSessions.delete(sKey);
       await sessionReply(rootId, '✅ 会话已关闭');
       logger.info(`[${tag(ds)}] Closed via card button`);
     }
@@ -169,7 +179,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
     return;
   }
 
-  const targetDs = activeSessions.get(rootId);
+  const targetDs = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
   if (!targetDs) {
     logger.warn(`Card action: no active session found for root ${rootId}`);
     return;

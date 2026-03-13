@@ -18,6 +18,7 @@ import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { LarkAttachment, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
+import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -157,7 +158,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
     messageQueue.ensureQueue(session.rootMessageId);
 
     const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
-    activeSessions.set(session.rootMessageId, {
+    activeSessions.set(sessionKey(session.rootMessageId, larkAppId), {
       session,
       worker: null,
       workerPort: null,
@@ -232,7 +233,7 @@ export async function executeScheduledTask(
     hasHistory: false,
     workingDir: task.workingDir,
   };
-  activeSessions.set(rootMessageId, ds);
+  activeSessions.set(sessionKey(rootMessageId, larkAppId), ds);
   forkWorker(ds, prompt);
 
   logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId})`);

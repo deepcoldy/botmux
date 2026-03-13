@@ -20,7 +20,8 @@ export async function execute(args: z.infer<typeof schema>) {
 
   try {
     // List chat messages and filter by root_id to get thread messages
-    const rawMessages = await listThreadMessages(config.lark.appId, session.chatId, session.rootMessageId, args.limit);
+    const appId = session.larkAppId || config.lark.appId;
+    const rawMessages = await listThreadMessages(appId, session.chatId, session.rootMessageId, args.limit);
     const messages = rawMessages.map(parseApiMessage);
 
     logger.info(`Retrieved ${messages.length} messages for session ${args.session_id}`);

@@ -17,6 +17,7 @@ import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentClaudeVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
+import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
@@ -42,7 +43,7 @@ function formatUptime(ms: number): string {
 
 export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
 }
@@ -54,8 +55,11 @@ async function handleScheduleCommand(
   rootId: string,
   chatId: string,
   deps: CommandHandlerDeps,
+  larkAppId?: string,
 ): Promise<void> {
-  const { activeSessions, sessionReply } = deps;
+  const { activeSessions } = deps;
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
   const trimmed = args.trim();
 
   // /schedule list | /schedule 列表
@@ -127,7 +131,7 @@ async function handleScheduleCommand(
   // Natural language: /schedule 每日17:50给我"帮我看看AI新闻"
   const parsed = scheduler.parseNaturalSchedule(trimmed);
   if (parsed) {
-    const ds = activeSessions.get(rootId);
+    const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
     const task = scheduler.addTask({
       name: parsed.name,
@@ -154,9 +158,12 @@ export async function handleCommand(
   rootId: string,
   message: LarkMessage,
   deps: CommandHandlerDeps,
+  larkAppId?: string,
 ): Promise<void> {
-  const { activeSessions, sessionReply, getActiveCount, lastRepoScan } = deps;
-  const ds = activeSessions.get(rootId);
+  const { activeSessions, getActiveCount, lastRepoScan } = deps;
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+  const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
   const t = ds ? tag(ds) : rootId.substring(0, 12);
 
   logger.info(`[${t}] Command: ${cmd}`);
@@ -167,7 +174,7 @@ export async function handleCommand(
         if (ds) {
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
-          activeSessions.delete(rootId);
+          activeSessions.delete(sessionKey(rootId, larkAppId!));
           await sessionReply(rootId, '会话已关闭，Claude 进程已终止。');
           logger.info(`[${t}] Session closed by /close command`);
         } else {
@@ -315,8 +322,8 @@ export async function handleCommand(
 
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
-        const chatId = activeSessions.get(rootId)?.chatId!;
-        await handleScheduleCommand(scheduleArgs, rootId, chatId, deps);
+        const chatId = ds?.chatId!;
+        await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${t}] Schedule command handled`);
         break;
       }

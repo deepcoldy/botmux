@@ -75,13 +75,20 @@ let trustHandled = false;
 function onPtyData(data: string): void {
   renderer?.write(data);
 
-  scrollback += data;
+  // In tmux mode, strip alternate screen sequences so xterm.js stays in
+  // normal screen mode (where scrollback works).  The headless renderer
+  // above still gets raw data for accurate screen capture.
+  const relayData = isTmuxMode
+    ? data.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, '')
+    : data;
+
+  scrollback += relayData;
   if (scrollback.length > MAX_SCROLLBACK) {
     scrollback = scrollback.slice(-MAX_SCROLLBACK);
   }
 
   for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    if (ws.readyState === WebSocket.OPEN) ws.send(relayData);
   }
 
   // Trust dialog auto-accept
@@ -249,10 +256,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         try {
           const msg = JSON.parse(String(raw));
           if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-            // In tmux mode, skip browser resize — tmux redraws on resize
-            // which can send alt-screen sequences that break xterm.js scrollback.
-            // Keep PTY at fixed 300×50 so scrollback stays intact.
-            if (!isTmuxMode) backend?.resize(msg.cols, msg.rows);
+            backend?.resize(msg.cols, msg.rows);
           } else if (msg.type === 'input' && typeof msg.data === 'string') {
             if (!authedClients.has(ws)) return; // read-only
             backend?.write(msg.data);

@@ -75,7 +75,8 @@ export async function execute(args: z.infer<typeof schema>) {
     });
 
     const replyInThread = session.chatType === 'p2p';
-    const messageId = await replyMessage(config.lark.appId, session.rootMessageId, content, 'post', replyInThread);
+    const appId = session.larkAppId || config.lark.appId;
+    const messageId = await replyMessage(appId, session.rootMessageId, content, 'post', replyInThread);
 
     return {
       success: true,

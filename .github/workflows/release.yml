@@ -26,7 +26,6 @@ jobs:
 
       - name: Publish to npm
         run: npm publish
-        continue-on-error: true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
 

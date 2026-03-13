@@ -80,7 +80,7 @@ The `setup` command will guide you through:
 
 | Command | Description |
 |---------|-------------|
-| `botmux setup` | Interactive first-time configuration |
+| `botmux setup` | Interactive setup (first-time or add bots) |
 | `botmux start` | Start daemon (PM2 managed) |
 | `botmux stop` | Stop daemon |
 | `botmux restart` | Restart daemon (auto-restores active sessions) |
@@ -118,11 +118,64 @@ Configuration is stored at `~/.botmux/.env`. Run `botmux setup` to create it int
 | `SESSION_DATA_DIR` | `~/.botmux/data` | Where sessions and queues are stored |
 | `DEBUG` | _(unset)_ | Set to `1` for debug logging |
 
+### Multi-Bot Configuration
+
+Run multiple Lark bots on a single machine, each mapped to a different CLI.
+
+**Progressive setup:**
+
+```bash
+# 1. First-time setup — single bot, writes ~/.botmux/.env
+botmux setup
+
+# 2. Add a second bot — auto-migrates to ~/.botmux/bots.json
+botmux setup
+# Choose "Add new bot", .env is backed up to .env.bak
+
+# 3. Add more bots
+botmux setup
+# Appends to bots.json
+```
+
+**bots.json format:**
+
+```json
+[
+  {
+    "larkAppId": "cli_xxx_bot1",
+    "larkAppSecret": "secret_1",
+    "cliId": "claude-code",
+    "workingDir": "~/projects",
+    "allowedUsers": ["alice@company.com"]
+  },
+  {
+    "larkAppId": "cli_xxx_bot2",
+    "larkAppSecret": "secret_2",
+    "cliId": "aiden",
+    "workingDir": "~/work"
+  }
+]
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `larkAppId` | Yes | Lark app ID |
+| `larkAppSecret` | Yes | Lark app secret |
+| `cliId` | No | CLI adapter, defaults to `claude-code` |
+| `cliPathOverride` | No | CLI binary path override |
+| `backendType` | No | Session backend: `pty` or `tmux` |
+| `workingDir` | No | Default working directory, supports comma-separated |
+| `allowedUsers` | No | Allowed user list |
+| `projectScanDir` | No | Directory to scan for git repos |
+
+**Config priority:** `BOTS_CONFIG` env var → `~/.botmux/bots.json` → `.env` single-bot mode
+
 ## File Locations
 
 | Path | Description |
 |------|-------------|
-| `~/.botmux/.env` | Configuration |
+| `~/.botmux/.env` | Single-bot configuration |
+| `~/.botmux/bots.json` | Multi-bot configuration |
 | `~/.botmux/data/` | Session data, message queues |
 | `~/.botmux/logs/` | Daemon logs |
 
@@ -259,6 +312,7 @@ src/
   cli.ts                    # CLI entry point (setup/start/stop/restart/logs/list/delete)
   daemon.ts                 # Daemon orchestrator (~400 lines, wires modules together)
   worker.ts                 # Worker process: uses adapters to manage CLI + PTY
+  bot-registry.ts           # Multi-bot registry (config loading, per-bot state)
   config.ts                 # Configuration from environment variables
   server.ts                 # MCP server setup
   types.ts                  # IPC message types
