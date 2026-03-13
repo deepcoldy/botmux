@@ -25,9 +25,10 @@ const adapterCache = new Map<string, CliAdapter>();
 
 /** Async adapter factory (uses dynamic import for lazy loading in daemon process). */
 export async function createCliAdapter(id: CliId, pathOverride?: string): Promise<CliAdapter> {
-  const key = `${id}:${pathOverride ?? ''}`;
+  const normalized = id.toLowerCase() as CliId;
+  const key = `${normalized}:${pathOverride ?? ''}`;
   if (adapterCache.has(key)) return adapterCache.get(key)!;
-  const adapter = createCliAdapterSync(id, pathOverride);
+  const adapter = createCliAdapterSync(normalized, pathOverride);
   adapterCache.set(key, adapter);
   return adapter;
 }
@@ -36,7 +37,7 @@ export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createC
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
-  switch (id) {
+  switch (id.toLowerCase() as CliId) {
     case 'claude-code': return createClaudeCodeAdapter(pathOverride);
     case 'aiden': return createAidenAdapter(pathOverride);
     case 'coco': return createCocoAdapter(pathOverride);
