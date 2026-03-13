@@ -41,8 +41,20 @@ export function createAidenAdapter(pathOverride?: string): CliAdapter {
         try { data = JSON.parse(readFileSync(configPath, 'utf-8')); } catch { /* fresh */ }
       }
       if (!data.mcpServers) data.mcpServers = {};
+
+      // Clean up stale entries pointing to the same server script under a different name
+      const serverScript = entry.args[0];
+      let dirty = false;
+      for (const [name, cfg] of Object.entries(data.mcpServers) as [string, any][]) {
+        if (name !== entry.name && cfg?.args?.[0] === serverScript) {
+          delete data.mcpServers[name];
+          dirty = true;
+        }
+      }
+
       const existing = data.mcpServers[entry.name];
-      if (existing && existing.args?.[0] === entry.args[0]) return;
+      const envMatch = existing && JSON.stringify(existing.env) === JSON.stringify(entry.env);
+      if (!dirty && existing && existing.args?.[0] === serverScript && envMatch) return;
       data.mcpServers[entry.name] = {
         command: entry.command,
         args: entry.args,

@@ -83,10 +83,22 @@ export class TmuxBackend implements SessionBackend {
         env: opts.env,
       });
     } else {
+      // Build -e flags for env vars that the tmux session command needs.
+      // tmux new-session runs the command in the tmux server's environment,
+      // which may differ from the spawning process (e.g. per-bot credentials).
+      const envFlags: string[] = [];
+      for (const key of TMUX_PASSTHROUGH_VARS) {
+        const val = opts.env?.[key];
+        if (val !== undefined) {
+          envFlags.push('-e', `${key}=${val}`);
+        }
+      }
+
       // Create new tmux session running the CLI command
       const tmuxArgs = [
         'new-session',
         '-s', this.sessionName,
+        ...envFlags,
         '-x', String(opts.cols),
         '-y', String(opts.rows),
         '--', bin, ...args,
@@ -98,6 +110,14 @@ export class TmuxBackend implements SessionBackend {
         cwd: opts.cwd,
         env: opts.env,
       });
+
+      // Disable status bar to avoid cursor-positioning noise that can
+      // interfere with xterm.js rendering in the web terminal.
+      setTimeout(() => {
+        try {
+          execSync(`tmux set-option -t ${shellescape(this.sessionName)} status off`, { stdio: 'ignore' });
+        } catch { /* session may not be ready yet — benign */ }
+      }, 500);
     }
   }
 
@@ -146,6 +166,19 @@ export class TmuxBackend implements SessionBackend {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Env vars that must be explicitly passed to the tmux session command via -e.
+ * The tmux server inherits env from the first session's creator; subsequent
+ * sessions share that env. Per-bot vars (LARK credentials) would be wrong
+ * for non-first bots without explicit passthrough.
+ */
+const TMUX_PASSTHROUGH_VARS = [
+  'LARK_APP_ID',
+  'LARK_APP_SECRET',
+  '__OWNER_OPEN_ID',
+  'SESSION_DATA_DIR',
+];
 
 /** Minimal shell-escape for tmux session names (alphanumeric + dash). */
 function shellescape(s: string): string {

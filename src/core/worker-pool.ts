@@ -24,7 +24,7 @@ const __dirname = dirname(__filename);
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerPoolCallbacks {
-  sessionReply: (rootId: string, content: string, msgType?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
 }
@@ -188,7 +188,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             botCfg.cliId,
             ds.streamExpanded,
           );
-          ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive');
+          ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
         } catch (err) {
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
           // Fallback: send static session card
@@ -199,7 +199,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.session.title || 'Claude Code',
             botCfg.cliId,
           );
-          await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive');
+          await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
         }
 
         break;
@@ -230,7 +230,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         if (ds.streamCardPending || !ds.streamCardId) {
           // New turn — create a fresh card, old card freezes at its last state
           ds.streamCardPending = false;
-          cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive')
+          cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
             .then(msgId => { ds.streamCardId = msgId; })
             .catch(err => logger.debug(`[${t}] Failed to create streaming card: ${err}`));
         } else {
@@ -260,7 +260,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           logger.warn(`[${t}] Claude crashed ${rc.count} times in 1 min, not auto-restarting`);
           // Kill the worker process to free resources
           killWorker(ds);
-          await cb.sessionReply(ds.session.rootMessageId, `⚠️ Claude 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`);
+          await cb.sessionReply(ds.session.rootMessageId, `⚠️ Claude 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
           break;
         }
 

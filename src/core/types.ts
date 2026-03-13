@@ -30,3 +30,8 @@ export interface DaemonSession {
   lastScreenStatus?: 'starting' | 'working' | 'idle';  // last screen_update status
   currentTurnTitle?: string;      // title for the current turn's streaming card
 }
+
+/** Composite key for activeSessions — allows multiple bots to have independent sessions for the same thread. */
+export function sessionKey(rootId: string, larkAppId: string): string {
+  return `${rootId}::${larkAppId}`;
+}

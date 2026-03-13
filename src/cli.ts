@@ -30,6 +30,7 @@ const CONFIG_DIR = join(homedir(), '.botmux');
 const ENV_FILE = join(CONFIG_DIR, '.env');
 const DATA_DIR = join(CONFIG_DIR, 'data');
 const LOG_DIR = join(CONFIG_DIR, 'logs');
+const BOTS_JSON_FILE = join(CONFIG_DIR, 'bots.json');
 const PM2_NAME = 'botmux';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -79,37 +80,17 @@ function ecosystemConfig(): string {
   return tmpFile;
 }
 
-function hasEnvFile(): boolean {
-  return existsSync(ENV_FILE);
+function hasConfig(): boolean {
+  return existsSync(BOTS_JSON_FILE) || existsSync(ENV_FILE);
 }
 
 function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise(resolve => rl.question(question, resolve));
 }
 
-// ─── Commands ────────────────────────────────────────────────────────────────
+// ─── Setup helpers ──────────────────────────────────────────────────────────
 
-async function cmdSetup(): Promise<void> {
-  ensureConfigDir();
-
-  console.log('\n🤖 botmux 配置向导\n');
-  console.log(`配置目录: ${CONFIG_DIR}`);
-  console.log(`数据目录: ${DATA_DIR}\n`);
-
-  if (hasEnvFile()) {
-    console.log(`⚠️  配置文件已存在: ${ENV_FILE}`);
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const answer = await ask(rl, '是否覆盖？(y/N) ');
-    rl.close();
-    if (answer.toLowerCase() !== 'y') {
-      console.log('已取消。');
-      return;
-    }
-  }
-
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-
-  console.log('── 飞书应用配置 ──');
+function printLarkPermissions(): void {
   console.log('请先在飞书开放平台创建应用: https://open.feishu.cn/app\n');
   console.log('需要的权限:');
   console.log('  - im:message (发送/接收消息)');
@@ -120,42 +101,166 @@ async function cmdSetup(): Promise<void> {
   console.log('启用事件订阅 (WebSocket 模式):');
   console.log('  - im.message.receive_v1');
   console.log('  - card.action.trigger\n');
+}
 
+async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any>> {
   const appId = await ask(rl, 'LARK_APP_ID: ');
   const appSecret = await ask(rl, 'LARK_APP_SECRET: ');
 
-  console.log('\n── 可选配置 ──');
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex' };
   const cliId = cliIdMap[cliChoice] ?? (cliChoice || 'claude-code');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
   const allowedUsers = await ask(rl, '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ');
+
+  const bot: Record<string, any> = { larkAppId: appId, larkAppSecret: appSecret, cliId };
+  if (workingDir) bot.workingDir = workingDir;
+  if (allowedUsers) bot.allowedUsers = allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
+
+  return bot;
+}
+
+/** Parse .env file to extract bot config for migration to bots.json */
+function parseDotEnvToBotConfig(): Record<string, any> {
+  const content = readFileSync(ENV_FILE, 'utf-8');
+  const vars: Record<string, string> = {};
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    vars[trimmed.substring(0, eqIdx)] = trimmed.substring(eqIdx + 1);
+  }
+
+  const bot: Record<string, any> = {
+    larkAppId: vars.LARK_APP_ID || '',
+    larkAppSecret: vars.LARK_APP_SECRET || '',
+  };
+  if (vars.CLI_ID) bot.cliId = vars.CLI_ID;
+  if (vars.CLI_PATH) bot.cliPathOverride = vars.CLI_PATH;
+  if (vars.BACKEND_TYPE) bot.backendType = vars.BACKEND_TYPE;
+  if (vars.WORKING_DIR) bot.workingDir = vars.WORKING_DIR;
+  if (vars.ALLOWED_USERS) bot.allowedUsers = vars.ALLOWED_USERS.split(',').map((s: string) => s.trim()).filter(Boolean);
+  if (vars.PROJECT_SCAN_DIR) bot.projectScanDir = vars.PROJECT_SCAN_DIR;
+
+  return bot;
+}
+
+/** Write single-bot .env config (fresh install or reconfigure) */
+async function writeSingleBotEnv(): Promise<void> {
+  console.log('── 飞书应用配置 ──\n');
+  printLarkPermissions();
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const bot = await promptBotConfig(rl);
   rl.close();
 
   const lines: string[] = [
     '# Lark (Feishu) App Credentials',
-    `LARK_APP_ID=${appId}`,
-    `LARK_APP_SECRET=${appSecret}`,
+    `LARK_APP_ID=${bot.larkAppId}`,
+    `LARK_APP_SECRET=${bot.larkAppSecret}`,
     '',
     '# Session data directory',
     `SESSION_DATA_DIR=${DATA_DIR}`,
     '',
     '# Daemon settings',
-    `CLI_ID=${cliId}`,
-    `WORKING_DIR=${workingDir || '~'}`,
+    `CLI_ID=${bot.cliId}`,
+    `WORKING_DIR=${bot.workingDir || '~'}`,
   ];
 
-  if (allowedUsers) lines.push(`ALLOWED_USERS=${allowedUsers}`);
+  if (bot.allowedUsers?.length) lines.push(`ALLOWED_USERS=${bot.allowedUsers.join(',')}`);
 
   writeFileSync(ENV_FILE, lines.join('\n') + '\n');
   console.log(`\n✅ 配置已写入: ${ENV_FILE}`);
   console.log(`\n下一步: botmux start`);
 }
 
+// ─── Commands ────────────────────────────────────────────────────────────────
+
+async function cmdSetup(): Promise<void> {
+  ensureConfigDir();
+
+  const hasBots = existsSync(BOTS_JSON_FILE);
+  const hasEnv = existsSync(ENV_FILE);
+
+  console.log('\n🤖 botmux 配置向导\n');
+  console.log(`配置目录: ${CONFIG_DIR}`);
+  console.log(`数据目录: ${DATA_DIR}\n`);
+
+  if (hasBots) {
+    // --- Multi-bot mode (bots.json exists) ---
+    const bots = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')) as any[];
+    console.log(`已配置 ${bots.length} 个机器人：`);
+    for (let i = 0; i < bots.length; i++) {
+      console.log(`  ${i + 1}. ${bots[i].larkAppId} (${bots[i].cliId ?? 'claude-code'})`);
+    }
+    console.log('');
+
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  (1/2) [1]: ');
+
+    if (action === '2') {
+      rl.close();
+      renameSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak\n`);
+      await writeSingleBotEnv();
+      return;
+    }
+
+    console.log('\n── 添加新机器人 ──\n');
+    printLarkPermissions();
+    const newBot = await promptBotConfig(rl);
+    rl.close();
+    bots.push(newBot);
+    writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
+    console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length} 个`);
+    console.log(`   配置文件: ${BOTS_JSON_FILE}`);
+    console.log(`\n下一步: botmux restart`);
+
+  } else if (hasEnv) {
+    // --- Single-bot mode (.env exists) ---
+    console.log(`当前使用单机器人配置: ${ENV_FILE}`);
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const action = await ask(rl, '操作: 1) 添加新机器人  2) 覆盖当前配置  (1/2): ');
+
+    if (action === '2') {
+      rl.close();
+      await writeSingleBotEnv();
+      return;
+    }
+
+    // Migrate .env → bots.json
+    const existingBot = parseDotEnvToBotConfig();
+    if (!existingBot.larkAppId || !existingBot.larkAppSecret) {
+      console.log('\n⚠️  当前 .env 缺少 LARK_APP_ID 或 LARK_APP_SECRET，请先完成基础配置');
+      rl.close();
+      await writeSingleBotEnv();
+      return;
+    }
+    console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
+    console.log('\n── 添加新机器人 ──\n');
+    printLarkPermissions();
+    const newBot = await promptBotConfig(rl);
+    rl.close();
+
+    const bots = [existingBot, newBot];
+    writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
+    renameSync(ENV_FILE, ENV_FILE + '.bak');
+    console.log(`\n✅ 已迁移到多机器人配置`);
+    console.log(`   配置文件: ${BOTS_JSON_FILE}`);
+    console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
+    console.log(`\n下一步: botmux restart`);
+
+  } else {
+    // --- Fresh install ---
+    await writeSingleBotEnv();
+  }
+}
+
 function cmdStart(): void {
-  if (!hasEnvFile()) {
-    console.error(`❌ 未找到配置文件: ${ENV_FILE}`);
+  if (!hasConfig()) {
+    console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
     process.exit(1);
   }
@@ -176,19 +281,16 @@ function cmdStop(): void {
 }
 
 function cmdRestart(): void {
-  if (!hasEnvFile()) {
-    console.error(`❌ 未找到配置文件: ${ENV_FILE}`);
+  if (!hasConfig()) {
+    console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
     process.exit(1);
   }
   ensureConfigDir();
-  // Try restart first; if not running, start fresh
-  try {
-    runPm2(['restart', PM2_NAME]);
-  } catch {
-    const cfg = ecosystemConfig();
-    runPm2(['start', cfg]);
-  }
+  // Delete and re-start to ensure ecosystem config (log paths, env) is up to date
+  try { runPm2(['delete', PM2_NAME], false); } catch { /* not running */ }
+  const cfg = ecosystemConfig();
+  runPm2(['start', cfg]);
 }
 
 function cmdLogs(): void {
@@ -232,12 +334,30 @@ interface SessionData {
   pid?: number;
   workingDir?: string;
   webPort?: number;
+  larkAppId?: string;
+}
+
+/**
+ * Resolve the session data directory.
+ * Priority: SESSION_DATA_DIR env > daemon breadcrumb (~/.botmux/.data-dir) > default (~/.botmux/data)
+ */
+function resolveDataDir(): string {
+  if (process.env.SESSION_DATA_DIR) return process.env.SESSION_DATA_DIR;
+
+  // Read breadcrumb written by the daemon at startup
+  const breadcrumb = join(CONFIG_DIR, '.data-dir');
+  if (existsSync(breadcrumb)) {
+    try {
+      const dir = readFileSync(breadcrumb, 'utf-8').trim();
+      if (dir && existsSync(join(dir, 'sessions.json'))) return dir;
+    } catch { /* ignore */ }
+  }
+
+  return DATA_DIR;
 }
 
 function getSessionsFilePath(): string {
-  // Check env first, then fallback to default
-  const dataDir = process.env.SESSION_DATA_DIR ?? DATA_DIR;
-  return join(dataDir, 'sessions.json');
+  return join(resolveDataDir(), 'sessions.json');
 }
 
 function loadSessions(): Map<string, SessionData> {
@@ -340,6 +460,14 @@ function padEndDisplay(str: string, targetWidth: number): string {
   return w >= targetWidth ? str : str + ' '.repeat(targetWidth - w);
 }
 
+/** Load bot configs for display (best effort — returns empty array on failure) */
+function loadBotConfigsForDisplay(): Array<{ larkAppId: string; cliId?: string }> {
+  if (existsSync(BOTS_JSON_FILE)) {
+    try { return JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')); } catch { /* ignore */ }
+  }
+  return [];
+}
+
 function cmdList(): void {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
@@ -349,17 +477,29 @@ function cmdList(): void {
     return;
   }
 
-  const cols = { id: 10, title: 30, dir: 30, pid: 8, uptime: 8, status: 8 };
+  // Detect multi-bot mode: show bot column if bots.json exists or sessions have different larkAppIds
+  const botConfigs = loadBotConfigsForDisplay();
+  const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
 
-  const header = [
-    'id'.padEnd(cols.id),
+  // Build a larkAppId → short label map (e.g. "bot1 (claude-code)")
+  const botLabels = new Map<string, string>();
+  for (let i = 0; i < botConfigs.length; i++) {
+    const b = botConfigs[i];
+    botLabels.set(b.larkAppId, `bot${i + 1} (${b.cliId ?? 'claude-code'})`);
+  }
+
+  const cols = { id: 10, ...(multiBot ? { bot: 22 } : {}), title: 28, dir: 28, pid: 8, uptime: 8, status: 8 };
+
+  const headerParts = ['id'.padEnd(cols.id)];
+  if (multiBot) headerParts.push('bot'.padEnd(cols.bot!));
+  headerParts.push(
     'title'.padEnd(cols.title),
     'working dir'.padEnd(cols.dir),
     'pid'.padEnd(cols.pid),
     'uptime'.padEnd(cols.uptime),
     'status'.padEnd(cols.status),
-  ].join(' │ ');
-
+  );
+  const header = headerParts.join(' │ ');
   const separator = '─'.repeat(displayWidth(header));
 
   console.log(separator);
@@ -368,6 +508,11 @@ function cmdList(): void {
 
   for (const s of active) {
     const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
+    const parts = [id];
+    if (multiBot) {
+      const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 18)) : '-';
+      parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
+    }
     const title = padEndDisplay(truncate(s.title || '(untitled)', cols.title), cols.title);
     const dir = padEndDisplay(truncate(s.workingDir || '-', cols.dir), cols.dir);
     const pid = s.pid ? String(s.pid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
@@ -375,7 +520,8 @@ function cmdList(): void {
     const alive = s.pid && isProcessAlive(s.pid);
     const status = (alive ? 'online' : s.pid ? 'stopped' : 'idle').padEnd(cols.status);
 
-    console.log([id, title, dir, pid, uptime, status].join(' │ '));
+    parts.push(title, dir, pid, uptime, status);
+    console.log(parts.join(' │ '));
   }
 
   console.log(separator);
@@ -431,6 +577,13 @@ function cmdDelete(): void {
       console.log(`  killed pid ${s.pid}`);
     }
 
+    // Kill associated tmux session if it exists
+    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+    try {
+      execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, { stdio: 'ignore' });
+      console.log(`  killed tmux ${tmuxName}`);
+    } catch { /* no tmux session */ }
+
     // Mark session as closed
     s.status = 'closed';
     s.closedAt = new Date().toISOString();
@@ -447,7 +600,7 @@ function showHelp(): void {
 botmux — IM ↔ AI 编程 CLI 桥接
 
 命令:
-  setup       交互式配置（首次使用）
+  setup       交互式配置（首次使用 / 添加机器人）
   start       启动 daemon
   stop        停止 daemon
   restart     重启 daemon（自动恢复活跃会话）

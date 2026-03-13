@@ -80,7 +80,7 @@ botmux start
 
 | 命令 | 说明 |
 |------|------|
-| `botmux setup` | 交互式首次配置 |
+| `botmux setup` | 交互式配置（首次使用 / 添加机器人） |
 | `botmux start` | 启动 daemon（PM2 管理） |
 | `botmux stop` | 停止 daemon |
 | `botmux restart` | 重启 daemon（自动恢复活跃会话） |
@@ -118,11 +118,64 @@ botmux start
 | `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列的存储目录 |
 | `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
 
+### 多机器人配置
+
+支持在同一台机器上运行多个飞书机器人，每个机器人可对应不同的 CLI。
+
+**渐进式配置：**
+
+```bash
+# 1. 首次配置 — 单机器人，写入 ~/.botmux/.env
+botmux setup
+
+# 2. 添加第二个机器人 — 自动迁移到 ~/.botmux/bots.json
+botmux setup
+# 选择「添加新机器人」，.env 自动备份为 .env.bak
+
+# 3. 继续添加更多机器人
+botmux setup
+# 直接追加到 bots.json
+```
+
+**bots.json 格式：**
+
+```json
+[
+  {
+    "larkAppId": "cli_xxx_bot1",
+    "larkAppSecret": "secret_1",
+    "cliId": "claude-code",
+    "workingDir": "~/projects",
+    "allowedUsers": ["alice@company.com"]
+  },
+  {
+    "larkAppId": "cli_xxx_bot2",
+    "larkAppSecret": "secret_2",
+    "cliId": "aiden",
+    "workingDir": "~/work"
+  }
+]
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `larkAppId` | 是 | 飞书应用 App ID |
+| `larkAppSecret` | 是 | 飞书应用 App Secret |
+| `cliId` | 否 | CLI 适配器，默认 `claude-code` |
+| `cliPathOverride` | 否 | CLI 可执行文件路径覆盖 |
+| `backendType` | 否 | 会话后端：`pty` 或 `tmux` |
+| `workingDir` | 否 | 默认工作目录，支持逗号分隔 |
+| `allowedUsers` | 否 | 允许的用户列表 |
+| `projectScanDir` | 否 | 扫描 Git 仓库的目录 |
+
+**配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json` → `.env` 单机器人模式
+
 ## 文件位置
 
 | 路径 | 说明 |
 |------|------|
-| `~/.botmux/.env` | 配置文件 |
+| `~/.botmux/.env` | 单机器人配置文件 |
+| `~/.botmux/bots.json` | 多机器人配置文件 |
 | `~/.botmux/data/` | 会话数据、消息队列 |
 | `~/.botmux/logs/` | Daemon 日志 |
 
@@ -259,6 +312,7 @@ src/
   cli.ts                    # CLI 入口（setup/start/stop/restart/logs/list/delete）
   daemon.ts                 # Daemon 编排入口（~400 行，调用各模块）
   worker.ts                 # Worker 进程：使用适配器管理 CLI + PTY
+  bot-registry.ts           # 多机器人注册表（配置加载、per-bot 状态管理）
   config.ts                 # 环境变量配置
   server.ts                 # MCP Server
   types.ts                  # IPC 消息类型

@@ -4,7 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { getBot } from '../../bot-registry.js';
+import { getBot, getAllBots } from '../../bot-registry.js';
 import { getChatInfo, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 
@@ -112,7 +112,10 @@ export async function checkGroupMessageAccess(
   }
 
   // No @mention — only allow if sender is the sole human in the group
-  if (isAllowed) {
+  // AND there's only 1 bot registered. With multiple bots, require @mention
+  // to disambiguate (Lark user_count excludes bots, so userCount=1 even in
+  // a group with 1 user + N bots).
+  if (isAllowed && getAllBots().length <= 1) {
     const userCount = await getGroupUserCount(larkAppId, chatId);
     if (userCount <= 1) {
       return 'allowed';
@@ -128,6 +131,8 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<void>;
   handleNewTopic: (data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p', larkAppId: string) => Promise<void>;
   handleThreadReply: (data: any, rootId: string, larkAppId: string) => Promise<void>;
+  /** Check if this bot owns an active session for the given rootId. */
+  isSessionOwner?: (rootId: string, larkAppId: string) => boolean;
 }
 
 /**
@@ -192,16 +197,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             return;
           }
         } else if (chatType === 'group' && rootId) {
-          // Group thread replies: require @mention or solo group (same as new topics)
-          const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
-          if (access === 'not_allowed') {
-            // @mentioned but not in allowlist — silently ignore in threads
-            logger.debug(`Ignoring thread reply from non-allowed user: ${senderOpenId}`);
-            return;
-          }
-          if (access === 'ignore') {
-            logger.debug(`Ignoring group thread reply not addressed to bot: ${messageId}`);
-            return;
+          // Group thread replies: allow if bot owns the session (no @mention needed),
+          // otherwise require @mention to address a specific bot.
+          const ownsSession = handlers.isSessionOwner?.(rootId, larkAppId) ?? false;
+          if (ownsSession && isAllowed) {
+            // Bot owns this thread + sender is in allowlist → process without @mention
+          } else {
+            const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
+            if (access === 'not_allowed') {
+              logger.debug(`Ignoring thread reply from non-allowed user: ${senderOpenId}`);
+              return;
+            }
+            if (access === 'ignore') {
+              logger.debug(`Ignoring group thread reply not addressed to bot: ${messageId}`);
+              return;
+            }
           }
         } else if (!isAllowed) {
           // P2P thread replies and DMs: still check allowlist
