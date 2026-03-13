@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import * as pty from 'node-pty';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { resolveCommand } from '../src/adapters/cli/registry.js';
 
 // ─── Constants (match production worker.ts) ─────────────────────────────────
 
@@ -279,6 +280,29 @@ describe('OpenCode first input submission', () => {
   it('adapter: altScreen is true (Bubble Tea)', () => {
     const adapter = createOpenCodeAdapter();
     expect(adapter.altScreen).toBe(true);
+  });
+
+  it('fix: resolveCommand finds opencode via interactive shell fallback', () => {
+    /**
+     * Reproduces the root cause of the first-session crash:
+     * opencode's installer adds PATH to .zshrc (interactive-only).
+     * resolveCommand with -lc (login non-interactive) can't find it.
+     * The -ic fallback (interactive shell) is needed.
+     *
+     * If opencode is installed, resolvedBin should be an absolute path.
+     */
+    const resolved = resolveCommand('opencode');
+    console.log(`>>> resolveCommand('opencode') = ${resolved}`);
+
+    const adapter = createOpenCodeAdapter();
+    console.log(`>>> adapter.resolvedBin = ${adapter.resolvedBin}`);
+
+    // If opencode is installed, it must resolve to an absolute path
+    // (not bare 'opencode' which would cause execvp ENOENT)
+    if (resolved !== 'opencode') {
+      expect(resolved.startsWith('/'), 'resolved path should be absolute').toBe(true);
+      expect(resolved).toContain('opencode');
+    }
   });
 
   it('adapter: MCP config written to ~/.config/opencode/opencode.json', () => {

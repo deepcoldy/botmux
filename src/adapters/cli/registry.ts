@@ -8,15 +8,25 @@ import { createCodexAdapter } from './codex.js';
 import { createGeminiAdapter } from './gemini.js';
 import { createOpenCodeAdapter } from './opencode.js';
 
-/** Resolve a command name to its absolute path via login-shell `which`. */
+/** Resolve a command name to its absolute path via shell `which`.
+ *  Tries login shell first (-lc), then interactive shell (-ic) for tools
+ *  whose installers add PATH entries to .bashrc/.zshrc only. */
 export function resolveCommand(cmd: string): string {
   if (isAbsolute(cmd)) return cmd;
   const shell = process.env.SHELL || '/bin/zsh';
   const shells = [shell, '/bin/zsh', '/bin/bash'].filter((v, i, a) => a.indexOf(v) === i);
-  for (const sh of shells) {
-    try {
-      return execSync(`${sh} -lc 'which ${cmd}'`, { encoding: 'utf-8', timeout: 5_000 }).trim();
-    } catch { /* try next shell */ }
+  // -lc: login shell (sources .profile/.zprofile) — covers npm/nvm/fnm installs
+  // -ic: interactive shell (sources .bashrc/.zshrc) — covers installers like opencode
+  for (const flags of ['-lc', '-ic']) {
+    for (const sh of shells) {
+      try {
+        const result = execSync(`${sh} ${flags} 'which ${cmd}' 2>/dev/null`, {
+          encoding: 'utf-8',
+          timeout: 5_000,
+        }).trim();
+        if (result && isAbsolute(result)) return result;
+      } catch { /* try next */ }
+    }
   }
   return cmd;
 }
