@@ -354,16 +354,17 @@ function getTerminalHtml(): string {
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%;background:#1a1b26;overflow:hidden}
 body{display:flex;flex-direction:column}
-#input-bar{display:none;padding:3px 6px;background:#15161e;border-bottom:1px solid #33467c;
-  gap:6px;align-items:flex-end}
-#input-bar.show{display:flex}
-#input-bar textarea{flex:1;background:#24283b;color:#a9b1d6;border:1px solid #33467c;
-  border-radius:4px;padding:4px 8px;font-size:14px;outline:none;resize:none;
-  font-family:-apple-system,sans-serif;line-height:1.3;max-height:72px;overflow-y:auto}
-#input-bar textarea:focus{border-color:#7aa2f7}
-#input-bar button{background:#7aa2f7;color:#1a1b26;border:none;border-radius:4px;
-  padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
-#input-bar button:active{opacity:0.7}
+#toolbar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:100;
+  padding:6px 8px calc(6px + env(safe-area-inset-bottom,0px));
+  background:rgba(21,22,30,0.92);border-top:1px solid #33467c;
+  gap:6px;align-items:center;justify-content:center;
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+#toolbar.show{display:flex}
+#toolbar button{background:#24283b;color:#a9b1d6;border:1px solid #33467c;
+  border-radius:6px;padding:8px 14px;font-size:14px;font-family:monospace;
+  white-space:nowrap;cursor:pointer;min-width:44px;min-height:36px;text-align:center;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+#toolbar button:active{background:#7aa2f7;color:#1a1b26}
 #terminal{flex:1;min-height:0}
 #terminal .xterm{height:100%}
 #status{position:fixed;top:8px;right:12px;z-index:10;font:12px monospace;
@@ -373,11 +374,17 @@ body{display:flex;flex-direction:column}
 </style>
 </head>
 <body>
-<div id="input-bar">
-  <textarea id="mi" rows="1" placeholder="输入消息..." autocomplete="off" autocorrect="off"></textarea>
-  <button id="ms">发送</button>
-</div>
 <div id="terminal"></div>
+<div id="toolbar">
+  <button data-k="esc">Esc</button>
+  <button data-k="ctrlc">^C</button>
+  <button data-k="tab">Tab</button>
+  <button data-k="up">\u2191</button>
+  <button data-k="down">\u2193</button>
+  <button data-k="left">\u2190</button>
+  <button data-k="right">\u2192</button>
+  <button data-k="enter">\u21B5</button>
+</div>
 <div id="status" class="err">connecting...</div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
@@ -393,7 +400,7 @@ var term=new Terminal({
     green:'#9ece6a',yellow:'#e0af68',blue:'#7aa2f7',magenta:'#bb9af7',
     cyan:'#7dcfff',white:'#a9b1d6'},
   fontSize:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
-  cursorBlink:!isTouch,disableStdin:isTouch,scrollback:50000,allowProposedApi:true
+  cursorBlink:!isTouch,scrollback:50000,allowProposedApi:true
 });
 var fit=new FitAddon.FitAddon();
 term.loadAddon(fit);
@@ -427,18 +434,32 @@ if(!hasToken&&!${isTmuxMode}){
   },{passive:false});
 }
 
-// ── Mobile input bar (top) ──
-if(isTouch){
-  var bar=document.getElementById('input-bar'),mi=document.getElementById('mi'),ms=document.getElementById('ms');
-  bar.classList.add('show');
-  function send(){
-    var v=mi.value;if(!v||!ws_||ws_.readyState!==1)return;
-    ws_.send(JSON.stringify({type:'input',data:v+String.fromCharCode(13)}));
-    mi.value='';mi.style.height='auto';
-    fit.fit();sendResize();
+// ── Touch shortcut toolbar ──
+if(isTouch&&hasToken){
+  var km={esc:'\\x1b',ctrlc:'\\x03',tab:'\\t',up:'\\x1b[A',down:'\\x1b[B',left:'\\x1b[D',right:'\\x1b[C',enter:'\\r'};
+  var tb=document.getElementById('toolbar');
+  tb.classList.add('show');
+  // Use direct listeners per button — more reliable on mobile than event delegation
+  var btns=tb.getElementsByTagName('button');
+  for(var i=0;i<btns.length;i++){(function(btn){
+    function fire(e){e.preventDefault();e.stopPropagation();
+      if(!ws_||ws_.readyState!==1)return;
+      var k=km[btn.getAttribute('data-k')];
+      if(k)ws_.send(JSON.stringify({type:'input',data:k}));
+    }
+    btn.addEventListener('touchend',fire,{passive:false});
+    btn.addEventListener('click',fire);
+  })(btns[i]);}
+  // Keyboard avoidance: move toolbar above virtual keyboard
+  if(window.visualViewport){
+    function posToolbar(){
+      var vv=window.visualViewport;
+      var kb=window.innerHeight-vv.height-vv.offsetTop;
+      tb.style.bottom=Math.max(0,Math.round(kb))+'px';
+    }
+    window.visualViewport.addEventListener('resize',posToolbar);
+    window.visualViewport.addEventListener('scroll',posToolbar);
   }
-  mi.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,72)+'px';fit.fit()});
-  ms.addEventListener('click',send);
 }
 </script>
 </body>
