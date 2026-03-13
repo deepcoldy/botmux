@@ -26,6 +26,20 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
 
     ensureMcpConfig(entry: McpServerEntry) {
       // Use `coco mcp add-json` CLI — coco stores config in ~/.trae/traecli.yaml
+      // Clean up stale entries (e.g. old "claude-code-robot" → renamed to "botmux")
+      for (const stale of ['claude-code-robot']) {
+        if (stale !== entry.name) {
+          try {
+            execSync(`${bin} mcp remove ${stale}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
+          } catch { /* not present — fine */ }
+        }
+      }
+
+      // Remove existing entry first to ensure env is fully replaced (no stale LARK_APP_ID)
+      try {
+        execSync(`${bin} mcp remove ${entry.name}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
+      } catch { /* not present — fine */ }
+
       const json = JSON.stringify({
         command: entry.command,
         args: entry.args,

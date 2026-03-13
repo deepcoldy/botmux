@@ -28,6 +28,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     ensureMcpConfig(entry: McpServerEntry) {
+      // Clean up stale entries (e.g. old "claude-code-robot" → renamed to "botmux")
+      for (const stale of ['claude-code-robot']) {
+        if (stale !== entry.name) {
+          try {
+            execSync(`${bin} mcp remove ${stale}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
+          } catch { /* not present — fine */ }
+        }
+      }
       // Remove first so re-registration picks up env changes (e.g. new SESSION_DATA_DIR)
       try {
         execSync(`${bin} mcp remove ${entry.name}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
