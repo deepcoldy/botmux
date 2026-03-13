@@ -6,10 +6,7 @@
 
 ## 演示
 
-
-
-https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65
-
+[演示视频](https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65)
 
 
 ## 功能特性
