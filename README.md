@@ -6,7 +6,15 @@
 
 ## 演示
 
+<p align="center">
+  <img src="gif/fold&unfold.gif" alt="飞书卡片交互 — 流式输出展开/折叠" width="600">
+</p>
+
+<details>
+<summary>📺 完整演示视频</summary>
+
 [演示视频](https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65)
+</details>
 
 ## 功能特性
 
@@ -210,6 +218,10 @@ botmux setup
 
 ### Web 终端
 
+<p align="center">
+  <img src="gif/web_terminal.gif" alt="Web 终端实时输出" width="600">
+</p>
+
 每个会话提供一个 Web 终端，地址为 `http://<WEB_EXTERNAL_HOST>:<端口>`。
 
 - **只读链接** — 展示在群话题的流式卡片上
@@ -218,6 +230,10 @@ botmux setup
 特性：xterm.js + fit/unicode11/web-links 插件、TokyoNight 主题、滚动缓冲区。移动端/平板通过悬浮快捷键工具栏提供 Esc、Ctrl+C、Tab、方向键等虚拟键盘缺失的控制键，工具栏自动避让虚拟键盘。
 
 ### Tmux 会话常驻
+
+<p align="center">
+  <img src="gif/tmux.gif" alt="botmux list — 交互式 tmux 会话管理" width="600">
+</p>
 
 安装 tmux 后，botmux 自动使用 tmux 后端。CLI 进程运行在 tmux session 内，daemon 通过 node-pty attach 到 tmux 来捕获输出，流式卡片、空闲检测、Web 终端等功能全部不受影响。
 
