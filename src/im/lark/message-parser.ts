@@ -1,4 +1,4 @@
-import type { LarkMessage } from '../../types.js';
+import type { LarkMessage, LarkMention } from '../../types.js';
 import { logger } from '../../utils/logger.js';
 
 // Event data structure from WSClient im.message.receive_v1
@@ -83,6 +83,17 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   }
 
   const resources = extractResources(message.message_type, message.content);
+
+  // Extract structured mentions
+  const mentions: LarkMention[] | undefined =
+    message.mentions && message.mentions.length > 0
+      ? message.mentions.map(m => ({
+          key: m.key,
+          name: m.name,
+          openId: m.id?.open_id,
+        }))
+      : undefined;
+
   const parsed: LarkMessage = {
     messageId: message.message_id,
     rootId: message.root_id ?? '',
@@ -91,6 +102,7 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
     msgType: message.message_type,
     content: extractTextContent(message.message_type, message.content, message.mentions),
     createTime: message.create_time,
+    mentions,
   };
   return { parsed, resources };
 }

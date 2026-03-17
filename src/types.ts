@@ -19,6 +19,12 @@ export interface LarkAttachment {
   name: string;       // 文件名
 }
 
+export interface LarkMention {
+  key: string;        // e.g. "@_user_1"
+  name: string;       // display name
+  openId?: string;    // open_id of the mentioned user/bot
+}
+
 export interface LarkMessage {
   messageId: string;
   rootId: string;
@@ -28,6 +34,7 @@ export interface LarkMessage {
   content: string;
   createTime: string;
   attachments?: LarkAttachment[];
+  mentions?: LarkMention[];
 }
 
 export interface ScheduledTask {
@@ -64,4 +71,5 @@ export const TOOL_NAMES = {
   SEND_TO_THREAD: 'send_to_thread',
   GET_THREAD_MESSAGES: 'get_thread_messages',
   REACT_TO_MESSAGE: 'react_to_message',
+  LIST_BOTS: 'list_bots',
 } as const;

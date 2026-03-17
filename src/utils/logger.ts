@@ -8,11 +8,9 @@ function fmt(msg: string, args: unknown[]): string {
 }
 
 // MCP server (index.ts) uses stdio transport — stdout must stay clean.
-// Daemon (index-daemon.ts) can safely use stdout for info/debug logs.
-// Detect which mode we're in: if stderr is the only safe channel, use it for all.
-const isMcpMode = !process.env.SESSION_DATA_DIR && !process.env.PM2_HOME;
-
-const out = isMcpMode ? process.stderr : process.stdout;
+// Always use stderr for log output — it's safe in both MCP and daemon mode,
+// and avoids misdetection (the MCP subprocess receives SESSION_DATA_DIR via --env).
+const out = process.stderr;
 
 export const logger = {
   info(msg: string, ...args: unknown[]): void {

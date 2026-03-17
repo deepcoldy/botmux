@@ -7,9 +7,13 @@ import { logger } from '../utils/logger.js';
 export const schema = z.object({
   session_id: z.string().describe('Session ID for the active session'),
   content: z.string().describe('Message content to send (plain text)'),
+  mentions: z.array(z.object({
+    open_id: z.string().describe('Open ID of the user/bot to @mention'),
+    name: z.string().describe('Display name for the @mention'),
+  })).optional().describe('Optional list of users/bots to @mention in the message. Get open_ids from list_bots tool.'),
 });
 
-export const description = 'Send a plain text message to the Lark thread associated with a session. Just send plain text — formatting is handled automatically.';
+export const description = 'Send a plain text message to the Lark thread associated with a session. Just send plain text — formatting is handled automatically. Use optional mentions parameter to @mention other bots.';
 
 /** Build a post content block from plain text, splitting by newlines into paragraphs */
 function textToPostContent(text: string): any[][] {
@@ -64,7 +68,16 @@ export async function execute(args: z.infer<typeof schema>) {
 
     const postContent = textToPostContent(text);
 
-    // Append @mention if we have a user to mention
+    // Append explicit mentions (e.g. @mention other bots)
+    if (args.mentions && args.mentions.length > 0) {
+      if (postContent.length === 0) postContent.push([]);
+      const lastLine = postContent[postContent.length - 1];
+      for (const m of args.mentions) {
+        lastLine.push({ tag: 'at', user_id: m.open_id });
+      }
+    }
+
+    // Append @mention to session owner (human user)
     if (mentionUser) {
       if (postContent.length === 0) postContent.push([]);
       postContent[postContent.length - 1].push({ tag: 'at', user_id: mentionUser });

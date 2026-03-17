@@ -16,7 +16,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { LarkAttachment, ScheduledTask } from '../types.js';
+import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -115,6 +115,8 @@ export function buildNewTopicPrompt(
   cliId: CliId,
   cliPathOverride?: string,
   attachments?: LarkAttachment[],
+  mentions?: LarkMention[],
+  availableBots?: Array<{ name: string; openId: string; cliId: string }>,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
@@ -124,6 +126,25 @@ export function buildNewTopicPrompt(
     '- 对于代码修改任务，先通过 send_to_thread 发送执行方案给用户确认后再执行',
     ...hints.map(h => `- ${h}`),
   ];
+
+  // Mention metadata section
+  let mentionSection = '';
+  if (mentions && mentions.length > 0) {
+    const mentionLines = mentions.map(m => {
+      const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
+      return `- @${m.name}${idPart}`;
+    });
+    mentionSection = `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
+  }
+
+  // Available bots section
+  let botSection = '';
+  if (availableBots && availableBots.length > 0) {
+    const botLines = availableBots.map(b =>
+      `- ${b.name} (open_id: ${b.openId}, CLI: ${b.cliId})`
+    );
+    botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 send_to_thread 的 mentions 参数 @mention 它们协作，也可用 list_bots 工具查询。`;
+  }
 
   return `你已连接到飞书话题，用户发送了：
 ---
@@ -135,7 +156,7 @@ Session ID: ${sessionId}
 请处理用户的请求，通过 send_to_thread 回复用户（session_id: "${sessionId}"）。
 
 注意：
-${noteLines.join('\n')}`;
+${noteLines.join('\n')}${mentionSection}${botSection}`;
 }
 
 // ─── Session restore ─────────────────────────────────────────────────────────

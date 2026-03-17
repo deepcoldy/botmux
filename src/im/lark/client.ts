@@ -278,3 +278,40 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
   allMessages.sort((a, b) => (a.create_time ?? '').localeCompare(b.create_time ?? ''));
   return allMessages;
 }
+
+/**
+ * List bot members of a chat. Returns array of { openId, name }.
+ */
+export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
+  const c = getBotClient(larkAppId);
+  const bots: Array<{ openId: string; name: string }> = [];
+  let pageToken: string | undefined;
+
+  do {
+    const res = await (c as any).im.v1.chatMembers.list({
+      path: { chat_id: chatId },
+      params: {
+        member_id_type: 'open_id',
+        page_size: 100,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat members: ${res.msg} (code: ${res.code})`);
+    }
+
+    for (const member of res.data?.items ?? []) {
+      if (member.member_type === 'bot') {
+        bots.push({
+          openId: member.member_id ?? '',
+          name: member.name ?? '',
+        });
+      }
+    }
+
+    pageToken = res.data?.page_token;
+  } while (pageToken);
+
+  return bots;
+}

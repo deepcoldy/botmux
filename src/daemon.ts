@@ -40,7 +40,7 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { probeBotOpenId, startLarkEventDispatcher } from './im/lark/event-dispatcher.js';
+import { probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile } from './im/lark/event-dispatcher.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -147,6 +147,17 @@ function getActiveCount(): number {
   return count;
 }
 
+/** Get available bots for prompt injection (excludes current bot). */
+function getAvailableBots(currentAppId: string): Array<{ name: string; openId: string; cliId: string }> {
+  return getAllBots()
+    .filter(b => b.botOpenId && b.config.larkAppId !== currentAppId)
+    .map(b => ({
+      name: getCliDisplayName(b.config.cliId),
+      openId: b.botOpenId!,
+      cliId: b.config.cliId,
+    }));
+}
+
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
@@ -247,7 +258,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   } else {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments);
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, getAvailableBots(larkAppId));
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -270,18 +281,15 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   let ds = activeSessions.get(sessionKey(rootId, larkAppId));
 
-  // If a different bot is @mentioned in this thread, take over the session.
-  // The event dispatcher only routes here if the bot was @mentioned or owns the session,
-  // so reaching this point without an existing session means an explicit @mention takeover.
+  // If this bot doesn't have a session but another bot does, allow coexistence.
+  // Multiple bots can have independent sessions in the same thread — the session
+  // key (rootId::larkAppId) already supports this. No need to kill the other bot.
   if (!ds) {
-    for (const [key, otherDs] of activeSessions) {
-      if (otherDs.session.rootMessageId === rootId && otherDs.larkAppId !== larkAppId) {
-        logger.info(`[${larkAppId}] Taking over thread ${rootId} from ${otherDs.larkAppId}`);
-        killWorker(otherDs);
-        sessionStore.closeSession(otherDs.session.sessionId);
-        activeSessions.delete(key);
-        break;
-      }
+    const hasOtherBot = [...activeSessions.values()].some(
+      s => s.session.rootMessageId === rootId && s.larkAppId !== larkAppId
+    );
+    if (hasOtherBot) {
+      logger.info(`[${larkAppId}] Joining thread ${rootId} alongside existing bot session(s)`);
     }
   }
 
@@ -355,7 +363,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     } else {
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments);
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, getAvailableBots(larkAppId));
       forkWorker(newDs, prompt);
     }
 
@@ -364,9 +372,18 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {
-    const msgContent = attachments.length > 0
+    // Enrich content with attachment hints and mention metadata for the CLI
+    let msgContent = attachments.length > 0
       ? `${parsed.content}${formatAttachmentsHint(attachments)}`
       : parsed.content;
+
+    if (parsed.mentions && parsed.mentions.length > 0) {
+      const mentionLines = parsed.mentions.map(m => {
+        const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
+        return `- @${m.name}${idPart}`;
+      });
+      msgContent += `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
+    }
     // Freeze the previous turn's card at "idle" before starting a new turn
     if (ds.streamCardId && ds.workerPort) {
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
@@ -435,8 +452,10 @@ export async function startDaemon(): Promise<void> {
       }
     }
 
-    // Probe bot open_id
-    probeBotOpenId(cfg.larkAppId).catch(err => {
+    // Probe bot open_id and persist to bots-info.json
+    probeBotOpenId(cfg.larkAppId).then(() => {
+      writeBotInfoFile(config.session.dataDir);
+    }).catch(err => {
       logger.warn(`[${cfg.larkAppId}] Bot open_id probe failed: ${err.message}`);
     });
 
@@ -455,7 +474,7 @@ export async function startDaemon(): Promise<void> {
         }
         return true;
       },
-    });
+    }, config.session.dataDir);
   }
 
   // Restore active sessions from previous run

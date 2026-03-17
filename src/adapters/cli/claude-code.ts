@@ -26,11 +26,13 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
 
     async writeInput(pty, content) {
       if (content.includes('\n')) {
-        // Multi-line content triggers Claude Code's "Pasted text" mode.
-        // The trailing \r must arrive AFTER the paste is fully processed,
-        // otherwise it gets swallowed. 150ms is the minimum reliable delay.
-        pty.write(content);
-        await new Promise(r => setTimeout(r, 150));
+        // Use bracketed paste mode so Claude Code reliably detects paste
+        // boundaries instead of relying on timing-based heuristics.
+        pty.write('\x1b[200~' + content + '\x1b[201~');
+        // Image file paths in pasted text trigger Claude Code's async image
+        // attachment, which needs extra time before Enter is accepted.
+        const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
+        await new Promise(r => setTimeout(r, hasImagePath ? 800 : 150));
         pty.write('\r');
       } else {
         pty.write(content + '\r');

@@ -4,6 +4,8 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { getChatInfo, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -14,8 +16,22 @@ export function getBotOpenId(larkAppId: string): string | undefined {
   return getBot(larkAppId).botOpenId;
 }
 
+/** Set the bot's open_id. Callers should also call writeBotInfoFile() to persist. */
 export function setBotOpenId(larkAppId: string, id: string): void {
   getBot(larkAppId).botOpenId = id;
+}
+
+/** Persist bot registry info to disk for MCP subprocesses to read. */
+export function writeBotInfoFile(dataDir: string): void {
+  const bots = getAllBots();
+  const info = bots.map(b => ({
+    larkAppId: b.config.larkAppId,
+    botOpenId: b.botOpenId ?? null,
+    cliId: b.config.cliId,
+  }));
+  const filePath = join(dataDir, 'bots-info.json');
+  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+  writeFileSync(filePath, JSON.stringify(info, null, 2) + '\n');
 }
 
 /**
@@ -78,18 +94,34 @@ export async function getGroupUserCount(larkAppId: string, chatId: string): Prom
 
 /** Check if the bot was @mentioned in this message */
 export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: string | undefined): boolean {
-  const mentions: any[] = message.mentions ?? [];
-  if (mentions.length === 0) return false;
-
   const botOpenId = getBot(larkAppId).botOpenId;
   if (!botOpenId) {
-    // Bot open_id unknown — cannot reliably detect @bot mentions.
-    // Will be resolved once probeBotOpenId() completes or first bot message event arrives.
     logger.warn('Bot open_id unknown, cannot check @mentions');
     return false;
   }
 
-  return mentions.some((m: any) => m.id?.open_id === botOpenId);
+  // 1. Check message.mentions array (populated for user-sent text messages)
+  const mentions: any[] = message.mentions ?? [];
+  if (mentions.some((m: any) => m.id?.open_id === botOpenId)) {
+    return true;
+  }
+
+  // 2. Check post content for inline at tags (bot-sent post messages may not
+  //    populate message.mentions — the @mention is embedded in the content structure)
+  try {
+    const content = JSON.parse(message.content ?? '{}');
+    const inner = content.zh_cn ?? content.en_us ?? content;
+    if (Array.isArray(inner?.content)) {
+      for (const paragraph of inner.content) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const node of paragraph) {
+          if (node.tag === 'at' && node.user_id === botOpenId) return true;
+        }
+      }
+    }
+  } catch { /* ignore parse errors */ }
+
+  return false;
 }
 
 // ─── Group message access check ──────────────────────────────────────────
@@ -139,7 +171,7 @@ export interface EventHandlers {
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
  */
-export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers): Lark.WSClient {
+export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers, dataDir?: string): Lark.WSClient {
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     'card.action.trigger': async (data: any) => {
       try {
@@ -158,23 +190,42 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const sender = data.sender;
         if (!message) return;
 
-        // Learn bot's own open_id from its outgoing messages
+        // Bot-originated messages
         if (sender?.sender_type === 'app') {
-          const botOpenId = getBotOpenId(larkAppId);
-          if (!botOpenId && sender.sender_id?.open_id) {
-            setBotOpenId(larkAppId, sender.sender_id.open_id);
+          const senderOpenId = sender.sender_id?.open_id;
+          const myOpenId = getBotOpenId(larkAppId);
+
+          // Learn own open_id from outgoing messages
+          if (!myOpenId && senderOpenId) {
+            setBotOpenId(larkAppId, senderOpenId);
+            if (dataDir) writeBotInfoFile(dataDir);
             logger.info(`Learned bot open_id from message event: ${getBotOpenId(larkAppId)}`);
           }
-          // Allow bot's own messages only if they are /close commands in threads
+
           const rootId = message.root_id;
           if (!rootId) return;
-          try {
-            const body = JSON.parse(message.content ?? '{}');
-            if (body.text?.trim() !== '/close') return;
-          } catch {
+
+          // Check if this is our own message vs another bot's message
+          const isSelfMessage = senderOpenId === getBotOpenId(larkAppId);
+
+          if (isSelfMessage) {
+            // Own messages: only process /close commands
+            try {
+              const body = JSON.parse(message.content ?? '{}');
+              if (body.text?.trim() !== '/close') return;
+            } catch {
+              return;
+            }
+            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling message event: ${err}`));
             return;
           }
-          handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling message event: ${err}`));
+
+          // Message from another bot: check if it @mentions this bot
+          const mentioned = isBotMentioned(larkAppId, message, undefined);
+          if (mentioned) {
+            logger.info(`Bot-to-bot @mention detected: routing to handleThreadReply`);
+            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling bot @mention: ${err}`));
+          }
           return;
         }
 
