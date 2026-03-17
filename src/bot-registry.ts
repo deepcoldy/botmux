@@ -71,8 +71,7 @@ export function getAllBots(): BotState[] {
 /**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
- * 2. ~/.botmux/bots.json — default multi-bot config path
- * 3. LARK_APP_ID / LARK_APP_SECRET / CLI_ID env vars — single-bot compat
+ * 2. ~/.botmux/bots.json — default config path
  */
 export function loadBotConfigs(): BotConfig[] {
   // 1. BOTS_CONFIG env var
@@ -91,31 +90,9 @@ export function loadBotConfigs(): BotConfig[] {
     return parseBotConfigFile(defaultPath);
   }
 
-  // 3. Single-bot fallback from env vars
-  const larkAppId = process.env.LARK_APP_ID;
-  const larkAppSecret = process.env.LARK_APP_SECRET;
-  if (!larkAppId || !larkAppSecret) {
-    throw new Error(
-      'No bot configuration found. Set BOTS_CONFIG, create ~/.botmux/bots.json, or set LARK_APP_ID + LARK_APP_SECRET.'
-    );
-  }
-
-  const workingDirRaw = process.env.WORKING_DIR ?? '~';
-  const workingDirs = workingDirRaw.split(',').map(s => s.trim()).filter(Boolean);
-
-  const cfg: BotConfig = {
-    larkAppId,
-    larkAppSecret,
-    cliId: (process.env.CLI_ID ?? 'claude-code') as CliId,
-    cliPathOverride: process.env.CLI_PATH,
-    backendType: process.env.BACKEND_TYPE as 'pty' | 'tmux' | undefined,
-    workingDir: workingDirs[0] || '~',
-    workingDirs,
-    allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
-    projectScanDir: process.env.PROJECT_SCAN_DIR,
-  };
-
-  return [cfg];
+  throw new Error(
+    'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
+  );
 }
 
 function parseBotConfigFile(filePath: string): BotConfig[] {
