@@ -78,47 +78,13 @@ botmux start
 
 ## 配置
 
-配置文件位于 `~/.botmux/.env`。运行 `botmux setup` 交互式创建，或手动编辑：
+通过 `~/.botmux/bots.json` 配置机器人。运行 `botmux setup` 交互式创建，或手动编辑。
 
-### 必填
-
-| 变量 | 说明 |
-|------|------|
-| `LARK_APP_ID` | 飞书应用 App ID |
-| `LARK_APP_SECRET` | 飞书应用 App Secret |
-
-### 可选
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`、`gemini`、`opencode`） |
-| `CLI_PATH` | _(按 CLI_ID 自动检测)_ | CLI 可执行文件路径覆盖 |
-| `BACKEND_TYPE` | _(自动检测)_ | 会话后端：有 tmux 则用 `tmux`，否则 `pty` |
-| `WORKING_DIR` | `~` | 默认工作目录，支持逗号分隔多个目录（如 `~/a,~/b`），`/repo` 会扫描所有目录 |
-| `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的用户，邮箱前缀或 open_id，逗号分隔 |
-| `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
-| `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
-| `WEB_EXTERNAL_HOST` | _(自动检测局域网 IP)_ | 终端链接中的外部主机名/IP |
-| `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列的存储目录 |
-| `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
-
-### 多机器人配置
-
-支持在同一台机器上运行多个飞书机器人，每个机器人可对应不同的 CLI。
-
-**渐进式配置：**
+支持在同一台机器上运行多个飞书机器人，每个机器人可对应不同的 CLI。同一群聊中的多个机器人通过 @mention 路由消息，仅有一个机器人时自动响应无需 @。
 
 ```bash
-# 1. 首次配置 — 单机器人，写入 ~/.botmux/.env
+# 交互式配置
 botmux setup
-
-# 2. 添加第二个机器人 — 自动迁移到 ~/.botmux/bots.json
-botmux setup
-# 选择「添加新机器人」，.env 自动备份为 .env.bak
-
-# 3. 继续添加更多机器人
-botmux setup
-# 直接追加到 bots.json
 ```
 
 **bots.json 格式：**
@@ -135,7 +101,7 @@ botmux setup
   {
     "larkAppId": "cli_xxx_bot2",
     "larkAppSecret": "secret_2",
-    "cliId": "aiden",
+    "cliId": "codex",
     "workingDir": "~/work"
   }
 ]
@@ -145,21 +111,30 @@ botmux setup
 |------|------|------|
 | `larkAppId` | 是 | 飞书应用 App ID |
 | `larkAppSecret` | 是 | 飞书应用 App Secret |
-| `cliId` | 否 | CLI 适配器，默认 `claude-code` |
+| `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`gemini`、`opencode`） |
 | `cliPathOverride` | 否 | CLI 可执行文件路径覆盖 |
-| `backendType` | 否 | 会话后端：`pty` 或 `tmux` |
-| `workingDir` | 否 | 默认工作目录，支持逗号分隔 |
-| `allowedUsers` | 否 | 允许的用户列表 |
+| `backendType` | 否 | 会话后端：`pty` 或 `tmux`（默认自动检测） |
+| `workingDir` | 否 | 默认工作目录，支持逗号分隔多个目录 |
+| `allowedUsers` | 否 | 允许的用户列表（邮箱前缀或 open_id） |
 | `projectScanDir` | 否 | 扫描 Git 仓库的目录 |
 
-**配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json` → `.env` 单机器人模式
+**配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `BOTS_CONFIG` | _(未设置)_ | 指定 bots.json 路径（覆盖默认位置） |
+| `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
+| `WEB_EXTERNAL_HOST` | _(自动检测局域网 IP)_ | 终端链接中的外部主机名/IP |
+| `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列的存储目录 |
+| `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
 
 ## 文件位置
 
 | 路径 | 说明 |
 |------|------|
-| `~/.botmux/.env` | 单机器人配置文件 |
-| `~/.botmux/bots.json` | 多机器人配置文件 |
+| `~/.botmux/bots.json` | 机器人配置文件 |
 | `~/.botmux/data/` | 会话数据、消息队列 |
 | `~/.botmux/logs/` | Daemon 日志 |
 
@@ -181,6 +156,7 @@ botmux setup
 |------|------|
 | `/repo` | 显示项目选择卡片 |
 | `/repo <N>` | 切换到上次扫描的第 N 个项目 |
+| `/skip` | 跳过仓库选择，直接开启会话 |
 | `/cd <路径>` | 切换工作目录 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
 | `/cost` | 查看 Token 用量和费用估算 |

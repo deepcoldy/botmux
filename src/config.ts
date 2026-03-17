@@ -45,8 +45,3 @@ export const config = {
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup
 export type Config = typeof config;
-
-export function validateConfig(): void {
-  if (!config.lark.appId) throw new Error('LARK_APP_ID is required');
-  if (!config.lark.appSecret) throw new Error('LARK_APP_SECRET is required');
-}

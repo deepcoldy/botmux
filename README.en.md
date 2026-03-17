@@ -70,47 +70,13 @@ The `setup` command will guide you through:
 
 ## Configuration
 
-Configuration is stored at `~/.botmux/.env`. Run `botmux setup` to create it interactively, or edit manually:
+Configure bots via `~/.botmux/bots.json`. Run `botmux setup` to create it interactively, or edit manually.
 
-### Required
-
-| Variable | Description |
-|----------|-------------|
-| `LARK_APP_ID` | Lark app ID |
-| `LARK_APP_SECRET` | Lark app secret |
-
-### Optional
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`, `gemini`, `opencode`) |
-| `CLI_PATH` | _(auto-detect by CLI_ID)_ | CLI binary path override |
-| `BACKEND_TYPE` | _(auto-detect)_ | Session backend: `tmux` if available, otherwise `pty` |
-| `WORKING_DIR` | `~` | Default working directory; supports comma-separated multiple dirs (e.g. `~/a,~/b`), `/repo` scans all |
-| `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated email prefixes or Lark open_ids |
-| `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
-| `WEB_HOST` | `0.0.0.0` | HTTP server bind address |
-| `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP for terminal URLs |
-| `SESSION_DATA_DIR` | `~/.botmux/data` | Where sessions and queues are stored |
-| `DEBUG` | _(unset)_ | Set to `1` for debug logging |
-
-### Multi-Bot Configuration
-
-Run multiple Lark bots on a single machine, each mapped to a different CLI.
-
-**Progressive setup:**
+Supports running multiple Lark bots on a single machine, each mapped to a different CLI. Multiple bots in the same group chat route messages via @mention; a single bot responds automatically without @.
 
 ```bash
-# 1. First-time setup — single bot, writes ~/.botmux/.env
+# Interactive setup
 botmux setup
-
-# 2. Add a second bot — auto-migrates to ~/.botmux/bots.json
-botmux setup
-# Choose "Add new bot", .env is backed up to .env.bak
-
-# 3. Add more bots
-botmux setup
-# Appends to bots.json
 ```
 
 **bots.json format:**
@@ -127,7 +93,7 @@ botmux setup
   {
     "larkAppId": "cli_xxx_bot2",
     "larkAppSecret": "secret_2",
-    "cliId": "aiden",
+    "cliId": "codex",
     "workingDir": "~/work"
   }
 ]
@@ -137,21 +103,30 @@ botmux setup
 |-------|----------|-------------|
 | `larkAppId` | Yes | Lark app ID |
 | `larkAppSecret` | Yes | Lark app secret |
-| `cliId` | No | CLI adapter, defaults to `claude-code` |
+| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `gemini`, `opencode`) |
 | `cliPathOverride` | No | CLI binary path override |
-| `backendType` | No | Session backend: `pty` or `tmux` |
+| `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
 | `workingDir` | No | Default working directory, supports comma-separated |
-| `allowedUsers` | No | Allowed user list |
+| `allowedUsers` | No | Allowed users (email prefixes or open_ids) |
 | `projectScanDir` | No | Directory to scan for git repos |
 
-**Config priority:** `BOTS_CONFIG` env var > `~/.botmux/bots.json` > `.env` single-bot mode
+**Config priority:** `BOTS_CONFIG` env var > `~/.botmux/bots.json`
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BOTS_CONFIG` | _(unset)_ | Path to bots.json (overrides default location) |
+| `WEB_HOST` | `0.0.0.0` | HTTP server bind address |
+| `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP for terminal URLs |
+| `SESSION_DATA_DIR` | `~/.botmux/data` | Where sessions and queues are stored |
+| `DEBUG` | _(unset)_ | Set to `1` for debug logging |
 
 ## File Locations
 
 | Path | Description |
 |------|-------------|
-| `~/.botmux/.env` | Single-bot configuration |
-| `~/.botmux/bots.json` | Multi-bot configuration |
+| `~/.botmux/bots.json` | Bot configuration |
 | `~/.botmux/data/` | Session data, message queues |
 | `~/.botmux/logs/` | Daemon logs |
 
@@ -173,6 +148,7 @@ botmux setup
 |---------|-------------|
 | `/repo` | Show project selector card |
 | `/repo <N>` | Switch to Nth project from last scan |
+| `/skip` | Skip repo selection, start session directly |
 | `/cd <path>` | Change working directory |
 | `/status` | Show session info (uptime, terminal URL, etc.) |
 | `/cost` | Show token usage and estimated cost |
