@@ -520,6 +520,7 @@ process.on('message', async (raw: unknown) => {
 
     case 'restart': {
       log('Restart requested');
+      backend?.destroySession?.();
       killCli();
       awaitingFirstPrompt = true;
       setTimeout(() => {
