@@ -44,28 +44,31 @@ export function buildSessionCard(
         ios_url: terminalUrl,
       },
     },
-    {
+  ];
+  if (!showManageButtons) {
+    // Group card: show "get write link" button (DM card already has the write token)
+    actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: '🔑 获取操作链接' },
       type: 'default',
       value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
-    },
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '❌ 关闭会话' },
-      type: 'danger',
-      value: { action: 'close', root_id: rootId, session_id: sessionId },
-    },
-  ];
+    });
+  }
   if (showManageButtons) {
-    // Insert restart button before close (second-to-last position)
-    actions.splice(-1, 0, {
+    // DM card: include restart button
+    actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
       type: 'default',
       value: { action: 'restart', root_id: rootId, session_id: sessionId },
     });
   }
+  actions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: '❌ 关闭会话' },
+    type: 'danger',
+    value: { action: 'close', root_id: rootId, session_id: sessionId },
+  });
   const card = {
     config: { wide_screen_mode: true },
     header: {
