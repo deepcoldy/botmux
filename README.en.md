@@ -10,7 +10,15 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 
 ## Demo
 
+<p align="center">
+  <img src="gif/fold&unfold.gif" alt="Lark card interaction — streaming output fold/unfold" width="600">
+</p>
+
+<details>
+<summary>📺 Full demo video</summary>
+
 [Demo Video](https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65)
+</details>
 
 ## Features
 
@@ -190,6 +198,10 @@ The card content is captured from a headless xterm terminal that filters out TUI
 
 ### Web Terminal
 
+<p align="center">
+  <img src="gif/web_terminal.gif" alt="Web terminal live output" width="600">
+</p>
+
 Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
 
 - **Read-only link** — shown on the streaming card in the group thread
@@ -198,6 +210,10 @@ Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
 Features: xterm.js with fit/unicode11/web-links addons, TokyoNight theme, scrollback buffer. On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow keys and other control keys missing from virtual keyboards, with automatic keyboard avoidance.
 
 ### Tmux Persistent Sessions
+
+<p align="center">
+  <img src="gif/tmux.gif" alt="botmux list — interactive tmux session management" width="600">
+</p>
 
 When tmux is installed, botmux automatically uses the tmux backend. CLI processes run inside tmux sessions while the daemon attaches via node-pty to capture output — streaming cards, idle detection, and web terminal all work unchanged.
 
