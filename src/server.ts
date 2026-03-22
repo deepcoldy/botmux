@@ -25,13 +25,11 @@ export function createServer(): McpServer {
     sessionStore.init(appId);
   }
 
-  const server = new McpServer(
-    {
-      name: 'botmux',
-      version: '1.0.0',
-    },
-    {
-      instructions: [
+  // Only inject instructions when running inside a botmux session (LARK_APP_ID
+  // is set by the worker process). When the MCP server is used standalone (e.g.
+  // user runs Claude Code directly), skip instructions to save context.
+  const instructions = appId
+    ? [
         'You are connected to a Lark (Feishu) topic group. The user reads Lark, not your terminal.',
         'Anything you want the user to see MUST go through the send_to_thread tool — your terminal output never reaches the chat.',
         '',
@@ -41,7 +39,16 @@ export function createServer(): McpServer {
         '- Send plain text only — formatting is handled automatically.',
         '- Use react_to_message to acknowledge messages (e.g. THUMBSUP, OnIt).',
         '- Use get_thread_messages to read earlier conversation context if needed.',
-      ].join('\n'),
+      ].join('\n')
+    : undefined;
+
+  const server = new McpServer(
+    {
+      name: 'botmux',
+      version: '1.0.0',
+    },
+    {
+      ...(instructions && { instructions }),
     },
   );
 
