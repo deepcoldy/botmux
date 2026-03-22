@@ -124,10 +124,8 @@ export function ensureMcpConfig(cliId: CliId, cliPathOverride?: string): void {
     command: 'node',
     args: [serverScript],
     env: {
+      BOTMUX: '1',  // Must be in config env: MCP SDK only passes config env to server subprocess
       SESSION_DATA_DIR: config.session.dataDir,
-      // BOTMUX flag is NOT set here — it's passed via the worker fork env so
-      // it only reaches MCP servers spawned by botmux, not standalone CLIs.
-      // CLIs that don't inherit env (e.g. Aiden) fall back to PID file detection.
     },
   });
   mcpConfiguredCliIds.add(cliId);
