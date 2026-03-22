@@ -1,38 +1,37 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
 
 /**
- * Check if a botmux daemon is currently running by probing PID files in
- * SESSION_DATA_DIR.  Used as a runtime guard: BOTMUX=1 lives in the static
- * MCP config (required because the MCP SDK only passes config env to the
- * server subprocess — it does NOT inherit the full parent env).  The PID
- * check ensures tools are only registered while a daemon is actually alive,
- * so standalone CLI sessions after daemon stop don't show stale tools.
+ * Walk up the process tree and check whether any ancestor has BOTMUX=1 in
+ * its environment.  This precisely distinguishes a botmux-spawned MCP server
+ * (whose ancestor chain includes a worker with BOTMUX=1) from a standalone
+ * CLI-spawned one (whose ancestors are the user's shell — no BOTMUX).
+ *
+ * Process chains:
+ *   botmux PTY:  daemon → worker(BOTMUX=1) → CLI(inherits) → MCP server
+ *   botmux tmux: daemon → worker(BOTMUX=1) → tmux(-e BOTMUX=1) → CLI → MCP server
+ *   standalone:  shell → CLI → MCP server  (no BOTMUX anywhere in ancestry)
+ *
+ * Linux-specific: reads /proc/<pid>/environ (null-byte separated).
  */
-function isDaemonRunning(): boolean {
-  const dataDir = process.env.SESSION_DATA_DIR;
-  if (!dataDir) return false;
-  try {
-    const pidFiles = readdirSync(dataDir).filter(f => /^daemon(-\d+)?\.pid$/.test(f));
-    for (const file of pidFiles) {
-      try {
-        const pid = parseInt(readFileSync(join(dataDir, file), 'utf-8').trim(), 10);
-        if (pid > 0) {
-          process.kill(pid, 0); // signal 0 = existence check
-          return true;
-        }
-      } catch {
-        // PID stale or file unreadable
-      }
+function isAncestorBotmux(): boolean {
+  let pid = process.ppid;
+  for (let depth = 0; depth < 8 && pid > 1; depth++) {
+    try {
+      const environ = readFileSync(`/proc/${pid}/environ`, 'utf-8');
+      if (environ.split('\0').some(e => e === 'BOTMUX=1')) return true;
+      const status = readFileSync(`/proc/${pid}/status`, 'utf-8');
+      const m = status.match(/PPid:\s*(\d+)/);
+      if (!m) break;
+      pid = parseInt(m[1], 10);
+    } catch {
+      break; // process gone or unreadable
     }
-  } catch {
-    // dataDir unreadable
   }
   return false;
 }
@@ -60,19 +59,15 @@ export function createServer(): McpServer {
 
   // Two-gate session detection:
   //
-  //  1. BOTMUX=1 — set in the static MCP config env so it reaches all CLI
-  //     MCP servers (the MCP SDK only passes config env + a short whitelist
-  //     to the server subprocess, NOT the full parent env).
+  //  1. BOTMUX=1 in env — set in the static MCP config so it reaches all
+  //     CLI MCP servers (the MCP SDK only passes config env + a 6-var
+  //     whitelist to the server subprocess, NOT the full parent env).
   //
-  //  2. isDaemonRunning() — verifies a botmux daemon is actually alive via
-  //     PID files in SESSION_DATA_DIR.  This prevents standalone CLI sessions
-  //     (after daemon has stopped) from registering tools just because the
-  //     static BOTMUX=1 flag persists in the config.
-  //
-  // Both gates must pass.  The only "false positive" is a standalone CLI
-  // started while the daemon happens to be running — acceptable because
-  // botmux is actively serving sessions in that scenario.
-  const isBotmuxSession = process.env.BOTMUX === '1' && isDaemonRunning();
+  //  2. isAncestorBotmux() — walks /proc/<pid>/environ up the process tree
+  //     to verify THIS MCP server was actually spawned by a botmux worker.
+  //     A standalone CLI's ancestors (user shell) won't have BOTMUX=1,
+  //     even if a botmux daemon happens to be running on the same machine.
+  const isBotmuxSession = process.env.BOTMUX === '1' && isAncestorBotmux();
 
   const instructions = isBotmuxSession
     ? [
