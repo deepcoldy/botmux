@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
@@ -8,18 +9,32 @@ import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
 
 /**
- * Check whether the MCP server's parent process (the CLI) was spawned by a
- * botmux worker.  The worker writes a marker file at
- *   SESSION_DATA_DIR/.botmux-cli-pids/<cli-pid>
- * after spawning each CLI.  The MCP server checks if its own ppid has a
- * corresponding marker.
+ * Walk up the process tree and check whether any ancestor has a CLI PID
+ * marker written by the botmux worker.  Walking (not just checking ppid)
+ * handles CLIs that fork internal subprocesses before spawning MCP servers.
  *
- * Cross-platform: uses only process.ppid + existsSync (no /proc dependency).
+ * Cross-platform: uses `ps -o ppid=` (works on macOS + Linux).
  */
-function isParentBotmuxCli(): boolean {
+function hasAncestorCliMarker(): boolean {
   const dataDir = process.env.SESSION_DATA_DIR;
   if (!dataDir) return false;
-  return existsSync(join(dataDir, '.botmux-cli-pids', String(process.ppid)));
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  let pid = process.ppid;
+  for (let depth = 0; depth < 8 && pid > 1; depth++) {
+    if (existsSync(join(markersDir, String(pid)))) return true;
+    try {
+      const output = execSync(`ps -o ppid= -p ${pid}`, {
+        encoding: 'utf-8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      pid = parseInt(output, 10);
+      if (isNaN(pid)) break;
+    } catch {
+      break;
+    }
+  }
+  return false;
 }
 
 export function createServer(): McpServer {
@@ -49,10 +64,11 @@ export function createServer(): McpServer {
   //     CLI MCP servers (the MCP SDK only passes config env + a 6-var
   //     whitelist to the server subprocess, NOT the full parent env).
   //
-  //  2. isParentBotmuxCli() — checks if the MCP server's parent process
-  //     (the CLI) has a marker file written by the botmux worker.
-  //     Cross-platform: uses process.ppid + existsSync, no /proc needed.
-  const isBotmuxSession = process.env.BOTMUX === '1' && isParentBotmuxCli();
+  //  2. hasAncestorCliMarker() — walks the process tree (via `ps -o ppid=`)
+  //     and checks if any ancestor PID has a marker file written by the
+  //     botmux worker.  Handles CLIs that fork internal subprocesses.
+  //     Cross-platform: `ps -o ppid=` works on both macOS and Linux.
+  const isBotmuxSession = process.env.BOTMUX === '1' && hasAncestorCliMarker();
 
   const instructions = isBotmuxSession
     ? [

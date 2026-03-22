@@ -100,6 +100,55 @@ async function listMcpToolsWithMarkedParent(
 }
 
 /**
+ * Spawn MCP server with an intermediate subprocess between the marked parent
+ * and the MCP server.  Simulates CLIs (e.g. Codex) that fork internal
+ * subprocesses which then spawn MCP servers:
+ *   test → wrapper(PID=X, marker) → internal(PID=Y) → MCP server(ppid=Y)
+ * The ancestor walk must find the marker for X by walking Y → X.
+ */
+async function listMcpToolsWithIntermediateProcess(
+  dataDir: string,
+): Promise<string[]> {
+  // Inner code: the intermediate subprocess that spawns the MCP server
+  const innerCode = [
+    'const {spawn}=require("child_process");',
+    `const c=spawn("node",[${JSON.stringify(DIST_INDEX)}],{stdio:"inherit"});`,
+    'c.on("exit",code=>process.exit(code??1));',
+  ].join('');
+
+  const wrapperCode = `
+    const fs = require('fs');
+    const path = require('path');
+    const { spawn } = require('child_process');
+    const dir = path.join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
+    fs.mkdirSync(dir, { recursive: true });
+    const marker = path.join(dir, String(process.pid));
+    fs.writeFileSync(marker, '');
+    const inner = spawn('node', ['-e', ${JSON.stringify(innerCode)}], { stdio: 'inherit' });
+    inner.on('exit', code => {
+      try { fs.unlinkSync(marker); } catch {}
+      process.exit(code ?? 1);
+    });
+  `;
+  const transport = new StdioClientTransport({
+    command: 'node',
+    args: ['-e', wrapperCode],
+    env: {
+      PATH: process.env.PATH!,
+      HOME: process.env.HOME!,
+      BOTMUX: '1',
+      SESSION_DATA_DIR: dataDir,
+    },
+  });
+  const client = new Client({ name: 'test-client', version: '1.0.0' });
+  await client.connect(transport);
+  const { tools } = await client.listTools();
+  const names = tools.map(t => t.name).sort();
+  await client.close();
+  return names;
+}
+
+/**
  * Spawn MCP server with raw JSON-RPC to capture stderr.
  */
 function spawnMcpRaw(
@@ -184,6 +233,13 @@ describe('MCP two-gate detection: BOTMUX=1 AND CLI PID marker', () => {
     const tools = await listMcpTools({});
     expect(tools).toHaveLength(0);
   }, 10_000);
+
+  it('gate1 ✓ + gate2 ✓ (Codex-style: marker on grandparent) → all 4 tools', async () => {
+    // CLI forks internal subprocess, which spawns MCP server.
+    // Marker is on the CLI PID (grandparent), not the internal subprocess.
+    const tools = await listMcpToolsWithIntermediateProcess(tempDir);
+    expect(tools).toEqual(EXPECTED_TOOLS.sort());
+  }, 15_000);
 
   it('standalone CLI while daemon is running → no tools', async () => {
     // Daemon running doesn't matter — only the CLI PID marker matters.
@@ -317,10 +373,10 @@ describe('MCP source code verification', () => {
     expect(block![1]).toContain("'BOTMUX'");
   });
 
-  it('server.ts: uses isParentBotmuxCli() as second gate', () => {
+  it('server.ts: uses hasAncestorCliMarker() as second gate', () => {
     const src = readFileSync(join(PROJECT_ROOT, 'src', 'server.ts'), 'utf-8');
-    expect(src).toContain('isParentBotmuxCli()');
-    expect(src).toMatch(/BOTMUX.*&&.*isParentBotmuxCli/);
+    expect(src).toContain('hasAncestorCliMarker()');
+    expect(src).toMatch(/BOTMUX.*&&.*hasAncestorCliMarker/);
   });
 
   it('worker.ts: writes CLI PID marker after spawn', () => {
