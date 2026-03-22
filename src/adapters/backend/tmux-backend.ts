@@ -179,6 +179,7 @@ export class TmuxBackend implements SessionBackend {
  * for non-first bots without explicit passthrough.
  */
 const TMUX_PASSTHROUGH_VARS = [
+  'BOTMUX',
   'LARK_APP_ID',
   'LARK_APP_SECRET',
   '__OWNER_OPEN_ID',

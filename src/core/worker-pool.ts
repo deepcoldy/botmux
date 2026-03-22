@@ -124,10 +124,10 @@ export function ensureMcpConfig(cliId: CliId, cliPathOverride?: string): void {
     command: 'node',
     args: [serverScript],
     env: {
-      BOTMUX: '1',  // Static flag so MCP server knows it's a botmux session
       SESSION_DATA_DIR: config.session.dataDir,
-      // LARK_APP_ID/SECRET come from worker process env at runtime
-      // (inherited through worker → CLI → MCP server process chain).
+      // BOTMUX flag is NOT set here — it's passed via the worker fork env so
+      // it only reaches MCP servers spawned by botmux, not standalone CLIs.
+      // CLIs that don't inherit env (e.g. Aiden) fall back to PID file detection.
     },
   });
   mcpConfiguredCliIds.add(cliId);
@@ -177,6 +177,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     env: {
       ...process.env,
       CLAUDECODE: undefined,
+      BOTMUX: '1',  // Inherited by CLI → MCP server for session detection
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },

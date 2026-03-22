@@ -25,10 +25,9 @@ export function createServer(): McpServer {
     sessionStore.init(appId);
   }
 
-  // BOTMUX env var is set in the static MCP config (written by ensureMcpConfig),
-  // so it's always available in botmux sessions regardless of env inheritance.
-  // LARK_APP_ID relies on process inheritance (worker → CLI → MCP) which some
-  // CLIs (e.g. Aiden) may not pass through to MCP server subprocesses.
+  // BOTMUX env var is set on the worker fork env and inherited through the
+  // process chain: worker → CLI → MCP server.  For tmux backend, it's
+  // explicitly passed via TMUX_PASSTHROUGH_VARS.
   const isBotmuxSession = process.env.BOTMUX === '1';
 
   const instructions = isBotmuxSession
