@@ -151,6 +151,19 @@ export class TmuxBackend implements SessionBackend {
     });
   }
 
+  getChildPid(): number | null {
+    try {
+      const output = execSync(
+        `tmux list-panes -t ${shellescape(this.sessionName)} -F '#{pane_pid}'`,
+        { encoding: 'utf-8', timeout: 3000 },
+      ).trim();
+      const pid = parseInt(output.split('\n')[0], 10);
+      return pid > 0 ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Detach only — kills the pty viewer but leaves tmux session alive. */
   kill(): void {
     if (this.process) {

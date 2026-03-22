@@ -13,6 +13,8 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
+import { mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from './types.js';
@@ -30,6 +32,7 @@ import * as pty from 'node-pty';
 
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
+let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
@@ -196,6 +199,21 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     env: { ...process.env, CLAUDECODE: undefined } as unknown as Record<string, string>,
   });
 
+  // Write CLI PID marker so the MCP server can verify it was spawned by botmux.
+  // The MCP server checks if process.ppid has a marker in this directory.
+  const cliPid = backend.getChildPid?.();
+  if (cliPid && process.env.SESSION_DATA_DIR) {
+    const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
+    try {
+      mkdirSync(markersDir, { recursive: true });
+      cliPidMarker = join(markersDir, String(cliPid));
+      writeFileSync(cliPidMarker, '');
+      log(`CLI PID marker written: ${cliPid}`);
+    } catch (err: any) {
+      log(`Failed to write CLI PID marker: ${err.message}`);
+    }
+  }
+
   // On tmux re-attach, CLI is already running — don't suppress first prompt
   if (tmuxBe?.isReattach) {
     awaitingFirstPrompt = false;
@@ -224,6 +242,11 @@ function killCli(): void {
   stopScreenUpdates();
   backend?.kill();
   backend = null;
+  // Clean up CLI PID marker
+  if (cliPidMarker) {
+    try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
+    cliPidMarker = null;
+  }
   isPromptReady = false;
   pendingMessages.length = 0;
   scrollback = '';

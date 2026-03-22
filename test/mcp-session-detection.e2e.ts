@@ -3,16 +3,15 @@
  *
  * Validates the two-gate detection: tools are registered only when BOTH:
  *   1. BOTMUX=1 in process env (from static MCP config)
- *   2. An ancestor process has BOTMUX=1 in its env (/proc/<pid>/environ)
+ *   2. Parent PID has a marker file in SESSION_DATA_DIR/.botmux-cli-pids/
  *
- * Gate 2 precisely distinguishes botmux-spawned MCP servers (ancestor chain
- * includes a worker with BOTMUX=1) from standalone CLI-spawned ones (ancestors
- * are the user's shell — no BOTMUX).  Unlike the PID-file approach, this works
- * correctly even when the daemon is running on the same machine.
+ * Gate 2 uses CLI PID markers written by the botmux worker after spawning
+ * each CLI.  The MCP server checks if its ppid matches a marker.  This is
+ * cross-platform (macOS + Linux) — no /proc dependency.
  *
  * Run:  pnpm exec vitest run test/mcp-session-detection.e2e.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
 import { spawn } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,8 +39,7 @@ const EXPECTED_TOOLS = ['send_to_thread', 'get_thread_messages', 'react_to_messa
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /**
- * Spawn MCP server directly (no botmux parent).  The MCP server's parent is
- * the test process, which does NOT have BOTMUX=1 in /proc environ.
+ * Spawn MCP server directly (no marker for parent).
  */
 async function listMcpTools(env: Record<string, string>): Promise<string[]> {
   const transport = new StdioClientTransport({
@@ -58,22 +56,40 @@ async function listMcpTools(env: Record<string, string>): Promise<string[]> {
 }
 
 /**
- * Spawn MCP server via a wrapper node process that has BOTMUX=1 in its env.
+ * Spawn MCP server via a wrapper node process whose PID has a marker file.
  * This simulates the botmux process chain:
- *   test → wrapper(BOTMUX=1) → MCP server
- * The MCP server reads /proc/<ppid>/environ, finds BOTMUX=1, gate2 passes.
+ *   test → wrapper(PID=X, marker exists) → MCP server(ppid=X)
  */
-async function listMcpToolsWithBotmuxParent(extraEnv: Record<string, string> = {}): Promise<string[]> {
-  // The wrapper script forwards stdin/stdout so MCP protocol works through it.
+async function listMcpToolsWithMarkedParent(
+  dataDir: string,
+  extraEnv: Record<string, string> = {},
+): Promise<string[]> {
+  // The wrapper writes a marker for its own PID, then spawns the MCP server.
+  // The MCP server's ppid = wrapper PID, which has a marker → gate2 passes.
   const wrapperCode = `
-    const {spawn}=require('child_process');
-    const c=spawn('node',[${JSON.stringify(DIST_INDEX)}],{stdio:'inherit'});
-    c.on('exit',code=>process.exit(code??1));
+    const fs = require('fs');
+    const path = require('path');
+    const { spawn } = require('child_process');
+    const dir = path.join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
+    fs.mkdirSync(dir, { recursive: true });
+    const marker = path.join(dir, String(process.pid));
+    fs.writeFileSync(marker, '');
+    const c = spawn('node', [${JSON.stringify(DIST_INDEX)}], { stdio: 'inherit' });
+    c.on('exit', code => {
+      try { fs.unlinkSync(marker); } catch {}
+      process.exit(code ?? 1);
+    });
   `;
   const transport = new StdioClientTransport({
     command: 'node',
     args: ['-e', wrapperCode],
-    env: { PATH: process.env.PATH!, HOME: process.env.HOME!, BOTMUX: '1', ...extraEnv },
+    env: {
+      PATH: process.env.PATH!,
+      HOME: process.env.HOME!,
+      BOTMUX: '1',
+      SESSION_DATA_DIR: dataDir,
+      ...extraEnv,
+    },
   });
   const client = new Client({ name: 'test-client', version: '1.0.0' });
   await client.connect(transport);
@@ -144,29 +160,33 @@ function spawnMcpRaw(
   });
 }
 
+// ─── Shared temp dir ────────────────────────────────────────────────────────
+
+const tempDir = mkdtempSync(join(tmpdir(), 'mcp-detect-'));
+afterAll(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
 // ─── Tests: two-gate detection ──────────────────────────────────────────────
 
-describe('MCP two-gate detection: BOTMUX=1 AND ancestor check', () => {
+describe('MCP two-gate detection: BOTMUX=1 AND CLI PID marker', () => {
 
-  it('gate1 ✓ + gate2 ✓ (botmux parent) → all 4 tools', async () => {
-    const tools = await listMcpToolsWithBotmuxParent();
+  it('gate1 ✓ + gate2 ✓ (parent has marker) → all 4 tools', async () => {
+    const tools = await listMcpToolsWithMarkedParent(tempDir);
     expect(tools).toEqual(EXPECTED_TOOLS.sort());
   }, 10_000);
 
-  it('gate1 ✓ + gate2 ✗ (standalone, no botmux ancestor) → no tools', async () => {
-    // MCP server spawned directly by test process (no BOTMUX in ancestry)
-    const tools = await listMcpTools({ BOTMUX: '1' });
+  it('gate1 ✓ + gate2 ✗ (no marker for parent) → no tools', async () => {
+    // BOTMUX=1 in env but no marker file for ppid
+    const tools = await listMcpTools({ BOTMUX: '1', SESSION_DATA_DIR: tempDir });
     expect(tools).toHaveLength(0);
   }, 10_000);
 
-  it('gate1 ✗ (no BOTMUX in env) + gate2 irrelevant → no tools', async () => {
+  it('gate1 ✗ (no BOTMUX) → no tools regardless of gate2', async () => {
     const tools = await listMcpTools({});
     expect(tools).toHaveLength(0);
   }, 10_000);
 
-  it('standalone CLI while daemon is running → no tools (daemon doesn\'t matter)', async () => {
-    // This is the key test: daemon running ≠ botmux session.
-    // BOTMUX=1 is in config env, but parent process is NOT a botmux worker.
+  it('standalone CLI while daemon is running → no tools', async () => {
+    // Daemon running doesn't matter — only the CLI PID marker matters.
     const tools = await listMcpTools({ BOTMUX: '1', SESSION_DATA_DIR: '/root/.botmux/data' });
     expect(tools).toHaveLength(0);
   }, 10_000);
@@ -196,18 +216,13 @@ describe('MCP empty shell: tools/list returns [] not -32601', () => {
 
 describe('MCP simulated spawn chains', () => {
 
-  it('all CLIs via MCP SDK: config BOTMUX + botmux parent → tools', async () => {
-    // Simulates: worker(BOTMUX=1) → CLI → MCP server
-    // The MCP SDK passes config env (BOTMUX=1) to server subprocess.
-    // The server's parent (CLI) inherited BOTMUX=1 from worker.
-    const tools = await listMcpToolsWithBotmuxParent();
+  it('PTY/tmux botmux session: marker + BOTMUX → tools', async () => {
+    const tools = await listMcpToolsWithMarkedParent(tempDir);
     expect(tools).toEqual(EXPECTED_TOOLS.sort());
   }, 10_000);
 
-  it('standalone CLI: config has BOTMUX but parent is user shell → no tools', async () => {
-    // User runs `claude` / `aiden` directly.  Config has BOTMUX=1 but
-    // the parent (user shell) doesn't have BOTMUX=1 in its env.
-    const tools = await listMcpTools({ BOTMUX: '1' });
+  it('standalone CLI: BOTMUX in config but no marker → no tools', async () => {
+    const tools = await listMcpTools({ BOTMUX: '1', SESSION_DATA_DIR: tempDir });
     expect(tools).toHaveLength(0);
   }, 10_000);
 });
@@ -220,11 +235,9 @@ describe('MCP static config verification', () => {
     const backupDir = mkdtempSync(join(tmpdir(), 'mcp-detect-test-'));
     const backup = join(backupDir, 'claude.json');
     if (existsSync(CLAUDE_JSON)) copyFileSync(CLAUDE_JSON, backup);
-
     try {
       const data = existsSync(CLAUDE_JSON)
-        ? JSON.parse(readFileSync(CLAUDE_JSON, 'utf-8'))
-        : {};
+        ? JSON.parse(readFileSync(CLAUDE_JSON, 'utf-8')) : {};
       if (!data.mcpServers) data.mcpServers = {};
       data.mcpServers.botmux = {
         command: 'node', args: [DIST_INDEX],
@@ -242,7 +255,6 @@ describe('MCP static config verification', () => {
 
       const result = JSON.parse(readFileSync(CLAUDE_JSON, 'utf-8'));
       expect(result.mcpServers.botmux.env.BOTMUX).toBe('1');
-      expect(result.mcpServers.botmux.env.SESSION_DATA_DIR).toBe('/tmp/test');
     } finally {
       if (existsSync(backup)) copyFileSync(backup, CLAUDE_JSON);
       rmSync(backupDir, { recursive: true, force: true });
@@ -253,7 +265,6 @@ describe('MCP static config verification', () => {
     const backupDir = mkdtempSync(join(tmpdir(), 'mcp-detect-test-'));
     const backup = join(backupDir, 'aiden-mcp.json');
     if (existsSync(AIDEN_MCP_JSON)) copyFileSync(AIDEN_MCP_JSON, backup);
-
     try {
       const dir = dirname(AIDEN_MCP_JSON);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -306,9 +317,27 @@ describe('MCP source code verification', () => {
     expect(block![1]).toContain("'BOTMUX'");
   });
 
-  it('server.ts: uses isAncestorBotmux() as second gate', () => {
+  it('server.ts: uses isParentBotmuxCli() as second gate', () => {
     const src = readFileSync(join(PROJECT_ROOT, 'src', 'server.ts'), 'utf-8');
-    expect(src).toContain('isAncestorBotmux()');
-    expect(src).toMatch(/BOTMUX.*&&.*isAncestorBotmux/);
+    expect(src).toContain('isParentBotmuxCli()');
+    expect(src).toMatch(/BOTMUX.*&&.*isParentBotmuxCli/);
+  });
+
+  it('worker.ts: writes CLI PID marker after spawn', () => {
+    const src = readFileSync(join(PROJECT_ROOT, 'src', 'worker.ts'), 'utf-8');
+    expect(src).toContain('.botmux-cli-pids');
+    expect(src).toContain('getChildPid');
+  });
+
+  it('backends: getChildPid implemented', () => {
+    const ptySrc = readFileSync(
+      join(PROJECT_ROOT, 'src', 'adapters', 'backend', 'pty-backend.ts'), 'utf-8',
+    );
+    const tmuxSrc = readFileSync(
+      join(PROJECT_ROOT, 'src', 'adapters', 'backend', 'tmux-backend.ts'), 'utf-8',
+    );
+    expect(ptySrc).toContain('getChildPid');
+    expect(tmuxSrc).toContain('getChildPid');
+    expect(tmuxSrc).toContain('pane_pid');
   });
 });

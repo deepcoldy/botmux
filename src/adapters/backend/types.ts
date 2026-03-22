@@ -16,4 +16,6 @@ export interface SessionBackend {
    *  Called only on explicit /close. Default: same as kill(). */
   destroySession?(): void;
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
+  /** PID of the CLI process running inside the backend. */
+  getChildPid?(): number | null;
 }

@@ -1,39 +1,25 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
 
 /**
- * Walk up the process tree and check whether any ancestor has BOTMUX=1 in
- * its environment.  This precisely distinguishes a botmux-spawned MCP server
- * (whose ancestor chain includes a worker with BOTMUX=1) from a standalone
- * CLI-spawned one (whose ancestors are the user's shell — no BOTMUX).
+ * Check whether the MCP server's parent process (the CLI) was spawned by a
+ * botmux worker.  The worker writes a marker file at
+ *   SESSION_DATA_DIR/.botmux-cli-pids/<cli-pid>
+ * after spawning each CLI.  The MCP server checks if its own ppid has a
+ * corresponding marker.
  *
- * Process chains:
- *   botmux PTY:  daemon → worker(BOTMUX=1) → CLI(inherits) → MCP server
- *   botmux tmux: daemon → worker(BOTMUX=1) → tmux(-e BOTMUX=1) → CLI → MCP server
- *   standalone:  shell → CLI → MCP server  (no BOTMUX anywhere in ancestry)
- *
- * Linux-specific: reads /proc/<pid>/environ (null-byte separated).
+ * Cross-platform: uses only process.ppid + existsSync (no /proc dependency).
  */
-function isAncestorBotmux(): boolean {
-  let pid = process.ppid;
-  for (let depth = 0; depth < 8 && pid > 1; depth++) {
-    try {
-      const environ = readFileSync(`/proc/${pid}/environ`, 'utf-8');
-      if (environ.split('\0').some(e => e === 'BOTMUX=1')) return true;
-      const status = readFileSync(`/proc/${pid}/status`, 'utf-8');
-      const m = status.match(/PPid:\s*(\d+)/);
-      if (!m) break;
-      pid = parseInt(m[1], 10);
-    } catch {
-      break; // process gone or unreadable
-    }
-  }
-  return false;
+function isParentBotmuxCli(): boolean {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir) return false;
+  return existsSync(join(dataDir, '.botmux-cli-pids', String(process.ppid)));
 }
 
 export function createServer(): McpServer {
@@ -63,11 +49,10 @@ export function createServer(): McpServer {
   //     CLI MCP servers (the MCP SDK only passes config env + a 6-var
   //     whitelist to the server subprocess, NOT the full parent env).
   //
-  //  2. isAncestorBotmux() — walks /proc/<pid>/environ up the process tree
-  //     to verify THIS MCP server was actually spawned by a botmux worker.
-  //     A standalone CLI's ancestors (user shell) won't have BOTMUX=1,
-  //     even if a botmux daemon happens to be running on the same machine.
-  const isBotmuxSession = process.env.BOTMUX === '1' && isAncestorBotmux();
+  //  2. isParentBotmuxCli() — checks if the MCP server's parent process
+  //     (the CLI) has a marker file written by the botmux worker.
+  //     Cross-platform: uses process.ppid + existsSync, no /proc needed.
+  const isBotmuxSession = process.env.BOTMUX === '1' && isParentBotmuxCli();
 
   const instructions = isBotmuxSession
     ? [
