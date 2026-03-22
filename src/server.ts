@@ -1,8 +1,41 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
+
+/**
+ * Check if a botmux daemon is currently running by probing PID files in
+ * SESSION_DATA_DIR.  Used as a runtime guard: BOTMUX=1 lives in the static
+ * MCP config (required because the MCP SDK only passes config env to the
+ * server subprocess — it does NOT inherit the full parent env).  The PID
+ * check ensures tools are only registered while a daemon is actually alive,
+ * so standalone CLI sessions after daemon stop don't show stale tools.
+ */
+function isDaemonRunning(): boolean {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir) return false;
+  try {
+    const pidFiles = readdirSync(dataDir).filter(f => /^daemon(-\d+)?\.pid$/.test(f));
+    for (const file of pidFiles) {
+      try {
+        const pid = parseInt(readFileSync(join(dataDir, file), 'utf-8').trim(), 10);
+        if (pid > 0) {
+          process.kill(pid, 0); // signal 0 = existence check
+          return true;
+        }
+      } catch {
+        // PID stale or file unreadable
+      }
+    }
+  } catch {
+    // dataDir unreadable
+  }
+  return false;
+}
 
 export function createServer(): McpServer {
   // Register all bots so MCP tools can send messages as any bot.
@@ -25,10 +58,21 @@ export function createServer(): McpServer {
     sessionStore.init(appId);
   }
 
-  // BOTMUX env var is set on the worker fork env and inherited through the
-  // process chain: worker → CLI → MCP server.  For tmux backend, it's
-  // explicitly passed via TMUX_PASSTHROUGH_VARS.
-  const isBotmuxSession = process.env.BOTMUX === '1';
+  // Two-gate session detection:
+  //
+  //  1. BOTMUX=1 — set in the static MCP config env so it reaches all CLI
+  //     MCP servers (the MCP SDK only passes config env + a short whitelist
+  //     to the server subprocess, NOT the full parent env).
+  //
+  //  2. isDaemonRunning() — verifies a botmux daemon is actually alive via
+  //     PID files in SESSION_DATA_DIR.  This prevents standalone CLI sessions
+  //     (after daemon has stopped) from registering tools just because the
+  //     static BOTMUX=1 flag persists in the config.
+  //
+  // Both gates must pass.  The only "false positive" is a standalone CLI
+  // started while the daemon happens to be running — acceptable because
+  // botmux is actively serving sessions in that scenario.
+  const isBotmuxSession = process.env.BOTMUX === '1' && isDaemonRunning();
 
   const instructions = isBotmuxSession
     ? [
@@ -67,6 +111,10 @@ export function createServer(): McpServer {
       });
     }
   } else {
+    // Declare empty tools capability so CLI clients (e.g. Codex) that call
+    // tools/list during startup don't fail with "Method not found" (-32601).
+    server.server.registerCapabilities({ tools: {} });
+    server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
     logger.info('MCP server: not a botmux session — running as empty shell (no tools, no instructions)');
   }
 
