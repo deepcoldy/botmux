@@ -39,7 +39,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Aiden, CoCo, Gemini, OpenCode) directly. Every CLI upgrade — new tools, stronger reasoning, more MCP support — benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Aiden, CoCo, Gemini, OpenCode) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -50,6 +50,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | Architecture | Bridges full CLI processes directly | Rebuilds on Agent SDK |
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, MCP ecosystem, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
+| Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
 | Multi-CLI Support | 6 CLIs, switch with one config (Claude Code / Codex / Aiden / CoCo / Gemini / OpenCode) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
