@@ -138,7 +138,7 @@ function resolvePostBody(parsed: any): { title: string; content: any[] } {
 function resolveMentions(text: string, mentions?: RawEventData['message']['mentions']): string {
   if (!mentions || mentions.length === 0) {
     // No mention info available — strip placeholders
-    return text.replace(/@_user_\d+/g, '').replace(/\s{2,}/g, ' ').trim();
+    return text.replace(/@_user_\d+/g, '').replace(/[^\S\r\n]{2,}/g, ' ').trim();
   }
   let result = text;
   for (const m of mentions) {
@@ -157,13 +157,18 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       const parsed = JSON.parse(rawContent);
       const { title, content } = resolvePostBody(parsed);
       const body = content
-        .flat()
-        .filter((node: any) => node.tag === 'text' || node.tag === 'a' || node.tag === 'at')
-        .map((node: any) => {
-          if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
-          return node.text ?? node.href ?? '';
+        .map((paragraph: any[]) => {
+          const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
+          return nodes
+            .filter((node: any) => node.tag === 'text' || node.tag === 'a' || node.tag === 'at')
+            .map((node: any) => {
+              if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
+              return node.text ?? node.href ?? '';
+            })
+            .join('');
         })
-        .join('');
+        .filter(Boolean)
+        .join('\n');
       return title ? `${title}\n${body}` : body;
     }
     if (msgType === 'image') {
