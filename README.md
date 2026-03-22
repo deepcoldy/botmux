@@ -29,6 +29,10 @@
 |:-:|:-:|:-:|
 | <img src="gif/fold&unfold.gif" width="280" /> | <img src="gif/web_terminal.gif" width="280" /> | <img src="gif/tmux.gif" width="280" /> |
 
+| 多机器人协作（赛博斗蛐蛐） |
+|:-:|
+| <img src="docs/setup/multi-bot-collab.png" width="600" /> |
+
 <details>
 <summary>完整演示视频</summary>
 

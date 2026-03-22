@@ -27,6 +27,10 @@
 |:-:|:-:|:-:|
 | <img src="gif/fold&unfold.gif" width="280" /> | <img src="gif/web_terminal.gif" width="280" /> | <img src="gif/tmux.gif" width="280" /> |
 
+| Multi-Bot Collaboration |
+|:-:|
+| <img src="docs/setup/multi-bot-collab.png" width="600" /> |
+
 <details>
 <summary>Full demo video</summary>
 
