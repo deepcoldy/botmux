@@ -877,6 +877,9 @@ async function cmdList(): Promise<void> {
     console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已死且无 tmux session）`);
   }
 
+  // Sort by creation time, newest first
+  live.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
   if (live.length === 0) {
     console.log('没有活跃会话。');
     return;
