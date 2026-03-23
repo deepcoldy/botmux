@@ -35,7 +35,7 @@ export function buildSessionCard(
   const actions: any[] = [
     {
       tag: 'button',
-      text: { tag: 'plain_text', content: '🖥️ 打开终端' },
+      text: { tag: 'plain_text', content: showManageButtons ? '🖥️ 打开可操作终端' : '🖥️ 打开终端' },
       type: 'primary',
       multi_url: {
         url: terminalUrl,
