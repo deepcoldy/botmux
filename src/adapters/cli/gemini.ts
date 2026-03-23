@@ -66,9 +66,7 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Ink TUI — '>' is too generic; rely on quiescence + spinner guard
-    systemHints: [
-      '消息可能包含 attachments，每个有 path 字段，用 Read 工具查看',
-    ],
+    systemHints: [],
     altScreen: true,                // Ink renders in alternate screen buffer by default
   };
 }

@@ -73,7 +73,6 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       '用 send_to_thread 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。消息里有 session_id，调用时传回。',
       '用 react_to_message 确认收到消息（如 THUMBSUP、OnIt）。',
       '需要上下文时用 get_thread_messages 读取之前的对话。',
-      '消息可能包含 attachments，每个有 path 字段，用 Read 工具查看',
     ],
     altScreen: false,
   };

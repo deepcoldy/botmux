@@ -80,9 +80,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Bubble Tea TUI — no reliable prompt indicator; rely on quiescence + spinner guard
-    systemHints: [
-      '消息可能包含 attachments，每个有 path 字段，用相关的文件读取工具查看',
-    ],
+    systemHints: [],
     altScreen: true,                // Bubble Tea renders in alternate screen buffer
   };
 }

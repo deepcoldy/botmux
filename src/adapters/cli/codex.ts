@@ -54,9 +54,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
-    systemHints: [
-      '消息可能包含 attachments，每个有 path 字段，用 file_read 工具查看',
-    ],
+    systemHints: [],
     altScreen: false,   // --no-alt-screen disables alternate screen
   };
 }
