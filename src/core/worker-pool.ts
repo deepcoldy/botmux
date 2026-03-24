@@ -9,8 +9,6 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
-import { updateMessage, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildSessionCard } from '../im/lark/card-builder.js';
 import { getCliDisplayName } from '../utils/cli-display.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -31,6 +29,14 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Update (PATCH) an existing IM message (e.g. card). */
+  updateMessage: (imBotId: string, messageId: string, content: string) => Promise<void>;
+  /** Check whether an error represents a withdrawn/deleted message in the IM platform. */
+  isMessageWithdrawn: (err: unknown) => boolean;
+  /** Build a streaming card JSON string for live CLI output. */
+  buildStreamingCard: (sessionId: string, rootMessageId: string, terminalUrl: string, title: string, content: string, status: 'starting' | 'working' | 'idle', cliId: string, expanded?: boolean, nonce?: string) => string;
+  /** Build a static session card JSON string with terminal link + action buttons. */
+  buildSessionCard: (sessionId: string, rootMessageId: string, terminalUrl: string, title: string, cliId: string) => string;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -85,9 +91,10 @@ function flushCardPatch(ds: DaemonSession): void {
   }
   ds.pendingCardJson = undefined;
   ds.cardPatchInFlight = true;
-  updateMessage(ds.imBotId, cardId, json)
+  const cb = requireCallbacks();
+  cb.updateMessage(ds.imBotId, cardId, json)
     .catch(err => {
-      if (err instanceof MessageWithdrawnError) {
+      if (cb.isMessageWithdrawn(err)) {
         logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
         ds.streamCardId = undefined;
         return;
@@ -234,7 +241,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
           const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
-          const streamCardJson = buildStreamingCard(
+          const streamCardJson = cb.buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,
             readOnlyUrl,
@@ -247,7 +254,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.imBotId);
         } catch (err) {
-          if (err instanceof MessageWithdrawnError) {
+          if (cb.isMessageWithdrawn(err)) {
             logger.warn(`[${t}] Root message withdrawn, closing stale session`);
             killWorker(ds);
             cb.closeSession(ds);
@@ -258,7 +265,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           ds.streamCardId = undefined;
           // Fallback: send static session card
           try {
-            const cardJson = buildSessionCard(
+            const cardJson = cb.buildSessionCard(
               ds.session.sessionId,
               ds.session.rootMessageId,
               readOnlyUrl,
@@ -267,7 +274,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             );
             await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.imBotId);
           } catch (fallbackErr) {
-            if (fallbackErr instanceof MessageWithdrawnError) {
+            if (cb.isMessageWithdrawn(fallbackErr)) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
               killWorker(ds);
               cb.closeSession(ds);
@@ -301,7 +308,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           // New turn — create a fresh card, old card freezes at its last state.
           // Generate new nonce so old card buttons are distinguishable.
           ds.streamCardNonce = randomBytes(4).toString('hex');
-          const cardJson = buildStreamingCard(
+          const cardJson = cb.buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,
             readUrl,
@@ -319,7 +326,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.imBotId)
             .then(msgId => { ds.streamCardId = msgId; })
             .catch(err => {
-              if (err instanceof MessageWithdrawnError) {
+              if (cb.isMessageWithdrawn(err)) {
                 logger.warn(`[${t}] Root message withdrawn, closing stale session`);
                 killWorker(ds);
                 cb.closeSession(ds);
@@ -330,7 +337,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             });
         } else {
           // Same turn — queue PATCH (serialized, latest-wins), reuse existing nonce
-          const cardJson = buildStreamingCard(
+          const cardJson = cb.buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,
             readUrl,
@@ -365,7 +372,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           if (ds.streamCardId && ds.workerPort) {
             const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
-            const frozenCard = buildStreamingCard(
+            const frozenCard = cb.buildStreamingCard(
               ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
             );
@@ -377,7 +384,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           try {
             await cb.sessionReply(ds.session.rootMessageId, `⚠️ ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.imBotId);
           } catch (replyErr) {
-            if (replyErr instanceof MessageWithdrawnError) {
+            if (cb.isMessageWithdrawn(replyErr)) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
               cb.closeSession(ds);
             }
