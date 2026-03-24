@@ -650,18 +650,38 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const imBotId = bot.imBotId;
       const imHandler: import('./im/types.js').ImEventHandler = {
         async onNewTopic(msg, chatId, chatType) {
-          // WeChat messages arrive as ImMessage; wrap into the Lark-style handler path
-          // by constructing a synthetic "parsed" + calling the same session creation logic.
           const content = msg.content.trim();
           const botCfg = getBot(imBotId).config;
+          const rootId = `wx-${msg.senderId}`;
+          const sk = sessionKey(rootId, imBotId);
+
+          // Reuse existing active session for this user (WeChat = one session per user)
+          const existing = activeSessions.get(sk);
+          if (existing) {
+            // Register in poller (may be missing after daemon restart) and route as reply
+            const wxAdapter = adapter as import('./im/weixin/adapter.js').WeixinImAdapter;
+            wxAdapter.getPoller()?.registerSession(msg.senderId, sk);
+            // Update contextToken
+            const ct = wxAdapter.getPoller()?.getContextToken(msg.senderId);
+            if (ct) {
+              existing.session.weixinContextToken = ct;
+              sessionStore.updateSession(existing.session);
+            }
+            await imHandler.onThreadReply(msg, sk);
+            return;
+          }
 
           refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
-          // Use senderId as rootMessageId (WeChat has no thread, one session per user)
-          const rootId = `wx-${msg.senderId}`;
+          // Close any previous sessions for this rootId (one active session per user)
+          for (const s of sessionStore.listSessions()) {
+            if (s.rootMessageId === rootId && s.status === 'active') {
+              sessionStore.closeSession(s.sessionId);
+            }
+          }
+
           const session = sessionStore.createSession(chatId, rootId, content.substring(0, 50), chatType);
           session.imBotId = imBotId;
-          // Persist WeChat context for MCP tools (runs in separate process without poller)
           const wxPoller = (adapter as import('./im/weixin/adapter.js').WeixinImAdapter).getPoller?.();
           session.weixinUserId = msg.senderId;
           session.weixinContextToken = wxPoller?.getContextToken(msg.senderId) ?? '';
@@ -689,14 +709,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             currentTurnTitle: content.substring(0, 50),
             nonStreamingIm: true,
           };
-          activeSessions.set(sessionKey(rootId, imBotId), ds);
+          activeSessions.set(sk, ds);
 
           const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride);
           forkWorker(ds, prompt);
 
-          // Register session in adapter's poller so replies route correctly
-          const wxAdapter = adapter as import('./im/weixin/adapter.js').WeixinImAdapter;
-          wxAdapter.getPoller()?.registerSession(msg.senderId, sessionKey(rootId, imBotId));
+          // Register session in poller so subsequent messages route to onThreadReply
+          wxPoller?.registerSession(msg.senderId, sk);
 
           logger.info(`[weixin] New session ${session.sessionId.substring(0, 8)} for user ${msg.senderId.substring(0, 16)}`);
         },
@@ -755,7 +774,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         },
       };
 
-      adapter.start(imHandler).catch(err => {
+      adapter.start(imHandler).then(() => {
+        // After poller starts, register any restored active sessions so
+        // subsequent messages route to onThreadReply instead of onNewTopic
+        const wxAdapter = adapter as import('./im/weixin/adapter.js').WeixinImAdapter;
+        const poller = wxAdapter.getPoller?.();
+        if (poller) {
+          for (const [sk, ds] of activeSessions) {
+            if (ds.imBotId === imBotId && ds.session.weixinUserId) {
+              poller.registerSession(ds.session.weixinUserId, sk);
+              logger.info(`[weixin] Restored poller mapping for user ${ds.session.weixinUserId.substring(0, 16)}`);
+            }
+          }
+        }
+      }).catch(err => {
         logger.error(`[${bot.imBotId}] Adapter start failed: ${err.message}`);
       });
     }
