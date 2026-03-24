@@ -235,17 +235,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
 
         if (ds.nonStreamingIm) {
-          // Send one-time welcome message with terminal URL
-          const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
-          const sessionCard = cb.buildSessionCard(
-            ds.session.sessionId, ds.session.rootMessageId, readOnlyUrl, initTitle, botCfg.cliId,
-          );
-          if (sessionCard) {
-            cb.sessionReply(ds.session.rootMessageId, sessionCard, 'interactive', ds.imBotId)
-              .catch(err => logger.debug(`[${t}] Failed to send welcome: ${err}`));
-          }
-          // Suppress the initial idle (CLI startup) — reset when new message arrives
-          ds.finalOutputSent = true;
+          // Non-streaming IM (WeChat): send a brief acknowledgment with terminal link.
+          // All subsequent replies come from CLI via MCP send_to_thread.
+          const ack = `✦ 收到，正在处理...\n🔗 终端: ${readOnlyUrl}`;
+          cb.sessionReply(ds.session.rootMessageId, ack, 'text', ds.imBotId)
+            .catch(err => logger.debug(`[${t}] Failed to send ack: ${err}`));
           break;
         }
 
@@ -316,8 +310,6 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(botCfg.cliId)} is ready for input`);
-        // For non-streaming IMs: CLI is about to process input, allow next idle to send
-        if (ds.nonStreamingIm) ds.finalOutputSent = false;
         break;
       }
 
@@ -326,24 +318,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = msg.status;
 
-        // Non-streaming IM: only send final output on first idle, skip everything else
-        if (ds.nonStreamingIm) {
-          if (msg.status === 'idle' && !ds.finalOutputSent) {
-            ds.finalOutputSent = true;
-            const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
-            const cardJson = cb.buildStreamingCard(
-              ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
-              msg.content, 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
-            );
-            if (cardJson) {
-              cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.imBotId)
-                .catch(err => logger.debug(`[${t}] Failed to send final output: ${err}`));
-            }
-          }
-          // Reset finalOutputSent when a new turn starts (worker receives new input)
-          break;
-        }
+        // Non-streaming IM (WeChat): skip all screen_update processing.
+        // Message replies are handled by CLI via MCP send_to_thread tool.
+        if (ds.nonStreamingIm) break;
 
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
