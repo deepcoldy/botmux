@@ -3,10 +3,16 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from './adapters/cli/types.js';
+import type { ImAdapter } from './im/types.js';
 
-export interface BotConfig {
-  larkAppId: string;
-  larkAppSecret: string;
+// ─── IM identifier ───────────────────────────────────────────────────────────
+
+export type ImId = 'lark' | 'weixin';
+
+// ─── Bot config types ────────────────────────────────────────────────────────
+
+export interface BotConfigBase {
+  im: ImId;
   cliId: CliId;
   cliPathOverride?: string;
   backendType?: 'pty' | 'tmux';
@@ -16,20 +22,38 @@ export interface BotConfig {
   projectScanDir?: string;
 }
 
+export interface LarkBotConfig extends BotConfigBase {
+  im: 'lark';
+  larkAppId: string;
+  larkAppSecret: string;
+}
+
+export interface WeixinBotConfig extends BotConfigBase {
+  im: 'weixin';
+}
+
+export type BotConfig = LarkBotConfig | WeixinBotConfig;
+
+// ─── Bot state ───────────────────────────────────────────────────────────────
+
 export interface BotState {
   config: BotConfig;
-  client: Lark.Client;
-  botOpenId?: string;
-  botName?: string;       // Lark app display name (from /bot/v3/info)
+  imBotId: string;               // larkAppId for Lark, 'weixin-<cliId>' for WeChat
+  adapter?: ImAdapter;           // set after adapter creation
+  botUserId?: string;            // was: botOpenId
+  botName?: string;              // IM app display name
   resolvedAllowedUsers: string[];
 }
 
 const bots = new Map<string, BotState>();
 
+// ─── Lark client storage ─────────────────────────────────────────────────────
+// Used by im/lark/client.ts functions that take appId
+
 // Provide a custom logger that writes to stderr.
 // The default Lark SDK logger uses console.log (stdout), which corrupts
 // MCP stdio protocol when the server is spawned as an MCP child process.
-const stderrLogger = {
+export const stderrLogger = {
   error: (...msg: any[]) => { process.stderr.write(`[lark:error] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
   warn:  (...msg: any[]) => { process.stderr.write(`[lark:warn] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
   info:  (...msg: any[]) => { process.stderr.write(`[lark:info] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
@@ -37,31 +61,38 @@ const stderrLogger = {
   trace: (...msg: any[]) => { process.stderr.write(`[lark:trace] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
 };
 
+const larkClients = new Map<string, Lark.Client>();
+
+export function registerLarkClient(appId: string, client: Lark.Client): void {
+  larkClients.set(appId, client);
+}
+
+// Keep getBotClient working — it's called by every function in im/lark/client.ts
+export function getBotClient(appId: string): Lark.Client {
+  const c = larkClients.get(appId);
+  if (!c) throw new Error(`Lark client not registered: ${appId}`);
+  return c;
+}
+
+// ─── Bot registration ────────────────────────────────────────────────────────
+
 export function registerBot(cfg: BotConfig): BotState {
-  const client = new Lark.Client({
-    appId: cfg.larkAppId,
-    appSecret: cfg.larkAppSecret,
-    logger: stderrLogger,
-  });
+  const imBotId = cfg.im === 'lark' ? cfg.larkAppId : `weixin-${cfg.cliId}`;
   const state: BotState = {
     config: cfg,
-    client,
+    imBotId,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
   };
-  bots.set(cfg.larkAppId, state);
+  bots.set(imBotId, state);
   return state;
 }
 
-export function getBot(larkAppId: string): BotState {
-  const state = bots.get(larkAppId);
+export function getBot(imBotId: string): BotState {
+  const state = bots.get(imBotId);
   if (!state) {
-    throw new Error(`Bot not registered: ${larkAppId}`);
+    throw new Error(`Bot not registered: ${imBotId}`);
   }
   return state;
-}
-
-export function getBotClient(larkAppId: string): Lark.Client {
-  return getBot(larkAppId).client;
 }
 
 export function getAllBots(): BotState[] {
@@ -111,12 +142,7 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i];
-    if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
-      throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
-    }
-    if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
-      throw new Error(`Bot config [${i}]: larkAppSecret is required and must be a string`);
-    }
+    const im: ImId = entry.im ?? 'lark';
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
     let workingDirs = entry.workingDirs;
@@ -124,17 +150,39 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
       workingDirs = String(entry.workingDir).split(',').map((s: string) => s.trim()).filter(Boolean);
     }
 
-    configs.push({
-      larkAppId: entry.larkAppId,
-      larkAppSecret: entry.larkAppSecret,
-      cliId: entry.cliId ?? 'claude-code',
-      cliPathOverride: entry.cliPathOverride,
-      backendType: entry.backendType,
-      workingDir: workingDirs?.[0] ?? entry.workingDir,
-      workingDirs,
-      allowedUsers: entry.allowedUsers,
-      projectScanDir: entry.projectScanDir,
-    });
+    if (im === 'lark') {
+      if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
+        throw new Error(`Bot config [${i}]: larkAppId is required for lark bots`);
+      }
+      if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
+        throw new Error(`Bot config [${i}]: larkAppSecret is required for lark bots`);
+      }
+      configs.push({
+        im: 'lark',
+        larkAppId: entry.larkAppId,
+        larkAppSecret: entry.larkAppSecret,
+        cliId: entry.cliId ?? 'claude-code',
+        cliPathOverride: entry.cliPathOverride,
+        backendType: entry.backendType,
+        workingDir: workingDirs?.[0] ?? entry.workingDir,
+        workingDirs,
+        allowedUsers: entry.allowedUsers,
+        projectScanDir: entry.projectScanDir,
+      });
+    } else if (im === 'weixin') {
+      configs.push({
+        im: 'weixin',
+        cliId: entry.cliId ?? 'claude-code',
+        cliPathOverride: entry.cliPathOverride,
+        backendType: entry.backendType,
+        workingDir: workingDirs?.[0] ?? entry.workingDir,
+        workingDirs,
+        allowedUsers: entry.allowedUsers,
+        projectScanDir: entry.projectScanDir,
+      });
+    } else {
+      throw new Error(`Bot config [${i}]: unknown im type '${im}'`);
+    }
   }
 
   return configs;

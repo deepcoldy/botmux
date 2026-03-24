@@ -13,18 +13,21 @@ export interface Session {
   imBotId?: string;
 }
 
+/** @deprecated Use from src/im/lark/types.ts */
 export interface LarkAttachment {
   type: 'image' | 'file';
   path: string;       // 本地文件绝对路径
   name: string;       // 文件名
 }
 
+/** @deprecated Use from src/im/lark/types.ts */
 export interface LarkMention {
   key: string;        // e.g. "@_user_1"
   name: string;       // display name
   openId?: string;    // open_id of the mentioned user/bot
 }
 
+/** @deprecated Use from src/im/lark/types.ts */
 export interface LarkMessage {
   messageId: string;
   rootId: string;

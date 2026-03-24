@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename } from 'node:path';
-import { getBotClient, getAllBots } from '../../bot-registry.js';
+import { getBotClient, getAllBots, type LarkBotConfig } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 
 // ─── Error types ──────────────────────────────────────────────────────────────
@@ -331,19 +331,22 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
 export async function listChatBotMembers(_larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
   const allBots = getAllBots();
   const results = await Promise.all(
-    allBots.map(async (bot) => {
-      try {
-        const res = await (bot.client as any).im.v1.chatMembers.isInChat({
-          path: { chat_id: chatId },
-        });
-        if (res.code === 0 && res.data?.is_in_chat) {
-          return { openId: bot.botOpenId!, name: bot.botName ?? bot.config.cliId };
+    allBots
+      .filter(bot => bot.config.im === 'lark')
+      .map(async (bot) => {
+        try {
+          const client = getBotClient((bot.config as LarkBotConfig).larkAppId);
+          const res = await (client as any).im.v1.chatMembers.isInChat({
+            path: { chat_id: chatId },
+          });
+          if (res.code === 0 && res.data?.is_in_chat) {
+            return { openId: bot.botUserId!, name: bot.botName ?? bot.config.cliId };
+          }
+        } catch (err) {
+          logger.debug(`isInChat check failed for ${bot.imBotId}: ${err}`);
         }
-      } catch (err) {
-        logger.debug(`isInChat check failed for ${bot.config.larkAppId}: ${err}`);
-      }
-      return null;
-    }),
+        return null;
+      }),
   );
   return results.filter((r): r is { openId: string; name: string } => r !== null && !!r.openId);
 }

@@ -1,4 +1,4 @@
-import type { LarkMessage, LarkMention } from '../../types.js';
+import type { LarkMessage, LarkMention } from './types.js';
 import { logger } from '../../utils/logger.js';
 
 // Event data structure from WSClient im.message.receive_v1

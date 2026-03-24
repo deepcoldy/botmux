@@ -65,7 +65,7 @@ async function sessionReply(rootId: string, content: string, msgType: string = '
       if (s.session.rootMessageId === rootId) { ds = s; break; }
     }
   }
-  const appId = imBotId ?? ds?.imBotId ?? getAllBots()[0]?.config.larkAppId;
+  const appId = imBotId ?? ds?.imBotId ?? getAllBots()[0]?.imBotId;
   if (!appId) throw new Error('No bot configured');
   const inThread = ds?.chatType === 'p2p';
   return replyMessage(appId, rootId, content, msgType, inThread);
@@ -420,18 +420,18 @@ interface BotMentionSignal {
 
 function processBotMentionSignal(signal: BotMentionSignal): void {
   // Find the target bot by open_id
-  const targetBot = getAllBots().find(b => b.botOpenId === signal.targetBotOpenId);
+  const targetBot = getAllBots().find(b => b.botUserId === signal.targetBotOpenId);
   if (!targetBot) {
     logger.debug(`[bot-mention] No bot found for open_id ${signal.targetBotOpenId}`);
     return;
   }
 
-  const targetAppId = targetBot.config.larkAppId;
+  const targetAppId = targetBot.imBotId;
   const ds = activeSessions.get(sessionKey(signal.rootMessageId, targetAppId));
 
   if (ds && ds.worker && !ds.worker.killed) {
     // Target bot has an active session in this thread — send the message
-    const senderBot = getAllBots().find(b => b.config.larkAppId === signal.senderAppId);
+    const senderBot = getAllBots().find(b => b.imBotId === signal.senderAppId);
     const senderName = senderBot?.botName ?? (senderBot ? getCliDisplayName(senderBot.config.cliId) : 'Bot');
     const enrichedContent = `[来自 ${senderName} 的 @mention]\n${signal.content}`;
     ds.lastMessageAt = Date.now();
@@ -495,9 +495,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
   }
   const cfg = botConfigs[idx];
-  registerBot(cfg);
-  sessionStore.init(cfg.larkAppId);
-  logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
+  const botState = registerBot(cfg);
+  sessionStore.init(botState.imBotId);
+  logger.info(`Bot ${idx}/${botConfigs.length}: ${botState.imBotId} (cli: ${cfg.cliId})`)
 
   writePidFile();
 
@@ -520,42 +520,45 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Refresh CLI version per bot's cliId
     refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
 
-    // Resolve allowed users per bot
-    if (bot.resolvedAllowedUsers.length > 0) {
+    // Resolve allowed users per bot (Lark-specific: email → open_id resolution)
+    if (bot.resolvedAllowedUsers.length > 0 && cfg.im === 'lark') {
       const hasEmails = bot.resolvedAllowedUsers.some(u => u.includes('@'));
       if (hasEmails) {
         try {
           bot.resolvedAllowedUsers = await resolveAllowedUsers(cfg.larkAppId, bot.resolvedAllowedUsers);
-          logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
+          logger.info(`[${bot.imBotId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
         } catch (err: any) {
-          logger.warn(`[${cfg.larkAppId}] Failed to resolve allowedUsers: ${err.message}`);
+          logger.warn(`[${bot.imBotId}] Failed to resolve allowedUsers: ${err.message}`);
         }
       }
     }
 
-    // Probe bot open_id and persist to bots-info.json
-    probeBotOpenId(cfg.larkAppId).then(() => {
-      writeBotInfoFile(config.session.dataDir);
-    }).catch(err => {
-      logger.warn(`[${cfg.larkAppId}] Bot open_id probe failed: ${err.message}`);
-    });
+    // Lark-specific initialization
+    if (cfg.im === 'lark') {
+      // Probe bot open_id and persist to bots-info.json
+      probeBotOpenId(cfg.larkAppId).then(() => {
+        writeBotInfoFile(config.session.dataDir);
+      }).catch(err => {
+        logger.warn(`[${bot.imBotId}] Bot open_id probe failed: ${err.message}`);
+      });
 
-    // Start event dispatcher for this bot
-    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
-      handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
-      handleNewTopic: (data, chatId, messageId, chatType, appId) =>
-        handleNewTopic(data, chatId, messageId, chatType, appId),
-      handleThreadReply: (data, rootId, appId) =>
-        handleThreadReply(data, rootId, appId),
-      isSessionOwner: (rootId, appId) => {
-        if (!activeSessions.has(sessionKey(rootId, appId))) return false;
-        // Only grant shortcut if no other bot also has a session for this rootId
-        for (const s of activeSessions.values()) {
-          if (s.session.rootMessageId === rootId && s.imBotId !== appId) return false;
-        }
-        return true;
-      },
-    });
+      // Start event dispatcher for this bot
+      startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
+        handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
+        handleNewTopic: (data, chatId, messageId, chatType, appId) =>
+          handleNewTopic(data, chatId, messageId, chatType, appId),
+        handleThreadReply: (data, rootId, appId) =>
+          handleThreadReply(data, rootId, appId),
+        isSessionOwner: (rootId, appId) => {
+          if (!activeSessions.has(sessionKey(rootId, appId))) return false;
+          // Only grant shortcut if no other bot also has a session for this rootId
+          for (const s of activeSessions.values()) {
+            if (s.session.rootMessageId === rootId && s.imBotId !== appId) return false;
+          }
+          return true;
+        },
+      });
+    }
   }
 
   // Restore active sessions from previous run

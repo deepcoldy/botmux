@@ -113,13 +113,13 @@ export async function getAvailableBots(
 ): Promise<Array<{ name: string; openId: string; cliId?: string }>> {
   try {
     const currentBot = getBot(currentAppId);
-    const myOpenId = currentBot.botOpenId;
+    const myOpenId = currentBot.botUserId;
     const chatBots = await listChatBotMembers(currentAppId, chatId);
 
     // Build a lookup from openId → registered bot for cliId enrichment
     const registeredByOpenId = new Map<string, string>();
     for (const b of getAllBots()) {
-      if (b.botOpenId) registeredByOpenId.set(b.botOpenId, b.config.cliId);
+      if (b.botUserId) registeredByOpenId.set(b.botUserId, b.config.cliId);
     }
 
     return chatBots
@@ -205,7 +205,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   for (const session of active) {
     messageQueue.ensureQueue(session.rootMessageId);
 
-    const imBotId = session.imBotId ?? getAllBots()[0]?.config.larkAppId ?? '';
+    const imBotId = session.imBotId ?? getAllBots()[0]?.imBotId ?? '';
     activeSessions.set(sessionKey(session.rootMessageId, imBotId), {
       session,
       worker: null,
@@ -247,7 +247,7 @@ export async function executeScheduledTask(
 ): Promise<void> {
   const defaultBot = getAllBots()[0];
   if (!defaultBot) { logger.warn('No bots configured, skipping scheduled task'); return; }
-  const imBotId = defaultBot.config.larkAppId;
+  const imBotId = defaultBot.imBotId;
 
   const { sendMessage } = await import('../im/lark/client.js');
 

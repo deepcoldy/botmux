@@ -14,15 +14,15 @@ import { logger } from '../../utils/logger.js';
 
 /** Set the bot's open_id. Callers should also call writeBotInfoFile() to persist. */
 export function setBotOpenId(larkAppId: string, id: string): void {
-  getBot(larkAppId).botOpenId = id;
+  getBot(larkAppId).botUserId = id;
 }
 
 /** Persist bot registry info to disk for MCP subprocesses to read. */
 export function writeBotInfoFile(dataDir: string): void {
   const bots = getAllBots();
   const info = bots.map(b => ({
-    larkAppId: b.config.larkAppId,
-    botOpenId: b.botOpenId ?? null,
+    larkAppId: b.config.im === 'lark' ? b.config.larkAppId : b.imBotId,
+    botOpenId: b.botUserId ?? null,
     botName: b.botName ?? null,
     cliId: b.config.cliId,
   }));
@@ -36,7 +36,8 @@ export function writeBotInfoFile(dataDir: string): void {
  */
 export async function probeBotOpenId(larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
-  if (bot.botOpenId) return; // already known
+  if (bot.botUserId) return; // already known
+  if (bot.config.im !== 'lark') throw new Error(`probeBotOpenId called for non-lark bot: ${larkAppId}`);
 
   // Call /bot/v3/info to get the bot's open_id using tenant_access_token
   const tokenRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
@@ -60,9 +61,9 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   const openId = botData.bot?.open_id;
   const appName = botData.bot?.app_name;
   if (openId) {
-    bot.botOpenId = openId;
+    bot.botUserId = openId;
     if (appName) bot.botName = appName;
-    logger.info(`Bot open_id: ${bot.botOpenId}`);
+    logger.info(`Bot open_id: ${bot.botUserId}`);
   } else {
     throw new Error('No open_id in bot info response');
   }
@@ -111,7 +112,7 @@ export async function getGroupBotCount(larkAppId: string, chatId: string): Promi
 
 /** Check if the bot was @mentioned in this message */
 export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: string | undefined): boolean {
-  const botOpenId = getBot(larkAppId).botOpenId;
+  const botOpenId = getBot(larkAppId).botUserId;
   if (!botOpenId) {
     logger.warn('Bot open_id unknown, cannot check @mentions');
     return false;
