@@ -16,7 +16,8 @@ import { sessionKey } from './core/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildRepoSelectCard, buildStreamingCard } from './im/lark/card-builder.js';
+import { getCliDisplayName } from './utils/cli-display.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,

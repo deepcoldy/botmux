@@ -1,18 +1,7 @@
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId } from '../../adapters/cli/types.js';
-
-const cliDisplayNames: Record<CliId, string> = {
-  'claude-code': 'Claude',
-  'aiden': 'Aiden',
-  'coco': 'CoCo',
-  'codex': 'Codex',
-  'gemini': 'Gemini',
-  'opencode': 'OpenCode',
-};
-
-export function getCliDisplayName(cliId: CliId): string {
-  return cliDisplayNames[cliId] ?? cliId;
-}
+import { getCliDisplayName } from '../../utils/cli-display.js';
+export { getCliDisplayName } from '../../utils/cli-display.js';
 
 /** Escape Lark markdown special characters in user-controlled strings. */
 function escapeMd(s: string): string {
