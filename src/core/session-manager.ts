@@ -34,9 +34,9 @@ export type DownloadResourceFn = (
   imBotId: string,
   messageId: string,
   resourceKey: string,
-  resourceType: string,
+  resourceType: 'image' | 'file',
   savePath: string,
-) => Promise<string>;
+) => Promise<string | void>;
 
 /** Callback to list bot members of a chat. */
 export type ListChatBotsFn = (

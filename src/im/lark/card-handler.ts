@@ -5,7 +5,7 @@
  */
 import { config } from '../../config.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
-import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
+import { sendUserMessage, updateMessage, deleteMessage, listChatBotMembers } from './client.js';
 import { buildSessionCard, buildStreamingCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
@@ -176,7 +176,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           botCfg.cliPathOverride,
           ds.pendingAttachments,
           ds.pendingMentions,
-          await getAvailableBots(ds.imBotId, ds.chatId),
+          await getAvailableBots(ds.imBotId, ds.chatId, listChatBotMembers),
         );
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
@@ -237,7 +237,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       botCfg.cliPathOverride,
       targetDs.pendingAttachments,
       targetDs.pendingMentions,
-      await getAvailableBots(targetDs.imBotId, targetDs.chatId),
+      await getAvailableBots(targetDs.imBotId, targetDs.chatId, listChatBotMembers),
     );
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;

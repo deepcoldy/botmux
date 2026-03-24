@@ -3,7 +3,14 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, watch, 
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { config } from './config.js';
-import { replyMessage, resolveAllowedUsers } from './im/lark/client.js';
+import {
+  replyMessage,
+  resolveAllowedUsers,
+  downloadMessageResource,
+  listChatBotMembers,
+  sendMessage as larkSendMessage,
+  MessageWithdrawnError,
+} from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
@@ -16,7 +23,11 @@ import { sessionKey } from './core/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildRepoSelectCard, buildStreamingCard } from './im/lark/card-builder.js';
+import {
+  buildRepoSelectCard,
+  buildStreamingCard as larkBuildStreamingCard,
+  buildSessionCard as larkBuildSessionCard,
+} from './im/lark/card-builder.js';
 import { getCliDisplayName } from './utils/cli-display.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -158,6 +169,12 @@ const commandDeps: CommandHandlerDeps = {
   sessionReply,
   getActiveCount,
   lastRepoScan,
+  buildRepoSelectCard,
+  deleteMessage: async (imBotId, messageId) => {
+    const { deleteMessage: larkDelete } = await import('./im/lark/client.js');
+    await larkDelete(imBotId, messageId);
+  },
+  listChatBots: listChatBotMembers,
 };
 
 // Dependencies passed to card-handler
@@ -203,7 +220,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   }
 
   // Download attachments
-  const attachments = await downloadResources(larkAppId, messageId, resources);
+  const attachments = await downloadResources(larkAppId, messageId, resources, downloadMessageResource);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -253,7 +270,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   } else {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId));
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId, listChatBotMembers));
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -290,7 +307,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // Download attachments
   const effectiveAppId = ds?.imBotId ?? larkAppId;
-  const attachments = await downloadResources(effectiveAppId, parsed.messageId, resources);
+  const attachments = await downloadResources(effectiveAppId, parsed.messageId, resources, downloadMessageResource);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -359,7 +376,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     } else {
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId));
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId, listChatBotMembers));
       forkWorker(newDs, prompt);
     }
 
@@ -385,7 +402,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
       const dsBotCfg = getBot(ds.imBotId).config;
       const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
-      const frozenCard = buildStreamingCard(
+      const frozenCard = larkBuildStreamingCard(
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
         ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
       );
@@ -511,6 +528,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       activeSessions.delete(sessionKey(ds.session.rootMessageId, ds.imBotId));
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
+    updateMessage: async (imBotId, messageId, content) => {
+      const { updateMessage: larkUpdate } = await import('./im/lark/client.js');
+      await larkUpdate(imBotId, messageId, content);
+    },
+    isMessageWithdrawn: (err) => err instanceof MessageWithdrawnError,
+    buildStreamingCard: larkBuildStreamingCard,
+    buildSessionCard: larkBuildSessionCard,
   });
 
   // Per-bot initialization
@@ -566,7 +590,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Start scheduled task scheduler (only on bot 0 to avoid duplicates)
   if (idx === 0) {
-    scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
+    scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion, larkSendMessage));
     scheduler.startScheduler();
   }
 

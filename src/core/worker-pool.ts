@@ -34,9 +34,9 @@ export interface WorkerPoolCallbacks {
   /** Check whether an error represents a withdrawn/deleted message in the IM platform. */
   isMessageWithdrawn: (err: unknown) => boolean;
   /** Build a streaming card JSON string for live CLI output. */
-  buildStreamingCard: (sessionId: string, rootMessageId: string, terminalUrl: string, title: string, content: string, status: 'starting' | 'working' | 'idle', cliId: string, expanded?: boolean, nonce?: string) => string;
+  buildStreamingCard: (sessionId: string, rootMessageId: string, terminalUrl: string, title: string, content: string, status: 'starting' | 'working' | 'idle', cliId?: CliId, expanded?: boolean, nonce?: string) => string;
   /** Build a static session card JSON string with terminal link + action buttons. */
-  buildSessionCard: (sessionId: string, rootMessageId: string, terminalUrl: string, title: string, cliId: string) => string;
+  buildSessionCard: (sessionId: string, rootMessageId: string, terminalUrl: string, title: string, cliId?: CliId, showManageButtons?: boolean) => string;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
