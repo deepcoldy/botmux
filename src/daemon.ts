@@ -80,13 +80,13 @@ async function sessionReply(rootId: string, content: string, msgType: string = '
   const botId = imBotId ?? ds?.imBotId ?? getAllBots()[0]?.imBotId;
   if (!botId) throw new Error('No bot configured');
 
-  // Route through adapter if available
-  const adapter = getBot(botId).adapter;
-  if (adapter) {
-    const format = msgType === 'interactive' ? 'rich' as const : 'text' as const;
-    return adapter.replyMessage(rootId, content, format);
+  // Non-Lark IM: route through adapter (WeChat, etc.)
+  const bot = getBot(botId);
+  if (bot.adapter && !bot.adapter.capabilities.threads) {
+    return bot.adapter.sendMessage(rootId, content, msgType === 'interactive' ? 'rich' : 'text');
   }
-  // Fallback to direct Lark call (should not happen after full migration)
+
+  // Lark: use direct client call to preserve replyInThread behavior
   const inThread = ds?.chatType === 'p2p';
   return replyMessage(botId, rootId, content, msgType, inThread);
 }
@@ -442,6 +442,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     }
     // Mark new turn — next screen_update will create a fresh streaming card
     ds.streamCardPending = true;
+    ds.finalOutputSent = false;
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
   } else {
@@ -483,6 +484,7 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
     const enrichedContent = `[来自 ${senderName} 的 @mention]\n${signal.content}`;
     ds.lastMessageAt = Date.now();
     ds.streamCardPending = true;
+    ds.finalOutputSent = false;
     ds.currentTurnTitle = signal.content.substring(0, 50);
     ds.worker.send({ type: 'message', content: enrichedContent } as DaemonToWorker);
     logger.info(`[bot-mention] Routed message from ${signal.senderAppId} to ${targetAppId} in thread ${signal.rootMessageId}`);
@@ -685,6 +687,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             pendingPrompt: content,
             ownerId: msg.senderId,
             currentTurnTitle: content.substring(0, 50),
+            nonStreamingIm: true,
           };
           activeSessions.set(sessionKey(rootId, imBotId), ds);
 
@@ -735,6 +738,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const botCfg = getBot(imBotId).config;
             refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
             ds.streamCardPending = true;
+            ds.finalOutputSent = false;
             ds.currentTurnTitle = content.substring(0, 50);
             forkWorker(ds, content, true);
           }

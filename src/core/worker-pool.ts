@@ -234,6 +234,19 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         const writeUrl = `${readOnlyUrl}?token=${msg.token}`;
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
 
+        if (ds.nonStreamingIm) {
+          // Send one-time welcome message with terminal URL
+          const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+          const sessionCard = cb.buildSessionCard(
+            ds.session.sessionId, ds.session.rootMessageId, readOnlyUrl, initTitle, botCfg.cliId,
+          );
+          if (sessionCard) {
+            cb.sessionReply(ds.session.rootMessageId, sessionCard, 'interactive', ds.imBotId)
+              .catch(err => logger.debug(`[${t}] Failed to send welcome: ${err}`));
+          }
+          break;
+        }
+
         // Send streaming card to group thread (read-only link, will be PATCHed with live output)
         // Set sentinel BEFORE await so concurrent screen_update messages
         // (which can arrive while the POST is in-flight) don't POST a duplicate card.
@@ -308,6 +321,25 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         if (!ds.workerPort) break;
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = msg.status;
+
+        // Non-streaming IM: only send final output on first idle, skip everything else
+        if (ds.nonStreamingIm) {
+          if (msg.status === 'idle' && !ds.finalOutputSent) {
+            ds.finalOutputSent = true;
+            const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+            const cardJson = cb.buildStreamingCard(
+              ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
+              msg.content, 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
+            );
+            if (cardJson) {
+              cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.imBotId)
+                .catch(err => logger.debug(`[${t}] Failed to send final output: ${err}`));
+            }
+          }
+          // Reset finalOutputSent when a new turn starts (worker receives new input)
+          break;
+        }
 
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);

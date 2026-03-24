@@ -35,6 +35,10 @@ export interface DaemonSession {
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
+  /** True when the session's IM doesn't support card updates (e.g. WeChat) */
+  nonStreamingIm?: boolean;
+  /** True after the idle-state final output has been sent for non-streaming IMs */
+  finalOutputSent?: boolean;
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent sessions for the same thread. */
