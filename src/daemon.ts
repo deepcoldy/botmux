@@ -77,10 +77,18 @@ async function sessionReply(rootId: string, content: string, msgType: string = '
       if (s.session.rootMessageId === rootId) { ds = s; break; }
     }
   }
-  const appId = imBotId ?? ds?.imBotId ?? getAllBots()[0]?.imBotId;
-  if (!appId) throw new Error('No bot configured');
+  const botId = imBotId ?? ds?.imBotId ?? getAllBots()[0]?.imBotId;
+  if (!botId) throw new Error('No bot configured');
+
+  // Route through adapter if available
+  const adapter = getBot(botId).adapter;
+  if (adapter) {
+    const format = msgType === 'interactive' ? 'rich' as const : 'text' as const;
+    return adapter.replyMessage(rootId, content, format);
+  }
+  // Fallback to direct Lark call (should not happen after full migration)
   const inThread = ds?.chatType === 'p2p';
-  return replyMessage(appId, rootId, content, msgType, inThread);
+  return replyMessage(botId, rootId, content, msgType, inThread);
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
