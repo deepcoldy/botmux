@@ -114,9 +114,15 @@ function printLarkPermissions(): void {
   console.log('  - card.action.trigger\n');
 }
 
-async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any>> {
-  const appId = await ask(rl, 'LARK_APP_ID: ');
-  const appSecret = await ask(rl, 'LARK_APP_SECRET: ');
+/** Inner prompt: given a known im type, collect the rest of the bot config fields. */
+async function promptBotConfig_inner(rl: ReturnType<typeof createInterface>, im: 'lark' | 'weixin'): Promise<Record<string, any>> {
+  let appId: string | undefined;
+  let appSecret: string | undefined;
+
+  if (im === 'lark') {
+    appId = await ask(rl, 'LARK_APP_ID: ');
+    appSecret = await ask(rl, 'LARK_APP_SECRET: ');
+  }
 
   console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
@@ -125,11 +131,26 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
   const allowedUsers = await ask(rl, '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ');
 
-  const bot: Record<string, any> = { larkAppId: appId, larkAppSecret: appSecret, cliId };
+  const bot: Record<string, any> = { im, cliId };
+  if (im === 'lark') {
+    bot.larkAppId = appId;
+    bot.larkAppSecret = appSecret;
+  }
   if (workingDir) bot.workingDir = workingDir;
   if (allowedUsers) bot.allowedUsers = allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
 
   return bot;
+}
+
+async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any>> {
+  const imChoice = await ask(rl, 'IM 类型: 1) 飞书  2) 微信 [1]: ');
+  const im = imChoice === '2' ? 'weixin' : 'lark';
+
+  if (im === 'lark') {
+    printLarkPermissions();
+  }
+
+  return promptBotConfig_inner(rl, im);
 }
 
 /** Parse .env file to extract bot config for migration to bots.json */
@@ -160,8 +181,7 @@ function parseDotEnvToBotConfig(): Record<string, any> {
 
 /** Write single-bot config to bots.json (fresh install or reconfigure) */
 async function writeSingleBotConfig(): Promise<void> {
-  console.log('── 飞书应用配置 ──\n');
-  printLarkPermissions();
+  console.log('── 机器人配置 ──\n');
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const bot = await promptBotConfig(rl);
@@ -189,7 +209,8 @@ async function cmdSetup(): Promise<void> {
     const bots = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')) as any[];
     console.log(`已配置 ${bots.length} 个机器人：`);
     for (let i = 0; i < bots.length; i++) {
-      console.log(`  ${i + 1}. ${bots[i].larkAppId} (${bots[i].cliId ?? 'claude-code'})`);
+      const label = bots[i].im === 'weixin' ? `weixin` : (bots[i].larkAppId ?? '(unknown)');
+      console.log(`  ${i + 1}. ${label} (${bots[i].cliId ?? 'claude-code'})`);
     }
     console.log('');
 
@@ -200,7 +221,6 @@ async function cmdSetup(): Promise<void> {
       renameSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak\n`);
       console.log('\n── 重新配置 ──\n');
-      printLarkPermissions();
       const newBot = await promptBotConfig(rl);
       rl.close();
       writeFileSync(BOTS_JSON_FILE, JSON.stringify([newBot], null, 2) + '\n');
@@ -210,12 +230,12 @@ async function cmdSetup(): Promise<void> {
     }
 
     console.log('\n── 添加新机器人 ──\n');
-    printLarkPermissions();
     const newBot = await promptBotConfig(rl);
     rl.close();
     bots.push(newBot);
     writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
-    console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length} 个`);
+    const newBotLabel = newBot.im === 'weixin' ? `weixin` : newBot.larkAppId;
+    console.log(`\n✅ 已添加机器人 ${newBotLabel}，共 ${bots.length} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`\n下一步: botmux restart`);
 
@@ -243,7 +263,6 @@ async function cmdSetup(): Promise<void> {
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
     console.log('\n── 添加新机器人 ──\n');
-    printLarkPermissions();
     const newBot = await promptBotConfig(rl);
     rl.close();
 
@@ -960,6 +979,43 @@ function cmdDelete(): void {
   console.log(`\n已关闭 ${toDelete.length} 个会话`);
 }
 
+async function cmdWeixinAuth(): Promise<void> {
+  ensureConfigDir();
+  const { loadToken, validateToken, getQrCode, pollQrCodeStatus, saveToken } = await import('./im/weixin/auth.js');
+
+  const existing = loadToken();
+  if (existing) {
+    const valid = await validateToken(existing.bot_token);
+    if (valid) {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await ask(rl, '已有有效 token。重新认证？[y/N] ');
+      rl.close();
+      if (answer.toLowerCase() !== 'y') {
+        console.log('保留现有 token。');
+        return;
+      }
+    } else {
+      console.log('现有 token 已失效，需要重新认证。');
+    }
+  }
+
+  console.log('正在获取微信登录二维码...');
+  const { qrcode, qrcode_img_content } = await getQrCode();
+
+  // Print QR code to terminal
+  const qrcodeTerminal = await import('qrcode-terminal');
+  (qrcodeTerminal.default || qrcodeTerminal).generate(qrcode_img_content || qrcode, { small: true });
+  console.log('\n请用微信扫描上方二维码');
+
+  console.log('等待扫码...');
+  const token = await pollQrCodeStatus(qrcode);
+  saveToken(token);
+
+  console.log(`\n✅ 认证成功！Bot ID: ${token.bot_id}`);
+  console.log('Token 已保存到 ~/.botmux/weixin-token.json');
+  console.log('\n下一步: botmux restart');
+}
+
 function showHelp(): void {
   console.log(`
 botmux — IM ↔ AI 编程 CLI 桥接
@@ -977,6 +1033,7 @@ botmux — IM ↔ AI 编程 CLI 桥接
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
+  weixin-auth 微信扫码认证（获取 iLink Bot Token）
 
 配置目录: ~/.botmux/
 文档: https://github.com/deepcoldy/botmux
@@ -1000,5 +1057,6 @@ switch (command) {
   case 'delete':
   case 'del':
   case 'rm':      cmdDelete(); break;
+  case 'weixin-auth': await cmdWeixinAuth(); break;
   default:        showHelp(); break;
 }
