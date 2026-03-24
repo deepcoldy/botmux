@@ -244,6 +244,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             cb.sessionReply(ds.session.rootMessageId, sessionCard, 'interactive', ds.imBotId)
               .catch(err => logger.debug(`[${t}] Failed to send welcome: ${err}`));
           }
+          // Suppress the initial idle (CLI startup) — reset when new message arrives
+          ds.finalOutputSent = true;
           break;
         }
 
@@ -314,6 +316,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(botCfg.cliId)} is ready for input`);
+        // For non-streaming IMs: CLI is about to process input, allow next idle to send
+        if (ds.nonStreamingIm) ds.finalOutputSent = false;
         break;
       }
 

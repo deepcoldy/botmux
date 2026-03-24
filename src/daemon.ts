@@ -733,8 +733,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           const parsed = { messageId: msg.id, rootId: ds.session.rootMessageId, senderId: msg.senderId, senderType: msg.senderType, msgType: msg.msgType, content, createTime: msg.createTime };
           messageQueue.appendMessage(ds.session.rootMessageId, parsed);
 
-          // If worker exited, auto-restart
-          if (!ds.worker || ds.worker.killed) {
+          if (ds.worker && !ds.worker.killed) {
+            // Worker alive — send message and mark new turn
+            ds.streamCardPending = true;
+            ds.finalOutputSent = false;
+            ds.currentTurnTitle = content.substring(0, 50);
+            ds.worker.send({ type: 'message', content } as DaemonToWorker);
+          } else {
+            // Worker exited — re-fork
             const botCfg = getBot(imBotId).config;
             refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
             ds.streamCardPending = true;
