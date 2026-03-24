@@ -59,18 +59,23 @@ export class WeixinImAdapter implements ImAdapter {
     this.poller = null;
   }
 
+  /** Strip the wx- prefix that daemon adds to rootId to recover the real iLink userId */
+  private toUserId(idOrRoot: string): string {
+    return idOrRoot.startsWith('wx-') ? idOrRoot.slice(3) : idOrRoot;
+  }
+
   async sendMessage(threadId: string, content: string, _format: 'text' | 'rich'): Promise<string> {
-    const ct = this.poller?.getContextToken(threadId) ?? '';
-    return ilink.sendMessage(this.token, threadId, content, ct);
+    const userId = this.toUserId(threadId);
+    const ct = this.poller?.getContextToken(userId) ?? '';
+    return ilink.sendMessage(this.token, userId, content, ct);
   }
 
   async replyMessage(
-    _messageId: string,
+    messageId: string,
     content: string,
     format: 'text' | 'rich',
   ): Promise<string> {
-    // WeChat P2P has no reply-to-message; just send to the same user thread
-    return this.sendMessage(_messageId, content, format);
+    return this.sendMessage(messageId, content, format);
   }
 
   async updateMessage(): Promise<void> { /* no-op: iLink has no update API */ }
