@@ -659,6 +659,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           const rootId = `wx-${msg.senderId}`;
           const session = sessionStore.createSession(chatId, rootId, content.substring(0, 50), chatType);
           session.imBotId = imBotId;
+          // Persist WeChat context for MCP tools (runs in separate process without poller)
+          const wxPoller = (adapter as import('./im/weixin/adapter.js').WeixinImAdapter).getPoller?.();
+          session.weixinUserId = msg.senderId;
+          session.weixinContextToken = wxPoller?.getContextToken(msg.senderId) ?? '';
           sessionStore.updateSession(session);
           messageQueue.ensureQueue(rootId);
 
@@ -702,6 +706,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             return;
           }
           ds.lastMessageAt = Date.now();
+          // Update persisted contextToken so MCP tools can use it
+          const wxPoll = (adapter as import('./im/weixin/adapter.js').WeixinImAdapter).getPoller?.();
+          const latestCt = wxPoll?.getContextToken(msg.senderId);
+          if (latestCt) {
+            ds.session.weixinContextToken = latestCt;
+            sessionStore.updateSession(ds.session);
+          }
           const content = msg.content.trim();
           if (!content) return;
 

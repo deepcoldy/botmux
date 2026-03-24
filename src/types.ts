@@ -11,6 +11,10 @@ export interface Session {
   workingDir?: string;
   webPort?: number;
   imBotId?: string;
+  /** WeChat iLink context token for replying — updated on every received message */
+  weixinContextToken?: string;
+  /** WeChat user ID (from_user_id) for sending replies */
+  weixinUserId?: string;
 }
 
 /** @deprecated Use from src/im/lark/types.ts */

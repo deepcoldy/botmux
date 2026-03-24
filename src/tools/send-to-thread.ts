@@ -61,20 +61,22 @@ export async function execute(args: z.infer<typeof schema>) {
   try {
     const appId = session.imBotId || config.lark.appId;
 
-    // Non-Lark IM (e.g. WeChat): send plain text through adapter
-    const bot = (() => { try { return getBot(appId); } catch { return undefined; } })();
-    const adapter = bot?.adapter;
-    if (adapter && !adapter.capabilities.richText) {
+    // Non-Lark IM (e.g. WeChat): send plain text via iLink API directly
+    // MCP runs in separate process without poller, so use persisted session data
+    if (session.weixinUserId) {
       let text = args.content;
       const extracted = extractTextFromPostJson(text);
       if (extracted) text = extracted;
       if (!text.trim() && !args.images?.length && !args.files?.length) {
         return { error: 'Empty message' };
       }
-      // Append file names as text hints (no upload support for non-Lark IMs)
       if (args.images?.length) text += `\n[${args.images.length} image(s) — view in terminal]`;
       if (args.files?.length) text += `\n[${args.files.length} file(s) — view in terminal]`;
-      const messageId = await adapter.sendMessage(session.rootMessageId, text, 'text');
+      const { sendMessage: weixinSend } = await import('../im/weixin/client.js');
+      const { loadToken } = await import('../im/weixin/auth.js');
+      const token = loadToken();
+      if (!token) return { error: 'WeChat token not found. Run "botmux weixin-auth".' };
+      const messageId = await weixinSend(token.bot_token, session.weixinUserId, text, session.weixinContextToken ?? '');
       return { success: true, messageId, sessionId: args.session_id };
     }
 
