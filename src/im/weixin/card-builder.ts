@@ -1,13 +1,29 @@
 import type { ImCardBuilder } from '../types.js';
 
 export const weixinCardBuilder: ImCardBuilder = {
-  buildSessionCard({ title }) {
-    return { payload: `[session] ${title}\n发送消息开始编程。\n输入 /help 查看命令。` };
+  buildSessionCard({ title, terminalUrl }) {
+    const lines = [
+      `✦ ${title}`,
+      '',
+      `🔗 终端: ${terminalUrl}`,
+      '',
+      '发送消息开始编程，输入 /help 查看命令。',
+    ];
+    return { payload: lines.join('\n') };
   },
-  buildStreamingCard({ title, content, status }) {
-    const statusText = status === 'idle' ? 'done' : status;
-    const preview = content ? `\n${content.slice(0, 500)}` : '';
-    return { payload: `[${statusText}] ${title}${preview}` };
+  buildStreamingCard({ title, terminalUrl, content, status }) {
+    const statusIcon = status === 'idle' ? '✅' : status === 'starting' ? '🚀' : '⏳';
+    const lines = [
+      `${statusIcon} ${title}`,
+      `🔗 终端: ${terminalUrl}`,
+    ];
+    if (status === 'idle' && content) {
+      // Send final output summary when done
+      const trimmed = content.trim();
+      const preview = trimmed.length > 800 ? trimmed.slice(-800) : trimmed;
+      lines.push('', preview);
+    }
+    return { payload: lines.join('\n') };
   },
   buildRepoSelectCard({ projects, currentCwd }) {
     const list = projects.map((p, i) => `${i + 1}. ${p.name} (${p.path})`).join('\n');

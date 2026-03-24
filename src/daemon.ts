@@ -571,8 +571,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       await larkUpdate(imBotId, messageId, content);
     },
     isMessageWithdrawn: (err) => err instanceof MessageWithdrawnError,
-    buildStreamingCard: larkBuildStreamingCard,
-    buildSessionCard: larkBuildSessionCard,
+    buildStreamingCard: (sessionId, rootMessageId, terminalUrl, title, content, status, cliId, expanded, nonce) => {
+      // Route card building through the session's adapter
+      const ds = [...activeSessions.values()].find(s => s.session.sessionId === sessionId);
+      const adapter = ds ? getBot(ds.imBotId).adapter : undefined;
+      if (adapter) {
+        const card = adapter.cards.buildStreamingCard({ sessionId, rootMessageId, terminalUrl, title, content, status });
+        return typeof card.payload === 'string' ? card.payload : JSON.stringify(card.payload);
+      }
+      return larkBuildStreamingCard(sessionId, rootMessageId, terminalUrl, title, content, status, cliId, expanded, nonce);
+    },
+    buildSessionCard: (sessionId, rootMessageId, terminalUrl, title, cliId, showManageButtons) => {
+      const ds = [...activeSessions.values()].find(s => s.session.sessionId === sessionId);
+      const adapter = ds ? getBot(ds.imBotId).adapter : undefined;
+      if (adapter) {
+        const card = adapter.cards.buildSessionCard({ sessionId, rootMessageId, terminalUrl, title });
+        return typeof card.payload === 'string' ? card.payload : JSON.stringify(card.payload);
+      }
+      return larkBuildSessionCard(sessionId, rootMessageId, terminalUrl, title, cliId, showManageButtons);
+    },
   });
 
   // Per-bot initialization
