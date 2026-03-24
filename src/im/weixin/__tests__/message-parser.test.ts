@@ -98,9 +98,7 @@ describe('parseMessage', () => {
         {
           type: 2,
           image_item: {
-            url: 'https://cdn.example.com/img.enc',
-            aes_key: 'dGVzdGtleQ==',
-            file_size: 1024,
+            media: { encrypt_query_param: 'abc123hex', aes_key: 'dGVzdGtleQ==' },
           },
         },
       ],
@@ -111,23 +109,42 @@ describe('parseMessage', () => {
     expect(msg.attachments![0].name).toBe('image_0.jpg');
   });
 
-  it('stores CDN URL and aes_key in attachment path separated by newline', () => {
+  it('builds CDN download URL from encrypt_query_param and stores aes_key', () => {
     const msg = parseMessage(makeRawMessage({
       message_type: 2,
       item_list: [
         {
           type: 2,
           image_item: {
-            url: 'https://cdn.example.com/img.enc',
-            aes_key: 'dGVzdGtleQ==',
-            file_size: 2048,
+            media: { encrypt_query_param: 'test_param_123', aes_key: 'dGVzdGtleQ==' },
           },
         },
       ],
     }));
     const [cdnUrl, aesKey] = msg.attachments![0].path.split('\n');
-    expect(cdnUrl).toBe('https://cdn.example.com/img.enc');
+    expect(cdnUrl).toContain('novac2c.cdn.weixin.qq.com');
+    expect(cdnUrl).toContain('encrypted_query_param=test_param_123');
     expect(aesKey).toBe('dGVzdGtleQ==');
+  });
+
+  it('resolves aeskey from hex field when media.aes_key is missing', () => {
+    // aeskey is 32-char hex = 16 bytes
+    const hexKey = '00112233445566778899aabbccddeeff';
+    const msg = parseMessage(makeRawMessage({
+      message_type: 2,
+      item_list: [
+        {
+          type: 2,
+          image_item: {
+            media: { encrypt_query_param: 'param' },
+            aeskey: hexKey,
+          },
+        },
+      ],
+    }));
+    expect(msg.attachments).toHaveLength(1);
+    const [, aesKey] = msg.attachments![0].path.split('\n');
+    expect(aesKey).toBe(Buffer.from(hexKey, 'hex').toString('base64'));
   });
 
   it('does not include attachments when no image items exist', () => {
@@ -147,25 +164,21 @@ describe('parseMessage', () => {
         {
           type: 2,
           image_item: {
-            url: 'https://cdn.example.com/a.enc',
-            aes_key: 'a2V5MQ==',
-            file_size: 512,
+            media: { encrypt_query_param: 'abc123', aes_key: 'a2V5MQ==' },
           },
         },
         {
           type: 2,
           image_item: {
-            url: 'https://cdn.example.com/b.enc',
-            aes_key: 'a2V5Mg==',
-            file_size: 768,
+            media: { encrypt_query_param: 'def456', aes_key: 'a2V5Mg==' },
           },
         },
       ],
     }));
     expect(msg.content).toBe('caption');
     expect(msg.attachments).toHaveLength(2);
-    expect(msg.attachments![0].name).toBe('image_0.jpg');
-    expect(msg.attachments![1].name).toBe('image_1.jpg');
+    expect(msg.attachments![0].name).toBe('image_1.jpg');  // index 1 in item_list (text is index 0)
+    expect(msg.attachments![1].name).toBe('image_2.jpg');
   });
 });
 

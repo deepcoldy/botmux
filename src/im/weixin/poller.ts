@@ -94,6 +94,11 @@ export class WeixinPoller {
       this.sessions.set(userId, { sessionKey: '', contextToken: raw.context_token });
     }
 
+    // Debug: log non-text message structure
+    if (!isTextMessage(raw)) {
+      logger.info(`[weixin] Non-text msg type=${raw.message_type} items=${JSON.stringify(raw.item_list).substring(0, 500)}`);
+    }
+
     // Only text and image messages are supported
     if (!isTextMessage(raw) && raw.message_type !== 2) {
       await this.commandCtx.sendReply(userId, '暂不支持该类型消息，请发送文字或图片。');
