@@ -44,26 +44,36 @@ export function isSuccess(data: GetUpdatesResponse): boolean {
   return Array.isArray(data.msgs);
 }
 
+function generateClientId(): string {
+  return `botmux_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export async function sendMessage(
   token: string,
   toUserId: string,
   text: string,
   contextToken: string,
 ): Promise<string> {
+  const body = {
+    msg: {
+      from_user_id: '',
+      to_user_id: toUserId,
+      client_id: generateClientId(),
+      message_type: 2,
+      message_state: 2,
+      context_token: contextToken,
+      item_list: [{ type: 1, text_item: { text } }],
+    },
+    base_info: { channel_version: '1.0.2' },
+  };
   const res = await fetch(`${ILINK_BASE}/ilink/bot/sendmessage`, {
     method: 'POST',
     headers: makeHeaders(token),
-    body: JSON.stringify({
-      msg: {
-        to_user_id: toUserId,
-        message_type: 2,
-        message_state: 2,
-        context_token: contextToken,
-        item_list: [{ type: 1, text_item: { text } }],
-      },
-    }),
+    body: JSON.stringify(body),
   });
-  const data = await res.json() as any;
+  const raw = await res.text();
+  let data: any;
+  try { data = JSON.parse(raw); } catch { data = {}; }
   return data.msg_id ?? data.message_id ?? '';
 }
 

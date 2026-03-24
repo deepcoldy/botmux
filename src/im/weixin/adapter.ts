@@ -67,7 +67,15 @@ export class WeixinImAdapter implements ImAdapter {
   async sendMessage(threadId: string, content: string, _format: 'text' | 'rich'): Promise<string> {
     const userId = this.toUserId(threadId);
     const ct = this.poller?.getContextToken(userId) ?? '';
-    return ilink.sendMessage(this.token, userId, content, ct);
+    logger.info(`[weixin] sendMessage to=${userId.substring(0, 20)}... ct=${ct ? 'yes' : 'empty'} len=${content.length}`);
+    try {
+      const msgId = await ilink.sendMessage(this.token, userId, content, ct);
+      logger.info(`[weixin] sendMessage OK, msgId=${msgId || '(empty)'}`);
+      return msgId;
+    } catch (err) {
+      logger.error(`[weixin] sendMessage FAILED: ${err}`);
+      throw err;
+    }
   }
 
   async replyMessage(
