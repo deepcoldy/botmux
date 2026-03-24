@@ -134,7 +134,7 @@ describe('buildStreamingCard', () => {
 
 describe('buildRepoSelectCard', () => {
   const projects = [
-    { name: 'proj-a', path: '/home/proj-a', type: 'git' as const, branch: 'main' },
+    { name: 'proj-a', path: '/home/proj-a', type: 'repo' as const, branch: 'main' },
     { name: 'proj-b', path: '/home/proj-b', type: 'worktree' as const, branch: 'feat-x' },
   ];
 

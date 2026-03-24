@@ -84,7 +84,7 @@ describe('createImAdapter', () => {
   it('throws for unknown im type', () => {
     const config = {
       im: 'telegram' as any,
-      cliId: 'claude-code',
+      cliId: 'claude-code' as any,
     };
     expect(() => createImAdapter(config)).toThrow('Unknown IM type');
   });
