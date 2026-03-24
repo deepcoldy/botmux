@@ -4,6 +4,7 @@ import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
+import { createImAdapter } from './im/registry.js';
 import * as sessionStore from './services/session-store.js';
 import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
@@ -44,7 +45,11 @@ export function createServer(): McpServer {
   try {
     const configs = loadBotConfigs();
     for (const cfg of configs) {
-      registerBot(cfg);
+      const botState = registerBot(cfg);
+      // Create adapter so Lark client gets registered for getBotClient() calls
+      try {
+        botState.adapter = createImAdapter(cfg);
+      } catch { /* WeChat adapter may fail without token in MCP context — that's fine */ }
     }
     logger.info(`MCP server registered ${configs.length} bot(s)`);
   } catch (err: any) {
