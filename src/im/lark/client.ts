@@ -1,5 +1,5 @@
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { dirname, extname, basename } from 'node:path';
 import { getBotClient, getAllBots } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 
@@ -202,6 +202,41 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   }
 
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
+}
+
+const EXT_TO_FILE_TYPE: Record<string, string> = {
+  '.opus': 'opus', '.mp4': 'mp4', '.pdf': 'pdf',
+  '.doc': 'doc', '.docx': 'doc', '.xls': 'xls', '.xlsx': 'xls',
+  '.ppt': 'ppt', '.pptx': 'ppt',
+};
+
+export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
+  const c = getBotClient(larkAppId);
+  const buf = readFileSync(imagePath);
+  // SDK returns { image_key } directly (not wrapped in { code, data })
+  const res = await c.im.v1.image.create({
+    data: { image_type: 'message', image: buf },
+  });
+  const imageKey = res?.image_key;
+  if (!imageKey) throw new Error(`Failed to upload image: no image_key in response (${JSON.stringify(res)})`);
+  logger.info(`Uploaded image ${imagePath} → ${imageKey}`);
+  return imageKey;
+}
+
+export async function uploadFile(larkAppId: string, filePath: string): Promise<string> {
+  const c = getBotClient(larkAppId);
+  const buf = readFileSync(filePath);
+  const ext = extname(filePath).toLowerCase();
+  const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
+  const fileName = basename(filePath);
+  // SDK returns { file_key } directly (not wrapped in { code, data })
+  const res = await c.im.v1.file.create({
+    data: { file_type: fileType as any, file_name: fileName, file: buf },
+  });
+  const fileKey = res?.file_key;
+  if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
+  logger.info(`Uploaded file ${filePath} → ${fileKey}`);
+  return fileKey;
 }
 
 /**

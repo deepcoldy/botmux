@@ -70,6 +70,6 @@ export type WorkerToDaemon =
 export const TOOL_NAMES = {
   SEND_TO_THREAD: 'send_to_thread',
   GET_THREAD_MESSAGES: 'get_thread_messages',
-  REACT_TO_MESSAGE: 'react_to_message',
+
   LIST_BOTS: 'list_bots',
 } as const;

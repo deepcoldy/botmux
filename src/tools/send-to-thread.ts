@@ -1,21 +1,23 @@
 import { z } from 'zod';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { replyMessage } from '../im/lark/client.js';
+import { replyMessage, uploadImage, uploadFile } from '../im/lark/client.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
   session_id: z.string().describe('Session ID for the active session'),
-  content: z.string().describe('Message content to send (plain text)'),
+  content: z.string().describe('Message text to send (plain text). Can be empty string when sending only images/files.'),
+  images: z.array(z.string()).optional().describe('Optional local file paths of images to attach (e.g. ["/tmp/chart.png"]). Images are embedded inline in the message.'),
+  files: z.array(z.string()).optional().describe('Optional local file paths of files to attach (e.g. ["/tmp/report.pdf"]). Each file is sent as a separate message.'),
   mentions: z.array(z.object({
     open_id: z.string().describe('Open ID of the user/bot to @mention'),
     name: z.string().describe('Display name for the @mention'),
   })).optional().describe('Optional list of users/bots to @mention in the message. Get open_ids from list_bots tool.'),
 });
 
-export const description = 'Send a plain text message to the Lark thread associated with a session. Just send plain text — formatting is handled automatically. Use optional mentions parameter to @mention other bots.';
+export const description = 'Send a message to the Lark thread associated with a session. Supports plain text, images (embedded inline), and file attachments. Just send plain text — formatting is handled automatically. Use `images` to attach local image files (png/jpg/gif etc.) and `files` to attach documents.';
 
 /** Build a post content block from plain text, splitting by newlines into paragraphs */
 function textToPostContent(text: string): any[][] {
@@ -61,6 +63,25 @@ export async function execute(args: z.infer<typeof schema>) {
     const mentionUser = process.env.__OWNER_OPEN_ID
       || (config.daemon.allowedUsers[0]?.startsWith('ou_') ? config.daemon.allowedUsers[0] : undefined);
 
+    const replyInThread = session.chatType === 'p2p';
+    const appId = session.larkAppId || config.lark.appId;
+
+    // Validate that image/file paths exist before doing anything
+    for (const p of [...(args.images ?? []), ...(args.files ?? [])]) {
+      if (!existsSync(p)) {
+        return { error: `File not found: ${p}` };
+      }
+    }
+
+    // Upload images in parallel
+    const imageKeys: string[] = [];
+    if (args.images && args.images.length > 0) {
+      const results = await Promise.all(
+        args.images.map(p => uploadImage(appId, p)),
+      );
+      imageKeys.push(...results);
+    }
+
     // If Claude sent post JSON as content, extract the plain text from it
     let text = args.content;
     const extracted = extractTextFromPostJson(text);
@@ -68,7 +89,12 @@ export async function execute(args: z.infer<typeof schema>) {
       text = extracted;
     }
 
-    const postContent = textToPostContent(text);
+    // Build post content: text paragraphs + inline images
+    const postContent = text ? textToPostContent(text) : [];
+
+    for (const key of imageKeys) {
+      postContent.push([{ tag: 'img', image_key: key }]);
+    }
 
     // Append explicit mentions (e.g. @mention other bots)
     if (args.mentions && args.mentions.length > 0) {
@@ -89,9 +115,18 @@ export async function execute(args: z.infer<typeof schema>) {
       zh_cn: { title: '', content: postContent },
     });
 
-    const replyInThread = session.chatType === 'p2p';
-    const appId = session.larkAppId || config.lark.appId;
     const messageId = await replyMessage(appId, session.rootMessageId, content, 'post', replyInThread);
+
+    // Send file attachments as separate messages (Lark post doesn't support inline files)
+    const fileMessageIds: string[] = [];
+    if (args.files && args.files.length > 0) {
+      for (const filePath of args.files) {
+        const fileKey = await uploadFile(appId, filePath);
+        const fileContent = JSON.stringify({ file_key: fileKey });
+        const fid = await replyMessage(appId, session.rootMessageId, fileContent, 'file', replyInThread);
+        fileMessageIds.push(fid);
+      }
+    }
 
     // Write signal files for bot-to-bot mentions.
     // Lark WSClient does not deliver im.message.receive_v1 events for bot-sent messages,
@@ -131,6 +166,7 @@ export async function execute(args: z.infer<typeof schema>) {
     return {
       success: true,
       messageId,
+      ...(fileMessageIds.length > 0 && { fileMessageIds }),
       sessionId: args.session_id,
     };
   } catch (err: any) {

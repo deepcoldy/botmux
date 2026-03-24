@@ -78,8 +78,10 @@ export function createServer(): McpServer {
         'Guidelines:',
         '- Use send_to_thread for: key conclusions, proposed plans (wait for confirmation before executing), final results, and progress updates.',
         '- The message includes a session_id — pass it back when calling send_to_thread.',
-        '- Send plain text only — formatting is handled automatically.',
-        '- Use react_to_message to acknowledge messages (e.g. THUMBSUP, OnIt).',
+        '- Send plain text — formatting is handled automatically. You can also attach images and files.',
+        '- To send images: pass local file paths in the `images` array (e.g. screenshots, charts, diagrams). Images are embedded inline in the message.',
+        '- To send files: pass local file paths in the `files` array (e.g. PDFs, documents). Each file is sent as a separate message.',
+
         '- Use get_thread_messages to read earlier conversation context if needed.',
       ].join('\n')
     : undefined;
