@@ -37,6 +37,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
+  getAvailableBots: vi.fn(() => []),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -47,6 +48,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendUserMessage: vi.fn(), updateMessage: vi.fn(), replyMessage: vi.fn(),
   resolveAllowedUsers: vi.fn(),
   getChatInfo: vi.fn(),
+  listChatBotMembers: vi.fn(),
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
@@ -144,10 +146,10 @@ async function routeForAllBots(
   message: any,
   checkGroupMessageAccess: Function,
   botInfos: typeof BOTS,
-  sessions?: Map<string, { larkAppId: string }>,
+  sessions?: Map<string, { imBotId: string }>,
 ): Promise<Map<string, string>> {
   const isSessionOwner = sessions
-    ? (rootId: string, appId: string) => sessions.get(rootId)?.larkAppId === appId
+    ? (rootId: string, appId: string) => sessions.get(rootId)?.imBotId === appId
     : undefined;
   const results = new Map<string, string>();
   for (const bot of botInfos) {
@@ -166,23 +168,23 @@ async function routeForAllBots(
 
 /** Simulate daemon's handleNewTopic with session guard */
 function simNewTopic(
-  appId: string, msgId: string, sessions: Map<string, { larkAppId: string }>,
+  appId: string, msgId: string, sessions: Map<string, { imBotId: string }>,
 ): 'created' | 'blocked' {
   const existing = sessions.get(msgId);
-  if (existing && existing.larkAppId !== appId) return 'blocked';
-  sessions.set(msgId, { larkAppId: appId });
+  if (existing && existing.imBotId !== appId) return 'blocked';
+  sessions.set(msgId, { imBotId: appId });
   return 'created';
 }
 
 /** Simulate daemon's handleThreadReply with session guard */
 function simThreadReply(
-  appId: string, rootId: string, sessions: Map<string, { larkAppId: string }>,
+  appId: string, rootId: string, sessions: Map<string, { imBotId: string }>,
 ): 'routed' | 'auto_created' | 'blocked_wrong_owner' {
   const ds = sessions.get(rootId);
   if (ds) {
-    return ds.larkAppId !== appId ? 'blocked_wrong_owner' : 'routed';
+    return ds.imBotId !== appId ? 'blocked_wrong_owner' : 'routed';
   }
-  sessions.set(rootId, { larkAppId: appId });
+  sessions.set(rootId, { imBotId: appId });
   return 'auto_created';
 }
 
@@ -197,13 +199,14 @@ describe('Bug 1: userCount=1 (bots excluded) → all bots respond without @menti
     const clientModule = await import('../src/im/lark/client.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
     // Lark user_count excludes bots. 1 human + 3 bots → user_count=1
     vi.mocked(clientModule.getChatInfo).mockResolvedValue({ userCount: 1 });
+    vi.mocked(clientModule.listChatBotMembers).mockResolvedValue(BOTS.map(b => ({ bot_id: b.openId })) as any);
 
     // User sends message WITHOUT @mention
     const event = makeEvent(MSG_TOPIC_A, { senderOpenId: 'irrelevant' });
@@ -222,11 +225,12 @@ describe('Bug 1: userCount=1 (bots excluded) → all bots respond without @menti
     const clientModule = await import('../src/im/lark/client.js');
 
     // Only 1 bot registered
-    const state = registerBot({ larkAppId: BOT1.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
+    const state = registerBot({ im: 'lark' as const, larkAppId: BOT1.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
     setBotOpenId(BOT1.appId, BOT1.openId);
     state.resolvedAllowedUsers = [BOT1.userOpenId];
 
     vi.mocked(clientModule.getChatInfo).mockResolvedValue({ userCount: 1 });
+    vi.mocked(clientModule.listChatBotMembers).mockResolvedValue([{ bot_id: BOT1.openId }] as any);
 
     const event = makeEvent(MSG_TOPIC_A, { senderOpenId: BOT1.userOpenId });
     const result = await checkGroupMessageAccess(BOT1.appId, event.message, CHAT_ID, BOT1.userOpenId);
@@ -241,12 +245,13 @@ describe('Bug 1: userCount=1 (bots excluded) → all bots respond without @menti
     const clientModule = await import('../src/im/lark/client.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
     vi.mocked(clientModule.getChatInfo).mockResolvedValue({ userCount: 4 });
+    vi.mocked(clientModule.listChatBotMembers).mockResolvedValue(BOTS.map(b => ({ bot_id: b.openId })) as any);
 
     const event = makeEvent(MSG_TOPIC_A, { senderOpenId: 'irrelevant' });
     const results = await routeForAllBots(event.message, checkGroupMessageAccess, BOTS);
@@ -266,16 +271,17 @@ describe('Fix B: Owning bot responds to thread replies without @mention', () => 
     const clientModule = await import('../src/im/lark/client.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
     vi.mocked(clientModule.getChatInfo).mockResolvedValue({ userCount: 4 });
+    vi.mocked(clientModule.listChatBotMembers).mockResolvedValue(BOTS.map(b => ({ bot_id: b.openId })) as any);
 
     // Bot1 owns the session
-    const sessions = new Map<string, { larkAppId: string }>();
-    sessions.set(MSG_TOPIC_A, { larkAppId: BOT1.appId });
+    const sessions = new Map<string, { imBotId: string }>();
+    sessions.set(MSG_TOPIC_A, { imBotId: BOT1.appId });
 
     // User replies WITHOUT @mention
     const reply = makeEvent('om_reply_1', {
@@ -296,15 +302,16 @@ describe('Fix B: Owning bot responds to thread replies without @mention', () => 
     const clientModule = await import('../src/im/lark/client.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
     vi.mocked(clientModule.getChatInfo).mockResolvedValue({ userCount: 4 });
+    vi.mocked(clientModule.listChatBotMembers).mockResolvedValue(BOTS.map(b => ({ bot_id: b.openId })) as any);
 
-    const sessions = new Map<string, { larkAppId: string }>();
-    sessions.set(MSG_TOPIC_A, { larkAppId: BOT1.appId });
+    const sessions = new Map<string, { imBotId: string }>();
+    sessions.set(MSG_TOPIC_A, { imBotId: BOT1.appId });
 
     // Reply from a user NOT in Bot1's allowlist
     const reply = makeEvent('om_reply_2', {
@@ -313,7 +320,7 @@ describe('Fix B: Owning bot responds to thread replies without @mention', () => 
     });
 
     // Simulate with per-bot routing: stranger's open_id is not in any bot's allowlist
-    const isSessionOwner = (rootId: string, appId: string) => sessions.get(rootId)?.larkAppId === appId;
+    const isSessionOwner = (rootId: string, appId: string) => sessions.get(rootId)?.imBotId === appId;
     const result = await routeForBot(
       BOT1.appId, reply.message, 'ou_stranger',
       checkGroupMessageAccess, [BOT1.userOpenId], isSessionOwner,
@@ -332,16 +339,17 @@ describe('Fix C: @mention Bot2 in Bot1 thread → takeover', () => {
     const clientModule = await import('../src/im/lark/client.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
     vi.mocked(clientModule.getChatInfo).mockResolvedValue({ userCount: 4 });
+    vi.mocked(clientModule.listChatBotMembers).mockResolvedValue(BOTS.map(b => ({ bot_id: b.openId })) as any);
 
     // Bot1 owns the session
-    const sessions = new Map<string, { larkAppId: string }>();
-    sessions.set(MSG_TOPIC_A, { larkAppId: BOT1.appId });
+    const sessions = new Map<string, { imBotId: string }>();
+    sessions.set(MSG_TOPIC_A, { imBotId: BOT1.appId });
 
     // User @mentions Bot2 in Bot1's thread
     const reply = makeEvent('om_reply_3', {
@@ -360,14 +368,14 @@ describe('Fix C: @mention Bot2 in Bot1 thread → takeover', () => {
     // Simulate takeover: Bot2 takes over from Bot1
     // (daemon.ts: if ds.larkAppId !== larkAppId → close old session, create new)
     const ds = sessions.get(MSG_TOPIC_A)!;
-    if (ds.larkAppId !== BOT2.appId) {
+    if (ds.imBotId !== BOT2.appId) {
       // Takeover: close old, create new
       sessions.delete(MSG_TOPIC_A);
-      sessions.set(MSG_TOPIC_A, { larkAppId: BOT2.appId });
+      sessions.set(MSG_TOPIC_A, { imBotId: BOT2.appId });
     }
 
     // Bot2 now owns the thread
-    expect(sessions.get(MSG_TOPIC_A)!.larkAppId, 'Bot2 owns thread after takeover').toBe(BOT2.appId);
+    expect(sessions.get(MSG_TOPIC_A)!.imBotId, 'Bot2 owns thread after takeover').toBe(BOT2.appId);
   });
 });
 
@@ -380,14 +388,15 @@ describe('Full scenario: reproducing user-reported bug end-to-end', () => {
     const clientModule = await import('../src/im/lark/client.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: 'secret', cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
     vi.mocked(clientModule.getChatInfo).mockResolvedValue({ userCount: 1 });
+    vi.mocked(clientModule.listChatBotMembers).mockResolvedValue(BOTS.map(b => ({ bot_id: b.openId })) as any);
 
-    const sessions = new Map<string, { larkAppId: string }>();
+    const sessions = new Map<string, { imBotId: string }>();
 
     // ━━ Step 1: Non-@mention → all ignore (Fix A) ━━━━━━━━━━━━━━━━━━━━━━━━
     const msg1 = makeEvent(MSG_TOPIC_A, { senderOpenId: 'irrelevant' });
@@ -406,7 +415,7 @@ describe('Full scenario: reproducing user-reported bug end-to-end', () => {
     expect(r2.get(BOT2.appId), 'Step 2: Bot2 ignores').toBe('ignore');
 
     simNewTopic(BOT1.appId, MSG_TOPIC_A, sessions);
-    expect(sessions.get(MSG_TOPIC_A)!.larkAppId).toBe(BOT1.appId);
+    expect(sessions.get(MSG_TOPIC_A)!.imBotId).toBe(BOT1.appId);
 
     // ━━ Step 3: Thread reply without @mention → Bot1 responds (Fix B) ━━━━━
     const msg3 = makeEvent('om_reply_1', {
@@ -428,7 +437,7 @@ describe('Full scenario: reproducing user-reported bug end-to-end', () => {
 
     // Simulate takeover (daemon kills Bot1's session, Bot2 creates new one)
     sessions.delete(MSG_TOPIC_A);
-    sessions.set(MSG_TOPIC_A, { larkAppId: BOT2.appId });
+    sessions.set(MSG_TOPIC_A, { imBotId: BOT2.appId });
 
     // ━━ Step 5: Thread reply without @mention → Bot2 responds now ━━━━━━━━━
     const msg5 = makeEvent('om_reply_3', {

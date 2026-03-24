@@ -39,10 +39,27 @@ function readBotsJson(): any[] {
 }
 
 function connectMcpClient(env: Record<string, string>): { client: Client; transport: StdioClientTransport } {
+  // Use a wrapper process that creates a PID marker, satisfying the
+  // two-gate detection (BOTMUX=1 + ancestor marker).
+  const dataDir = env.SESSION_DATA_DIR ?? '/root/.botmux/data';
+  const wrapperCode = `
+    const fs = require('fs');
+    const path = require('path');
+    const { spawn } = require('child_process');
+    const dir = path.join(${JSON.stringify(dataDir)}, '.botmux-cli-pids');
+    fs.mkdirSync(dir, { recursive: true });
+    const marker = path.join(dir, String(process.pid));
+    fs.writeFileSync(marker, '');
+    const c = spawn('node', [${JSON.stringify(DIST_INDEX)}], { stdio: 'inherit' });
+    c.on('exit', code => {
+      try { fs.unlinkSync(marker); } catch {}
+      process.exit(code ?? 1);
+    });
+  `;
   const transport = new StdioClientTransport({
     command: 'node',
-    args: [DIST_INDEX],
-    env,
+    args: ['-e', wrapperCode],
+    env: { ...env, BOTMUX: '1' },
   });
   const client = new Client({ name: 'test-client', version: '1.0.0' });
   return { client, transport };
@@ -74,10 +91,12 @@ describe('MCP server bot registration', () => {
   it('bots.json exists and has bot configs', () => {
     const bots = readBotsJson();
     expect(bots.length).toBeGreaterThan(0);
-    console.log('Bots:', bots.map(b => `${b.larkAppId} (${b.cliId})`));
+    console.log('Bots:', bots.map(b => `${b.larkAppId ?? b.im ?? 'unknown'} (${b.cliId})`));
 
-    // Each bot must have credentials
-    for (const bot of bots) {
+    // Each lark bot must have credentials; non-lark bots are allowed without them
+    const larkBots = bots.filter((b: any) => !b.im || b.im === 'lark');
+    expect(larkBots.length).toBeGreaterThan(0);
+    for (const bot of larkBots) {
       expect(bot.larkAppId).toBeTruthy();
       expect(bot.larkAppSecret).toBeTruthy();
     }

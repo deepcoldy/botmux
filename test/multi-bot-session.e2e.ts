@@ -22,6 +22,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
+  getAvailableBots: vi.fn(() => []),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -34,6 +35,8 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendUserMessage: vi.fn(),
   updateMessage: vi.fn(),
   getChatInfo: vi.fn(),
+  listChatBotMembers: vi.fn(() => []),
+  deleteMessage: vi.fn(),
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
@@ -112,7 +115,7 @@ describe('Multi-bot @mention detection', () => {
 
     // Register all bots and set their open_ids
     for (const bot of BOTS) {
-      registerBot({ larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
+      registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
     }
 
@@ -131,7 +134,7 @@ describe('Multi-bot @mention detection', () => {
     const { isBotMentioned } = await import('../src/im/lark/event-dispatcher.js');
 
     // Register bot WITHOUT setting open_id
-    registerBot({ larkAppId: BOT1.appId, larkAppSecret: BOT1.secret, cliId: 'claude-code' });
+    registerBot({ im: 'lark' as const, larkAppId: BOT1.appId, larkAppSecret: BOT1.secret, cliId: 'claude-code' });
 
     const event = makeLarkEvent(MSG_ID_TOPIC_A, BOT1.openId, BOT1.userOpenId);
 
@@ -149,7 +152,7 @@ describe('Multi-bot checkGroupMessageAccess', () => {
 
     // Register bots with resolved allowed users
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
@@ -180,7 +183,7 @@ describe('Multi-bot checkGroupMessageAccess', () => {
     const { checkGroupMessageAccess, setBotOpenId } = await import('../src/im/lark/event-dispatcher.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
@@ -204,28 +207,28 @@ describe('Multi-bot session isolation (activeSessions collision)', () => {
   it('composite key: each bot gets its own session for the same rootId', async () => {
     // With composite key, 3 bots can independently have sessions for the same thread.
     const { sessionKey } = await import('../src/core/types.js');
-    const activeSessions = new Map<string, { larkAppId: string; sessionId: string }>();
+    const activeSessions = new Map<string, { imBotId: string; sessionId: string }>();
     const rootId = MSG_ID_TOPIC_A;
 
     // Simulate 3 bots all creating sessions for the same rootId
-    activeSessions.set(sessionKey(rootId, BOT1.appId), { larkAppId: BOT1.appId, sessionId: 'uuid-1' });
-    activeSessions.set(sessionKey(rootId, BOT2.appId), { larkAppId: BOT2.appId, sessionId: 'uuid-2' });
-    activeSessions.set(sessionKey(rootId, BOT3.appId), { larkAppId: BOT3.appId, sessionId: 'uuid-3' });
+    activeSessions.set(sessionKey(rootId, BOT1.appId), { imBotId: BOT1.appId, sessionId: 'uuid-1' });
+    activeSessions.set(sessionKey(rootId, BOT2.appId), { imBotId: BOT2.appId, sessionId: 'uuid-2' });
+    activeSessions.set(sessionKey(rootId, BOT3.appId), { imBotId: BOT3.appId, sessionId: 'uuid-3' });
 
     // All 3 sessions coexist
     expect(activeSessions.size).toBe(3);
-    expect(activeSessions.get(sessionKey(rootId, BOT1.appId))!.larkAppId).toBe(BOT1.appId);
-    expect(activeSessions.get(sessionKey(rootId, BOT2.appId))!.larkAppId).toBe(BOT2.appId);
-    expect(activeSessions.get(sessionKey(rootId, BOT3.appId))!.larkAppId).toBe(BOT3.appId);
+    expect(activeSessions.get(sessionKey(rootId, BOT1.appId))!.imBotId).toBe(BOT1.appId);
+    expect(activeSessions.get(sessionKey(rootId, BOT2.appId))!.imBotId).toBe(BOT2.appId);
+    expect(activeSessions.get(sessionKey(rootId, BOT3.appId))!.imBotId).toBe(BOT3.appId);
   });
 
   it('each bot can look up only its own session for a shared rootId', async () => {
     const { sessionKey } = await import('../src/core/types.js');
-    const activeSessions = new Map<string, { larkAppId: string; sessionId: string }>();
+    const activeSessions = new Map<string, { imBotId: string; sessionId: string }>();
     const rootId = MSG_ID_TOPIC_A;
 
     // Only Bot1 has a session
-    activeSessions.set(sessionKey(rootId, BOT1.appId), { larkAppId: BOT1.appId, sessionId: 'uuid-1' });
+    activeSessions.set(sessionKey(rootId, BOT1.appId), { imBotId: BOT1.appId, sessionId: 'uuid-1' });
 
     // Bot2 looks up — finds nothing (its own composite key doesn't exist)
     expect(activeSessions.has(sessionKey(rootId, BOT2.appId))).toBe(false);
@@ -245,7 +248,7 @@ describe('Multi-bot card action allowedUsers', () => {
 
     // Register bots with DIFFERENT per-app open_ids for the same user
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
@@ -253,7 +256,7 @@ describe('Multi-bot card action allowedUsers', () => {
     const activeSessions = new Map<string, any>();
     activeSessions.set(sessionKey(MSG_ID_TOPIC_A, BOT2.appId), {
       session: { sessionId: 'uuid-2', rootMessageId: MSG_ID_TOPIC_A },
-      larkAppId: BOT2.appId,
+      imBotId: BOT2.appId,
       pendingRepo: true,
       pendingPrompt: 'test',
       worker: null,
@@ -280,7 +283,7 @@ describe('Multi-bot card action allowedUsers', () => {
     const { sessionKey } = await import('../src/core/types.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
 
@@ -288,7 +291,7 @@ describe('Multi-bot card action allowedUsers', () => {
     const activeSessions = new Map<string, any>();
     activeSessions.set(sessionKey(MSG_ID_TOPIC_A, BOT1.appId), {
       session: { sessionId: 'uuid-1', rootMessageId: MSG_ID_TOPIC_A },
-      larkAppId: BOT1.appId,
+      imBotId: BOT1.appId,
       pendingRepo: true,
       pendingPrompt: 'test',
       worker: null,
@@ -323,7 +326,7 @@ describe('Multi-bot handleNewTopic guard', () => {
     const { setBotOpenId, checkGroupMessageAccess } = await import('../src/im/lark/event-dispatcher.js');
 
     for (const bot of BOTS) {
-      const state = registerBot({ larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
+      const state = registerBot({ im: 'lark' as const, larkAppId: bot.appId, larkAppSecret: bot.secret, cliId: 'claude-code' });
       setBotOpenId(bot.appId, bot.openId);
       state.resolvedAllowedUsers = [bot.userOpenId];
     }
@@ -351,16 +354,16 @@ describe('Multi-bot handleNewTopic guard', () => {
   });
 
   it('different topics can be handled by different bots without collision', async () => {
-    const activeSessions = new Map<string, { larkAppId: string }>();
+    const activeSessions = new Map<string, { imBotId: string }>();
 
     // Bot1 handles Topic A
-    activeSessions.set(MSG_ID_TOPIC_A, { larkAppId: BOT1.appId });
+    activeSessions.set(MSG_ID_TOPIC_A, { imBotId: BOT1.appId });
 
     // Bot2 handles Topic B (different rootId — no collision)
-    activeSessions.set(MSG_ID_TOPIC_B, { larkAppId: BOT2.appId });
+    activeSessions.set(MSG_ID_TOPIC_B, { imBotId: BOT2.appId });
 
-    expect(activeSessions.get(MSG_ID_TOPIC_A)!.larkAppId).toBe(BOT1.appId);
-    expect(activeSessions.get(MSG_ID_TOPIC_B)!.larkAppId).toBe(BOT2.appId);
+    expect(activeSessions.get(MSG_ID_TOPIC_A)!.imBotId).toBe(BOT1.appId);
+    expect(activeSessions.get(MSG_ID_TOPIC_B)!.imBotId).toBe(BOT2.appId);
     expect(activeSessions.size).toBe(2);
   });
 });

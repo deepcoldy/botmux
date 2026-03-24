@@ -112,7 +112,7 @@ describe('CoCo adapter: writeInput', () => {
     const mock = { write: (d: string) => written.push(d) };
 
     await adapter.writeInput(mock, 'hello world');
-    expect(written).toEqual(['hello world\r']);
+    expect(written).toEqual(['hello world', '\r']);
   });
 
   it('empty content still sends \\r', async () => {
@@ -120,7 +120,7 @@ describe('CoCo adapter: writeInput', () => {
     const mock = { write: (d: string) => written.push(d) };
 
     await adapter.writeInput(mock, '');
-    expect(written).toEqual(['\r']);
+    expect(written).toEqual(['', '\r']);
   });
 });
 

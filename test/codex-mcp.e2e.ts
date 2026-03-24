@@ -63,8 +63,27 @@ function runMcpSession(
     const responses: Record<number, any> = {};
     let resolved = false;
 
-    const proc = spawn('node', [MCP_SERVER_SCRIPT], {
-      env: { ...process.env, ...env },
+    // Use a wrapper process that creates a PID marker for its own PID,
+    // then spawns the MCP server as a child. The server's ppid matches
+    // the marker, satisfying the two-gate detection (BOTMUX=1 + marker).
+    const dataDir = env.SESSION_DATA_DIR ?? '/tmp/codex-mcp-test';
+    const wrapperCode = `
+      const fs = require('fs');
+      const path = require('path');
+      const { spawn } = require('child_process');
+      const dir = path.join(${JSON.stringify(dataDir)}, '.botmux-cli-pids');
+      fs.mkdirSync(dir, { recursive: true });
+      const marker = path.join(dir, String(process.pid));
+      fs.writeFileSync(marker, '');
+      const c = spawn('node', [${JSON.stringify(MCP_SERVER_SCRIPT)}], { stdio: 'inherit' });
+      c.on('exit', code => {
+        try { fs.unlinkSync(marker); } catch {}
+        process.exit(code ?? 1);
+      });
+    `;
+
+    const proc = spawn('node', ['-e', wrapperCode], {
+      env: { ...process.env, ...env, BOTMUX: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: PROJECT_ROOT,
     });
@@ -221,17 +240,19 @@ describe('MCP session lookup', () => {
     try { rmSync(testDataDir, { recursive: true, force: true }); } catch {}
   });
 
-  it('bug: without SESSION_DATA_DIR, tools return "Session not found"', async () => {
+  it('bug: without SESSION_DATA_DIR pointing to session data, tools return "Session not found"', async () => {
     /**
-     * Reproduces the production bug: ensureMcpConfig() does not pass
-     * SESSION_DATA_DIR, so the MCP server defaults to ../data relative
-     * to dist/index.js — a wrong path that has no sessions.json.
+     * Reproduces the production bug: SESSION_DATA_DIR points to a directory
+     * that has no sessions.json, so the MCP tools cannot find any session.
+     * (With two-gate detection, SESSION_DATA_DIR must be set for tools to
+     * register at all — the marker file lives under SESSION_DATA_DIR.)
      */
+    const emptyDataDir = mkdtempSync(join(tmpdir(), 'mcp-empty-data-'));
     const result = await runMcpSession(
       {
         LARK_APP_ID: 'test',
         LARK_APP_SECRET: 'test',
-        // SESSION_DATA_DIR intentionally NOT set — this is the bug
+        SESSION_DATA_DIR: emptyDataDir,
       },
       [
         mcpToolCall(10, 'send_to_thread', {

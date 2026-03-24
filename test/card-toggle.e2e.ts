@@ -52,9 +52,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+    config: { im: 'lark' as const, larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
-    botOpenId: 'ou_bot',
+    botUserId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
@@ -80,7 +80,6 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
     ...orig,
     forkWorker: vi.fn(),
     killWorker: vi.fn(),
-    initWorkerPool: vi.fn(),
   };
 });
 
@@ -99,6 +98,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports & helpers ───────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
+import { initWorkerPool } from '../src/core/worker-pool.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -123,7 +123,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
     worker: { killed: false, send: vi.fn() } as any,
     workerPort: 8080,
     workerToken: 'tok',
-    larkAppId: APP_ID,
+    imBotId: APP_ID,
     chatId: 'oc_chat',
     chatType: 'group',
     spawnedAt: Date.now(),
@@ -169,6 +169,20 @@ describe('Streaming card toggle_stream', () => {
   beforeEach(() => {
     patchCalls.length = 0;
     vi.clearAllMocks();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => ''),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 0,
+      closeSession: vi.fn(),
+      updateMessage: (_appId: string, msgId: string, json: string) => {
+        return new Promise<void>((resolve, reject) => {
+          patchCalls.push({ larkAppId: _appId, messageId: msgId, cardJson: json, resolve, reject });
+        });
+      },
+      isMessageWithdrawn: () => false,
+      buildStreamingCard: vi.fn(() => '{}'),
+      buildSessionCard: vi.fn(() => '{}'),
+    });
   });
 
   // ── Bug 1: Old card toggle should NOT affect latest card ──────────────────

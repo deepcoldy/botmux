@@ -34,7 +34,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..');
 const DIST_INDEX = join(PROJECT_ROOT, 'dist', 'index.js');
 
-const EXPECTED_TOOLS = ['send_to_thread', 'get_thread_messages', 'react_to_message', 'list_bots'];
+const EXPECTED_TOOLS = ['send_to_thread', 'get_thread_messages', 'list_bots'];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
