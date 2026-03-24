@@ -9,7 +9,6 @@ import { homedir } from 'node:os';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
-import { downloadMessageResource, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, killStalePids, getCurrentCliVersion } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -18,9 +17,39 @@ import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { ScheduledTask } from '../types.js';
 import type { ImAttachment, ImMention } from '../im/types.js';
-import type { MessageResource } from '../im/lark/message-parser.js';
 import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
+
+// ─── IM-agnostic callback types ─────────────────────────────────────────────
+
+/** Describes an attachment resource to download (replaces Lark-specific MessageResource). */
+export interface ResourceDescriptor {
+  type: 'image' | 'file';
+  key: string;
+  name: string;
+}
+
+/** Callback to download a single message resource. */
+export type DownloadResourceFn = (
+  imBotId: string,
+  messageId: string,
+  resourceKey: string,
+  resourceType: string,
+  savePath: string,
+) => Promise<string>;
+
+/** Callback to list bot members of a chat. */
+export type ListChatBotsFn = (
+  imBotId: string,
+  chatId: string,
+) => Promise<Array<{ openId: string; name: string }>>;
+
+/** Callback to send a top-level message (used by scheduled tasks). */
+export type SendMessageFn = (
+  imBotId: string,
+  chatId: string,
+  content: string,
+) => Promise<string>;
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
@@ -83,7 +112,12 @@ export function getAttachmentsDir(messageId: string): string {
   return join(resolve(config.session.dataDir), 'attachments', messageId);
 }
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<ImAttachment[]> {
+export async function downloadResources(
+  imBotId: string,
+  messageId: string,
+  resources: ResourceDescriptor[],
+  downloadFn: DownloadResourceFn,
+): Promise<ImAttachment[]> {
   if (resources.length === 0) return [];
 
   const attachments: ImAttachment[] = [];
@@ -92,7 +126,7 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   for (const res of resources) {
     const savePath = join(dir, res.name);
     try {
-      await downloadMessageResource(larkAppId, messageId, res.key, res.type, savePath);
+      await downloadFn(imBotId, messageId, res.key, res.type, savePath);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       logger.warn(`Failed to download ${res.type} ${res.key}: ${err.message}`);
@@ -105,16 +139,17 @@ export async function downloadResources(larkAppId: string, messageId: string, re
 // ─── Prompts ─────────────────────────────────────────────────────────────────
 
 /** Get bots actually present in the chat (excludes current bot).
- *  Calls Lark OpenAPI to list chat members, then cross-references with
+ *  Calls the IM backend to list chat members, then cross-references with
  *  registered bots to enrich with cliId. Falls back to empty on API error. */
 export async function getAvailableBots(
   currentAppId: string,
   chatId: string,
+  listChatBotsFn: ListChatBotsFn,
 ): Promise<Array<{ name: string; openId: string; cliId?: string }>> {
   try {
     const currentBot = getBot(currentAppId);
     const myOpenId = currentBot.botUserId;
-    const chatBots = await listChatBotMembers(currentAppId, chatId);
+    const chatBots = await listChatBotsFn(currentAppId, chatId);
 
     // Build a lookup from openId → registered bot for cliId enrichment
     const registeredByOpenId = new Map<string, string>();
@@ -244,15 +279,14 @@ export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: (...args: any[]) => boolean,
+  sendMessageFn: SendMessageFn,
 ): Promise<void> {
   const defaultBot = getAllBots()[0];
   if (!defaultBot) { logger.warn('No bots configured, skipping scheduled task'); return; }
   const imBotId = defaultBot.imBotId;
 
-  const { sendMessage } = await import('../im/lark/client.js');
-
   // Send a top-level message to create a thread
-  const rootMessageId = await sendMessage(
+  const rootMessageId = await sendMessageFn(
     imBotId,
     task.chatId,
     `🕐 定时任务「${task.name}」开始执行`,

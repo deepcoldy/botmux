@@ -11,14 +11,14 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
-import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { getCliDisplayName } from '../utils/cli-display.js';
-import { deleteMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
+import type { ProjectInfo } from '../services/project-scanner.js';
+import type { ListChatBotsFn } from './session-manager.js';
 import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
 
@@ -47,7 +47,13 @@ export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, imBotId?: string) => Promise<string>;
   getActiveCount: () => number;
-  lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
+  lastRepoScan: Map<string, ProjectInfo[]>;
+  /** Build a repo selection card (interactive or text). Returns card JSON string. */
+  buildRepoSelectCard: (projects: ProjectInfo[], currentCwd: string, rootMessageId: string) => string;
+  /** Delete a message by its ID. */
+  deleteMessage: (imBotId: string, messageId: string) => Promise<void>;
+  /** List bot members in a chat (for getAvailableBots). */
+  listChatBots: ListChatBotsFn;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -284,7 +290,7 @@ export async function handleCommand(
               botCfg.cliPathOverride,
               ds.pendingAttachments,
               ds.pendingMentions,
-              await getAvailableBots(ds.imBotId, ds.chatId),
+              await getAvailableBots(ds.imBotId, ds.chatId, deps.listChatBots),
             );
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
@@ -302,7 +308,7 @@ export async function handleCommand(
           }
           // Withdraw repo selection card
           if (ds.repoCardMessageId) {
-            deleteMessage(ds.imBotId, ds.repoCardMessageId);
+            deps.deleteMessage(ds.imBotId, ds.repoCardMessageId);
             ds.repoCardMessageId = undefined;
           }
           logger.info(`[${t}] Repo selected via /repo ${repoIndex}: ${selectedPath}`);
@@ -327,7 +333,7 @@ export async function handleCommand(
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
-        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
+        const cardJson = deps.buildRepoSelectCard(projects, currentCwd, rootId);
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) ds.repoCardMessageId = repoCardMsgId;
         logger.info(`[${t}] Sent repo card with ${projects.length} project(s)`);
@@ -346,7 +352,7 @@ export async function handleCommand(
             botCfg.cliPathOverride,
             ds.pendingAttachments,
             ds.pendingMentions,
-            await getAvailableBots(ds.imBotId, ds.chatId),
+            await getAvailableBots(ds.imBotId, ds.chatId, deps.listChatBots),
           );
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
@@ -355,7 +361,7 @@ export async function handleCommand(
           const cwd = getSessionWorkingDir(ds);
           await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
           if (ds.repoCardMessageId) {
-            deleteMessage(ds.imBotId, ds.repoCardMessageId);
+            deps.deleteMessage(ds.imBotId, ds.repoCardMessageId);
             ds.repoCardMessageId = undefined;
           }
           logger.info(`[${t}] Skip repo via /skip, spawning CLI in ${cwd}`);
