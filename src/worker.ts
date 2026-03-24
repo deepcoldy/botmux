@@ -512,9 +512,9 @@ process.on('message', async (raw: unknown) => {
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
       sessionId = msg.sessionId;
-      if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
+      if (msg.ownerId) process.env.__OWNER_OPEN_ID = msg.ownerId;
       // Scope session store to this bot's per-bot file
-      if (msg.larkAppId) sessionStore.init(msg.larkAppId);
+      if (msg.imBotId) sessionStore.init(msg.imBotId);
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}`);
 
       try {

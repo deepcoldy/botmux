@@ -20,7 +20,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 
 export interface CardHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, imBotId?: string) => Promise<string>;
   lastRepoScan: Map<string, ProjectInfo[]>;
 }
 
@@ -62,7 +62,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 1. Use the receiving bot (larkAppId from event dispatcher) — most accurate
     // 2. Fall back to session's bot
     // 3. Fall back to merging all bots
-    const effectiveAppId = larkAppId ?? ds?.larkAppId;
+    const effectiveAppId = larkAppId ?? ds?.imBotId;
     let allowedUsers: string[];
     if (effectiveAppId) {
       allowedUsers = getBot(effectiveAppId).resolvedAllowedUsers;
@@ -84,7 +84,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const ds = activeSessions.get(sKey);
 
     if (actionType === 'restart' && ds) {
-      const botCfg = getBot(ds.larkAppId).config;
+      const botCfg = getBot(ds.imBotId).config;
       if (ds.worker) {
         // Worker alive — tell it to restart CLI
         logger.info(`[${tag(ds)}] Restart via card button`);
@@ -110,7 +110,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
-      const botCfg = getBot(ds.larkAppId).config;
+      const botCfg = getBot(ds.imBotId).config;
       if (ds.workerPort && ds.workerToken) {
         const writeUrl = `http://${config.web.externalHost}:${ds.workerPort}?token=${ds.workerToken}`;
         const dmCardJson = buildSessionCard(
@@ -121,7 +121,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           botCfg.cliId,
           true, // showManageButtons — DM card includes restart & close
         );
-        sendUserMessage(ds.larkAppId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
+        sendUserMessage(ds.imBotId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
           logger.warn(`[${tag(ds)}] Failed to DM write link: ${err}`),
         );
         logger.info(`[${tag(ds)}] Sent write link via DM to ${operatorOpenId}`);
@@ -138,7 +138,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce) {
         logger.debug(`[${tag(ds)}] Ignoring toggle on old card: nonce=${clickedNonce}, current=${ds.streamCardNonce}`);
       } else {
-        const botCfg = getBot(ds.larkAppId).config;
+        const botCfg = getBot(ds.imBotId).config;
         ds.streamExpanded = !ds.streamExpanded;
         if (ds.streamCardId && ds.workerPort) {
           const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
@@ -166,7 +166,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (actionType === 'skip_repo' && ds) {
       if (ds.pendingRepo) {
-        const botCfg = getBot(ds.larkAppId).config;
+        const botCfg = getBot(ds.imBotId).config;
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
         const prompt = buildNewTopicPrompt(
@@ -176,7 +176,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           botCfg.cliPathOverride,
           ds.pendingAttachments,
           ds.pendingMentions,
-          await getAvailableBots(ds.larkAppId, ds.chatId),
+          await getAvailableBots(ds.imBotId, ds.chatId),
         );
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
@@ -227,7 +227,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   sessionStore.updateSession(targetDs.session);
 
   if (targetDs.pendingRepo) {
-    const botCfg = getBot(targetDs.larkAppId).config;
+    const botCfg = getBot(targetDs.imBotId).config;
     // First-time repo selection — now spawn CLI with the original prompt
     targetDs.pendingRepo = false;
     const prompt = buildNewTopicPrompt(
@@ -237,7 +237,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       botCfg.cliPathOverride,
       targetDs.pendingAttachments,
       targetDs.pendingMentions,
-      await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
+      await getAvailableBots(targetDs.imBotId, targetDs.chatId),
     );
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;

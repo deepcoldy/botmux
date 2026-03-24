@@ -373,7 +373,7 @@ interface SessionData {
   pid?: number;
   workingDir?: string;
   webPort?: number;
-  larkAppId?: string;
+  imBotId?: string;
 }
 
 /**
@@ -434,7 +434,7 @@ function loadSessions(): Map<string, SessionData> {
 /** Save a single session back to its appropriate file based on larkAppId. */
 function saveSession(session: SessionData): void {
   const dataDir = resolveDataDir();
-  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
+  const fileName = session.imBotId ? `sessions-${session.imBotId}.json` : 'sessions.json';
   const fp = join(dataDir, fileName);
 
   // Read current file, update session, write back
@@ -544,7 +544,7 @@ function formatSessionRow(
   const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
   const parts = [id];
   if (multiBot) {
-    const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 18)) : '-';
+    const label = s.imBotId ? (botLabels.get(s.imBotId) ?? s.imBotId.substring(0, 18)) : '-';
     parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
   }
   const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);
@@ -560,7 +560,7 @@ function formatSessionRow(
 /** Print plain session table (non-interactive). */
 function printSessionTable(active: SessionData[]): void {
   const botConfigs = loadBotConfigsForDisplay();
-  const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
+  const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.imBotId).filter(Boolean)).size > 1;
   const botLabels = new Map<string, string>();
   for (let i = 0; i < botConfigs.length; i++) {
     const b = botConfigs[i];
@@ -613,7 +613,7 @@ function shortenPath(p: string): string {
 /** Interactive TUI session picker — returns a promise that resolves when done. */
 function interactiveSessionPicker(active: SessionData[]): Promise<void> {
   const botConfigs = loadBotConfigsForDisplay();
-  const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
+  const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.imBotId).filter(Boolean)).size > 1;
   const botLabels = new Map<string, string>();
   for (let i = 0; i < botConfigs.length; i++) {
     const b = botConfigs[i];
@@ -649,7 +649,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
       const parts = [id];
       if (multiBot) {
-        const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
+        const label = s.imBotId ? (botLabels.get(s.imBotId) ?? s.imBotId.substring(0, 16)) : '-';
         parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
       }
       const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);

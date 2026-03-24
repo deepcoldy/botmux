@@ -64,7 +64,7 @@ export async function execute(args: z.infer<typeof schema>) {
       || (config.daemon.allowedUsers[0]?.startsWith('ou_') ? config.daemon.allowedUsers[0] : undefined);
 
     const replyInThread = session.chatType === 'p2p';
-    const appId = session.larkAppId || config.lark.appId;
+    const appId = session.imBotId || config.lark.appId;
 
     // Validate that image/file paths exist before doing anything
     for (const p of [...(args.images ?? []), ...(args.files ?? [])]) {

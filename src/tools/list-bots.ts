@@ -35,7 +35,7 @@ export async function execute(args: z.infer<typeof schema>) {
     return { error: `Session ${args.session_id} not found` };
   }
 
-  const appId = session.larkAppId || config.lark.appId;
+  const appId = session.imBotId || config.lark.appId;
   const botInfo = readBotInfo();
 
   // Build a map of open_id → bot info for quick lookup

@@ -53,7 +53,7 @@ function load(): void {
         const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
         sessions = new Map();
         for (const [k, v] of Object.entries(data)) {
-          if (v.larkAppId === currentAppId) {
+          if (v.imBotId === currentAppId) {
             sessions.set(k, v);
           }
         }
@@ -109,7 +109,7 @@ export function getSession(sessionId: string): Session | undefined {
  *
  * The MCP server is a global singleton (one config in ~/.claude.json shared
  * by all CLI instances). It may be spawned from a non-botmux context where
- * LARK_APP_ID is unavailable, so it can't scope to the right per-bot file.
+ * IM_BOT_ID is unavailable, so it can't scope to the right per-bot file.
  * Scanning all files is safe here because MCP tools only read sessions.
  */
 function findInOtherFiles(sessionId: string): Session | undefined {

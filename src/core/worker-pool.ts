@@ -26,7 +26,7 @@ const __dirname = dirname(__filename);
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerPoolCallbacks {
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, imBotId?: string) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
@@ -85,7 +85,7 @@ function flushCardPatch(ds: DaemonSession): void {
   }
   ds.pendingCardJson = undefined;
   ds.cardPatchInFlight = true;
-  updateMessage(ds.larkAppId, cardId, json)
+  updateMessage(ds.imBotId, cardId, json)
     .catch(err => {
       if (err instanceof MessageWithdrawnError) {
         logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
@@ -151,7 +151,7 @@ export function killWorker(ds: DaemonSession): void {
 
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const cb = requireCallbacks();
-  const bot = getBot(ds.larkAppId);
+  const bot = getBot(ds.imBotId);
   const botCfg = bot.config;
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
@@ -177,8 +177,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       ...process.env,
       CLAUDECODE: undefined,
       BOTMUX: '1',  // Inherited by CLI → MCP server for session detection
-      LARK_APP_ID: botCfg.larkAppId,
-      LARK_APP_SECRET: botCfg.larkAppSecret,
+      IM_BOT_ID: ds.imBotId,
     },
   });
 
@@ -208,10 +207,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
-    ownerOpenId: ds.ownerOpenId,
+    ownerId: ds.ownerId,
     webPort: ds.session.webPort,
-    larkAppId: botCfg.larkAppId,
-    larkAppSecret: botCfg.larkAppSecret,
+    imBotId: ds.imBotId,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -247,7 +245,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.streamExpanded,
             ds.streamCardNonce,
           );
-          ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
+          ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.imBotId);
         } catch (err) {
           if (err instanceof MessageWithdrawnError) {
             logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -267,7 +265,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
               ds.session.title || getCliDisplayName(botCfg.cliId),
               botCfg.cliId,
             );
-            await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
+            await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.imBotId);
           } catch (fallbackErr) {
             if (fallbackErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -318,7 +316,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           // not POSTed as duplicate cards.
           ds.streamCardPending = false;
           ds.streamCardId = CARD_POSTING_SENTINEL;
-          cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
+          cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.imBotId)
             .then(msgId => { ds.streamCardId = msgId; })
             .catch(err => {
               if (err instanceof MessageWithdrawnError) {
@@ -377,7 +375,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           killWorker(ds);
           const cliName = getCliDisplayName(botCfg.cliId);
           try {
-            await cb.sessionReply(ds.session.rootMessageId, `⚠️ ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
+            await cb.sessionReply(ds.session.rootMessageId, `⚠️ ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.imBotId);
           } catch (replyErr) {
             if (replyErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);

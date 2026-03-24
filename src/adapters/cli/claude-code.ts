@@ -49,7 +49,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
 
       // Clean up stale entries pointing to the same server script under a different name.
       // Old installations may have entries (e.g. "claude-code-robot") with hardcoded
-      // LARK_APP_ID/SECRET that override per-bot credentials from the worker env.
+      // IM_BOT_ID that override per-bot credentials from the worker env.
       const serverScript = entry.args[0];
       let dirty = false;
       for (const [name, cfg] of Object.entries(data.mcpServers) as [string, any][]) {

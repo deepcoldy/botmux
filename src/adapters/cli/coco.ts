@@ -43,7 +43,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         }
       }
 
-      // Remove existing entry first to ensure env is fully replaced (no stale LARK_APP_ID)
+      // Remove existing entry first to ensure env is fully replaced (no stale IM_BOT_ID)
       try {
         execSync(`${bin} mcp remove ${entry.name}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
       } catch { /* not present — fine */ }

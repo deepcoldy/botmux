@@ -10,7 +10,7 @@ export interface Session {
   pid?: number;
   workingDir?: string;
   webPort?: number;
-  larkAppId?: string;
+  imBotId?: string;
 }
 
 export interface LarkAttachment {
@@ -54,7 +54,7 @@ export interface ScheduledTask {
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; ownerId?: string; webPort?: number; imBotId: string }
   | { type: 'message'; content: string }
   | { type: 'close' }
   | { type: 'restart' };

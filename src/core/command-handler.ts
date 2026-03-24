@@ -45,7 +45,7 @@ function formatUptime(ms: number): string {
 
 export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, imBotId?: string) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
 }
@@ -134,7 +134,7 @@ async function handleScheduleCommand(
   const parsed = scheduler.parseNaturalSchedule(trimmed);
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
-    const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
+    const workingDir = ds?.workingDir ?? (ds?.imBotId ? getBot(ds.imBotId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
     const task = scheduler.addTask({
       name: parsed.name,
       type: parsed.type,
@@ -178,7 +178,7 @@ export async function handleCommand(
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
           activeSessions.delete(sessionKey(rootId, larkAppId!));
-          const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+          const cliName = getCliDisplayName(getBot(ds.imBotId).config.cliId);
           await sessionReply(rootId, `会话已关闭，${cliName} 进程已终止。`);
           logger.info(`[${t}] Session closed by /close command`);
         } else {
@@ -207,11 +207,11 @@ export async function handleCommand(
         if (ds) {
           if (ds.worker && !ds.worker.killed) {
             ds.worker.send({ type: 'restart' } as DaemonToWorker);
-            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+            const cliName = getCliDisplayName(getBot(ds.imBotId).config.cliId);
             await sessionReply(rootId, `🔄 正在重启 ${cliName}...`);
           } else {
             killWorker(ds);
-            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+            const cliName = getCliDisplayName(getBot(ds.imBotId).config.cliId);
             await sessionReply(rootId, `${cliName} 进程已终止，下次发消息时将自动恢复。`);
           }
           logger.info(`[${t}] Restart by /restart command`);
@@ -274,7 +274,7 @@ export async function handleCommand(
           sessionStore.updateSession(ds.session);
 
           if (ds.pendingRepo) {
-            const botCfg = getBot(ds.larkAppId).config;
+            const botCfg = getBot(ds.imBotId).config;
             ds.pendingRepo = false;
             const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
             const prompt = buildNewTopicPrompt(
@@ -284,7 +284,7 @@ export async function handleCommand(
               botCfg.cliPathOverride,
               ds.pendingAttachments,
               ds.pendingMentions,
-              await getAvailableBots(ds.larkAppId, ds.chatId),
+              await getAvailableBots(ds.imBotId, ds.chatId),
             );
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
@@ -302,7 +302,7 @@ export async function handleCommand(
           }
           // Withdraw repo selection card
           if (ds.repoCardMessageId) {
-            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
+            deleteMessage(ds.imBotId, ds.repoCardMessageId);
             ds.repoCardMessageId = undefined;
           }
           logger.info(`[${t}] Repo selected via /repo ${repoIndex}: ${selectedPath}`);
@@ -336,7 +336,7 @@ export async function handleCommand(
 
       case '/skip': {
         if (ds?.pendingRepo) {
-          const botCfg = getBot(ds.larkAppId).config;
+          const botCfg = getBot(ds.imBotId).config;
           ds.pendingRepo = false;
           const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
           const prompt = buildNewTopicPrompt(
@@ -346,7 +346,7 @@ export async function handleCommand(
             botCfg.cliPathOverride,
             ds.pendingAttachments,
             ds.pendingMentions,
-            await getAvailableBots(ds.larkAppId, ds.chatId),
+            await getAvailableBots(ds.imBotId, ds.chatId),
           );
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
@@ -355,7 +355,7 @@ export async function handleCommand(
           const cwd = getSessionWorkingDir(ds);
           await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
           if (ds.repoCardMessageId) {
-            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
+            deleteMessage(ds.imBotId, ds.repoCardMessageId);
             ds.repoCardMessageId = undefined;
           }
           logger.info(`[${t}] Skip repo via /skip, spawning CLI in ${cwd}`);
@@ -375,7 +375,7 @@ export async function handleCommand(
             `Status: ${alive ? '运行中' : '等待中'}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
-            `${getCliDisplayName(getBot(ds.larkAppId).config.cliId)}: v${ds.cliVersion}${ds.cliVersion !== getCurrentCliVersion() ? ` (latest: v${getCurrentCliVersion()})` : ''}`,
+            `${getCliDisplayName(getBot(ds.imBotId).config.cliId)}: v${ds.cliVersion}${ds.cliVersion !== getCurrentCliVersion() ? ` (latest: v${getCurrentCliVersion()})` : ''}`,
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
@@ -422,7 +422,7 @@ export async function handleCommand(
       }
 
       case '/help': {
-        const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
+        const botCfg = ds ? getBot(ds.imBotId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const help = [
           '📌 会话管理：',

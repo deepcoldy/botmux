@@ -16,7 +16,8 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
+import type { ScheduledTask } from '../types.js';
+import type { ImAttachment, ImMention } from '../im/types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -29,8 +30,8 @@ export function expandHome(p: string): string {
 
 export function getSessionWorkingDir(ds?: DaemonSession): string {
   if (ds?.workingDir) return expandHome(ds.workingDir);
-  if (ds?.larkAppId) {
-    const bot = getBot(ds.larkAppId);
+  if (ds?.imBotId) {
+    const bot = getBot(ds.imBotId);
     return expandHome(bot.config.workingDir ?? '~');
   }
   // Fallback for calls without a session (e.g. during restore)
@@ -48,8 +49,8 @@ export function getProjectScanDir(ds?: DaemonSession): string {
 
 /** Return all directories to scan for projects (supports multi-dir WORKING_DIR). */
 export function getProjectScanDirs(ds?: DaemonSession): string[] {
-  if (ds?.larkAppId) {
-    const bot = getBot(ds.larkAppId);
+  if (ds?.imBotId) {
+    const bot = getBot(ds.imBotId);
     if (bot.config.projectScanDir) {
       return [expandHome(bot.config.projectScanDir)];
     }
@@ -82,10 +83,10 @@ export function getAttachmentsDir(messageId: string): string {
   return join(resolve(config.session.dataDir), 'attachments', messageId);
 }
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<LarkAttachment[]> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<ImAttachment[]> {
   if (resources.length === 0) return [];
 
-  const attachments: LarkAttachment[] = [];
+  const attachments: ImAttachment[] = [];
   const dir = getAttachmentsDir(messageId);
 
   for (const res of resources) {
@@ -134,7 +135,7 @@ export async function getAvailableBots(
   }
 }
 
-export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
+export function formatAttachmentsHint(attachments?: ImAttachment[]): string {
   if (!attachments || attachments.length === 0) return '';
   const lines = attachments.map(a => `- ${a.path}`);
   return `\n\n附件（使用 Read 工具查看）：\n${lines.join('\n')}`;
@@ -145,8 +146,8 @@ export function buildNewTopicPrompt(
   sessionId: string,
   cliId: CliId,
   cliPathOverride?: string,
-  attachments?: LarkAttachment[],
-  mentions?: LarkMention[],
+  attachments?: ImAttachment[],
+  mentions?: ImMention[],
   availableBots?: Array<{ name: string; openId: string; cliId?: string }>,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
@@ -158,7 +159,7 @@ export function buildNewTopicPrompt(
   let mentionSection = '';
   if (mentions && mentions.length > 0) {
     const mentionLines = mentions.map(m => {
-      const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
+      const idPart = m.userId ? ` → open_id: ${m.userId}` : '';
       return `- @${m.name}${idPart}`;
     });
     mentionSection = `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
@@ -204,13 +205,13 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   for (const session of active) {
     messageQueue.ensureQueue(session.rootMessageId);
 
-    const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
-    activeSessions.set(sessionKey(session.rootMessageId, larkAppId), {
+    const imBotId = session.imBotId ?? getAllBots()[0]?.config.larkAppId ?? '';
+    activeSessions.set(sessionKey(session.rootMessageId, imBotId), {
       session,
       worker: null,
       workerPort: null,
       workerToken: null,
-      larkAppId,
+      imBotId,
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
       spawnedAt: Date.now(),
@@ -246,13 +247,13 @@ export async function executeScheduledTask(
 ): Promise<void> {
   const defaultBot = getAllBots()[0];
   if (!defaultBot) { logger.warn('No bots configured, skipping scheduled task'); return; }
-  const larkAppId = defaultBot.config.larkAppId;
+  const imBotId = defaultBot.config.larkAppId;
 
   const { sendMessage } = await import('../im/lark/client.js');
 
   // Send a top-level message to create a thread
   const rootMessageId = await sendMessage(
-    larkAppId,
+    imBotId,
     task.chatId,
     `🕐 定时任务「${task.name}」开始执行`,
   );
@@ -260,7 +261,7 @@ export async function executeScheduledTask(
   // Create a session for this thread
   refreshCliVersion(defaultBot.config.cliId, defaultBot.config.cliPathOverride);
   const session = sessionStore.createSession(task.chatId, rootMessageId, `[定时] ${task.name}`);
-  session.larkAppId = larkAppId;
+  session.imBotId = imBotId;
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(rootMessageId);
 
@@ -271,7 +272,7 @@ export async function executeScheduledTask(
     worker: null,
     workerPort: null,
     workerToken: null,
-    larkAppId,
+    imBotId,
     chatId: task.chatId,
     chatType: 'group',
     spawnedAt: Date.now(),
@@ -280,7 +281,7 @@ export async function executeScheduledTask(
     hasHistory: false,
     workingDir: task.workingDir,
   };
-  activeSessions.set(sessionKey(rootMessageId, larkAppId), ds);
+  activeSessions.set(sessionKey(rootMessageId, imBotId), ds);
   forkWorker(ds, prompt);
 
   logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId})`);

@@ -56,16 +56,16 @@ const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
  * Reply to a message, automatically using reply_in_thread for p2p sessions.
  * In p2p chats, Lark needs reply_in_thread=true to create/continue a thread.
  */
-async function sessionReply(rootId: string, content: string, msgType: string = 'text', larkAppId?: string): Promise<string> {
+async function sessionReply(rootId: string, content: string, msgType: string = 'text', imBotId?: string): Promise<string> {
   let ds: DaemonSession | undefined;
-  if (larkAppId) {
-    ds = activeSessions.get(sessionKey(rootId, larkAppId));
+  if (imBotId) {
+    ds = activeSessions.get(sessionKey(rootId, imBotId));
   } else {
     for (const s of activeSessions.values()) {
       if (s.session.rootMessageId === rootId) { ds = s; break; }
     }
   }
-  const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
+  const appId = imBotId ?? ds?.imBotId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
   const inThread = ds?.chatType === 'p2p';
   return replyMessage(appId, rootId, content, msgType, inThread);
@@ -181,21 +181,21 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     const cmd = content.split(/\s+/)[0].toLowerCase();
     if (DAEMON_COMMANDS.has(cmd)) {
       const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
-      session.larkAppId = larkAppId;
+      session.imBotId = larkAppId;
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(messageId, larkAppId), {
         session,
         worker: null,
         workerPort: null,
         workerToken: null,
-        larkAppId,
+        imBotId: larkAppId,
         chatId,
         chatType,
         spawnedAt: Date.now(),
         cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
         lastMessageAt: Date.now(),
         hasHistory: false,
-        ownerOpenId: senderOpenId,
+        ownerId: senderOpenId,
       });
       await handleCommand(cmd, messageId, parsed, commandDeps, larkAppId);
       return;
@@ -212,7 +212,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
 
   // Create session in pending-repo state — don't spawn CLI yet
   const session = sessionStore.createSession(chatId, messageId, parsed.content.substring(0, 50), chatType);
-  session.larkAppId = larkAppId;
+  session.imBotId = larkAppId;
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(messageId);
   messageQueue.appendMessage(messageId, parsed);
@@ -222,7 +222,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     worker: null,
     workerPort: null,
     workerToken: null,
-    larkAppId,
+    imBotId: larkAppId,
     chatId,
     chatType,
     spawnedAt: Date.now(),
@@ -232,8 +232,8 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     pendingRepo: true,
     pendingPrompt: content,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
-    pendingMentions: parsed.mentions,
-    ownerOpenId: senderOpenId,
+    pendingMentions: parsed.mentions?.map(m => ({ key: m.key, name: m.name, userId: m.openId })),
+    ownerId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
   };
   activeSessions.set(sessionKey(messageId, larkAppId), ds);
@@ -278,10 +278,10 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // If this bot doesn't have a session but another bot does, allow coexistence.
   // Multiple bots can have independent sessions in the same thread — the session
-  // key (rootId::larkAppId) already supports this. No need to kill the other bot.
+  // key (rootId::imBotId) already supports this. No need to kill the other bot.
   if (!ds) {
     const hasOtherBot = [...activeSessions.values()].some(
-      s => s.session.rootMessageId === rootId && s.larkAppId !== larkAppId
+      s => s.session.rootMessageId === rootId && s.imBotId !== larkAppId
     );
     if (hasOtherBot) {
       logger.info(`[${larkAppId}] Joining thread ${rootId} alongside existing bot session(s)`);
@@ -289,7 +289,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   }
 
   // Download attachments
-  const effectiveAppId = ds?.larkAppId ?? larkAppId;
+  const effectiveAppId = ds?.imBotId ?? larkAppId;
   const attachments = await downloadResources(effectiveAppId, parsed.messageId, resources);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
@@ -321,14 +321,14 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     logger.info(`No active session for thread ${rootId}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50), chatType);
-    session.larkAppId = larkAppId;
+    session.imBotId = larkAppId;
     sessionStore.updateSession(session);
     const newDs: DaemonSession = {
       session,
       worker: null,
       workerPort: null,
       workerToken: null,
-      larkAppId,
+      imBotId: larkAppId,
       chatId,
       chatType,
       spawnedAt: Date.now(),
@@ -338,8 +338,8 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       pendingRepo: true,
       pendingPrompt: parsed.content,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
-      pendingMentions: parsed.mentions,
-      ownerOpenId: data.sender?.sender_id?.open_id,
+      pendingMentions: parsed.mentions?.map(m => ({ key: m.key, name: m.name, userId: m.openId })),
+      ownerId: data.sender?.sender_id?.open_id,
       currentTurnTitle: parsed.content.substring(0, 50),
     };
     activeSessions.set(sessionKey(rootId, larkAppId), newDs);
@@ -383,7 +383,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     // Freeze the previous turn's card at "idle" before starting a new turn
     if (ds.streamCardId && ds.workerPort) {
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-      const dsBotCfg = getBot(ds.larkAppId).config;
+      const dsBotCfg = getBot(ds.imBotId).config;
       const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
       const frozenCard = buildStreamingCard(
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
@@ -508,7 +508,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getActiveCount,
     closeSession(ds: DaemonSession) {
       sessionStore.closeSession(ds.session.sessionId);
-      activeSessions.delete(sessionKey(ds.session.rootMessageId, ds.larkAppId));
+      activeSessions.delete(sessionKey(ds.session.rootMessageId, ds.imBotId));
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
   });
@@ -551,7 +551,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!activeSessions.has(sessionKey(rootId, appId))) return false;
         // Only grant shortcut if no other bot also has a session for this rootId
         for (const s of activeSessions.values()) {
-          if (s.session.rootMessageId === rootId && s.larkAppId !== appId) return false;
+          if (s.session.rootMessageId === rootId && s.imBotId !== appId) return false;
         }
         return true;
       },
@@ -579,8 +579,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const [, ds] of activeSessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
-        const backendType = ds.larkAppId
-          ? (getBot(ds.larkAppId).config.backendType ?? config.daemon.backendType)
+        const backendType = ds.imBotId
+          ? (getBot(ds.imBotId).config.backendType ?? config.daemon.backendType)
           : config.daemon.backendType;
         if (backendType === 'tmux') {
           // Tmux mode: just kill the worker process — tmux session survives for re-attach.

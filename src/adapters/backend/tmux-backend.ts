@@ -188,13 +188,12 @@ export class TmuxBackend implements SessionBackend {
 /**
  * Env vars that must be explicitly passed to the tmux session command via -e.
  * The tmux server inherits env from the first session's creator; subsequent
- * sessions share that env. Per-bot vars (LARK credentials) would be wrong
+ * sessions share that env. Per-bot vars (IM credentials) would be wrong
  * for non-first bots without explicit passthrough.
  */
 const TMUX_PASSTHROUGH_VARS = [
   'BOTMUX',
-  'LARK_APP_ID',
-  'LARK_APP_SECRET',
+  'IM_BOT_ID',
   '__OWNER_OPEN_ID',
   'SESSION_DATA_DIR',
 ];

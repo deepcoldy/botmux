@@ -40,7 +40,7 @@ function hasAncestorCliMarker(): boolean {
 export function createServer(): McpServer {
   // Register all bots so MCP tools can send messages as any bot.
   // loadBotConfigs() reads from bots.json / env vars — works regardless
-  // of whether the CLI passes LARK_APP_ID through to the MCP subprocess.
+  // of whether the CLI passes IM_BOT_ID through to the MCP subprocess.
   try {
     const configs = loadBotConfigs();
     for (const cfg of configs) {
@@ -52,8 +52,8 @@ export function createServer(): McpServer {
   }
 
   // Scope session store to the owning bot's per-bot file (sessions-{appId}.json).
-  // LARK_APP_ID is inherited from the worker process env.
-  const appId = process.env.LARK_APP_ID;
+  // IM_BOT_ID is inherited from the worker process env.
+  const appId = process.env.IM_BOT_ID;
   if (appId) {
     sessionStore.init(appId);
   }
