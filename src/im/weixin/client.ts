@@ -54,9 +54,13 @@ export async function sendMessage(
     method: 'POST',
     headers: makeHeaders(token),
     body: JSON.stringify({
-      to_user_id: toUserId,
-      context_token: contextToken,
-      item_list: [{ type: 1, text_item: { text } }],
+      msg: {
+        to_user_id: toUserId,
+        message_type: 2,
+        message_state: 2,
+        context_token: contextToken,
+        item_list: [{ type: 1, text_item: { text } }],
+      },
     }),
   });
   const data = await res.json() as any;
