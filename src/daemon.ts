@@ -575,6 +575,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // Route card building through the session's adapter
       const ds = [...activeSessions.values()].find(s => s.session.sessionId === sessionId);
       const adapter = ds ? getBot(ds.imBotId).adapter : undefined;
+      if (adapter && !adapter.capabilities.updateMessage) {
+        // Non-updateMessage IM (WeChat): only send on idle (final result), suppress working/starting
+        if (status !== 'idle') return '';
+        const card = adapter.cards.buildStreamingCard({ sessionId, rootMessageId, terminalUrl, title, content, status });
+        return typeof card.payload === 'string' ? card.payload : JSON.stringify(card.payload);
+      }
       if (adapter) {
         const card = adapter.cards.buildStreamingCard({ sessionId, rootMessageId, terminalUrl, title, content, status });
         return typeof card.payload === 'string' ? card.payload : JSON.stringify(card.payload);

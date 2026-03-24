@@ -252,6 +252,18 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.streamExpanded,
             ds.streamCardNonce,
           );
+          if (!streamCardJson) {
+            // Non-streaming IM (e.g. WeChat) — send static session card instead, skip streaming
+            ds.streamCardId = undefined;
+            const sessionCard = cb.buildSessionCard(
+              ds.session.sessionId, ds.session.rootMessageId, readOnlyUrl,
+              initTitle, botCfg.cliId,
+            );
+            if (sessionCard) {
+              await cb.sessionReply(ds.session.rootMessageId, sessionCard, 'interactive', ds.imBotId);
+            }
+            break;
+          }
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.imBotId);
         } catch (err) {
           if (cb.isMessageWithdrawn(err)) {
@@ -319,6 +331,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.streamExpanded,
             ds.streamCardNonce,
           );
+          // Empty card JSON = non-streaming IM, skip sending
+          if (!cardJson) break;
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
           ds.streamCardPending = false;
@@ -348,7 +362,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.streamExpanded,
             ds.streamCardNonce,
           );
-          scheduleCardPatch(ds, cardJson);
+          if (cardJson) scheduleCardPatch(ds, cardJson);
         }
         break;
       }
