@@ -237,7 +237,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         if (ds.nonStreamingIm) {
           // Non-streaming IM (WeChat): send a brief acknowledgment with terminal link.
           // All subsequent replies come from CLI via MCP send_to_thread.
-          const ack = `✦ 收到，正在处理...\n🔗 终端: ${readOnlyUrl}`;
+          const ack = `收到，正在处理...\n${readOnlyUrl}`;
           cb.sessionReply(ds.session.rootMessageId, ack, 'text', ds.imBotId)
             .catch(err => logger.debug(`[${t}] Failed to send ack: ${err}`));
           break;
