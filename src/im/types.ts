@@ -1,3 +1,13 @@
+export interface ImCapabilities {
+  cards: boolean;
+  updateMessage: boolean;
+  threads: boolean;
+  richText: boolean;
+  reactions: boolean;
+  typing: boolean;
+  attachments: boolean;
+}
+
 export interface ImMessage {
   id: string;
   threadId: string;
@@ -18,6 +28,12 @@ export interface ImAttachment {
 export interface ImUser {
   id: string;
   identifier: string;
+}
+
+export interface ImMention {
+  key: string;
+  name: string;
+  userId?: string;
 }
 
 export interface ImCard {
@@ -62,6 +78,9 @@ export interface ImCardBuilder {
 }
 
 export interface ImAdapter {
+  readonly id: string;
+  readonly capabilities: ImCapabilities;
+
   start(handler: ImEventHandler): Promise<void>;
   stop(): Promise<void>;
 
@@ -70,6 +89,7 @@ export interface ImAdapter {
   sendMessage(threadId: string, content: string, format: 'text' | 'rich'): Promise<string>;
   replyMessage(messageId: string, content: string, format: 'text' | 'rich'): Promise<string>;
   updateMessage(messageId: string, content: string): Promise<void>;
+  deleteMessage(messageId: string): Promise<void>;
   sendCard(threadId: string, card: ImCard): Promise<string>;
   updateCard(messageId: string, card: ImCard): Promise<void>;
 
