@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { replyMessage, uploadImage, uploadFile } from '../im/lark/client.js';
 import { config } from '../config.js';
+import { getBot } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';
 
@@ -58,13 +59,32 @@ export async function execute(args: z.infer<typeof schema>) {
   }
 
   try {
+    const appId = session.imBotId || config.lark.appId;
+
+    // Non-Lark IM (e.g. WeChat): send plain text through adapter
+    const bot = (() => { try { return getBot(appId); } catch { return undefined; } })();
+    const adapter = bot?.adapter;
+    if (adapter && !adapter.capabilities.richText) {
+      let text = args.content;
+      const extracted = extractTextFromPostJson(text);
+      if (extracted) text = extracted;
+      if (!text.trim() && !args.images?.length && !args.files?.length) {
+        return { error: 'Empty message' };
+      }
+      // Append file names as text hints (no upload support for non-Lark IMs)
+      if (args.images?.length) text += `\n[${args.images.length} image(s) — view in terminal]`;
+      if (args.files?.length) text += `\n[${args.files.length} file(s) — view in terminal]`;
+      const messageId = await adapter.sendMessage(session.rootMessageId, text, 'text');
+      return { success: true, messageId, sessionId: args.session_id };
+    }
+
+    // Lark path: rich text with images, files, mentions
     // Prefer the session owner's open_id (set by worker from init message),
     // fall back to first configured allowed user if it looks like an open_id.
     const mentionUser = process.env.__OWNER_OPEN_ID
       || (config.daemon.allowedUsers[0]?.startsWith('ou_') ? config.daemon.allowedUsers[0] : undefined);
 
     const replyInThread = session.chatType === 'p2p';
-    const appId = session.imBotId || config.lark.appId;
 
     // Validate that image/file paths exist before doing anything
     for (const p of [...(args.images ?? []), ...(args.files ?? [])]) {

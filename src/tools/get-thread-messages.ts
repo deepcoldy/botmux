@@ -3,6 +3,7 @@ import * as sessionStore from '../services/session-store.js';
 import { listThreadMessages } from '../im/lark/client.js';
 import { parseApiMessage } from '../im/lark/message-parser.js';
 import { config } from '../config.js';
+import { getBot } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
@@ -19,8 +20,13 @@ export async function execute(args: z.infer<typeof schema>) {
   }
 
   try {
-    // List chat messages and filter by root_id to get thread messages
     const appId = session.imBotId || config.lark.appId;
+
+    // Non-Lark IM: no message history API
+    const bot = (() => { try { return getBot(appId); } catch { return undefined; } })();
+    if (bot?.adapter && !bot.adapter.capabilities.threads) {
+      return { sessionId: args.session_id, threadId: session.rootMessageId, messages: [], total: 0, hint: 'Message history not available for this IM type.' };
+    }
     const rawMessages = await listThreadMessages(appId, session.chatId, session.rootMessageId, args.limit);
     const messages = rawMessages.map(parseApiMessage);
 

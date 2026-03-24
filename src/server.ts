@@ -77,16 +77,14 @@ export function createServer(): McpServer {
 
   const instructions = isBotmuxSession
     ? [
-        'You are connected to a Lark (Feishu) topic group. The user reads Lark, not your terminal.',
+        'You are connected to an IM chat (Lark/Feishu or WeChat). The user reads the chat app, not your terminal.',
         'Anything you want the user to see MUST go through the send_to_thread tool — your terminal output never reaches the chat.',
         '',
         'Guidelines:',
         '- Use send_to_thread for: key conclusions, proposed plans (wait for confirmation before executing), final results, and progress updates.',
         '- The message includes a session_id — pass it back when calling send_to_thread.',
-        '- Send plain text — formatting is handled automatically. You can also attach images and files.',
-        '- To send images: pass local file paths in the `images` array (e.g. screenshots, charts, diagrams). Images are embedded inline in the message.',
-        '- To send files: pass local file paths in the `files` array (e.g. PDFs, documents). Each file is sent as a separate message.',
-
+        '- Send plain text — formatting is handled automatically.',
+        '- For Lark sessions: you can attach images (via `images` array) and files (via `files` array).',
         '- Use get_thread_messages to read earlier conversation context if needed.',
       ].join('\n')
     : undefined;

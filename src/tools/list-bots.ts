@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import * as sessionStore from '../services/session-store.js';
 import { listChatBotMembers } from '../im/lark/client.js';
 import { config } from '../config.js';
+import { getBot } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
@@ -36,6 +37,18 @@ export async function execute(args: z.infer<typeof schema>) {
   }
 
   const appId = session.imBotId || config.lark.appId;
+
+  // Non-Lark IM: no group chat, return minimal info
+  const bot = (() => { try { return getBot(appId); } catch { return undefined; } })();
+  if (bot?.adapter && !bot.adapter.capabilities.threads) {
+    return {
+      sessionId: args.session_id,
+      bots: [{ name: bot.botName ?? bot.config.cliId, openId: appId, cliId: bot.config.cliId, isSelf: true }],
+      total: 1,
+      hint: 'This is a direct chat — only the current bot is available.',
+    };
+  }
+
   const botInfo = readBotInfo();
 
   // Build a map of open_id → bot info for quick lookup
