@@ -255,7 +255,18 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   };
   activeSessions.set(sessionKey(messageId, larkAppId), ds);
 
-  // Show repo selection card
+  const adapterCapabilities = getBot(larkAppId).adapter?.capabilities;
+
+  if (adapterCapabilities && !adapterCapabilities.cards) {
+    // Non-card IM (e.g. WeChat): skip repo selection, auto-start with default workingDir
+    ds.pendingRepo = false;
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId, listChatBotMembers));
+    forkWorker(ds, prompt);
+    logger.info(`Session ${session.sessionId} ready (no-card IM, skipping repo selection), total active: ${getActiveCount()}`);
+    return;
+  }
+
+  // Show repo selection card (card-capable IMs only)
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
   if (scanDirs.length > 0) {
@@ -361,23 +372,33 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     };
     activeSessions.set(sessionKey(rootId, larkAppId), newDs);
 
-    // Show repo selection card (same as handleNewTopic)
-    const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
-    let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
-    if (scanDirs2.length > 0) {
-      projects = scanMultipleProjects(scanDirs2);
-    }
-    if (projects.length > 0) {
-      lastRepoScan.set(chatId, projects);
-      const currentCwd = getSessionWorkingDir(newDs);
-      const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
-      newDs.repoCardMessageId = await sessionReply(rootId, cardJson, 'interactive', larkAppId);
-      logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
-    } else {
-      // No projects found — skip repo selection, spawn directly
+    const newAdapterCapabilities = getBot(larkAppId).adapter?.capabilities;
+
+    if (newAdapterCapabilities && !newAdapterCapabilities.cards) {
+      // Non-card IM: skip repo selection, auto-start with default workingDir
       newDs.pendingRepo = false;
       const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId, listChatBotMembers));
       forkWorker(newDs, prompt);
+      logger.info(`[${tag(newDs)}] Auto-created session (no-card IM, skipping repo selection)`);
+    } else {
+      // Show repo selection card (same as handleNewTopic)
+      const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
+      let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
+      if (scanDirs2.length > 0) {
+        projects = scanMultipleProjects(scanDirs2);
+      }
+      if (projects.length > 0) {
+        lastRepoScan.set(chatId, projects);
+        const currentCwd = getSessionWorkingDir(newDs);
+        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
+        newDs.repoCardMessageId = await sessionReply(rootId, cardJson, 'interactive', larkAppId);
+        logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
+      } else {
+        // No projects found — skip repo selection, spawn directly
+        newDs.pendingRepo = false;
+        const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId, listChatBotMembers));
+        forkWorker(newDs, prompt);
+      }
     }
 
     return;
@@ -529,6 +550,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
     updateMessage: async (imBotId, messageId, content) => {
+      const adapter = getBot(imBotId).adapter;
+      if (adapter && !adapter.capabilities.updateMessage) {
+        // No-op for IMs that don't support message updates (e.g. WeChat)
+        return;
+      }
       const { updateMessage: larkUpdate } = await import('./im/lark/client.js');
       await larkUpdate(imBotId, messageId, content);
     },
