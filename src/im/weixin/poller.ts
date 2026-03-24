@@ -1,10 +1,12 @@
 import * as client from './client.js';
+import { downloadImage } from './client.js';
 import { parseMessage, isTextMessage } from './message-parser.js';
 import type { ILinkRawMessage } from './message-parser.js';
 import { isCommand, handleCommand } from './command-handler.js';
 import type { WeixinCommandContext } from './command-handler.js';
 import type { ImEventHandler } from '../types.js';
 import { logger } from '../../utils/logger.js';
+import { join } from 'node:path';
 
 export interface SessionMapping {
   sessionKey: string;
@@ -92,14 +94,33 @@ export class WeixinPoller {
       this.sessions.set(userId, { sessionKey: '', contextToken: raw.context_token });
     }
 
-    // Skip non-text messages
-    if (!isTextMessage(raw)) {
-      await this.commandCtx.sendReply(userId, '暂不支持媒体消息，请发送文字。');
+    // Only text and image messages are supported
+    if (!isTextMessage(raw) && raw.message_type !== 2) {
+      await this.commandCtx.sendReply(userId, '暂不支持该类型消息，请发送文字或图片。');
       return;
     }
 
     const imMsg = parseMessage(raw);
-    if (!imMsg.content.trim()) return;
+
+    // Download images to local temp files
+    if (imMsg.attachments) {
+      for (const att of imMsg.attachments) {
+        if (att.type === 'image' && att.path.includes('\n')) {
+          const [cdnUrl, aesKey] = att.path.split('\n');
+          const tmpDir = join('/tmp', 'botmux-weixin-images');
+          const savePath = join(tmpDir, `${Date.now()}-${att.name}`);
+          try {
+            await downloadImage(cdnUrl, aesKey, savePath);
+            att.path = savePath;  // Replace CDN URL with local path
+          } catch (err) {
+            logger.warn(`[weixin] Failed to download image: ${err}`);
+            att.path = '';  // Mark as failed
+          }
+        }
+      }
+    }
+
+    if (!imMsg.content.trim() && !imMsg.attachments?.length) return;
 
     if (isCommand(imMsg.content)) {
       await handleCommand(imMsg, this.commandCtx);

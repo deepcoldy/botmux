@@ -90,6 +90,83 @@ describe('parseMessage', () => {
     }));
     expect(msg.content).toBe('has text');
   });
+
+  it('extracts image attachments from image_item', () => {
+    const msg = parseMessage(makeRawMessage({
+      message_type: 2,
+      item_list: [
+        {
+          type: 2,
+          image_item: {
+            url: 'https://cdn.example.com/img.enc',
+            aes_key: 'dGVzdGtleQ==',
+            file_size: 1024,
+          },
+        },
+      ],
+    }));
+    expect(msg.attachments).toBeDefined();
+    expect(msg.attachments).toHaveLength(1);
+    expect(msg.attachments![0].type).toBe('image');
+    expect(msg.attachments![0].name).toBe('image_0.jpg');
+  });
+
+  it('stores CDN URL and aes_key in attachment path separated by newline', () => {
+    const msg = parseMessage(makeRawMessage({
+      message_type: 2,
+      item_list: [
+        {
+          type: 2,
+          image_item: {
+            url: 'https://cdn.example.com/img.enc',
+            aes_key: 'dGVzdGtleQ==',
+            file_size: 2048,
+          },
+        },
+      ],
+    }));
+    const [cdnUrl, aesKey] = msg.attachments![0].path.split('\n');
+    expect(cdnUrl).toBe('https://cdn.example.com/img.enc');
+    expect(aesKey).toBe('dGVzdGtleQ==');
+  });
+
+  it('does not include attachments when no image items exist', () => {
+    const msg = parseMessage(makeRawMessage({
+      item_list: [
+        { type: 1, text_item: { text: 'text only' } },
+      ],
+    }));
+    expect(msg.attachments).toBeUndefined();
+  });
+
+  it('extracts both text and image from mixed item_list', () => {
+    const msg = parseMessage(makeRawMessage({
+      message_type: 2,
+      item_list: [
+        { type: 1, text_item: { text: 'caption' } },
+        {
+          type: 2,
+          image_item: {
+            url: 'https://cdn.example.com/a.enc',
+            aes_key: 'a2V5MQ==',
+            file_size: 512,
+          },
+        },
+        {
+          type: 2,
+          image_item: {
+            url: 'https://cdn.example.com/b.enc',
+            aes_key: 'a2V5Mg==',
+            file_size: 768,
+          },
+        },
+      ],
+    }));
+    expect(msg.content).toBe('caption');
+    expect(msg.attachments).toHaveLength(2);
+    expect(msg.attachments![0].name).toBe('image_0.jpg');
+    expect(msg.attachments![1].name).toBe('image_1.jpg');
+  });
 });
 
 describe('isTextMessage', () => {

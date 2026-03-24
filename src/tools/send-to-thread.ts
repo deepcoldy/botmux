@@ -70,13 +70,26 @@ export async function execute(args: z.infer<typeof schema>) {
       if (!text.trim() && !args.images?.length && !args.files?.length) {
         return { error: 'Empty message' };
       }
-      if (args.images?.length) text += `\n[${args.images.length} image(s) — view in terminal]`;
       if (args.files?.length) text += `\n[${args.files.length} file(s) — view in terminal]`;
-      const { sendMessage: weixinSend } = await import('../im/weixin/client.js');
+      const { sendMessage: weixinSend, uploadImage: weixinUploadImage, sendImage: weixinSendImage } = await import('../im/weixin/client.js');
       const { loadToken } = await import('../im/weixin/auth.js');
       const token = loadToken();
       if (!token) return { error: 'WeChat token not found. Run "botmux weixin-auth".' };
-      const messageId = await weixinSend(token.bot_token, session.weixinUserId, text, session.weixinContextToken ?? '');
+      let messageId = '';
+      if (text.trim()) {
+        messageId = await weixinSend(token.bot_token, session.weixinUserId, text, session.weixinContextToken ?? '');
+      }
+      // Send images if provided
+      if (args.images && args.images.length > 0) {
+        for (const imagePath of args.images) {
+          try {
+            const { cdnUrl, aesKey, fileSize } = await weixinUploadImage(token.bot_token, imagePath);
+            await weixinSendImage(token.bot_token, session.weixinUserId!, session.weixinContextToken ?? '', cdnUrl, aesKey, fileSize);
+          } catch (err: any) {
+            logger.warn(`Failed to send WeChat image ${imagePath}: ${err.message}`);
+          }
+        }
+      }
       return { success: true, messageId, sessionId: args.session_id };
     }
 
