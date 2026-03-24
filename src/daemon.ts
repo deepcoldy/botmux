@@ -612,6 +612,100 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           return true;
         },
       });
+    } else {
+      // Non-Lark IM (e.g. WeChat): start adapter with ImEventHandler
+      const imBotId = bot.imBotId;
+      const imHandler: import('./im/types.js').ImEventHandler = {
+        async onNewTopic(msg, chatId, chatType) {
+          // WeChat messages arrive as ImMessage; wrap into the Lark-style handler path
+          // by constructing a synthetic "parsed" + calling the same session creation logic.
+          const content = msg.content.trim();
+          const botCfg = getBot(imBotId).config;
+
+          refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+
+          // Use senderId as rootMessageId (WeChat has no thread, one session per user)
+          const rootId = `wx-${msg.senderId}`;
+          const session = sessionStore.createSession(chatId, rootId, content.substring(0, 50), chatType);
+          session.imBotId = imBotId;
+          sessionStore.updateSession(session);
+          messageQueue.ensureQueue(rootId);
+
+          const parsed = { messageId: msg.id, rootId, senderId: msg.senderId, senderType: msg.senderType, msgType: msg.msgType, content, createTime: msg.createTime };
+          messageQueue.appendMessage(rootId, parsed);
+
+          const ds: DaemonSession = {
+            session,
+            worker: null,
+            workerPort: null,
+            workerToken: null,
+            imBotId,
+            chatId,
+            chatType,
+            spawnedAt: Date.now(),
+            cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+            lastMessageAt: Date.now(),
+            hasHistory: false,
+            pendingRepo: false,
+            pendingPrompt: content,
+            ownerId: msg.senderId,
+            currentTurnTitle: content.substring(0, 50),
+          };
+          activeSessions.set(sessionKey(rootId, imBotId), ds);
+
+          const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride);
+          forkWorker(ds, prompt);
+
+          // Register session in adapter's poller so replies route correctly
+          const wxAdapter = adapter as import('./im/weixin/adapter.js').WeixinImAdapter;
+          wxAdapter.getPoller()?.registerSession(msg.senderId, sessionKey(rootId, imBotId));
+
+          logger.info(`[weixin] New session ${session.sessionId.substring(0, 8)} for user ${msg.senderId.substring(0, 16)}`);
+        },
+
+        async onThreadReply(msg, threadId) {
+          const sk = threadId;
+          const ds = activeSessions.get(sk);
+          if (!ds) {
+            logger.warn(`[weixin] Reply to unknown session: ${sk}`);
+            return;
+          }
+          ds.lastMessageAt = Date.now();
+          const content = msg.content.trim();
+          if (!content) return;
+
+          // Intercept daemon commands
+          if (content.startsWith('/')) {
+            const cmd = content.split(/\s+/)[0].toLowerCase();
+            if (DAEMON_COMMANDS.has(cmd)) {
+              const parsed = { messageId: msg.id, rootId: ds.session.rootMessageId, senderId: msg.senderId, senderType: msg.senderType, msgType: msg.msgType, content, createTime: msg.createTime };
+              await handleCommand(cmd, ds.session.rootMessageId, parsed, commandDeps, imBotId);
+              return;
+            }
+          }
+
+          // Forward to CLI via message queue
+          const parsed = { messageId: msg.id, rootId: ds.session.rootMessageId, senderId: msg.senderId, senderType: msg.senderType, msgType: msg.msgType, content, createTime: msg.createTime };
+          messageQueue.appendMessage(ds.session.rootMessageId, parsed);
+
+          // If worker exited, auto-restart
+          if (!ds.worker || ds.worker.killed) {
+            const botCfg = getBot(imBotId).config;
+            refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+            ds.streamCardPending = true;
+            ds.currentTurnTitle = content.substring(0, 50);
+            forkWorker(ds, content, true);
+          }
+        },
+
+        async onCardAction(_action) {
+          // WeChat has no card actions — no-op
+        },
+      };
+
+      adapter.start(imHandler).catch(err => {
+        logger.error(`[${bot.imBotId}] Adapter start failed: ${err.message}`);
+      });
     }
   }
 
