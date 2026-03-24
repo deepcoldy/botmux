@@ -7,21 +7,21 @@ import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
-let currentAppId: string | undefined;
+let currentImBotId: string | undefined;
 
 /**
  * Initialise session store for a specific bot (multi-daemon mode).
- * When appId is set, sessions are stored in `sessions-{appId}.json`.
+ * When imBotId is set, sessions are stored in `sessions-{imBotId}.json`.
  * When unset, uses the legacy `sessions.json`.
  */
-export function init(appId?: string): void {
-  currentAppId = appId;
+export function init(imBotId?: string): void {
+  currentImBotId = imBotId;
   loaded = false;
   sessions = new Map();
 }
 
 function getFilePath(): string {
-  const fileName = currentAppId ? `sessions-${currentAppId}.json` : 'sessions.json';
+  const fileName = currentImBotId ? `sessions-${currentImBotId}.json` : 'sessions.json';
   return join(config.session.dataDir, fileName);
 }
 
@@ -38,14 +38,21 @@ function load(): void {
   const fp = getFilePath();
   if (existsSync(fp)) {
     try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8'));
-      sessions = new Map(Object.entries(data));
+      const data: Record<string, Session> = JSON.parse(readFileSync(fp, 'utf-8'));
+      sessions = new Map();
+      for (const [k, v] of Object.entries(data)) {
+        // Migrate sessions that still have the old larkAppId field
+        if ((v as any).larkAppId && !v.imBotId) {
+          v.imBotId = (v as any).larkAppId;
+        }
+        sessions.set(k, v);
+      }
       logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
     } catch (err) {
       logger.error(`Failed to load sessions: ${err}`);
       sessions = new Map();
     }
-  } else if (currentAppId) {
+  } else if (currentImBotId) {
     // Per-bot file doesn't exist — migrate matching sessions from legacy sessions.json
     const legacyFp = join(config.session.dataDir, 'sessions.json');
     if (existsSync(legacyFp)) {
@@ -53,7 +60,11 @@ function load(): void {
         const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
         sessions = new Map();
         for (const [k, v] of Object.entries(data)) {
-          if (v.imBotId === currentAppId) {
+          // Migrate sessions that still have the old larkAppId field
+          if ((v as any).larkAppId && !v.imBotId) {
+            v.imBotId = (v as any).larkAppId;
+          }
+          if (v.imBotId === currentImBotId) {
             sessions.set(k, v);
           }
         }
