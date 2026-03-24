@@ -54,6 +54,7 @@ import {
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import { probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile } from './im/lark/event-dispatcher.js';
+import { createImAdapter } from './im/registry.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -534,6 +535,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   const cfg = botConfigs[idx];
   const botState = registerBot(cfg);
+  // Create IM adapter — this registers Lark client for getBotClient() calls
+  const adapter = createImAdapter(cfg);
+  botState.adapter = adapter;
   sessionStore.init(botState.imBotId);
   logger.info(`Bot ${idx}/${botConfigs.length}: ${botState.imBotId} (cli: ${cfg.cliId})`)
 

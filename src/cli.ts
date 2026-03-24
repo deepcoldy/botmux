@@ -1013,7 +1013,35 @@ async function cmdWeixinAuth(): Promise<void> {
 
   console.log(`\n✅ 认证成功！Bot ID: ${token.bot_id}`);
   console.log('Token 已保存到 ~/.botmux/weixin-token.json');
-  console.log('\n下一步: botmux restart');
+
+  // Auto-add weixin bot to bots.json if not already configured
+  const bots = loadBotsJson();
+  const hasWeixin = bots.some((b: any) => b.im === 'weixin');
+  if (!hasWeixin) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
+    const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
+    const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex', '5': 'gemini', '6': 'opencode' };
+    const cliId = cliIdMap[cliChoice] ?? (cliChoice || 'claude-code');
+    const workingDir = await ask(rl, '默认工作目录 [~]: ') || '~';
+    rl.close();
+
+    const weixinBot: Record<string, any> = { im: 'weixin', cliId, workingDir };
+    bots.push(weixinBot);
+    writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
+    console.log(`\n✅ 已添加微信 bot 到 ${BOTS_JSON_FILE}`);
+  } else {
+    console.log('\nbots.json 中已有微信 bot 配置。');
+  }
+
+  // Auto-restart daemon
+  const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+  const restart = await ask(rl2, '\n立即重启 daemon？[Y/n] ');
+  rl2.close();
+  if (restart.toLowerCase() !== 'n') {
+    cmdRestart();
+    console.log('\n✅ daemon 已重启');
+  }
 }
 
 function showHelp(): void {
