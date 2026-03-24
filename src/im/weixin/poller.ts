@@ -58,15 +58,15 @@ export class WeixinPoller {
     while (this.running) {
       try {
         const data = await client.getUpdates(this.token, this.cursor);
-        if (data.ret !== 0) {
+        if (client.isAuthError(data)) {
           logger.error(
-            `[weixin] getupdates ret=${data.ret}. Run "botmux weixin-auth" to re-authenticate.`,
+            `[weixin] getupdates error: ${data.errmsg} (code ${data.errcode}). Run "botmux weixin-auth" to re-authenticate.`,
           );
           this.running = false;
           break;
         }
         backoff = 1000;
-        this.cursor = data.get_updates_buf;
+        if (data.get_updates_buf) this.cursor = data.get_updates_buf;
 
         for (const rawMsg of (data.msgs ?? [])) {
           await this.handleMessage(rawMsg as ILinkRawMessage);

@@ -11,10 +11,14 @@ function makeHeaders(token: string): Record<string, string> {
 }
 
 export interface GetUpdatesResponse {
-  ret: number;
-  msgs: any[];
-  get_updates_buf: string;
-  longpolling_timeout_ms: number;
+  // Success fields
+  msgs?: any[];
+  sync_buf?: string;
+  get_updates_buf?: string;
+  longpolling_timeout_ms?: number;
+  // Error fields
+  errcode?: number;
+  errmsg?: string;
 }
 
 export async function getUpdates(token: string, cursor: string): Promise<GetUpdatesResponse> {
@@ -28,6 +32,16 @@ export async function getUpdates(token: string, cursor: string): Promise<GetUpda
     signal: AbortSignal.timeout(40000),
   });
   return res.json();
+}
+
+/** Check if a getUpdates response indicates an auth/session error */
+export function isAuthError(data: GetUpdatesResponse): boolean {
+  return data.errcode !== undefined && data.errcode !== 0;
+}
+
+/** Check if a getUpdates response is successful (has msgs array) */
+export function isSuccess(data: GetUpdatesResponse): boolean {
+  return Array.isArray(data.msgs);
 }
 
 export async function sendMessage(
@@ -45,8 +59,8 @@ export async function sendMessage(
       item_list: [{ type: 1, text_item: { text } }],
     }),
   });
-  const data = await res.json();
-  return data.msg_id ?? '';
+  const data = await res.json() as any;
+  return data.msg_id ?? data.message_id ?? '';
 }
 
 export async function sendTyping(

@@ -35,14 +35,18 @@ export function saveToken(token: WeixinToken): void {
 
 export async function validateToken(botToken: string): Promise<boolean> {
   try {
+    // getupdates is a long-poll (35s server hold). Use a generous timeout
+    // so we don't mistake a slow but valid response for an auth failure.
     const res = await fetch(`${ILINK_BASE}/ilink/bot/getupdates`, {
       method: 'POST',
       headers: makeHeaders(botToken),
       body: JSON.stringify({ get_updates_buf: '', base_info: { channel_version: '1.0.2' } }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(40000),
     });
-    const data = await res.json();
-    return data.ret === 0;
+    const data = await res.json() as any;
+    // Success: response has msgs array. Error: has errcode field.
+    if (data.errcode !== undefined && data.errcode !== 0) return false;
+    return Array.isArray(data.msgs) || data.sync_buf !== undefined;
   } catch { return false; }
 }
 
