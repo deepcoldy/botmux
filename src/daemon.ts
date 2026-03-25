@@ -28,6 +28,7 @@ import {
 } from './core/worker-pool.js';
 import { DAEMON_COMMANDS, handleCommand } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
+import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
 import {
   getSessionWorkingDir,
   getProjectScanDir,
@@ -261,6 +262,16 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
 async function handleThreadReply(data: any, rootId: string, larkAppId: string): Promise<void> {
   const { parsed, resources } = parseEventMessage(data);
   const content = parsed.content.trim();
+
+  // Intercept OAuth callback URLs (from /login flow)
+  if (isCallbackUrl(content)) {
+    const result = await handleCallbackUrl(content);
+    if (result) {
+      replyMessage(larkAppId, parsed.messageId, JSON.stringify({ text: result }), 'text', true)
+        .catch(err => logger.error(`Failed to reply login result: ${err}`));
+      return;
+    }
+  }
 
   // Intercept daemon commands
   if (content.startsWith('/')) {

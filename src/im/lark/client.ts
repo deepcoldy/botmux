@@ -1,7 +1,8 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename } from 'node:path';
-import { getBotClient, getAllBots } from '../../bot-registry.js';
+import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
+import { resolveUserToken } from '../../utils/user-token.js';
 
 // ─── Error types ──────────────────────────────────────────────────────────────
 
@@ -176,32 +177,72 @@ export async function getMessageDetail(larkAppId: string, messageId: string): Pr
 }
 
 export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
-  const c = getBotClient(larkAppId);
-
   const dir = dirname(savePath);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
 
+  // Try App Token first
+  try {
+    await downloadWithAppToken(larkAppId, messageId, fileKey, type, savePath);
+    logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
+    return;
+  } catch (appErr: any) {
+    // AxiosError status can be at various paths depending on SDK version
+    const status = appErr?.response?.status ?? appErr?.response?.statusCode
+      ?? appErr?.status ?? appErr?.statusCode;
+    // Only fall through to User Token for 400/403; other errors (network, etc.) re-throw
+    if (status && status !== 400 && status !== 403) throw appErr;
+    logger.debug(`App Token download failed (${status ?? 'unknown'}), trying User Token fallback...`);
+  }
+
+  // Fallback: User Token via feishu-cli's stored OAuth token
+  const bot = getBot(larkAppId);
+  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret);
+  if (!userToken) {
+    throw new Error(
+      `App Token 无法下载此资源，且未找到 User Token。` +
+      `请运行 feishu-cli auth login 授权后重试。`
+    );
+  }
+
+  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath);
+  logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
+}
+
+async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+  const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageResource.get({
     path: { message_id: messageId, file_key: fileKey },
     params: { type },
   });
+  await writeResourceToDisk(res, savePath);
+}
 
+async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+  const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${userToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(`User Token download failed: HTTP ${res.status}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  writeFileSync(savePath, buf);
+}
+
+async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
   if (res instanceof Buffer) {
     writeFileSync(savePath, res);
   } else if (res && typeof res === 'object' && 'writeFile' in res) {
     await res.writeFile(savePath);
   } else {
-    // Response is likely a readable stream or buffer-like
     const chunks: Buffer[] = [];
     for await (const chunk of res as AsyncIterable<Buffer>) {
       chunks.push(Buffer.from(chunk));
     }
     writeFileSync(savePath, Buffer.concat(chunks));
   }
-
-  logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
 }
 
 const EXT_TO_FILE_TYPE: Record<string, string> = {

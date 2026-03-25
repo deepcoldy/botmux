@@ -29,12 +29,16 @@ const bots = new Map<string, BotState>();
 // Provide a custom logger that writes to stderr.
 // The default Lark SDK logger uses console.log (stdout), which corrupts
 // MCP stdio protocol when the server is spawned as an MCP child process.
+function safeStringify(v: unknown): string {
+  if (typeof v === 'string') return v;
+  try { return JSON.stringify(v); } catch { return String(v); }
+}
 const stderrLogger = {
-  error: (...msg: any[]) => { process.stderr.write(`[lark:error] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-  warn:  (...msg: any[]) => { process.stderr.write(`[lark:warn] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-  info:  (...msg: any[]) => { process.stderr.write(`[lark:info] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-  debug: (...msg: any[]) => { process.stderr.write(`[lark:debug] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-  trace: (...msg: any[]) => { process.stderr.write(`[lark:trace] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
+  error: (...msg: any[]) => { process.stderr.write(`[lark:error] ${msg.map(safeStringify).join(' ')}\n`); },
+  warn:  (...msg: any[]) => { process.stderr.write(`[lark:warn] ${msg.map(safeStringify).join(' ')}\n`); },
+  info:  (...msg: any[]) => { process.stderr.write(`[lark:info] ${msg.map(safeStringify).join(' ')}\n`); },
+  debug: (...msg: any[]) => { process.stderr.write(`[lark:debug] ${msg.map(safeStringify).join(' ')}\n`); },
+  trace: (...msg: any[]) => { process.stderr.write(`[lark:trace] ${msg.map(safeStringify).join(' ')}\n`); },
 };
 
 export function registerBot(cfg: BotConfig): BotState {
