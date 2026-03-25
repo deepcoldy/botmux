@@ -3,6 +3,7 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
@@ -136,6 +137,7 @@ export function closeSession(sessionId: string): void {
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     save();
+    deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
 }

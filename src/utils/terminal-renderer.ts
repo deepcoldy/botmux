@@ -106,6 +106,7 @@ export class TerminalRenderer {
     const buffer = this.terminal.buffer.active;
     const baseY = buffer.baseY;
     const rows = this.terminal.rows;
+    const cursorAbsY = baseY + buffer.cursorY;
 
     // Find the last non-empty line in the current viewport
     let lastContentY = baseY;
@@ -117,7 +118,11 @@ export class TerminalRenderer {
       }
     }
 
-    this.turnBaselineY = lastContentY;
+    // Cap at cursor position — TUI renderers (Ink) place the status bar below
+    // the cursor. Without this cap, the status bar inflates lastContentY past
+    // the actual content boundary, causing Strategy 1 to start reading too late
+    // and miss content that Ink renders above the cursor on the next turn.
+    this.turnBaselineY = Math.min(lastContentY, cursorAbsY + 1);
     this.peakContent = '';
     this.lastHash = '';
   }
@@ -146,8 +151,15 @@ export class TerminalRenderer {
 
     // Peak retention — TUI redraws can wipe response from the terminal buffer.
     // Save non-empty content; return saved peak when current screen is empty.
+    // Only update peak when new content is at least as long — prevents Strategy 1's
+    // partial captures (starting from turnBaselineY) from overwriting a more complete
+    // peak that Strategy 2 captured from the full viewport earlier in the turn.
     if (content) {
-      this.peakContent = content;
+      if (content.length >= this.peakContent.length) {
+        this.peakContent = content;
+      } else {
+        content = this.peakContent;
+      }
     } else {
       content = this.peakContent;
     }

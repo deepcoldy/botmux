@@ -9,6 +9,7 @@ import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, killWorker, scheduleCardPatch } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots } from '../../core/session-manager.js';
 import type { DaemonToWorker } from '../../types.js';
@@ -131,13 +132,40 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'toggle_stream' && ds) {
-      // Only toggle the current (latest) streaming card — ignore clicks on frozen older cards.
-      // We embed a card_nonce in the button value at build time. When clicked, compare
-      // the nonce from the event with ds.streamCardNonce to distinguish old vs current.
       const clickedNonce: string | undefined = value?.card_nonce;
       if (clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce) {
-        logger.debug(`[${tag(ds)}] Ignoring toggle on old card: nonce=${clickedNonce}, current=${ds.streamCardNonce}`);
+        // Clicked on a historical frozen card — toggle using cached content
+        if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
+        const frozen = ds.frozenCards.get(clickedNonce);
+        if (frozen) {
+          frozen.expanded = !frozen.expanded;
+          const botCfg = getBot(ds.larkAppId).config;
+          const readUrl = ds.workerPort
+            ? `http://${config.web.externalHost}:${ds.workerPort}`
+            : '';
+          const cardJson = buildStreamingCard(
+            ds.session.sessionId,
+            ds.session.rootMessageId,
+            readUrl,
+            frozen.title,
+            frozen.content,
+            'idle',
+            botCfg.cliId,
+            frozen.expanded,
+            clickedNonce,
+          );
+          // PATCH the frozen card directly — no serialization needed (no streaming race)
+          updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
+            logger.debug(`[${tag(ds)}] Failed to toggle frozen card: ${err}`),
+          );
+          saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+          logger.info(`[${tag(ds)}] Frozen card toggled: ${frozen.expanded ? 'expanded' : 'collapsed'} (nonce=${clickedNonce})`);
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        } else {
+          logger.debug(`[${tag(ds)}] Toggle on unknown old card: nonce=${clickedNonce}, current=${ds.streamCardNonce}`);
+        }
       } else {
+        // Current (latest) streaming card — toggle normally
         const botCfg = getBot(ds.larkAppId).config;
         ds.streamExpanded = !ds.streamExpanded;
         if (ds.streamCardId && ds.workerPort) {
