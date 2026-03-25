@@ -297,9 +297,22 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   // Update last message time
   if (ds) ds.lastMessageAt = Date.now();
 
-  // If waiting for repo selection, remind user
+  // If waiting for repo selection, buffer the message and remind user
   if (ds?.pendingRepo) {
-    await sessionReply(rootId, '请先在上方卡片中选择仓库，再发送消息。', 'text', larkAppId);
+    // Enrich content with attachment hints and mention metadata (same as normal send)
+    let enriched = attachments.length > 0
+      ? `${parsed.content}${formatAttachmentsHint(attachments)}`
+      : parsed.content;
+    if (parsed.mentions && parsed.mentions.length > 0) {
+      const mentionLines = parsed.mentions.map(m => {
+        const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
+        return `- @${m.name}${idPart}`;
+      });
+      enriched += `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
+    }
+    if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
+    ds.pendingFollowUps.push(enriched);
+    await sessionReply(rootId, '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。', 'text', larkAppId);
     return;
   }
 

@@ -284,11 +284,67 @@ export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Pro
 
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
   const c = getBotClient(larkAppId);
+
+  // Resolve the thread_id (omt_xxx) from a known thread reply.
+  // container_id_type="thread" is faster and more reliable than scanning the whole chat.
+  const threadId = await resolveThreadId(c, rootMessageId);
+
+  if (threadId) {
+    return listByThread(c, threadId, pageSize);
+  }
+  // Fallback: scan chat messages and filter by root_id
+  return listByChatFilter(c, chatId, rootMessageId, pageSize);
+}
+
+/** Get the thread_id (omt_xxx) from the root message via message.get. */
+async function resolveThreadId(c: any, rootMessageId: string): Promise<string | undefined> {
+  try {
+    const res = await c.im.v1.message.get({ path: { message_id: rootMessageId } });
+    if (res.code === 0) {
+      return res.data?.items?.[0]?.thread_id;
+    }
+  } catch {
+    // Ignore — fallback to chat scan
+  }
+  return undefined;
+}
+
+/** List thread messages using container_id_type="thread" (fast path). */
+async function listByThread(c: any, threadId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
 
-  // Lark API only supports container_id_type="chat", so we list chat messages
-  // and filter by root_id to get thread messages
+  do {
+    const res = await c.im.v1.message.list({
+      params: {
+        container_id_type: 'thread' as any,
+        container_id: threadId,
+        page_size: pageSize,
+        sort_type: 'ByCreateTimeAsc' as any,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+
+    if (res.code !== 0) {
+      throw new Error(`Failed to list thread messages: ${res.msg} (code: ${res.code})`);
+    }
+
+    if (res.data?.items) {
+      allMessages.push(...res.data.items);
+    }
+
+    pageToken = res.data?.page_token;
+    if (allMessages.length >= pageSize) break;
+  } while (pageToken);
+
+  return allMessages;
+}
+
+/** Fallback: scan chat messages and filter by root_id. */
+async function listByChatFilter(c: any, chatId: string, rootMessageId: string, pageSize: number): Promise<any[]> {
+  const allMessages: any[] = [];
+  let pageToken: string | undefined;
+
   do {
     const res = await c.im.v1.message.list({
       params: {
@@ -306,7 +362,6 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
 
     if (res.data?.items) {
       for (const item of res.data.items) {
-        // Include the root message itself and all its thread replies
         if (item.message_id === rootMessageId || item.root_id === rootMessageId) {
           allMessages.push(item);
         }
@@ -314,11 +369,9 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
     }
 
     pageToken = res.data?.page_token;
-    // Stop early if we've collected enough or gone past the root message timestamp
     if (allMessages.length >= pageSize) break;
   } while (pageToken);
 
-  // Sort by create_time ascending
   allMessages.sort((a, b) => (a.create_time ?? '').localeCompare(b.create_time ?? ''));
   return allMessages;
 }

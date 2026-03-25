@@ -434,6 +434,7 @@ term.loadAddon(new Unicode11Addon.Unicode11Addon());
 term.unicode.activeVersion='11';
 term.open(document.getElementById('terminal'));
 fit.fit();
+document.getElementById('terminal').addEventListener('contextmenu',function(e){e.preventDefault()});
 
 // ── WebSocket ──
 var ws_=null,el=document.getElementById('status');

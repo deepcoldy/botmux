@@ -68,6 +68,22 @@ export function extractResources(msgType: string, rawContent: string): MessageRe
       }
       return resources;
     }
+
+    if (msgType === 'interactive') {
+      // Lark API returns card elements as nested arrays: [[{tag:"img",image_key:"..."}, ...], ...]
+      const resources: MessageResource[] = [];
+      if (Array.isArray(parsed.elements)) {
+        for (const block of parsed.elements) {
+          const nodes = Array.isArray(block) ? block : [block];
+          for (const node of nodes) {
+            if ((node.tag === 'img' || node.tag === 'image') && node.image_key) {
+              resources.push({ type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
+            }
+          }
+        }
+      }
+      return resources;
+    }
   } catch {
     // ignore parse errors
   }
@@ -183,10 +199,103 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       }
     }
     if (msgType === 'interactive') {
-      return '[interactive card]';
+      return extractCardContent(rawContent);
     }
     return rawContent;
   } catch {
     return rawContent;
+  }
+}
+
+/**
+ * Extract human-readable text from an interactive card.
+ *
+ * Lark API returns card content in a **simplified format** (not the original card JSON):
+ *   { title: "...", elements: [[{tag:"text",text:"..."}, ...], ...] }
+ * This is similar to post message body.  We also handle the original card JSON
+ * (header/config/elements with tag objects) for locally-cached cards.
+ */
+function extractCardContent(rawContent: string): string {
+  try {
+    const card = JSON.parse(rawContent);
+
+    // Template-based card — no inline content to extract
+    if (card.type === 'template') {
+      return '[卡片 (模板)]';
+    }
+
+    const parts: string[] = [];
+
+    // --- Format A: Lark API simplified format ---
+    // { title: "...", elements: [[{tag,text}, ...], ...] }
+    const title = card.title ?? card.header?.title?.content;
+    if (title) parts.push(`[卡片: ${title}]`);
+    else parts.push('[卡片]');
+
+    if (Array.isArray(card.elements)) {
+      // Detect format: API returns elements as array-of-arrays (like post paragraphs)
+      const isApiFormat = card.elements.length > 0 && Array.isArray(card.elements[0]);
+
+      if (isApiFormat) {
+        // Format A: [[{tag:"text",text:"..."}, {tag:"img",...}, {tag:"button",...}], ...]
+        for (const paragraph of card.elements) {
+          if (!Array.isArray(paragraph)) continue;
+          const textNodes: string[] = [];
+          const buttons: string[] = [];
+          for (const node of paragraph) {
+            if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
+            else if (node.tag === 'a') textNodes.push(node.text ?? node.href ?? '');
+            else if (node.tag === 'at') textNodes.push(`@${node.user_name ?? 'unknown'}`);
+            else if (node.tag === 'img') textNodes.push('[图片]');
+            else if (node.tag === 'button') { if (node.text) buttons.push(`[${node.text}]`); }
+          }
+          const line = textNodes.join('').trim();
+          if (line) parts.push(line);
+          if (buttons.length) parts.push(buttons.join(' '));
+        }
+      } else {
+        // Format B: original card JSON — elements are objects with tag field
+        for (const el of card.elements) {
+          extractElementText(el, parts);
+        }
+      }
+    }
+
+    return parts.join('\n') || '[卡片]';
+  } catch {
+    return '[卡片]';
+  }
+}
+
+/** Recursively extract readable text from an original-format card element. */
+function extractElementText(el: any, parts: string[]): void {
+  if (!el || typeof el !== 'object') return;
+
+  const tag = el.tag;
+
+  // div / markdown / plain_text blocks
+  if (tag === 'div' || tag === 'markdown') {
+    const text = el.text?.content ?? el.content;
+    if (text) parts.push(text);
+  }
+
+  // note blocks
+  if (tag === 'note' && Array.isArray(el.elements)) {
+    const noteTexts = el.elements
+      .map((n: any) => n.content ?? n.text?.content ?? '')
+      .filter(Boolean);
+    if (noteTexts.length) parts.push(noteTexts.join(' '));
+  }
+
+  // column_set / column — recurse into nested elements
+  if (Array.isArray(el.columns)) {
+    for (const col of el.columns) {
+      if (Array.isArray(col.elements)) {
+        for (const child of col.elements) extractElementText(child, parts);
+      }
+    }
+  }
+  if (Array.isArray(el.elements) && tag !== 'note') {
+    for (const child of el.elements) extractElementText(child, parts);
   }
 }

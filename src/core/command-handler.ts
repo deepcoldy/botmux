@@ -285,10 +285,18 @@ export async function handleCommand(
               ds.pendingMentions,
               await getAvailableBots(ds.larkAppId, ds.chatId),
             );
+            const followUps = ds.pendingFollowUps;
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
+            ds.pendingFollowUps = undefined;
             forkWorker(ds, prompt);
+            if (followUps && followUps.length > 0 && ds.worker) {
+              for (const msg of followUps) {
+                ds.worker.send({ type: 'message', content: msg } as DaemonToWorker);
+              }
+              logger.info(`[${t}] Flushed ${followUps.length} buffered follow-up(s)`);
+            }
             await sessionReply(rootId, `✅ 已选择 ${displayName}`);
           } else {
             killWorker(ds);
@@ -347,10 +355,18 @@ export async function handleCommand(
             ds.pendingMentions,
             await getAvailableBots(ds.larkAppId, ds.chatId),
           );
+          const followUps2 = ds.pendingFollowUps;
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;
+          ds.pendingFollowUps = undefined;
           forkWorker(ds, prompt);
+          if (followUps2 && followUps2.length > 0 && ds.worker) {
+            for (const msg of followUps2) {
+              ds.worker.send({ type: 'message', content: msg } as DaemonToWorker);
+            }
+            logger.info(`[${t}] Flushed ${followUps2.length} buffered follow-up(s)`);
+          }
           const cwd = getSessionWorkingDir(ds);
           await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
           if (ds.repoCardMessageId) {
