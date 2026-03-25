@@ -17,13 +17,14 @@ import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
+import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/cost', '/schedule']);
+export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/cost', '/schedule', '/login']);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -284,13 +285,13 @@ export async function handleCommand(
               ds.pendingAttachments,
               ds.pendingMentions,
               await getAvailableBots(ds.larkAppId, ds.chatId),
+              ds.pendingFollowUps,
             );
-            const followUps = ds.pendingFollowUps;
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
             ds.pendingFollowUps = undefined;
-            forkWorker(ds, prompt, false, followUps);
+            forkWorker(ds, prompt);
             await sessionReply(rootId, `✅ 已选择 ${displayName}`);
           } else {
             killWorker(ds);
@@ -348,13 +349,13 @@ export async function handleCommand(
             ds.pendingAttachments,
             ds.pendingMentions,
             await getAvailableBots(ds.larkAppId, ds.chatId),
+            ds.pendingFollowUps,
           );
-          const followUps2 = ds.pendingFollowUps;
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;
           ds.pendingFollowUps = undefined;
-          forkWorker(ds, prompt, false, followUps2);
+          forkWorker(ds, prompt);
           const cwd = getSessionWorkingDir(ds);
           await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
           if (ds.repoCardMessageId) {
@@ -424,6 +425,34 @@ export async function handleCommand(
         break;
       }
 
+      case '/login': {
+        const subCmd = message.content.replace(/^\/login\s*/, '').trim();
+        if (subCmd === 'status' || subCmd === '状态') {
+          await sessionReply(rootId, getTokenStatus());
+          break;
+        }
+        // Generate OAuth URL
+        const botCfg2 = ds ? getBot(ds.larkAppId).config : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
+        if (!botCfg2?.larkAppId || !botCfg2?.larkAppSecret) {
+          await sessionReply(rootId, '❌ 无法获取应用凭证');
+          break;
+        }
+        const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret);
+        await sessionReply(rootId, [
+          '🔐 飞书用户授权',
+          '',
+          '1. 点击下方链接完成授权：',
+          authUrl,
+          '',
+          '2. 授权后浏览器会跳转到一个打不开的页面（正常）',
+          '3. 复制浏览器地址栏的完整 URL，发送到本话题',
+          '',
+          '授权后可下载第三方卡片中的图片等资源。',
+          '查看状态：/login status',
+        ].join('\n'));
+        break;
+      }
+
       case '/help': {
         const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
@@ -446,6 +475,10 @@ export async function handleCommand(
           '/schedule run <id>                 - 立即执行一次',
           '',
           '支持的时间格式：每日/每天、每周X、每月X号、工作日每天、每N小时、每N分钟',
+          '',
+          '🔐 用户授权：',
+          '/login              - 飞书用户授权（可下载第三方卡片图片等）',
+          '/login status       - 查看授权状态',
           '',
           '/help       - 显示此帮助',
         ];

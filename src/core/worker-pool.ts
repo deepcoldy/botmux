@@ -148,7 +148,7 @@ export function killWorker(ds: DaemonSession): void {
 
 // ─── Fork worker ────────────────────────────────────────────────────────────
 
-export function forkWorker(ds: DaemonSession, prompt: string, resume = false, followUps?: string[]): void {
+export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
@@ -211,7 +211,6 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false, fo
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
-    ...(followUps && followUps.length > 0 ? { followUps } : {}),
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

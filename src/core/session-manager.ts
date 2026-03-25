@@ -148,6 +148,7 @@ export function buildNewTopicPrompt(
   attachments?: LarkAttachment[],
   mentions?: LarkMention[],
   availableBots?: Array<{ name: string; openId: string; cliId?: string }>,
+  followUps?: string[],
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
@@ -176,8 +177,16 @@ export function buildNewTopicPrompt(
 
   const parts = [
     `用户发送了：\n---\n${userMessage}${formatAttachmentsHint(attachments)}\n---`,
-    `Session ID: ${sessionId}`,
   ];
+
+  // Append follow-up messages buffered during repo selection
+  if (followUps && followUps.length > 0) {
+    for (const fu of followUps) {
+      parts.push(`用户追加了：\n---\n${fu}\n---`);
+    }
+  }
+
+  parts.push(`Session ID: ${sessionId}`);
   if (noteLines.length > 0) parts.push(noteLines.join('\n'));
   if (mentionSection) parts.push(mentionSection.trim());
   if (botSection) parts.push(botSection.trim());

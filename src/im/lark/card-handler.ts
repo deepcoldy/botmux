@@ -177,13 +177,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.pendingAttachments,
           ds.pendingMentions,
           await getAvailableBots(ds.larkAppId, ds.chatId),
+          ds.pendingFollowUps,
         );
-        const followUps = ds.pendingFollowUps;
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
         ds.pendingFollowUps = undefined;
-        forkWorker(ds, prompt, false, followUps);
+        forkWorker(ds, prompt);
         const cwd = getSessionWorkingDir(ds);
         await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
         logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
@@ -240,13 +240,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       targetDs.pendingAttachments,
       targetDs.pendingMentions,
       await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
+      targetDs.pendingFollowUps,
     );
-    const followUps = targetDs.pendingFollowUps;
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
     targetDs.pendingMentions = undefined;
     targetDs.pendingFollowUps = undefined;
-    forkWorker(targetDs, prompt, false, followUps);
+    forkWorker(targetDs, prompt);
     await sessionReply(rootId, `✅ 已选择 ${displayName}`);
     logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);
   } else {
