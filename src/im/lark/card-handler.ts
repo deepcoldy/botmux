@@ -183,13 +183,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
         ds.pendingFollowUps = undefined;
-        forkWorker(ds, prompt);
-        if (followUps && followUps.length > 0 && ds.worker) {
-          for (const msg of followUps) {
-            ds.worker.send({ type: 'message', content: msg } as DaemonToWorker);
-          }
-          logger.info(`[${tag(ds)}] Flushed ${followUps.length} buffered follow-up(s)`);
-        }
+        forkWorker(ds, prompt, false, followUps);
         const cwd = getSessionWorkingDir(ds);
         await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
         logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
@@ -252,15 +246,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     targetDs.pendingAttachments = undefined;
     targetDs.pendingMentions = undefined;
     targetDs.pendingFollowUps = undefined;
-    forkWorker(targetDs, prompt);
-    // Send buffered follow-up messages to the worker — they'll be queued in
-    // the worker's pendingMessages until the CLI is ready.
-    if (followUps && followUps.length > 0 && targetDs.worker) {
-      for (const msg of followUps) {
-        targetDs.worker.send({ type: 'message', content: msg } as DaemonToWorker);
-      }
-      logger.info(`[${tag(targetDs)}] Flushed ${followUps.length} buffered follow-up(s)`);
-    }
+    forkWorker(targetDs, prompt, false, followUps);
     await sessionReply(rootId, `✅ 已选择 ${displayName}`);
     logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);
   } else {

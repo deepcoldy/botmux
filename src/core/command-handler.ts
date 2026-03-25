@@ -290,13 +290,7 @@ export async function handleCommand(
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
             ds.pendingFollowUps = undefined;
-            forkWorker(ds, prompt);
-            if (followUps && followUps.length > 0 && ds.worker) {
-              for (const msg of followUps) {
-                ds.worker.send({ type: 'message', content: msg } as DaemonToWorker);
-              }
-              logger.info(`[${t}] Flushed ${followUps.length} buffered follow-up(s)`);
-            }
+            forkWorker(ds, prompt, false, followUps);
             await sessionReply(rootId, `✅ 已选择 ${displayName}`);
           } else {
             killWorker(ds);
@@ -360,13 +354,7 @@ export async function handleCommand(
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;
           ds.pendingFollowUps = undefined;
-          forkWorker(ds, prompt);
-          if (followUps2 && followUps2.length > 0 && ds.worker) {
-            for (const msg of followUps2) {
-              ds.worker.send({ type: 'message', content: msg } as DaemonToWorker);
-            }
-            logger.info(`[${t}] Flushed ${followUps2.length} buffered follow-up(s)`);
-          }
+          forkWorker(ds, prompt, false, followUps2);
           const cwd = getSessionWorkingDir(ds);
           await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
           if (ds.repoCardMessageId) {

@@ -530,6 +530,14 @@ process.on('message', async (raw: unknown) => {
           pendingMessages.push(msg.prompt);
         }
 
+        // Queue follow-up messages (buffered while waiting for repo selection)
+        if (msg.followUps && msg.followUps.length > 0) {
+          for (const fu of msg.followUps) {
+            pendingMessages.push(fu);
+          }
+          log(`Queued ${msg.followUps.length} follow-up message(s)`);
+        }
+
         send({ type: 'ready', port, token: writeToken });
       } catch (err: any) {
         send({ type: 'error', message: `init failed: ${err.message}` });
