@@ -1,6 +1,14 @@
 import type { ChildProcess } from 'node:child_process';
 import type { Session, DaemonToWorker, LarkAttachment, LarkMention } from '../types.js';
 
+/** Frozen card state — cached content for historical streaming cards that can still be toggled. */
+export interface FrozenCard {
+  messageId: string;      // Lark message_id for PATCHing
+  content: string;        // frozen screen content snapshot
+  title: string;          // turn title at freeze time
+  expanded: boolean;      // independent expand/collapse state
+}
+
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
  *  in the ImAdapter implementation (e.g. Map<string, ImRenderState>
@@ -35,6 +43,7 @@ export interface DaemonSession {
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
+  frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent sessions for the same thread. */

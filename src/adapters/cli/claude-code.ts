@@ -32,7 +32,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         // Image file paths in pasted text trigger Claude Code's async image
         // attachment, which needs extra time before Enter is accepted.
         const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
-        await new Promise(r => setTimeout(r, hasImagePath ? 800 : 150));
+        await new Promise(r => setTimeout(r, hasImagePath ? 800 : 500));
         pty.write('\r');
       } else {
         pty.write(content + '\r');

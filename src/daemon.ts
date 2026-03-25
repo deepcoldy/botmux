@@ -25,7 +25,9 @@ import {
   scheduleCardPatch,
   setCurrentCliVersion,
   getCurrentCliVersion,
+  CARD_POSTING_SENTINEL,
 } from './core/worker-pool.js';
+import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, handleCommand } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -391,18 +393,24 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {
-    // Enrich content with attachment hints and mention metadata for the CLI
-    let msgContent = attachments.length > 0
-      ? `${parsed.content}${formatAttachmentsHint(attachments)}`
-      : parsed.content;
+    // Build follow-up prompt with consistent structure (mirrors buildNewTopicPrompt)
+    const parts: string[] = [
+      attachments.length > 0
+        ? `${parsed.content}${formatAttachmentsHint(attachments)}`
+        : parsed.content,
+    ];
+
+    parts.push(`Session ID: ${ds.session.sessionId}`);
 
     if (parsed.mentions && parsed.mentions.length > 0) {
       const mentionLines = parsed.mentions.map(m => {
         const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
         return `- @${m.name}${idPart}`;
       });
-      msgContent += `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
+      parts.push(`消息中的 @mention：\n${mentionLines.join('\n')}`);
     }
+
+    const msgContent = parts.join('\n\n');
     // Freeze the previous turn's card at "idle" before starting a new turn
     if (ds.streamCardId && ds.workerPort) {
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
@@ -415,6 +423,18 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       // Freeze through the serialization queue to avoid racing with an in-flight PATCH.
       // scheduleCardPatch replaces any stale pending item (latest-wins).
       scheduleCardPatch(ds, frozenCard);
+
+      // Cache frozen card data so historical cards can still be toggled (expand/collapse)
+      if (ds.streamCardNonce && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+        if (!ds.frozenCards) ds.frozenCards = new Map();
+        ds.frozenCards.set(ds.streamCardNonce, {
+          messageId: ds.streamCardId,
+          content: ds.lastScreenContent ?? '',
+          title: prevTitle,
+          expanded: ds.streamExpanded ?? false,
+        });
+        saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+      }
     }
     // Mark new turn — next screen_update will create a fresh streaming card
     ds.streamCardPending = true;
@@ -456,7 +476,7 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
     // Target bot has an active session in this thread — send the message
     const senderBot = getAllBots().find(b => b.config.larkAppId === signal.senderAppId);
     const senderName = senderBot?.botName ?? (senderBot ? getCliDisplayName(senderBot.config.cliId) : 'Bot');
-    const enrichedContent = `[来自 ${senderName} 的 @mention]\n${signal.content}`;
+    const enrichedContent = [`[来自 ${senderName} 的 @mention]\n${signal.content}`, `Session ID: ${ds.session.sessionId}`].join('\n\n');
     ds.lastMessageAt = Date.now();
     ds.streamCardPending = true;
     ds.currentTurnTitle = signal.content.substring(0, 50);

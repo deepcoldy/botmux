@@ -55,7 +55,7 @@ function tag(ds: DaemonSession): string {
 // Sentinel value for streamCardId while a POST (new card) is in-flight.
 // Prevents duplicate card POSTs when multiple screen_updates arrive before
 // the first POST returns a real message_id.
-const CARD_POSTING_SENTINEL = '__posting__';
+export const CARD_POSTING_SENTINEL = '__posting__';
 
 // ─── Card PATCH serialization queue ─────────────────────────────────────────
 // Only one PATCH in-flight at a time per session. New PATCHes queue on
@@ -301,13 +301,14 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
           // New turn — create a fresh card, old card freezes at its last state.
           // Generate new nonce so old card buttons are distinguishable.
+          const isNewTurn = !!ds.streamCardPending;
           ds.streamCardNonce = randomBytes(4).toString('hex');
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,
             readUrl,
             turnTitle,
-            msg.content,
+            isNewTurn ? '' : msg.content,
             msg.status,
             botCfg.cliId,
             ds.streamExpanded,

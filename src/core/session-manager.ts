@@ -136,7 +136,7 @@ export async function getAvailableBots(
 
 export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
   if (!attachments || attachments.length === 0) return '';
-  const lines = attachments.map(a => `- ${a.path}`);
+  const lines = attachments.map(a => `- (${a.path})`);
   return `\n\n附件（使用 Read 工具查看）：\n${lines.join('\n')}`;
 }
 
