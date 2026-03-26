@@ -139,6 +139,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Replace session ID with original CLI session ID for --resume
       sessionStore.closeSession(ds.session.sessionId);
       ds.session.sessionId = originalSessionId;
+      // Clear old port so the new worker gets a fresh one (old worker may still hold it)
+      ds.session.webPort = undefined;
+      // Clear streaming card state so the new worker creates a fresh card
+      ds.streamCardId = undefined;
+      ds.streamCardNonce = undefined;
+      ds.streamCardPending = undefined;
+      ds.lastScreenContent = undefined;
+      ds.lastScreenStatus = undefined;
       sessionStore.updateSession(ds.session);
 
       // Fork standard Botmux worker with resume
