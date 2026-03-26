@@ -1,5 +1,6 @@
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId } from '../../adapters/cli/types.js';
+import type { AdoptableSession } from '../../core/session-discovery.js';
 
 const cliDisplayNames: Record<CliId, string> = {
   'claude-code': 'Claude',
@@ -96,6 +97,8 @@ export function buildStreamingCard(
   cliId?: CliId,
   expanded?: boolean,
   cardNonce?: string,
+  adoptMode?: boolean,
+  showTakeover?: boolean,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const templateMap = { starting: 'yellow', working: 'blue', idle: 'green' } as const;
@@ -137,12 +140,31 @@ export function buildStreamingCard(
         type: 'default',
         value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
       },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: '❌ 关闭会话' },
-        type: 'danger',
-        value: { action: 'close', root_id: rootId, session_id: sessionId },
-      },
+      ...(adoptMode
+        ? [
+            ...(showTakeover
+              ? [{
+                  tag: 'button' as const,
+                  text: { tag: 'plain_text' as const, content: '🔄 接管' },
+                  type: 'default' as const,
+                  value: { action: 'takeover', root_id: rootId, session_id: sessionId },
+                }]
+              : []),
+            {
+              tag: 'button' as const,
+              text: { tag: 'plain_text' as const, content: '⏏ 断开' },
+              type: 'danger' as const,
+              value: { action: 'disconnect', root_id: rootId, session_id: sessionId },
+            },
+          ]
+        : [
+            {
+              tag: 'button' as const,
+              text: { tag: 'plain_text' as const, content: '❌ 关闭会话' },
+              type: 'danger' as const,
+              value: { action: 'close', root_id: rootId, session_id: sessionId },
+            },
+          ]),
     ],
   });
 
@@ -217,5 +239,52 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
     ],
   };
 
+  return JSON.stringify(card);
+}
+
+// ─── Adopt cards ─────────────────────────────────────────────────────────────
+
+function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h${m % 60}m`;
+  const d = Math.floor(h / 24);
+  return `${d}d${h % 24}h`;
+}
+
+export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId?: string): string {
+  const options = sessions.map((s) => {
+    const project = s.cwd.split('/').pop() || s.cwd;
+    const cliName = getCliDisplayName(s.cliId);
+    const uptime = s.startedAt ? formatDuration(Date.now() - s.startedAt) : '未知';
+    return {
+      text: { tag: 'plain_text' as const, content: `${cliName} · ${project} · ${s.tmuxTarget} · ${uptime}` },
+      value: JSON.stringify({ tmuxTarget: s.tmuxTarget, cliPid: s.cliPid }),
+    };
+  });
+
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: '📡 选择要接入的 CLI 会话' },
+    },
+    elements: [
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'select_static',
+            placeholder: { tag: 'plain_text', content: '选择 CLI 会话' },
+            options,
+            value: { key: 'adopt_select', root_id: rootMessageId ?? '' },
+          },
+        ],
+      },
+    ],
+  };
   return JSON.stringify(card);
 }

@@ -55,7 +55,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'takeover', 'disconnect'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     const ds = rootId ? activeSessions.get(rootId) : undefined;
@@ -108,6 +108,44 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       activeSessions.delete(sKey);
       await sessionReply(rootId, '✅ 会话已关闭');
       logger.info(`[${tag(ds)}] Closed via card button`);
+    }
+
+    if (actionType === 'disconnect' && ds) {
+      killWorker(ds);
+      sessionStore.closeSession(ds.session.sessionId);
+      activeSessions.delete(sKey);
+      await sessionReply(rootId, '⏏ 已断开，原 CLI 会话不受影响');
+      logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);
+    }
+
+    if (actionType === 'takeover' && ds && ds.adoptedFrom) {
+      const adopted = ds.adoptedFrom;
+      if (!adopted.sessionId) {
+        await sessionReply(rootId, '⚠️ 无法接管：未找到 CLI session ID');
+        return;
+      }
+
+      // Kill adopt worker (detaches from user's pane)
+      killWorker(ds);
+
+      // Clear adopt state, set up for standard botmux session
+      const originalSessionId = adopted.sessionId;
+      const originalCwd = adopted.cwd;
+      ds.adoptedFrom = undefined;
+      ds.workingDir = originalCwd;
+      ds.session.workingDir = originalCwd;
+      ds.hasHistory = true;
+
+      // Replace session ID with original CLI session ID for --resume
+      sessionStore.closeSession(ds.session.sessionId);
+      ds.session.sessionId = originalSessionId;
+      sessionStore.updateSession(ds.session);
+
+      // Fork standard Botmux worker with resume
+      forkWorker(ds, '', true);
+
+      await sessionReply(rootId, '🔄 已接管会话，MCP 已启用');
+      logger.info(`[${tag(ds)}] Takeover: resumed session ${originalSessionId} as standard botmux session`);
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
@@ -225,13 +263,44 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return;
   }
 
-  // Handle repo select card (option-based dropdown)
+  // Handle dropdown selections (option-based)
   const option = action?.option;
   if (!option) {
     logger.warn('Card action received but no option or action value');
     return;
   }
 
+  // Handle adopt session selection
+  if (action?.value?.key === 'adopt_select' && option) {
+    const rootId = action?.value?.root_id;
+    if (!rootId) return;
+
+    const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
+    const ds = activeSessions.get(sKey);
+    if (!ds) return;
+
+    // Parse selected session info
+    let selected: { tmuxTarget: string; cliPid: number };
+    try { selected = JSON.parse(option); } catch { return; }
+
+    // Re-discover to get full session info and validate
+    const { discoverAdoptableSessions } = await import('../../core/session-discovery.js');
+    const sessions = discoverAdoptableSessions();
+    const target = sessions.find(s => s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
+    if (!target) {
+      await sessionReply(rootId, '⚠️ 目标 CLI 会话已退出');
+      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+      return;
+    }
+
+    // Import and call startAdoptSession
+    const { startAdoptSession } = await import('../../core/command-handler.js');
+    await startAdoptSession(target, ds, { activeSessions, sessionReply: deps.sessionReply, getActiveCount: () => 0, lastRepoScan }, larkAppId);
+    if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+    return;
+  }
+
+  // Handle repo select card (option-based dropdown)
   const selectedPath = option;
   const rootId = action?.value?.root_id;
   logger.info(`Card action: repo switch to ${selectedPath} (root_id: ${rootId})`);

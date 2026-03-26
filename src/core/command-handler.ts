@@ -11,12 +11,13 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
-import { buildRepoSelectCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { deleteMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
-import { killWorker, forkWorker, getCurrentCliVersion } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
+import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey } from './types.js';
@@ -24,7 +25,7 @@ import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/cost', '/schedule', '/login']);
+export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/cost', '/schedule', '/login', '/adopt']);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -453,6 +454,32 @@ export async function handleCommand(
         break;
       }
 
+      case '/adopt': {
+        const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
+        const sessions = discoverAdoptableSessions();
+
+        if (sessions.length === 0) {
+          await sessionReply(rootId, '未发现可接入的 CLI 会话');
+          break;
+        }
+
+        const directTarget = adoptArgs;
+        if (directTarget) {
+          const target = sessions.find(s => s.tmuxTarget === directTarget);
+          if (!target) {
+            await sessionReply(rootId, `未找到 tmux pane ${directTarget}`);
+            break;
+          }
+          if (ds) await startAdoptSession(target, ds, deps, larkAppId);
+          break;
+        }
+
+        // Show selection card
+        const cardJson = buildAdoptSelectCard(sessions, rootId);
+        await sessionReply(rootId, cardJson, 'interactive');
+        break;
+      }
+
       case '/help': {
         const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
@@ -476,6 +503,10 @@ export async function handleCommand(
           '',
           '支持的时间格式：每日/每天、每周X、每月X号、工作日每天、每N小时、每N分钟',
           '',
+          '📡 会话接入：',
+          '/adopt              - 接入本机正在运行的 CLI 会话',
+          '/adopt <tmux_pane>  - 直接接入指定 tmux pane',
+          '',
           '🔐 用户授权：',
           '/login              - 飞书用户授权（可下载第三方卡片图片等）',
           '/login status       - 查看授权状态',
@@ -489,4 +520,43 @@ export async function handleCommand(
   } catch (err: any) {
     logger.error(`[${t}] Command ${cmd} error: ${err.message}`);
   }
+}
+
+// ─── Adopt session helper ────────────────────────────────────────────────────
+
+export async function startAdoptSession(
+  target: AdoptableSession,
+  ds: DaemonSession,
+  deps: CommandHandlerDeps,
+  larkAppId?: string,
+): Promise<void> {
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+
+  // Validate target is still alive
+  if (!validateAdoptTarget(target.tmuxTarget, target.cliPid)) {
+    await sessionReply(ds.session.rootMessageId, '⚠️ 目标 CLI 会话已退出');
+    return;
+  }
+
+  const project = target.cwd.split('/').pop() || target.cwd;
+
+  // Update the existing DaemonSession with adopt info
+  ds.workingDir = target.cwd;
+  ds.session.workingDir = target.cwd;
+  ds.session.title = `Adopt: ${project}`;
+  ds.adoptedFrom = {
+    tmuxTarget: target.tmuxTarget,
+    originalCliPid: target.cliPid,
+    sessionId: target.sessionId,
+    cliId: target.cliId,
+    cwd: target.cwd,
+    paneCols: target.paneCols,
+    paneRows: target.paneRows,
+  };
+
+  forkAdoptWorker(ds);
+
+  const cliName = getCliDisplayName(target.cliId);
+  await sessionReply(ds.session.rootMessageId, `📡 已接入 ${cliName} · ${project} (${target.tmuxTarget})`);
 }
