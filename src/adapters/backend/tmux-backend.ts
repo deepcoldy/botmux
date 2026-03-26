@@ -175,6 +175,20 @@ export class TmuxBackend implements SessionBackend {
 
   /** Detach only — kills the pty viewer but leaves tmux session alive. */
   kill(): void {
+    // Unzoom adopted pane before detaching (restore user's original layout)
+    if (this.adoptedPaneTarget) {
+      try {
+        // Only unzoom if the pane is currently zoomed
+        const zoomed = execSync(
+          `tmux display -t ${shellescape(this.adoptedPaneTarget)} -p '#{window_zoomed_flag}'`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        ).trim();
+        if (zoomed === '1') {
+          execSync(`tmux resize-pane -Z -t ${shellescape(this.adoptedPaneTarget)}`, { stdio: 'ignore' });
+        }
+      } catch { /* pane may be gone — benign */ }
+      this.adoptedPaneTarget = null;
+    }
     if (this.process) {
       try { this.process.kill(); } catch { /* already dead */ }
       this.process = null;
@@ -192,9 +206,21 @@ export class TmuxBackend implements SessionBackend {
   /**
    * Attach to an existing user tmux pane (not a bmx-* session).
    * Used by adopt mode — Botmux observes an already-running CLI.
+   *
+   * Zooms the target pane so only it is visible (hides other panes in the window).
+   * The zoom is undone when the backend is killed (detach/disconnect).
    */
   attachToExisting(tmuxTarget: string, opts: SpawnOpts): void {
     this.reattaching = true;
+    this.adoptedPaneTarget = tmuxTarget;
+
+    // Zoom the target pane BEFORE attaching — this makes the pane fill the entire
+    // window, so the PTY output (and web terminal) only shows this one pane.
+    // If the pane is already the only one in the window, zoom is a no-op.
+    try {
+      execSync(`tmux resize-pane -Z -t ${shellescape(tmuxTarget)}`, { stdio: 'ignore' });
+    } catch { /* pane may not support zoom (single pane) — benign */ }
+
     this.process = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
       name: 'xterm-256color',
       cols: opts.cols,
@@ -203,6 +229,9 @@ export class TmuxBackend implements SessionBackend {
       env: opts.env,
     });
   }
+
+  /** Tmux pane target when in adopt mode (e.g. "0:2.0") — used for zoom cleanup. */
+  private adoptedPaneTarget: string | null = null;
 
   getAttachInfo() {
     return { type: 'tmux' as const, sessionName: this.sessionName };

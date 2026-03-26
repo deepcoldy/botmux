@@ -156,8 +156,10 @@ function getPaneDimensions(tmuxTarget: string): { cols: number; rows: number } |
  * Skips `bmx-*` prefixed sessions (already managed by Botmux).
  * For each remaining pane, recursively searches the process tree (up to 3 levels)
  * for known CLI binaries.
+ *
+ * @param filterCliId - If provided, only return sessions matching this CLI type.
  */
-export function discoverAdoptableSessions(): AdoptableSession[] {
+export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession[] {
   // 1. List all tmux panes
   let panesRaw: string;
   try {
@@ -190,6 +192,9 @@ export function discoverAdoptableSessions(): AdoptableSession[] {
     // 3. Recursively search process tree for known CLI binaries (up to 3 levels)
     const match = findCliProcess(panePid, 3);
     if (!match) continue;
+
+    // 3b. Filter by CLI type if requested
+    if (filterCliId && match.cliId !== filterCliId) continue;
 
     // 4. Read CLI working directory from /proc
     const cwd = readCwd(match.pid);

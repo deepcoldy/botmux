@@ -456,7 +456,9 @@ export async function handleCommand(
 
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
-        const sessions = discoverAdoptableSessions();
+        // Only show sessions matching this bot's CLI type
+        const botCliId = ds ? getBot(ds.larkAppId).config.cliId : undefined;
+        const sessions = discoverAdoptableSessions(botCliId);
 
         if (sessions.length === 0) {
           await sessionReply(rootId, '未发现可接入的 CLI 会话');
