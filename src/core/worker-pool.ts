@@ -457,8 +457,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
   worker.on('exit', (code) => {
     logger.info(`[${t}] Worker process exited (code: ${code})`);
-    ds.worker = null;
-    ds.workerPort = null;
+    // Only clear ds.worker if it's still THIS worker — during takeover,
+    // the old worker's exit fires AFTER the new worker has been assigned.
+    if (ds.worker === worker) {
+      ds.worker = null;
+      ds.workerPort = null;
+    }
   });
 }
 
