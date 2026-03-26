@@ -114,6 +114,19 @@ BACKEND_TYPE=pty botmux start
 
 **tmux 会话命名规则：** `bmx-<sessionId 前 8 位>`
 
+### 会话接入（Adopt）
+
+将已在 tmux 中运行的 CLI 进程无缝接入 Botmux，在手机上通过飞书查看进度和交互。
+
+```
+/adopt              # 扫描 tmux，弹出选择卡片
+/adopt 0:2.0        # 直接接入指定 tmux pane
+```
+
+- **共享模式** — Botmux 接入后，iTerm2 和飞书双向同步：流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端
+- **一键接管** — 点击流式卡片上的「🔄 接管」按钮，Botmux 以 `--resume` 重建会话，启用 MCP，转为标准 Botmux 会话
+- **安全断开** — 点击「⏏ 断开」，Botmux 退出观察，原 CLI 不受影响
+
 ### 定时任务
 
 基于 Cron 的周期性任务，支持中文自然语言配置。
@@ -256,6 +269,7 @@ botmux start
 | `/restart` | 重启 CLI 进程 |
 | `/close` | 关闭会话并终止 CLI |
 | `/clear` | 清除上下文（新会话，同一话题） |
+| `/adopt` | 接入已运行的 CLI 会话（tmux） |
 | `/schedule` | 管理定时任务 |
 | `/help` | 显示可用命令 |
 

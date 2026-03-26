@@ -210,6 +210,19 @@ BACKEND_TYPE=pty botmux start
 | `/close` or close button | Destroyed | Terminated (SIGHUP) |
 | CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
 
+### Session Adopt
+
+Seamlessly connect Botmux to CLI processes already running in tmux — monitor and interact from your phone via Lark.
+
+```
+/adopt              # Scan tmux, show selection card
+/adopt 0:2.0        # Directly adopt a specific tmux pane
+```
+
+- **Shared mode** — After adopting, iTerm2 and Lark stay in sync: streaming card shows real-time terminal output, Lark chat input is forwarded directly to the terminal
+- **One-click takeover** — Click the "Takeover" button on the streaming card to rebuild the session with `--resume`, enable MCP, and convert to a standard Botmux session
+- **Safe disconnect** — Click "Disconnect" to detach Botmux without affecting the original CLI
+
 ### Scheduled Tasks
 
 Create recurring tasks with natural language:
@@ -255,6 +268,7 @@ botmux exposes MCP tools so the CLI can interact with Lark directly:
 | `/restart` | Restart CLI process |
 | `/close` | Close session and terminate CLI |
 | `/clear` | Clear context (new session, same thread) |
+| `/adopt` | Adopt a running CLI session (tmux) |
 | `/schedule` | Manage scheduled tasks |
 | `/help` | Show available commands |
 
