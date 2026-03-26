@@ -16,10 +16,12 @@ import type { SessionBackend, SpawnOpts } from './types.js';
 export class TmuxBackend implements SessionBackend {
   private process: pty.IPty | null = null;
   private readonly sessionName: string;
+  private readonly ownsSession: boolean;
   private reattaching = false;
 
-  constructor(sessionName: string) {
+  constructor(sessionName: string, opts?: { ownsSession?: boolean }) {
     this.sessionName = sessionName;
+    this.ownsSession = opts?.ownsSession ?? true;
   }
 
   // ─── Static helpers ───────────────────────────────────────────────────────
@@ -182,7 +184,24 @@ export class TmuxBackend implements SessionBackend {
   /** Kill the tmux session permanently. Called on explicit /close. */
   destroySession(): void {
     this.kill();
-    TmuxBackend.killSession(this.sessionName);
+    if (this.ownsSession) {
+      TmuxBackend.killSession(this.sessionName);
+    }
+  }
+
+  /**
+   * Attach to an existing user tmux pane (not a bmx-* session).
+   * Used by adopt mode — Botmux observes an already-running CLI.
+   */
+  attachToExisting(tmuxTarget: string, opts: SpawnOpts): void {
+    this.reattaching = true;
+    this.process = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
+      name: 'xterm-256color',
+      cols: opts.cols,
+      rows: opts.rows,
+      cwd: opts.cwd,
+      env: opts.env,
+    });
   }
 
   getAttachInfo() {

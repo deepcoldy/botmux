@@ -45,6 +45,16 @@ export interface DaemonSession {
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
+  /** Present when this session was created via /adopt (shared observation mode). */
+  adoptedFrom?: {
+    tmuxTarget: string;       // e.g. "0:2.0" — user's original tmux pane
+    originalCliPid: number;   // CLI process PID in the user's pane
+    sessionId?: string;       // CLI session ID (for takeover/resume)
+    cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type
+    cwd: string;              // CLI working directory
+    paneCols?: number;        // tmux pane width at adopt time
+    paneRows?: number;        // tmux pane height at adopt time
+  };
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent sessions for the same thread. */
