@@ -1,50 +1,50 @@
-# E2E Browser Test Design
+# E2E 浏览器测试设计
 
-## Goal
+## 目标
 
-Build a browser-based E2E test framework for botmux that verifies the full message flow through Feishu web UI: send a message in a topic group → bot creates a thread and replies with a message card.
+为 botmux 构建基于浏览器的 E2E 测试框架，验证飞书网页版的完整消息流程：在话题群发送消息 → bot 创建话题并回复消息卡片。
 
-Tests are publishable to GitHub with zero credential leakage. Anyone can clone the repo, provide their own Feishu account and Midscene API key, and run the tests.
+测试用例可发布到 GitHub，零凭证泄露。任何人 clone 项目后，填入自己的飞书账号和 Midscene API key 即可运行。
 
-## Tech Stack
+## 技术栈
 
-- **Midscene.js** (`@midscene/web`) — AI vision-driven page interaction, uses natural language instead of CSS selectors
-- **Playwright** — Browser automation engine (Midscene wraps it)
-- **Vitest** — Test runner (reuses existing project configuration)
+- **Midscene.js** (`@midscene/web`) — AI 视觉驱动的页面交互，用自然语言代替 CSS 选择器
+- **Playwright** — 浏览器自动化引擎（Midscene 底层封装）
+- **Vitest** — 测试运行器（复用项目现有配置）
 
-## Credential Management
+## 凭证管理
 
-All sensitive data lives in gitignored files:
+所有敏感数据存放在 gitignored 文件中：
 
-| File | Contents | In Git? |
-|------|----------|---------|
-| `.env` | Midscene API key, Feishu test group URL | No (gitignored) |
-| `storageState.json` | Feishu login cookies/localStorage | No (gitignored) |
-| `.env.example` | Template showing required variables | Yes |
+| 文件 | 内容 | 是否入 Git？ |
+|------|------|-------------|
+| `.env` | Midscene API key、飞书测试群 URL | 否（gitignored） |
+| `storageState.json` | 飞书登录态（cookies/localStorage） | 否（gitignored） |
+| `.env.example` | 变量模板，展示需要填写的内容 | 是 |
 
-### `.env.example` variables
+### `.env.example` 变量
 
 ```bash
-# Feishu test group URL (the topic group where the bot is added)
+# 飞书测试群 URL（bot 所在的话题群）
 FEISHU_TEST_GROUP_URL=https://xxx.feishu.cn/next/messenger/...
 
-# Midscene AI model configuration
+# Midscene AI 模型配置
 MIDSCENE_MODEL_NAME=your-model-name
 MIDSCENE_MODEL_API_KEY=your-api-key
 MIDSCENE_MODEL_BASE_URL=https://your-endpoint
 MIDSCENE_MODEL_FAMILY=your-model-family
 ```
 
-## File Structure
+## 文件结构
 
 ```
 test/e2e-browser/
-  setup-login.ts          # One-time login script, saves storageState.json
-  feishu-bot-reply.e2e.ts # Core test: send message → bot replies → verify card
-  helpers.ts              # Shared utilities (browser launch, page/agent creation)
+  setup-login.ts          # 一次性登录脚本，生成 storageState.json
+  feishu-bot-reply.e2e.ts # 核心测试：发消息 → bot 回复 → 验证卡片
+  helpers.ts              # 共用工具（浏览器启动、page/agent 创建）
 ```
 
-## Browser Configuration
+## 浏览器配置
 
 ```typescript
 const BROWSER_CONFIG = {
@@ -54,39 +54,39 @@ const BROWSER_CONFIG = {
 };
 ```
 
-### System Font Requirements
+### 系统字体要求
 
-Headless Linux environments need fonts for emoji and CJK rendering:
+Headless Linux 环境需要安装字体以支持 emoji 和中文渲染：
 
-- `fonts-noto-color-emoji` — color emoji rendering
-- `fonts-noto-cjk` — Chinese/Japanese/Korean font support
+- `fonts-noto-color-emoji` — 彩色 emoji 渲染
+- `fonts-noto-cjk` — 中日韩字体支持
 
-The setup script checks for these and prints install instructions if missing.
+setup 脚本会检测字体是否已安装，缺失时打印安装命令。
 
-## Workflow
+## 使用流程
 
-### One-time Setup
+### 一次性准备
 
 ```bash
-# 1. Install dependencies
+# 1. 安装依赖
 pnpm install
 
-# 2. Install Playwright browsers
+# 2. 安装 Playwright 浏览器
 npx playwright install chromium
 
-# 3. Install system fonts (if missing)
+# 3. 安装系统字体（如缺失）
 apt install fonts-noto-color-emoji fonts-noto-cjk
 
-# 4. Copy and fill in env vars
+# 4. 复制并填写环境变量
 cp .env.example .env
-# Edit .env with your Midscene API key and Feishu group URL
+# 编辑 .env，填入你的 Midscene API key 和飞书群 URL
 
-# 5. Login to Feishu (opens browser, user logs in manually)
+# 5. 登录飞书（打开浏览器，手动登录）
 pnpm test:e2e-browser:setup
-# Script detects successful login and saves storageState.json
+# 脚本检测登录成功后自动保存 storageState.json
 ```
 
-### Running Tests
+### 运行测试
 
 ```bash
 pnpm test:e2e-browser
@@ -101,49 +101,49 @@ pnpm test:e2e-browser
 }
 ```
 
-## Test: feishu-bot-reply.e2e.ts
+## 测试用例：feishu-bot-reply.e2e.ts
 
-### Flow
+### 流程
 
-1. Launch Chromium with saved `storageState.json` (viewport 1920x1080)
-2. Navigate to the Feishu test group URL from `.env`
-3. Use Midscene AI to type a test message (e.g., `"e2e-test-{timestamp}"`) in the input box and send
-4. Wait for bot to reply (Midscene `aiWaitFor` with timeout)
-5. Assert that a bot reply / message card appeared in the thread
+1. 使用已保存的 `storageState.json` 启动 Chromium（视口 1920x1080）
+2. 导航到 `.env` 中配置的飞书测试群 URL
+3. 通过 Midscene AI 在输入框中输入测试消息（如 `"e2e-test-{timestamp}"`）并发送
+4. 等待 bot 回复（Midscene `aiWaitFor`，带超时）
+5. 断言 bot 的回复 / 消息卡片出现在话题中
 
-### Key Decisions
+### 关键决策
 
-- **Message uniqueness**: Each test run uses a timestamped message to avoid collisions
-- **Timeout**: 60s for bot reply (CLI spawn + first response can be slow)
-- **No card interaction yet**: Phase 1 only verifies the reply appears; card button tests come later
+- **消息唯一性**：每次测试使用带时间戳的消息，避免冲突
+- **超时时间**：60 秒等待 bot 回复（CLI 启动 + 首次响应可能较慢）
+- **暂不测试卡片交互**：Phase 1 仅验证回复出现；卡片按钮测试后续扩展
 
 ## setup-login.ts
 
-### Flow
+### 流程
 
-1. **Pre-flight checks**:
-   - Playwright browsers installed?
-   - System fonts (emoji, CJK) installed?
-   - `.env` file exists with required variables?
-2. **Open browser** (headed mode, not headless) at Feishu login page
-3. **Wait for user** to complete login manually
-4. **Detect login success** by checking URL change or presence of messenger UI elements
-5. **Save** `storageState.json` via `context.storageState({ path: ... })`
-6. **Print** success message and close browser
+1. **前置检查**：
+   - Playwright 浏览器是否已安装？
+   - 系统字体（emoji、CJK）是否已安装？
+   - `.env` 文件是否存在且包含必要变量？
+2. **打开浏览器**（有头模式，非 headless）至飞书登录页
+3. **等待用户**手动完成登录
+4. **检测登录成功**：通过 URL 变化或 messenger UI 元素判断
+5. **保存** `storageState.json`（通过 `context.storageState({ path: ... })`）
+6. **打印**成功信息并关闭浏览器
 
 ## helpers.ts
 
-Exports:
-- `createBrowser()` — launches Chromium with proper config
-- `createPage(browser)` — creates context with storageState + viewport + locale
-- `createAgent(page)` — wraps page with Midscene `PlaywrightAgent`
-- `checkPrerequisites()` — validates fonts, env vars, storageState existence
+导出：
+- `createBrowser()` — 启动 Chromium，应用浏览器配置
+- `createPage(browser)` — 创建 context，加载 storageState + 视口 + 语言
+- `createAgent(page)` — 用 Midscene `PlaywrightAgent` 封装 page
+- `checkPrerequisites()` — 校验字体、环境变量、storageState 是否存在
 
-## Future Expansion (Out of Scope)
+## 后续扩展（不在本期范围）
 
-These are not part of Phase 1 but the framework supports adding them:
+框架支持后续添加以下测试场景：
 
-- Card button interaction tests (expand/collapse, restart, close)
-- Web Terminal link accessibility verification
-- Multi-bot @mention routing tests
-- Screenshot comparison / visual regression
+- 卡片按钮交互测试（展开/收起、重启、关闭）
+- Web Terminal 链接可访问性验证
+- 多 bot @mention 路由测试
+- 截图对比 / 视觉回归测试
