@@ -215,36 +215,35 @@ export async function waitForCardStatus(
 }
 
 /**
- * After sending a message, the bot may show a repo selection card
- * ("项目仓库管理") before starting the CLI. This helper detects
- * and skips it by clicking "直接开启会话".
- * If no repo card appears (bot auto-selects), this is a no-op.
- */
-export async function handleRepoSelection(agent: PlaywrightAgent): Promise<void> {
-  try {
-    await agent.aiWaitFor(
-      '页面上出现了"项目仓库管理"卡片或包含"直接开启会话"按钮的卡片',
-      { timeoutMs: 15_000, checkIntervalMs: 3_000 },
-    );
-    await agent.aiAct('点击"▶️ 直接开启会话"按钮');
-  } catch {
-    // No repo selection card appeared — bot auto-selected. Continue.
-  }
-}
-
-/**
- * Full flow after sending a message: handle repo selection if needed,
- * then wait for the streaming card to appear.
+ * Full flow after sending a message:
+ *  1. Wait for any bot card to appear (repo selection OR streaming card)
+ *  2. If repo selection card, skip it
+ *  3. Confirm streaming card is present
  */
 export async function waitForStreamingCard(
   agent: PlaywrightAgent,
   opts?: { timeoutMs?: number },
 ): Promise<void> {
-  await handleRepoSelection(agent);
+  const timeoutMs = opts?.timeoutMs ?? 60_000;
+
+  // Wait for any bot card response
   await agent.aiWaitFor(
-    '页面上出现了一个卡片，其标题中包含"启动中"或"工作中"或"就绪"字样',
-    { timeoutMs: opts?.timeoutMs ?? 60_000, checkIntervalMs: 3_000 },
+    '页面上出现了来自机器人的新卡片（可能是"项目仓库管理"卡片，也可能是标题包含"启动中"或"工作中"或"就绪"的流式卡片）',
+    { timeoutMs, checkIntervalMs: 3_000 },
   );
+
+  // Quick check: is it a repo selection card?
+  const hasSkipButton = await agent.aiBoolean(
+    '页面上可以看到"直接开启会话"按钮',
+  );
+  if (hasSkipButton) {
+    await agent.aiAct('点击"▶️ 直接开启会话"按钮');
+    // Now wait for the actual streaming card
+    await agent.aiWaitFor(
+      '页面上出现了标题包含"启动中"或"工作中"或"就绪"的流式卡片',
+      { timeoutMs, checkIntervalMs: 3_000 },
+    );
+  }
 }
 
 /** Generate a unique test message with timestamp and optional label. */

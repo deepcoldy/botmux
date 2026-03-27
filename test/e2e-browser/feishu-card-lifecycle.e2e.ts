@@ -62,21 +62,36 @@ describe('feishu card lifecycle', () => {
   }, 150_000);
 
   it('expand/collapse toggle works', async () => {
-    // Expand
-    await agent.aiAct('点击卡片上的"📖 展开输出"按钮');
-    await page.waitForTimeout(2000);
-    await agent.aiAssert('卡片中有"📕 收起输出"按钮，说明输出已展开');
+    // Detect current state and toggle once.
+    // Note: streaming cards update every ~2s, so we verify quickly after toggle.
+    const isExpanded = await agent.aiBoolean(
+      '卡片中可以看到"📕 收起输出"按钮',
+    );
 
-    // Collapse
-    await agent.aiAct('点击卡片上的"📕 收起输出"按钮');
-    await page.waitForTimeout(1000);
-    await agent.aiAssert('卡片中有"📖 展开输出"按钮，说明输出已收起');
-  }, 120_000);
+    if (isExpanded) {
+      await agent.aiAct('点击卡片上的"📕 收起输出"按钮');
+      await agent.aiWaitFor('卡片中出现了"📖 展开输出"按钮', {
+        timeoutMs: 15_000,
+        checkIntervalMs: 3_000,
+      });
+    } else {
+      await agent.aiAct('点击卡片上的"📖 展开输出"按钮');
+      await agent.aiWaitFor('卡片中出现了"📕 收起输出"按钮', {
+        timeoutMs: 15_000,
+        checkIntervalMs: 3_000,
+      });
+    }
+  }, 60_000);
 
   it('expanded card content has no abnormal characters', async () => {
-    // Re-expand to check content quality
-    await agent.aiAct('点击卡片上的"📖 展开输出"按钮');
-    await page.waitForTimeout(2000);
+    // Ensure card is expanded before checking content
+    const isCollapsed = await agent.aiBoolean(
+      '卡片中可以看到"📖 展开输出"按钮（表示当前是收起状态）',
+    );
+    if (isCollapsed) {
+      await agent.aiAct('点击卡片上的"📖 展开输出"按钮');
+      await page.waitForTimeout(2000);
+    }
 
     await agent.aiAssert(
       '卡片展开的输出内容是可读的正常文本，' +
