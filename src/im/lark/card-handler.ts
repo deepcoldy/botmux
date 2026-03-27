@@ -3,6 +3,7 @@
  * from Feishu interactive cards.
  * Extracted from daemon.ts for modularity.
  */
+import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
@@ -128,6 +129,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Kill adopt worker (detaches from user's pane)
       killWorker(ds);
 
+      // Capture adopt info before clearing state
+      const origPid = adopted.originalCliPid;
+      const paneTarget = adopted.tmuxTarget;
+      const resumeSessionId = adopted.sessionId;
+      const origCliId = adopted.cliId ?? 'claude-code';
+
       // Clear adopt state, set up for standard botmux session
       const originalSessionId = adopted.sessionId;
       const originalCwd = adopted.cwd;
@@ -136,9 +143,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ds.session.workingDir = originalCwd;
       ds.hasHistory = true;
 
-      // Replace session ID with original CLI session ID for --resume
+      // Replace session ID with original CLI session ID for --resume.
+      // closeSession mutates the session object in-place (shared reference),
+      // so we must re-activate afterwards to prevent the new session from
+      // being saved as 'closed'.
       sessionStore.closeSession(ds.session.sessionId);
       ds.session.sessionId = originalSessionId;
+      ds.session.status = 'active';
+      ds.session.closedAt = undefined;
       // Clear old port so the new worker gets a fresh one (old worker may still hold it)
       ds.session.webPort = undefined;
       // Clear streaming card state so the new worker creates a fresh card
@@ -149,8 +161,38 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ds.lastScreenStatus = undefined;
       sessionStore.updateSession(ds.session);
 
-      // Fork standard Botmux worker with resume
+      // Fork standard Botmux worker with resume — BEFORE killing original CLI,
+      // so the new worker reads the session file while it's still intact.
       forkWorker(ds, '', true);
+
+      // Kill original CLI and echo notice AFTER forkWorker, with a delay to let
+      // the new worker read the session file first. Use SIGKILL to prevent the
+      // original CLI's shutdown handler from modifying the session file.
+      const resumeCmd: Record<string, string> = {
+        'claude-code': `claude --resume ${resumeSessionId}`,
+        'aiden': `aiden --resume ${resumeSessionId}`,
+        'coco': `coco --resume ${resumeSessionId}`,
+      };
+      const resumeHint = resumeCmd[origCliId] ?? `<cli> --resume ${resumeSessionId}`;
+      setTimeout(() => {
+        if (origPid) {
+          try { process.kill(origPid, 'SIGKILL'); } catch { /* already dead */ }
+        }
+        try {
+          const esc = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+          execSync(`tmux send-keys -t ${esc(paneTarget)} C-c`, { stdio: 'ignore', timeout: 2000 });
+          const notice = [
+            `printf '\\n\\033[1;33m⚠️  此会话已被 botmux 接管\\033[0m\\n`,
+            `session: ${resumeSessionId}\\n`,
+            `\\n`,
+            `如需恢复本地操作：\\n`,
+            `  1. 在飞书中 /close 关闭当前接管会话\\n`,
+            `  2. ${resumeHint}\\n`,
+            `\\n'`,
+          ].join('');
+          execSync(`tmux send-keys -t ${esc(paneTarget)} ${esc(notice)} Enter`, { stdio: 'ignore', timeout: 2000 });
+        } catch { /* pane may be gone — benign */ }
+      }, 1500);
 
       await sessionReply(rootId, '🔄 已接管会话，MCP 已启用');
       logger.info(`[${tag(ds)}] Takeover: resumed session ${originalSessionId} as standard botmux session`);

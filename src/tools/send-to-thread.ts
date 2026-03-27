@@ -131,35 +131,66 @@ export async function execute(args: z.infer<typeof schema>) {
     // Write signal files for bot-to-bot mentions.
     // Lark WSClient does not deliver im.message.receive_v1 events for bot-sent messages,
     // so the daemon uses these signal files to route messages to target bots internally.
-    if (args.mentions && args.mentions.length > 0) {
-      const botInfoPath = join(config.session.dataDir, 'bots-info.json');
-      let botOpenIds = new Set<string>();
-      try {
-        if (existsSync(botInfoPath)) {
-          const entries: Array<{ botOpenId: string | null }> = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
-          botOpenIds = new Set(entries.filter(e => e.botOpenId).map(e => e.botOpenId!));
-        }
-      } catch { /* ignore */ }
+    //
+    // Resolve targets from two sources:
+    // 1. Explicit args.mentions (CLI passed open_ids directly)
+    // 2. Auto-detect @BotName in text content (CLIs often forget the mentions param)
+    const botInfoPath = join(config.session.dataDir, 'bots-info.json');
+    type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+    let botEntries: BotInfoEntry[] = [];
+    try {
+      if (existsSync(botInfoPath)) {
+        botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
+      }
+    } catch { /* ignore */ }
 
+    // Collect target open_ids: explicit mentions + auto-detected from text
+    const targetOpenIds = new Set<string>();
+    const botOpenIds = new Set(botEntries.filter(e => e.botOpenId).map(e => e.botOpenId!));
+    // Find self open_id to exclude from targets (don't signal yourself)
+    const selfOpenId = botEntries.find(e => e.larkAppId === appId)?.botOpenId;
+
+    // 1. Explicit mentions (excluding self)
+    if (args.mentions) {
+      for (const m of args.mentions) {
+        if (m.open_id !== selfOpenId && botOpenIds.has(m.open_id)) targetOpenIds.add(m.open_id);
+      }
+    }
+
+    // 2. Auto-detect @BotName / @cliId in text (case-insensitive)
+    if (text && botEntries.length > 0) {
+      for (const entry of botEntries) {
+        if (!entry.botOpenId || entry.larkAppId === appId) continue; // skip self
+        const names = [entry.botName, entry.cliId].filter(Boolean) as string[];
+        for (const name of names) {
+          // Match @Name with word boundary (handles "@Aiden", "@Claude Code", "@claude-code")
+          const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          if (new RegExp(`@${escaped}\\b`, 'i').test(text)) {
+            targetOpenIds.add(entry.botOpenId);
+            break;
+          }
+        }
+      }
+    }
+
+    if (targetOpenIds.size > 0) {
       const signalDir = join(config.session.dataDir, 'bot-mentions');
       if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
 
-      for (const m of args.mentions) {
-        if (botOpenIds.has(m.open_id)) {
-          const signal = {
-            rootMessageId: session.rootMessageId,
-            chatId: session.chatId,
-            chatType: session.chatType,
-            senderAppId: appId,
-            targetBotOpenId: m.open_id,
-            content: text,
-            messageId,
-            timestamp: Date.now(),
-          };
-          const filename = `${Date.now()}-${m.open_id.slice(-8)}.json`;
-          writeFileSync(join(signalDir, filename), JSON.stringify(signal));
-          logger.info(`Wrote bot-mention signal for ${m.open_id} in thread ${session.rootMessageId}`);
-        }
+      for (const openId of targetOpenIds) {
+        const signal = {
+          rootMessageId: session.rootMessageId,
+          chatId: session.chatId,
+          chatType: session.chatType,
+          senderAppId: appId,
+          targetBotOpenId: openId,
+          content: text,
+          messageId,
+          timestamp: Date.now(),
+        };
+        const filename = `${Date.now()}-${openId.slice(-8)}.json`;
+        writeFileSync(join(signalDir, filename), JSON.stringify(signal));
+        logger.info(`Wrote bot-mention signal for ${openId} in thread ${session.rootMessageId}`);
       }
     }
 

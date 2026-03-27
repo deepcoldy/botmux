@@ -488,6 +488,23 @@ term.loadAddon(new Unicode11Addon.Unicode11Addon());
 term.unicode.activeVersion='11';
 term.open(document.getElementById('terminal'));
 fit.fit();
+// ── OSC 52 clipboard ──
+var _clipBuf='';
+function _doCopy(text){
+  var ta=document.createElement('textarea');ta.value=text;
+  ta.style.cssText='position:fixed;left:-9999px';
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand('copy')}catch(e){}
+  document.body.removeChild(ta);
+}
+function _showCopied(){
+  var d=document.createElement('div');
+  d.textContent='Copied!';
+  d.style.cssText='position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:999;background:#9ece6a;color:#1a1b26;padding:4px 16px;border-radius:4px;font:13px monospace;pointer-events:none;opacity:1;transition:opacity .4s';
+  document.body.appendChild(d);
+  setTimeout(function(){d.style.opacity='0'},800);
+  setTimeout(function(){document.body.removeChild(d)},1200);
+}
 document.getElementById('terminal').addEventListener('contextmenu',function(e){e.preventDefault()});
 
 // ── WebSocket ──
@@ -500,7 +517,13 @@ window.addEventListener('resize',function(){fit.fit();sendResize()});
   var ws=new WebSocket('ws://'+location.host+'/?token='+t);
   ws_=ws;ws.binaryType='arraybuffer';
   ws.onopen=function(){el.textContent='connected';el.className='ok';sendResize()};
-  ws.onmessage=function(e){term.write(typeof e.data==='string'?e.data:new TextDecoder().decode(e.data))};
+  ws.onmessage=function(e){
+    var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
+    // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
+    var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
+    if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
+    term.write(data);
+  };
   ws.onclose=function(){ws_=null;el.textContent='disconnected';el.className='err';setTimeout(connect,2000)};
   ws.onerror=function(){ws.close()};
 })();

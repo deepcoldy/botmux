@@ -38,6 +38,7 @@ import {
   downloadResources,
   formatAttachmentsHint,
   buildNewTopicPrompt,
+  buildFollowUpContent,
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
@@ -393,24 +394,11 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {
-    // Build follow-up prompt with consistent structure (mirrors buildNewTopicPrompt)
-    const parts: string[] = [
-      attachments.length > 0
-        ? `${parsed.content}${formatAttachmentsHint(attachments)}`
-        : parsed.content,
-    ];
-
-    parts.push(`Session ID: ${ds.session.sessionId}`);
-
-    if (parsed.mentions && parsed.mentions.length > 0) {
-      const mentionLines = parsed.mentions.map(m => {
-        const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
-        return `- @${m.name}${idPart}`;
-      });
-      parts.push(`消息中的 @mention：\n${mentionLines.join('\n')}`);
-    }
-
-    const msgContent = parts.join('\n\n');
+    const msgContent = buildFollowUpContent(parsed.content, ds.session.sessionId, {
+      attachments,
+      mentions: parsed.mentions,
+      isAdoptMode: !!ds.adoptedFrom,
+    });
     // Freeze the previous turn's card at "idle" before starting a new turn
     if (ds.streamCardId && ds.workerPort) {
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
@@ -476,7 +464,9 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
     // Target bot has an active session in this thread — send the message
     const senderBot = getAllBots().find(b => b.config.larkAppId === signal.senderAppId);
     const senderName = senderBot?.botName ?? (senderBot ? getCliDisplayName(senderBot.config.cliId) : 'Bot');
-    const enrichedContent = [`[来自 ${senderName} 的 @mention]\n${signal.content}`, `Session ID: ${ds.session.sessionId}`].join('\n\n');
+    const enrichedParts = [`[来自 ${senderName} 的 @mention]\n${signal.content}`];
+    if (!ds.adoptedFrom) enrichedParts.push(`Session ID: ${ds.session.sessionId}`);
+    const enrichedContent = enrichedParts.join('\n\n');
     ds.lastMessageAt = Date.now();
     ds.streamCardPending = true;
     ds.currentTurnTitle = signal.content.substring(0, 50);
@@ -485,6 +475,10 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
   } else {
     logger.debug(`[bot-mention] Target bot ${targetAppId} has no active worker for thread ${signal.rootMessageId}`);
   }
+}
+
+function isSignalForMe(signal: BotMentionSignal): boolean {
+  return getAllBots().some(b => b.botOpenId === signal.targetBotOpenId);
 }
 
 function startBotMentionWatcher(): void {
@@ -498,11 +492,11 @@ function startBotMentionWatcher(): void {
       const filePath = join(signalDir, file);
       try {
         const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
+        if (!isSignalForMe(signal)) continue; // not for this daemon, leave for target
         unlinkSync(filePath);
         processBotMentionSignal(signal);
       } catch (err) {
         logger.debug(`[bot-mention] Failed to process signal ${file}: ${err}`);
-        try { unlinkSync(join(signalDir, file)); } catch { /* ignore */ }
       }
     }
   } catch { /* ignore */ }
@@ -516,11 +510,11 @@ function startBotMentionWatcher(): void {
       try {
         if (!existsSync(filePath)) return; // already processed or deleted
         const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
+        if (!isSignalForMe(signal)) return; // not for this daemon, leave for target
         unlinkSync(filePath);
         processBotMentionSignal(signal);
       } catch (err) {
         logger.debug(`[bot-mention] Failed to process signal ${filename}: ${err}`);
-        try { unlinkSync(filePath); } catch { /* ignore */ }
       }
     }, 50);
   });

@@ -194,6 +194,37 @@ export function buildNewTopicPrompt(
   return parts.join('\n\n');
 }
 
+/**
+ * Build the content for a follow-up message (thread reply to an active session).
+ * Mirrors buildNewTopicPrompt structure but for subsequent messages.
+ * In adopt mode (no MCP), session ID is omitted from the prompt.
+ */
+export function buildFollowUpContent(
+  content: string,
+  sessionId: string,
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean },
+): string {
+  const parts: string[] = [
+    opts?.attachments && opts.attachments.length > 0
+      ? `${content}${formatAttachmentsHint(opts.attachments)}`
+      : content,
+  ];
+
+  if (!opts?.isAdoptMode) {
+    parts.push(`Session ID: ${sessionId}`);
+  }
+
+  if (opts?.mentions && opts.mentions.length > 0) {
+    const mentionLines = opts.mentions.map(m => {
+      const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
+      return `- @${m.name}${idPart}`;
+    });
+    parts.push(`消息中的 @mention：\n${mentionLines.join('\n')}`);
+  }
+
+  return parts.join('\n\n');
+}
+
 // ─── Session restore ─────────────────────────────────────────────────────────
 
 export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): void {

@@ -123,6 +123,8 @@ export class TmuxBackend implements SessionBackend {
         const t = shellescape(this.sessionName);
         execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore' });
         execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore' });
+        // set-clipboard is a server option — enable OSC 52 passthrough for web copy
+        execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore' });
         execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore' });
         // Prevent web terminal clients (smaller viewport) from shrinking the
         // tmux window.  The backend PTY is intentionally wide (300 cols) so

@@ -4,7 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { getChatInfo, listChatBotMembers, replyMessage } from './client.js';
@@ -17,18 +17,39 @@ export function setBotOpenId(larkAppId: string, id: string): void {
   getBot(larkAppId).botOpenId = id;
 }
 
-/** Persist bot registry info to disk for MCP subprocesses to read. */
+/** Persist bot registry info to disk for MCP subprocesses to read.
+ *  Merges current process's bot(s) into the existing file so that
+ *  multiple daemon processes (one per bot) don't overwrite each other. */
 export function writeBotInfoFile(dataDir: string): void {
-  const bots = getAllBots();
-  const info = bots.map(b => ({
-    larkAppId: b.config.larkAppId,
-    botOpenId: b.botOpenId ?? null,
-    botName: b.botName ?? null,
-    cliId: b.config.cliId,
-  }));
   const filePath = join(dataDir, 'bots-info.json');
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  writeFileSync(filePath, JSON.stringify(info, null, 2) + '\n');
+
+  // Read existing entries from other daemon processes
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  let existing: BotInfoEntry[] = [];
+  try {
+    if (existsSync(filePath)) {
+      existing = JSON.parse(readFileSync(filePath, 'utf-8'));
+    }
+  } catch { /* ignore corrupt file */ }
+
+  // Build a map keyed by larkAppId, start with existing entries
+  const map = new Map<string, BotInfoEntry>();
+  for (const entry of existing) {
+    if (entry.larkAppId) map.set(entry.larkAppId, entry);
+  }
+
+  // Upsert current process's bot(s)
+  for (const b of getAllBots()) {
+    map.set(b.config.larkAppId, {
+      larkAppId: b.config.larkAppId,
+      botOpenId: b.botOpenId ?? null,
+      botName: b.botName ?? null,
+      cliId: b.config.cliId,
+    });
+  }
+
+  writeFileSync(filePath, JSON.stringify([...map.values()], null, 2) + '\n');
 }
 
 /**
@@ -212,9 +233,33 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const sender = data.sender;
         if (!message) return;
 
-        // Bot-originated messages: WSClient does not deliver these, skip.
-        // Bot-to-bot communication is handled via signal files (processBotMentionSignal).
-        if (sender?.sender_type === 'app') return;
+        // Bot-originated messages
+        if (sender?.sender_type === 'app') {
+          const senderOpenId = sender.sender_id?.open_id;
+          const rootId = message.root_id;
+          if (!rootId) return; // ignore bot messages outside threads
+
+          const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
+
+          if (isSelfMessage) {
+            // Own messages: only process /close commands
+            try {
+              const body = JSON.parse(message.content ?? '{}');
+              if (body.text?.trim() !== '/close') return;
+            } catch {
+              return;
+            }
+            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling message event: ${err}`));
+            return;
+          }
+
+          // Message from another bot: check if it @mentions this bot
+          if (isBotMentioned(larkAppId, message, undefined)) {
+            logger.info(`Bot-to-bot @mention detected: routing to handleThreadReply`);
+            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling bot @mention: ${err}`));
+          }
+          return;
+        }
 
         const rootId = message.root_id;
         const chatId = message.chat_id;
