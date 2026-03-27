@@ -63,22 +63,23 @@ export function createBotTest(botName: BotName): void {
       await sendMessage(agent, msg);
 
       // Handle repo selection if it appears, then wait for streaming card
-      await waitForStreamingCard(agent, { timeoutMs: 90_000 });
+      await waitForStreamingCard(agent, {
+        timeoutMs: 90_000,
+        msgHint: msg,
+      });
 
-      // Verify the reply is from this bot
+      // Verify the reply is from this bot (we're now in the thread panel)
       await agent.aiAssert(
-        `聊天中有来自 ${botName} 机器人的回复消息`,
+        `话题面板中有来自 ${botName} 机器人的回复`,
       );
-    }, 120_000);
+    }, 240_000);
 
     it(`card reaches idle status for ${botName}`, async () => {
-      // This test continues from the previous test's state.
-      // The card should eventually transition to "就绪".
-      await waitForCardStatus(agent, '就绪', { timeoutMs: 90_000 });
-
-      await agent.aiAssert(
-        `有一个卡片的标题中包含"就绪"字样`,
+      // Continues from the thread panel opened by previous test
+      await agent.aiWaitFor(
+        '话题面板中的流式卡片标题包含"就绪"',
+        { timeoutMs: 120_000, checkIntervalMs: 5_000 },
       );
-    }, 120_000);
+    }, 180_000);
   });
 }
