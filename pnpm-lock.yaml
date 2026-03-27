@@ -41,7 +41,10 @@ importers:
     devDependencies:
       '@midscene/web':
         specifier: ^1.6.0
-        version: 1.6.0(playwright@1.58.2)
+        version: 1.6.0(@playwright/test@1.58.2)(playwright@1.58.2)
+      '@playwright/test':
+        specifier: ^1.58.2
+        version: 1.58.2
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.33
@@ -547,6 +550,11 @@ packages:
     peerDependenciesMeta:
       '@cfworker/json-schema':
         optional: true
+
+  '@playwright/test@1.58.2':
+    resolution: {integrity: sha512-akea+6bHYBBfA9uQqSYmlJXn61cTa+jbO87xVLCWbTqbWadRVmhxlXATaOjOgcBaWU4ePo0wB41KMFv3o35IXA==}
+    engines: {node: '>=18'}
+    hasBin: true
 
   '@pm2/agent@2.1.1':
     resolution: {integrity: sha512-0V9ckHWd/HSC8BgAbZSoq8KXUG81X97nSkAxmhKDhmF8vanyaoc1YXwc2KVkbWz82Rg4gjd2n9qiT3i7bdvGrQ==}
@@ -2792,7 +2800,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@midscene/web@1.6.0(playwright@1.58.2)':
+  '@midscene/web@1.6.0(@playwright/test@1.58.2)(playwright@1.58.2)':
     dependencies:
       '@midscene/core': 1.6.0(ws@8.19.0)
       '@midscene/playground': 1.6.0(ws@8.19.0)
@@ -2806,6 +2814,8 @@ snapshots:
       socket.io: 4.8.3
       socket.io-client: 4.8.1
       ws: 8.19.0
+    optionalDependencies:
+      '@playwright/test': 1.58.2
     transitivePeerDependencies:
       - bare-abort-controller
       - bare-buffer
@@ -2851,6 +2861,10 @@ snapshots:
       zod-to-json-schema: 3.25.1(zod@3.25.76)
     transitivePeerDependencies:
       - supports-color
+
+  '@playwright/test@1.58.2':
+    dependencies:
+      playwright: 1.58.2
 
   '@pm2/agent@2.1.1':
     dependencies:
