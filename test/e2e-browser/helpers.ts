@@ -214,6 +214,39 @@ export async function waitForCardStatus(
   );
 }
 
+/**
+ * After sending a message, the bot may show a repo selection card
+ * ("项目仓库管理") before starting the CLI. This helper detects
+ * and skips it by clicking "直接开启会话".
+ * If no repo card appears (bot auto-selects), this is a no-op.
+ */
+export async function handleRepoSelection(agent: PlaywrightAgent): Promise<void> {
+  try {
+    await agent.aiWaitFor(
+      '页面上出现了"项目仓库管理"卡片或包含"直接开启会话"按钮的卡片',
+      { timeoutMs: 15_000, checkIntervalMs: 3_000 },
+    );
+    await agent.aiAct('点击"▶️ 直接开启会话"按钮');
+  } catch {
+    // No repo selection card appeared — bot auto-selected. Continue.
+  }
+}
+
+/**
+ * Full flow after sending a message: handle repo selection if needed,
+ * then wait for the streaming card to appear.
+ */
+export async function waitForStreamingCard(
+  agent: PlaywrightAgent,
+  opts?: { timeoutMs?: number },
+): Promise<void> {
+  await handleRepoSelection(agent);
+  await agent.aiWaitFor(
+    '页面上出现了一个卡片，其标题中包含"启动中"或"工作中"或"就绪"字样',
+    { timeoutMs: opts?.timeoutMs ?? 60_000, checkIntervalMs: 3_000 },
+  );
+}
+
 /** Generate a unique test message with timestamp and optional label. */
 export function testMessage(label?: string): string {
   const ts = Date.now();

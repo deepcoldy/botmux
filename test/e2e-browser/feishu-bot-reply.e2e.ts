@@ -1,6 +1,6 @@
 /**
  * Basic smoke test: send a message to a bot → bot replies.
- * Uses FEISHU_TEST_GROUP_URL directly (the simplest possible test).
+ * Navigates to messenger → opens Claude chat → sends message.
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
@@ -11,11 +11,12 @@ import {
   createPage,
   createAgent,
   checkPrerequisites,
-  getRequiredEnv,
   STORAGE_STATE_PATH,
   testMessage,
   sendMessage,
-  waitForBotReply,
+  waitForStreamingCard,
+  navigateToMessenger,
+  openChat,
 } from './helpers.js';
 
 describe('feishu bot reply (smoke test)', () => {
@@ -43,14 +44,12 @@ describe('feishu bot reply (smoke test)', () => {
   });
 
   it('should receive bot reply after sending a message', async () => {
-    const groupUrl = getRequiredEnv('FEISHU_TEST_GROUP_URL');
     const msg = testMessage();
 
-    await page.goto(groupUrl, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(3000);
-
+    await navigateToMessenger(page);
+    await openChat(agent, 'Claude');
     await sendMessage(agent, msg);
-    await waitForBotReply(agent);
+    await waitForStreamingCard(agent);
     await agent.aiAssert('聊天中有来自机器人的回复消息');
   }, 120_000);
 });

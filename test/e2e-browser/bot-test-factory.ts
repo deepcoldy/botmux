@@ -25,6 +25,7 @@ import {
   openChat,
   waitForBotReply,
   waitForCardStatus,
+  waitForStreamingCard,
   type BotName,
 } from './helpers.js';
 
@@ -61,8 +62,8 @@ export function createBotTest(botName: BotName): void {
       const msg = testMessage(botName.toLowerCase());
       await sendMessage(agent, msg);
 
-      // Wait for bot to reply (creates topic + responds)
-      await waitForBotReply(agent, { timeoutMs: 90_000 });
+      // Handle repo selection if it appears, then wait for streaming card
+      await waitForStreamingCard(agent, { timeoutMs: 90_000 });
 
       // Verify the reply is from this bot
       await agent.aiAssert(

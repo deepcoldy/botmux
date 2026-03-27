@@ -15,11 +15,13 @@ import {
   createPage,
   createAgent,
   checkPrerequisites,
-  getRequiredEnv,
   STORAGE_STATE_PATH,
   testMessage,
   sendMessage,
   waitForCardStatus,
+  waitForStreamingCard,
+  navigateToMessenger,
+  openChat,
 } from './helpers.js';
 
 describe('feishu web terminal', () => {
@@ -47,16 +49,18 @@ describe('feishu web terminal', () => {
   });
 
   it('web terminal content matches card streaming output', async () => {
-    const groupUrl = getRequiredEnv('FEISHU_TEST_GROUP_URL');
     const msg = testMessage('terminal');
 
-    // Navigate and send message
-    await page.goto(groupUrl, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(3000);
+    // Navigate to Claude chat and send message
+    await navigateToMessenger(page);
+    await openChat(agent, 'Claude');
     await sendMessage(agent, msg);
 
+    // Handle repo selection if needed, then wait for streaming card
+    await waitForStreamingCard(agent, { timeoutMs: 90_000 });
+
     // Wait for bot to finish responding
-    await waitForCardStatus(agent, '就绪', { timeoutMs: 90_000 });
+    await waitForCardStatus(agent, '就绪', { timeoutMs: 120_000 });
 
     // Expand card to see full output
     await agent.aiAct('点击卡片上的"📖 展开输出"按钮');

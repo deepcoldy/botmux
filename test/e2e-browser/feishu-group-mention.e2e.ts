@@ -27,7 +27,7 @@ import {
   navigateToMessenger,
   openChat,
   getGroupChatName,
-  waitForBotReply,
+  waitForStreamingCard,
 } from './helpers.js';
 
 describe('feishu group @mention routing', () => {
@@ -68,8 +68,8 @@ describe('feishu group @mention routing', () => {
     const msg = testMessage('mention-single');
     await sendMentionMessage(page, agent, 'Claude', msg);
 
-    // Wait for Claude to reply
-    await waitForBotReply(agent, { timeoutMs: 90_000 });
+    // Wait for Claude to reply (handle repo selection if needed)
+    await waitForStreamingCard(agent, { timeoutMs: 90_000 });
 
     // Verify Claude replied
     await agent.aiAssert(
