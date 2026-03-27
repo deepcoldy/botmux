@@ -1,3 +1,7 @@
+/**
+ * Basic smoke test: send a message to a bot → bot replies.
+ * Uses FEISHU_TEST_GROUP_URL directly (the simplest possible test).
+ */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
@@ -9,9 +13,12 @@ import {
   checkPrerequisites,
   getRequiredEnv,
   STORAGE_STATE_PATH,
+  testMessage,
+  sendMessage,
+  waitForBotReply,
 } from './helpers.js';
 
-describe('feishu bot reply', () => {
+describe('feishu bot reply (smoke test)', () => {
   let browser: Browser;
   let context: BrowserContext;
   let page: Page;
@@ -19,13 +26,11 @@ describe('feishu bot reply', () => {
 
   beforeAll(async () => {
     checkPrerequisites();
-
     if (!existsSync(STORAGE_STATE_PATH)) {
       throw new Error(
         'storageState.json not found. Run setup first: pnpm test:e2e-browser:setup',
       );
     }
-
     browser = await createBrowser();
     ({ context, page } = await createPage(browser));
     agent = createAgent(page);
@@ -39,24 +44,13 @@ describe('feishu bot reply', () => {
 
   it('should receive bot reply after sending a message', async () => {
     const groupUrl = getRequiredEnv('FEISHU_TEST_GROUP_URL');
-    const testMessage = `e2e-test-${Date.now()}`;
+    const msg = testMessage();
 
-    // 1. Navigate to the test group
     await page.goto(groupUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(3000);
 
-    // 2. Type and send a message
-    await agent.aiAct(
-      `在消息输入框中输入 "${testMessage}" 然后按 Enter 发送`,
-    );
-
-    // 3. Wait for bot to reply (60s — CLI spawn can be slow)
-    await agent.aiWaitFor(
-      '页面上出现了新的消息回复，不是我刚才发送的消息',
-      { timeoutMs: 60_000, checkIntervalMs: 5_000 },
-    );
-
-    // 4. Assert bot replied
+    await sendMessage(agent, msg);
+    await waitForBotReply(agent);
     await agent.aiAssert('聊天中有来自机器人的回复消息');
   }, 120_000);
 });

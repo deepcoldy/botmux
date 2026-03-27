@@ -15,6 +15,14 @@ export const BROWSER_CONFIG = {
   locale: 'zh-CN',
 };
 
+/** All bot display names available for testing (except Gemini). */
+export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden'] as const;
+export type BotName = (typeof BOT_NAMES)[number];
+
+// ---------------------------------------------------------------------------
+// Env helpers
+// ---------------------------------------------------------------------------
+
 export function getRequiredEnv(key: string): string {
   const value = process.env[key];
   if (!value) {
@@ -24,6 +32,21 @@ export function getRequiredEnv(key: string): string {
   }
   return value;
 }
+
+/** Derive messenger base URL from FEISHU_TEST_GROUP_URL. */
+export function getMessengerUrl(): string {
+  const groupUrl = getRequiredEnv('FEISHU_TEST_GROUP_URL');
+  const url = new URL(groupUrl);
+  return `${url.origin}/next/messenger`;
+}
+
+export function getGroupChatName(): string {
+  return process.env.FEISHU_TEST_GROUP_CHAT_NAME ?? 'Agent群聊';
+}
+
+// ---------------------------------------------------------------------------
+// Prerequisites
+// ---------------------------------------------------------------------------
 
 function isFontInstalled(fontPattern: string): boolean {
   try {
@@ -65,6 +88,10 @@ export function checkPrerequisites(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Browser / page / agent creation
+// ---------------------------------------------------------------------------
+
 export async function createBrowser(headless = true): Promise<Browser> {
   return chromium.launch({ headless });
 }
@@ -87,4 +114,108 @@ export async function createPage(
 
 export function createAgent(page: Page): PlaywrightAgent {
   return new PlaywrightAgent(page);
+}
+
+// ---------------------------------------------------------------------------
+// Navigation helpers
+// ---------------------------------------------------------------------------
+
+/** Navigate to the messenger page and wait for it to load. */
+export async function navigateToMessenger(page: Page): Promise<void> {
+  await page.goto(getMessengerUrl(), { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(3000);
+}
+
+/**
+ * Open a specific chat by clicking its entry in the left sidebar.
+ * Works for both bot private chats ("Claude") and group chats ("Agent群聊").
+ */
+export async function openChat(
+  agent: PlaywrightAgent,
+  chatName: string,
+): Promise<void> {
+  await agent.aiAct(`在左侧聊天列表中，点击名称包含"${chatName}"的对话`);
+  // Wait for chat to load
+  await agent.aiWaitFor(`右侧聊天区域显示了与"${chatName}"的对话内容`, {
+    timeoutMs: 10_000,
+    checkIntervalMs: 2_000,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Message helpers
+// ---------------------------------------------------------------------------
+
+/** Send a plain text message in the currently open chat. */
+export async function sendMessage(
+  agent: PlaywrightAgent,
+  message: string,
+): Promise<void> {
+  await agent.aiAct(
+    `在底部消息输入框中输入 "${message}" 然后按 Enter 发送`,
+  );
+}
+
+/**
+ * Send a message with @mention in a group chat.
+ * Types "@", selects the bot from the dropdown, then types the rest.
+ */
+export async function sendMentionMessage(
+  page: Page,
+  agent: PlaywrightAgent,
+  botName: string,
+  message: string,
+): Promise<void> {
+  // Click into the input box
+  await agent.aiAct('点击底部的消息输入框');
+  // Type @ to trigger mention dropdown
+  await page.keyboard.type('@');
+  await page.waitForTimeout(1000);
+  // Type bot name to filter the dropdown, then select
+  await agent.aiAct(
+    `在弹出的@提及搜索列表中，找到并点击"${botName}"`,
+  );
+  await page.waitForTimeout(500);
+  // Type the rest of the message and send
+  await page.keyboard.type(` ${message}`);
+  await page.keyboard.press('Enter');
+}
+
+// ---------------------------------------------------------------------------
+// Verification helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Wait for a bot reply to appear. Checks for any new message that isn't
+ * the test message itself.
+ */
+export async function waitForBotReply(
+  agent: PlaywrightAgent,
+  opts?: { timeoutMs?: number },
+): Promise<void> {
+  await agent.aiWaitFor(
+    '聊天中出现了来自机器人的新回复消息（不是我自己发送的消息）',
+    { timeoutMs: opts?.timeoutMs ?? 60_000, checkIntervalMs: 5_000 },
+  );
+}
+
+/**
+ * Wait for a streaming card to appear with a specific status.
+ * Status values: "启动中…", "工作中", "就绪"
+ */
+export async function waitForCardStatus(
+  agent: PlaywrightAgent,
+  status: '启动中…' | '工作中' | '就绪',
+  opts?: { timeoutMs?: number },
+): Promise<void> {
+  await agent.aiWaitFor(
+    `页面上出现了一个卡片，其标题栏中包含"${status}"字样`,
+    { timeoutMs: opts?.timeoutMs ?? 60_000, checkIntervalMs: 3_000 },
+  );
+}
+
+/** Generate a unique test message with timestamp and optional label. */
+export function testMessage(label?: string): string {
+  const ts = Date.now();
+  return label ? `e2e-${label}-${ts}` : `e2e-test-${ts}`;
 }
