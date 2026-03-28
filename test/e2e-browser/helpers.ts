@@ -41,7 +41,7 @@ export function getMessengerUrl(): string {
 }
 
 export function getGroupChatName(): string {
-  return process.env.FEISHU_TEST_GROUP_CHAT_NAME ?? 'Agent群聊';
+  return process.env.FEISHU_TEST_GROUP_CHAT_NAME ?? '普通群聊';
 }
 
 // ---------------------------------------------------------------------------
@@ -128,17 +128,29 @@ export async function navigateToMessenger(page: Page): Promise<void> {
 
 /**
  * Open a specific chat by clicking its entry in the left sidebar.
- * Works for both bot private chats ("Claude") and group chats ("Agent群聊").
+ * Works for both bot private chats ("Claude") and group chats.
+ * Scrolls the sidebar if the chat is not immediately visible.
  */
 export async function openChat(
   agent: PlaywrightAgent,
   chatName: string,
 ): Promise<void> {
-  await agent.aiAct(`在左侧聊天列表中，点击名称包含"${chatName}"的对话`);
+  // Try clicking directly first
+  try {
+    await agent.aiAct(
+      `在左侧聊天列表中，点击名称包含"${chatName}"的对话`,
+    );
+  } catch {
+    // Chat not visible — scroll sidebar down and retry
+    await agent.aiScroll('左侧聊天列表', { direction: 'down', scrollCount: 5 });
+    await agent.aiAct(
+      `在左侧聊天列表中，点击名称包含"${chatName}"的对话`,
+    );
+  }
   // Wait for chat to load
-  await agent.aiWaitFor(`右侧聊天区域显示了与"${chatName}"的对话内容`, {
-    timeoutMs: 10_000,
-    checkIntervalMs: 2_000,
+  await agent.aiWaitFor(`右侧聊天区域显示了与"${chatName}"的对话`, {
+    timeoutMs: 15_000,
+    checkIntervalMs: 3_000,
   });
 }
 
