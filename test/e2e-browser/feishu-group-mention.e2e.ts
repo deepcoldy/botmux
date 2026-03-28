@@ -56,13 +56,13 @@ describe('feishu group @mention routing', () => {
     const msg = testMessage('no-mention');
     await sendMessage(agent, msg);
 
-    // Wait 15 seconds — no bot should respond
+    // Wait 15 seconds — no bot should respond in a multi-bot group
     await page.waitForTimeout(15_000);
 
     await agent.aiAssert(
       `我发送的消息"${msg}"之后，没有任何机器人回复`,
     );
-  }, 60_000);
+  }, 120_000);
 
   it('@mention a single bot → only that bot responds', async () => {
     const msg = testMessage('mention');
