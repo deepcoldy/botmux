@@ -537,12 +537,23 @@ if(!hasToken&&!${isTmuxMode}){
   },{passive:false});
 }
 
+// ── Scroll helper (shared by toolbar buttons & two-finger touch) ──
+function _sendScroll(up,n){
+  n=n||3;
+  if(${isTmuxMode}){
+    // SGR mouse wheel: 64=up 65=down — tmux enters copy-mode and scrolls
+    var seq='\\x1b[<'+(up?64:65)+';1;1M';
+    for(var i=0;i<n;i++){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:seq}))}
+  }else{
+    term.scrollLines(up?-n:n);
+  }
+}
+
 // ── Touch shortcut toolbar ──
 if(isTouch&&hasToken){
   var km={esc:'\\x1b',ctrlc:'\\x03',tab:'\\t',up:'\\x1b[A',down:'\\x1b[B',left:'\\x1b[D',right:'\\x1b[C',enter:'\\r'};
   var tb=document.getElementById('toolbar');
   tb.classList.add('show');
-  // Use direct listeners per button — more reliable on mobile than event delegation
   var btns=tb.getElementsByTagName('button');
   for(var i=0;i<btns.length;i++){(function(btn){
     function fire(e){e.preventDefault();e.stopPropagation();
@@ -563,6 +574,35 @@ if(isTouch&&hasToken){
     window.visualViewport.addEventListener('resize',posToolbar);
     window.visualViewport.addEventListener('scroll',posToolbar);
   }
+}
+
+// ── Two-finger touch scroll (mobile) ──
+// Distinguishes scroll (parallel drag) from pinch (spread/squeeze) by
+// tracking inter-finger distance.  If distance changes > 30 % from start
+// it's a pinch — ignore.  Direction is "natural" (finger-up = content-up).
+if(isTouch){
+  var _2fY=0,_2f=false,_2fGap0=0,_2fGapPrev=0;
+  var _te=document.getElementById('terminal');
+  function _gap(e){var dx=e.touches[0].clientX-e.touches[1].clientX,dy=e.touches[0].clientY-e.touches[1].clientY;return Math.sqrt(dx*dx+dy*dy)}
+  _te.addEventListener('touchstart',function(e){
+    if(e.touches.length===2){_2f=true;_2fY=(e.touches[0].clientY+e.touches[1].clientY)/2;_2fGap0=_gap(e)||1;_2fGapPrev=_2fGap0}
+  },{passive:true});
+  _te.addEventListener('touchmove',function(e){
+    if(!_2f||e.touches.length!==2)return;
+    var g=_gap(e);
+    // Pinch detection: >15% from initial OR >8% between frames → not a scroll
+    if(Math.abs(g-_2fGap0)/_2fGap0>0.15||Math.abs(g-_2fGapPrev)/(_2fGapPrev||1)>0.08){_2f=false;return}
+    _2fGapPrev=g;
+    var y=(e.touches[0].clientY+e.touches[1].clientY)/2;
+    var d=_2fY-y;
+    if(Math.abs(d)>12){
+      var n=Math.max(1,Math.floor(Math.abs(d)/12));
+      _sendScroll(d<0,n);
+      _2fY=y;
+      e.preventDefault();
+    }
+  },{passive:false});
+  _te.addEventListener('touchend',function(e){if(e.touches.length<2)_2f=false},{passive:true});
 }
 </script>
 </body>
