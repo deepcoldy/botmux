@@ -286,6 +286,39 @@ export async function waitForStreamingCard(
   );
 }
 
+/**
+ * Close the current session by clicking the "❌ 关闭会话" button
+ * in the thread panel. Call this in afterAll/afterEach to clean up.
+ * Silently ignores failures (session might already be closed).
+ */
+export async function closeSession(
+  agent: PlaywrightAgent,
+  page: Page,
+): Promise<void> {
+  try {
+    // Scroll down to reveal the close button if needed
+    await agent.aiScroll(undefined, { direction: 'down', scrollCount: 3 });
+    await page.waitForTimeout(500);
+    await agent.aiAct('点击"❌ 关闭会话"按钮');
+    await page.waitForTimeout(2000);
+  } catch {
+    // Session already closed or button not visible — ignore
+  }
+}
+
+/**
+ * Send a reply within the currently open thread panel.
+ * Used for commands like /close, /schedule, /repo within a thread.
+ */
+export async function sendThreadReply(
+  agent: PlaywrightAgent,
+  message: string,
+): Promise<void> {
+  await agent.aiAct(
+    `在右侧话题面板底部的"回复"输入框中输入 "${message}" 然后按 Enter 发送`,
+  );
+}
+
 /** Generate a unique test message with timestamp and optional label. */
 export function testMessage(label?: string): string {
   const ts = Date.now();

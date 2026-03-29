@@ -22,6 +22,7 @@ import {
   waitForStreamingCard,
   navigateToMessenger,
   openChat,
+  closeSession,
 } from './helpers.js';
 
 describe('feishu card lifecycle', () => {
@@ -46,6 +47,7 @@ describe('feishu card lifecycle', () => {
   }, 90_000);
 
   afterAll(async () => {
+    await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();

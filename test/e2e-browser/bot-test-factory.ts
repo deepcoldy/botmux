@@ -23,9 +23,8 @@ import {
   sendMessage,
   navigateToMessenger,
   openChat,
-  waitForBotReply,
-  waitForCardStatus,
   waitForStreamingCard,
+  closeSession,
   type BotName,
 } from './helpers.js';
 
@@ -49,6 +48,7 @@ export function createBotTest(botName: BotName): void {
     });
 
     afterAll(async () => {
+      await closeSession(agent, page);
       await agent?.destroy();
       await context?.close();
       await browser?.close();
