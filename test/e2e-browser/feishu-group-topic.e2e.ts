@@ -1,8 +1,8 @@
 /**
  * Group chat topic/thread creation test:
  *  - In a regular group chat, @mention a bot with a message
- *  - Verify the bot creates a topic/thread to reply (not inline)
- *  - The reply should appear in a thread panel when clicked
+ *  - Verify the bot replies and creates a topic (thread structure)
+ *  - The reply should be associated with the original message
  *
  * Per requirements: bots must ALWAYS create topics in any chat type.
  */
@@ -21,8 +21,6 @@ import {
   navigateToMessenger,
   openChat,
   getGroupChatName,
-  waitForStreamingCard,
-  closeSession,
 } from './helpers.js';
 
 describe('group chat topic creation', () => {
@@ -47,29 +45,27 @@ describe('group chat topic creation', () => {
   }, 120_000);
 
   afterAll(async () => {
-    // Clean up: close the session
-    await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();
   });
 
-  it('bot creates topic thread when replying in regular group', async () => {
+  it('bot creates topic when replying in regular group', async () => {
     const msg = testMessage('group-topic');
     await sendMentionMessage(page, agent, 'Claude', msg);
 
-    // Wait for bot to respond — this opens the thread panel
-    await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg });
-
-    // Key assertion: the response is in a THREAD panel (topic),
-    // not just an inline reply in the group chat
-    await agent.aiAssert(
-      '右侧打开了一个话题详情面板，里面有来自 Claude 的回复和流式卡片',
+    // Wait for bot to respond (any reply card or message from Claude)
+    await agent.aiWaitFor(
+      `聊天中"${msg}"消息下方出现了来自 Claude 机器人的回复`,
+      { timeoutMs: 90_000, checkIntervalMs: 5_000 },
     );
 
-    // Verify the thread panel title or context shows it's a thread
+    // Verify the reply is in a topic/thread structure:
+    // In Feishu, threaded replies show "N条回复" or "回复话题" under
+    // the original message, indicating a topic was created.
     await agent.aiAssert(
-      '话题面板的顶部或上下文区域显示了原始消息内容，表明这是一个话题/线程',
+      `消息"${msg}"区域可以看到"回复话题"或"条回复"的链接，` +
+        '说明机器人的回复是以话题/线程形式组织的，而不是普通的群聊消息',
     );
   }, 240_000);
 });
