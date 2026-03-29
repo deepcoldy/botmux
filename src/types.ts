@@ -11,6 +11,16 @@ export interface Session {
   workingDir?: string;
   webPort?: number;
   larkAppId?: string;
+  /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts. */
+  adoptedFrom?: {
+    tmuxTarget: string;
+    originalCliPid: number;
+    sessionId?: string;
+    cliId?: string;
+    cwd: string;
+    paneCols?: number;
+    paneRows?: number;
+  };
 }
 
 export interface LarkAttachment {

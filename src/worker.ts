@@ -431,7 +431,7 @@ function getTerminalHtml(): string {
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%;background:#1a1b26;overflow:hidden}
+html,body{height:100%;background:#1a1b26;overflow:hidden;overscroll-behavior:none}
 body{display:flex;flex-direction:column}
 #toolbar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:100;
   padding:6px 8px calc(6px + env(safe-area-inset-bottom,0px));
@@ -469,6 +469,7 @@ body{display:flex;flex-direction:column}
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0/lib/addon-web-links.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0/lib/addon-unicode11.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch)document.getElementById('vp').content='width=1100,viewport-fit=cover';
@@ -576,33 +577,29 @@ if(isTouch&&hasToken){
   }
 }
 
-// ── Two-finger touch scroll (mobile) ──
-// Distinguishes scroll (parallel drag) from pinch (spread/squeeze) by
-// tracking inter-finger distance.  If distance changes > 30 % from start
-// it's a pinch — ignore.  Direction is "natural" (finger-up = content-up).
-if(isTouch){
-  var _2fY=0,_2f=false,_2fGap0=0,_2fGapPrev=0;
-  var _te=document.getElementById('terminal');
-  function _gap(e){var dx=e.touches[0].clientX-e.touches[1].clientX,dy=e.touches[0].clientY-e.touches[1].clientY;return Math.sqrt(dx*dx+dy*dy)}
-  _te.addEventListener('touchstart',function(e){
-    if(e.touches.length===2){_2f=true;_2fY=(e.touches[0].clientY+e.touches[1].clientY)/2;_2fGap0=_gap(e)||1;_2fGapPrev=_2fGap0}
-  },{passive:true});
-  _te.addEventListener('touchmove',function(e){
-    if(!_2f||e.touches.length!==2)return;
-    var g=_gap(e);
-    // Pinch detection: >15% from initial OR >8% between frames → not a scroll
-    if(Math.abs(g-_2fGap0)/_2fGap0>0.15||Math.abs(g-_2fGapPrev)/(_2fGapPrev||1)>0.08){_2f=false;return}
-    _2fGapPrev=g;
-    var y=(e.touches[0].clientY+e.touches[1].clientY)/2;
-    var d=_2fY-y;
-    if(Math.abs(d)>12){
-      var n=Math.max(1,Math.floor(Math.abs(d)/12));
-      _sendScroll(d<0,n);
-      _2fY=y;
-      e.preventDefault();
+// ── Two-finger touch scroll via Hammer.js (mobile) ──
+// Hammer distinguishes Pan (parallel drag) from Pinch (spread/squeeze)
+// internally.  Pan with pointers:2 only fires for genuine two-finger scroll.
+if(isTouch&&typeof Hammer!=='undefined'){
+  var mc=new Hammer.Manager(document.getElementById('terminal'),{touchAction:'auto',inputClass:Hammer.TouchInput});
+  var pinch=new Hammer.Pinch();
+  var pan=new Hammer.Pan({pointers:2,direction:Hammer.DIRECTION_VERTICAL,threshold:4});
+  pinch.recognizeWith(pan);
+  mc.add([pinch,pan]);
+  var _panPrevY=0,_panAcc=0;
+  mc.on('panstart',function(ev){_panPrevY=ev.center.y;_panAcc=0});
+  mc.on('panmove',function(ev){
+    var d=ev.center.y-_panPrevY;
+    _panPrevY=ev.center.y;
+    // Accumulate sub-pixel deltas; fire 1 wheel event per ~85px
+    // (tmux scrolls ~5 lines per wheel, line height ~17px)
+    _panAcc+=d;
+    var step=85;
+    while(Math.abs(_panAcc)>=step){
+      _sendScroll(_panAcc>0,1);
+      _panAcc-=(_panAcc>0?step:-step);
     }
-  },{passive:false});
-  _te.addEventListener('touchend',function(e){if(e.touches.length<2)_2f=false},{passive:true});
+  });
 }
 </script>
 </body>

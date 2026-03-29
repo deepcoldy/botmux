@@ -35,6 +35,8 @@ export interface MessageResource {
   type: 'image' | 'file';
   key: string;
   name: string;
+  /** When set, download uses this message_id instead of the parent (e.g. merge_forward sub-messages). */
+  messageId?: string;
 }
 
 export function extractResources(msgType: string, rawContent: string): MessageResource[] {
@@ -200,6 +202,9 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
     }
     if (msgType === 'interactive') {
       return extractCardContent(rawContent);
+    }
+    if (msgType === 'merge_forward') {
+      return '[合并转发消息]';
     }
     return rawContent;
   } catch {

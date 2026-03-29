@@ -139,6 +139,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const originalSessionId = adopted.sessionId;
       const originalCwd = adopted.cwd;
       ds.adoptedFrom = undefined;
+      ds.session.adoptedFrom = undefined;
       ds.workingDir = originalCwd;
       ds.session.workingDir = originalCwd;
       ds.hasHistory = true;

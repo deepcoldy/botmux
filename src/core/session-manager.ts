@@ -11,11 +11,12 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, killStalePids, getCurrentCliVersion } from './worker-pool.js';
+import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { validateAdoptTarget } from './session-discovery.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import { sessionKey } from './types.js';
@@ -91,7 +92,8 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   for (const res of resources) {
     const savePath = join(dir, res.name);
     try {
-      await downloadMessageResource(larkAppId, messageId, res.key, res.type, savePath);
+      const resMessageId = res.messageId ?? messageId;
+      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       logger.warn(`Failed to download ${res.type} ${res.key}: ${err.message}`);
@@ -242,9 +244,40 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
 
   for (const session of active) {
-    // Skip adopt sessions — they are ephemeral and should be re-created via /adopt
+    // Adopt sessions: restore if original CLI is still alive, otherwise close
+    if (session.title?.startsWith('Adopt:') && session.adoptedFrom) {
+      const adopted = session.adoptedFrom;
+      if (!validateAdoptTarget(adopted.tmuxTarget, adopted.originalCliPid)) {
+        logger.info(`Closing adopt session ${session.sessionId} (original CLI exited)`);
+        sessionStore.closeSession(session.sessionId);
+        continue;
+      }
+      // Original CLI still alive — re-register and fork adopt worker
+      messageQueue.ensureQueue(session.rootMessageId);
+      const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+      const ds: DaemonSession = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        larkAppId,
+        chatId: session.chatId,
+        chatType: session.chatType ?? 'group',
+        spawnedAt: Date.now(),
+        cliVersion: getCurrentCliVersion(),
+        lastMessageAt: Date.now(),
+        hasHistory: false,
+        workingDir: adopted.cwd,
+        adoptedFrom: adopted as DaemonSession['adoptedFrom'],
+      };
+      activeSessions.set(sessionKey(session.rootMessageId, larkAppId), ds);
+      forkAdoptWorker(ds);
+      logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adopted.tmuxTarget})`);
+      continue;
+    }
+    // Adopt sessions without persisted metadata — close (legacy)
     if (session.title?.startsWith('Adopt:')) {
-      logger.debug(`Skipping adopt session ${session.sessionId} (ephemeral)`);
+      logger.debug(`Closing adopt session ${session.sessionId} (no persisted metadata)`);
       sessionStore.closeSession(session.sessionId);
       continue;
     }

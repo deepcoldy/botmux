@@ -72,7 +72,7 @@ export async function replyMessage(larkAppId: string, messageId: string, content
 
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
-  logger.info(`Replied ${replyId} to message ${messageId}${replyInThread ? ' (in thread)' : ''}`);
+  logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
   return replyId;
 }
 
@@ -321,6 +321,36 @@ export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Pro
     logger.warn(`resolveAllowedUsers failed: ${err.message}`);
   }
   return openIds;
+}
+
+export async function listMergeForwardMessages(larkAppId: string, messageId: string): Promise<any[]> {
+  const c = getBotClient(larkAppId);
+  const allMessages: any[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const res = await c.im.v1.message.list({
+      params: {
+        container_id_type: 'merge_forward' as any,
+        container_id: messageId,
+        page_size: 50,
+        sort_type: 'ByCreateTimeAsc' as any,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+
+    if (res.code !== 0) {
+      throw new Error(`Failed to list merge_forward messages: ${res.msg} (code: ${res.code})`);
+    }
+
+    if (res.data?.items) {
+      allMessages.push(...res.data.items);
+    }
+
+    pageToken = res.data?.page_token;
+  } while (pageToken);
+
+  return allMessages;
 }
 
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
