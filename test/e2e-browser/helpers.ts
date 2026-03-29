@@ -267,13 +267,17 @@ export async function waitForStreamingCard(
     { timeoutMs, checkIntervalMs: 3_000 },
   );
 
-  // Step 2: Click into the thread to see full card content
+  // Step 2: Click into the thread to see full card content.
+  // IMPORTANT: In Feishu, newest messages are at the BOTTOM of the chat.
+  // "最底部" = newest, "最顶部" = oldest. Always target the bottom-most element.
   if (msgText) {
     await agent.aiAct(
       `点击聊天中"${msgText}"消息区域或其"回复话题"链接，打开话题详情`,
     );
   } else {
-    await agent.aiAct('点击最新消息的"回复话题"链接，打开话题详情');
+    await agent.aiAct(
+      '点击聊天区域最底部（最新的）那条消息的"回复话题"链接，打开话题详情',
+    );
   }
   await agent.aiWaitFor('右侧出现了话题详情面板', {
     timeoutMs: 15_000,
@@ -322,11 +326,17 @@ export async function closeSession(
   page: Page,
 ): Promise<void> {
   try {
-    // Scroll down to reveal the close button if needed
-    await agent.aiScroll(undefined, { direction: 'down', scrollCount: 3 });
+    // Scroll thread panel to bottom to reveal the close button
+    await scrollThreadToBottom(agent);
     await page.waitForTimeout(500);
-    await agent.aiAct('点击"❌ 关闭会话"按钮');
+    await agent.aiAct('点击话题面板中的"❌ 关闭会话"按钮');
+    // Scroll to bottom again and verify closure
+    await scrollThreadToBottom(agent);
     await page.waitForTimeout(2000);
+    await agent.aiWaitFor(
+      '话题面板底部出现了"会话已关闭"或"✅ 会话已关闭"的消息',
+      { timeoutMs: 15_000, checkIntervalMs: 3_000 },
+    );
   } catch {
     // Session already closed or button not visible — ignore
   }
@@ -338,10 +348,13 @@ export async function closeSession(
  */
 export async function sendThreadReply(
   agent: PlaywrightAgent,
+  page: Page,
   message: string,
 ): Promise<void> {
+  // Scroll to bottom first to ensure the reply input is visible
+  await scrollThreadToBottom(agent);
   await agent.aiAct(
-    `在右侧话题面板底部的"回复"输入框中输入 "${message}" 然后按 Enter 发送`,
+    `在右侧话题面板最底部的回复输入框中输入 "${message}" 然后按 Enter 发送`,
   );
 }
 

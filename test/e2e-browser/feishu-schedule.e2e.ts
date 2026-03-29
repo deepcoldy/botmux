@@ -74,7 +74,7 @@ describe('scheduled task topic creation', () => {
     });
 
     // Step 2: Create a scheduled task in the thread
-    await sendThreadReply(agent, `/schedule 每小时 ${label}`);
+    await sendThreadReply(agent, page, `/schedule 每小时 ${label}`);
     await page.waitForTimeout(5000);
 
     // Scroll thread panel to bottom to reveal the bot's response
@@ -91,7 +91,7 @@ describe('scheduled task topic creation', () => {
     );
 
     // Step 3: Trigger the task immediately
-    await sendThreadReply(agent, `/schedule run ${taskId}`);
+    await sendThreadReply(agent, page, `/schedule run ${taskId}`);
     await page.waitForTimeout(3000);
 
     // Step 4: Go back to main chat to look for the new topic thread

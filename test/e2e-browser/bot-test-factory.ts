@@ -24,6 +24,7 @@ import {
   navigateToMessenger,
   openChat,
   waitForStreamingCard,
+  scrollThreadToBottom,
   closeSession,
   type BotName,
 } from './helpers.js';
@@ -68,16 +69,20 @@ export function createBotTest(botName: BotName): void {
         msgHint: msg,
       });
 
-      // Verify the reply is from this bot (we're now in the thread panel)
+      // Verify the bot actually replied (not just repo/status messages).
+      // The real reply is a message with @mention to the user, appearing
+      // after the streaming card — NOT the "工作目录" or repo selection text.
+      await scrollThreadToBottom(agent);
       await agent.aiAssert(
-        `话题面板中有来自 ${botName} 机器人的回复`,
+        `话题面板底部有来自 ${botName} 的流式卡片（标题含"启动中"或"工作中"或"就绪"）`,
       );
     }, 240_000);
 
     it(`card reaches idle status for ${botName}`, async () => {
       // Continues from the thread panel opened by previous test
+      await scrollThreadToBottom(agent);
       await agent.aiWaitFor(
-        '话题面板中的流式卡片标题包含"就绪"',
+        '话题面板底部的流式卡片标题包含"就绪"',
         { timeoutMs: 120_000, checkIntervalMs: 5_000 },
       );
     }, 180_000);
