@@ -3,13 +3,13 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, watch, 
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { config } from './config.js';
-import { replyMessage, resolveAllowedUsers } from './im/lark/client.js';
+import { replyMessage, resolveAllowedUsers, listMergeForwardMessages } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
-import { parseEventMessage } from './im/lark/message-parser.js';
+import { parseEventMessage, parseApiMessage, extractResources, type MessageResource } from './im/lark/message-parser.js';
 import { logger } from './utils/logger.js';
-import type { DaemonToWorker } from './types.js';
+import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import { sessionKey } from './core/types.js';
@@ -170,10 +170,53 @@ const cardDeps: CardHandlerDeps = {
   lastRepoScan,
 };
 
+// ─── Merge-forward expansion ────────────────────────────────────────────────
+
+/**
+ * Expand a merge_forward message by fetching sub-messages via Lark API.
+ * Replaces parsed.content with readable text and collects additional resources.
+ */
+async function expandMergeForward(
+  larkAppId: string, messageId: string, parsed: LarkMessage,
+): Promise<{ extraResources: MessageResource[] }> {
+  const extraResources: MessageResource[] = [];
+  try {
+    const subMessages = await listMergeForwardMessages(larkAppId, messageId);
+    if (subMessages.length === 0) return { extraResources };
+
+    const parts: string[] = ['[转发消息]'];
+    for (const msg of subMessages) {
+      const sub = parseApiMessage(msg);
+      const senderLabel = msg.sender?.sender_type === 'app' ? '机器人' : (msg.sender?.id ?? '未知');
+      parts.push(`--- ${senderLabel} ---`);
+      parts.push(sub.content);
+
+      // Collect resources (images/files) from sub-messages for download
+      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '');
+      for (const r of subResources) {
+        extraResources.push({ ...r, messageId: msg.message_id });
+      }
+    }
+    parsed.content = parts.join('\n');
+    parsed.msgType = 'merge_forward_expanded';
+  } catch (err) {
+    logger.warn(`Failed to expand merge_forward ${messageId}: ${err}`);
+    // Keep original placeholder content
+  }
+  return { extraResources };
+}
+
 // ─── Event handling ──────────────────────────────────────────────────────────
 
 async function handleNewTopic(data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p' = 'group', larkAppId: string): Promise<void> {
   const { parsed, resources } = parseEventMessage(data);
+
+  // Expand merge_forward: fetch sub-messages and collect their resources
+  if (parsed.msgType === 'merge_forward') {
+    const { extraResources } = await expandMergeForward(larkAppId, messageId, parsed);
+    resources.push(...extraResources);
+  }
+
   const content = parsed.content.trim();
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const botCfg = getBot(larkAppId).config;
@@ -264,6 +307,13 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
 
 async function handleThreadReply(data: any, rootId: string, larkAppId: string): Promise<void> {
   const { parsed, resources } = parseEventMessage(data);
+
+  // Expand merge_forward: fetch sub-messages and collect their resources
+  if (parsed.msgType === 'merge_forward') {
+    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
+    resources.push(...extraResources);
+  }
+
   const content = parsed.content.trim();
 
   // Intercept OAuth callback URLs (from /login flow)

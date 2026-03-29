@@ -556,6 +556,9 @@ export async function startAdoptSession(
     paneCols: target.paneCols,
     paneRows: target.paneRows,
   };
+  // Persist adopt metadata so the session can be restored after daemon restart
+  ds.session.adoptedFrom = { ...ds.adoptedFrom };
+  sessionStore.updateSession(ds.session);
 
   forkAdoptWorker(ds);
 
