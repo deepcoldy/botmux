@@ -50,7 +50,7 @@ describe('feishu group @mention routing', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  });
+  }, 60_000);
 
   // BUG: bots respond without @mention in multi-bot group.
   // getGroupBotCount() may not detect all bots correctly.

@@ -47,7 +47,7 @@ describe('feishu web terminal', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  });
+  }, 60_000);
 
   it('web terminal content matches card streaming output', async () => {
     const msg = testMessage('terminal');

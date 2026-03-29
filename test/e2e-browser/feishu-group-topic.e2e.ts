@@ -50,7 +50,7 @@ describe('group chat topic reply mode', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  });
+  }, 60_000);
 
   it('bot uses topic replies (话题回复) in regular group', async () => {
     const msg = testMessage('topic-mode');
