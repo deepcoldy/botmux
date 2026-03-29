@@ -7,7 +7,7 @@ import { replyMessage, resolveAllowedUsers, listMergeForwardMessages } from './i
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
-import { parseEventMessage, parseApiMessage, extractResources, type MessageResource } from './im/lark/message-parser.js';
+import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, type MessageResource } from './im/lark/message-parser.js';
 import { logger } from './utils/logger.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
@@ -209,6 +209,7 @@ async function expandMergeForward(
 // ─── Event handling ──────────────────────────────────────────────────────────
 
 async function handleNewTopic(data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p' = 'group', larkAppId: string): Promise<void> {
+  await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
   // Expand merge_forward: fetch sub-messages and collect their resources
@@ -306,6 +307,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
 }
 
 async function handleThreadReply(data: any, rootId: string, larkAppId: string): Promise<void> {
+  await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
   // Expand merge_forward: fetch sub-messages and collect their resources

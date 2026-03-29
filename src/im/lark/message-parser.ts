@@ -1,4 +1,5 @@
 import type { LarkMessage, LarkMention } from '../../types.js';
+import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
 
 // Event data structure from WSClient im.message.receive_v1
@@ -29,6 +30,30 @@ interface RawEventData {
       tenant_key?: string;
     }>;
   };
+}
+
+/**
+ * When the WebSocket event delivers message_type "nonsupport", call the REST API
+ * to fetch the real message content and patch the event data in-place.
+ */
+export async function resolveNonsupportMessage(data: RawEventData, larkAppId: string): Promise<void> {
+  if (data.message.message_type !== 'nonsupport') return;
+
+  try {
+    const detail = await getMessageDetail(larkAppId, data.message.message_id);
+    const msg = detail?.items?.[0];
+    if (!msg) return;
+
+    const realType = msg.msg_type;
+    const realContent = msg.body?.content;
+    if (realType && realContent) {
+      logger.info(`[parser] Resolved nonsupport → ${realType} for ${data.message.message_id}`);
+      data.message.message_type = realType;
+      data.message.content = realContent;
+    }
+  } catch (err) {
+    logger.debug(`[parser] Failed to resolve nonsupport message ${data.message.message_id}: ${err}`);
+  }
 }
 
 export interface MessageResource {
