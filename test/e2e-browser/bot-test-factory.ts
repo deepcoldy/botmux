@@ -53,7 +53,7 @@ export function createBotTest(botName: BotName): void {
       await agent?.destroy();
       await context?.close();
       await browser?.close();
-    });
+    }, 60_000);
 
     it(`sends hello and receives reply from ${botName}`, async () => {
       // Navigate to bot's private chat

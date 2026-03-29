@@ -54,7 +54,7 @@ describe('scheduled task topic creation', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  });
+  }, 60_000);
 
   it('scheduled task creates a new topic thread when triggered', async () => {
     const label = `sched-${Date.now()}`;

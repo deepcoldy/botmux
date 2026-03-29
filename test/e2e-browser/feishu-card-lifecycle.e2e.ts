@@ -51,7 +51,7 @@ describe('feishu card lifecycle', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  });
+  }, 60_000);
 
   it('full card lifecycle: active status → toggle → no artifacts → idle', async () => {
     const msg = testMessage('card');
