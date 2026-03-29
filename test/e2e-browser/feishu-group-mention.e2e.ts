@@ -52,10 +52,7 @@ describe('feishu group @mention routing', () => {
     await browser?.close();
   }, 60_000);
 
-  // TODO: Known bug — bots respond without @mention in multi-bot group.
-  // getGroupBotCount() doesn't detect all bots correctly.
-  // Unskip after fixing the @mention routing in event-dispatcher.ts.
-  it.skip('no @mention in multi-bot group → no bot responds', async () => {
+  it('no @mention in multi-bot group → no bot responds', async () => {
     const msg = testMessage('no-mention');
     await sendMessage(agent, msg);
 
@@ -67,9 +64,7 @@ describe('feishu group @mention routing', () => {
     );
   }, 120_000);
 
-  // TODO: Same bug as above — all bots respond when only one is @mentioned.
-  // Unskip after fixing the @mention routing in event-dispatcher.ts.
-  it.skip('@mention a single bot → only that bot responds', async () => {
+  it('@mention a single bot → only that bot responds', async () => {
     const msg = testMessage('mention');
     await sendMentionMessage(page, agent, 'Claude', msg);
 

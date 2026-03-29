@@ -1,8 +1,23 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename } from 'node:path';
+import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
+import { loadBotConfigs } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
+
+// Cached lightweight Lark clients for all configured bots (for isInChat checks)
+let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
+function getAllBotClients() {
+  if (!allBotClients) {
+    allBotClients = loadBotConfigs().map((cfg) => ({
+      appId: cfg.larkAppId,
+      cliId: cfg.cliId,
+      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, loggerLevel: LoggerLevel.error }),
+    }));
+  }
+  return allBotClients;
+}
 
 // ─── Error types ──────────────────────────────────────────────────────────────
 
@@ -448,26 +463,27 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
 }
 
 /**
- * Check which registered bots are in a chat.
- * Uses isInChat API per bot (chatMembers.get doesn't return bot members).
- * Each bot's own client calls isInChat to check its presence.
+ * Check which bots are in a chat.
+ * Uses isInChat API for ALL configured bots (from bots.json), not just
+ * the one registered in this daemon process. This is critical for
+ * multi-bot groups where each daemon only manages a single bot.
  */
 export async function listChatBotMembers(_larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
-  const allBots = getAllBots();
+  const clients = getAllBotClients();
   const results = await Promise.all(
-    allBots.map(async (bot) => {
+    clients.map(async ({ appId, cliId, client }) => {
       try {
-        const res = await (bot.client as any).im.v1.chatMembers.isInChat({
+        const res = await (client as any).im.v1.chatMembers.isInChat({
           path: { chat_id: chatId },
         });
         if (res.code === 0 && res.data?.is_in_chat) {
-          return { openId: bot.botOpenId!, name: bot.botName ?? bot.config.cliId };
+          return { openId: appId, name: cliId };
         }
       } catch (err) {
-        logger.debug(`isInChat check failed for ${bot.config.larkAppId}: ${err}`);
+        logger.debug(`isInChat check failed for ${appId}: ${err}`);
       }
       return null;
     }),
   );
-  return results.filter((r): r is { openId: string; name: string } => r !== null && !!r.openId);
+  return results.filter((r): r is { openId: string; name: string } => r !== null);
 }

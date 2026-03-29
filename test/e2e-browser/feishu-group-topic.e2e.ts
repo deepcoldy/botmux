@@ -86,10 +86,7 @@ describe('group chat topic reply mode', () => {
     );
   }, 240_000);
 
-  // TODO: Known bug — getGroupBotCount() doesn't detect other bots,
-  // so all bots respond when only one is @mentioned.
-  // Unskip after fixing the @mention routing in event-dispatcher.ts.
-  it.skip('only @mentioned bot responds, others stay silent', async () => {
+  it('only @mentioned bot responds, others stay silent', async () => {
     const msg = testMessage('mention-only');
     await sendMentionMessage(page, agent, 'Claude', msg);
 
