@@ -50,7 +50,7 @@ describe('bot-to-bot collaboration (@Aiden ↔ @CoCo)', () => {
 
     await navigateToMessenger(page);
     await openChat(page, agent, getGroupChatName());
-  }, 120_000);
+  });
 
   afterAll(async () => {
     // Try to close any open sessions
@@ -60,7 +60,7 @@ describe('bot-to-bot collaboration (@Aiden ↔ @CoCo)', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('Aiden and CoCo collaborate with 3+ rounds of back-and-forth', async () => {
     const msg = testMessage('collab');

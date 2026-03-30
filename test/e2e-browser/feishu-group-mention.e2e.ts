@@ -45,14 +45,14 @@ describe('feishu group @mention routing', () => {
 
     await navigateToMessenger(page);
     await openChat(page, agent, getGroupChatName());
-  }, 180_000);
+  });
 
   afterAll(async () => {
     await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('no @mention in multi-bot group → no bot responds', async () => {
     const msg = testMessage('no-mention');
@@ -72,7 +72,7 @@ describe('feishu group @mention routing', () => {
       `消息"${msg}"附近没有显示"N 条话题回复"或"查看更早 N 条话题回复"这类回复计数。` +
         '注意："回复话题"输入框不算，那是所有消息都有的默认UI元素。',
     );
-  }, 120_000);
+  });
 
   it('@mention a single bot → only that bot responds', async () => {
     // Ensure we're back at the bottom of the group chat with fresh state

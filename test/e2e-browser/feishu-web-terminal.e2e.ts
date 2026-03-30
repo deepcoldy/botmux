@@ -49,7 +49,7 @@ describe('feishu web terminal', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('web terminal content matches card streaming output', async () => {
     const msg = testMessage('terminal');

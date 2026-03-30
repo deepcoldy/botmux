@@ -51,7 +51,7 @@ describe('private chat topic reply mode', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('bot uses topic replies (话题回复) in private chat', async () => {
     const msg = testMessage('private-topic');

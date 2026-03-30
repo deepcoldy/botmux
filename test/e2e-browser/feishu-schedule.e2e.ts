@@ -47,14 +47,14 @@ describe('scheduled task topic creation', () => {
 
     await navigateToMessenger(page);
     await openChat(page, agent, 'Claude');
-  }, 120_000);
+  });
 
   afterAll(async () => {
     await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('scheduled task creates a new topic thread when triggered', async () => {
     const label = `sched-${Date.now()}`;

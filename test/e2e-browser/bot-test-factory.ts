@@ -54,7 +54,7 @@ export function createBotTest(botName: BotName): void {
       await agent?.destroy();
       await context?.close();
       await browser?.close();
-    }, 120_000);
+    });
 
     it(`sends hello, receives streaming card and actual reply from ${botName}`, async () => {
       await navigateToMessenger(page);

@@ -45,14 +45,14 @@ describe('feishu card lifecycle', () => {
 
     await navigateToMessenger(page);
     await openChat(page, agent, 'Claude');
-  }, 120_000);
+  });
 
   afterAll(async () => {
     await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('full card lifecycle: active status → toggle → no artifacts → idle', async () => {
     const msg = testMessage('card');

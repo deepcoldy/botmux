@@ -43,7 +43,7 @@ describe('feishu bot reply (smoke test)', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('should receive bot reply after sending a message', async () => {
     const msg = testMessage();

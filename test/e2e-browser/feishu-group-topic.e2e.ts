@@ -45,14 +45,14 @@ describe('group chat topic reply mode', () => {
 
     await navigateToMessenger(page);
     await openChat(page, agent, getGroupChatName());
-  }, 120_000);
+  });
 
   afterAll(async () => {
     await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 120_000);
+  });
 
   it('bot uses topic replies (话题回复) in regular group', async () => {
     const msg = testMessage('topic-mode');
