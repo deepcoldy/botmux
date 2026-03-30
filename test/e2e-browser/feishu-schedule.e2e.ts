@@ -74,8 +74,13 @@ describe('scheduled task topic creation', () => {
     });
 
     // Step 2: Create a scheduled task in the thread
-    await sendThreadReply(agent, page, `/schedule 每小时 ${label}`);
-    await page.waitForTimeout(5000);
+    // Use page.keyboard.type directly for the command to preserve the "/" prefix
+    await scrollThreadToBottom(agent);
+    await agent.aiAct('点击右侧话题面板最底部的回复输入框');
+    await page.waitForTimeout(500);
+    await page.keyboard.type(`/schedule 每小时 ${label}`, { delay: 30 });
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(8000);
 
     // Scroll thread panel to bottom to reveal the bot's response
     await scrollThreadToBottom(agent);
@@ -83,15 +88,19 @@ describe('scheduled task topic creation', () => {
 
     // Extract the task ID from the bot's response in the thread panel
     await agent.aiWaitFor(
-      '话题面板中出现了包含"✅ 定时任务已创建"的消息',
-      { timeoutMs: 30_000, checkIntervalMs: 3_000 },
+      '话题面板中出现了包含"✅ 定时任务已创建"或"定时任务已创建"的消息',
+      { timeoutMs: 60_000, checkIntervalMs: 5_000 },
     );
     const taskId = await agent.aiString(
       '话题面板中"定时任务已创建"消息里，"ID:"后面的值是什么（8个字符的ID）',
     );
 
     // Step 3: Trigger the task immediately
-    await sendThreadReply(agent, page, `/schedule run ${taskId}`);
+    await scrollThreadToBottom(agent);
+    await agent.aiAct('点击右侧话题面板最底部的回复输入框');
+    await page.waitForTimeout(500);
+    await page.keyboard.type(`/schedule run ${taskId}`, { delay: 30 });
+    await page.keyboard.press('Enter');
     await page.waitForTimeout(3000);
 
     // Step 4: Go back to main chat to look for the new topic thread

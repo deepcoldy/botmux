@@ -287,12 +287,22 @@ export async function waitForStreamingCard(
   // Step 3: Scroll thread panel to bottom to reveal latest content
   await scrollThreadToBottom(agent);
 
-  // Step 4: Handle repo selection card if present
-  const hasSkipButton = await agent.aiBoolean(
-    '话题面板中可以看到"直接开启会话"按钮',
-  );
-  if (hasSkipButton) {
-    await agent.aiAct('点击话题面板中的"▶️ 直接开启会话"按钮');
+  // Step 4: Handle repo selection card if present.
+  // The "项目仓库管理" card may take a moment to load. Try twice with scrolling.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const hasSkipButton = await agent.aiBoolean(
+      '话题面板中可以看到"直接开启会话"或"▶️ 直接开启会话"按钮',
+    );
+    if (hasSkipButton) {
+      await agent.aiAct(
+        '点击话题面板中的"直接开启会话"按钮（可能带有▶️图标）',
+      );
+      break;
+    }
+    if (attempt === 0) {
+      // Scroll down more — the card might not be visible yet
+      await scrollThreadToBottom(agent);
+    }
   }
 
   // Step 5: Wait for streaming card

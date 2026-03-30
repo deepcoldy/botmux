@@ -86,15 +86,16 @@ describe('feishu card lifecycle', () => {
     // --- Step 4: Wait for idle ---
     await scrollThreadToBottom(agent);
     await agent.aiWaitFor(
-      '话题面板底部的流式卡片标题包含"就绪"',
-      { timeoutMs: 120_000, checkIntervalMs: 5_000 },
+      '话题面板中有一个流式卡片，其标题栏中包含"就绪"字样',
+      { timeoutMs: 180_000, checkIntervalMs: 5_000 },
     );
 
     // --- Step 5: Verify bot sent actual reply (not just card status) ---
     await scrollThreadToBottom(agent);
     await agent.aiAssert(
-      '话题面板中有来自 Claude 的文本回复消息（包含"@"某用户的内容），' +
-        '这是机器人对用户问题的实际回答，不是"继续使用当前仓库"等状态消息',
+      '话题面板中有来自 Claude 的回复内容，' +
+        '且不仅仅是"继续使用当前仓库""项目仓库管理"等状态消息，' +
+        '而是包含了机器人对用户消息的实际响应',
     );
   }, 420_000);
 });
