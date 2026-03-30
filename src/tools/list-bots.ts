@@ -15,6 +15,7 @@ export const description = 'List bots available in the current group chat. Retur
 interface BotInfoEntry {
   larkAppId: string;
   botOpenId: string | null;
+  botName: string | null;
   cliId: string;
 }
 
@@ -52,9 +53,8 @@ export async function execute(args: z.infer<typeof schema>) {
     const result = chatBots.map(cb => {
       const info = botByCli.get(cb.name);  // cb.name is cliId
       return {
-        name: cb.name,
+        name: cb.displayName,
         openId: cb.openId,
-        cliId: info?.cliId ?? cb.name,
         isSelf: info?.larkAppId === appId,
       };
     });
@@ -73,9 +73,8 @@ export async function execute(args: z.infer<typeof schema>) {
     const result = botInfo
       .filter(b => b.botOpenId)
       .map(b => ({
-        name: b.cliId,  // best-effort name when chat query fails
+        name: b.botName ?? b.cliId,
         openId: b.botOpenId!,
-        cliId: b.cliId,
         isSelf: b.larkAppId === appId,
       }));
 

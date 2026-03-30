@@ -111,21 +111,18 @@ export async function downloadResources(larkAppId: string, messageId: string, re
 export async function getAvailableBots(
   currentAppId: string,
   chatId: string,
-): Promise<Array<{ name: string; openId: string; cliId?: string }>> {
+): Promise<Array<{ name: string; displayName: string; openId: string }>> {
   try {
     const currentBot = getBot(currentAppId);
     const myCliId = currentBot.config.cliId;
     const chatBots = await listChatBotMembers(currentAppId, chatId);
 
-    // listChatBotMembers returns { openId, name: cliId }.
-    // Filter out the current bot by cliId (not openId — Lark open_ids are
-    // per-app scoped so self-seen != cross-ref IDs).
     return chatBots
       .filter(b => b.name !== myCliId)
       .map(b => ({
         name: b.name,
+        displayName: b.displayName,
         openId: b.openId,
-        cliId: b.name,  // name IS the cliId
       }));
   } catch (err) {
     logger.warn(`Failed to list chat bot members, skipping bot section: ${err}`);
@@ -146,7 +143,7 @@ export function buildNewTopicPrompt(
   cliPathOverride?: string,
   attachments?: LarkAttachment[],
   mentions?: LarkMention[],
-  availableBots?: Array<{ name: string; openId: string; cliId?: string }>,
+  availableBots?: Array<{ name: string; displayName: string; openId: string }>,
   followUps?: string[],
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
@@ -164,14 +161,15 @@ export function buildNewTopicPrompt(
     mentionSection = `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
   }
 
-  // Available bots section
+  // Available bots section — only show bots NOT already in @mentions
   let botSection = '';
   if (availableBots && availableBots.length > 0) {
-    const botLines = availableBots.map(b => {
-      const cli = b.cliId ? `, CLI: ${b.cliId}` : '';
-      return `- ${b.name} (open_id: ${b.openId}${cli})`;
-    });
-    botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 send_to_thread 的 mentions 参数 @mention 它们协作，也可用 list_bots 工具查询。`;
+    const mentionedOpenIds = new Set(mentions?.map(m => m.openId).filter(Boolean));
+    const unmentionedBots = availableBots.filter(b => !mentionedOpenIds.has(b.openId));
+    if (unmentionedBots.length > 0) {
+      const botLines = unmentionedBots.map(b => `- ${b.displayName} (open_id: ${b.openId})`);
+      botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 send_to_thread 的 mentions 参数 @mention 它们协作，也可用 list_bots 工具查询。`;
+    }
   }
 
   const parts = [

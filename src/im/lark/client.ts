@@ -441,7 +441,7 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
  * the one registered in this daemon process. This is critical for
  * multi-bot groups where each daemon only manages a single bot.
  */
-export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
+export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string; displayName: string }>> {
   // Read per-bot cross-reference: other bots' open_ids as seen by larkAppId's app.
   // This is populated from @mention data in Lark events (the only reliable source,
   // since Lark open_id is per-app scoped — a bot's self-reported open_id is
@@ -482,7 +482,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
           const openId = (info?.botName && crossRef.get(info.botName.toLowerCase()))
             ?? info?.botOpenId
             ?? appId;
-          return { openId, name: cliId };
+          return { openId, name: cliId, displayName: info?.botName ?? cliId };
         }
       } catch (err) {
         logger.debug(`isInChat check failed for ${appId}: ${err}`);
@@ -490,5 +490,5 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
       return null;
     }),
   );
-  return results.filter((r): r is { openId: string; name: string } => r !== null);
+  return results.filter((r): r is { openId: string; name: string; displayName: string } => r !== null);
 }
