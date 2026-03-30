@@ -17,6 +17,7 @@ import {
   waitForStreamingCard,
   navigateToMessenger,
   openChat,
+  closeSession,
 } from './helpers.js';
 
 describe('feishu bot reply (smoke test)', () => {
@@ -38,6 +39,7 @@ describe('feishu bot reply (smoke test)', () => {
   });
 
   afterAll(async () => {
+    await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();

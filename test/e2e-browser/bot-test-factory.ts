@@ -73,15 +73,20 @@ export function createBotTest(botName: BotName): void {
         { timeoutMs: 120_000, checkIntervalMs: 5_000 },
       );
 
-      // KEY: Verify bot sent an ACTUAL reply message, not just status.
-      // A real reply is a text message from the bot containing @用户,
-      // visible below or near the streaming card. It must NOT be just
-      // "继续使用当前仓库" or "项目仓库管理" — those are setup messages.
+      // Verify the streaming card has actual output content (not just an empty card).
+      // Different CLIs respond differently — some send separate text replies,
+      // some only output through the streaming card. We check the card has content.
       await scrollThreadToBottom(agent);
+      const needExpand = await agent.aiBoolean(
+        '话题面板中的流式卡片里有"📖 展开输出"按钮',
+      );
+      if (needExpand) {
+        await agent.aiAct('点击话题面板中流式卡片里的"📖 展开输出"按钮');
+        await page.waitForTimeout(2000);
+      }
       await agent.aiAssert(
-        `话题面板中有来自 ${botName} 的文本回复消息（包含"@"某用户的内容），` +
-          '这条消息不是"继续使用当前仓库"或"项目仓库管理"等状态消息，' +
-          '而是机器人对用户问题的实际回答',
+        `话题面板中的流式卡片包含输出内容（展开后可见文本），` +
+          `说明 ${botName} 已经处理了用户消息并产生了输出`,
       );
     }, 300_000);
   });

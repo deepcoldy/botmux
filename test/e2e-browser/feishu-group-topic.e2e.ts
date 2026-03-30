@@ -23,6 +23,7 @@ import {
   navigateToMessenger,
   openChat,
   getGroupChatName,
+  closeSession,
 } from './helpers.js';
 
 describe('group chat topic reply mode', () => {
@@ -47,6 +48,7 @@ describe('group chat topic reply mode', () => {
   }, 120_000);
 
   afterAll(async () => {
+    await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
     await browser?.close();
@@ -86,23 +88,6 @@ describe('group chat topic reply mode', () => {
     );
   }, 240_000);
 
-  it('only @mentioned bot responds, others stay silent', async () => {
-    const msg = testMessage('mention-only');
-    await sendMentionMessage(page, agent, 'Claude', msg);
-
-    // Wait for Claude to respond
-    await agent.aiWaitFor(
-      `聊天中"${msg}"消息附近出现了来自 Claude 的回复`,
-      { timeoutMs: 90_000, checkIntervalMs: 5_000 },
-    );
-
-    // Wait extra time to confirm no other bots respond
-    await page.waitForTimeout(15_000);
-
-    // Assert ONLY Claude replied — no other bots should have responded
-    await agent.aiAssert(
-      `在消息"${msg}"的话题回复中，只有 Claude 一个机器人回复了。` +
-        '没有看到 CoCo、Codex、OpenCode 或 Aiden 的回复或卡片。',
-    );
-  }, 240_000);
+  // "Only @mentioned bot responds" is covered by feishu-group-mention.e2e.ts
+  // with a more robust approach (dedicated test with thread panel verification).
 });
