@@ -32,7 +32,7 @@ Daemon (daemon.ts → core/ modules)
     |-- core/scheduler: cron scheduling
     |
 Worker (worker.ts) -- forked per session
-    |-- adapters/cli/*: CLI adapters (Claude Code / Aiden / CoCo / Codex / Gemini)
+    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / Gemini / OpenCode)
     |-- adapters/backend: PtyBackend or TmuxBackend
     |-- utils/idle-detector: idle detection
     |-- HTTP + WebSocket: xterm.js web terminal
@@ -62,8 +62,6 @@ src/
       types.ts              # CliAdapter interface, CliId type
       registry.ts           # Adapter factory + resolveCommand
       claude-code.ts        # Claude Code adapter
-      aiden.ts              # Aiden adapter
-      coco.ts               # CoCo adapter
       codex.ts              # Codex adapter
       gemini.ts             # Gemini CLI adapter
     backend/
