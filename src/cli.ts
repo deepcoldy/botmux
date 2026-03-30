@@ -409,10 +409,14 @@ function loadSessions(): Map<string, SessionData> {
 
   // Read legacy sessions.json
   const legacyFp = join(dataDir, 'sessions.json');
+  let legacyData: Record<string, SessionData> = {};
   if (existsSync(legacyFp)) {
     try {
-      const data = JSON.parse(readFileSync(legacyFp, 'utf-8'));
-      for (const [k, v] of Object.entries(data)) sessions.set(k, v as SessionData);
+      legacyData = JSON.parse(readFileSync(legacyFp, 'utf-8'));
+      for (const [, v] of Object.entries(legacyData)) {
+        const s = v as SessionData;
+        if (s.sessionId) sessions.set(s.sessionId, s);
+      }
     } catch { /* ignore */ }
   }
 
@@ -421,12 +425,48 @@ function loadSessions(): Map<string, SessionData> {
     for (const file of readdirSync(dataDir)) {
       if (file.startsWith('sessions-') && file.endsWith('.json')) {
         try {
+          // Extract appId from filename: sessions-{appId}.json
+          const appId = file.slice('sessions-'.length, -'.json'.length);
           const data = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
-          for (const [k, v] of Object.entries(data)) sessions.set(k, v as SessionData);
+          for (const [, v] of Object.entries(data)) {
+            const session = v as SessionData;
+            if (!session.sessionId) continue;
+            // Stamp larkAppId so saveSession writes back to the correct file
+            if (!session.larkAppId) session.larkAppId = appId;
+            sessions.set(session.sessionId, session);
+          }
         } catch { /* ignore */ }
       }
     }
   } catch { /* ignore */ }
+
+  // Migrate: remove sessions from legacy file if they have larkAppId (belong in per-bot files)
+  let legacyDirty = false;
+  for (const [k, v] of Object.entries(legacyData)) {
+    const s = v as SessionData;
+    if (s.larkAppId) {
+      delete legacyData[k];
+      legacyDirty = true;
+      // Ensure the session exists in its per-bot file
+      const perBotFp = join(dataDir, `sessions-${s.larkAppId}.json`);
+      let perBotData: Record<string, SessionData> = {};
+      if (existsSync(perBotFp)) {
+        try { perBotData = JSON.parse(readFileSync(perBotFp, 'utf-8')); } catch { /* */ }
+      }
+      // Only write if per-bot file doesn't already have this session
+      if (!perBotData[k]) {
+        perBotData[k] = s;
+        const tmpFp = perBotFp + '.tmp';
+        writeFileSync(tmpFp, JSON.stringify(perBotData, null, 2), 'utf-8');
+        renameSync(tmpFp, perBotFp);
+      }
+    }
+  }
+  if (legacyDirty) {
+    const tmpFp = legacyFp + '.tmp';
+    writeFileSync(tmpFp, JSON.stringify(legacyData, null, 2), 'utf-8');
+    renameSync(tmpFp, legacyFp);
+  }
 
   return sessions;
 }
@@ -444,9 +484,33 @@ function saveSession(session: SessionData): void {
   }
   data[session.sessionId] = session;
 
+  // Clean up entries where file key doesn't match the entry's sessionId (data corruption)
+  for (const [key, val] of Object.entries(data)) {
+    if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
+      delete data[key];
+    }
+  }
+
   const tmpFp = fp + '.tmp';
   writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
   renameSync(tmpFp, fp);
+
+  // Remove duplicate from legacy file if session moved to per-bot file (or vice versa)
+  const otherFile = session.larkAppId ? 'sessions.json' : null;
+  if (otherFile) {
+    const otherFp = join(dataDir, otherFile);
+    if (existsSync(otherFp)) {
+      try {
+        const otherData: Record<string, SessionData> = JSON.parse(readFileSync(otherFp, 'utf-8'));
+        if (otherData[session.sessionId]) {
+          delete otherData[session.sessionId];
+          const otherTmp = otherFp + '.tmp';
+          writeFileSync(otherTmp, JSON.stringify(otherData, null, 2), 'utf-8');
+          renameSync(otherTmp, otherFp);
+        }
+      } catch { /* ignore */ }
+    }
+  }
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -862,7 +926,7 @@ async function cmdList(): Promise<void> {
   for (const s of active) {
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
     const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-    if (s.pid && !hasPid && !hasTmux) {
+    if (!hasPid && !hasTmux) {
       pruned.push(s);
     } else {
       live.push(s);
@@ -915,7 +979,11 @@ function cmdDelete(): void {
   if (target === 'all') {
     toDelete = active;
   } else if (target === 'stopped') {
-    toDelete = active.filter(s => s.pid && !isProcessAlive(s.pid));
+    toDelete = active.filter(s => {
+      const hasPid = !!(s.pid && isProcessAlive(s.pid));
+      const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
+      return !hasPid && !hasTmux;
+    });
     if (toDelete.length === 0) {
       console.log('没有 stopped 状态的会话。');
       return;
