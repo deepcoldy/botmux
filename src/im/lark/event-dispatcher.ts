@@ -7,6 +7,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getAllBots } from '../../bot-registry.js';
+import { config } from '../../config.js';
 import { getChatInfo, listChatBotMembers, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 
@@ -128,6 +129,84 @@ export async function getGroupBotCount(larkAppId: string, chatId: string): Promi
   }
 }
 
+// ─── Cross-bot open_id mapping ──────────────────────────────────────────
+//
+// Lark open_id is per-app scoped: Bot A sees a different open_id for Bot B
+// than Bot B sees for itself. The self-reported botOpenId (from /bot/v3/info)
+// is useless for other bots to @mention.
+//
+// We build a per-bot cross-reference from event data: when Bot A's event
+// handler receives a message that @mentions Bot B, the mention includes
+// Bot B's open_id as seen by Bot A's app. We persist this mapping so that
+// listChatBotMembers can return correct open_ids.
+
+/** Read the per-bot cross-reference: botName(lowercase) → openId as seen by larkAppId's app */
+export function readBotOpenIdCrossRef(dataDir: string, larkAppId: string): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    const fp = join(dataDir, `bot-openids-${larkAppId}.json`);
+    if (existsSync(fp)) {
+      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
+      for (const [name, openId] of Object.entries(data)) {
+        map.set(name.toLowerCase(), openId);
+      }
+    }
+  } catch { /* ignore */ }
+  return map;
+}
+
+/** Update the per-bot cross-reference from @mention data in an event.
+ *  mentionsList comes from Lark event message.mentions array. */
+export function updateBotOpenIdCrossRef(
+  dataDir: string,
+  larkAppId: string,
+  mentionsList: Array<{ name?: string; id?: { open_id?: string } }>,
+): void {
+  if (!mentionsList || mentionsList.length === 0) return;
+
+  // Read known bot names from bots-info.json
+  const knownBotNames = new Set<string>();
+  try {
+    const infoPath = join(dataDir, 'bots-info.json');
+    if (existsSync(infoPath)) {
+      const entries: Array<{ botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      for (const e of entries) {
+        if (e.botName) knownBotNames.add(e.botName.toLowerCase());
+      }
+    }
+  } catch { /* ignore */ }
+  if (knownBotNames.size === 0) return;
+
+  // Read existing cross-reference
+  const fp = join(dataDir, `bot-openids-${larkAppId}.json`);
+  let existing: Record<string, string> = {};
+  try {
+    if (existsSync(fp)) existing = JSON.parse(readFileSync(fp, 'utf-8'));
+  } catch { /* ignore */ }
+
+  // Update with new mentions that match known bot names
+  let changed = false;
+  for (const m of mentionsList) {
+    const name = m.name;
+    const openId = m.id?.open_id;
+    if (!name || !openId) continue;
+    if (!knownBotNames.has(name.toLowerCase())) continue;
+    if (existing[name] === openId) continue;
+    existing[name] = openId;
+    changed = true;
+  }
+
+  if (changed) {
+    try {
+      if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+      writeFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
+      logger.debug(`Updated bot open_id cross-ref for ${larkAppId}: ${JSON.stringify(existing)}`);
+    } catch (err) {
+      logger.debug(`Failed to write bot open_id cross-ref: ${err}`);
+    }
+  }
+}
+
 // ─── @mention detection ──────────────────────────────────────────────────
 
 /** Check if the bot was @mentioned in this message */
@@ -233,6 +312,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const message = data.message;
         const sender = data.sender;
         if (!message) return;
+
+        // Learn other bots' open_ids from @mentions in this event.
+        // Lark open_id is per-app: these IDs are correct for our app context.
+        if (message.mentions?.length > 0) {
+          updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, message.mentions);
+        }
 
         // Bot-originated messages
         if (sender?.sender_type === 'app') {

@@ -38,10 +38,11 @@ export async function execute(args: z.infer<typeof schema>) {
   const appId = session.larkAppId || config.lark.appId;
   const botInfo = readBotInfo();
 
-  // Build a map of open_id → bot info for quick lookup
-  const botByOpenId = new Map<string, BotInfoEntry>();
+  // Build a map of cliId → bot info for lookup (open_id matching is unreliable
+  // because Lark open_ids are per-app scoped)
+  const botByCli = new Map<string, BotInfoEntry>();
   for (const b of botInfo) {
-    if (b.botOpenId) botByOpenId.set(b.botOpenId, b);
+    botByCli.set(b.cliId, b);
   }
 
   try {
@@ -49,11 +50,11 @@ export async function execute(args: z.infer<typeof schema>) {
     const chatBots = await listChatBotMembers(appId, session.chatId);
 
     const result = chatBots.map(cb => {
-      const info = botByOpenId.get(cb.openId);
+      const info = botByCli.get(cb.name);  // cb.name is cliId
       return {
         name: cb.name,
         openId: cb.openId,
-        cliId: info?.cliId ?? 'unknown',
+        cliId: info?.cliId ?? cb.name,
         isSelf: info?.larkAppId === appId,
       };
     });

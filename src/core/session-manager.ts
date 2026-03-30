@@ -114,21 +114,18 @@ export async function getAvailableBots(
 ): Promise<Array<{ name: string; openId: string; cliId?: string }>> {
   try {
     const currentBot = getBot(currentAppId);
-    const myOpenId = currentBot.botOpenId;
+    const myCliId = currentBot.config.cliId;
     const chatBots = await listChatBotMembers(currentAppId, chatId);
 
-    // Build a lookup from openId → registered bot for cliId enrichment
-    const registeredByOpenId = new Map<string, string>();
-    for (const b of getAllBots()) {
-      if (b.botOpenId) registeredByOpenId.set(b.botOpenId, b.config.cliId);
-    }
-
+    // listChatBotMembers returns { openId, name: cliId }.
+    // Filter out the current bot by cliId (not openId — Lark open_ids are
+    // per-app scoped so self-seen != cross-ref IDs).
     return chatBots
-      .filter(b => b.openId !== myOpenId)
+      .filter(b => b.name !== myCliId)
       .map(b => ({
         name: b.name,
         openId: b.openId,
-        cliId: registeredByOpenId.get(b.openId),
+        cliId: b.name,  // name IS the cliId
       }));
   } catch (err) {
     logger.warn(`Failed to list chat bot members, skipping bot section: ${err}`);

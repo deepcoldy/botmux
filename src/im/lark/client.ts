@@ -441,17 +441,30 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
  * the one registered in this daemon process. This is critical for
  * multi-bot groups where each daemon only manages a single bot.
  */
-export async function listChatBotMembers(_larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
-  // Read bots-info.json for larkAppId → botOpenId mapping.
-  // Each daemon process only registers its own bot, but bots-info.json
-  // is written by all daemon processes and has every bot's open_id.
-  const appIdToOpenId = new Map<string, string>();
+export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
+  // Read per-bot cross-reference: other bots' open_ids as seen by larkAppId's app.
+  // This is populated from @mention data in Lark events (the only reliable source,
+  // since Lark open_id is per-app scoped — a bot's self-reported open_id is
+  // different from how other apps see it).
+  const crossRef = new Map<string, string>();
+  try {
+    const crossRefPath = join(config.session.dataDir, `bot-openids-${larkAppId}.json`);
+    if (existsSync(crossRefPath)) {
+      const data: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
+      for (const [name, openId] of Object.entries(data)) {
+        crossRef.set(name.toLowerCase(), openId);
+      }
+    }
+  } catch { /* ignore */ }
+
+  // Also read bots-info.json for bot display names and as fallback
+  const appIdToInfo = new Map<string, { botOpenId: string | null; botName: string | null }>();
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId: string; botOpenId: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
       for (const e of entries) {
-        if (e.botOpenId) appIdToOpenId.set(e.larkAppId, e.botOpenId);
+        appIdToInfo.set(e.larkAppId, { botOpenId: e.botOpenId, botName: e.botName });
       }
     }
   } catch { /* ignore corrupt file */ }
@@ -464,7 +477,11 @@ export async function listChatBotMembers(_larkAppId: string, chatId: string): Pr
           path: { chat_id: chatId },
         });
         if (res.code === 0 && res.data?.is_in_chat) {
-          const openId = appIdToOpenId.get(appId) ?? appId;
+          const info = appIdToInfo.get(appId);
+          // Prefer cross-reference (correct per-app open_id), fall back to self-seen
+          const openId = (info?.botName && crossRef.get(info.botName.toLowerCase()))
+            ?? info?.botOpenId
+            ?? appId;
           return { openId, name: cliId };
         }
       } catch (err) {
