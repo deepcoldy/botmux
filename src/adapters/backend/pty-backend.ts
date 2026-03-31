@@ -1,5 +1,17 @@
 import * as pty from 'node-pty';
+import { chmodSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
 import type { SessionBackend, SpawnOpts } from './types.js';
+
+// npx may strip execute bits from prebuilt binaries — fix before first spawn.
+try {
+  const req = createRequire(import.meta.url);
+  const helper = join(dirname(req.resolve('node-pty/package.json')),
+    'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper');
+  const mode = statSync(helper).mode;
+  if (!(mode & 0o111)) chmodSync(helper, mode | 0o755);
+} catch { /* best effort */ }
 
 export class PtyBackend implements SessionBackend {
   private process: pty.IPty | null = null;
