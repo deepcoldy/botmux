@@ -7,7 +7,7 @@ import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
-  session_id: z.string().describe('Session ID for the active session'),
+  session_id: z.string().optional().describe('Session ID for the active session (auto-detected if omitted)'),
   content: z.string().describe('Message text to send (plain text). Can be empty string when sending only images/files.'),
   images: z.array(z.string()).optional().describe('Optional local file paths of images to attach (e.g. ["/tmp/chart.png"]). Images are embedded inline in the message.'),
   files: z.array(z.string()).optional().describe('Optional local file paths of files to attach (e.g. ["/tmp/report.pdf"]). Each file is sent as a separate message.'),
@@ -89,6 +89,9 @@ function extractTextFromPostJson(raw: string): string | null {
 }
 
 export async function execute(args: z.infer<typeof schema>) {
+  if (!args.session_id) {
+    return { error: 'session_id is required but was not provided and could not be auto-detected' };
+  }
   const session = sessionStore.getSession(args.session_id);
   if (!session) {
     return { error: `Session ${args.session_id} not found` };

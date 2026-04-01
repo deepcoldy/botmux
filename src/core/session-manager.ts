@@ -183,7 +183,11 @@ export function buildNewTopicPrompt(
     }
   }
 
-  parts.push(`Session ID: ${sessionId}`);
+  // CLIs with injectsSessionContext (e.g. Claude Code) get session ID via
+  // --append-system-prompt + MCP auto-detection, so skip per-message injection.
+  if (!adapter.injectsSessionContext) {
+    parts.push(`Session ID: ${sessionId}`);
+  }
   if (noteLines.length > 0) parts.push(noteLines.join('\n'));
   if (mentionSection) parts.push(mentionSection.trim());
   if (botSection) parts.push(botSection.trim());
@@ -194,12 +198,12 @@ export function buildNewTopicPrompt(
 /**
  * Build the content for a follow-up message (thread reply to an active session).
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
- * In adopt mode (no MCP), session ID is omitted from the prompt.
+ * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string },
 ): string {
   const parts: string[] = [
     opts?.attachments && opts.attachments.length > 0
@@ -208,7 +212,13 @@ export function buildFollowUpContent(
   ];
 
   if (!opts?.isAdoptMode) {
-    parts.push(`Session ID: ${sessionId}`);
+    // CLIs with injectsSessionContext get session ID via system prompt + MCP auto-detection
+    const skipSessionId = opts?.cliId
+      ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
+      : false;
+    if (!skipSessionId) {
+      parts.push(`Session ID: ${sessionId}`);
+    }
   }
 
   if (opts?.mentions && opts.mentions.length > 0) {

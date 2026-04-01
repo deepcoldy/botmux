@@ -59,6 +59,11 @@ export interface CliAdapter {
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */
   readonly systemHints: string[];
 
+  /** When true, the adapter injects Lark session context (instructions +
+   *  session ID) via CLI flags (e.g. --append-system-prompt).  The session
+   *  manager skips appending "Session ID: ..." to every user message. */
+  readonly injectsSessionContext?: boolean;
+
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 }

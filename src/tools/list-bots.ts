@@ -7,7 +7,7 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
-  session_id: z.string().describe('Session ID — used to determine which group chat to query for bot members'),
+  session_id: z.string().optional().describe('Session ID — used to determine which group chat to query for bot members (auto-detected if omitted)'),
 });
 
 export const description = 'List bots available in the current group chat. Returns bot names, open_ids, and CLI types for use with send_to_thread mentions.';
@@ -31,6 +31,9 @@ function readBotInfo(): BotInfoEntry[] {
 }
 
 export async function execute(args: z.infer<typeof schema>) {
+  if (!args.session_id) {
+    return { error: 'session_id is required but was not provided and could not be auto-detected' };
+  }
   const session = sessionStore.getSession(args.session_id);
   if (!session) {
     return { error: `Session ${args.session_id} not found` };

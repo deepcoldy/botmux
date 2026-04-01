@@ -463,10 +463,13 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {
+    const dsBotCfgForMsg = getBot(ds.larkAppId).config;
     const msgContent = buildFollowUpContent(parsed.content, ds.session.sessionId, {
       attachments,
       mentions: parsed.mentions,
       isAdoptMode: !!ds.adoptedFrom,
+      cliId: dsBotCfgForMsg.cliId,
+      cliPathOverride: dsBotCfgForMsg.cliPathOverride,
     });
     // Freeze the previous turn's card at "idle" before starting a new turn
     if (ds.streamCardId && ds.workerPort) {
@@ -543,7 +546,13 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
       }
     } catch { /* ignore */ }
     const enrichedParts = [`[来自 ${senderName} 的 @mention]\n${signal.content}`];
-    if (!ds.adoptedFrom) enrichedParts.push(`Session ID: ${ds.session.sessionId}`);
+    if (!ds.adoptedFrom) {
+      const mentionBotCfg = getBot(ds.larkAppId).config;
+      const mentionAdapter = createCliAdapterSync(mentionBotCfg.cliId, mentionBotCfg.cliPathOverride);
+      if (!mentionAdapter.injectsSessionContext) {
+        enrichedParts.push(`Session ID: ${ds.session.sessionId}`);
+      }
+    }
     const enrichedContent = enrichedParts.join('\n\n');
     ds.lastMessageAt = Date.now();
     ds.streamCardPending = true;

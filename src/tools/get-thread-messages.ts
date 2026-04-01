@@ -6,13 +6,16 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
 export const schema = z.object({
-  session_id: z.string().describe('Session ID for the active session'),
+  session_id: z.string().optional().describe('Session ID for the active session (auto-detected if omitted)'),
   limit: z.number().optional().default(50).describe('Max number of messages to return (default 50)'),
 });
 
 export const description = 'Get message history from the Lark thread associated with a session.';
 
 export async function execute(args: z.infer<typeof schema>) {
+  if (!args.session_id) {
+    return { error: 'session_id is required but was not provided and could not be auto-detected' };
+  }
   const session = sessionStore.getSession(args.session_id);
   if (!session) {
     return { error: `Session ${args.session_id} not found` };

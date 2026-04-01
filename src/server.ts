@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { execSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
@@ -9,19 +9,29 @@ import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
 
 /**
- * Walk up the process tree and check whether any ancestor has a CLI PID
- * marker written by the botmux worker.  Walking (not just checking ppid)
- * handles CLIs that fork internal subprocesses before spawning MCP servers.
+ * Walk up the process tree and look for a CLI PID marker written by the
+ * botmux worker.  Returns the session ID stored in the marker, or null.
+ *
+ * The marker file now contains the session ID (was empty in older versions).
+ * Backward-compatible: returns `''` for empty markers (still counts as found).
  *
  * Cross-platform: uses `ps -o ppid=` (works on macOS + Linux).
  */
-function hasAncestorCliMarker(): boolean {
+function findAncestorCliMarker(): { found: boolean; sessionId?: string } {
   const dataDir = process.env.SESSION_DATA_DIR;
-  if (!dataDir) return false;
+  if (!dataDir) return { found: false };
   const markersDir = join(dataDir, '.botmux-cli-pids');
   let pid = process.ppid;
   for (let depth = 0; depth < 8 && pid > 1; depth++) {
-    if (existsSync(join(markersDir, String(pid)))) return true;
+    const markerPath = join(markersDir, String(pid));
+    if (existsSync(markerPath)) {
+      try {
+        const content = readFileSync(markerPath, 'utf-8').trim();
+        return { found: true, sessionId: content || undefined };
+      } catch {
+        return { found: true };
+      }
+    }
     try {
       const output = execSync(`ps -o ppid= -p ${pid}`, {
         encoding: 'utf-8',
@@ -34,7 +44,7 @@ function hasAncestorCliMarker(): boolean {
       break;
     }
   }
-  return false;
+  return { found: false };
 }
 
 export function createServer(): McpServer {
@@ -64,11 +74,16 @@ export function createServer(): McpServer {
   //     CLI MCP servers (the MCP SDK only passes config env + a 6-var
   //     whitelist to the server subprocess, NOT the full parent env).
   //
-  //  2. hasAncestorCliMarker() — walks the process tree (via `ps -o ppid=`)
-  //     and checks if any ancestor PID has a marker file written by the
-  //     botmux worker.  Handles CLIs that fork internal subprocesses.
+  //  2. findAncestorCliMarker() — walks the process tree (via `ps -o ppid=`)
+  //     and reads the marker file written by the botmux worker (contains the
+  //     session ID).  Handles CLIs that fork internal subprocesses.
   //     Cross-platform: `ps -o ppid=` works on both macOS and Linux.
-  const isBotmuxSession = process.env.BOTMUX === '1' && hasAncestorCliMarker();
+  const marker = findAncestorCliMarker();
+  const isBotmuxSession = process.env.BOTMUX === '1' && marker.found;
+  const autoSessionId = marker.sessionId;
+  if (autoSessionId) {
+    logger.info(`MCP server: auto-detected session ID ${autoSessionId.substring(0, 8)}...`);
+  }
 
   const instructions = isBotmuxSession
     ? [
@@ -77,11 +92,9 @@ export function createServer(): McpServer {
         '',
         'Guidelines:',
         '- Use send_to_thread for: key conclusions, proposed plans (wait for confirmation before executing), final results, and progress updates.',
-        '- The message includes a session_id — pass it back when calling send_to_thread.',
         '- Send plain text — formatting is handled automatically. You can also attach images and files.',
         '- To send images: pass local file paths in the `images` array (e.g. screenshots, charts, diagrams). Images are embedded inline in the message.',
         '- To send files: pass local file paths in the `files` array (e.g. PDFs, documents). Each file is sent as a separate message.',
-
         '- Use get_thread_messages to read earlier conversation context if needed.',
       ].join('\n')
     : undefined;
@@ -101,6 +114,10 @@ export function createServer(): McpServer {
   if (isBotmuxSession) {
     for (const [name, tool] of Object.entries(tools)) {
       server.tool(name, tool.description, tool.schema.shape, async (args: any) => {
+        // Auto-fill session_id from PID marker when the LLM omits it
+        if (autoSessionId && !args.session_id) {
+          args.session_id = autoSessionId;
+        }
         logger.info(`Tool called: ${name}`, args);
         const result = await tool.execute(args);
         return {

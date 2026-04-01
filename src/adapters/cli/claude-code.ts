@@ -21,8 +21,19 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       }
       args.push('--dangerously-skip-permissions');
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
+      args.push('--append-system-prompt', [
+        '你连接到了飞书（Lark）话题群。用户在飞书上阅读，看不到你的终端输出。',
+        '想让用户看到的内容必须通过 send_to_thread 工具发送，终端输出不会到达聊天。',
+        '',
+        '使用指南：',
+        '- 用 send_to_thread 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。',
+        '- 发送纯文本即可，格式会自动处理。也可以通过 images 和 files 参数附带图片和文件。',
+        '- 需要上下文时用 get_thread_messages 读取之前的对话。',
+      ].join('\n'));
       return args;
     },
+
+    injectsSessionContext: true,
 
     async writeInput(pty, content) {
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
