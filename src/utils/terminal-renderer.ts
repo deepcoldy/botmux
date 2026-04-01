@@ -72,7 +72,7 @@ function shouldSkipLine(line: string): boolean {
 
 /** CLI output markers — lines starting with these indicate real work output.
  *  Includes CoCo spinner chars (❇❋✢) alongside Claude Code's markers. */
-const OUTPUT_MARKER_RE = /^[●·⎿✓⚠★☐☑⏵✽✻❇❋✢]|^\s+⎿/;
+const OUTPUT_MARKER_RE = /^\s*[●·⎿✓⚠★☐☑⏵✽✻❇❋✢]/;
 
 /**
  * How many columns to read from each line for the Feishu card snapshot.

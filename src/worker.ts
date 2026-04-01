@@ -146,6 +146,7 @@ function markPromptReady(): void {
 async function flushPending(): Promise<void> {
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!isPromptReady || !backend || !cliAdapter) return;
+  if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
 
   isFlushing = true;
   isPromptReady = false;
@@ -263,7 +264,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     try {
       mkdirSync(markersDir, { recursive: true });
       cliPidMarker = join(markersDir, String(cliPid));
-      writeFileSync(cliPidMarker, '');
+      writeFileSync(cliPidMarker, cfg.sessionId);
       log(`CLI PID marker written: ${cliPid}`);
     } catch (err: any) {
       log(`Failed to write CLI PID marker: ${err.message}`);
