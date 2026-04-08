@@ -92,14 +92,16 @@ describe('MCP server bot registration', () => {
       // No LARK_APP_ID, no LARK_APP_SECRET — server must read bots.json
     });
 
-    await client.connect(transport);
-    const { tools } = await client.listTools();
+    try {
+      await client.connect(transport);
+      const { tools } = await client.listTools();
 
-    expect(tools.length).toBeGreaterThan(0);
-    expect(tools.map(t => t.name)).toContain('send_to_thread');
-    console.log('Tools available:', tools.map(t => t.name));
-
-    await client.close();
+      expect(tools.length).toBeGreaterThan(0);
+      expect(tools.map(t => t.name)).toContain('send_to_thread');
+      console.log('Tools available:', tools.map(t => t.name));
+    } finally {
+      await client.close();
+    }
   });
 
   it('send_to_thread with invalid session returns error (not "Bot not registered")', async () => {
@@ -112,19 +114,21 @@ describe('MCP server bot registration', () => {
       SESSION_DATA_DIR: '/root/.botmux/data',
     });
 
-    await client.connect(transport);
+    try {
+      await client.connect(transport);
 
-    const result = await callTool(client, 'send_to_thread', {
-      session_id: 'nonexistent-session-id',
-      content: 'test',
-    });
+      const result = await callTool(client, 'send_to_thread', {
+        session_id: 'nonexistent-session-id',
+        content: 'test',
+      });
 
-    console.log('Tool result:', result);
-    expect(result.error).toBeDefined();
-    expect(result.error).toContain('not found');
-    expect(result.error).not.toContain('Bot not registered');
-
-    await client.close();
+      console.log('Tool result:', result);
+      expect(result.error).toBeDefined();
+      expect(result.error).toContain('not found');
+      expect(result.error).not.toContain('Bot not registered');
+    } finally {
+      await client.close();
+    }
   });
 
   it('send_to_thread with real session resolves bot correctly', async () => {
@@ -159,21 +163,23 @@ describe('MCP server bot registration', () => {
       SESSION_DATA_DIR: dataDir,
     });
 
-    await client.connect(transport);
+    try {
+      await client.connect(transport);
 
-    // Call get_thread_messages — should NOT fail with "Bot not registered"
-    const result = await callTool(client, 'get_thread_messages', {
-      session_id: activeSession.sessionId,
-      limit: 1,
-    });
+      // Call get_thread_messages — should NOT fail with "Bot not registered"
+      const result = await callTool(client, 'get_thread_messages', {
+        session_id: activeSession.sessionId,
+        limit: 1,
+      });
 
-    console.log('get_thread_messages result:', JSON.stringify(result).substring(0, 200));
+      console.log('get_thread_messages result:', JSON.stringify(result).substring(0, 200));
 
-    // If the session's bot is registered, we should NOT see "Bot not registered"
-    if (result.error) {
-      expect(result.error).not.toContain('Bot not registered');
+      // If the session's bot is registered, we should NOT see "Bot not registered"
+      if (result.error) {
+        expect(result.error).not.toContain('Bot not registered');
+      }
+    } finally {
+      await client.close();
     }
-
-    await client.close();
   });
 });

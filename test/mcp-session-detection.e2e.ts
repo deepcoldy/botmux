@@ -48,11 +48,13 @@ async function listMcpTools(env: Record<string, string>): Promise<string[]> {
     env: { PATH: process.env.PATH!, HOME: process.env.HOME!, ...env },
   });
   const client = new Client({ name: 'test-client', version: '1.0.0' });
-  await client.connect(transport);
-  const { tools } = await client.listTools();
-  const names = tools.map(t => t.name).sort();
-  await client.close();
-  return names;
+  try {
+    await client.connect(transport);
+    const { tools } = await client.listTools();
+    return tools.map(t => t.name).sort();
+  } finally {
+    await client.close();
+  }
 }
 
 /**
@@ -92,11 +94,13 @@ async function listMcpToolsWithMarkedParent(
     },
   });
   const client = new Client({ name: 'test-client', version: '1.0.0' });
-  await client.connect(transport);
-  const { tools } = await client.listTools();
-  const names = tools.map(t => t.name).sort();
-  await client.close();
-  return names;
+  try {
+    await client.connect(transport);
+    const { tools } = await client.listTools();
+    return tools.map(t => t.name).sort();
+  } finally {
+    await client.close();
+  }
 }
 
 /**
@@ -141,11 +145,13 @@ async function listMcpToolsWithIntermediateProcess(
     },
   });
   const client = new Client({ name: 'test-client', version: '1.0.0' });
-  await client.connect(transport);
-  const { tools } = await client.listTools();
-  const names = tools.map(t => t.name).sort();
-  await client.close();
-  return names;
+  try {
+    await client.connect(transport);
+    const { tools } = await client.listTools();
+    return tools.map(t => t.name).sort();
+  } finally {
+    await client.close();
+  }
 }
 
 /**
@@ -257,10 +263,13 @@ describe('MCP empty shell: tools/list returns [] not -32601', () => {
       env: { PATH: process.env.PATH!, HOME: process.env.HOME! },
     });
     const client = new Client({ name: 'test-client', version: '1.0.0' });
-    await client.connect(transport);
-    const { tools } = await client.listTools();
-    expect(tools).toHaveLength(0);
-    await client.close();
+    try {
+      await client.connect(transport);
+      const { tools } = await client.listTools();
+      expect(tools).toHaveLength(0);
+    } finally {
+      await client.close();
+    }
   }, 10_000);
 
   it('empty shell stderr logs "empty shell"', async () => {
