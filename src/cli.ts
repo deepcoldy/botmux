@@ -21,9 +21,11 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { createRequire } from 'node:module';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const require = createRequire(import.meta.url);
 
 // Package root is one level up from dist/
 const PKG_ROOT = dirname(__dirname);
@@ -33,27 +35,49 @@ const DATA_DIR = join(CONFIG_DIR, 'data');
 const LOG_DIR = join(CONFIG_DIR, 'logs');
 const BOTS_JSON_FILE = join(CONFIG_DIR, 'bots.json');
 const PM2_NAME = 'botmux';
+/**
+ * Dedicated PM2_HOME for botmux. Isolates our pm2 daemon state from any
+ * other pm2 installation on the machine (e.g. the one bundled in IDE
+ * remote-ssh extensions). Prevents stale ProcessContainerFork.js paths
+ * when those external pm2 installations get moved or removed.
+ */
+const PM2_HOME = join(CONFIG_DIR, 'pm2');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function ensureConfigDir(): void {
-  for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR]) {
+  for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR, PM2_HOME]) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 }
 
+/**
+ * Resolve the pm2 CLI script path. Uses require.resolve so it always lands
+ * on the pm2 bundled with this package, never on a PATH-resolved pm2 that
+ * may belong to an unrelated installation (e.g. IDE remote extensions).
+ */
 function pm2Bin(): string {
-  // Use the pm2 bundled with this package
-  const local = join(PKG_ROOT, 'node_modules', '.bin', 'pm2');
-  if (existsSync(local)) return local;
-  // Fallback to global pm2
+  try {
+    return require.resolve('pm2/bin/pm2');
+  } catch { /* fall through */ }
+  // Fallbacks for unusual installation layouts
+  const direct = join(PKG_ROOT, 'node_modules', 'pm2', 'bin', 'pm2');
+  if (existsSync(direct)) return direct;
+  const symlink = join(PKG_ROOT, 'node_modules', '.bin', 'pm2');
+  if (existsSync(symlink)) return symlink;
   return 'pm2';
 }
 
-function runPm2(args: string[], inherit = true): void {
-  const result = inherit
-    ? execSync(`${pm2Bin()} ${args.join(' ')}`, { stdio: 'inherit', env: process.env })
-    : execSync(`${pm2Bin()} ${args.join(' ')}`, { env: process.env });
+/** Env for pm2 invocations with an isolated PM2_HOME. */
+function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
+  return { ...process.env, PM2_HOME: home };
+}
+
+function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
+  execSync(`${pm2Bin()} ${args.join(' ')}`, {
+    stdio: inherit ? 'inherit' : 'pipe',
+    env: pm2Env(home),
+  });
 }
 
 function loadBotsJson(): any[] {
@@ -268,6 +292,7 @@ function cmdStart(): void {
     process.exit(1);
   }
   ensureConfigDir();
+  cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
   const bots = loadBotsJson();
@@ -277,23 +302,63 @@ function cmdStart(): void {
   console.log(`   状态: botmux status`);
 }
 
-/** Delete all pm2 processes matching botmux / botmux-* */
-function deleteAllBotmuxProcesses(): void {
+/** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
+function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
   try {
-    const output = execSync(`${pm2Bin()} jlist`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const output = execSync(`${pm2Bin()} jlist`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: pm2Env(home),
+      timeout: 10_000,
+    });
     const apps = JSON.parse(output) as any[];
     for (const app of apps) {
       if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
-        try { execSync(`${pm2Bin()} delete ${app.name}`, { stdio: ['pipe', 'pipe', 'pipe'] }); } catch { /* */ }
+        try {
+          execSync(`${pm2Bin()} delete ${app.name}`, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: pm2Env(home),
+            timeout: 10_000,
+          });
+        } catch { /* */ }
       }
     }
   } catch { /* pm2 not running or no apps */ }
 }
 
+/**
+ * One-time migration for users upgrading from versions that used the default
+ * ~/.pm2 directory. Removes any lingering botmux-* processes registered under
+ * the legacy home so the new dedicated PM2_HOME becomes the sole source of
+ * truth. Only touches processes named `botmux` or `botmux-*` — the user's
+ * unrelated pm2 apps are left untouched. No-op on fresh installs.
+ */
+function cleanupLegacyPm2(): boolean {
+  const legacyHome = join(homedir(), '.pm2');
+  if (legacyHome === PM2_HOME) return false;
+  const legacyPidFile = join(legacyHome, 'pm2.pid');
+  if (!existsSync(legacyPidFile)) return false;
+
+  let legacyPid = 0;
+  try { legacyPid = parseInt(readFileSync(legacyPidFile, 'utf-8').trim(), 10); } catch { return false; }
+  if (!legacyPid) return false;
+  // If the legacy daemon isn't alive anymore there's nothing to clean.
+  try { process.kill(legacyPid, 0); } catch { return false; }
+
+  deleteAllBotmuxProcesses(legacyHome);
+  return true;
+}
+
 function cmdStop(): void {
+  cleanupLegacyPm2();
   let stopped = false;
   try {
-    const output = execSync(`${pm2Bin()} jlist`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const output = execSync(`${pm2Bin()} jlist`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: pm2Env(),
+      timeout: 10_000,
+    });
     const apps = JSON.parse(output) as any[];
     for (const app of apps) {
       if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
@@ -311,13 +376,44 @@ function cmdRestart(): void {
     process.exit(1);
   }
   ensureConfigDir();
+  cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
 }
 
+/**
+ * If a legacy ~/.pm2 daemon with botmux processes still exists alongside our
+ * new PM2_HOME, warn the user so read-only commands (status/logs) don't
+ * silently show an empty new home while the old daemon keeps running.
+ */
+function warnIfLegacyBotmuxAlive(): void {
+  const legacyHome = join(homedir(), '.pm2');
+  if (legacyHome === PM2_HOME) return;
+  const legacyPidFile = join(legacyHome, 'pm2.pid');
+  if (!existsSync(legacyPidFile)) return;
+  let legacyPid = 0;
+  try { legacyPid = parseInt(readFileSync(legacyPidFile, 'utf-8').trim(), 10); } catch { return; }
+  if (!legacyPid) return;
+  try { process.kill(legacyPid, 0); } catch { return; }
+  try {
+    const output = execSync(`${pm2Bin()} jlist`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: pm2Env(legacyHome),
+      timeout: 10_000,
+    });
+    const apps = JSON.parse(output) as any[];
+    const hasBotmux = apps.some(a => a.name === PM2_NAME || a.name.startsWith(`${PM2_NAME}-`));
+    if (hasBotmux) {
+      console.warn('⚠️  检测到旧版 PM2_HOME (~/.pm2) 下仍有 botmux 进程,运行 `botmux restart` 完成迁移。\n');
+    }
+  } catch { /* ignore */ }
+}
+
 function cmdLogs(): void {
+  warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
     : '50';
@@ -339,12 +435,13 @@ function cmdLogs(): void {
   // Use spawn for streaming output
   const child = spawn(pm2Bin(), ['logs', target, '--lines', lines], {
     stdio: 'inherit',
-    env: process.env,
+    env: pm2Env(),
   });
   child.on('exit', code => process.exit(code ?? 0));
 }
 
 function cmdStatus(): void {
+  warnIfLegacyBotmuxAlive();
   runPm2(['status']);
 }
 
