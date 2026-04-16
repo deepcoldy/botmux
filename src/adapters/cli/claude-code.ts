@@ -11,6 +11,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'claude-code',
     resolvedBin: bin,
+    supportsTypeAhead: true,
 
     buildArgs({ sessionId, resume }) {
       const args: string[] = [];
@@ -36,28 +37,21 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     injectsSessionContext: true,
 
     async writeInput(pty, content) {
+      // Always use bracketed paste: Claude Code's paste-burst heuristic can
+      // swallow a trailing Enter sent via send-keys -l + send-keys Enter,
+      // leaving content in the input box. Bracketed paste marks an explicit
+      // \x1b[201~ boundary so the post-paste Enter is unambiguously submit.
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
+      const submitDelay = hasImagePath ? 800 : 500;
 
-      if (content.includes('\n')) {
-        if (pty.pasteText && pty.sendSpecialKeys) {
-          // Tmux mode: paste-buffer auto-handles bracketed paste
-          pty.pasteText(content);
-          await new Promise(r => setTimeout(r, hasImagePath ? 800 : 500));
-          pty.sendSpecialKeys('Enter');
-        } else {
-          // Non-tmux fallback: manual bracketed paste
-          pty.write('\x1b[200~' + content + '\x1b[201~');
-          await new Promise(r => setTimeout(r, hasImagePath ? 800 : 500));
-          pty.write('\r');
-        }
+      if (pty.pasteText && pty.sendSpecialKeys) {
+        pty.pasteText(content);
+        await new Promise(r => setTimeout(r, submitDelay));
+        pty.sendSpecialKeys('Enter');
       } else {
-        if (pty.sendText && pty.sendSpecialKeys) {
-          // Tmux mode: send-keys -l + Enter
-          pty.sendText(content);
-          pty.sendSpecialKeys('Enter');
-        } else {
-          pty.write(content + '\r');
-        }
+        pty.write('\x1b[200~' + content + '\x1b[201~');
+        await new Promise(r => setTimeout(r, submitDelay));
+        pty.write('\r');
       }
     },
 
