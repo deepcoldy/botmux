@@ -24,10 +24,6 @@
     "daemon:status": "node dist/cli.js status",
     "test": "vitest run",
     "test:codex": "vitest run test/codex-input.e2e.ts",
-    "test:mcp": "vitest run test/codex-mcp.e2e.ts",
-    "test:claude-mcp": "vitest run test/claude-code-mcp.e2e.ts",
-    "test:coco-mcp": "vitest run test/coco-mcp.e2e.ts",
-    "test:mcp-detect": "vitest run test/mcp-session-detection.e2e.ts",
     "test:gemini": "vitest run test/gemini-input.e2e.ts",
     "test:e2e-browser:setup": "tsx test/e2e-browser/setup-login.ts",
     "test:e2e-browser": "vitest run test/e2e-browser/",
@@ -35,7 +31,6 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.59.0",
-    "@modelcontextprotocol/sdk": "^1.18.1",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/headless": "^6.0.0",
     "croner": "^10.0.1",

@@ -2,10 +2,10 @@
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
  */
-import { fork, type ChildProcess } from 'node:child_process';
+import { fork, execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills } from '../skills/installer.js';
 import { randomBytes } from 'node:crypto';
@@ -128,6 +128,114 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   skillsInstalledCliIds.add(cliId);
 }
 
+// ─── Legacy MCP config cleanup ──────────────────────────────────────────────
+//
+// botmux used to register itself as an MCP server in each CLI's config so the
+// CLI could call send_to_thread / get_thread_messages / list_bots.  Those
+// tools have since been migrated to `botmux` subcommands + Skills.  The old
+// MCP entry is now dead — if we leave it, the CLI will try to spawn a
+// non-existent server on startup and users see scary errors.
+//
+// For each CLI, best-effort remove any `botmux` entry from its MCP config.
+// Runs once per CLI per daemon lifecycle, same lifecycle as ensureCliSkills.
+
+/** Track which CLI adapters have had legacy MCP config cleaned this daemon lifecycle */
+const legacyMcpCleanedCliIds = new Set<string>();
+
+/** Remove a key from a JSON config file at the given dotted path. Best-effort. */
+function removeJsonKey(configPath: string, pathSegments: string[], keyToRemove: string): boolean {
+  try {
+    if (!existsSync(configPath)) return false;
+    const raw = readFileSync(configPath, 'utf-8');
+    const data = JSON.parse(raw);
+    let node: any = data;
+    for (const seg of pathSegments) {
+      if (!node || typeof node !== 'object' || !(seg in node)) return false;
+      node = node[seg];
+    }
+    if (!node || typeof node !== 'object' || !(keyToRemove in node)) return false;
+    delete node[keyToRemove];
+    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Try running `<cli> mcp remove botmux`. Returns true if the command ran. */
+function tryCliMcpRemove(binName: string): boolean {
+  try {
+    execSync(`${binName} mcp remove botmux`, { stdio: 'ignore', timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove legacy `botmux` MCP server registration from the given CLI's config.
+ * Idempotent — runs once per CLI per daemon lifecycle.  Best-effort: any
+ * failure is swallowed; we never want to block worker startup.
+ */
+export function cleanupLegacyMcpConfig(cliId: CliId): void {
+  if (legacyMcpCleanedCliIds.has(cliId)) return;
+  legacyMcpCleanedCliIds.add(cliId);
+
+  try {
+    const home = homedir();
+    switch (cliId) {
+      case 'claude-code': {
+        // ~/.claude.json → { mcpServers: { botmux } }
+        if (removeJsonKey(join(home, '.claude.json'), ['mcpServers'], 'botmux')) {
+          logger.info(`[legacy-mcp] Removed botmux entry from ~/.claude.json`);
+        }
+        break;
+      }
+      case 'aiden': {
+        // ~/.aiden/.mcp.json or cwd/.mcp.json → { mcpServers: { botmux } }
+        for (const p of [join(home, '.aiden', '.mcp.json'), join(process.cwd(), '.mcp.json')]) {
+          if (removeJsonKey(p, ['mcpServers'], 'botmux')) {
+            logger.info(`[legacy-mcp] Removed botmux entry from ${p}`);
+          }
+        }
+        break;
+      }
+      case 'opencode': {
+        // ~/.config/opencode/opencode.json → { mcp: { botmux } } or { mcpServers: { botmux } }
+        const p = join(home, '.config', 'opencode', 'opencode.json');
+        const removed =
+          removeJsonKey(p, ['mcp'], 'botmux') ||
+          removeJsonKey(p, ['mcpServers'], 'botmux') ||
+          removeJsonKey(p, ['mcp', 'servers'], 'botmux');
+        if (removed) logger.info(`[legacy-mcp] Removed botmux entry from ${p}`);
+        break;
+      }
+      case 'coco':
+      case 'codex':
+      case 'gemini': {
+        // These CLIs managed MCP via their own subcommand.  Skip silently if
+        // the binary isn't on PATH — nothing to clean then.
+        if (tryCliMcpRemove(cliId)) {
+          logger.info(`[legacy-mcp] Ran \`${cliId} mcp remove botmux\``);
+        }
+        break;
+      }
+    }
+  } catch (err) {
+    logger.debug(`[legacy-mcp] Cleanup for ${cliId} failed (ignored): ${err}`);
+  }
+}
+
+/**
+ * Ensure per-CLI environment is set up for this daemon lifecycle: install
+ * built-in skills and clean up any legacy MCP server registration.
+ * Both steps are idempotent and best-effort.
+ */
+export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
+  ensureCliSkills(cliId, cliPathOverride);
+  cleanupLegacyMcpConfig(cliId);
+}
+
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
 export function killWorker(ds: DaemonSession): void {
@@ -164,7 +272,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     ds.workerToken = null;
   }
 
-  ensureCliSkills(botCfg.cliId, botCfg.cliPathOverride);
+  ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);
 
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.

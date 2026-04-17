@@ -1,26 +1,18 @@
 /**
- * Unit tests for CLI adapters: factory, buildArgs, patterns, properties, ensureMcpConfig.
+ * Unit tests for CLI adapters: factory, buildArgs, patterns, properties.
  *
  * Run:  pnpm vitest run test/cli-adapters.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing adapters
 // ---------------------------------------------------------------------------
 
-// Mock child_process.execSync so resolveCommand() returns the command as-is
-// and ensureMcpConfig() calls that shell out don't actually run.
+// Mock child_process.execSync so resolveCommand() returns the command as-is.
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(() => ''),
 }));
-
-// Virtual fs for adapters that read/write JSON config files
-import { vol } from 'memfs';
-vi.mock('node:fs', async () => {
-  const memfs = await import('memfs');
-  return memfs.fs;
-});
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
@@ -29,24 +21,13 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
-import { execSync } from 'node:child_process';
-import type { CliAdapter, CliId, McpServerEntry } from '../src/adapters/cli/types.js';
+import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode'];
-
-function makeMcpEntry(overrides?: Partial<McpServerEntry>): McpServerEntry {
-  return {
-    name: 'botmux',
-    command: 'node',
-    args: ['/path/to/server.js'],
-    env: { LARK_APP_ID: 'app1', LARK_APP_SECRET: 'secret1' },
-    ...overrides,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -386,233 +367,3 @@ describe('altScreen property', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// 7. ensureMcpConfig — file-based adapters (claude-code, aiden, opencode)
-// ---------------------------------------------------------------------------
-
-describe('ensureMcpConfig: claude-code (writes ~/.claude.json)', () => {
-  const homedir = process.env.HOME || '/root';
-
-  beforeEach(() => {
-    vol.reset();
-    // Ensure the home directory exists in memfs
-    vol.mkdirSync(homedir, { recursive: true });
-  });
-
-  it('creates config file when it does not exist', () => {
-    const adapter = createClaudeCodeAdapter('/bin/claude');
-    const entry = makeMcpEntry();
-    adapter.ensureMcpConfig(entry);
-
-    const configPath = `${homedir}/.claude.json`;
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcpServers.botmux).toBeDefined();
-    expect(data.mcpServers.botmux.command).toBe('node');
-    expect(data.mcpServers.botmux.args).toEqual(['/path/to/server.js']);
-    expect(data.mcpServers.botmux.env).toEqual({ LARK_APP_ID: 'app1', LARK_APP_SECRET: 'secret1' });
-  });
-
-  it('is idempotent — skips write when config matches', () => {
-    const adapter = createClaudeCodeAdapter('/bin/claude');
-    const entry = makeMcpEntry();
-    adapter.ensureMcpConfig(entry);
-    adapter.ensureMcpConfig(entry);
-
-    // Just verify no error and config is still correct
-    const configPath = `${homedir}/.claude.json`;
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcpServers.botmux).toBeDefined();
-  });
-
-  it('updates config when env changes', () => {
-    const adapter = createClaudeCodeAdapter('/bin/claude');
-    adapter.ensureMcpConfig(makeMcpEntry());
-    adapter.ensureMcpConfig(makeMcpEntry({ env: { LARK_APP_ID: 'app2', LARK_APP_SECRET: 'secret2' } }));
-
-    const configPath = `${homedir}/.claude.json`;
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcpServers.botmux.env).toEqual({ LARK_APP_ID: 'app2', LARK_APP_SECRET: 'secret2' });
-  });
-
-  it('removes stale entries pointing to the same server script', () => {
-    const adapter = createClaudeCodeAdapter('/bin/claude');
-    const configPath = `${homedir}/.claude.json`;
-
-    // Pre-populate with a stale entry
-    const existing = {
-      mcpServers: {
-        'claude-code-robot': { command: 'node', args: ['/path/to/server.js'], env: {} },
-      },
-    };
-    vol.writeFileSync(configPath, JSON.stringify(existing));
-
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcpServers['claude-code-robot']).toBeUndefined();
-    expect(data.mcpServers.botmux).toBeDefined();
-  });
-});
-
-describe('ensureMcpConfig: aiden (writes ~/.aiden/.mcp.json)', () => {
-  const homedir = process.env.HOME || '/root';
-
-  beforeEach(() => {
-    vol.reset();
-    vol.mkdirSync(homedir, { recursive: true });
-  });
-
-  it('creates config file when it does not exist', () => {
-    const adapter = createAidenAdapter('/bin/aiden');
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const configPath = `${homedir}/.aiden/.mcp.json`;
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcpServers.botmux).toBeDefined();
-    expect(data.mcpServers.botmux.command).toBe('node');
-  });
-
-  it('removes stale entries pointing to same server script', () => {
-    const adapter = createAidenAdapter('/bin/aiden');
-    const configPath = `${homedir}/.aiden/.mcp.json`;
-
-    vol.mkdirSync(`${homedir}/.aiden`, { recursive: true });
-    const existing = {
-      mcpServers: {
-        'claude-code-robot': { command: 'node', args: ['/path/to/server.js'], env: {} },
-      },
-    };
-    vol.writeFileSync(configPath, JSON.stringify(existing));
-
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcpServers['claude-code-robot']).toBeUndefined();
-    expect(data.mcpServers.botmux).toBeDefined();
-  });
-});
-
-describe('ensureMcpConfig: opencode (writes ~/.config/opencode/opencode.json)', () => {
-  const homedir = process.env.HOME || '/root';
-
-  beforeEach(() => {
-    vol.reset();
-    vol.mkdirSync(homedir, { recursive: true });
-  });
-
-  it('creates config file when it does not exist', () => {
-    const adapter = createOpenCodeAdapter('/bin/opencode');
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const configPath = `${homedir}/.config/opencode/opencode.json`;
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcp.botmux).toBeDefined();
-    expect(data.mcp.botmux.type).toBe('local');
-    expect(data.mcp.botmux.command).toEqual(['node', '/path/to/server.js']);
-    expect(data.mcp.botmux.environment).toEqual({ LARK_APP_ID: 'app1', LARK_APP_SECRET: 'secret1' });
-  });
-
-  it('is idempotent — skips write when config matches', () => {
-    const adapter = createOpenCodeAdapter('/bin/opencode');
-    const entry = makeMcpEntry();
-    adapter.ensureMcpConfig(entry);
-    adapter.ensureMcpConfig(entry);
-
-    const configPath = `${homedir}/.config/opencode/opencode.json`;
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcp.botmux).toBeDefined();
-  });
-
-  it('removes stale entries pointing to same server script', () => {
-    const adapter = createOpenCodeAdapter('/bin/opencode');
-    const configPath = `${homedir}/.config/opencode/opencode.json`;
-
-    vol.mkdirSync(`${homedir}/.config/opencode`, { recursive: true });
-    const existing = {
-      mcp: {
-        'claude-code-robot': { type: 'local', command: ['node', '/path/to/server.js'], environment: {} },
-      },
-    };
-    vol.writeFileSync(configPath, JSON.stringify(existing));
-
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const data = JSON.parse(vol.readFileSync(configPath, 'utf-8') as string);
-    expect(data.mcp['claude-code-robot']).toBeUndefined();
-    expect(data.mcp.botmux).toBeDefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 8. ensureMcpConfig — shell-based adapters (coco, codex, gemini)
-// ---------------------------------------------------------------------------
-
-describe('ensureMcpConfig: coco (shells out to coco mcp add-json)', () => {
-  const mockedExecSync = vi.mocked(execSync);
-
-  beforeEach(() => {
-    mockedExecSync.mockReset();
-    mockedExecSync.mockReturnValue('');
-  });
-
-  it('calls coco mcp remove then add-json', () => {
-    const adapter = createCocoAdapter('/usr/bin/coco');
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const calls = mockedExecSync.mock.calls.map(c => c[0] as string);
-    // Should remove stale "claude-code-robot" entry
-    expect(calls.some(c => c.includes('mcp remove claude-code-robot'))).toBe(true);
-    // Should remove existing entry
-    expect(calls.some(c => c.includes('mcp remove botmux'))).toBe(true);
-    // Should add new entry
-    expect(calls.some(c => c.includes('mcp add-json botmux'))).toBe(true);
-  });
-});
-
-describe('ensureMcpConfig: codex (shells out to codex mcp add)', () => {
-  const mockedExecSync = vi.mocked(execSync);
-
-  beforeEach(() => {
-    mockedExecSync.mockReset();
-    mockedExecSync.mockReturnValue('');
-  });
-
-  it('calls codex mcp remove then add with env args', () => {
-    const adapter = createCodexAdapter('/usr/bin/codex');
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const calls = mockedExecSync.mock.calls.map(c => c[0] as string);
-    expect(calls.some(c => c.includes('mcp remove claude-code-robot'))).toBe(true);
-    expect(calls.some(c => c.includes('mcp remove botmux'))).toBe(true);
-    const addCall = calls.find(c => c.includes('mcp add botmux'));
-    expect(addCall).toBeDefined();
-    expect(addCall).toContain('--env LARK_APP_ID=app1');
-    expect(addCall).toContain('--env LARK_APP_SECRET=secret1');
-    expect(addCall).toContain('-- node /path/to/server.js');
-  });
-});
-
-describe('ensureMcpConfig: gemini (shells out to gemini mcp add)', () => {
-  const mockedExecSync = vi.mocked(execSync);
-
-  beforeEach(() => {
-    mockedExecSync.mockReset();
-    mockedExecSync.mockReturnValue('');
-  });
-
-  it('calls gemini mcp remove then add with -e env args', () => {
-    const adapter = createGeminiAdapter('/usr/bin/gemini');
-    adapter.ensureMcpConfig(makeMcpEntry());
-
-    const calls = mockedExecSync.mock.calls.map(c => c[0] as string);
-    expect(calls.some(c => c.includes('mcp remove claude-code-robot'))).toBe(true);
-    expect(calls.some(c => c.includes('mcp remove botmux'))).toBe(true);
-    const addCall = calls.find(c => c.includes('mcp add botmux'));
-    expect(addCall).toBeDefined();
-    expect(addCall).toContain('-e LARK_APP_ID=app1');
-    expect(addCall).toContain('-e LARK_APP_SECRET=secret1');
-    expect(addCall).toContain('--trust');
-    expect(addCall).toContain('--scope user');
-    expect(addCall).toContain('node /path/to/server.js');
-  });
-});

@@ -22,7 +22,6 @@ function makeCli(opts: {
     resolvedBin: '/usr/bin/test-cli',
     buildArgs: () => [],
     writeInput: async () => {},
-    ensureMcpConfig: () => {},
     completionPattern: opts.completionPattern,
     readyPattern: opts.readyPattern,
     systemHints: [],
