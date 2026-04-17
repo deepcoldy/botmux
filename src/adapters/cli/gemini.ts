@@ -1,6 +1,5 @@
-import { execSync } from 'node:child_process';
 import { resolveCommand } from './registry.js';
-import type { CliAdapter, PtyHandle, McpServerEntry } from './types.js';
+import type { CliAdapter, PtyHandle } from './types.js';
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -38,33 +37,6 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
         pty.write(content);
         await delay(1000);
         pty.write('\r');
-      }
-    },
-
-    ensureMcpConfig(entry: McpServerEntry) {
-      // Clean up stale entries (e.g. old "claude-code-robot" → renamed to "botmux")
-      for (const stale of ['claude-code-robot']) {
-        if (stale !== entry.name) {
-          try {
-            execSync(`${bin} mcp remove ${stale}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
-          } catch { /* not present — fine */ }
-        }
-      }
-      // Remove first so re-registration picks up env changes
-      try {
-        execSync(`${bin} mcp remove ${entry.name}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
-      } catch { /* not registered yet — fine */ }
-
-      // gemini mcp add <name> <command> [args...] -e K=V --trust --scope user
-      const envArgs = Object.entries(entry.env)
-        .map(([k, v]) => `-e ${k}=${v}`)
-        .join(' ');
-      const argsStr = entry.args.join(' ');
-      const cmd = `${bin} mcp add ${entry.name} ${entry.command} ${argsStr} ${envArgs} --trust --scope user`;
-      try {
-        execSync(cmd, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
-      } catch (err: any) {
-        console.warn(`[gemini] Failed to add MCP config: ${err.message}`);
       }
     },
 

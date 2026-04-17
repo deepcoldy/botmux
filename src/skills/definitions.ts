@@ -136,7 +136,130 @@ JSON 格式，字段：
 - 需要先把 JSON 读进来再做总结，不要直接把 JSON 扔给用户
 `;
 
+const SEND_SKILL = `---
+name: botmux-send
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持文本、图片、文件附件和 @mention。
+---
+
+# botmux-send — 向飞书话题发送消息
+
+**核心规则**：用户在飞书上阅读，看不到你的终端输出。想让用户看到的内容**必须**通过 \`botmux send\` 发送。
+
+## 什么时候用
+
+- 关键结论、方案（等用户确认再执行）
+- 最终结果
+- 进度更新（长任务的中途汇报）
+- 需要用户回复的问题
+
+## 什么时候不用
+
+- 中间过程的调试输出
+- 给自己看的分析笔记
+- 纯粹的代码操作（编辑/运行命令）
+
+## 用法
+
+### 纯文本（最常见）
+
+\`\`\`bash
+# 直接传参
+botmux send "分析完成，核心问题是 X"
+
+# heredoc（多行内容推荐）
+botmux send <<'EOF'
+## 分析报告
+
+1. 发现问题 A
+2. 建议方案 B
+
+需要你确认后我再动手。
+EOF
+
+# 管道
+echo "构建成功 ✅" | botmux send
+\`\`\`
+
+### 带图片（内联显示）
+
+\`\`\`bash
+botmux send --images /tmp/screenshot.png <<'EOF'
+截图如上，红框部分是问题所在。
+EOF
+\`\`\`
+
+### 带文件附件
+
+\`\`\`bash
+botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
+\`\`\`
+
+### @mention 其他机器人协作
+
+\`\`\`bash
+# 先查可用机器人
+botmux bots list
+
+# @mention 协作
+botmux send --mention "ou_xxx:Aiden" "请 @Aiden 帮忙 review 这段代码"
+\`\`\`
+
+## 参数
+
+| 参数 | 说明 |
+|---|---|
+| (positional 或 stdin) | 消息文本（纯文本，格式自动处理） |
+| \`--content-file <path>\` | 从文件读取内容（优先于 stdin/positional） |
+| \`--images <path>\` | 内联图片，可重复多次 |
+| \`--files <path>\` | 附件文件，可重复多次，每个单独发送 |
+| \`--mention <open_id:name>\` | @mention，可重复。用 \`botmux bots list\` 查 open_id |
+| \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
+
+## 输出
+
+成功返回 JSON: \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`
+失败打印错误到 stderr 并 exit 1。
+`;
+
+const BOTS_SKILL = `---
+name: botmux-bots
+description: 列出当前飞书群聊中的机器人及其 open_id。在需要 @mention 其他机器人协作时使用。
+---
+
+# botmux-bots — 查询可用机器人
+
+## 用法
+
+\`\`\`bash
+botmux bots list
+\`\`\`
+
+## 输出
+
+JSON 格式：
+\`\`\`json
+{
+  "sessionId": "...",
+  "chatId": "...",
+  "bots": [
+    { "name": "Claude", "openId": "ou_xxx", "isSelf": true },
+    { "name": "Aiden", "openId": "ou_yyy", "isSelf": false }
+  ],
+  "total": 2
+}
+\`\`\`
+
+## 配合 botmux send 使用
+
+\`\`\`bash
+# 查到 Aiden 的 open_id 后
+botmux send --mention "ou_yyy:Aiden" "请 @Aiden 帮忙处理"
+\`\`\`
+`;
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-thread-messages', content: THREAD_MESSAGES_SKILL },
+  { name: 'botmux-send', content: SEND_SKILL },
+  { name: 'botmux-bots', content: BOTS_SKILL },
 ];

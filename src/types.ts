@@ -112,9 +112,3 @@ export type WorkerToDaemon =
   | { type: 'screen_update'; content: string; status: 'working' | 'idle' }
   | { type: 'error'; message: string };
 
-export const TOOL_NAMES = {
-  SEND_TO_THREAD: 'send_to_thread',
-  GET_THREAD_MESSAGES: 'get_thread_messages',
-
-  LIST_BOTS: 'list_bots',
-} as const;

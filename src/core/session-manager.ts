@@ -170,7 +170,7 @@ export function buildNewTopicPrompt(
     const unmentionedBots = availableBots.filter(b => !mentionedOpenIds.has(b.openId));
     if (unmentionedBots.length > 0) {
       const botLines = unmentionedBots.map(b => `- ${b.displayName} (open_id: ${b.openId})`);
-      botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 send_to_thread 的 mentions 参数 @mention 它们协作，也可用 list_bots 工具查询。`;
+      botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 botmux send --mention 参数 @mention 它们协作，也可用 botmux bots list 查询。`;
     }
   }
 
@@ -231,6 +231,11 @@ export function buildFollowUpContent(
     });
     parts.push(`消息中的 @mention：\n${mentionLines.join('\n')}`);
   }
+
+  // Per-message routing hint — keeps the "use botmux send" instruction
+  // close to the latest attention window, preventing long-context forgetting.
+  // ~8 tokens per message, negligible cost.
+  parts.push('[回复请用 botmux send，终端输出用户看不到]');
 
   return parts.join('\n\n');
 }

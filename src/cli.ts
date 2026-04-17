@@ -471,6 +471,7 @@ interface SessionData {
   workingDir?: string;
   webPort?: number;
   larkAppId?: string;
+  ownerOpenId?: string;
 }
 
 /**
@@ -1150,8 +1151,13 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
 
-会话消息（在会话内自动推断 session-id）:
-  thread messages [--limit N]          拉取当前 Lark 话题的消息历史 (JSON)
+飞书消息（在 CLI 会话内自动推断 session）:
+  send [content]                       发消息到当前话题（支持 stdin / --content-file）
+       --images <path>                 内联图片（可重复）
+       --files <path>                  附件（可重复）
+       --mention <open_id:name>        @提及（可重复）
+  bots list                            列出当前群聊中的机器人（含 open_id）
+  thread messages [--limit N]          拉取当前话题的消息历史 (JSON)
 
 配置目录: ~/.botmux/
 文档: https://github.com/deepcoldy/botmux
@@ -1415,6 +1421,280 @@ async function cmdThreadMessages(rest: string[]): Promise<void> {
   }
 }
 
+// ─── Send subcommand ─────────────────────────────────────────────────────────
+
+/** Read all of stdin until EOF. Returns '' if stdin is a TTY (no piped data). */
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) { resolve(''); return; }
+    const chunks: Buffer[] = [];
+    process.stdin.on('data', (c) => chunks.push(c));
+    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+    process.stdin.on('error', () => resolve(''));
+  });
+}
+
+/** Collect all values for a repeatable flag: --flag v1 --flag v2 */
+function argValues(args: string[], ...flags: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    for (const f of flags) {
+      if (args[i] === f && i + 1 < args.length) { out.push(args[++i]); break; }
+      if (args[i].startsWith(f + '=')) { out.push(args[i].slice(f.length + 1)); break; }
+    }
+  }
+  return out;
+}
+
+async function cmdSend(rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const sessionIdArg = argValue(rest, '--session-id');
+  const images = argValues(rest, '--image', '--images');
+  const files = argValues(rest, '--file', '--files');
+  const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
+  const contentFile = argValue(rest, '--content-file');
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+
+  const sessions = loadSessions();
+  const s = sessions.get(sid);
+  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
+  if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+
+  // Read content from: --content-file > positional arg > stdin
+  let content = '';
+  if (contentFile) {
+    if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
+    content = readFileSync(contentFile, 'utf-8');
+  } else {
+    const pos = positionals(rest);
+    if (pos.length > 0) {
+      content = pos.join(' ');
+    } else {
+      content = await readStdin();
+    }
+  }
+
+  if (!content.trim() && images.length === 0 && files.length === 0) {
+    console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png');
+    process.exit(1);
+  }
+
+  // Parse mentions: "open_id:Display Name"
+  const mentions: Array<{ open_id: string; name: string }> = [];
+  for (const m of mentionArgs) {
+    const idx = m.indexOf(':');
+    if (idx > 0) {
+      mentions.push({ open_id: m.slice(0, idx), name: m.slice(idx + 1) });
+    }
+  }
+
+  // Validate file paths
+  for (const p of [...images, ...files]) {
+    if (!existsSync(p)) { console.error(`文件不存在: ${p}`); process.exit(1); }
+  }
+
+  // Register bots so Lark client works
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+
+  const { replyMessage, uploadImage, uploadFile } = await import('./im/lark/client.js');
+  const appId = s.larkAppId!;
+
+  try {
+    // Upload images in parallel
+    const imageKeys: string[] = [];
+    if (images.length > 0) {
+      const results = await Promise.all(images.map(p => uploadImage(appId, p)));
+      imageKeys.push(...results);
+    }
+
+    // Try to extract plain text if Claude accidentally sent post JSON as content
+    let text = content;
+    try {
+      const parsed = JSON.parse(text);
+      const inner = parsed.zh_cn ?? parsed.en_us ?? parsed;
+      if (Array.isArray(inner?.content)) {
+        const lines: string[] = [];
+        for (const para of inner.content) {
+          if (!Array.isArray(para)) continue;
+          lines.push(para.filter((n: any) => n.tag === 'text').map((n: any) => n.text).join(''));
+        }
+        text = lines.join('\n').trim();
+      }
+    } catch { /* not JSON, use as-is */ }
+
+    // Build post content: text → paragraphs, with @mention replacement
+    let mentionPattern: RegExp | null = null;
+    const mentionMap = new Map<string, string>();
+    if (mentions.length > 0) {
+      const patterns = mentions.map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+      mentionPattern = new RegExp(`@(${patterns.join('|')})\\b`, 'gi');
+      for (const m of mentions) mentionMap.set(m.name.toLowerCase(), m.open_id);
+    }
+
+    const postContent: any[][] = text ? text.split('\n').map((line: string) => {
+      if (!mentionPattern) return [{ tag: 'text', text: line }];
+      const nodes: any[] = [];
+      let lastIndex = 0;
+      for (const match of line.matchAll(mentionPattern)) {
+        const openId = mentionMap.get(match[1].toLowerCase());
+        if (!openId) continue;
+        if (match.index > lastIndex) nodes.push({ tag: 'text', text: line.slice(lastIndex, match.index) });
+        nodes.push({ tag: 'at', user_id: openId });
+        lastIndex = match.index + match[0].length;
+      }
+      if (lastIndex < line.length) nodes.push({ tag: 'text', text: line.slice(lastIndex) });
+      return nodes.length > 0 ? nodes : [{ tag: 'text', text: line }];
+    }) : [];
+
+    for (const key of imageKeys) postContent.push([{ tag: 'img', image_key: key }]);
+
+    // Unused mentions → append at end
+    if (mentions.length > 0) {
+      const usedIds = new Set<string>();
+      for (const para of postContent) for (const n of para) if (n.tag === 'at') usedIds.add(n.user_id);
+      const unused = mentions.filter(m => !usedIds.has(m.open_id));
+      if (unused.length > 0) {
+        if (postContent.length === 0) postContent.push([]);
+        for (const m of unused) postContent[postContent.length - 1].push({ tag: 'at', user_id: m.open_id });
+      }
+    }
+
+    // Append @mention to session owner
+    if (s.ownerOpenId) {
+      if (postContent.length === 0) postContent.push([]);
+      postContent[postContent.length - 1].push({ tag: 'at', user_id: s.ownerOpenId });
+    }
+
+    const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
+    const messageId = await replyMessage(appId, s.rootMessageId, postJson, 'post', true);
+
+    // Send file attachments as separate messages
+    const fileIds: string[] = [];
+    for (const fp of files) {
+      const fileKey = await uploadFile(appId, fp);
+      const fid = await replyMessage(appId, s.rootMessageId, JSON.stringify({ file_key: fileKey }), 'file', true);
+      fileIds.push(fid);
+    }
+
+    // Bot-to-bot mention signals
+    const dataDir = resolveDataDir();
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+    let botEntries: BotInfoEntry[] = [];
+    try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
+
+    const openIdToAppId = new Map<string, string>();
+    for (const e of botEntries) if (e.botOpenId) openIdToAppId.set(e.botOpenId, e.larkAppId);
+    try {
+      for (const file of readdirSync(dataDir)) {
+        if (!file.startsWith('bot-openids-') || !file.endsWith('.json')) continue;
+        try {
+          const crossRef: Record<string, string> = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+          for (const [botName, crossOpenId] of Object.entries(crossRef)) {
+            const entry = botEntries.find(e => e.botName?.toLowerCase() === botName.toLowerCase());
+            if (entry) openIdToAppId.set(crossOpenId, entry.larkAppId);
+          }
+        } catch { /* */ }
+      }
+    } catch { /* */ }
+
+    const targetAppIds = new Set<string>();
+    for (const m of mentions) {
+      const ta = openIdToAppId.get(m.open_id);
+      if (ta && ta !== appId) targetAppIds.add(ta);
+    }
+    if (text && botEntries.length > 0) {
+      for (const entry of botEntries) {
+        if (!entry.botOpenId || entry.larkAppId === appId) continue;
+        const names = [entry.botName, entry.cliId].filter(Boolean) as string[];
+        for (const name of names) {
+          if (new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text)) {
+            targetAppIds.add(entry.larkAppId); break;
+          }
+        }
+      }
+    }
+    if (targetAppIds.size > 0) {
+      const signalDir = join(dataDir, 'bot-mentions');
+      if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
+      for (const targetApp of targetAppIds) {
+        const te = botEntries.find(e => e.larkAppId === targetApp);
+        const signal = {
+          rootMessageId: s.rootMessageId, chatId: s.chatId, chatType: s.chatType,
+          senderAppId: appId, targetBotOpenId: te?.botOpenId ?? targetApp,
+          content: text, messageId, timestamp: Date.now(),
+        };
+        writeFileSync(join(signalDir, `${Date.now()}-${(te?.botOpenId ?? targetApp).slice(-8)}.json`), JSON.stringify(signal));
+      }
+    }
+
+    console.log(JSON.stringify({ success: true, messageId, sessionId: sid }));
+  } catch (err: any) {
+    console.error(`发送失败: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ─── Bots subcommand ─────────────────────────────────────────────────────────
+
+async function cmdBots(sub: string, rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+
+  if (sub !== 'list' && sub !== 'ls' && sub !== '') {
+    console.error('用法: botmux bots list [--session-id ID]');
+    process.exit(1);
+  }
+
+  const sessionIdArg = argValue(rest, '--session-id');
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+
+  const sessions = loadSessions();
+  const s = sessions.get(sid);
+  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
+  if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+
+  // Register bots
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+
+  const appId = s.larkAppId!;
+  const dataDir = resolveDataDir();
+  const botInfoPath = join(dataDir, 'bots-info.json');
+
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  let botEntries: BotInfoEntry[] = [];
+  try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
+
+  const botByCli = new Map<string, BotInfoEntry>();
+  for (const b of botEntries) botByCli.set(b.cliId, b);
+
+  try {
+    const { listChatBotMembers } = await import('./im/lark/client.js');
+    const chatBots = await listChatBotMembers(appId, s.chatId);
+    const result = chatBots.map(cb => {
+      const info = botByCli.get(cb.name);
+      return { name: cb.displayName, openId: cb.openId, isSelf: info?.larkAppId === appId };
+    });
+    console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
+  } catch (err: any) {
+    // Fallback to bots-info.json
+    const result = botEntries.filter(b => b.botOpenId).map(b => ({
+      name: b.botName ?? b.cliId, openId: b.botOpenId!, isSelf: b.larkAppId === appId,
+    }));
+    console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, note: `chat query failed: ${err.message}` }, null, 2));
+  }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 function getVersion(): string {
@@ -1445,6 +1725,8 @@ switch (command) {
   case 'del':
   case 'rm':      cmdDelete(); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'thread':   {
     const sub = process.argv[3] ?? '';
     if (sub === 'messages' || sub === 'msgs') await cmdThreadMessages(process.argv.slice(4));

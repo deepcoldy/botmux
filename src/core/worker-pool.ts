@@ -6,6 +6,7 @@ import { fork, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { ensureSkills } from '../skills/installer.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -110,43 +111,20 @@ function flushCardPatch(ds: DaemonSession): void {
 
 export const restartCounts = new Map<string, { count: number; lastAt: number }>();
 
-// ─── MCP config ─────────────────────────────────────────────────────────────
+// ─── Skills installation ────────────────────────────────────────────────────
 
-/** Track which CLI adapters have had MCP config ensured this daemon lifecycle */
-const mcpConfiguredCliIds = new Set<string>();
 /** Track which CLI adapters have had skills installed this daemon lifecycle */
 const skillsInstalledCliIds = new Set<string>();
 
 /**
- * Ensure the botmux MCP server is registered globally for a given CLI.
- * Delegates to the CLI adapter which knows the correct config file location.
+ * Ensure built-in skills are installed for a given CLI.
+ * Synchronous and idempotent — runs once per CLI per daemon lifecycle.
  */
-export function ensureMcpConfig(cliId: CliId, cliPathOverride?: string): void {
-  if (mcpConfiguredCliIds.has(cliId)) return;
+export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
+  if (skillsInstalledCliIds.has(cliId)) return;
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
-  // Resolve path relative to src/ (one level up from core/)
-  const serverScript = join(__dirname, '..', 'index.js');
-  adapter.ensureMcpConfig({
-    name: 'botmux',
-    command: 'node',
-    args: [serverScript],
-    env: {
-      BOTMUX: '1',  // Must be in config env: MCP SDK only passes config env to server subprocess
-      SESSION_DATA_DIR: config.session.dataDir,
-    },
-  });
-  mcpConfiguredCliIds.add(cliId);
-
-  // Install built-in skills (schedule, thread-messages) into the CLI's skill dir.
-  // Idempotent per lifecycle.
-  if (!skillsInstalledCliIds.has(cliId) && adapter.skillsDir) {
-    import('../skills/installer.js')
-      .then(({ ensureSkills }) => {
-        ensureSkills(cliId, adapter.skillsDir);
-        skillsInstalledCliIds.add(cliId);
-      })
-      .catch(err => logger.warn(`[worker-pool] Failed to install skills for ${cliId}: ${err.message}`));
-  }
+  ensureSkills(cliId, adapter.skillsDir);
+  skillsInstalledCliIds.add(cliId);
 }
 
 // ─── Kill worker ────────────────────────────────────────────────────────────
@@ -185,7 +163,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     ds.workerToken = null;
   }
 
-  ensureMcpConfig(botCfg.cliId, botCfg.cliPathOverride);
+  ensureCliSkills(botCfg.cliId, botCfg.cliPathOverride);
 
   const worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -501,7 +479,7 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     ds.workerToken = null;
   }
 
-  // NO ensureMcpConfig — adopt mode has no MCP
+  // No ensureCliSkills — adopt mode attaches to an existing CLI session
 
   const worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],

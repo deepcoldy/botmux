@@ -1,8 +1,5 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
 import { resolveCommand } from './registry.js';
-import type { CliAdapter, PtyHandle, McpServerEntry } from './types.js';
+import type { CliAdapter, PtyHandle } from './types.js';
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed) for \d+[smh]/;
 
@@ -24,12 +21,15 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       args.push('--append-system-prompt', [
         '你连接到了飞书（Lark）话题群。用户在飞书上阅读，看不到你的终端输出。',
-        '想让用户看到的内容必须通过 send_to_thread 工具发送，终端输出不会到达聊天。',
+        '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
         '',
         '使用指南：',
-        '- 用 send_to_thread 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。',
-        '- 发送纯文本即可，格式会自动处理。也可以通过 images 和 files 参数附带图片和文件。',
-        '- 需要上下文时用 get_thread_messages 读取之前的对话。',
+        '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。',
+        '- 发送纯文本即可：`botmux send "消息"` 或用 heredoc 传多行。格式自动处理。',
+        '- 附带图片：`botmux send --images /path/to/img.png "说明文字"`',
+        '- 附带文件：`botmux send --files /path/to/file.pdf "请查收"`',
+        '- 需要上下文时用 `botmux thread messages` 读取之前的对话。',
+        '- 查看可协作的机器人：`botmux bots list`',
       ].join('\n'));
       return args;
     },
@@ -52,42 +52,6 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         pty.write('\x1b[200~' + content + '\x1b[201~');
         await new Promise(r => setTimeout(r, submitDelay));
         pty.write('\r');
-      }
-    },
-
-    ensureMcpConfig(entry) {
-      const configPath = join(homedir(), '.claude.json');
-      let data: any = {};
-      if (existsSync(configPath)) {
-        try { data = JSON.parse(readFileSync(configPath, 'utf-8')); } catch { /* fresh */ }
-      }
-      if (!data.mcpServers) data.mcpServers = {};
-
-      // Clean up stale entries pointing to the same server script under a different name.
-      // Old installations may have entries (e.g. "claude-code-robot") with hardcoded
-      // LARK_APP_ID/SECRET that override per-bot credentials from the worker env.
-      const serverScript = entry.args[0];
-      let dirty = false;
-      for (const [name, cfg] of Object.entries(data.mcpServers) as [string, any][]) {
-        if (name !== entry.name && cfg?.args?.[0] === serverScript) {
-          delete data.mcpServers[name];
-          dirty = true;
-        }
-      }
-
-      const existing = data.mcpServers[entry.name];
-      const envMatch = existing && JSON.stringify(existing.env) === JSON.stringify(entry.env);
-      if (!dirty && existing && existing.args?.[0] === serverScript && envMatch) return;
-      data.mcpServers[entry.name] = {
-        command: entry.command,
-        args: entry.args,
-        env: entry.env,
-      };
-      try {
-        mkdirSync(dirname(configPath), { recursive: true });
-        writeFileSync(configPath, JSON.stringify(data, null, 2) + '\n');
-      } catch (err: any) {
-        console.warn(`[claude-code] Failed to write MCP config: ${err.message}`);
       }
     },
 

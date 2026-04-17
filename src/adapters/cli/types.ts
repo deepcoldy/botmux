@@ -8,13 +8,6 @@ export interface PtyHandle {
   pasteText?(text: string): void;
 }
 
-export interface McpServerEntry {
-  name: string;
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
-
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -40,9 +33,6 @@ export interface CliAdapter {
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete. */
   writeInput(pty: PtyHandle, content: string): Promise<void>;
-
-  /** Install MCP server config. Idempotent — skips if up to date. */
-  ensureMcpConfig(entry: McpServerEntry): void;
 
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
    *  skill directory.  When set, `ensureSkills` will write/refresh skill files

@@ -1,6 +1,5 @@
-import { execSync } from 'node:child_process';
 import { resolveCommand } from './registry.js';
-import type { CliAdapter, PtyHandle, McpServerEntry } from './types.js';
+import type { CliAdapter, PtyHandle } from './types.js';
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -30,31 +29,6 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         pty.write(content);
         await delay(1000);
         pty.write('\r');
-      }
-    },
-
-    ensureMcpConfig(entry: McpServerEntry) {
-      // Clean up stale entries (e.g. old "claude-code-robot" → renamed to "botmux")
-      for (const stale of ['claude-code-robot']) {
-        if (stale !== entry.name) {
-          try {
-            execSync(`${bin} mcp remove ${stale}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
-          } catch { /* not present — fine */ }
-        }
-      }
-      // Remove first so re-registration picks up env changes (e.g. new SESSION_DATA_DIR)
-      try {
-        execSync(`${bin} mcp remove ${entry.name}`, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
-      } catch { /* not registered yet — fine */ }
-
-      const envArgs = Object.entries(entry.env)
-        .map(([k, v]) => `--env ${k}=${v}`)
-        .join(' ');
-      const cmd = `${bin} mcp add ${entry.name} ${envArgs} -- ${entry.command} ${entry.args.join(' ')}`;
-      try {
-        execSync(cmd, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
-      } catch (err: any) {
-        console.warn(`[codex] Failed to add MCP config: ${err.message}`);
       }
     },
 

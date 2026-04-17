@@ -5,7 +5,6 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
-import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
 
 /**
@@ -109,27 +108,12 @@ export function createServer(): McpServer {
     },
   );
 
-  // Only register tools inside botmux sessions. Outside botmux, tools would
-  // fail anyway and just waste tool-description context tokens.
-  if (isBotmuxSession) {
-    for (const [name, tool] of Object.entries(tools)) {
-      server.tool(name, tool.description, tool.schema.shape, async (args: any) => {
-        // Auto-fill session_id from PID marker when the LLM omits it
-        if (autoSessionId && !args.session_id) {
-          args.session_id = autoSessionId;
-        }
-        logger.info(`Tool called: ${name}`, args);
-        const result = await tool.execute(args);
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
-        };
-      });
-    }
-  } else {
-    // Declare empty tools capability so CLI clients (e.g. Codex) that call
-    // tools/list during startup don't fail with "Method not found" (-32601).
-    server.server.registerCapabilities({ tools: {} });
-    server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+  // MCP tools removed — all capabilities migrated to CLI subcommands + Skills.
+  // Keep empty tools capability so old claude.json configs that still reference
+  // this MCP entry point don't fail with "Method not found" (-32601).
+  server.server.registerCapabilities({ tools: {} });
+  server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+  if (!isBotmuxSession) {
     logger.info('MCP server: not a botmux session — running as empty shell (no tools, no instructions)');
   }
 
