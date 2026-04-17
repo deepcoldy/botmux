@@ -4,6 +4,7 @@
  */
 import { fork, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills } from '../skills/installer.js';
@@ -165,13 +166,20 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
   ensureCliSkills(botCfg.cliId, botCfg.cliPathOverride);
 
+  // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
+  // The wrapper script there is written by the daemon at startup.
+  const botmuxBinDir = join(homedir(), '.botmux', 'bin');
+  const pathWithBotmux = `${botmuxBinDir}:${process.env.PATH ?? ''}`;
+
   const worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
     env: {
       ...process.env,
+      PATH: pathWithBotmux,
       CLAUDECODE: undefined,
       BOTMUX: '1',  // Inherited by CLI → MCP server for session detection
+      SESSION_DATA_DIR: config.session.dataDir,
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },

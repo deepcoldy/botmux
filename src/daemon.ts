@@ -1,7 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { replyMessage, resolveAllowedUsers, getMessageDetail } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
@@ -82,6 +86,10 @@ function getPidFile(): string {
   return join(config.session.dataDir, name);
 }
 
+/** Path to the wrapper bin directory — injected into worker PATH so CLIs
+ *  can call `botmux send` / `botmux schedule` without a global npm install. */
+const BOTMUX_BIN_DIR = join(homedir(), '.botmux', 'bin');
+
 function writePidFile(): void {
   const dir = config.session.dataDir;
   if (!existsSync(dir)) {
@@ -94,6 +102,26 @@ function writePidFile(): void {
     mkdirSync(join(homedir(), '.botmux'), { recursive: true });
     writeFileSync(breadcrumb, config.session.dataDir, 'utf-8');
   } catch { /* best effort */ }
+
+  // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
+  // regardless of whether the package was installed globally.  The wrapper
+  // points at THIS daemon's dist/cli.js, so it's always the same version.
+  try {
+    mkdirSync(BOTMUX_BIN_DIR, { recursive: true });
+    const cliScript = join(__dirname, 'cli.js');  // dist/cli.js
+    const wrapper = join(BOTMUX_BIN_DIR, 'botmux');
+    const content = `#!/bin/sh\nexec node "${cliScript}" "$@"\n`;
+    // Only write if changed (avoid unnecessary disk writes on every restart)
+    let existing = '';
+    try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* doesn't exist yet */ }
+    if (existing !== content) {
+      writeFileSync(wrapper, content, { mode: 0o755 });
+      logger.info(`Wrapper script written: ${wrapper} → ${cliScript}`);
+    }
+  } catch (err: any) {
+    logger.warn(`Failed to write botmux wrapper script: ${err.message}`);
+  }
+
   logger.info(`PID file written: ${getPidFile()} (pid: ${process.pid})`);
 }
 
