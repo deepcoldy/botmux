@@ -135,8 +135,6 @@ let displayMode: DisplayMode = 'hidden';
 let screenshotTimer: ReturnType<typeof setInterval> | null = null;
 let pendingShotTimer: ReturnType<typeof setTimeout> | null = null;
 let lastShotHash = '';
-/** Lines scrolled up from the live viewport (for half-page pagination). 0 = bottom. */
-let scrollOffset = 0;
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 
@@ -173,11 +171,11 @@ async function captureAndUpload(): Promise<void> {
   if (!larkAppIdForUpload || !larkAppSecretForUpload) return;
 
   const term = renderer.xterm;
-  const startY = renderer.startYFromOffset(scrollOffset, SHOT_ROWS);
+  const startY = term.buffer.active.baseY;
 
-  // Hash dedup — raw snapshot text + scroll offset; identical → skip upload
+  // Hash dedup — same content → skip upload
   const snap = renderer.rawSnapshot();
-  const hash = createHash('md5').update(snap).update(`|${scrollOffset}`).digest('hex');
+  const hash = createHash('md5').update(snap).digest('hex');
   if (hash === lastShotHash) return;
   lastShotHash = hash;
 
@@ -204,42 +202,72 @@ async function captureAndUpload(): Promise<void> {
 
 function applyDisplayMode(mode: DisplayMode): void {
   displayMode = mode;
-  scrollOffset = 0;
   lastShotHash = '';
   if (mode === 'screenshot') startScreenshotLoop();
   else stopScreenshotLoop();
 }
 
-const TMUX_KEY_MAP: Record<TermActionKey, string | null> = {
+// Quick-action key → real key event for the CLI (tmux send-keys names + PTY ANSI seqs).
+const TMUX_KEY_MAP: Record<TermActionKey, string> = {
   esc: 'Escape', ctrlc: 'C-c', tab: 'Tab', enter: 'Enter', space: 'Space',
   up: 'Up', down: 'Down', left: 'Left', right: 'Right',
-  half_page_up: null, half_page_down: null,
+  half_page_up: 'PPage', half_page_down: 'NPage',
 };
-const PTY_SEQ_MAP: Record<TermActionKey, string | null> = {
+const PTY_SEQ_MAP: Record<TermActionKey, string> = {
   esc: '\x1b', ctrlc: '\x03', tab: '\t', enter: '\r', space: ' ',
   up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C',
-  half_page_up: null, half_page_down: null,
+  half_page_up: '\x1b[5~', half_page_down: '\x1b[6~',
 };
 
+// ── Tmux copy-mode scroll state ────────────────────────────────────────────
+// TUIs (Claude Code, vim, etc.) run in the alternate screen buffer which has
+// no in-buffer scrollback — PageUp/PageDown sent to the CLI typically does
+// nothing. In tmux mode we instead use tmux's own copy-mode to scroll the
+// pane viewport into history; pipe-pane streams the scrolled view back to
+// our headless terminal so the next screenshot captures it.
+let tmuxScrolledHalfPages = 0;
+
+function exitTmuxScrollMode(): void {
+  if (tmuxScrolledHalfPages === 0 || !backend || !('sendCopyModeCommand' in backend)) return;
+  try { (backend as any).sendCopyModeCommand('cancel'); } catch { /* benign */ }
+  tmuxScrolledHalfPages = 0;
+}
+
 function handleTermAction(key: TermActionKey): void {
-  // Pagination: scroll the screenshot viewport, don't touch the backend
-  if (key === 'half_page_up' || key === 'half_page_down') {
-    const half = Math.max(1, Math.floor(SHOT_ROWS / 2));
-    scrollOffset += key === 'half_page_up' ? half : -half;
-    if (scrollOffset < 0) scrollOffset = 0;
-    log(`Scroll offset → ${scrollOffset}`);
+  if (!backend) return;
+  const isHalfPage = key === 'half_page_up' || key === 'half_page_down';
+
+  // Tmux copy-mode scroll (works around alternate-buffer scrollback limitation)
+  if (isHalfPage && 'sendCopyModeCommand' in backend) {
+    const tb = backend as any;
+    try {
+      if (tmuxScrolledHalfPages === 0 && key === 'half_page_up') {
+        tb.enterCopyMode();
+      }
+      if (key === 'half_page_up' || tmuxScrolledHalfPages > 0) {
+        tb.sendCopyModeCommand(key === 'half_page_up' ? 'halfpage-up' : 'halfpage-down');
+        tmuxScrolledHalfPages += key === 'half_page_up' ? 1 : -1;
+        if (tmuxScrolledHalfPages <= 0) {
+          tmuxScrolledHalfPages = 0;
+          // -e flag to copy-mode auto-exits when scrolled to bottom; cancel as fallback.
+          try { tb.sendCopyModeCommand('cancel'); } catch { /* benign */ }
+        }
+      }
+      log(`Tmux scroll: ${key} → ${tmuxScrolledHalfPages} halfpages above bottom`);
+    } catch (err: any) {
+      log(`Tmux scroll failed: ${err.message}`);
+    }
     scheduleOneShotAfterAction();
     return;
   }
 
-  if (!backend) return;
-  // Real key input — reset scroll so the user sees live state
-  scrollOffset = 0;
+  // Any non-scroll key cancels active scroll first so the live view returns.
+  if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
 
   if ('sendSpecialKeys' in backend && TMUX_KEY_MAP[key]) {
     (backend as any).sendSpecialKeys(TMUX_KEY_MAP[key]);
   } else if (PTY_SEQ_MAP[key]) {
-    backend.write(PTY_SEQ_MAP[key]!);
+    backend.write(PTY_SEQ_MAP[key]);
   }
   log(`Term action: ${key}`);
   scheduleOneShotAfterAction();
@@ -927,6 +955,8 @@ process.on('message', async (raw: unknown) => {
     case 'message': {
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
+      // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
+      if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
       if (lastInitConfig?.adoptMode) {
         // Adopt mode: raw write to PTY (no adapter writeInput)

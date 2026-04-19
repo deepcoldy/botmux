@@ -167,6 +167,26 @@ export class TmuxBackend implements SessionBackend {
   }
 
   /**
+   * Enter copy-mode on the pane (`-e` makes it auto-exit when scrolled back to
+   * the bottom). Lets us use tmux's own scrollback even when the running app
+   * is in the alternate screen buffer (Claude Code, vim, etc.).
+   */
+  enterCopyMode(): void {
+    execFileSync('tmux', ['copy-mode', '-e', '-t', this.sessionName], {
+      stdio: 'ignore',
+      timeout: 5000,
+    });
+  }
+
+  /** Send a copy-mode X-command (e.g. 'halfpage-up', 'halfpage-down', 'cancel'). */
+  sendCopyModeCommand(xCommand: string): void {
+    execFileSync('tmux', ['send-keys', '-t', this.sessionName, '-X', xCommand], {
+      stdio: 'ignore',
+      timeout: 5000,
+    });
+  }
+
+  /**
    * Paste text into the tmux pane via load-buffer + paste-buffer.
    * Tmux automatically wraps in bracketed paste if the pane has it enabled.
    * Safe for multiline content (unlike sendText where \n becomes Enter).

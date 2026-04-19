@@ -282,15 +282,6 @@ export class TerminalRenderer {
   /** Expose the underlying xterm-headless instance for screenshot rendering. */
   get xterm(): InstanceType<typeof Terminal> { return this.terminal; }
 
-  /** Resolve a startY (absolute line) given a viewport offset (lines from bottom).
-   *  offsetLines=0 means current viewport top, positive scrolls toward older content. */
-  startYFromOffset(offsetLines: number, displayRows: number): number {
-    const buffer = this.terminal.buffer.active;
-    const baseY = buffer.baseY;
-    const target = baseY - Math.max(0, offsetLines);
-    return Math.max(0, target);
-  }
-
   dispose(): void {
     this.terminal.dispose();
   }
