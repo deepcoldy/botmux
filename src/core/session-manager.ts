@@ -240,6 +240,33 @@ export function buildFollowUpContent(
   return parts.join('\n\n');
 }
 
+// ─── Stream-card state persistence ───────────────────────────────────────────
+
+/** Sentinel value (CARD_POSTING_SENTINEL from worker-pool) we must skip — it marks an in-flight POST, not a real message_id. */
+const STREAM_CARD_SENTINEL = '__posting__';
+
+/**
+ * Copy current streaming-card fields from `ds` into the persisted Session and save.
+ * Lets the existing card be PATCHed on next screen_update after a daemon restart,
+ * instead of a fresh card being POSTed.
+ */
+export function persistStreamCardState(ds: DaemonSession): void {
+  const cardId = ds.streamCardId === STREAM_CARD_SENTINEL ? undefined : ds.streamCardId;
+  const s = ds.session;
+  // Skip write if nothing actually changed — avoids disk churn on every screen_update.
+  if (
+    s.streamCardId === cardId &&
+    s.streamCardNonce === ds.streamCardNonce &&
+    s.streamExpanded === ds.streamExpanded &&
+    s.currentTurnTitle === ds.currentTurnTitle
+  ) return;
+  s.streamCardId = cardId;
+  s.streamCardNonce = ds.streamCardNonce;
+  s.streamExpanded = ds.streamExpanded;
+  s.currentTurnTitle = ds.currentTurnTitle;
+  sessionStore.updateSession(s);
+}
+
 // ─── Session restore ─────────────────────────────────────────────────────────
 
 export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): void {
@@ -282,6 +309,10 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         hasHistory: false,
         workingDir: adopted.cwd,
         adoptedFrom: adopted as DaemonSession['adoptedFrom'],
+        streamCardId: session.streamCardId,
+        streamCardNonce: session.streamCardNonce,
+        streamExpanded: session.streamExpanded,
+        currentTurnTitle: session.currentTurnTitle,
       };
       activeSessions.set(sessionKey(session.rootMessageId, larkAppId), ds);
       forkAdoptWorker(ds);
@@ -310,6 +341,15 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       lastMessageAt: Date.now(),
       hasHistory: true,  // restored sessions have prior CLI history
       workingDir: session.workingDir,
+      // Restore persisted streaming-card state — next screen_update will PATCH
+      // the existing card instead of POSTing a fresh one. If the card was
+      // withdrawn while we were down, the PATCH fails with MessageWithdrawnError
+      // and the existing handler (worker-pool flushCardPatch) clears streamCardId,
+      // letting the next update create a new card.
+      streamCardId: session.streamCardId,
+      streamCardNonce: session.streamCardNonce,
+      streamExpanded: session.streamExpanded,
+      currentTurnTitle: session.currentTurnTitle,
     });
 
     logger.debug(`Registered session ${session.sessionId} (thread: ${session.rootMessageId})`);

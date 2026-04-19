@@ -46,6 +46,7 @@ import {
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
+  persistStreamCardState,
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
@@ -533,11 +534,13 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     // Mark new turn — next screen_update will create a fresh streaming card
     ds.streamCardPending = true;
     ds.currentTurnTitle = parsed.content.substring(0, 50);
+    persistStreamCardState(ds);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     ds.currentTurnTitle = parsed.content.substring(0, 50);
+    persistStreamCardState(ds);
     forkWorker(ds, parsed.content, ds.hasHistory);
   }
 }
@@ -591,6 +594,7 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
     ds.lastMessageAt = Date.now();
     ds.streamCardPending = true;
     ds.currentTurnTitle = signal.content.substring(0, 50);
+    persistStreamCardState(ds);
     ds.worker.send({ type: 'message', content: enrichedContent } as DaemonToWorker);
     logger.info(`[bot-mention] Routed message from ${signal.senderAppId} to ${targetAppId} in thread ${signal.rootMessageId}`);
   } else {

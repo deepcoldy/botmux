@@ -12,6 +12,12 @@ export interface Session {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
+  /** Persisted streaming-card state — allows the existing card to be PATCHed
+   *  (rather than a fresh POST) after daemon restart. */
+  streamCardId?: string;
+  streamCardNonce?: string;
+  streamExpanded?: boolean;
+  currentTurnTitle?: string;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts. */
   adoptedFrom?: {
     tmuxTarget: string;

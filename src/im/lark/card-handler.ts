@@ -12,7 +12,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, killWorker, scheduleCardPatch } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots } from '../../core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState } from '../../core/session-manager.js';
 import type { DaemonToWorker } from '../../types.js';
 import { sessionKey } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -160,6 +160,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ds.streamCardPending = undefined;
       ds.lastScreenContent = undefined;
       ds.lastScreenStatus = undefined;
+      ds.session.streamCardId = undefined;
+      ds.session.streamCardNonce = undefined;
+      ds.session.streamExpanded = undefined;
+      ds.session.currentTurnTitle = undefined;
       sessionStore.updateSession(ds.session);
 
       // Fork standard Botmux worker with resume — BEFORE killing original CLI,
@@ -257,6 +261,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // Current (latest) streaming card — toggle normally
         const botCfg = getBot(ds.larkAppId).config;
         ds.streamExpanded = !ds.streamExpanded;
+        persistStreamCardState(ds);
         if (ds.streamCardId && ds.workerPort) {
           const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
           const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);

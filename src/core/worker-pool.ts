@@ -11,6 +11,7 @@ import { ensureSkills } from '../skills/installer.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
+import { persistStreamCardState } from './session-manager.js';
 import { updateMessage, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildSessionCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
@@ -96,6 +97,7 @@ function flushCardPatch(ds: DaemonSession): void {
       if (err instanceof MessageWithdrawnError) {
         logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
         ds.streamCardId = undefined;
+        persistStreamCardState(ds);
         return;
       }
       logger.debug(`[${tag(ds)}] Failed to update streaming card: ${err}`);
@@ -361,6 +363,44 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         const writeUrl = `${readOnlyUrl}?token=${msg.token}`;
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
 
+        // If a previous streaming card survived (e.g. daemon restart), try to
+        // PATCH it with the new "starting" state instead of POSTing a fresh card.
+        // ds.streamCardPending forces a new card (e.g. mid-session repo switch
+        // explicitly cleared streamCardId before re-fork — keep that behaviour).
+        const restoredCardId =
+          ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && !ds.streamCardPending
+            ? ds.streamCardId
+            : undefined;
+        if (restoredCardId) {
+          try {
+            const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+            // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
+            if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
+            const streamCardJson = buildStreamingCard(
+              ds.session.sessionId,
+              ds.session.rootMessageId,
+              readOnlyUrl,
+              initTitle,
+              ds.lastScreenContent ?? '',
+              'starting',
+              botCfg.cliId,
+              ds.streamExpanded,
+              ds.streamCardNonce,
+              isAdopt,
+              showTakeover,
+            );
+            await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
+            persistStreamCardState(ds);
+            logger.info(`[${t}] Reused existing streaming card ${restoredCardId.substring(0, 12)} after worker (re)start`);
+            break;
+          } catch (err) {
+            // PATCH failed (withdrawn, expired, etc.) — fall through to POST a fresh card.
+            logger.info(`[${t}] Failed to reuse existing streaming card (${err instanceof Error ? err.message : err}), posting new one`);
+            ds.streamCardId = undefined;
+            persistStreamCardState(ds);
+          }
+        }
+
         // Send streaming card to group thread (read-only link, will be PATCHed with live output)
         // Set sentinel BEFORE await so concurrent screen_update messages
         // (which can arrive while the POST is in-flight) don't POST a duplicate card.
@@ -382,6 +422,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             showTakeover,
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
+          persistStreamCardState(ds);
         } catch (err) {
           if (err instanceof MessageWithdrawnError) {
             logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -392,6 +433,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
           // Clear sentinel so screen_updates can create a streaming card later
           ds.streamCardId = undefined;
+          persistStreamCardState(ds);
           // Fallback: send static session card
           try {
             const cardJson = buildSessionCard(
@@ -456,7 +498,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           ds.streamCardPending = false;
           ds.streamCardId = CARD_POSTING_SENTINEL;
           cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
-            .then(msgId => { ds.streamCardId = msgId; })
+            .then(msgId => { ds.streamCardId = msgId; persistStreamCardState(ds); })
             .catch(err => {
               if (err instanceof MessageWithdrawnError) {
                 logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -466,6 +508,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
+              persistStreamCardState(ds);
             });
         } else {
           // Same turn — queue PATCH (serialized, latest-wins), reuse existing nonce
