@@ -1490,25 +1490,55 @@ function parseTableBlock(block: string): any | null {
 }
 
 /**
- * Split markdown into card v2 body elements: pipe-table blocks become native
- * `table` elements, remaining prose becomes `markdown` elements (with ATX
- * headings promoted to bold since the markdown element doesn't render `#`).
+ * Split markdown into card v2 body elements:
+ *   1. Fenced code blocks are preserved verbatim (shielded from heading/table
+ *      transforms so `#` and `|` inside code don't get mis-parsed).
+ *   2. Pipe-table blocks in prose become native `table` elements.
+ *   3. Everything else becomes a `markdown` element with ATX headings promoted
+ *      to bold (Feishu's markdown element doesn't render `#`).
+ * Consecutive markdown fragments are merged so the card keeps reasonable
+ * element counts.
  */
 function buildCardBodyElements(md: string): any[] {
   const elements: any[] = [];
-  const re = /(?:^[ \t]*\|.+\|[ \t]*\r?\n?){2,}/gm;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(md)) !== null) {
-    const pre = md.slice(cursor, match.index).replace(/\s+$/, '');
-    if (pre) elements.push({ tag: 'markdown', content: transformHeadings(pre) });
-    const table = parseTableBlock(match[0]);
-    if (table) elements.push(table);
-    else elements.push({ tag: 'markdown', content: transformHeadings(match[0]) });
-    cursor = match.index + match[0].length;
+  let buffer = '';
+  const flushBuffer = () => {
+    const t = buffer.replace(/^\s+|\s+$/g, '');
+    if (t) elements.push({ tag: 'markdown', content: transformHeadings(t) });
+    buffer = '';
+  };
+
+  // Segment by fenced code blocks (``` ... ```)
+  const fenceRe = /^```[^\n]*\n[\s\S]*?^```[ \t]*$/gm;
+  const segments: Array<{ type: 'prose' | 'code'; text: string }> = [];
+  let fCursor = 0;
+  let fm: RegExpExecArray | null;
+  while ((fm = fenceRe.exec(md)) !== null) {
+    if (fm.index > fCursor) segments.push({ type: 'prose', text: md.slice(fCursor, fm.index) });
+    segments.push({ type: 'code', text: fm[0] });
+    fCursor = fm.index + fm[0].length;
   }
-  const tail = md.slice(cursor).replace(/^\s+/, '').replace(/\s+$/, '');
-  if (tail) elements.push({ tag: 'markdown', content: transformHeadings(tail) });
+  if (fCursor < md.length) segments.push({ type: 'prose', text: md.slice(fCursor) });
+
+  for (const seg of segments) {
+    if (seg.type === 'code') {
+      buffer += (buffer && !buffer.endsWith('\n') ? '\n' : '') + seg.text + '\n';
+      continue;
+    }
+    const tableRe = /(?:^[ \t]*\|.+\|[ \t]*\r?\n?){2,}/gm;
+    let tCursor = 0;
+    let tm: RegExpExecArray | null;
+    while ((tm = tableRe.exec(seg.text)) !== null) {
+      buffer += seg.text.slice(tCursor, tm.index);
+      flushBuffer();
+      const table = parseTableBlock(tm[0]);
+      if (table) elements.push(table);
+      else buffer += tm[0];
+      tCursor = tm.index + tm[0].length;
+    }
+    buffer += seg.text.slice(tCursor);
+  }
+  flushBuffer();
   return elements;
 }
 
@@ -1646,16 +1676,26 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (s.ownerOpenId) trailingAts.push(`<at id=${s.ownerOpenId}></at>`);
       if (trailingAts.length > 0) md = md ? `${md}\n\n${trailingAts.join(' ')}` : trailingAts.join(' ');
 
-      const elements: any[] = md ? buildCardBodyElements(md) : [];
-      for (const key of imageKeys) {
-        elements.push({
-          tag: 'img',
-          img_key: key,
-          alt: { tag: 'plain_text', content: '' },
-          scale_type: 'fit_horizontal',
-          preview: true,
+      // Inline images into the markdown via ![](img_key). If caller used an
+      // `![alt](img:N)` placeholder, substitute by 0-based index; any remaining
+      // images get appended at the end so they flow with the text.
+      let mdWithImages = md;
+      const usedImgIdx = new Set<number>();
+      if (imageKeys.length > 0) {
+        mdWithImages = mdWithImages.replace(/!\[([^\]]*)\]\(img:(\d+)\)/g, (full, alt: string, idxStr: string) => {
+          const idx = Number(idxStr);
+          if (idx < 0 || idx >= imageKeys.length) return full;
+          usedImgIdx.add(idx);
+          return `![${alt}](${imageKeys[idx]})`;
         });
+        const trailing = imageKeys
+          .map((k, i) => (usedImgIdx.has(i) ? '' : `![](${k})`))
+          .filter(Boolean)
+          .join('\n\n');
+        if (trailing) mdWithImages = mdWithImages ? `${mdWithImages}\n\n${trailing}` : trailing;
       }
+
+      const elements = mdWithImages ? buildCardBodyElements(mdWithImages) : [];
       const cardJson = JSON.stringify({
         schema: '2.0',
         config: { update_multi: true },
