@@ -522,11 +522,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               persistStreamCardState(ds);
             });
         } else {
-          // Same turn — gating:
-          //   text mode: PATCH on every update (markdown content changes)
-          //   screenshot/hidden: PATCH only on status change (image PATCH happens via screenshot_uploaded)
+          // Same turn — PATCH only on status change. Image PATCHes go through
+          // the screenshot_uploaded path; text is no longer a card body mode.
           const statusChanged = prevStatus !== msg.status;
-          if (mode !== 'text' && !statusChanged) break;
+          if (!statusChanged) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,

@@ -91,7 +91,7 @@ export function buildSessionCard(
 const MAX_CONTENT_BYTES = 100_000;
 
 /** Truncate content to fit within MAX_CONTENT_BYTES, keeping the tail (most recent output). */
-function truncateContent(content: string): string {
+export function truncateContent(content: string): string {
   if (Buffer.byteLength(content, 'utf-8') <= MAX_CONTENT_BYTES) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
@@ -116,10 +116,9 @@ function truncateContent(content: string): string {
  * displayMode:
  *   - 'hidden'     — body collapsed; only header + main controls visible.
  *   - 'screenshot' — img element (rendered server-side, uploaded for img_key).
- *   - 'text'       — markdown element with terminal text content.
  *
  * Quick-action buttons (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½屏 ↑/↓) appear
- * whenever displayMode !== 'hidden', regardless of body type.
+ * whenever displayMode !== 'hidden'.
  */
 export function buildStreamingCard(
   sessionId: string,
@@ -155,10 +154,6 @@ export function buildStreamingCard(
       elements.push({ tag: 'markdown', content: '_(等待第一张截图…)_' });
     }
     elements.push({ tag: 'hr' });
-  } else if (displayMode === 'text') {
-    const displayContent = truncateContent(screenContent) || '(等待输出…)';
-    elements.push({ tag: 'markdown', content: displayContent });
-    elements.push({ tag: 'hr' });
   }
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
@@ -173,9 +168,9 @@ export function buildStreamingCard(
   if (displayMode !== 'hidden') {
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: displayMode === 'text' ? '🖼️ 截图' : '📝 文字' },
+      text: { tag: 'plain_text', content: '📝 导出文字' },
       type: 'default' as const,
-      value: { action: 'toggle_mode', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
+      value: { action: 'export_text', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
     });
   }
   if (displayMode === 'screenshot') {

@@ -18,7 +18,7 @@ export interface Session {
   streamCardNonce?: string;
   /** Legacy field kept for migrating sessions persisted before displayMode was added. */
   streamExpanded?: boolean;
-  /** Card body display mode — 'hidden' | 'text' | 'screenshot'. */
+  /** Card body display mode — 'hidden' | 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key, persisted so card can re-render after restart. */
   currentImageKey?: string;
@@ -109,7 +109,7 @@ export interface ScheduledTask {
 // ─── Worker IPC Messages ─────────────────────────────────────────────────────
 
 /** Display modes for the streaming card output. */
-export type DisplayMode = 'hidden' | 'text' | 'screenshot';
+export type DisplayMode = 'hidden' | 'screenshot';
 
 /** Quick-action keys sent from card buttons to the worker's PTY/tmux backend. */
 export type TermActionKey =

@@ -320,7 +320,9 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         adoptedFrom: adopted as DaemonSession['adoptedFrom'],
         streamCardId: session.streamCardId,
         streamCardNonce: session.streamCardNonce,
-        displayMode: session.displayMode ?? (session.streamExpanded ? 'text' : 'hidden'),
+        displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
+          ? session.displayMode
+          : (session.streamExpanded ? 'screenshot' : 'hidden'),
         currentImageKey: session.currentImageKey,
         currentTurnTitle: session.currentTurnTitle,
       };
@@ -358,7 +360,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
-      displayMode: session.displayMode ?? (session.streamExpanded ? 'text' : 'hidden'),
+      displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
     });

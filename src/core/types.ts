@@ -4,7 +4,7 @@ import type { Session, DaemonToWorker, LarkAttachment, LarkMention, DisplayMode 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
   messageId: string;      // Lark message_id for PATCHing
-  content: string;        // frozen text snapshot (used in text mode)
+  content: string;        // frozen text snapshot — kept so "导出文字" still works on historical cards
   title: string;          // turn title at freeze time
   /** Legacy boolean expand/collapse — kept for migrating old persisted cards. */
   expanded?: boolean;
@@ -14,10 +14,12 @@ export interface FrozenCard {
   imageKey?: string;
 }
 
-/** Resolve effective display mode for a frozen card (with backward-compat). */
+/** Resolve effective display mode for a frozen card.
+ *  Legacy persisted values (e.g. `'text'` from pre-v2.4 cards) map to
+ *  `'screenshot'` so old cards still render meaningfully. */
 export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
-  if (fc.displayMode) return fc.displayMode;
-  return fc.expanded ? 'text' : 'hidden';
+  if (fc.displayMode === 'screenshot' || fc.displayMode === 'hidden') return fc.displayMode;
+  return fc.expanded ? 'screenshot' : 'hidden';
 }
 
 /** Core session state — IM-agnostic.

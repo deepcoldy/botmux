@@ -7,7 +7,7 @@ import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, getCliDisplayName } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
@@ -57,7 +57,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'toggle_mode', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     const ds = rootId ? activeSessions.get(rootId) : undefined;
@@ -327,23 +327,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
 
-    // Display & mode toggles (new). 'toggle_stream' is the legacy alias from
-    // pre-screenshot cards and is mapped to toggle_display semantics.
-    if ((actionType === 'toggle_display' || actionType === 'toggle_stream' || actionType === 'toggle_mode') && ds) {
+    // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
+    // from pre-screenshot cards and is mapped to toggle_display semantics.
+    if ((actionType === 'toggle_display' || actionType === 'toggle_stream') && ds) {
       const clickedNonce: string | undefined = value?.card_nonce;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 
-      // Compute next mode for a current vs frozen card
-      function nextMode(current: DisplayMode, hasImage: boolean): DisplayMode {
-        if (actionType === 'toggle_mode') {
-          if (current === 'hidden') return 'screenshot';
-          // Switch text↔screenshot when shown
-          return current === 'text' ? 'screenshot' : 'text';
-        }
-        // toggle_display / legacy toggle_stream: hidden ↔ shown (default screenshot)
-        if (current === 'hidden') return hasImage || actionType !== 'toggle_stream' ? 'screenshot' : 'text';
-        return 'hidden';
-      }
+      const nextMode = (current: DisplayMode): DisplayMode =>
+        current === 'hidden' ? 'screenshot' : 'hidden';
 
       if (isFrozenClick) {
         // Historical card — toggle using cached state
@@ -354,7 +345,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           return;
         }
         const cur = frozenDisplayMode(frozen);
-        const next = nextMode(cur, !!frozen.imageKey);
+        const next = nextMode(cur);
         frozen.displayMode = next;
         frozen.expanded = next !== 'hidden';
         const botCfg = getBot(ds.larkAppId).config;
@@ -383,7 +374,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Current (latest) card — change displayMode + tell worker
       const botCfg = getBot(ds.larkAppId).config;
       const cur: DisplayMode = ds.displayMode ?? 'hidden';
-      const next = nextMode(cur, !!ds.currentImageKey);
+      const next = nextMode(cur);
       ds.displayMode = next;
       persistStreamCardState(ds);
       if (ds.worker) {
@@ -409,6 +400,25 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
       logger.info(`[${tag(ds)}] Display mode → ${next}`);
+      return;
+    }
+
+    // Export current terminal text as a thread reply. One-shot action — the
+    // card body itself stays in screenshot mode. For frozen cards, export
+    // from the cached frozen content; for the live card, use ds.lastScreenContent.
+    if (actionType === 'export_text' && ds) {
+      const clickedNonce: string | undefined = value?.card_nonce;
+      const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
+      let content = '';
+      if (isFrozenClick) {
+        if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
+        content = ds.frozenCards.get(clickedNonce!)?.content ?? '';
+      } else {
+        content = ds.lastScreenContent ?? '';
+      }
+      const body = content.trim() ? truncateContent(content) : '(当前无输出内容)';
+      await sessionReply(ds.session.rootMessageId, body);
+      logger.info(`[${tag(ds)}] Exported terminal text (${body.length} chars)`);
       return;
     }
 
