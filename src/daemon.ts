@@ -32,7 +32,7 @@ import {
   CARD_POSTING_SENTINEL,
 } from './core/worker-pool.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, handleCommand } from './core/command-handler.js';
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
 import {
@@ -267,6 +267,10 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   // Intercept daemon commands in new topics (no session needed for some commands)
   if (content.startsWith('/')) {
     const cmd = content.split(/\s+/)[0].toLowerCase();
+    if (PASSTHROUGH_COMMANDS.has(cmd)) {
+      await sessionReply(messageId, `${cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。`, 'text', larkAppId);
+      return;
+    }
     if (DAEMON_COMMANDS.has(cmd)) {
       const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
       session.larkAppId = larkAppId;
@@ -377,6 +381,17 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   // Intercept daemon commands
   if (content.startsWith('/')) {
     const cmd = content.split(/\s+/)[0].toLowerCase();
+    if (PASSTHROUGH_COMMANDS.has(cmd)) {
+      const ds = activeSessions.get(sessionKey(rootId, larkAppId));
+      if (ds?.worker && !ds.worker.killed) {
+        ds.worker.send({ type: 'raw_input', content } as DaemonToWorker);
+        ds.lastMessageAt = Date.now();
+        logger.info(`[${rootId.substring(0, 12)}] Passthrough ${cmd} → worker`);
+      } else {
+        sessionReply(rootId, `${cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。`, 'text', larkAppId);
+      }
+      return;
+    }
     if (DAEMON_COMMANDS.has(cmd)) {
       handleCommand(cmd, rootId, parsed, commandDeps, larkAppId);
       return;

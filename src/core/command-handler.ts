@@ -14,7 +14,6 @@ import { scanProjects, scanMultipleProjects } from '../services/project-scanner.
 import { buildRepoSelectCard, buildAdoptSelectCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { deleteMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
@@ -25,7 +24,16 @@ import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/cost', '/schedule', '/login', '/adopt']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt']);
+
+/**
+ * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
+ * Claude Code's `/compact`, `/model`, `/usage`). The daemon does NOT handle
+ * these — it just relays them to the worker via a raw_input IPC message,
+ * bypassing the normal prompt-wrapping and bracketed-paste path so the CLI's
+ * own slash-command parser sees them.
+ */
+export const PASSTHROUGH_COMMANDS = new Set(['/compact', '/model', '/clear', '/plugin', '/usage']);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -186,22 +194,6 @@ export async function handleCommand(
           const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
           await sessionReply(rootId, `会话已关闭，${cliName} 进程已终止。`);
           logger.info(`[${t}] Session closed by /close command`);
-        } else {
-          await sessionReply(rootId, '当前话题没有活跃的会话。');
-        }
-        break;
-      }
-
-      case '/clear': {
-        if (ds) {
-          killWorker(ds);
-          sessionStore.closeSession(ds.session.sessionId);
-          const newSession = sessionStore.createSession(ds.chatId, rootId, ds.session.title, ds.chatType);
-          ds.session = newSession;
-          ds.cliVersion = getCurrentCliVersion();
-          ds.hasHistory = false;
-          await sessionReply(rootId, `上下文已清除，下次发消息时将使用新会话。\nNew Session: ${newSession.sessionId}`);
-          logger.info(`[${t}] Context cleared by /clear command, new session: ${newSession.sessionId}`);
         } else {
           await sessionReply(rootId, '当前话题没有活跃的会话。');
         }
@@ -397,31 +389,6 @@ export async function handleCommand(
         break;
       }
 
-      case '/cost': {
-        if (ds) {
-          const cwd = getSessionWorkingDir(ds);
-          const cost = getSessionCost(ds.session.sessionId, cwd);
-          if (cost) {
-            const lines = [
-              `Session: ${ds.session.sessionId}`,
-              `Model: ${cost.model || 'unknown'}`,
-              `Turns: ${cost.turns}`,
-              `Input tokens: ${formatNumber(cost.inputTokens)}`,
-              `Output tokens: ${formatNumber(cost.outputTokens)}`,
-              `Cache read: ${formatNumber(cost.cacheReadTokens)}`,
-              `Cache creation: ${formatNumber(cost.cacheCreateTokens)}`,
-            ];
-            await sessionReply(rootId, lines.join('\n'));
-          } else {
-            await sessionReply(rootId, `未找到会话 ${ds.session.sessionId} 的 token 数据。`);
-          }
-          logger.info(`[${t}] Cost queried for session ${ds.session.sessionId}`);
-        } else {
-          await sessionReply(rootId, '当前话题没有活跃的会话。');
-        }
-        break;
-      }
-
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
@@ -492,13 +459,14 @@ export async function handleCommand(
         const help = [
           '📌 会话管理：',
           `/close      - 关闭当前会话，终止 ${cliName} 进程`,
-          `/clear      - 清除上下文，重启 ${cliName} 进程`,
           `/restart    - 重启 ${cliName} 进程（保留 session）`,
           `/cd <path>  - 切换工作目录并重启 ${cliName} 进程`,
           '/repo       - 查看项目列表（交互式下拉 + 文本列表）',
           '/repo <N>   - 切换到第 N 个项目',
-          '/cost       - 查看当前会话的 token 消耗和估算费用',
           '/status     - 查看当前会话状态（含终端链接）',
+          '',
+          `🔀 透传给 ${cliName}（字面送达，供其内置 slash 命令处理）：`,
+          '/compact /model /clear /plugin /usage',
           '',
           '⏰ 定时任务：',
           '/schedule 每日17:50 帮我看AI新闻   - 创建定时任务（自然语言）',

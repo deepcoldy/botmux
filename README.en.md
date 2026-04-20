@@ -273,13 +273,12 @@ MCP entry point has been removed (stale config is auto-cleaned on upgrade).
 | `/skip` | Skip repo selection, start session directly |
 | `/cd <path>` | Change working directory |
 | `/status` | Show session info (uptime, terminal URL, etc.) |
-| `/cost` | Show token usage and estimated cost |
 | `/restart` | Restart CLI process |
 | `/close` | Close session and terminate CLI |
-| `/clear` | Clear context (new session, same thread) |
 | `/adopt` | Adopt a running CLI session (tmux) |
 | `/schedule` | Manage scheduled tasks |
 | `/help` | Show available commands |
+| `/compact` `/model` `/clear` `/plugin` `/usage` | Forwarded verbatim to the underlying CLI (e.g. Claude Code's built-in slash commands) |
 
 ### Scheduled Task Management
 

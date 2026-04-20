@@ -272,13 +272,12 @@ botmux start
 | `/skip` | 跳过仓库选择，直接开启会话 |
 | `/cd <路径>` | 切换工作目录 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
-| `/cost` | 查看 Token 用量和费用估算 |
 | `/restart` | 重启 CLI 进程 |
 | `/close` | 关闭会话并终止 CLI |
-| `/clear` | 清除上下文（新会话，同一话题） |
 | `/adopt` | 接入已运行的 CLI 会话（tmux） |
 | `/schedule` | 管理定时任务 |
 | `/help` | 显示可用命令 |
+| `/compact` `/model` `/clear` `/plugin` `/usage` | 字面透传给底层 CLI（例如 Claude Code 的内置 slash 命令） |
 
 ### 定时任务管理
 

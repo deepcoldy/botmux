@@ -108,11 +108,6 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-vi.mock('../src/core/cost-calculator.js', () => ({
-  getSessionCost: vi.fn(),
-  formatNumber: vi.fn((n: number) => n.toLocaleString()),
-}));
-
 vi.mock('../src/core/worker-pool.js', () => ({
   killWorker: vi.fn(),
   forkWorker: vi.fn(),
@@ -133,13 +128,12 @@ vi.mock('../src/utils/user-token.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, handleCommand } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand } from '../src/core/command-handler.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { killWorker, forkWorker, getCurrentCliVersion } from '../src/core/worker-pool.js';
-import { getSessionCost } from '../src/core/cost-calculator.js';
 import { getSessionWorkingDir } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -214,19 +208,38 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/cost', '/schedule', '/login', '/adopt'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
   });
 
-  it('should not contain unknown commands', () => {
+  it('should not contain passthrough or unknown commands', () => {
+    // These pass through to the CLI and are NOT handled by the daemon
+    expect(DAEMON_COMMANDS.has('/clear')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/cost')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/compact')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/model')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/usage')).toBe(false);
     expect(DAEMON_COMMANDS.has('/unknown')).toBe(false);
-    expect(DAEMON_COMMANDS.has('/exit')).toBe(false);
   });
 
   it('should have the correct size', () => {
-    expect(DAEMON_COMMANDS.size).toBe(12);
+    expect(DAEMON_COMMANDS.size).toBe(10);
+  });
+});
+
+describe('PASSTHROUGH_COMMANDS set', () => {
+  it('should contain expected slash commands forwarded to CLI', () => {
+    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage']) {
+      expect(PASSTHROUGH_COMMANDS.has(cmd), `Expected PASSTHROUGH_COMMANDS to contain ${cmd}`).toBe(true);
+    }
+  });
+
+  it('should not overlap with DAEMON_COMMANDS', () => {
+    for (const cmd of PASSTHROUGH_COMMANDS) {
+      expect(DAEMON_COMMANDS.has(cmd), `${cmd} must not be in both sets`).toBe(false);
+    }
   });
 });
 
@@ -259,43 +272,6 @@ describe('handleCommand', () => {
       const deps = makeDeps(); // no session
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
-
-      expect(killWorker).not.toHaveBeenCalled();
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('没有活跃的会话'),
-        undefined,
-        LARK_APP_ID,
-      );
-    });
-  });
-
-  // ─── /clear ─────────────────────────────────────────────────────────────
-
-  describe('/clear', () => {
-    it('should kill worker, close old session, create new session', async () => {
-      const ds = makeDaemonSession();
-      const deps = makeDeps(ds);
-
-      await handleCommand('/clear', ROOT_ID, makeLarkMessage('/clear'), deps, LARK_APP_ID);
-
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-001');
-      expect(sessionStore.createSession).toHaveBeenCalledWith(CHAT_ID, ROOT_ID, 'Test Session', 'group');
-      expect(ds.session.sessionId).toBe('new-session-123');
-      expect(ds.hasHistory).toBe(false);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('上下文已清除'),
-        undefined,
-        LARK_APP_ID,
-      );
-    });
-
-    it('should reply no-session message when session does not exist', async () => {
-      const deps = makeDeps();
-
-      await handleCommand('/clear', ROOT_ID, makeLarkMessage('/clear'), deps, LARK_APP_ID);
 
       expect(killWorker).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
@@ -431,11 +407,12 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/restart');
       expect(replyContent).toContain('/cd');
       expect(replyContent).toContain('/repo');
-      expect(replyContent).toContain('/cost');
       expect(replyContent).toContain('/status');
       expect(replyContent).toContain('/help');
       expect(replyContent).toContain('/schedule');
       expect(replyContent).toContain('/login');
+      expect(replyContent).toContain('/compact'); // passthrough list
+      expect(replyContent).toContain('/model');
       expect(replyContent).toContain('Claude'); // CLI display name
     });
 
@@ -604,53 +581,6 @@ describe('handleCommand', () => {
 
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('当前没有待选择的仓库');
-    });
-  });
-
-  // ─── /cost ──────────────────────────────────────────────────────────────
-
-  describe('/cost', () => {
-    it('should show cost data when available', async () => {
-      vi.mocked(getSessionCost).mockReturnValue({
-        inputTokens: 1500,
-        outputTokens: 800,
-        cacheReadTokens: 200,
-        cacheCreateTokens: 100,
-        model: 'claude-sonnet-4-20250514',
-        turns: 3,
-      });
-
-      const ds = makeDaemonSession();
-      const deps = makeDeps(ds);
-
-      await handleCommand('/cost', ROOT_ID, makeLarkMessage('/cost'), deps, LARK_APP_ID);
-
-      expect(getSessionCost).toHaveBeenCalledWith('sess-001', '/home/testuser/projects');
-      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('sess-001');
-      expect(replyContent).toContain('claude-sonnet-4-20250514');
-      expect(replyContent).toContain('Turns: 3');
-    });
-
-    it('should show not-found message when cost data is missing', async () => {
-      vi.mocked(getSessionCost).mockReturnValue(null as any);
-
-      const ds = makeDaemonSession();
-      const deps = makeDeps(ds);
-
-      await handleCommand('/cost', ROOT_ID, makeLarkMessage('/cost'), deps, LARK_APP_ID);
-
-      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('未找到会话');
-    });
-
-    it('should reply no-session when session does not exist', async () => {
-      const deps = makeDeps();
-
-      await handleCommand('/cost', ROOT_ID, makeLarkMessage('/cost'), deps, LARK_APP_ID);
-
-      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('没有活跃的会话');
     });
   });
 

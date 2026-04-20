@@ -1088,6 +1088,28 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'raw_input': {
+      // Slash-command passthrough (e.g. /compact, /model, /usage). Write the
+      // literal string + Enter without bracketed paste — otherwise Claude Code
+      // treats `/…` as pasted prompt text and the slash-command parser never
+      // fires. Also skip adapter.writeInput() / pendingMessages queueing so
+      // the prompt wrapping (Session ID, mention hints) is not prepended.
+      renderer?.markNewTurn();
+      if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+      if (backend) {
+        if ('sendText' in backend && 'sendSpecialKeys' in backend) {
+          (backend as any).sendText(msg.content);
+          (backend as any).sendSpecialKeys('Enter');
+        } else {
+          backend.write(msg.content + '\r');
+        }
+        isPromptReady = false;
+        idleDetector?.reset();
+        log(`Passthrough slash command: ${msg.content}`);
+      }
+      break;
+    }
+
     case 'restart': {
       if (lastInitConfig?.adoptMode) {
         log('Restart ignored in adopt mode');

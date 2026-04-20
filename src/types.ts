@@ -121,6 +121,7 @@ export type TermActionKey =
 export type DaemonToWorker =
   | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number }
   | { type: 'message'; content: string }
+  | { type: 'raw_input'; content: string }
   | { type: 'close' }
   | { type: 'restart' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
