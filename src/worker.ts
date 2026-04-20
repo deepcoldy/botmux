@@ -76,6 +76,15 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
 const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
+/** Tracks whether the CLI is currently in the alt screen buffer. Updated by
+ *  scanning PTY output for DECSET 1049/47/1047 toggles. Used when trimming
+ *  scrollback at cap so replay always starts with the correct buffer mode —
+ *  otherwise a cap-time slice can drop the alt-buffer-enter and every
+ *  subsequent TUI redraw lands in the *normal* buffer, producing the
+ *  "scrolling up shows several duplicated screens" bug. */
+let altBufferActive = false;
+const ALT_ENTER_RE = /\x1b\[\?(1049|1047|47)h/g;
+const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
 
 // ─── Screen Analyzer (AI-based TUI prompt detection) ────────────────────────
 
@@ -378,9 +387,30 @@ function onPtyData(data: string): void {
   // In tmux mode, web clients have their own tmux attach — no relay needed.
   // In non-tmux mode, broadcast to all WS clients via shared scrollback.
   if (!isTmuxMode) {
+    // Track alt-buffer state so we can restore it in the scrollback prefix.
+    // Scan for the *last* toggle in this chunk — that's the current state.
+    let lastToggleIdx = -1;
+    let lastToggleActive = altBufferActive;
+    ALT_ENTER_RE.lastIndex = 0;
+    ALT_EXIT_RE.lastIndex = 0;
+    for (let m: RegExpExecArray | null; (m = ALT_ENTER_RE.exec(data)); ) {
+      if (m.index > lastToggleIdx) { lastToggleIdx = m.index; lastToggleActive = true; }
+    }
+    for (let m: RegExpExecArray | null; (m = ALT_EXIT_RE.exec(data)); ) {
+      if (m.index > lastToggleIdx) { lastToggleIdx = m.index; lastToggleActive = false; }
+    }
+    altBufferActive = lastToggleActive;
+
     scrollback += data;
     if (scrollback.length > MAX_SCROLLBACK) {
-      scrollback = scrollback.slice(-MAX_SCROLLBACK);
+      // Slice at an escape-sequence boundary so the replay never starts
+      // mid-sequence. Then re-inject a full reset + alt-buffer-enter so
+      // the receiving xterm lands in the right buffer, matching the CLI.
+      let cut = scrollback.length - MAX_SCROLLBACK;
+      const escAt = scrollback.indexOf('\x1b', cut);
+      cut = escAt >= 0 ? escAt : cut;
+      const prefix = altBufferActive ? '\x1bc\x1b[?1049h' : '\x1bc';
+      scrollback = prefix + scrollback.slice(cut);
     }
     for (const ws of wsClients) {
       if (ws.readyState === WebSocket.OPEN) ws.send(data);
@@ -623,6 +653,7 @@ function killCli(): void {
   isPromptReady = false;
   pendingMessages.length = 0;
   scrollback = '';
+  altBufferActive = false;
   trustHandled = false;
 }
 
@@ -653,27 +684,54 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // Each WS client gets its own `tmux attach-session` PTY.
         // Scrollback is handled natively by tmux (history-limit).
         // In adopt mode, attach to the user's original pane; otherwise use bmx-* session.
+        //
+        // Spawn is DEFERRED until the client sends its first 'resize'.  If we
+        // spawned at a default size (e.g. 80×24) first and then resized, tmux
+        // would render at the old size, send those bytes, and then only
+        // diff-update the rows that changed.  Rows that happen to match
+        // byte-for-byte (empty, separators, etc.) are not retransmitted, so
+        // the earlier frame "bleeds through" — visible as a second
+        // banner/prompt stacked above the new layout when scrolling up.
         const tmuxTarget = lastInitConfig?.adoptTmuxTarget ?? TmuxBackend.sessionName(sessionId);
-        const cp = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
-          name: 'xterm-256color',
-          cols: 80,
-          rows: 24,
-        });
-        clientPtys.set(ws, cp);
+        let cp: pty.IPty | null = null;
+        const pendingInput: string[] = [];
 
-        cp.onData((d: string) => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(d);
-        });
-        cp.onExit(() => {
-          clientPtys.delete(ws);
-          if (ws.readyState === WebSocket.OPEN) ws.close();
-        });
+        const startAttach = (cols: number, rows: number) => {
+          if (cp) return;
+          cp = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
+            name: 'xterm-256color',
+            cols,
+            rows,
+          });
+          clientPtys.set(ws, cp);
+
+          cp.onData((d: string) => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(d);
+          });
+          cp.onExit(() => {
+            clientPtys.delete(ws);
+            if (ws.readyState === WebSocket.OPEN) ws.close();
+          });
+
+          // Replay any input that arrived during the spawn window.
+          for (const data of pendingInput) cp.write(data);
+          pendingInput.length = 0;
+        };
+
+        // Safety net: if no resize arrives (very old client?), start the
+        // attach at a reasonable default after a short delay.
+        const spawnTimer = setTimeout(() => startAttach(150, 40), 500);
 
         ws.on('message', (raw) => {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-              cp.resize(msg.cols, msg.rows);
+              if (!cp) {
+                clearTimeout(spawnTimer);
+                startAttach(msg.cols, msg.rows);
+              } else {
+                cp.resize(msg.cols, msg.rows);
+              }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) {
                 // Read-only: allow mouse events through (scroll/click are
@@ -681,12 +739,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 // SGR mouse: \x1b[<...  X10 mouse: \x1b[M...
                 if (!/^\x1b\[([<M])/.test(msg.data)) return;
               }
-              cp.write(msg.data);
+              if (cp) cp.write(msg.data);
+              else pendingInput.push(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
 
         ws.on('close', () => {
+          clearTimeout(spawnTimer);
           wsClients.delete(ws);
           const existing = clientPtys.get(ws);
           if (existing) {
