@@ -1660,7 +1660,9 @@ async function cmdSend(rest: string[]): Promise<void> {
 
     let messageId: string;
     if (useCard) {
-      // Inline @mention → <at id=open_id></at>; unused + owner appended at end.
+      // Inline @mention → <at id=open_id></at>; explicit --mention args that
+      // weren't inlined are appended to the body. The session owner is
+      // rendered in the footer note instead of the body.
       const usedIds = new Set<string>();
       let md = text;
       if (mentionPattern) {
@@ -1673,7 +1675,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
       const trailingAts: string[] = [];
       for (const m of mentions) if (!usedIds.has(m.open_id)) trailingAts.push(`<at id=${m.open_id}></at>`);
-      if (s.ownerOpenId) trailingAts.push(`<at id=${s.ownerOpenId}></at>`);
       if (trailingAts.length > 0) md = md ? `${md}\n\n${trailingAts.join(' ')}` : trailingAts.join(' ');
 
       // Inline images into the markdown via ![](img_key). If caller used an
@@ -1696,6 +1697,18 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
 
       const elements = mdWithImages ? buildCardBodyElements(mdWithImages) : [];
+
+      // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
+      // text size + grey font tag so it reads like a footnote below the hr.
+      const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
+      if (s.ownerOpenId) footerParts.push(`发送给：<at id=${s.ownerOpenId}></at>`);
+      elements.push({ tag: 'hr' });
+      elements.push({
+        tag: 'markdown',
+        text_size: 'notation_small_v2',
+        content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+      });
+
       const cardJson = JSON.stringify({
         schema: '2.0',
         config: { update_multi: true },
