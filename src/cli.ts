@@ -1156,6 +1156,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --images <path>                 内联图片（可重复）
        --files <path>                  附件（可重复）
        --mention <open_id:name>        @提及（可重复）
+       --card | --text                 强制卡片 / 纯文本（默认按 md 语法自动判断）
   bots list                            列出当前群聊中的机器人（含 open_id）
   thread messages [--limit N]          拉取当前话题的消息历史 (JSON)
 
@@ -1446,6 +1447,93 @@ function argValues(args: string[], ...flags: string[]): string[] {
   return out;
 }
 
+/** Feishu card markdown element doesn't render ATX headings → promote to bold. */
+function transformHeadings(md: string): string {
+  return md.replace(/^#{1,6}\s+(.+)$/gm, (_m, c: string) => `**${c.trim()}**`);
+}
+
+/** Parse a contiguous pipe-table block into a Feishu card v2 `table` element. */
+function parseTableBlock(block: string): any | null {
+  const lines = block.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return null;
+  const rows = lines.map(l => l.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim()));
+  const sepIdx = rows.findIndex(r => r.length > 0 && r.every(c => /^:?-{2,}:?$/.test(c)));
+  const header = rows[0];
+  const body = sepIdx === 1 ? rows.slice(2) : rows.slice(1);
+  if (header.length === 0) return null;
+  const columns = header.map((h, i) => ({
+    name: `c${i}`,
+    display_name: h || ' ',
+    data_type: 'lark_md',
+    width: 'auto',
+  }));
+  const tableRows = body.map(r => {
+    const o: Record<string, string> = {};
+    for (let i = 0; i < header.length; i++) o[`c${i}`] = r[i] ?? '';
+    return o;
+  });
+  return {
+    tag: 'table',
+    page_size: Math.min(10, Math.max(1, tableRows.length || 1)),
+    row_height: 'low',
+    header_style: {
+      text_align: 'left',
+      text_size: 'normal',
+      background_style: 'grey',
+      text_color: 'default',
+      bold: true,
+      lines: 1,
+    },
+    columns,
+    rows: tableRows,
+  };
+}
+
+/**
+ * Split markdown into card v2 body elements: pipe-table blocks become native
+ * `table` elements, remaining prose becomes `markdown` elements (with ATX
+ * headings promoted to bold since the markdown element doesn't render `#`).
+ */
+function buildCardBodyElements(md: string): any[] {
+  const elements: any[] = [];
+  const re = /(?:^[ \t]*\|.+\|[ \t]*\r?\n?){2,}/gm;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(md)) !== null) {
+    const pre = md.slice(cursor, match.index).replace(/\s+$/, '');
+    if (pre) elements.push({ tag: 'markdown', content: transformHeadings(pre) });
+    const table = parseTableBlock(match[0]);
+    if (table) elements.push(table);
+    else elements.push({ tag: 'markdown', content: transformHeadings(match[0]) });
+    cursor = match.index + match[0].length;
+  }
+  const tail = md.slice(cursor).replace(/^\s+/, '').replace(/\s+$/, '');
+  if (tail) elements.push({ tag: 'markdown', content: transformHeadings(tail) });
+  return elements;
+}
+
+/**
+ * Heuristic: does `text` contain markdown syntax that renders badly as plain
+ * text in Feishu (code fences, headings, lists, bold, inline code, links,
+ * tables, blockquotes, hr)? If so, `cmdSend` switches to an interactive card
+ * so Feishu can render it properly.
+ */
+function hasMarkdown(text: string): boolean {
+  if (!text) return false;
+  return (
+    /```/.test(text) ||
+    /^#{1,6}\s/m.test(text) ||
+    /^\s{0,3}[-*+]\s+\S/m.test(text) ||
+    /^\s{0,3}\d+\.\s+\S/m.test(text) ||
+    /\*\*[^*\n]+\*\*/.test(text) ||
+    /(^|[^`])`[^`\n]+`([^`]|$)/.test(text) ||
+    /\[[^\]\n]+\]\([^)\n]+\)/.test(text) ||
+    /^\s*\|.+\|\s*$/m.test(text) ||
+    /^>\s/m.test(text) ||
+    /^(?:---|\*\*\*|___)\s*$/m.test(text)
+  );
+}
+
 async function cmdSend(rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
@@ -1453,6 +1541,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   const files = argValues(rest, '--file', '--files');
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
   const contentFile = argValue(rest, '--content-file');
+  const forceCard = rest.includes('--card');
+  const forceText = rest.includes('--text');
 
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
@@ -1528,51 +1618,87 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     } catch { /* not JSON, use as-is */ }
 
-    // Build post content: text → paragraphs, with @mention replacement
-    let mentionPattern: RegExp | null = null;
+    // Decide: interactive card (renders markdown) vs. post (plain text).
+    // Explicit --card / --text wins; otherwise auto-detect markdown syntax.
+    const useCard = forceCard || (!forceText && hasMarkdown(text));
+
     const mentionMap = new Map<string, string>();
-    if (mentions.length > 0) {
-      const patterns = mentions.map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-      mentionPattern = new RegExp(`@(${patterns.join('|')})\\b`, 'gi');
-      for (const m of mentions) mentionMap.set(m.name.toLowerCase(), m.open_id);
-    }
+    for (const m of mentions) mentionMap.set(m.name.toLowerCase(), m.open_id);
+    const mentionPattern = mentions.length > 0
+      ? new RegExp(`@(${mentions.map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'gi')
+      : null;
 
-    const postContent: any[][] = text ? text.split('\n').map((line: string) => {
-      if (!mentionPattern) return [{ tag: 'text', text: line }];
-      const nodes: any[] = [];
-      let lastIndex = 0;
-      for (const match of line.matchAll(mentionPattern)) {
-        const openId = mentionMap.get(match[1].toLowerCase());
-        if (!openId) continue;
-        if (match.index > lastIndex) nodes.push({ tag: 'text', text: line.slice(lastIndex, match.index) });
-        nodes.push({ tag: 'at', user_id: openId });
-        lastIndex = match.index + match[0].length;
-      }
-      if (lastIndex < line.length) nodes.push({ tag: 'text', text: line.slice(lastIndex) });
-      return nodes.length > 0 ? nodes : [{ tag: 'text', text: line }];
-    }) : [];
-
-    for (const key of imageKeys) postContent.push([{ tag: 'img', image_key: key }]);
-
-    // Unused mentions → append at end
-    if (mentions.length > 0) {
+    let messageId: string;
+    if (useCard) {
+      // Inline @mention → <at id=open_id></at>; unused + owner appended at end.
       const usedIds = new Set<string>();
-      for (const para of postContent) for (const n of para) if (n.tag === 'at') usedIds.add(n.user_id);
-      const unused = mentions.filter(m => !usedIds.has(m.open_id));
-      if (unused.length > 0) {
-        if (postContent.length === 0) postContent.push([]);
-        for (const m of unused) postContent[postContent.length - 1].push({ tag: 'at', user_id: m.open_id });
+      let md = text;
+      if (mentionPattern) {
+        md = text.replace(mentionPattern, (full: string, name: string) => {
+          const openId = mentionMap.get(name.toLowerCase());
+          if (!openId) return full;
+          usedIds.add(openId);
+          return `<at id=${openId}></at>`;
+        });
       }
-    }
+      const trailingAts: string[] = [];
+      for (const m of mentions) if (!usedIds.has(m.open_id)) trailingAts.push(`<at id=${m.open_id}></at>`);
+      if (s.ownerOpenId) trailingAts.push(`<at id=${s.ownerOpenId}></at>`);
+      if (trailingAts.length > 0) md = md ? `${md}\n\n${trailingAts.join(' ')}` : trailingAts.join(' ');
 
-    // Append @mention to session owner
-    if (s.ownerOpenId) {
-      if (postContent.length === 0) postContent.push([]);
-      postContent[postContent.length - 1].push({ tag: 'at', user_id: s.ownerOpenId });
-    }
+      const elements: any[] = md ? buildCardBodyElements(md) : [];
+      for (const key of imageKeys) {
+        elements.push({
+          tag: 'img',
+          img_key: key,
+          alt: { tag: 'plain_text', content: '' },
+          scale_type: 'fit_horizontal',
+          preview: true,
+        });
+      }
+      const cardJson = JSON.stringify({
+        schema: '2.0',
+        config: { update_multi: true },
+        body: { direction: 'vertical', elements },
+      });
+      messageId = await replyMessage(appId, s.rootMessageId, cardJson, 'interactive', true);
+    } else {
+      // Plain-text path: build post content, paragraph per line.
+      const postContent: any[][] = text ? text.split('\n').map((line: string) => {
+        if (!mentionPattern) return [{ tag: 'text', text: line }];
+        const nodes: any[] = [];
+        let lastIndex = 0;
+        for (const match of line.matchAll(mentionPattern)) {
+          const openId = mentionMap.get(match[1].toLowerCase());
+          if (!openId) continue;
+          if (match.index > lastIndex) nodes.push({ tag: 'text', text: line.slice(lastIndex, match.index) });
+          nodes.push({ tag: 'at', user_id: openId });
+          lastIndex = match.index + match[0].length;
+        }
+        if (lastIndex < line.length) nodes.push({ tag: 'text', text: line.slice(lastIndex) });
+        return nodes.length > 0 ? nodes : [{ tag: 'text', text: line }];
+      }) : [];
 
-    const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
-    const messageId = await replyMessage(appId, s.rootMessageId, postJson, 'post', true);
+      for (const key of imageKeys) postContent.push([{ tag: 'img', image_key: key }]);
+
+      if (mentions.length > 0) {
+        const usedIds = new Set<string>();
+        for (const para of postContent) for (const n of para) if (n.tag === 'at') usedIds.add(n.user_id);
+        const unused = mentions.filter(m => !usedIds.has(m.open_id));
+        if (unused.length > 0) {
+          if (postContent.length === 0) postContent.push([]);
+          for (const m of unused) postContent[postContent.length - 1].push({ tag: 'at', user_id: m.open_id });
+        }
+      }
+
+      if (s.ownerOpenId) {
+        if (postContent.length === 0) postContent.push([]);
+        postContent[postContent.length - 1].push({ tag: 'at', user_id: s.ownerOpenId });
+      }
+
+      const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
+      messageId = await replyMessage(appId, s.rootMessageId, postJson, 'post', true);
+    }
 
     // Send file attachments as separate messages
     const fileIds: string[] = [];
