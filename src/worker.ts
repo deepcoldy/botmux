@@ -60,10 +60,9 @@ const pendingMessages: string[] = [];
 let awaitingFirstPrompt = true;
 
 // ─── PTY Dimensions ──────────────────────────────────────────────────────────
-// Wide PTY so CLI positions right-aligned TUI overlays (timer, timeout)
-// far to the right. The snapshot reader only reads the first 160 columns,
-// cleanly excluding overlays without any regex hacking.
-const PTY_COLS = 300;
+// Matches SNAPSHOT_COLS / SHOT_COLS (160). Narrow enough for the web terminal
+// to render comfortably; the card PNG crops at this width anyway.
+const PTY_COLS = 160;
 const PTY_ROWS = 50;
 
 // ─── Headless Terminal for Screen Capture ────────────────────────────────────
@@ -277,6 +276,16 @@ function handleTermAction(key: TermActionKey): void {
     (backend as any).sendSpecialKeys(TMUX_KEY_MAP[key]);
   } else if (PTY_SEQ_MAP[key]) {
     backend.write(PTY_SEQ_MAP[key]);
+  }
+  // ESC/Ctrl-C/Enter likely ends an active TUI prompt. The analyzer
+  // won't re-analyze while promptActive=true, so un-wedge both flags here.
+  // Without this, dismissing an AskUserQuestion dialog via the quick-key
+  // button leaves tuiPromptBlocking=true forever and silently queues every
+  // subsequent user message.
+  if (tuiPromptBlocking && (key === 'esc' || key === 'ctrlc' || key === 'enter')) {
+    tuiPromptBlocking = false;
+    screenAnalyzer?.notifySelection(`term_action:${key}`);
+    void flushPending();
   }
   log(`Term action: ${key}`);
   scheduleOneShotAfterAction();

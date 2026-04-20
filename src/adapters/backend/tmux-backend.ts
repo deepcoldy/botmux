@@ -127,11 +127,10 @@ export class TmuxBackend implements SessionBackend {
         execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore' });
         execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore' });
         // Prevent web terminal clients (smaller viewport) from shrinking the
-        // tmux window.  The backend PTY is intentionally wide (300 cols) so
-        // TUI overlays stay outside the snapshot area.  If a web client at
-        // 80×24 causes tmux to resize the window down, reflowed content shifts
-        // buffer positions and the terminal renderer's baseline tracking breaks
-        // — historical output leaks into the streaming card.
+        // tmux window.  If a web client at 80×24 causes tmux to resize the
+        // window down, reflowed content shifts buffer positions and the
+        // terminal renderer's baseline tracking breaks — historical output
+        // leaks into the streaming card.
         execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore' });
       } catch { /* session may not be ready yet — benign */ }
     }, 500);
