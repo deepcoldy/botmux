@@ -239,7 +239,7 @@ export function buildFollowUpContent(
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false;
   if (!skipHint) {
-    parts.push('[回复请用 botmux send，终端输出用户看不到]');
+    parts.push('[请用 botmux send "消息" - 这个shell工具回复飞书用户，终端输出用户看不到]');
   }
 
   return parts.join('\n\n');

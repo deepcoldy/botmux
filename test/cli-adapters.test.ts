@@ -289,32 +289,22 @@ describe('readyPattern', () => {
 // ---------------------------------------------------------------------------
 
 describe('systemHints', () => {
-  it('claude-code has empty systemHints', () => {
+  it('claude-code has empty systemHints (uses --append-system-prompt instead)', () => {
     expect(createClaudeCodeAdapter('/bin/claude').systemHints).toEqual([]);
   });
 
-  it('aiden has empty systemHints', () => {
-    expect(createAidenAdapter('/bin/aiden').systemHints).toEqual([]);
-  });
+  const nonClaudeAdapters: Array<[string, () => CliAdapter]> = [
+    ['aiden', () => createAidenAdapter('/bin/aiden')],
+    ['coco', () => createCocoAdapter('/bin/coco')],
+    ['codex', () => createCodexAdapter('/bin/codex')],
+    ['gemini', () => createGeminiAdapter('/bin/gemini')],
+    ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
+  ];
 
-  it('coco has non-empty systemHints', () => {
-    const hints = createCocoAdapter('/bin/coco').systemHints;
-    expect(Array.isArray(hints)).toBe(true);
+  it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
+    const hints = factory().systemHints;
     expect(hints.length).toBeGreaterThan(0);
-    // Verify hints mention send_to_thread (key integration guidance)
-    expect(hints.some(h => h.includes('send_to_thread'))).toBe(true);
-  });
-
-  it('codex has empty systemHints', () => {
-    expect(createCodexAdapter('/bin/codex').systemHints).toEqual([]);
-  });
-
-  it('gemini has empty systemHints', () => {
-    expect(createGeminiAdapter('/bin/gemini').systemHints).toEqual([]);
-  });
-
-  it('opencode has empty systemHints', () => {
-    expect(createOpenCodeAdapter('/bin/opencode').systemHints).toEqual([]);
+    expect(hints.some(h => h.includes('botmux send'))).toBe(true);
   });
 });
 
