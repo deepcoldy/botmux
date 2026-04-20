@@ -1150,6 +1150,18 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'refresh_screen': {
+      if (displayMode !== 'screenshot') break;
+      lastShotHash = '';
+      if (screenshotTimer) {
+        clearInterval(screenshotTimer);
+        screenshotTimer = setInterval(() => { void captureAndUpload(); }, SCREENSHOT_INTERVAL_MS);
+      }
+      void captureAndUpload();
+      log('Manual screenshot refresh');
+      break;
+    }
+
     case 'close': {
       log('Close requested');
       stopScreenshotLoop();

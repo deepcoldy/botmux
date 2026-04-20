@@ -57,7 +57,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'toggle_mode', 'term_action', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'toggle_mode', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     const ds = rootId ? activeSessions.get(rootId) : undefined;
@@ -409,6 +409,36 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
       logger.info(`[${tag(ds)}] Display mode → ${next}`);
+      return;
+    }
+
+    // Manual screenshot refresh — force immediate capture bypassing 10s interval + hash dedup.
+    if (actionType === 'refresh_screenshot' && ds) {
+      if (ds.worker) {
+        ds.worker.send({ type: 'refresh_screen' } as DaemonToWorker);
+        logger.info(`[${tag(ds)}] Manual screenshot refresh`);
+      }
+      // Return the current card JSON so Feishu doesn't revert the displayed
+      // image to the originally-POSTed initial frame while waiting for the
+      // fresh screenshot PATCH (~1s).
+      if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
+        const botCfg = getBot(ds.larkAppId).config;
+        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          ds.session.rootMessageId,
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          ds.lastScreenStatus || 'working',
+          botCfg.cliId,
+          ds.displayMode ?? 'screenshot',
+          ds.streamCardNonce,
+          ds.currentImageKey,
+        );
+        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+      }
       return;
     }
 

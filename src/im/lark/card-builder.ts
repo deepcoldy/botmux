@@ -178,6 +178,14 @@ export function buildStreamingCard(
       value: { action: 'toggle_mode', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
     });
   }
+  if (displayMode === 'screenshot') {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '🔃 刷新' },
+      type: 'default' as const,
+      value: { action: 'refresh_screenshot', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
+    });
+  }
   headerActions.push({
     tag: 'button',
     text: { tag: 'plain_text', content: '🖥️ 打开终端' },
@@ -215,8 +223,9 @@ export function buildStreamingCard(
   }
   elements.push({ tag: 'action', actions: headerActions });
 
-  // ── Quick-action keys (only when output is shown) ───────────────────────
-  if (displayMode !== 'hidden') {
+  // ── Quick-action keys (only when the screenshot is visible — in text mode
+  //    there's no visible cursor/input, so these keys would fire blindly) ──
+  if (displayMode === 'screenshot') {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },

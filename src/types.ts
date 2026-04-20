@@ -127,7 +127,8 @@ export type DaemonToWorker =
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
   | { type: 'tui_text_input'; keys: string[]; text: string }
   | { type: 'set_display_mode'; mode: DisplayMode }
-  | { type: 'term_action'; key: TermActionKey };
+  | { type: 'term_action'; key: TermActionKey }
+  | { type: 'refresh_screen' };
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
