@@ -1,4 +1,5 @@
 import { resolveCommand } from './registry.js';
+import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 function delay(ms: number): Promise<void> {
@@ -34,7 +35,7 @@ export function createAidenAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,  // quiescence only
-    systemHints: [],
+    systemHints: BOTMUX_SHELL_HINTS,
     altScreen: false,
   };
 }

@@ -1,4 +1,5 @@
 import { resolveCommand } from './registry.js';
+import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 function delay(ms: number): Promise<void> {
@@ -34,7 +35,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
-    systemHints: [],
+    systemHints: BOTMUX_SHELL_HINTS,
     altScreen: false,   // --no-alt-screen disables alternate screen
   };
 }
