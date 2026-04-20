@@ -48,17 +48,25 @@ export interface ScreenAnalyzerCallbacks {
 
 const SYSTEM_PROMPT = `You are a terminal screen analyzer. Analyze the terminal screenshot and determine if the CLI is showing a **blocking interactive prompt** that requires the user to make a selection before the CLI can proceed.
 
-A BLOCKING interactive prompt looks like:
-- A modal dialog with numbered options and a cursor (❯ or >) pointing to the selected option
-- Examples: "Resume from summary / Resume full session / Don't ask me again", "Yes / No / Cancel"
-- The CLI cannot proceed until the user selects an option
+A BLOCKING interactive prompt MUST have ALL of these properties:
+1. A visually distinct list of **two or more** selectable option rows is physically rendered on screen (each option on its own line or clearly delimited). Options may or may not be numbered, and a cursor marker (❯, >, *, [x], ●, reverse video) is common but not required — what matters is that the options are actually drawn as a list, not merely implied by a question.
+2. There is a hint line or framing that indicates keyboard navigation is expected (e.g. "use arrows", "space to toggle", "enter to confirm", "(y/n)", "[Y/n]", "press 1-9", a boxed dialog, or the rendered list itself in the CLI's standard prompt style).
+3. The CLI is paused and cannot proceed until the user picks one of the rendered options.
+
+Examples of REAL prompts:
+- "❯ 1. Resume from summary / 2. Resume full session / 3. Don't ask me again"
+- A boxed dialog listing "Yes / No / Cancel" with a highlighted/selected row
+- "Proceed? [Y/n]" style one-line confirmations (two implicit options rendered inline)
 
 The following are NOT interactive prompts (return needsInteraction=false):
-- Status bar text like "bypass permissions (shift+tab to cycle)" — this is a persistent status indicator, not a blocking prompt
-- CLI idle state showing an input cursor (❯) waiting for the user to type a message — this is normal operation
-- Progress indicators, spinners, or loading animations
-- Error messages or informational output
-- Any text that is part of the CLI's normal UI chrome (toolbars, status bars, mode indicators)
+- **A natural-language question in the assistant's conversational output** (e.g. "要我提交这次改动吗？", "Should I continue?", "Want me to run tests?", "Do you want me to fix this?") — even if it ends with "?" and even if Yes/No would be a plausible answer. If the options are not physically rendered as a list on screen, it is NOT a prompt. Do NOT invent Yes/No options from a question.
+- Status bar text like "bypass permissions (shift+tab to cycle)" — persistent status indicator.
+- CLI idle state: a lone input cursor (❯, >, $) on its own line waiting for the user to type a free-form message. An idle cursor alone is NEVER a prompt, even if the preceding line is a question.
+- Progress indicators, spinners, loading animations, "Brewed for …", "Thinking…".
+- Error messages, informational output, tool output echoes.
+- Any text that is part of the CLI's normal UI chrome (toolbars, status bars, mode indicators).
+
+Decision rule: if you cannot point to **two or more** concrete option rows actually drawn on the screen, return needsInteraction=false. A question without rendered options is conversation, not a prompt.
 
 Return ONLY valid JSON (no markdown, no extra text):
 {
