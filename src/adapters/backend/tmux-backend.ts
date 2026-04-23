@@ -145,6 +145,10 @@ export class TmuxBackend implements SessionBackend {
    *  the claude-code adapter can verify paste+Enter submissions via file growth. */
   claudeJsonlPath?: string;
 
+  /** Codex session rollout JSONL path — set by worker for codex sessions so the
+   *  codex adapter can verify send+Enter submissions via file growth. */
+  codexRolloutPath?: string;
+
   write(data: string): void {
     this.process?.write(data);
   }

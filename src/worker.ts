@@ -21,6 +21,7 @@ import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from 
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession } from './adapters/cli/claude-code.js';
+import { resolveCodexRolloutPath } from './adapters/cli/codex.js';
 import type { CliAdapter } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -495,7 +496,7 @@ async function flushPending(): Promise<void> {
         log(`writeInput: submit not confirmed after retries — notifying user. preview="${preview}"`);
         send({
           type: 'user_notify',
-          message: `⚠️ 刚才那条消息发给 CLI 后没能确认提交（paste 后重试 Enter 3 次仍未在会话 JSONL 中看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
+          message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 3 次仍未在会话 JSONL 中看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
         });
       }
     }
@@ -593,6 +594,23 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (cfg.cliId === 'claude-code') {
     (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
       claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
+  }
+
+  // Codex path is discovered async: Codex owns its own session id so the
+  // rollout filename contains a uuid we don't know ahead of time. Poll for
+  // the newest rollout-*.jsonl under ~/.codex/sessions whose session_meta
+  // references our cwd, started after this spawn.
+  if (cfg.cliId === 'codex') {
+    const spawnStart = Date.now();
+    void resolveCodexRolloutPath(cfg.workingDir, spawnStart).then(path => {
+      if (!backend) return;  // exited during resolution
+      if (path) {
+        (backend as TmuxBackend | PtyBackend).codexRolloutPath = path;
+        log(`Codex rollout path resolved: ${path}`);
+      } else {
+        log('Codex rollout path not found within 10s — submit verification disabled');
+      }
+    });
   }
 
   const args = cliAdapter.buildArgs({
