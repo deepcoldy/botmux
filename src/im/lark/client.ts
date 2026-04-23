@@ -181,11 +181,24 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
   }
 }
 
-export async function getMessageDetail(larkAppId: string, messageId: string): Promise<any> {
+export async function getMessageDetail(
+  larkAppId: string,
+  messageId: string,
+  options: { userCardContent?: boolean } = {},
+): Promise<any> {
   const c = getBotClient(larkAppId);
+  // card_msg_content_type=user_card_content returns the original card JSON
+  // (including v2 schema/body/elements) instead of Lark's simplified fallback
+  // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
+  // fetches, but merge_forward enumeration MUST pass false — Lark returns
+  // HTTP 500 when the param is combined with a merge_forward message_id.
+  // Without the param, sub-messages still come back in the "Format A"
+  // simplified card shape which extractCardContent handles.
+  const userCardContent = options.userCardContent ?? true;
   const res = await c.im.v1.message.get({
     path: { message_id: messageId },
-  });
+    ...(userCardContent ? { params: { card_msg_content_type: 'user_card_content' } } : {}),
+  } as any);
   if (res.code !== 0) {
     throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
   }

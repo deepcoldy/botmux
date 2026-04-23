@@ -1414,7 +1414,7 @@ async function cmdThreadMessages(rest: string[]): Promise<void> {
   const { parseApiMessage } = await import('./im/lark/message-parser.js');
   try {
     const raw = await listThreadMessages(s.larkAppId, s.chatId, s.rootMessageId, limit);
-    const messages = raw.map(parseApiMessage);
+    const messages = raw.map(m => parseApiMessage(m));
     console.log(JSON.stringify({ sessionId: sid, threadId: s.rootMessageId, messages, total: messages.length }, null, 2));
   } catch (err: any) {
     console.error(`获取话题消息失败: ${err.message}`);

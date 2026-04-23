@@ -72,23 +72,28 @@ export async function resolveNonsupportMessage(data: RawEventData, larkAppId: st
 
 /**
  * Lark bundles the real v2 card JSON inside a `user_dsl` string on the
- * simplified WS payload. When present, replace content with the unwrapped
- * v2 body so downstream extractors see schema/body.elements directly.
- * Returns true when unwrap succeeded.
+ * simplified interactive payload. When present, return the unwrapped v2
+ * body so downstream extractors see schema/body.elements directly.
  */
-function unwrapUserDsl(data: RawEventData): boolean {
+export function unwrapUserDslContent(rawContent: string): string | null {
   try {
-    const outer = JSON.parse(data.message.content);
-    if (typeof outer?.user_dsl !== 'string') return false;
+    const outer = JSON.parse(rawContent);
+    if (typeof outer?.user_dsl !== 'string') return null;
     const inner = JSON.parse(outer.user_dsl);
-    if (!inner || typeof inner !== 'object') return false;
-    if (!inner.body && !inner.elements && !inner.header) return false;
-    data.message.content = JSON.stringify(inner);
-    logger.info(`[parser] Unwrapped user_dsl for ${data.message.message_id}`);
-    return true;
+    if (!inner || typeof inner !== 'object') return null;
+    if (!inner.body && !inner.elements && !inner.header) return null;
+    return JSON.stringify(inner);
   } catch {
-    return false;
+    return null;
   }
+}
+
+function unwrapUserDsl(data: RawEventData): boolean {
+  const unwrapped = unwrapUserDslContent(data.message.content);
+  if (unwrapped === null) return false;
+  data.message.content = unwrapped;
+  logger.info(`[parser] Unwrapped user_dsl for ${data.message.message_id}`);
+  return true;
 }
 
 /**
@@ -116,22 +121,49 @@ export interface MessageResource {
   messageId?: string;
 }
 
-export function extractResources(msgType: string, rawContent: string): MessageResource[] {
+/**
+ * Stateful numbering that keeps `[图片 N]` placeholders in the rendered text
+ * aligned with the attachment footer. The same key always gets the same
+ * number, so duplicates across merge_forward sub-messages collapse correctly.
+ */
+export interface ImgNumberer {
+  assign(key: string): { num: number; isNew: boolean };
+}
+
+export function createImgNumberer(): ImgNumberer {
+  const map = new Map<string, number>();
+  let counter = 0;
+  return {
+    assign(key: string) {
+      const existing = map.get(key);
+      if (existing !== undefined) return { num: existing, isNew: false };
+      counter++;
+      map.set(key, counter);
+      return { num: counter, isNew: true };
+    },
+  };
+}
+
+export function extractResources(msgType: string, rawContent: string, numberer?: ImgNumberer): MessageResource[] {
+  const nb = numberer ?? createImgNumberer();
+  const pushIfNew = (resources: MessageResource[], r: MessageResource) => {
+    if (nb.assign(`${r.type}:${r.key}`).isNew) resources.push(r);
+  };
   try {
     const parsed = JSON.parse(rawContent);
 
     if (msgType === 'image') {
+      const resources: MessageResource[] = [];
       const imageKey = parsed.image_key;
-      if (imageKey) {
-        return [{ type: 'image', key: imageKey, name: `${imageKey}.jpg` }];
-      }
+      if (imageKey) pushIfNew(resources, { type: 'image', key: imageKey, name: `${imageKey}.jpg` });
+      return resources;
     }
 
     if (msgType === 'file') {
+      const resources: MessageResource[] = [];
       const fileKey = parsed.file_key;
-      if (fileKey) {
-        return [{ type: 'file', key: fileKey, name: parsed.file_name ?? fileKey }];
-      }
+      if (fileKey) pushIfNew(resources, { type: 'file', key: fileKey, name: parsed.file_name ?? fileKey });
+      return resources;
     }
 
     if (msgType === 'post') {
@@ -141,7 +173,7 @@ export function extractResources(msgType: string, rawContent: string): MessageRe
         const nodes = Array.isArray(block) ? block : [block];
         for (const node of nodes) {
           if (node.tag === 'img' && node.image_key) {
-            resources.push({ type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
+            pushIfNew(resources, { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
           }
         }
       }
@@ -163,13 +195,13 @@ export function extractResources(msgType: string, rawContent: string): MessageRe
             for (const node of block) {
               const key = node.image_key ?? node.img_key;
               if ((node.tag === 'img' || node.tag === 'image') && key) {
-                resources.push({ type: 'image', key, name: `${key}.jpg` });
+                pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
               }
             }
           }
         } else {
           for (const el of rootElements) {
-            extractElementImages(el, resources);
+            extractElementImages(el, resources, pushIfNew);
           }
         }
       }
@@ -189,7 +221,11 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
     logger.info(`[parser] type=${message.message_type} content=${message.content} keys=${Object.keys(message).join(',')}`);
   }
 
-  const resources = extractResources(message.message_type, message.content);
+  // Share numberer so in-body [图片 N] placeholders use the same numbers as
+  // the attachment list. Resources first → numbers assigned; text second →
+  // reuses them.
+  const numberer = createImgNumberer();
+  const resources = extractResources(message.message_type, message.content, numberer);
 
   // Extract structured mentions
   const mentions: LarkMention[] | undefined =
@@ -207,21 +243,21 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
     senderId: sender.sender_id?.open_id ?? '',
     senderType: sender.sender_type,
     msgType: message.message_type,
-    content: extractTextContent(message.message_type, message.content, message.mentions),
+    content: extractTextContent(message.message_type, message.content, message.mentions, numberer),
     createTime: message.create_time,
     mentions,
   };
   return { parsed, resources };
 }
 
-export function parseApiMessage(msg: any): LarkMessage {
+export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
   return {
     messageId: msg.message_id ?? '',
     rootId: msg.root_id ?? msg.thread_id ?? '',
     senderId: msg.sender?.id ?? '',
     senderType: msg.sender?.sender_type ?? 'unknown',
     msgType: msg.msg_type ?? 'text',
-    content: extractTextContent(msg.msg_type ?? 'text', msg.body?.content ?? ''),
+    content: extractTextContent(msg.msg_type ?? 'text', msg.body?.content ?? '', undefined, numberer),
     createTime: msg.create_time ?? '',
   };
 }
@@ -254,7 +290,7 @@ function resolveMentions(text: string, mentions?: RawEventData['message']['menti
   return result.trim();
 }
 
-function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions']): string {
+function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
     if (msgType === 'text') {
       const parsed = JSON.parse(rawContent);
@@ -267,10 +303,14 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
         .map((paragraph: any[]) => {
           const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
           return nodes
-            .filter((node: any) => node.tag === 'text' || node.tag === 'a' || node.tag === 'at')
             .map((node: any) => {
+              if (node.tag === 'text') return node.text ?? '';
+              if (node.tag === 'a') return node.text ?? node.href ?? '';
               if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
-              return node.text ?? node.href ?? '';
+              if (node.tag === 'img' && node.image_key && numberer) {
+                return `[图片 ${numberer.assign(`image:${node.image_key}`).num}]`;
+              }
+              return '';
             })
             .join('');
         })
@@ -279,18 +319,26 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       return title ? `${title}\n${body}` : body;
     }
     if (msgType === 'image') {
+      try {
+        const p = JSON.parse(rawContent);
+        if (p.image_key && numberer) return `[图片 ${numberer.assign(`image:${p.image_key}`).num}]`;
+      } catch { /* fall through */ }
       return '[图片]';
     }
     if (msgType === 'file') {
       try {
         const p = JSON.parse(rawContent);
+        if (p.file_key && numberer) {
+          const n = numberer.assign(`file:${p.file_key}`).num;
+          return p.file_name ? `[文件 ${n}: ${p.file_name}]` : `[文件 ${n}]`;
+        }
         return `[文件: ${p.file_name ?? 'unknown'}]`;
       } catch {
         return '[文件]';
       }
     }
     if (msgType === 'interactive') {
-      return extractCardContent(rawContent);
+      return extractCardContent(rawContent, numberer);
     }
     if (msgType === 'merge_forward') {
       return '[合并转发消息]';
@@ -309,7 +357,7 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
  * This is similar to post message body.  We also handle the original card JSON
  * (header/config/elements with tag objects) for locally-cached cards.
  */
-function extractCardContent(rawContent: string): string {
+function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
   try {
     const card = JSON.parse(rawContent);
 
@@ -331,9 +379,7 @@ function extractCardContent(rawContent: string): string {
       ? card.body.elements
       : Array.isArray(card.elements) ? card.elements : null;
 
-    // Shared counter so inline image placeholders align with the ordered
-    // attachment list produced by extractResources (same traversal order).
-    const imgCounter = { n: 0 };
+    const imgLabel = (key: string) => numberer ? `[图片 ${numberer.assign(`image:${key}`).num}]` : '[图片]';
 
     if (rootElements) {
       const isApiFormat = rootElements.length > 0 && Array.isArray(rootElements[0]);
@@ -349,7 +395,8 @@ function extractCardContent(rawContent: string): string {
             else if (node.tag === 'a') textNodes.push(node.text ?? node.href ?? '');
             else if (node.tag === 'at') textNodes.push(`@${node.user_name ?? 'unknown'}`);
             else if (node.tag === 'img' || node.tag === 'image') {
-              if (node.image_key ?? node.img_key) textNodes.push(`[图片 ${++imgCounter.n}]`);
+              const k = node.image_key ?? node.img_key;
+              if (k) textNodes.push(imgLabel(k));
             }
             else if (node.tag === 'button') {
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
@@ -362,7 +409,7 @@ function extractCardContent(rawContent: string): string {
         }
       } else {
         for (const el of rootElements) {
-          extractElementText(el, parts, imgCounter);
+          extractElementText(el, parts, imgLabel);
         }
       }
     }
@@ -373,34 +420,36 @@ function extractCardContent(rawContent: string): string {
   }
 }
 
+type ResourcePusher = (resources: MessageResource[], r: MessageResource) => void;
+
 /** Recursively extract image resources from an original-format card element. */
-function extractElementImages(el: any, resources: MessageResource[]): void {
+function extractElementImages(el: any, resources: MessageResource[], pushIfNew: ResourcePusher): void {
   if (!el || typeof el !== 'object') return;
 
   const tag = el.tag;
   const key = el.image_key ?? el.img_key;
   if ((tag === 'img' || tag === 'image') && key) {
-    resources.push({ type: 'image', key, name: `${key}.jpg` });
+    pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
   }
 
   // div.extra can contain an image
-  if (el.extra) extractElementImages(el.extra, resources);
+  if (el.extra) extractElementImages(el.extra, resources, pushIfNew);
 
   // column_set / column — recurse into nested elements
   if (Array.isArray(el.columns)) {
     for (const col of el.columns) {
       if (Array.isArray(col.elements)) {
-        for (const child of col.elements) extractElementImages(child, resources);
+        for (const child of col.elements) extractElementImages(child, resources, pushIfNew);
       }
     }
   }
   if (Array.isArray(el.elements)) {
-    for (const child of el.elements) extractElementImages(child, resources);
+    for (const child of el.elements) extractElementImages(child, resources, pushIfNew);
   }
 }
 
 /** Recursively extract readable text from an original-format card element. */
-function extractElementText(el: any, parts: string[], imgCounter: { n: number }): void {
+function extractElementText(el: any, parts: string[], imgLabel: (key: string) => string): void {
   if (!el || typeof el !== 'object') return;
 
   const tag = el.tag;
@@ -419,7 +468,8 @@ function extractElementText(el: any, parts: string[], imgCounter: { n: number })
 
   // image — emit a numbered placeholder matching the attachment list order.
   if (tag === 'img' || tag === 'image') {
-    if (el.image_key ?? el.img_key) parts.push(`[图片 ${++imgCounter.n}]`);
+    const k = el.image_key ?? el.img_key;
+    if (k) parts.push(imgLabel(k));
   }
 
   // note blocks (v1 only — v2 removed the tag but we still parse v1 cards)
@@ -431,17 +481,17 @@ function extractElementText(el: any, parts: string[], imgCounter: { n: number })
   }
 
   // div.extra can host an image
-  if (el.extra) extractElementText(el.extra, parts, imgCounter);
+  if (el.extra) extractElementText(el.extra, parts, imgLabel);
 
   // column_set / column — recurse into nested elements
   if (Array.isArray(el.columns)) {
     for (const col of el.columns) {
       if (Array.isArray(col.elements)) {
-        for (const child of col.elements) extractElementText(child, parts, imgCounter);
+        for (const child of col.elements) extractElementText(child, parts, imgLabel);
       }
     }
   }
   if (Array.isArray(el.elements) && tag !== 'note') {
-    for (const child of el.elements) extractElementText(child, parts, imgCounter);
+    for (const child of el.elements) extractElementText(child, parts, imgLabel);
   }
 }

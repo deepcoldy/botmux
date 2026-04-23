@@ -134,8 +134,12 @@ export async function getAvailableBots(
 
 export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
   if (!attachments || attachments.length === 0) return '';
-  const lines = attachments.map(a => `- (${a.path})`);
-  return `\n\n附件（使用 Read 工具查看）：\n${lines.join('\n')}`;
+  let imgN = 0, fileN = 0;
+  const lines = attachments.map(a => {
+    const label = a.type === 'image' ? `[图片 ${++imgN}]` : `[文件 ${++fileN}]`;
+    return `- ${label} (${a.path})`;
+  });
+  return `\n\n附件（使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应）：\n${lines.join('\n')}`;
 }
 
 export function buildNewTopicPrompt(

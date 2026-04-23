@@ -11,7 +11,7 @@ import { replyMessage, resolveAllowedUsers, getMessageDetail } from './im/lark/c
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
-import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, type MessageResource } from './im/lark/message-parser.js';
+import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, createImgNumberer, unwrapUserDslContent, type MessageResource } from './im/lark/message-parser.js';
 import { logger } from './utils/logger.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
@@ -208,11 +208,16 @@ const cardDeps: CardHandlerDeps = {
 async function expandMergeForward(
   larkAppId: string, messageId: string, parsed: LarkMessage,
   depth: number = 0,
+  numberer = createImgNumberer(),
 ): Promise<{ extraResources: MessageResource[] }> {
   const MAX_DEPTH = 5;
   const extraResources: MessageResource[] = [];
   try {
-    const detail = await getMessageDetail(larkAppId, messageId);
+    // Lark returns HTTP 500 if user_card_content is combined with a
+    // merge_forward message_id, so explicitly disable it here. Interactive
+    // sub-messages come back in the simplified "Format A" shape which our
+    // card extractor already handles.
+    const detail = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
     const subMessages = (detail?.items ?? []).filter((m: any) => m.upper_message_id === messageId);
     if (subMessages.length === 0) return { extraResources };
 
@@ -221,22 +226,39 @@ async function expandMergeForward(
       const senderLabel = msg.sender?.sender_type === 'app' ? '机器人' : (msg.sender?.id ?? '未知');
       parts.push(`--- ${senderLabel} ---`);
 
+      // Interactive sub-messages may still carry the simplified "upgrade your
+      // client" fallback; unwrap user_dsl before any extraction so both the
+      // resource pass and text pass see the real v2 body.
+      // Interactive sub-messages arrive via REST as a simplified fallback.
+      // Lark's im.message.get never returns user_dsl (even for the bot's own
+      // messages, even via direct id lookup), so we can only unwrap when a
+      // user_dsl somehow got through. For third-party cards whose simplified
+      // form is the "请升级至最新版本客户端" fallback, the real body is
+      // unrecoverable from REST.
+      if (msg.msg_type === 'interactive') {
+        const unwrapped = unwrapUserDslContent(msg.body?.content ?? '');
+        if (unwrapped !== null) {
+          msg.body = { ...(msg.body ?? {}), content: unwrapped };
+        }
+      }
+
+      // Resources first so the numberer assigns [图片 N] in attachment order;
+      // text extraction below reuses those numbers. Do NOT override messageId —
+      // Lark requires the parent merge_forward's message_id to download
+      // resources (error 234003 if sub-message ID is used).
+      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '', numberer);
+      extraResources.push(...subResources);
+
       // Recursively expand nested merge_forward
       if (msg.msg_type === 'merge_forward' && depth < MAX_DEPTH) {
         const nested: LarkMessage = { content: '[合并转发消息]', msgType: 'merge_forward', messageId: msg.message_id, rootId: '', senderId: msg.sender?.id ?? '', senderType: msg.sender?.sender_type ?? '', createTime: msg.create_time ?? '', mentions: [] };
-        const { extraResources: nestedResources } = await expandMergeForward(larkAppId, msg.message_id, nested, depth + 1);
+        const { extraResources: nestedResources } = await expandMergeForward(larkAppId, msg.message_id, nested, depth + 1, numberer);
         parts.push(nested.content);
         extraResources.push(...nestedResources);
       } else {
-        const sub = parseApiMessage(msg);
+        const sub = parseApiMessage(msg, numberer);
         parts.push(sub.content);
       }
-
-      // Collect resources (images/files) from sub-messages for download.
-      // Do NOT override messageId — Lark requires the parent merge_forward's
-      // message_id to download resources (error 234003 if sub-message ID is used).
-      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '');
-      extraResources.push(...subResources);
     }
     parsed.content = parts.join('\n');
     parsed.msgType = 'merge_forward_expanded';
