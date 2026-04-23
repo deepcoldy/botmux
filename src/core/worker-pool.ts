@@ -325,6 +325,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
+    botName: bot.botName,
+    botOpenId: bot.botOpenId,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -768,6 +770,8 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
+    botName: bot.botName,
+    botOpenId: bot.botOpenId,
     adoptMode: true,
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptPaneCols: adopted.paneCols,

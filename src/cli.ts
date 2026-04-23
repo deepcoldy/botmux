@@ -1604,12 +1604,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Parse mentions: "open_id:Display Name"
+  // Parse mentions: "open_id:Display Name" or bare "open_id"
+  // Bare form appends a trailing <at id=...> to the message and still writes
+  // a bot-mention signal — useful when the sender doesn't know the target's
+  // display name or just wants to notify without inline substitution.
   const mentions: Array<{ open_id: string; name: string }> = [];
   for (const m of mentionArgs) {
     const idx = m.indexOf(':');
     if (idx > 0) {
       mentions.push({ open_id: m.slice(0, idx), name: m.slice(idx + 1) });
+    } else if (m.trim()) {
+      mentions.push({ open_id: m.trim(), name: '' });
     }
   }
 
@@ -1648,14 +1653,46 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     } catch { /* not JSON, use as-is */ }
 
+    // Auto-detect @BotName in text and inject as mentions, using the sender
+    // app's cross-ref file for per-app-scoped open_ids. Without this, a plain
+    // "@Claude" in text only triggers IPC routing but Lark UI shows it as
+    // plain text — confusing the user who thinks the @ didn't fire.
+    try {
+      const dataDir = resolveDataDir();
+      const botInfoPath = join(dataDir, 'bots-info.json');
+      type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+      const botEntries: BotInfoEntry[] = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
+      const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
+      const crossRef: Record<string, string> = existsSync(crossRefPath)
+        ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+        : {};
+      const alreadyMentioned = new Set(mentions.map(m => m.open_id));
+      for (const entry of botEntries) {
+        if (!entry.botName || entry.larkAppId === appId) continue;
+        const names = [entry.botName, entry.cliId].filter(Boolean) as string[];
+        for (const name of names) {
+          const re = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+          if (!re.test(text)) continue;
+          // Prefer sender-scoped open_id from cross-ref (what Lark's sender app
+          // has seen for the target bot); fall back to target's own open_id.
+          const senderScopedId = crossRef[entry.botName] ?? entry.botOpenId;
+          if (!senderScopedId || alreadyMentioned.has(senderScopedId)) break;
+          mentions.push({ open_id: senderScopedId, name: entry.botName });
+          alreadyMentioned.add(senderScopedId);
+          break;
+        }
+      }
+    } catch { /* best-effort */ }
+
     // Decide: interactive card (renders markdown) vs. post (plain text).
     // Explicit --card / --text wins; otherwise auto-detect markdown syntax.
     const useCard = forceCard || (!forceText && hasMarkdown(text));
 
     const mentionMap = new Map<string, string>();
-    for (const m of mentions) mentionMap.set(m.name.toLowerCase(), m.open_id);
-    const mentionPattern = mentions.length > 0
-      ? new RegExp(`@(${mentions.map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'gi')
+    for (const m of mentions) if (m.name) mentionMap.set(m.name.toLowerCase(), m.open_id);
+    const namedMentions = mentions.filter(m => m.name);
+    const mentionPattern = namedMentions.length > 0
+      ? new RegExp(`@(${namedMentions.map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'gi')
       : null;
 
     let messageId: string;

@@ -219,8 +219,11 @@ botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 # 先查可用机器人
 botmux bots list
 
-# @mention 协作
+# 形式 A：带名字 — 文本里 @Aiden 被替换成 <at> 标签
 botmux send --mention "ou_xxx:Aiden" "请 @Aiden 帮忙 review 这段代码"
+
+# 形式 B：只传 open_id — 在消息末尾追加 @mention 通知
+botmux send --mention ou_xxx "帮忙看下这段代码"
 \`\`\`
 
 ## 参数
@@ -231,7 +234,7 @@ botmux send --mention "ou_xxx:Aiden" "请 @Aiden 帮忙 review 这段代码"
 | \`--content-file <path>\` | 从文件读取内容（优先于 stdin/positional） |
 | \`--images <path>\` | 内联图片，可重复多次 |
 | \`--files <path>\` | 附件文件，可重复多次，每个单独发送 |
-| \`--mention <open_id:name>\` | @mention，可重复。用 \`botmux bots list\` 查 open_id |
+| \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
 | \`--card\` / \`--text\` | 强制卡片或纯文本模式（默认按 md 语法自动判断） |
 | \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
 

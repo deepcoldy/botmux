@@ -271,7 +271,8 @@ export async function handleCommand(
           sessionStore.updateSession(ds.session);
 
           if (ds.pendingRepo) {
-            const botCfg = getBot(ds.larkAppId).config;
+            const selfBot = getBot(ds.larkAppId);
+            const botCfg = selfBot.config;
             ds.pendingRepo = false;
             const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
             const prompt = buildNewTopicPrompt(
@@ -283,6 +284,7 @@ export async function handleCommand(
               ds.pendingMentions,
               await getAvailableBots(ds.larkAppId, ds.chatId),
               ds.pendingFollowUps,
+              { name: selfBot.botName, openId: selfBot.botOpenId },
             );
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
@@ -335,7 +337,8 @@ export async function handleCommand(
 
       case '/skip': {
         if (ds?.pendingRepo) {
-          const botCfg = getBot(ds.larkAppId).config;
+          const selfBot = getBot(ds.larkAppId);
+          const botCfg = selfBot.config;
           ds.pendingRepo = false;
           const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
           const prompt = buildNewTopicPrompt(
@@ -347,6 +350,7 @@ export async function handleCommand(
             ds.pendingMentions,
             await getAvailableBots(ds.larkAppId, ds.chatId),
             ds.pendingFollowUps,
+            { name: selfBot.botName, openId: selfBot.botOpenId },
           );
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;

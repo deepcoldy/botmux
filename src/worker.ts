@@ -582,6 +582,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     sessionId: cfg.sessionId,
     resume: cfg.resume ?? false,
     initialPrompt: cfg.prompt || undefined,
+    botName: cfg.botName,
+    botOpenId: cfg.botOpenId,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)

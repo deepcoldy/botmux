@@ -147,11 +147,25 @@ export function buildNewTopicPrompt(
   mentions?: LarkMention[],
   availableBots?: Array<{ name: string; displayName: string; openId: string }>,
   followUps?: string[],
+  botIdentity?: { name?: string; openId?: string },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
 
   const noteLines = hints.map(h => `- ${h}`);
+
+  // Bot identity section — tells the bot who it is so it can distinguish
+  // itself when multiple bots are @mentioned in the same message.
+  let identitySection = '';
+  if (botIdentity && (botIdentity.name || botIdentity.openId)) {
+    const lines = [
+      `- 名字：${botIdentity.name ?? '(未知)'}`,
+      `- open_id：${botIdentity.openId ?? '(未知)'}`,
+      '- 同一群里可能有多个机器人同时被 @，消息里会以 `@名字` 和 `open_id` 区分',
+      '- 只执行明确分给自己的那部分，整条消息都指派给别的机器人时保持沉默',
+    ];
+    identitySection = `\n\n你的身份：\n${lines.join('\n')}`;
+  }
 
   // Mention metadata section
   let mentionSection = '';
@@ -192,6 +206,7 @@ export function buildNewTopicPrompt(
     parts.push(`Session ID: ${sessionId}`);
   }
   if (noteLines.length > 0) parts.push(noteLines.join('\n'));
+  if (identitySection) parts.push(identitySection.trim());
   if (mentionSection) parts.push(mentionSection.trim());
   if (botSection) parts.push(botSection.trim());
 
@@ -450,7 +465,7 @@ export async function executeScheduledTask(
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(threadRootId);
 
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride);
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId });
 
   const ds: DaemonSession = {
     session,

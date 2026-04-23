@@ -24,6 +24,8 @@ export interface CliAdapter {
     sessionId: string;
     resume: boolean;
     initialPrompt?: string;
+    botName?: string;
+    botOpenId?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).

@@ -350,7 +350,8 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   } else {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId));
+    const selfBot = getBot(larkAppId);
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -504,7 +505,8 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     } else {
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId));
+      const selfBot = getBot(larkAppId);
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
     }
 

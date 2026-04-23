@@ -488,7 +488,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (actionType === 'skip_repo' && ds) {
       if (ds.pendingRepo) {
-        const botCfg = getBot(ds.larkAppId).config;
+        const selfBot = getBot(ds.larkAppId);
+        const botCfg = selfBot.config;
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
         const prompt = buildNewTopicPrompt(
@@ -500,6 +501,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.pendingMentions,
           await getAvailableBots(ds.larkAppId, ds.chatId),
           ds.pendingFollowUps,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
         );
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
@@ -582,7 +584,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   sessionStore.updateSession(targetDs.session);
 
   if (targetDs.pendingRepo) {
-    const botCfg = getBot(targetDs.larkAppId).config;
+    const selfBot = getBot(targetDs.larkAppId);
+    const botCfg = selfBot.config;
     // First-time repo selection — now spawn CLI with the original prompt
     targetDs.pendingRepo = false;
     const prompt = buildNewTopicPrompt(
@@ -594,6 +597,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       targetDs.pendingMentions,
       await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
       targetDs.pendingFollowUps,
+      { name: selfBot.botName, openId: selfBot.botOpenId },
     );
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
