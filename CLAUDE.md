@@ -32,14 +32,17 @@ pnpm daemon:logs          # 查看日志
 - **日常提交**：正常 `git commit` + `git push`，不会触发发版
 - **发版**：打 `v*` tag 并 push 即可，GitHub Action 自动从 tag 提取版本号写入 `package.json` 后发布 npm + 创建 GitHub Release
 - **不要**手动修改 `package.json` 的 `version` 字段来发版，CI 会自动处理
-- commit message 遵循 commitlint：`type(scope): message`
+- commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文
+- 发版的 annotated tag message 用中文撰写，CI 会把 tag message 作为 GitHub Release body
 
 ```bash
 # 日常开发
-git add <files> && git commit -m "fix(cli): description" && git push
+git add <files> && git commit -m "fix(cli): 修复某某问题" && git push
 
 # 发版（仅在用户明确要求时执行）
-git tag -a v1.x.x -m "release description"
+git tag -a v1.x.x -m "中文 changelog 标题
+
+详细改动说明..."
 git push origin v1.x.x
 ```
 

@@ -37,16 +37,17 @@ jobs:
         id: changelog
         run: |
           PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
-          if [ -z "$PREV_TAG" ]; then
-            COMMITS=$(git log --pretty=format:"- %s" HEAD)
-          else
-            COMMITS=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
+          TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          if [ -z "$TAG_MSG" ]; then
+            if [ -z "$PREV_TAG" ]; then
+              TAG_MSG=$(git log --pretty=format:"- %s" HEAD)
+            else
+              TAG_MSG=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
+            fi
           fi
           {
             echo 'body<<CHANGELOG_EOF'
-            echo "## Changes"
-            echo ""
-            echo "$COMMITS"
+            echo "$TAG_MSG"
             echo ""
             echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo 'CHANGELOG_EOF'
