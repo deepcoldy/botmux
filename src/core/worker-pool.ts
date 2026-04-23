@@ -692,6 +692,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         logger.error(`[${t}] Worker error: ${msg.message}`);
         break;
       }
+
+      case 'user_notify': {
+        logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+        try {
+          await cb.sessionReply(ds.session.rootMessageId, msg.message, 'text', ds.larkAppId);
+        } catch (err: any) {
+          logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
+        }
+        break;
+      }
     }
   });
 

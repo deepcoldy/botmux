@@ -1,5 +1,49 @@
+import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+
+/** Resolve the JSONL transcript path Claude Code writes user/assistant turns to.
+ *  Claude Code's project-hash scheme replaces both `/` and `.` with `-`. */
+export function claudeJsonlPathForSession(sessionId: string, cwd: string): string {
+  const projectHash = cwd.replace(/[/.]/g, '-');
+  return join(homedir(), '.claude', 'projects', projectHash, `${sessionId}.jsonl`);
+}
+
+/** Substring that appears on every real user submission line and NOT on tool-result
+ *  lines (those have array content: `"content":[{...}]`). */
+const USER_SUBMIT_MARKER = '"role":"user","content":"';
+
+function currentFileSize(path: string): number {
+  if (!existsSync(path)) return 0;
+  try { return statSync(path).size; } catch { return 0; }
+}
+
+function deltaHasUserSubmit(path: string, fromByte: number): boolean {
+  if (!existsSync(path)) return false;
+  let size: number;
+  try { size = statSync(path).size; } catch { return false; }
+  if (size <= fromByte) return false;
+  const len = size - fromByte;
+  const buf = Buffer.alloc(len);
+  const fd = openSync(path, 'r');
+  try {
+    readSync(fd, buf, 0, len, fromByte);
+  } finally {
+    closeSync(fd);
+  }
+  return buf.toString('utf8').includes(USER_SUBMIT_MARKER);
+}
+
+async function waitForUserSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (deltaHasUserSubmit(path, baseByte)) return true;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
+}
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed) for \d+[smh]/;
 
@@ -56,18 +100,45 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       // swallow a trailing Enter sent via send-keys -l + send-keys Enter,
       // leaving content in the input box. Bracketed paste marks an explicit
       // \x1b[201~ boundary so the post-paste Enter is unambiguously submit.
+      // Past that, we still can't trust fixed-delay timing (slow disk, big
+      // paste, image loading). The robust signal is Claude Code's session
+      // JSONL: each real user submit appends a line — if no new line appears,
+      // Enter was swallowed and we re-send it.
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
       const submitDelay = hasImagePath ? 800 : 500;
 
+      const sendEnter = () => {
+        if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+        else pty.write('\r');
+      };
+
+      const baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
+
       if (pty.pasteText && pty.sendSpecialKeys) {
         pty.pasteText(content);
-        await new Promise(r => setTimeout(r, submitDelay));
-        pty.sendSpecialKeys('Enter');
       } else {
         pty.write('\x1b[200~' + content + '\x1b[201~');
-        await new Promise(r => setTimeout(r, submitDelay));
-        pty.write('\r');
       }
+      await new Promise(r => setTimeout(r, submitDelay));
+      sendEnter();
+
+      // Without a JSONL path we can't verify — trust the fixed delay and return.
+      if (!pty.claudeJsonlPath) return;
+
+      // Retry budget: up to 2 extra Enters (3 sends total), each followed by
+      // an 800ms wait for the JSONL append. If the user is concurrently typing
+      // in the web terminal, a stray Enter may submit their half-typed text —
+      // but we only retry when the JSONL is provably unchanged, so the race
+      // window is bounded to cases where submit really did fail.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (await waitForUserSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
+        sendEnter();
+      }
+      // Final grace check.
+      if (await waitForUserSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
+      // All retries exhausted and still no user line in JSONL. Signal failure
+      // so the worker can notify the user in Lark instead of silently dropping.
+      return { submitted: false };
     },
 
     completionPattern: COMPLETION_RE,

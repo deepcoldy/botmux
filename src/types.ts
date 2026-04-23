@@ -139,5 +139,6 @@ export type WorkerToDaemon =
   | { type: 'error'; message: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean }
   | { type: 'tui_prompt_resolved'; selectedText?: string }
-  | { type: 'screenshot_uploaded'; imageKey: string; status: 'working' | 'idle' | 'analyzing' };
+  | { type: 'screenshot_uploaded'; imageKey: string; status: 'working' | 'idle' | 'analyzing' }
+  | { type: 'user_notify'; message: string };
 
