@@ -20,6 +20,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { claudeJsonlPathForSession } from './adapters/cli/claude-code.js';
 import type { CliAdapter } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -488,7 +489,15 @@ async function flushPending(): Promise<void> {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const msg = pendingMessages.shift()!;
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-      await cliAdapter.writeInput(backend, msg);
+      const result = await cliAdapter.writeInput(backend, msg);
+      if (result && result.submitted === false) {
+        const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+        log(`writeInput: submit not confirmed after retries — notifying user. preview="${preview}"`);
+        send({
+          type: 'user_notify',
+          message: `⚠️ 刚才那条消息发给 CLI 后没能确认提交（paste 后重试 Enter 3 次仍未在会话 JSONL 中看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
+        });
+      }
     }
   } finally {
     isFlushing = false;
@@ -577,6 +586,14 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   isTmuxMode = useTmux;
   const tmuxBe = useTmux ? new TmuxBackend(TmuxBackend.sessionName(cfg.sessionId)) : null;
   backend = tmuxBe ?? new PtyBackend();
+
+  // Claude Code appends a line to ~/.claude/projects/<cwd-hash>/<sid>.jsonl each
+  // time the user submits. The adapter uses this file to verify paste+Enter
+  // actually committed (rather than trusting a fixed sleep), so wire it up now.
+  if (cfg.cliId === 'claude-code') {
+    (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
+      claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
+  }
 
   const args = cliAdapter.buildArgs({
     sessionId: cfg.sessionId,

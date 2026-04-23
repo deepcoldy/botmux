@@ -141,6 +141,10 @@ export class TmuxBackend implements SessionBackend {
     return this.reattaching;
   }
 
+  /** Claude Code session JSONL path — set by worker for claude-code sessions so
+   *  the claude-code adapter can verify paste+Enter submissions via file growth. */
+  claudeJsonlPath?: string;
+
   write(data: string): void {
     this.process?.write(data);
   }

@@ -6,6 +6,10 @@ export interface PtyHandle {
   sendSpecialKeys?(...keys: string[]): void;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
+  /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
+   *  Used by writeInput to verify a paste+Enter actually committed (new user-content
+   *  line appended) and retry Enter if not — rather than trusting fixed sleep timing. */
+  claudeJsonlPath?: string;
 }
 
 export interface CliAdapter {
@@ -33,8 +37,13 @@ export interface CliAdapter {
   readonly passesInitialPromptViaArgs?: boolean;
 
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
-   *  Resolves when all writes are complete. */
-  writeInput(pty: PtyHandle, content: string): Promise<void>;
+   *  Resolves when all writes are complete.
+   *
+   *  Return value is optional: adapters that can verify the submit (e.g. Claude
+   *  Code via session JSONL) return `{ submitted: false }` when all retries
+   *  failed, so the worker can surface that to the user. `void` / undefined
+   *  means "no verification performed, assume OK". */
+  writeInput(pty: PtyHandle, content: string): Promise<void | { submitted: boolean }>;
 
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
    *  skill directory.  When set, `ensureSkills` will write/refresh skill files

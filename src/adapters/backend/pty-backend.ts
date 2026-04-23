@@ -16,6 +16,10 @@ try {
 export class PtyBackend implements SessionBackend {
   private process: pty.IPty | null = null;
 
+  /** Claude Code session JSONL path — set by worker for claude-code sessions so
+   *  the claude-code adapter can verify paste+Enter submissions via file growth. */
+  claudeJsonlPath?: string;
+
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     this.process = pty.spawn(bin, args, {
       name: 'xterm-256color',
