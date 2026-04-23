@@ -49,7 +49,7 @@ export const config = {
     /** Snapshot polling interval in ms */
     intervalMs: Number(process.env.SCREEN_ANALYZER_INTERVAL_MS) || 2_000,
     /** Consecutive unchanged snapshots required before calling AI */
-    stableCount: Number(process.env.SCREEN_ANALYZER_STABLE_COUNT) || 3,
+    stableCount: Number(process.env.SCREEN_ANALYZER_STABLE_COUNT) || 6,
     /** Max characters to send from snapshot */
     snapshotMaxChars: Number(process.env.SCREEN_ANALYZER_SNAPSHOT_MAX_CHARS) || 8_000,
     /** Extra headers for the API request (JSON string, e.g. '{"X-Custom":"value"}') */
