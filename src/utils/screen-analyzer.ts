@@ -59,14 +59,17 @@ Examples of REAL prompts:
 - "Proceed? [Y/n]" style one-line confirmations (two implicit options rendered inline)
 
 The following are NOT interactive prompts (return needsInteraction=false):
-- **A natural-language question in the assistant's conversational output** (e.g. "要我提交这次改动吗？", "Should I continue?", "Want me to run tests?", "Do you want me to fix this?") — even if it ends with "?" and even if Yes/No would be a plausible answer. If the options are not physically rendered as a list on screen, it is NOT a prompt. Do NOT invent Yes/No options from a question.
+- **A natural-language question in the assistant's conversational output with NO rendered option list** (e.g. "要我提交这次改动吗？", "Should I continue?", "Want me to run tests?", "Do you want me to fix this?") — if the options are not physically rendered as a list on screen, it is NOT a prompt. Do NOT invent Yes/No options from a question.
 - Status bar text like "bypass permissions (shift+tab to cycle)" — persistent status indicator.
 - CLI idle state: a lone input cursor (❯, >, $) on its own line waiting for the user to type a free-form message. An idle cursor alone is NEVER a prompt, even if the preceding line is a question.
 - Progress indicators, spinners, loading animations, "Brewed for …", "Thinking…".
 - Error messages, informational output, tool output echoes.
 - Any text that is part of the CLI's normal UI chrome (toolbars, status bars, mode indicators).
 
-Decision rule: if you cannot point to **two or more** concrete option rows actually drawn on the screen, return needsInteraction=false. A question without rendered options is conversation, not a prompt.
+Decision rule (apply in order):
+1. Scan the screen for ≥2 concrete option rows actually drawn (numbered like "1. ...", "2. ...", bulleted with ❯/>/*/●, or checkboxes [ ]/[x]). If yes → needsInteraction=true. The question wording above them ("Do you want to…", "Proceed with…", anything ending in "?") does NOT disqualify the prompt. Rendered options win over question phrasing.
+2. If only a question is visible with no rendered option rows → needsInteraction=false.
+3. A framed/boxed dialog with a highlighted row is always a prompt regardless of question wording.
 
 Return ONLY valid JSON (no markdown, no extra text):
 {
@@ -208,10 +211,8 @@ export class ScreenAnalyzer {
     let analysis: ScreenAnalysis;
     try {
       analysis = await this.callAI(snapshot);
-      if (analysis.needsInteraction) {
-        this.callbacks.log(`ScreenAnalyzer AI input:\n${snapshot.slice(-1500)}`);
-        this.callbacks.log(`ScreenAnalyzer AI response: ${JSON.stringify(analysis)}`);
-      }
+      this.callbacks.log(`ScreenAnalyzer AI input:\n${snapshot.slice(-1500)}`);
+      this.callbacks.log(`ScreenAnalyzer AI response: ${JSON.stringify(analysis)}`);
     } catch (err: any) {
       this.callbacks.log(`ScreenAnalyzer AI call failed: ${err.message}`);
       this.waitingForContentChange = true;
