@@ -36,6 +36,8 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
+          # actions/checkout 默认把 tag 存成轻量指针，需重新 fetch 才能拿到 annotated tag object
+          git fetch origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" --force
           PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
           if [ -z "$TAG_MSG" ]; then
