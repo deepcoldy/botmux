@@ -1632,6 +1632,25 @@ function hasMarkdown(text: string): boolean {
   );
 }
 
+/**
+ * Decide who the reply card should @ in its footer.
+ *
+ * Non-oncall chats: `发送给: @<owner>` as before, no cc.
+ * Oncall chats: `发送给: @<last caller>` (falls back to owner if unknown);
+ *   if caller differs from the owners list, `cc` the owners so they stay
+ *   notified. Caller is deduped out of cc to avoid double-@.
+ */
+function buildFooterAddressing(
+  s: { ownerOpenId?: string; lastCallerOpenId?: string },
+  oncall: { owners: string[] } | undefined,
+): { sendTo: string | undefined; cc: string[] } {
+  const owner = s.ownerOpenId;
+  const caller = s.lastCallerOpenId ?? owner;
+  if (!oncall) return { sendTo: owner, cc: [] };
+  const cc = oncall.owners.filter(id => id && id !== caller);
+  return { sendTo: caller, cc };
+}
+
 async function cmdSend(rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
@@ -1692,11 +1711,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   // Register bots so Lark client works
-  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  const { registerBot, loadBotConfigs, findOncallChat } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
 
   const { replyMessage, uploadImage, uploadFile } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
+  const oncallEntry = s.chatId ? findOncallChat(appId, s.chatId) : undefined;
 
   try {
     // Upload images in parallel
@@ -1805,8 +1825,15 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
       // text size + grey font tag so it reads like a footnote below the hr.
+      // Oncall groups: `发送给` targets whoever triggered this turn (may not
+      // be the session owner), plus a `cc` line listing oncall owners so they
+      // stay informed. Non-oncall: keep owner-only behaviour.
       const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-      if (s.ownerOpenId) footerParts.push(`发送给：<at id=${s.ownerOpenId}></at>`);
+      const addressing = buildFooterAddressing(s, oncallEntry);
+      if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
+      if (addressing.cc.length > 0) {
+        footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
+      }
       elements.push({ tag: 'hr' });
       elements.push({
         tag: 'markdown',
@@ -1849,9 +1876,18 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      if (s.ownerOpenId) {
-        if (postContent.length === 0) postContent.push([]);
-        postContent[postContent.length - 1].push({ tag: 'at', user_id: s.ownerOpenId });
+      // Footer: mirror the card layout — a blank paragraph separates the body
+      // from the addressing line(s). `发送给: @<caller>` always; oncall groups
+      // additionally get `cc: @<owners>` on the next line.
+      const addressing = buildFooterAddressing(s, oncallEntry);
+      if (addressing.sendTo || addressing.cc.length > 0) {
+        if (postContent.length > 0) postContent.push([{ tag: 'text', text: '' }]);
+        if (addressing.sendTo) {
+          postContent.push([{ tag: 'text', text: '发送给：' }, { tag: 'at', user_id: addressing.sendTo }]);
+        }
+        if (addressing.cc.length > 0) {
+          postContent.push([{ tag: 'text', text: 'cc：' }, ...addressing.cc.map(id => ({ tag: 'at', user_id: id }))]);
+        }
       }
 
       const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
