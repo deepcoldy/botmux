@@ -159,6 +159,10 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 - **Node.js** >= 20
 - **AI 编程 CLI** 已安装并完成认证（`claude`、`codex`、`gemini` 或 `opencode` 在 PATH 中）
 - **tmux** >= 3.x（可选，安装后自动启用会话常驻）
+- **CJK 字体**（用于截图渲染中文/emoji）：
+  - macOS 自带 PingFang/Hiragino，无需配置
+  - Debian/Ubuntu：daemon 启动时若检测到缺字体会后台 `apt-get install fonts-noto-cjk fonts-noto-color-emoji`（需免密 sudo 或以 root 运行；装完重启 daemon 生效）
+  - 其他 Linux 发行版请手动安装 Noto CJK + Noto Color Emoji（包名视发行版而定）
 
 ## 5 分钟快速接入
 

@@ -64,6 +64,10 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 - **Node.js** >= 20
 - **AI coding CLI** installed and authenticated (`claude`, `codex`, `gemini`, or `opencode` in PATH)
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
+- **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
+  - macOS: ships with PingFang / Hiragino, no action needed
+  - Debian/Ubuntu: daemon will background-install `fonts-noto-cjk fonts-noto-color-emoji` on first boot if missing (requires passwordless sudo or running as root; restart the daemon after install)
+  - Other Linux distros: install Noto CJK + Noto Color Emoji manually (package names vary)
 
 ## 5-Minute Setup
 

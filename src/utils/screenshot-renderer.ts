@@ -40,22 +40,21 @@ function ensureFontRegistered(): void {
   }
 
   // 2. CJK monospace — primary for Latin + Han glyphs.
-  const cjkRegular = [
-    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
-    '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
-    '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc',
-    '/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc',
+  //    Linux: Noto Sans CJK（需要 fonts-noto-cjk 包）；macOS: 系统自带 PingFang/Hiragino。
+  const cjkCandidates: Array<{ regular: string; bold?: string; family: string }> = [
+    { regular: '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
+    { regular: '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
+    { regular: '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
+    { regular: '/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc', bold: '/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
+    { regular: '/System/Library/Fonts/PingFang.ttc', family: 'PingFang SC' },
+    { regular: '/System/Library/Fonts/STHeiti Light.ttc', family: 'Heiti SC' },
+    { regular: '/Library/Fonts/Hiragino Sans GB.ttc', family: 'Hiragino Sans GB' },
+    { regular: '/System/Library/Fonts/Hiragino Sans GB.ttc', family: 'Hiragino Sans GB' },
   ];
-  const cjkBold = [
-    '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
-    '/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc',
-    '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc',
-    '/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Bold.ttc',
-  ];
-  for (const p of cjkRegular) {
-    if (tryRegister(p)) {
-      for (const bp of cjkBold) if (tryRegister(bp)) break;
-      fontFamilyChain.push('Noto Sans Mono CJK SC');
+  for (const c of cjkCandidates) {
+    if (tryRegister(c.regular)) {
+      if (c.bold) tryRegister(c.bold);
+      fontFamilyChain.push(c.family);
       break;
     }
   }

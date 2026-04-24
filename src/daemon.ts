@@ -13,6 +13,7 @@ import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, createImgNumberer, unwrapUserDslContent, type MessageResource } from './im/lark/message-parser.js';
 import { logger } from './utils/logger.js';
+import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
@@ -726,6 +727,10 @@ function startBotMentionWatcher(): void {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
+  // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
+  ensureCjkFontsInstalled();
+
   // Load the assigned bot (one daemon per bot)
   const botConfigs = loadBotConfigs();
   const idx = botIndex ?? 0;
