@@ -12,6 +12,11 @@ export interface Session {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
+  /** open_id of the user whose message triggered the most recent CLI turn.
+   *  Equals ownerOpenId for the first turn; updates on every subsequent reply.
+   *  Used by `botmux send` to address the card to the actual caller in oncall
+   *  groups (where the caller is often not the session owner). */
+  lastCallerOpenId?: string;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;

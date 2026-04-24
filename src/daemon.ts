@@ -306,6 +306,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
       const session = sessionStore.createSession(chatId, messageId, cmdContent.substring(0, 50), chatType);
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
+      session.lastCallerOpenId = senderOpenId;
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(messageId, larkAppId), {
         session,
@@ -485,8 +486,17 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     sessionReply(rootId, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', effectiveAppId);
   }
 
-  // Update last message time
-  if (ds) ds.lastMessageAt = Date.now();
+  // Update last message time + last caller (used by `botmux send` to address
+  // reply cards to whoever triggered this turn — matters in oncall groups
+  // where the caller is often not the session owner).
+  if (ds) {
+    ds.lastMessageAt = Date.now();
+    const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+    if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
+      ds.session.lastCallerOpenId = callerOpenId;
+      sessionStore.updateSession(ds.session);
+    }
+  }
 
   // If waiting for repo selection, buffer the message and remind user
   if (ds?.pendingRepo) {
@@ -527,6 +537,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50), chatType);
     session.larkAppId = larkAppId;
     session.ownerOpenId = senderOId;
+    session.lastCallerOpenId = senderOId;
     sessionStore.updateSession(session);
 
     // Oncall group: pin working dir from binding, skip repo selection entirely
