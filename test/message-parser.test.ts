@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, stripLeadingMentions } from '../src/im/lark/message-parser.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -241,5 +241,39 @@ describe('extractResources: interactive cards', () => {
     const card = { type: 'template', data: { template_id: 'xxx' } };
     const resources = extractResources('interactive', JSON.stringify(card));
     expect(resources).toHaveLength(0);
+  });
+});
+
+// ─── stripLeadingMentions ──────────────────────────────────────────────────
+
+describe('stripLeadingMentions', () => {
+  it('strips a single leading mention with multi-word name', () => {
+    const out = stripLeadingMentions('@Botmux Oncall /oncall bind ~/iserver/botmux', [
+      { name: 'Botmux Oncall' },
+    ]);
+    expect(out).toBe('/oncall bind ~/iserver/botmux');
+  });
+
+  it('strips multiple leading mentions in sequence', () => {
+    const out = stripLeadingMentions('@Alice @Bob /restart', [
+      { name: 'Alice' },
+      { name: 'Bob' },
+    ]);
+    expect(out).toBe('/restart');
+  });
+
+  it('leaves content untouched when there is no leading mention', () => {
+    const out = stripLeadingMentions('hello @Bot how are you', [{ name: 'Bot' }]);
+    expect(out).toBe('hello @Bot how are you');
+  });
+
+  it('falls back to single-word @<word> regex when no mentions list given', () => {
+    const out = stripLeadingMentions('@bot /status', undefined);
+    expect(out).toBe('/status');
+  });
+
+  it('preserves trailing content unchanged when stripping', () => {
+    const out = stripLeadingMentions('@Botmux 介绍下当前项目', [{ name: 'Botmux' }]);
+    expect(out).toBe('介绍下当前项目');
   });
 });
