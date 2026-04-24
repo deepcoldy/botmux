@@ -30,9 +30,11 @@ vi.mock('node:fs', async (importOriginal) => {
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
+const mockFindOncallChat = vi.fn(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
   getAllBots: () => mockGetAllBots(),
+  findOncallChat: (...args: any[]) => mockFindOncallChat(...args),
 }));
 
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);

@@ -6,6 +6,7 @@
 import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
+import { canOperate } from './event-dispatcher.js';
 import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
@@ -60,22 +61,29 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
-    const ds = rootId ? activeSessions.get(rootId) : undefined;
-    // Determine which bot's allowedUsers to check:
-    // 1. Use the receiving bot (larkAppId from event dispatcher) — most accurate
-    // 2. Fall back to session's bot
-    // 3. Fall back to merging all bots
+    // activeSessions here is keyed by sessionKey(rootId, larkAppId); try both
+    // the per-bot key and the raw rootId (legacy single-bot shape) so ds
+    // lookup works for both code paths.
+    const ds = rootId
+      ? (larkAppId
+          ? activeSessions.get(`${rootId}:${larkAppId}`) ?? activeSessions.get(rootId)
+          : activeSessions.get(rootId))
+      : undefined;
     const effectiveAppId = larkAppId ?? ds?.larkAppId;
-    let allowedUsers: string[];
+    const chatId = ds?.chatId;
     if (effectiveAppId) {
-      allowedUsers = getBot(effectiveAppId).resolvedAllowedUsers;
-    } else {
-      allowedUsers = getAllBots().flatMap(b => b.resolvedAllowedUsers);
-    }
-    if (allowedUsers.length > 0) {
-      if (!operatorOpenId || !allowedUsers.includes(operatorOpenId)) {
-        logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
+      if (!canOperate(effectiveAppId, chatId, operatorOpenId)) {
+        logger.info(`Card action "${value.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
         return;
+      }
+    } else {
+      // No resolvable bot context — fall back to union of all allowedUsers
+      const allowedUsers = getAllBots().flatMap(b => b.resolvedAllowedUsers);
+      if (allowedUsers.length > 0) {
+        if (!operatorOpenId || !allowedUsers.includes(operatorOpenId)) {
+          logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
+          return;
+        }
       }
     }
   }

@@ -6,7 +6,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { getBot, getAllBots } from '../../bot-registry.js';
+import { getBot, getAllBots, findOncallChat } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { getChatInfo, listChatBotMembers, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -241,6 +241,33 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
   return false;
 }
 
+// ─── Permission gates ────────────────────────────────────────────────────
+//
+// Two separate gates for oncall support:
+//   canTalk    — may address the bot in this chat (prompts, thread replies)
+//   canOperate — may trigger state-changing actions (card buttons, daemon
+//                slash commands like /cd /restart /close /oncall)
+//
+// Non-oncall chats: both fall back to the bot's allowedUsers. Oncall-bound
+// chats: talking is open to everyone; operating is restricted to the entry's
+// `owners` list (initial binder + anyone they later add).
+
+export function canTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined): boolean {
+  const oncall = chatId ? findOncallChat(larkAppId, chatId) : undefined;
+  if (oncall) return true;
+  const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
+  if (allowedUsers.length === 0) return true;
+  return !!senderOpenId && allowedUsers.includes(senderOpenId);
+}
+
+export function canOperate(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined): boolean {
+  const oncall = chatId ? findOncallChat(larkAppId, chatId) : undefined;
+  if (oncall) return !!senderOpenId && oncall.owners.includes(senderOpenId);
+  const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
+  if (allowedUsers.length === 0) return true;
+  return !!senderOpenId && allowedUsers.includes(senderOpenId);
+}
+
 // ─── Group message access check ──────────────────────────────────────────
 
 /**
@@ -253,8 +280,7 @@ export async function checkGroupMessageAccess(
   larkAppId: string, message: any, chatId: string, senderOpenId: string | undefined,
 ): Promise<'allowed' | 'not_allowed' | 'ignore'> {
   const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
-  const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
-  const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
+  const isAllowed = canTalk(larkAppId, chatId, senderOpenId);
 
   logger.debug(`Check group message access: mentioned=${mentioned}, isAllowed=${isAllowed}`);
   if (mentioned) {
@@ -352,8 +378,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const chatType = message.chat_type;  // 'group' or 'p2p'
         const messageId = message.message_id;
         const senderOpenId = sender?.sender_id?.open_id as string | undefined;
-        const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
-        const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
+        const isAllowed = canTalk(larkAppId, chatId, senderOpenId);
 
         logger.debug('Received message:', message);
         // Group new topics (no rootId): check @mention + permissions

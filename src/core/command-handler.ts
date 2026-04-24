@@ -18,13 +18,14 @@ import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from '.
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
+import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey } from './types.js';
 import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt', '/oncall']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -457,6 +458,108 @@ export async function handleCommand(
         break;
       }
 
+      case '/oncall': {
+        const args = message.content.replace(/^\/oncall\s*/i, '').trim();
+        const [sub, ...rest] = args.length > 0 ? args.split(/\s+/) : [];
+        const appId = larkAppId ?? ds?.larkAppId;
+        const chatId = ds?.chatId;
+        const senderOpenId = message.senderId;
+
+        if (!appId || !chatId) {
+          await sessionReply(rootId, '/oncall 需要在群聊中、以新话题方式使用。');
+          break;
+        }
+        if (!senderOpenId) {
+          await sessionReply(rootId, '⚠️ 无法识别当前发送者身份。');
+          break;
+        }
+
+        if (!sub || sub === 'status' || sub === '状态') {
+          const entry = getOncallStatus(appId, chatId);
+          if (!entry) {
+            await sessionReply(rootId, [
+              '当前群尚未绑定 oncall 项目。',
+              '',
+              '用法：',
+              '/oncall bind <path>     — 绑定当前群到某个项目目录，跳过仓库选择卡片',
+              '/oncall unbind          — 解除当前群的 oncall 绑定',
+              '/oncall status          — 查看当前绑定状态',
+              '',
+              '绑定后：群内任何成员都可以 @ 机器人提问，但仅 owner 能点卡片按钮、执行 /cd /restart /close 等命令。',
+            ].join('\n'));
+          } else {
+            await sessionReply(rootId, [
+              '🟢 已绑定 oncall',
+              `工作目录：${entry.workingDir}`,
+              `Owners (${entry.owners.length})：${entry.owners.join(', ')}`,
+              '',
+              '/oncall unbind 可解除绑定；/cd <path> 切换工作目录（仍保留 oncall 模式）。',
+            ].join('\n'));
+          }
+          break;
+        }
+
+        if (sub === 'bind' || sub === '绑定') {
+          const target = rest.join(' ').trim();
+          if (!target) {
+            await sessionReply(rootId, '用法：/oncall bind <path>\n例如：/oncall bind ~/projects/payments-service');
+            break;
+          }
+          const resolvedPath = resolve(expandHome(target));
+          if (!existsSync(resolvedPath)) {
+            await sessionReply(rootId, `目录不存在：${resolvedPath}`);
+            break;
+          }
+          const home = homedir();
+          if (!resolvedPath.startsWith(home)) {
+            await sessionReply(rootId, `路径必须在用户主目录 (${home}) 下`);
+            break;
+          }
+          const result = bindOncall(appId, chatId, target, senderOpenId);
+          if (!result.ok) {
+            if (result.reason === 'not_owner') {
+              await sessionReply(rootId, '⚠️ 此群已绑定 oncall，仅现有 owner 可修改工作目录。');
+            } else if (result.reason === 'bot_not_in_config') {
+              await sessionReply(rootId, '⚠️ 无法在配置文件中找到当前机器人条目，绑定失败。');
+            } else {
+              await sessionReply(rootId, `⚠️ 绑定失败：${result.reason}`);
+            }
+            break;
+          }
+          const verb = result.created ? '已绑定' : '已更新';
+          await sessionReply(rootId, [
+            `✅ ${verb} oncall`,
+            `群：${chatId}`,
+            `工作目录：${target} → ${resolvedPath}`,
+            `Owner：${senderOpenId}`,
+            '',
+            '下次在本群开新话题时会直接用此目录启动 CLI，不再弹仓库选择卡片。',
+          ].join('\n'));
+          logger.info(`[${t}] /oncall bind chat=${chatId} dir=${target}`);
+          break;
+        }
+
+        if (sub === 'unbind' || sub === '解绑') {
+          const result = unbindOncall(appId, chatId, senderOpenId);
+          if (!result.ok) {
+            if (result.reason === 'not_bound') {
+              await sessionReply(rootId, '当前群未绑定 oncall。');
+            } else if (result.reason === 'not_owner') {
+              await sessionReply(rootId, '⚠️ 仅 owner 可解除绑定。');
+            } else {
+              await sessionReply(rootId, `⚠️ 解绑失败：${result.reason}`);
+            }
+            break;
+          }
+          await sessionReply(rootId, '✅ 已解除 oncall 绑定。下次开新话题将恢复默认仓库选择卡片流程。');
+          logger.info(`[${t}] /oncall unbind chat=${chatId}`);
+          break;
+        }
+
+        await sessionReply(rootId, `未知子命令：${sub}\n支持：/oncall bind <path> | /oncall unbind | /oncall status`);
+        break;
+      }
+
       case '/help': {
         const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
@@ -488,6 +591,11 @@ export async function handleCommand(
           '🔐 用户授权：',
           '/login              - 飞书用户授权（可下载第三方卡片图片等）',
           '/login status       - 查看授权状态',
+          '',
+          '🛎️ Oncall 模式（群聊）：',
+          '/oncall bind <path>  - 把当前群绑到某个项目，跳过仓库选择卡片，owner=绑定者',
+          '/oncall unbind       - 解绑当前群（仅 owner）',
+          '/oncall status       - 查看当前群的 oncall 绑定',
           '',
           '/help       - 显示此帮助',
         ];

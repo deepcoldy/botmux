@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { replyMessage, resolveAllowedUsers, getMessageDetail } from './im/lark/client.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, createImgNumberer, unwrapUserDslContent, type MessageResource } from './im/lark/message-parser.js';
@@ -50,7 +50,7 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate } from './im/lark/event-dispatcher.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -294,6 +294,12 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
+      // Oncall groups: any member can talk, but daemon commands (except /oncall
+      // itself which gates bind/unbind inside) are owner-only.
+      if (cmd !== '/oncall' && findOncallChat(larkAppId, chatId) && !canOperate(larkAppId, chatId, senderOpenId)) {
+        await sessionReply(messageId, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
+        return;
+      }
       const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
@@ -336,6 +342,8 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   messageQueue.ensureQueue(messageId);
   messageQueue.appendMessage(messageId, parsed);
 
+  // Oncall group: pin working dir from binding, skip repo selection entirely.
+  const oncallEntry = findOncallChat(larkAppId, chatId);
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -348,14 +356,28 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
     lastMessageAt: Date.now(),
     hasHistory: false,
-    pendingRepo: true,
+    pendingRepo: !oncallEntry,
     pendingPrompt: content,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
+    workingDir: oncallEntry?.workingDir,
   };
+  if (oncallEntry) {
+    ds.session.workingDir = oncallEntry.workingDir;
+    sessionStore.updateSession(ds.session);
+  }
   activeSessions.set(sessionKey(messageId, larkAppId), ds);
+
+  // Oncall-bound chat: spawn CLI immediately with the pinned working dir.
+  if (oncallEntry) {
+    const selfBot = getBot(larkAppId);
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+    forkWorker(ds, prompt);
+    logger.info(`[${tag(ds)}] Oncall-bound chat ${chatId} → workingDir=${oncallEntry.workingDir}, skipped repo select`);
+    return;
+  }
 
   // Show repo selection card
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
@@ -416,6 +438,14 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
+      // Oncall owner gate for thread-reply daemon commands
+      const existingDs = activeSessions.get(sessionKey(rootId, larkAppId));
+      const threadChatId = existingDs?.chatId ?? data?.message?.chat_id;
+      const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+      if (cmd !== '/oncall' && threadChatId && findOncallChat(larkAppId, threadChatId) && !canOperate(larkAppId, threadChatId, threadSenderOpenId)) {
+        sessionReply(rootId, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
+        return;
+      }
       handleCommand(cmd, rootId, parsed, commandDeps, larkAppId);
       return;
     }

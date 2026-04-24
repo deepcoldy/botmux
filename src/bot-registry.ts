@@ -4,6 +4,15 @@ import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from './adapters/cli/types.js';
 
+export interface OncallChat {
+  /** Lark chat_id (oc_xxx) the bot was pulled into. */
+  chatId: string;
+  /** Default working directory used for every new topic spawned in this chat. */
+  workingDir: string;
+  /** open_id allowlist — may only operate (cards / daemon commands). Empty = initial binder only (set at bind time). */
+  owners: string[];
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -14,6 +23,8 @@ export interface BotConfig {
   workingDirs?: string[];
   allowedUsers?: string[];
   projectScanDir?: string;
+  /** Oncall bindings: chat_id → default workingDir + owners. Any group member can talk; only owners can run card buttons / daemon commands. */
+  oncallChats?: OncallChat[];
 }
 
 export interface BotState {
@@ -25,6 +36,12 @@ export interface BotState {
 }
 
 const bots = new Map<string, BotState>();
+
+/** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
+let loadedConfigPath: string | undefined;
+export function getLoadedConfigPath(): string | undefined {
+  return loadedConfigPath;
+}
 
 // Provide a custom logger that writes to stderr.
 // The default Lark SDK logger uses console.log (stdout), which corrupts
@@ -72,6 +89,12 @@ export function getAllBots(): BotState[] {
   return Array.from(bots.values());
 }
 
+/** Lookup the oncall binding for a given bot+chat, if any. */
+export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
+  const bot = bots.get(larkAppId);
+  return bot?.config.oncallChats?.find(c => c.chatId === chatId);
+}
+
 /**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
@@ -85,12 +108,14 @@ export function loadBotConfigs(): BotConfig[] {
     if (!existsSync(resolved)) {
       throw new Error(`BOTS_CONFIG file not found: ${resolved}`);
     }
+    loadedConfigPath = resolved;
     return parseBotConfigFile(resolved);
   }
 
   // 2. ~/.botmux/bots.json
   const defaultPath = resolve(homedir(), '.botmux', 'bots.json');
   if (existsSync(defaultPath)) {
+    loadedConfigPath = defaultPath;
     return parseBotConfigFile(defaultPath);
   }
 
@@ -128,6 +153,17 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
       workingDirs = String(entry.workingDir).split(',').map((s: string) => s.trim()).filter(Boolean);
     }
 
+    let oncallChats: OncallChat[] | undefined;
+    if (Array.isArray(entry.oncallChats)) {
+      oncallChats = entry.oncallChats
+        .filter((c: any) => c && typeof c.chatId === 'string' && typeof c.workingDir === 'string')
+        .map((c: any) => ({
+          chatId: c.chatId,
+          workingDir: c.workingDir,
+          owners: Array.isArray(c.owners) ? c.owners.filter((o: any) => typeof o === 'string') : [],
+        }));
+    }
+
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
@@ -138,6 +174,7 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
       workingDirs,
       allowedUsers: entry.allowedUsers,
       projectScanDir: entry.projectScanDir,
+      oncallChats,
     });
   }
 
