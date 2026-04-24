@@ -11,7 +11,7 @@ import { replyMessage, resolveAllowedUsers, getMessageDetail } from './im/lark/c
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
-import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, createImgNumberer, unwrapUserDslContent, type MessageResource } from './im/lark/message-parser.js';
+import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, createImgNumberer, unwrapUserDslContent, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { logger } from './utils/logger.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -283,13 +283,15 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   }
 
   const content = parsed.content.trim();
+  // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
+  const cmdContent = stripLeadingMentions(content, parsed.mentions);
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const botCfg = getBot(larkAppId).config;
   logger.info(`New topic: "${content.substring(0, 60)}" (resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId}`);
 
   // Intercept daemon commands in new topics (no session needed for some commands)
-  if (content.startsWith('/')) {
-    const cmd = content.split(/\s+/)[0].toLowerCase();
+  if (cmdContent.startsWith('/')) {
+    const cmd = cmdContent.split(/\s+/)[0].toLowerCase();
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
       await sessionReply(messageId, `${cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。`, 'text', larkAppId);
       return;
@@ -301,7 +303,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         await sessionReply(messageId, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
         return;
       }
-      const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
+      const session = sessionStore.createSession(chatId, messageId, cmdContent.substring(0, 50), chatType);
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
       sessionStore.updateSession(session);
@@ -319,7 +321,8 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         hasHistory: false,
         ownerOpenId: senderOpenId,
       });
-      await handleCommand(cmd, messageId, parsed, commandDeps, larkAppId);
+      // Pass mention-stripped content so /command argument parsing works.
+      await handleCommand(cmd, messageId, { ...parsed, content: cmdContent }, commandDeps, larkAppId);
       return;
     }
   }
@@ -413,6 +416,8 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   }
 
   const content = parsed.content.trim();
+  // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
+  const cmdContent = stripLeadingMentions(content, parsed.mentions);
 
   // Intercept OAuth callback URLs (from /login flow)
   if (isCallbackUrl(content)) {
@@ -425,12 +430,12 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   }
 
   // Intercept daemon commands
-  if (content.startsWith('/')) {
-    const cmd = content.split(/\s+/)[0].toLowerCase();
+  if (cmdContent.startsWith('/')) {
+    const cmd = cmdContent.split(/\s+/)[0].toLowerCase();
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
       const ds = activeSessions.get(sessionKey(rootId, larkAppId));
       if (ds?.worker && !ds.worker.killed) {
-        ds.worker.send({ type: 'raw_input', content } as DaemonToWorker);
+        ds.worker.send({ type: 'raw_input', content: cmdContent } as DaemonToWorker);
         ds.lastMessageAt = Date.now();
         logger.info(`[${rootId.substring(0, 12)}] Passthrough ${cmd} → worker`);
       } else {
@@ -447,7 +452,8 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
         sessionReply(rootId, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
         return;
       }
-      handleCommand(cmd, rootId, parsed, commandDeps, larkAppId);
+      // Pass mention-stripped content so /command argument parsing works.
+      handleCommand(cmd, rootId, { ...parsed, content: cmdContent }, commandDeps, larkAppId);
       return;
     }
   }

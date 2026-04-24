@@ -278,6 +278,47 @@ function resolvePostBody(parsed: any): { title: string; content: any[] } {
   return { title: '', content: [] };
 }
 
+/**
+ * Strip leading `@<name>` mentions from a resolved-content string so callers
+ * can detect daemon `/commands` even when the user @-mentioned the bot first.
+ *
+ * Uses the structured mentions list when available (handles names with spaces);
+ * falls back to a `@\S+` regex for cases where Lark didn't populate mentions
+ * (e.g. some post messages where the at-tag becomes a plain `@<user_name>`
+ * string in the rendered text).
+ */
+export function stripLeadingMentions(content: string, mentions?: { name: string }[]): string {
+  let s = content.trimStart();
+  if (mentions && mentions.length > 0) {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const m of mentions) {
+        const tag = `@${m.name}`;
+        if (s.startsWith(tag)) {
+          s = s.slice(tag.length).trimStart();
+          changed = true;
+          break;
+        }
+      }
+    }
+    return s;
+  }
+  // No mentions list (e.g. some post messages) — best-effort strip leading
+  // single-word @<word> patterns. Multi-word names without a mentions list
+  // can't be reliably detected and will be left in place.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const m = s.match(/^@\S+/);
+    if (m) {
+      s = s.slice(m[0].length).trimStart();
+      changed = true;
+    }
+  }
+  return s;
+}
+
 function resolveMentions(text: string, mentions?: RawEventData['message']['mentions']): string {
   if (!mentions || mentions.length === 0) {
     // No mention info available — strip placeholders
