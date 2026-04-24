@@ -528,6 +528,10 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     session.larkAppId = larkAppId;
     session.ownerOpenId = senderOId;
     sessionStore.updateSession(session);
+
+    // Oncall group: pin working dir from binding, skip repo selection entirely
+    // (mirrors handleNewTopic — auto-create was missing this check).
+    const oncallEntry = findOncallChat(larkAppId, chatId);
     const newDs: DaemonSession = {
       session,
       worker: null,
@@ -540,14 +544,28 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
       lastMessageAt: Date.now(),
       hasHistory: false,
-      pendingRepo: true,
+      pendingRepo: !oncallEntry,
       pendingPrompt: parsed.content,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
       ownerOpenId: senderOId,
       currentTurnTitle: parsed.content.substring(0, 50),
+      workingDir: oncallEntry?.workingDir,
     };
+    if (oncallEntry) {
+      newDs.session.workingDir = oncallEntry.workingDir;
+      sessionStore.updateSession(newDs.session);
+    }
     activeSessions.set(sessionKey(rootId, larkAppId), newDs);
+
+    // Oncall-bound chat: spawn CLI immediately with the pinned working dir.
+    if (oncallEntry) {
+      const selfBot = getBot(larkAppId);
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      forkWorker(newDs, prompt);
+      logger.info(`[${tag(newDs)}] Oncall-bound chat ${chatId} → workingDir=${oncallEntry.workingDir}, skipped repo select`);
+      return;
+    }
 
     // Show repo selection card (same as handleNewTopic)
     const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
