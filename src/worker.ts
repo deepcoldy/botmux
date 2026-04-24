@@ -21,7 +21,6 @@ import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from 
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession } from './adapters/cli/claude-code.js';
-import { resolveCodexRolloutPath } from './adapters/cli/codex.js';
 import type { CliAdapter } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -591,26 +590,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // Claude Code appends a line to ~/.claude/projects/<cwd-hash>/<sid>.jsonl each
   // time the user submits. The adapter uses this file to verify paste+Enter
   // actually committed (rather than trusting a fixed sleep), so wire it up now.
+  // Codex's adapter uses ~/.codex/history.jsonl (a fixed global path) directly,
+  // so it needs no per-session wiring here.
   if (cfg.cliId === 'claude-code') {
     (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
       claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
-  }
-
-  // Codex path is discovered async: Codex owns its own session id so the
-  // rollout filename contains a uuid we don't know ahead of time. Poll for
-  // the newest rollout-*.jsonl under ~/.codex/sessions whose session_meta
-  // references our cwd, started after this spawn.
-  if (cfg.cliId === 'codex') {
-    const spawnStart = Date.now();
-    void resolveCodexRolloutPath(cfg.workingDir, spawnStart).then(path => {
-      if (!backend) return;  // exited during resolution
-      if (path) {
-        (backend as TmuxBackend | PtyBackend).codexRolloutPath = path;
-        log(`Codex rollout path resolved: ${path}`);
-      } else {
-        log('Codex rollout path not found within 10s — submit verification disabled');
-      }
-    });
   }
 
   const args = cliAdapter.buildArgs({

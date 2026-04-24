@@ -10,10 +10,6 @@ export interface PtyHandle {
    *  Used by writeInput to verify a paste+Enter actually committed (new user-content
    *  line appended) and retry Enter if not — rather than trusting fixed sleep timing. */
   claudeJsonlPath?: string;
-  /** Absolute path to Codex's session rollout JSONL; set by worker for codex adapter
-   *  once discovered (Codex owns its own session id, so path is resolved async after
-   *  spawn). Used by writeInput to verify send+Enter actually committed. */
-  codexRolloutPath?: string;
 }
 
 export interface CliAdapter {

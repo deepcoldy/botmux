@@ -1,24 +1,26 @@
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+/** Global submit log — Codex appends one JSON line here on every successful
+ *  user submit across all sessions. Far better than the per-session rollout
+ *  file, which Codex creates lazily at the first submit (chicken-and-egg:
+ *  you can't use it to verify the *first* submit that we're trying to fix). */
+const HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
 
-/** Substring present on every real user-submit line in Codex's session rollout
- *  and absent from session_meta / response_item / other event_msg subtypes. */
-const USER_SUBMIT_MARKER = '"type":"event_msg","payload":{"type":"user_message"';
+function delay(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
 }
 
-function deltaHasUserSubmit(path: string, fromByte: number): boolean {
+function deltaContains(path: string, fromByte: number, marker: string): boolean {
   if (!existsSync(path)) return false;
   let size: number;
   try { size = statSync(path).size; } catch { return false; }
@@ -31,87 +33,27 @@ function deltaHasUserSubmit(path: string, fromByte: number): boolean {
   } finally {
     closeSync(fd);
   }
-  return buf.toString('utf8').includes(USER_SUBMIT_MARKER);
+  return buf.toString('utf8').includes(marker);
 }
 
-async function waitForUserSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
+async function waitForHistoryAppend(
+  path: string, fromByte: number, marker: string, timeoutMs: number,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (deltaHasUserSubmit(path, baseByte)) return true;
+    if (deltaContains(path, fromByte, marker)) return true;
     await delay(100);
   }
   return false;
 }
 
-/** Enumerate rollout-*.jsonl files under ~/.codex/sessions newer than spawnStart. */
-function enumerateRollouts(root: string, sinceMs: number): string[] {
-  if (!existsSync(root)) return [];
-  const results: { path: string; mtime: number }[] = [];
-  const walk = (dir: string, depth: number) => {
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { return; }
-    for (const name of entries) {
-      const p = join(dir, name);
-      let st;
-      try { st = statSync(p); } catch { continue; }
-      if (st.isDirectory() && depth < 3) {
-        walk(p, depth + 1);
-      } else if (
-        depth === 3 &&
-        st.isFile() &&
-        name.startsWith('rollout-') &&
-        name.endsWith('.jsonl') &&
-        st.mtimeMs >= sinceMs
-      ) {
-        results.push({ path: p, mtime: st.mtimeMs });
-      }
-    }
-  };
-  walk(root, 0);
-  results.sort((a, b) => b.mtime - a.mtime);
-  return results.map(r => r.path);
-}
-
-/** Read the first JSONL line of a rollout file (session_meta) and check its cwd. */
-function rolloutMatchesCwd(path: string, cwd: string): boolean {
-  try {
-    const fd = openSync(path, 'r');
-    try {
-      const buf = Buffer.alloc(4096);
-      const n = readSync(fd, buf, 0, 4096, 0);
-      const text = buf.slice(0, n).toString('utf8');
-      const nl = text.indexOf('\n');
-      const line = nl > 0 ? text.slice(0, nl) : text;
-      return line.includes(`"cwd":"${cwd}"`);
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Resolve the rollout JSONL path for a freshly-spawned Codex session. Codex
- * manages its own session id, so the file name contains a uuid we don't know
- * ahead of time. Poll ~/.codex/sessions/YYYY/MM/DD for the newest
- * `rollout-<ts>-<uuid>.jsonl` whose first-line session_meta references our cwd.
- * `spawnStartMs` filters out pre-existing files from unrelated sessions.
- */
-export async function resolveCodexRolloutPath(
-  cwd: string,
-  spawnStartMs: number,
-  timeoutMs = 10_000,
-): Promise<string | null> {
-  const root = join(homedir(), '.codex', 'sessions');
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    for (const path of enumerateRollouts(root, spawnStartMs)) {
-      if (rolloutMatchesCwd(path, cwd)) return path;
-    }
-    await delay(200);
-  }
-  return null;
+/** Build a JSON-escaped prefix of the content so substring-match against the
+ *  raw history.jsonl file content (where text fields store \n as the two-char
+ *  escape `\n`, not a literal newline) finds our line. The prefix length is
+ *  chosen to be unique-enough even when two bots submit near-identical text. */
+function historyMarker(content: string): string {
+  const prefix = content.slice(0, 40);
+  return JSON.stringify(prefix).slice(1, -1);  // strip surrounding quotes
 }
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
@@ -130,36 +72,48 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // Codex's TUI has a paste-grouping heuristic: a rapid burst of chars
-      // followed quickly by Enter can absorb the Enter as "still pasting",
-      // leaving the text stuck in the input box (same failure mode Claude Code
-      // has). The fixed 200ms delay is not enough under slow disk / big paste /
-      // MCP init. Tail the session rollout JSONL: every real user submit
-      // appends a line with `"type":"event_msg","payload":{"type":"user_message"`.
-      // If it doesn't show up, re-send Enter up to 3 times, then surface to
-      // the user instead of silently dropping.
-      const sendEnter = () => {
-        if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-        else pty.write('\r');
+      // Codex's TUI in --no-alt-screen mode does NOT handle bracketed paste:
+      // wrapping content in \x1b[200~...\x1b[201~ via tmux paste-buffer
+      // makes Codex exit cleanly (code 0) — it parses the ESC as an abort.
+      // So we stick with the older `send-keys -l` raw-stream path that has
+      // worked historically.
+      //
+      // Known limitation: Codex's input mode treats every \n as Enter, so a
+      // multi-line burst submits one-line fragments until Codex's internal
+      // paste-detection finally kicks in — visible as e.g. the tail of
+      // "Session ID: <uuid>" stranded in the input box. The verification
+      // loop below catches that case (the full content prefix never appears
+      // in history.jsonl) and surfaces it via user_notify rather than
+      // silently dropping the message.
+      const trySendEnter = (): boolean => {
+        try {
+          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+          else pty.write('\r');
+          return true;
+        } catch {
+          // tmux session is gone (CLI exited mid-write) — bail out cleanly
+          // rather than crashing the worker on an unhandled execFileSync error.
+          return false;
+        }
       };
 
-      const baseByte = pty.codexRolloutPath ? currentFileSize(pty.codexRolloutPath) : 0;
+      const baseByte = currentFileSize(HISTORY_PATH);
+      const marker = historyMarker(content);
 
-      if (pty.sendText) {
-        pty.sendText(content);
-      } else {
-        pty.write(content);
+      try {
+        if (pty.sendText) pty.sendText(content);
+        else pty.write(content);
+      } catch {
+        return { submitted: false };
       }
       await delay(200);
-      sendEnter();
-
-      if (!pty.codexRolloutPath) return;
+      if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForUserSubmit(pty.codexRolloutPath, baseByte, 800)) return;
-        sendEnter();
+        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) return;
+        if (!trySendEnter()) return { submitted: false };
       }
-      if (await waitForUserSubmit(pty.codexRolloutPath, baseByte, 800)) return;
+      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) return;
       return { submitted: false };
     },
 
