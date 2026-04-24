@@ -16,7 +16,7 @@
  *   botmux delete all     — close all active sessions
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -285,6 +285,72 @@ async function cmdSetup(): Promise<void> {
   }
 }
 
+/**
+ * Pre-flight check for stale Node interpreters.
+ *
+ * Failure mode: user installs botmux globally under nvm Node vX, later
+ * uninstalls that version. The pm2 god daemon may still be alive with a
+ * dead execPath (kept in-memory but removed from disk), and this package
+ * lives under a node_modules dir whose Node binary no longer exists.
+ * Both cases cause `spawn … node ENOENT` loops when pm2 tries to fork
+ * the daemon, but the error gets buried in pm2 logs and the user sees
+ * silence.
+ *
+ * Detects two cases and either auto-heals or aborts with a clear message:
+ *   1. pm2 god daemon's running binary is deleted → auto `pm2 kill`
+ *   2. This package is installed under an nvm Node version that no longer
+ *      exists on disk → abort with reinstall instructions
+ */
+function preflightNodeSanity(): void {
+  // Case 1: pm2 god is alive but its Node binary has been deleted.
+  const pm2PidFile = join(PM2_HOME, 'pm2.pid');
+  if (existsSync(pm2PidFile)) {
+    let pm2Pid = 0;
+    try { pm2Pid = parseInt(readFileSync(pm2PidFile, 'utf-8').trim(), 10); } catch { /* ignore */ }
+    if (pm2Pid) {
+      let pm2Alive = false;
+      try { process.kill(pm2Pid, 0); pm2Alive = true; } catch { /* not alive */ }
+      if (pm2Alive && process.platform === 'linux') {
+        // On Linux, /proc/<pid>/exe is a symlink to the running executable.
+        // readlink includes a " (deleted)" suffix when the on-disk file is gone.
+        try {
+          const exe = readlinkSync(`/proc/${pm2Pid}/exe`);
+          const cleanPath = exe.replace(/ \(deleted\)$/, '');
+          const exeDeleted = exe.endsWith(' (deleted)') || !existsSync(cleanPath);
+          if (exeDeleted) {
+            console.warn(`⚠️  pm2 god daemon (pid ${pm2Pid}) 使用的 Node 二进制已失效: ${cleanPath}`);
+            console.warn(`   自动杀掉 pm2 god 以便用当前 Node 重启...`);
+            try {
+              execSync(`${pm2Bin()} kill`, { env: pm2Env(), stdio: 'pipe', timeout: 10_000 });
+            } catch {
+              try { process.kill(pm2Pid, 'SIGKILL'); } catch { /* ignore */ }
+            }
+          }
+        } catch { /* /proc not readable, skip */ }
+      }
+    }
+  }
+
+  // Case 2: botmux installed under a dead nvm Node version.
+  const nvmMatch = PKG_ROOT.match(/\/\.nvm\/versions\/node\/([^/]+)\//);
+  if (nvmMatch) {
+    const installedVersion = nvmMatch[1];
+    const installedNodeBin = PKG_ROOT.slice(0, PKG_ROOT.indexOf(installedVersion) + installedVersion.length) + '/bin/node';
+    if (!existsSync(installedNodeBin)) {
+      console.error(`❌ botmux 安装在 Node ${installedVersion}, 但该 Node 二进制已不存在:`);
+      console.error(`     ${installedNodeBin}`);
+      console.error(`   daemon 启动后 fork worker 时会报 ENOENT, 无法正常工作。`);
+      console.error(``);
+      console.error(`   请在当前可用的 Node 下重新全局安装 botmux:`);
+      console.error(`     npm i -g botmux`);
+      console.error(``);
+      console.error(`   验证重装后路径不再指向 ${installedVersion}:`);
+      console.error(`     readlink -f $(which botmux)`);
+      process.exit(1);
+    }
+  }
+}
+
 function cmdStart(): void {
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
@@ -292,6 +358,7 @@ function cmdStart(): void {
     process.exit(1);
   }
   ensureConfigDir();
+  preflightNodeSanity();
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
@@ -376,6 +443,7 @@ function cmdRestart(): void {
     process.exit(1);
   }
   ensureConfigDir();
+  preflightNodeSanity();
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
