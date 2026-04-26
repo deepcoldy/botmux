@@ -266,15 +266,10 @@ export function buildFollowUpContent(
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
 
-  // Per-message routing hint — only for CLIs without system prompt context.
-  // CLIs with injectsSessionContext (e.g. Claude Code) already have the
-  // "use botmux send" instruction in --append-system-prompt, no need to repeat.
-  const skipHint = opts?.cliId
-    ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
-    : false;
-  if (!skipHint) {
-    parts.push('<botmux_reminder>请用 `botmux send "消息"` 这个 shell 命令回复飞书用户，终端输出用户看不到。</botmux_reminder>');
-  }
+  // Per-message routing hint — system prompt routing block can fade in long
+  // sessions, so re-state the core "use botmux send" rule at the tail of every
+  // follow-up regardless of CLI.
+  parts.push('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
 
   return parts.join('\n\n');
 }
