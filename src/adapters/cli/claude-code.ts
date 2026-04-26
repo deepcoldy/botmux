@@ -108,11 +108,20 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       // making tmux's paste-buffer drop the markers and turning embedded \r
       // into Enters that fragment the message into multiple submits.
       //
+      // Each tmux send-keys is throttled so the cumulative input rate stays
+      // below Claude Code's paste-burst threshold — otherwise on long messages
+      // (~1300+ chars / ~25+ lines) Ink flips into paste mode mid-stream and
+      // subsequent `\` + Enter pairs are kept as literal `\\\r` in the
+      // submitted content instead of being consumed as soft-newline markers.
+      //
       // Trailing Enter is still subject to Claude Code's paste-burst heuristic
       // (rapid input followed by Enter can be coalesced as paste), so we keep
       // the JSONL retry loop below as the source of truth for "did it submit".
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
       const submitDelay = hasImagePath ? 800 : 500;
+      const TYPING_THROTTLE_MS = 30;
+
+      const tick = () => new Promise<void>(r => setTimeout(r, TYPING_THROTTLE_MS));
 
       const sendEnter = () => {
         if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
@@ -124,12 +133,17 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       if (pty.sendText && pty.sendSpecialKeys) {
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
-          if (lines[i].length > 0) pty.sendText(lines[i]);
+          if (lines[i].length > 0) {
+            pty.sendText(lines[i]);
+            await tick();
+          }
           if (i < lines.length - 1) {
             // Soft-newline: backslash + Enter inserts a newline in Claude
             // Code's input box without submitting.
             pty.sendText('\\');
+            await tick();
             pty.sendSpecialKeys('Enter');
+            await tick();
           }
         }
       } else {
