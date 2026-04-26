@@ -18,7 +18,7 @@ export function setBotOpenId(larkAppId: string, id: string): void {
   getBot(larkAppId).botOpenId = id;
 }
 
-/** Persist bot registry info to disk for MCP subprocesses to read.
+/** Persist bot registry info to disk for agent-facing CLI subcommands to read.
  *  Merges current process's bot(s) into the existing file so that
  *  multiple daemon processes (one per bot) don't overwrite each other. */
 export function writeBotInfoFile(dataDir: string): void {

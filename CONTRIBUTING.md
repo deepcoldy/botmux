@@ -99,27 +99,23 @@ src/
 
 ## CLI-Agent Interaction (Skills + CLI subcommands)
 
-botmux previously exposed its Lark-interaction capabilities as MCP tools.
-As of April 2026, everything has been migrated to **CLI subcommands** (`botmux send`,
-`botmux schedule`, `botmux bots`, `botmux thread messages`) paired with
-auto-installed **Skills** that teach the agent when/how to use them.
+botmux exposes its Lark-interaction surface as **CLI subcommands**
+(`botmux send`, `botmux schedule`, `botmux bots`,
+`botmux thread messages`) paired with auto-installed **Skills** that
+teach the agent when/how to use them.
 
 **Runtime setup per CLI worker spawn** (see `src/core/worker-pool.ts`):
 
 1. `ensureCliSkills(cliId)` — writes `src/skills/definitions.ts` content
    into the CLI's native skill dir (`~/.claude/skills/`, `~/.gemini/skills/`,
    `~/.config/opencode/skills/`). Synchronous, idempotent per lifecycle.
-2. `cleanupLegacyMcpConfig(cliId)` — best-effort removes the stale `botmux`
-   MCP entry from `~/.claude.json` / `~/.aiden/.mcp.json` /
-   `~/.config/opencode/opencode.json` / `<cli> mcp remove botmux`, so users
-   upgrading from the pre-migration version don't see "MCP server failed" errors.
-3. Worker `PATH` is prepended with `~/.botmux/bin`, which contains a
+2. Worker `PATH` is prepended with `~/.botmux/bin`, which contains a
    `botmux` shell wrapper written by the daemon at startup (points at the
    running daemon's `dist/cli.js` — always in sync).
-4. `--append-system-prompt` flag injects the routing instruction
+3. `--append-system-prompt` flag injects the routing instruction
    ("user reads Lark, not terminal — use `botmux send` for user-facing content")
    into each CLI session.
-5. Every user message carries a per-message hint (`[回复请用 botmux send]`)
+4. Every user message carries a per-message hint (`[回复请用 botmux send]`)
    appended in `buildFollowUpContent` to keep the instruction near the attention
    window even in long conversations.
 
@@ -135,8 +131,8 @@ auto-installed **Skills** that teach the agent when/how to use them.
 
 All agent-facing subcommands auto-detect session context by walking the
 process tree looking for a CLI-pid marker written by the worker
-(`{dataDir}/.botmux-cli-pids/{pid}`). No MCP needed — works across every
-CLI that can spawn child processes.
+(`{dataDir}/.botmux-cli-pids/{pid}`). Works across every CLI that can
+spawn child processes — no extra protocol support required from the CLI.
 
 ## Adding a New CLI Adapter
 
@@ -165,5 +161,4 @@ The `CliAdapter` interface requires:
 pnpm test                # Run all tests (unit + E2E)
 pnpm test:codex          # Codex input E2E
 pnpm test:gemini         # Gemini CLI input E2E
-# MCP-specific test scripts have been removed along with the MCP server
 ```

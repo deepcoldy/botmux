@@ -7,9 +7,8 @@ function fmt(msg: string, args: unknown[]): string {
   return `[${timestamp()}] ${msg}${extra}\n`;
 }
 
-// MCP server (index.ts) uses stdio transport — stdout must stay clean.
-// Always use stderr for log output — it's safe in both MCP and daemon mode,
-// and avoids misdetection (the MCP subprocess receives SESSION_DATA_DIR via --env).
+// Always log to stderr so stdout stays clean for any consumer that pipes
+// daemon/CLI output (PM2, tmux capture-pane, JSON streams, etc.).
 const out = process.stderr;
 
 export const logger = {

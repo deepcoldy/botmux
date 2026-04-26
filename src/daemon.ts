@@ -881,9 +881,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
 
-  // Watch for bot-to-bot mention signals from MCP send_to_thread tool.
-  // Lark WSClient does not deliver events for bot-sent messages, so the MCP
-  // tool writes signal files that the daemon picks up and routes internally.
+  // Watch for bot-to-bot mention signals. Lark WSClient does not deliver
+  // events for bot-sent messages, so `botmux send --mention <other-bot>`
+  // writes a signal file that the daemon picks up and routes internally.
   startBotMentionWatcher();
 
   // Graceful shutdown

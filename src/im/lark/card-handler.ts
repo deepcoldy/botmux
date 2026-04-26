@@ -212,7 +212,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         } catch { /* pane may be gone — benign */ }
       }, 1500);
 
-      await sessionReply(rootId, '🔄 已接管会话，MCP 已启用');
+      await sessionReply(rootId, '🔄 已接管会话');
       logger.info(`[${tag(ds)}] Takeover: resumed session ${originalSessionId} as standard botmux session`);
     }
 

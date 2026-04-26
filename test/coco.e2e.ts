@@ -4,17 +4,13 @@
  * Verifies:
  *   1. buildArgs: correct flags for new session & resume
  *   2. writeInput: content + carriage-return sent to PTY
- *   3. ensureMcpConfig: registers MCP via `coco mcp add-json`, entry appears in traecli.yaml
- *   4. PTY spawn: coco actually starts with our flags and produces output
- *   5. Prompt round-trip: send a simple task, get a response
+ *   3. PTY spawn: coco actually starts with our flags and produces output
+ *   4. Prompt round-trip: send a simple task, get a response
  *
  * Run:  pnpm vitest run test/coco-e2e.ts
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as pty from 'node-pty';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { resolveCommand } from '../src/adapters/cli/registry.js';
 
@@ -143,46 +139,6 @@ describe('CoCo adapter: properties', () => {
 });
 
 // ─── Real CLI tests ───────────────────────────────────────────────────────────
-
-describe('CoCo adapter: ensureMcpConfig', () => {
-  const adapter = createCocoAdapter();
-  const testName = `_e2e_test_${Date.now()}`;
-
-  afterEach(() => {
-    // Clean up test entry from traecli.yaml
-    const yamlPath = join(homedir(), '.trae', 'traecli.yaml');
-    if (!existsSync(yamlPath)) return;
-    const yaml = readFileSync(yamlPath, 'utf-8');
-    if (!yaml.includes(testName)) return;
-    const lines = yaml.split('\n');
-    const cleaned: string[] = [];
-    let skip = false;
-    for (const line of lines) {
-      if (line.trim() === `- name: ${testName}`) { skip = true; continue; }
-      if (skip && (line.startsWith('      ') || line.startsWith('\t\t'))) continue;
-      if (skip) skip = false;
-      if (!skip) cleaned.push(line);
-    }
-    writeFileSync(yamlPath, cleaned.join('\n'));
-  });
-
-  it('installs MCP entry via coco mcp add-json', () => {
-    adapter.ensureMcpConfig({
-      name: testName,
-      command: 'echo',
-      args: ['mcp-test'],
-      env: { TEST_KEY: 'test_value' },
-    });
-
-    const yamlPath = join(homedir(), '.trae', 'traecli.yaml');
-    expect(existsSync(yamlPath)).toBe(true);
-
-    const yaml = readFileSync(yamlPath, 'utf-8');
-    expect(yaml).toContain(testName);
-    expect(yaml).toContain('echo');
-    expect(yaml).toContain('mcp-test');
-  });
-});
 
 describe('CoCo adapter: PTY spawn', () => {
   let session: PtySession | null = null;

@@ -412,7 +412,7 @@ describe('One-shot Chinese patterns', () => {
   });
 });
 
-// ─── New: parseSchedule() — bare schedule parser for CLI/MCP ─────────────────
+// ─── New: parseSchedule() — bare schedule parser for CLI ─────────────────────
 
 describe('parseSchedule (bare schedule strings)', () => {
   it('cron expression', () => {

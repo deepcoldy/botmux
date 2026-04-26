@@ -4,7 +4,7 @@
  * Covers:
  *   1. buildNewTopicPrompt always includes Session ID (used in normal mode)
  *   2. buildFollowUpContent includes Session ID in normal mode
- *   3. buildFollowUpContent omits Session ID in adopt mode (no MCP)
+ *   3. buildFollowUpContent omits Session ID in adopt mode
  *   4. buildFollowUpContent handles attachments and mentions correctly
  *
  * Run:  pnpm vitest run test/prompt-builder.test.ts
@@ -64,8 +64,9 @@ describe('buildNewTopicPrompt', () => {
   const SESSION_ID = 'test-session-id-123';
 
   // Note: claude-code has injectsSessionContext=true so session ID is conveyed
-  // out-of-band (system prompt + MCP) rather than embedded in the user prompt.
-  // We test session-id embedding via a CLI without that flag (codex).
+  // out-of-band (system prompt + ancestor-pid auto-detection) rather than
+  // embedded in the user prompt. We test session-id embedding via a CLI
+  // without that flag (codex).
 
   it('should embed <session_id> for CLIs without injectsSessionContext', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');

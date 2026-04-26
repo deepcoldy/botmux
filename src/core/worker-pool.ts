@@ -288,7 +288,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       ...process.env,
       PATH: pathWithBotmux,
       CLAUDECODE: undefined,
-      BOTMUX: '1',  // Inherited by CLI → MCP server for session detection
+      BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
       SESSION_DATA_DIR: config.session.dataDir,
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,

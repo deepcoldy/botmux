@@ -2,9 +2,9 @@
  * E2E test: Claude Code first-input submission.
  *
  * Bug: claude-code adapter had NO readyPattern, so IdleDetector used pure
- * quiescence (2s silence). During startup, Claude Code loads MCP servers
- * which can produce a quiet gap — idle fires prematurely before the input
- * prompt (❯) is rendered, causing the first prompt to be silently lost.
+ * quiescence (2s silence). During startup, plugin/extension init can
+ * produce a quiet gap — idle fires prematurely before the input prompt
+ * (❯) is rendered, causing the first prompt to be silently lost.
  *
  * Fix: added readyPattern: /❯/ to claude-code adapter, so IdleDetector
  * suppresses quiescence until the ❯ prompt appears.
@@ -111,7 +111,7 @@ describe('Claude Code first-input submission (IdleDetector + readyPattern)', () 
     /**
      * Reproduces the old behavior: no readyPattern → IdleDetector uses
      * pure quiescence (2s PTY silence) → idle fires prematurely during
-     * MCP server loading before the ❯ prompt appears.
+     * plugin/extension loading before the ❯ prompt appears.
      */
     const adapter = createClaudeCodeAdapter();
     // Simulate old buggy behavior: strip readyPattern

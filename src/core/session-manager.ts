@@ -249,7 +249,7 @@ export function buildFollowUpContent(
   if (attachHint) parts.push(attachHint);
 
   if (!opts?.isAdoptMode) {
-    // CLIs with injectsSessionContext get session ID via system prompt + MCP auto-detection
+    // CLIs with injectsSessionContext get session ID via system prompt + ancestor-pid auto-detection
     const skipSessionId = opts?.cliId
       ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
       : false;

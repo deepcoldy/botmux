@@ -108,10 +108,10 @@ export function getSession(sessionId: string): Session | undefined {
 /**
  * Search all session files for a session not found in the current file.
  *
- * The MCP server is a global singleton (one config in ~/.claude.json shared
- * by all CLI instances). It may be spawned from a non-botmux context where
- * LARK_APP_ID is unavailable, so it can't scope to the right per-bot file.
- * Scanning all files is safe here because MCP tools only read sessions.
+ * Sessions are partitioned per-bot (sessions-<larkAppId>.json), but agent-
+ * facing CLI subcommands (`botmux send`, etc.) may be invoked in contexts
+ * where LARK_APP_ID isn't set, so they can't pick the right file directly.
+ * Scanning all files is safe — these callers only read sessions.
  */
 function findInOtherFiles(sessionId: string): Session | undefined {
   const dataDir = config.session.dataDir;

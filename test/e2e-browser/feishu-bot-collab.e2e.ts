@@ -4,7 +4,7 @@
  * In the group chat ("普通群聊"), @mention Aiden and ask it to collaborate
  * with CoCo. Verify that:
  *  1. Aiden receives the message and starts working
- *  2. Aiden @mentions CoCo via the send_to_thread MCP tool
+ *  2. Aiden @mentions CoCo via `botmux send --mention <coco-open-id>`
  *  3. CoCo picks up and responds in the same thread
  *  4. At least 3 rounds of back-and-forth occur between the bots
  *

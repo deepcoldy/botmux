@@ -48,7 +48,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | Feature | botmux | OpenClaw-style |
 |---------|--------|---------------|
 | Architecture | Bridges full CLI processes directly | Rebuilds on Agent SDK |
-| CLI Capabilities | Full runtime (hooks, memory, plan mode, MCP ecosystem, `/` commands) | SDK API subset, missing features must be reimplemented |
+| CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
 | Multi-CLI Support | 4 CLIs, switch with one config (Claude Code / Codex / Gemini / OpenCode) | Tied to a single SDK, cannot switch CLIs |
@@ -158,6 +158,23 @@ Go to "Version Management & Release", click "Create Version" and publish. Set av
 
 ![Add bot to group](docs/setup/add-bot-to-group.png)
 
+### Step 8: Enable Boot-time Autostart (recommended)
+
+Once the bot is sending and receiving messages cleanly, run:
+
+```bash
+botmux autostart enable
+```
+
+This registers the daemon with your user's init system (launchd on macOS, user systemd on Linux). **No sudo required.** After a reboot — or after logging back in — the daemon comes up on its own; you never need to remember `botmux start` again.
+
+- The command only manages the "starts at boot" hook — it does **not** touch a running daemon.
+- On a headless Linux box where you log out between sessions, also run `sudo loginctl enable-linger <your-user>` so user systemd survives logout. The command warns you if linger is off.
+- To disable autostart: `botmux autostart disable` (also leaves the daemon alone). Check state: `botmux autostart status`.
+- After switching nvm/fnm Node versions, re-run `botmux autostart enable` to refresh the embedded paths — `botmux start`/`restart` also detect path drift and refresh in place.
+
+See [CLI Commands § Boot-time Autostart](#boot-time-autostart) below for the full reference.
+
 ---
 
 ## Features
@@ -251,8 +268,12 @@ When a CLI spawns inside a botmux session it automatically gets
 - `botmux schedule` — manage scheduled tasks
 
 These capabilities are wired via `--append-system-prompt` and Skill
-descriptions, so the agent picks them up automatically. The pre-April-2026
-MCP entry point has been removed (stale config is auto-cleaned on upgrade).
+descriptions, so the agent picks them up automatically. Compared to
+Anthropic's official Telegram channel — which exposes each action as an
+MCP tool — the Skill + CLI combo skips the MCP handshake on every CLI
+launch, doesn't burn tool-list tokens, and works across every CLI that
+can read a system prompt and shell out (Claude Code / Codex / Gemini /
+OpenCode), with no MCP protocol support required.
 
 ---
 

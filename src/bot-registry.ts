@@ -43,9 +43,8 @@ export function getLoadedConfigPath(): string | undefined {
   return loadedConfigPath;
 }
 
-// Provide a custom logger that writes to stderr.
-// The default Lark SDK logger uses console.log (stdout), which corrupts
-// MCP stdio protocol when the server is spawned as an MCP child process.
+// Provide a custom logger that writes to stderr — the default Lark SDK
+// logger uses console.log, which would mix into stdout consumers.
 function safeStringify(v: unknown): string {
   if (typeof v === 'string') return v;
   try { return JSON.stringify(v); } catch { return String(v); }

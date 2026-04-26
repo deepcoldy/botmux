@@ -618,8 +618,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     env: { ...process.env, CLAUDECODE: undefined } as unknown as Record<string, string>,
   });
 
-  // Write CLI PID marker so the MCP server can verify it was spawned by botmux.
-  // The MCP server checks if process.ppid has a marker in this directory.
+  // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)
+  // can verify they were spawned inside a botmux session by walking the
+  // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -655,10 +656,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     send({ type: 'claude_exit', code, signal });
   });
 
-  // Fallback: if the CLI takes too long to show its prompt (e.g. slow MCP
-  // server init), unblock screen updates so the card doesn't stay at "启动中"
-  // forever.  markNewTurn() sets a clean baseline at the current cursor
-  // position so only content written *after* this point appears in the card.
+  // Fallback: if the CLI takes too long to show its prompt (e.g. slow
+  // plugin init), unblock screen updates so the card doesn't stay at
+  // "启动中" forever.  markNewTurn() sets a clean baseline at the current
+  // cursor position so only content written *after* this point appears in
+  // the card.
   setTimeout(() => {
     if (awaitingFirstPrompt) {
       awaitingFirstPrompt = false;
