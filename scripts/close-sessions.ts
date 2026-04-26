@@ -3,7 +3,7 @@ import 'dotenv/config';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { config } from '../src/config.js';
+import { loadBotConfigs } from '../src/bot-registry.js';
 
 interface Session {
   sessionId: string;
@@ -12,6 +12,7 @@ interface Session {
   title: string;
   status: string;
   createdAt: string;
+  larkAppId?: string;
 }
 
 const SESSIONS_FILE = join(process.cwd(), 'data', 'sessions.json');
@@ -63,7 +64,8 @@ async function main() {
     activeSessions.forEach((s, i) => {
       console.log(`${i + 1}. ${s.title}`);
       console.log(`   Session: ${s.sessionId}`);
-      console.log(`   Age: ${formatAge(s.createdAt)}  Created: ${new Date(s.createdAt).toLocaleString()}`);
+      console.log(`   Bot:     ${s.larkAppId ?? '(unknown)'}`);
+      console.log(`   Age:     ${formatAge(s.createdAt)}  Created: ${new Date(s.createdAt).toLocaleString()}`);
       console.log('');
     });
     console.log('用法: pnpm sessions:close [indices|all]');
@@ -76,19 +78,42 @@ async function main() {
     ? activeSessions
     : Array.from(indices).sort().map(i => activeSessions[i - 1]);
 
-  // Send /close command to each thread via Lark API
-  // Daemon will pick it up and properly close the session
-  const larkClient = new Lark.Client({
-    appId: config.lark.appId,
-    appSecret: config.lark.appSecret,
-  });
+  // Build a per-bot Lark client map. Each session is owned by exactly one bot
+  // (session.larkAppId), and that bot's secret lives in bots.json — using the
+  // global LARK_APP_ID env var fails in multi-bot setups.
+  const botConfigs = loadBotConfigs();
+  const secretByAppId = new Map(botConfigs.map(b => [b.larkAppId, b.larkAppSecret]));
+  const clientByAppId = new Map<string, Lark.Client>();
+  function getClient(appId: string): Lark.Client | null {
+    if (!secretByAppId.has(appId)) return null;
+    let c = clientByAppId.get(appId);
+    if (!c) {
+      c = new Lark.Client({ appId, appSecret: secretByAppId.get(appId)! });
+      clientByAppId.set(appId, c);
+    }
+    return c;
+  }
 
   console.log(`关闭 ${toClose.length} 个会话...\n`);
 
+  let ok = 0, fail = 0;
   for (const s of toClose) {
-    process.stdout.write(`  ${s.sessionId.substring(0, 8)} (${s.title})... `);
+    const tag = `${s.sessionId.substring(0, 8)} (${s.title.slice(0, 30)})`;
+    const appId = s.larkAppId;
+    if (!appId) {
+      console.log(`  ${tag} ✗ session 没有 larkAppId 字段，跳过`);
+      fail++;
+      continue;
+    }
+    const client = getClient(appId);
+    if (!client) {
+      console.log(`  ${tag} ✗ bots.json 里找不到 appId=${appId} 的配置（bot 已下线？），跳过`);
+      fail++;
+      continue;
+    }
+    process.stdout.write(`  ${tag}... `);
     try {
-      await larkClient.im.message.reply({
+      await client.im.message.reply({
         path: { message_id: s.rootMessageId },
         data: {
           content: JSON.stringify({ text: '/close' }),
@@ -96,12 +121,15 @@ async function main() {
         },
       });
       console.log('✓');
+      ok++;
     } catch (err: any) {
-      console.log(`✗ ${err.message}`);
+      console.log(`✗ ${err.message ?? err}`);
+      fail++;
     }
   }
 
-  console.log(`\n✅ 已向 ${toClose.length} 个话题发送 /close 命令，daemon 将自动处理。`);
+  console.log(`\n✅ 成功 ${ok}，失败 ${fail}。daemon 会处理收到的 /close 命令。`);
+  if (fail > 0) process.exitCode = 1;
 }
 
 main().catch(err => {
