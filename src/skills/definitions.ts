@@ -138,7 +138,7 @@ JSON 格式，字段：
 
 const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持文本、图片、文件附件和 @mention。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、@mention。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -195,17 +195,33 @@ echo "构建成功 ✅" | botmux send
 | pipe 表格 | **原生 table 组件**（不是 monospace 伪表格） |
 | \`<at id=open_id></at>\` | @mention（一般用 \`--mention\` 自动注入，无需手写） |
 
-**图片混排**：\`--images\` 上传的本地图片默认追加到消息末尾。想在正文中指定位置，用占位符 \`![说明](img:N)\`（N 是 0-based 索引），会被替换成真正的 img_key。例：\`botmux send --images a.png --images b.png "前情\\n\\n![图1](img:0)\\n\\n中间文字\\n\\n![图2](img:1)"\`。
-
 **不支持**：外链图片 \`![](http://...)\`（飞书 markdown 元素只认本地上传的 img_key）、setext 标题（\`===\` 下划线式）、HTML 标签。
 
-### 带图片（内联显示）
+### 图文混排（图片穿插在正文中）
+
+\`--images <path>\` 上传本地图片（可重复）。在 markdown 正文中用占位符 \`![alt](img:N)\` 标记位置（\`N\` 是 0-based 索引，按 \`--images\` 给出的顺序对应）；不写占位符的图片自动追加到消息末尾。
 
 \`\`\`bash
-botmux send --images /tmp/screenshot.png <<'EOF'
-截图如上，红框部分是问题所在。
+# 单图：默认追加到末尾
+botmux send --images /tmp/screenshot.png "截图如上，红框部分是问题所在。"
+
+# 图文混排：占位符控制图片位置
+botmux send --images chart.png --images table.png <<'EOF'
+## 销售报告
+
+第一张是趋势图：
+
+![趋势](img:0)
+
+明细见下表：
+
+![明细](img:1)
+
+环比 +12%。
 EOF
 \`\`\`
+
+只支持本地路径上传，外链图片 \`![](http://...)\` 不会渲染。
 
 ### 带文件附件
 
