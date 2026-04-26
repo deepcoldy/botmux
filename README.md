@@ -337,6 +337,21 @@ botmux start
 | `botmux delete <id>` | 关闭指定会话，支持 ID 前缀匹配（别名 `del`/`rm`） |
 | `botmux delete all` | 关闭所有活跃会话 |
 | `botmux delete stopped` | 清理所有进程已退出的僵尸会话 |
+| `botmux autostart enable` | 注册开机自启（macOS launchd / Linux user systemd，无需 sudo） |
+| `botmux autostart disable` | 注销开机自启 |
+| `botmux autostart status` | 查看自启状态 |
+
+### 开机自启
+
+`botmux autostart enable` 把 daemon 注册到当前用户的 init 系统，重启机器后自动起来：
+
+- **macOS**：写 `~/Library/LaunchAgents/com.botmux.daemon.plist`，用 `launchctl bootstrap` 加载，**不需要 sudo**。
+- **Linux**：写 `~/.config/systemd/user/botmux.service`，用 `systemctl --user enable --now` 启用，**不需要 sudo**。
+  - 服务器/无桌面环境下，登出会话后 user systemd 默认会停服务。需要跨登出常驻请额外跑 `sudo loginctl enable-linger <你的用户名>`，autostart enable 会在 linger 未启用时提示。
+  - 容器或 SSH-only 没有 user DBus 的环境会回退到打印手动指令。
+- 单元文件里的 `node` / `cli.js` 路径来自当前 `process.execPath`，nvm/fnm 切版本后跑一次 `botmux autostart enable` 重写即可。`botmux start`/`restart` 也会自动检测路径变化、原地刷新单元文件，无需手动操作。
+- `enable` / `disable` **只管开机自启钩子，不动正在跑的 daemon**。需要立即启动跑 `botmux start`，需要停跑 `botmux stop`。这样就不会"我只是想关掉自启，结果服务也被一起干掉了"。
+- 想用 systemd 管 daemon 生命周期（`systemctl --user start/stop botmux`）也行——unit 里写了 ExecStop 调用 `botmux stop`，是干净的关停路径。
 
 ### 会话内子命令（给 CLI agent 用）
 

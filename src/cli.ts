@@ -14,6 +14,7 @@
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
+ *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync } from 'node:fs';
@@ -22,6 +23,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
+import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -367,6 +369,11 @@ function cmdStart(): void {
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
   console.log(`   日志: botmux logs`);
   console.log(`   状态: botmux status`);
+  // If the user previously enabled autostart, sync the unit file in case
+  // node/cli.js paths changed since (nvm switch, npm upgrade, etc.).
+  if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+    console.log(`   autostart unit 已同步到当前 Node/cli.js 路径`);
+  }
 }
 
 /** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
@@ -449,6 +456,9 @@ function cmdRestart(): void {
   deleteAllBotmuxProcesses();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
+  if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+    console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
+  }
 }
 
 /**
@@ -1211,6 +1221,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
+  autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
+  autostart disable    注销开机自启
+  autostart status     查看自启状态
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -2051,6 +2064,16 @@ switch (command) {
     const sub = process.argv[3] ?? '';
     if (sub === 'messages' || sub === 'msgs') await cmdThreadMessages(process.argv.slice(4));
     else { console.error(`用法: botmux thread messages [--limit N] [--session-id ID]`); process.exit(1); }
+    break;
+  }
+  case 'autostart': {
+    ensureConfigDir();
+    const sub = process.argv[3] ?? 'status';
+    const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
+    if (sub === 'enable' || sub === 'install') enableAutostart(opts);
+    else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
+    else if (sub === 'status') autostartStatus(opts);
+    else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
     break;
   }
   default:        showHelp(); break;

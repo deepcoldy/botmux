@@ -400,6 +400,21 @@ botmux setup
 | `botmux delete <id>` | Close a session by ID prefix (alias: `del`/`rm`) |
 | `botmux delete all` | Close all active sessions |
 | `botmux delete stopped` | Clean up zombie sessions with dead processes |
+| `botmux autostart enable` | Register boot-time autostart (macOS launchd / Linux user systemd, no sudo) |
+| `botmux autostart disable` | Unregister boot-time autostart |
+| `botmux autostart status` | Show autostart status |
+
+### Boot-time Autostart
+
+`botmux autostart enable` registers the daemon with your user's init system so it comes back automatically after a reboot:
+
+- **macOS**: writes `~/Library/LaunchAgents/com.botmux.daemon.plist` and loads it via `launchctl bootstrap`. **No sudo required.**
+- **Linux**: writes `~/.config/systemd/user/botmux.service` and runs `systemctl --user enable --now`. **No sudo required.**
+  - On servers / headless boxes the user systemd manager stops when you log out. To survive logouts and reboots, also run `sudo loginctl enable-linger <your-user>` — `autostart enable` warns when linger is off.
+  - Containers / SSH-only sessions without a user DBus fall back to printing manual instructions.
+- The `node` and `cli.js` paths baked into the unit come from `process.execPath` at install time. After switching nvm/fnm versions, run `botmux autostart enable` once to rewrite. `botmux start`/`restart` also detect path drift and refresh the unit in place — no manual step needed.
+- `enable` / `disable` **only manage the autostart hook — they do not touch a running daemon**. To start the daemon right away run `botmux start`; to stop it run `botmux stop`. This avoids the "I just wanted to turn off autostart, why did my service also die" footgun.
+- If you prefer letting systemd own the lifecycle (`systemctl --user start/stop botmux`), that works too — the unit declares `ExecStop=botmux stop` for a clean shutdown path.
 
 ### Agent-facing subcommands
 
