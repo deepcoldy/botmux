@@ -63,17 +63,28 @@ import { buildNewTopicPrompt, buildFollowUpContent } from '../src/core/session-m
 describe('buildNewTopicPrompt', () => {
   const SESSION_ID = 'test-session-id-123';
 
-  it('should include Session ID in the prompt', () => {
+  // Note: claude-code has injectsSessionContext=true so session ID is conveyed
+  // out-of-band (system prompt + MCP) rather than embedded in the user prompt.
+  // We test session-id embedding via a CLI without that flag (codex).
+
+  it('should embed <session_id> for CLIs without injectsSessionContext', () => {
+    const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
+  });
+
+  it('should NOT embed <session_id> for CLIs with injectsSessionContext (claude-code)', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'claude-code');
-    expect(prompt).toContain(`Session ID: ${SESSION_ID}`);
+    expect(prompt).not.toContain('<session_id>');
   });
 
-  it('should include the user message', () => {
+  it('should wrap the user message in <user_message>', () => {
     const prompt = buildNewTopicPrompt('请帮我看一下这个 bug', SESSION_ID, 'claude-code');
+    expect(prompt).toContain('<user_message>');
     expect(prompt).toContain('请帮我看一下这个 bug');
+    expect(prompt).toContain('</user_message>');
   });
 
-  it('should include follow-up messages when provided', () => {
+  it('should include follow-up messages wrapped in <follow_up_message>', () => {
     const prompt = buildNewTopicPrompt(
       'first message',
       SESSION_ID,
@@ -84,11 +95,11 @@ describe('buildNewTopicPrompt', () => {
       undefined,
       ['second message', 'third message'],
     );
-    expect(prompt).toContain('用户追加了：\n---\nsecond message\n---');
-    expect(prompt).toContain('用户追加了：\n---\nthird message\n---');
+    expect(prompt).toContain('<follow_up_message>\nsecond message\n</follow_up_message>');
+    expect(prompt).toContain('<follow_up_message>\nthird message\n</follow_up_message>');
   });
 
-  it('should include mention metadata when provided', () => {
+  it('should include mention metadata in <mentions>', () => {
     const prompt = buildNewTopicPrompt(
       'hello',
       SESSION_ID,
@@ -97,69 +108,72 @@ describe('buildNewTopicPrompt', () => {
       undefined,
       [{ name: 'Alice', openId: 'ou_alice' }],
     );
-    expect(prompt).toContain('@Alice');
-    expect(prompt).toContain('ou_alice');
+    expect(prompt).toContain('<mentions>');
+    expect(prompt).toContain('name="Alice"');
+    expect(prompt).toContain('open_id="ou_alice"');
   });
 });
 
 describe('buildFollowUpContent', () => {
   const SESSION_ID = 'follow-up-session-456';
 
-  it('should include Session ID in normal mode', () => {
+  it('should include <session_id> in normal mode', () => {
     const content = buildFollowUpContent('hello', SESSION_ID);
-    expect(content).toContain(`Session ID: ${SESSION_ID}`);
+    expect(content).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
-  it('should include Session ID when isAdoptMode is false', () => {
+  it('should include <session_id> when isAdoptMode is false', () => {
     const content = buildFollowUpContent('hello', SESSION_ID, { isAdoptMode: false });
-    expect(content).toContain(`Session ID: ${SESSION_ID}`);
+    expect(content).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
-  it('should omit Session ID in adopt mode', () => {
+  it('should omit <session_id> in adopt mode', () => {
     const content = buildFollowUpContent('hello', SESSION_ID, { isAdoptMode: true });
+    expect(content).not.toContain('<session_id>');
     expect(content).not.toContain('Session ID');
   });
 
-  it('should include user content in all modes', () => {
+  it('should include user content wrapped in <user_message> in all modes', () => {
     const normalContent = buildFollowUpContent('请修复这个问题', SESSION_ID);
     const adoptContent = buildFollowUpContent('请修复这个问题', SESSION_ID, { isAdoptMode: true });
 
-    expect(normalContent).toContain('请修复这个问题');
-    expect(adoptContent).toContain('请修复这个问题');
+    expect(normalContent).toContain('<user_message>\n请修复这个问题');
+    expect(adoptContent).toContain('<user_message>\n请修复这个问题');
   });
 
-  it('should include attachment hints when provided', () => {
+  it('should include attachment block when provided', () => {
     const attachments = [{ type: 'image' as const, path: '/tmp/img.jpg', name: 'img.jpg' }];
     const content = buildFollowUpContent('看这个图', SESSION_ID, { attachments });
-    expect(content).toContain('附件');
-    expect(content).toContain('/tmp/img.jpg');
+    expect(content).toContain('<attachments');
+    expect(content).toContain('path="/tmp/img.jpg"');
   });
 
-  it('should include mention metadata when provided', () => {
+  it('should include mention metadata in <mentions>', () => {
     const mentions = [{ name: 'Bob', openId: 'ou_bob' }];
     const content = buildFollowUpContent('hello', SESSION_ID, { mentions });
-    expect(content).toContain('@Bob');
-    expect(content).toContain('ou_bob');
+    expect(content).toContain('<mentions>');
+    expect(content).toContain('name="Bob"');
+    expect(content).toContain('open_id="ou_bob"');
   });
 
-  it('should omit Session ID but keep mentions in adopt mode', () => {
+  it('should omit <session_id> but keep mentions in adopt mode', () => {
     const mentions = [{ name: 'Charlie', openId: 'ou_charlie' }];
     const content = buildFollowUpContent('hello', SESSION_ID, {
       isAdoptMode: true,
       mentions,
     });
-    expect(content).not.toContain('Session ID');
-    expect(content).toContain('@Charlie');
-    expect(content).toContain('ou_charlie');
+    expect(content).not.toContain('<session_id>');
+    expect(content).toContain('name="Charlie"');
+    expect(content).toContain('open_id="ou_charlie"');
   });
 
-  it('should omit Session ID but keep attachments in adopt mode', () => {
+  it('should omit <session_id> but keep attachments in adopt mode', () => {
     const attachments = [{ type: 'image' as const, path: '/tmp/img.jpg', name: 'img.jpg' }];
     const content = buildFollowUpContent('看图', SESSION_ID, {
       isAdoptMode: true,
       attachments,
     });
-    expect(content).not.toContain('Session ID');
-    expect(content).toContain('/tmp/img.jpg');
+    expect(content).not.toContain('<session_id>');
+    expect(content).toContain('path="/tmp/img.jpg"');
   });
 });

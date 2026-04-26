@@ -63,13 +63,14 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       }
       args.push('--dangerously-skip-permissions');
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
-      const identityLines =
+      const identityBlock =
         botName || botOpenId
           ? [
               '',
-              '你的身份：',
-              `- 名字：${botName ?? '(未知)'}`,
-              `- open_id：${botOpenId ?? '(未知)'}`,
+              '<identity>',
+              `  <name>${botName ?? '(未知)'}</name>`,
+              `  <open_id>${botOpenId ?? '(未知)'}</open_id>`,
+              '</identity>',
               '同一群里可能有多个机器人同时被 @，消息里会以 `@名字` 和 `open_id` 区分。',
               '判断本条消息是不是分派给你：对照上面的名字和 open_id。',
               '- 只执行明确分给自己的那部分，别抢别的机器人的活',
@@ -78,6 +79,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
             ]
           : [];
       args.push('--append-system-prompt', [
+        '<botmux_routing>',
         '你连接到了飞书（Lark）话题群。用户在飞书上阅读，看不到你的终端输出。',
         '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
         '',
@@ -88,7 +90,8 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         '- 附带文件：`botmux send --files /path/to/file.pdf "请查收"`',
         '- 需要上下文时用 `botmux thread messages` 读取之前的对话。',
         '- 查看可协作的机器人：`botmux bots list`',
-        ...identityLines,
+        '</botmux_routing>',
+        ...identityBlock,
       ].join('\n'));
       return args;
     },
@@ -96,14 +99,18 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     injectsSessionContext: true,
 
     async writeInput(pty, content) {
-      // Always use bracketed paste: Claude Code's paste-burst heuristic can
-      // swallow a trailing Enter sent via send-keys -l + send-keys Enter,
-      // leaving content in the input box. Bracketed paste marks an explicit
-      // \x1b[201~ boundary so the post-paste Enter is unambiguously submit.
-      // Past that, we still can't trust fixed-delay timing (slow disk, big
-      // paste, image loading). The robust signal is Claude Code's session
-      // JSONL: each real user submit appends a line — if no new line appears,
-      // Enter was swallowed and we re-send it.
+      // Type content like a human: literal text via send-keys -l, and each
+      // newline replaced by `\` + Enter (Claude Code's documented soft-newline
+      // idiom — keeps content in the input box without submitting). The final
+      // Enter at the bottom is the unambiguous submit. This sidesteps tmux
+      // bracketed-paste mode entirely, which was unreliable: Claude Code can
+      // toggle bracketed-paste off mid-session (after slash commands etc.),
+      // making tmux's paste-buffer drop the markers and turning embedded \r
+      // into Enters that fragment the message into multiple submits.
+      //
+      // Trailing Enter is still subject to Claude Code's paste-burst heuristic
+      // (rapid input followed by Enter can be coalesced as paste), so we keep
+      // the JSONL retry loop below as the source of truth for "did it submit".
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
       const submitDelay = hasImagePath ? 800 : 500;
 
@@ -114,9 +121,20 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
 
       const baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
 
-      if (pty.pasteText && pty.sendSpecialKeys) {
-        pty.pasteText(content);
+      if (pty.sendText && pty.sendSpecialKeys) {
+        const lines = content.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].length > 0) pty.sendText(lines[i]);
+          if (i < lines.length - 1) {
+            // Soft-newline: backslash + Enter inserts a newline in Claude
+            // Code's input box without submitting.
+            pty.sendText('\\');
+            pty.sendSpecialKeys('Enter');
+          }
+        }
       } else {
+        // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
+        // we control the markers directly.
         pty.write('\x1b[200~' + content + '\x1b[201~');
       }
       await new Promise(r => setTimeout(r, submitDelay));

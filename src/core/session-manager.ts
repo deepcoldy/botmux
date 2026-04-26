@@ -132,14 +132,28 @@ export async function getAvailableBots(
   }
 }
 
+/** XML-escape a string for use as element text content or attribute value.
+ *  Covers the five XML-mandated entities; sufficient for our use case
+ *  (paths, names, open_ids, bot identifiers) since we never embed raw user
+ *  input in attribute values. */
+function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
   if (!attachments || attachments.length === 0) return '';
   let imgN = 0, fileN = 0;
-  const lines = attachments.map(a => {
-    const label = a.type === 'image' ? `[图片 ${++imgN}]` : `[文件 ${++fileN}]`;
-    return `- ${label} (${a.path})`;
+  const items = attachments.map(a => {
+    const tag = a.type === 'image' ? 'image' : 'file';
+    const n = a.type === 'image' ? ++imgN : ++fileN;
+    return `  <${tag} n="${n}" path="${xmlEscape(a.path)}" />`;
   });
-  return `\n\n附件（使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应）：\n${lines.join('\n')}`;
+  return `<attachments hint="使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应">\n${items.join('\n')}\n</attachments>`;
 }
 
 export function buildNewTopicPrompt(
@@ -156,63 +170,63 @@ export function buildNewTopicPrompt(
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
 
-  const noteLines = hints.map(h => `- ${h}`);
+  const routingBlock = hints.length > 0
+    ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
+    : '';
 
-  // Bot identity section — tells the bot who it is so it can distinguish
-  // itself when multiple bots are @mentioned in the same message.
-  let identitySection = '';
+  let identityBlock = '';
   if (botIdentity && (botIdentity.name || botIdentity.openId)) {
-    const lines = [
-      `- 名字：${botIdentity.name ?? '(未知)'}`,
-      `- open_id：${botIdentity.openId ?? '(未知)'}`,
-      '- 同一群里可能有多个机器人同时被 @，消息里会以 `@名字` 和 `open_id` 区分',
-      '- 只执行明确分给自己的那部分，整条消息都指派给别的机器人时保持沉默',
-    ];
-    identitySection = `\n\n你的身份：\n${lines.join('\n')}`;
+    identityBlock = [
+      '<identity>',
+      `  <name>${xmlEscape(botIdentity.name ?? '(未知)')}</name>`,
+      `  <open_id>${xmlEscape(botIdentity.openId ?? '(未知)')}</open_id>`,
+      '</identity>',
+      '同一群里可能有多个机器人同时被 @，消息里会以 `@名字` 和 `open_id` 区分。只执行明确分给自己的那部分，整条消息都指派给别的机器人时保持沉默。',
+    ].join('\n');
   }
 
-  // Mention metadata section
-  let mentionSection = '';
+  let mentionBlock = '';
   if (mentions && mentions.length > 0) {
-    const mentionLines = mentions.map(m => {
-      const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
-      return `- @${m.name}${idPart}`;
+    const items = mentions.map(m => {
+      const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
+      return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
     });
-    mentionSection = `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
+    mentionBlock = `<mentions>\n${items.join('\n')}\n</mentions>`;
   }
 
-  // Available bots section — only show bots NOT already in @mentions
-  let botSection = '';
+  let botBlock = '';
   if (availableBots && availableBots.length > 0) {
     const mentionedOpenIds = new Set(mentions?.map(m => m.openId).filter(Boolean));
     const unmentionedBots = availableBots.filter(b => !mentionedOpenIds.has(b.openId));
     if (unmentionedBots.length > 0) {
-      const botLines = unmentionedBots.map(b => `- ${b.displayName} (open_id: ${b.openId})`);
-      botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 botmux send --mention 参数 @mention 它们协作，也可用 botmux bots list 查询。`;
+      const items = unmentionedBots.map(
+        b => `  <bot name="${xmlEscape(b.displayName)}" open_id="${xmlEscape(b.openId)}" />`,
+      );
+      botBlock = `<available_bots hint="可通过 botmux send --mention 参数 @ 它们协作，也可用 botmux bots list 查询">\n${items.join('\n')}\n</available_bots>`;
     }
   }
 
-  // CLIs with injectsSessionContext get Lark context via system prompt,
-  // so pass user messages cleanly without wrapper — same format as follow-ups.
-  const attachHint = formatAttachmentsHint(attachments);
-  const parts: string[] = adapter.injectsSessionContext
-    ? [`${userMessage}${attachHint}`]
-    : [`用户发送了：\n---\n${userMessage}${attachHint}\n---`];
+  const userBlock = `<user_message>\n${userMessage}\n</user_message>`;
+  const parts: string[] = [userBlock];
 
-  // Append follow-up messages buffered during repo selection
   if (followUps && followUps.length > 0) {
     for (const fu of followUps) {
-      parts.push(adapter.injectsSessionContext ? fu : `用户追加了：\n---\n${fu}\n---`);
+      parts.push(`<follow_up_message>\n${fu}\n</follow_up_message>`);
     }
   }
 
+  const attachHint = formatAttachmentsHint(attachments);
+  if (attachHint) parts.push(attachHint);
+
+  // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
+  // and session ID via system prompt, so skip those blocks here.
   if (!adapter.injectsSessionContext) {
-    parts.push(`Session ID: ${sessionId}`);
+    parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+    if (routingBlock) parts.push(routingBlock);
+    if (identityBlock) parts.push(identityBlock);
   }
-  if (noteLines.length > 0) parts.push(noteLines.join('\n'));
-  if (identitySection) parts.push(identitySection.trim());
-  if (mentionSection) parts.push(mentionSection.trim());
-  if (botSection) parts.push(botSection.trim());
+  if (mentionBlock) parts.push(mentionBlock);
+  if (botBlock) parts.push(botBlock);
 
   return parts.join('\n\n');
 }
@@ -227,11 +241,12 @@ export function buildFollowUpContent(
   sessionId: string,
   opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string },
 ): string {
-  const parts: string[] = [
-    opts?.attachments && opts.attachments.length > 0
-      ? `${content}${formatAttachmentsHint(opts.attachments)}`
-      : content,
-  ];
+  const parts: string[] = [`<user_message>\n${content}\n</user_message>`];
+
+  const attachHint = opts?.attachments && opts.attachments.length > 0
+    ? formatAttachmentsHint(opts.attachments)
+    : '';
+  if (attachHint) parts.push(attachHint);
 
   if (!opts?.isAdoptMode) {
     // CLIs with injectsSessionContext get session ID via system prompt + MCP auto-detection
@@ -239,16 +254,16 @@ export function buildFollowUpContent(
       ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
       : false;
     if (!skipSessionId) {
-      parts.push(`Session ID: ${sessionId}`);
+      parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
     }
   }
 
   if (opts?.mentions && opts.mentions.length > 0) {
-    const mentionLines = opts.mentions.map(m => {
-      const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
-      return `- @${m.name}${idPart}`;
+    const items = opts.mentions.map(m => {
+      const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
+      return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
     });
-    parts.push(`消息中的 @mention：\n${mentionLines.join('\n')}`);
+    parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
 
   // Per-message routing hint — only for CLIs without system prompt context.
@@ -258,7 +273,7 @@ export function buildFollowUpContent(
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false;
   if (!skipHint) {
-    parts.push('[请用 botmux send "消息" - 这个shell工具回复飞书用户，终端输出用户看不到]');
+    parts.push('<botmux_reminder>请用 `botmux send "消息"` 这个 shell 命令回复飞书用户，终端输出用户看不到。</botmux_reminder>');
   }
 
   return parts.join('\n\n');

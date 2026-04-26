@@ -5,8 +5,8 @@
  * `claude-code.ts`; this constant is only consumed by CLIs that don't expose
  * a system-prompt flag (coco / codex / gemini / opencode / aiden).
  *
- * Each array element becomes one bullet line when rendered by
- * `buildNewTopicPrompt` in `session-manager.ts`.
+ * Each array element becomes one line inside the `<botmux_routing>` XML block
+ * rendered by `buildNewTopicPrompt` in `session-manager.ts`.
  *
  * The phrasing emphasises that `botmux send` is a shell command (not an MCP
  * tool) to stop models — particularly CoCo — from searching the tool list,
