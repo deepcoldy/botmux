@@ -1,8 +1,8 @@
 /**
  * Card lifecycle test (consolidated single test):
- *  1. Card status: 启动中… / 工作中 → 就绪
+ *  1. Card status: 启动中… / 工作中 → 等待输入
  *  2. Toggle button exists
- *  3. Expanded content has no abnormal characters
+ *  3. Screenshot output mode can be shown
  *
  * All assertions reference the specific test message to avoid
  * confusion with old test threads in the chat.
@@ -18,8 +18,12 @@ import {
   checkPrerequisites,
   STORAGE_STATE_PATH,
   testMessage,
+  expectedReplyMarker,
   sendMessage,
   waitForStreamingCard,
+  waitForCardStatus,
+  showStreamingOutput,
+  waitForModelTextReply,
   scrollThreadToBottom,
   navigateToMessenger,
   openChat,
@@ -59,43 +63,33 @@ describe('feishu card lifecycle', () => {
     await sendMessage(agent, msg);
 
     // Wait for bot to respond, open thread panel, handle repo selection
-    await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg });
+    await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg, page });
 
-    // --- Step 1: Verify toggle button exists ---
+    // --- Step 1: Verify current display toggle exists ---
     await agent.aiAssert(
-      '话题面板中的流式卡片里有"📕 收起输出"或"📖 展开输出"按钮',
+      '右侧话题详情面板最底部当前会话的流式卡片里有"📖 显示输出"或"📕 隐藏输出"按钮',
     );
 
-    // --- Step 3: Ensure expanded and check content ---
-    const needExpand = await agent.aiBoolean(
-      '话题面板中的流式卡片里有"📖 展开输出"按钮',
-    );
-    if (needExpand) {
-      await agent.aiAct('点击话题面板中流式卡片里的"📖 展开输出"按钮');
-      await page.waitForTimeout(2000);
-    }
+    // --- Step 2: Ensure output is visible in the current screenshot mode ---
+    await showStreamingOutput(agent, page);
 
-    // Check for ANSI escape codes specifically (the real concern).
-    // Note: CLI output may contain JSON fragments from MCP tool calls,
-    // which look messy but are expected terminal output.
+    // Check for ANSI escape codes specifically. CLI output may contain JSON
+    // fragments from tool calls, which are expected terminal output.
     await agent.aiAssert(
-      '话题面板中流式卡片展开的输出内容不包含 ANSI 终端转义序列' +
+      '右侧话题详情面板最底部当前会话的流式卡片可见输出区域不包含 ANSI 终端转义序列' +
         '（如"[32m""[0m""[1;34m"这类带方括号和字母的颜色代码）',
     );
 
     // --- Step 4: Wait for idle ---
     await scrollThreadToBottom(agent);
-    await agent.aiWaitFor(
-      '话题面板中有一个流式卡片，其标题栏中包含"就绪"字样',
-      { timeoutMs: 180_000, checkIntervalMs: 5_000 },
-    );
+    await waitForCardStatus(agent, '等待输入', { timeoutMs: 180_000 });
 
     // --- Step 5: Verify bot sent actual reply (not just card status) ---
     await scrollThreadToBottom(agent);
-    await agent.aiAssert(
-      '话题面板中有来自 Claude 的回复内容，' +
-        '且不仅仅是"继续使用当前仓库""项目仓库管理"等状态消息，' +
-        '而是包含了机器人对用户消息的实际响应',
-    );
+    await waitForModelTextReply(agent, {
+      botName: 'Claude',
+      marker: expectedReplyMarker(msg),
+      timeoutMs: 180_000,
+    });
   }, 420_000);
 });

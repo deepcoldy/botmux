@@ -6,8 +6,8 @@
  *  1. Navigate to messenger → click bot's private chat
  *  2. Send "hello" → bot creates topic and replies
  *  3. Verify streaming card appears
- *  4. Wait for card to reach "就绪"
- *  5. Verify bot sent an actual reply message (with @mention to user)
+ *  4. Wait for card to reach "等待输入", or for Codex to return a quota/rate-limit response
+ *  5. Verify bot sent an actual text reply message, or that Codex reached Codex-side response handling
  *  6. Close session and verify "会话已关闭"
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
@@ -21,16 +21,27 @@ import {
   checkPrerequisites,
   STORAGE_STATE_PATH,
   testMessage,
+  expectedReplyMarker,
   sendMessage,
   navigateToMessenger,
   openChat,
   waitForStreamingCard,
+  waitForCardStatus,
+  waitForIdleOrCodexUsageLimit,
+  waitForCodexSideResponse,
+  clickDirectStartIfPresent,
+  showStreamingOutput,
+  waitForModelTextReply,
   scrollThreadToBottom,
   closeSession,
   type BotName,
 } from './helpers.js';
 
-export function createBotTest(botName: BotName): void {
+type BotTestOptions = {
+  allowCodexUsageLimitResponse?: boolean;
+};
+
+export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
   describe(`${botName} basic flow`, () => {
     let browser: Browser;
     let context: BrowserContext;
@@ -56,7 +67,12 @@ export function createBotTest(botName: BotName): void {
       await browser?.close();
     });
 
-    it(`sends hello, receives streaming card and actual reply from ${botName}`, async () => {
+    const title = opts?.allowCodexUsageLimitResponse
+      ? `sends hello, opens the current thread, and receives a Codex-side response`
+      : `sends hello, receives streaming card and actual reply from ${botName}`;
+    const timeoutMs = opts?.allowCodexUsageLimitResponse ? 600_000 : 360_000;
+
+    it(title, async () => {
       await navigateToMessenger(page);
       await openChat(page, agent, botName);
 
@@ -64,39 +80,46 @@ export function createBotTest(botName: BotName): void {
       await sendMessage(agent, msg);
 
       // Wait for streaming card in thread panel
-      await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg });
-
-      // Wait for card to reach idle — means CLI finished processing
-      await scrollThreadToBottom(agent);
-      await agent.aiWaitFor(
-        '话题面板底部的流式卡片标题包含"就绪"',
-        { timeoutMs: 120_000, checkIntervalMs: 5_000 },
-      );
-
-      // --- Step A: Verify streaming card has output content ---
-      await scrollThreadToBottom(agent);
-      const needExpand = await agent.aiBoolean(
-        '话题面板中的流式卡片里有"📖 展开输出"按钮',
-      );
-      if (needExpand) {
-        await agent.aiAct('点击话题面板中流式卡片里的"📖 展开输出"按钮');
-        await page.waitForTimeout(2000);
+      await waitForStreamingCard(agent, {
+        timeoutMs: 90_000,
+        msgHint: msg,
+        page,
+      });
+      if (opts?.allowCodexUsageLimitResponse) {
+        await clickDirectStartIfPresent(agent, page);
       }
-      await agent.aiAssert(
-        `话题面板中的流式卡片包含输出内容（展开后可见文本），` +
-          `说明 ${botName} 已经处理了用户消息并产生了输出`,
-      );
 
-      // --- Step B: Verify bot sent an actual reply (with @user mention) ---
-      // The real "reply" is a text message from the bot that @mentions the user,
-      // not just the streaming card output. This proves the bot finished and
-      // posted its answer back to Feishu.
+      // Wait for card to reach idle, or for Codex to return a quota/rate-limit response.
       await scrollThreadToBottom(agent);
-      await agent.aiWaitFor(
-        `话题面板中有来自 ${botName} 的文本回复消息（包含"@"某用户的内容），` +
-          '这是机器人对用户问题的实际回答',
-        { timeoutMs: 60_000, checkIntervalMs: 5_000 },
-      );
-    }, 360_000);
+      const outcome = opts?.allowCodexUsageLimitResponse
+        ? await waitForIdleOrCodexUsageLimit(agent, { timeoutMs: 180_000 })
+        : 'idle';
+      if (outcome === 'idle') {
+        await waitForCardStatus(agent, '等待输入', { timeoutMs: 120_000 });
+      }
+
+      if (outcome === 'codex-usage-limit') {
+        await scrollThreadToBottom(agent);
+        await waitForCodexSideResponse(agent, { timeoutMs: 60_000 });
+        return;
+      }
+
+      // --- Step A: Wait for the model's actual text reply. This is the
+      //      real "task succeeded" gate — card status "等待输入" only
+      //      proves the CLI went idle, not that the model answered. ---
+      await scrollThreadToBottom(agent);
+      await waitForModelTextReply(agent, {
+        botName,
+        marker: expectedReplyMarker(msg),
+        timeoutMs: 180_000,
+      });
+
+      // --- Step B: Verify the streaming card's display-toggle still works
+      //      (i.e. the Feishu card feature is healthy). Running this AFTER
+      //      the text reply is in place means the card has a real screenshot
+      //      to show and the toggle isn't fighting a mid-flight re-render. ---
+      await scrollThreadToBottom(agent);
+      await showStreamingOutput(agent, page);
+    }, timeoutMs);
   });
 }

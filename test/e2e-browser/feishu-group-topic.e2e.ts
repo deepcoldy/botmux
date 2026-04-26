@@ -19,10 +19,14 @@ import {
   checkPrerequisites,
   STORAGE_STATE_PATH,
   testMessage,
+  expectedReplyMarker,
   sendMentionMessage,
   navigateToMessenger,
   openChat,
   getGroupChatName,
+  openThreadForMessage,
+  scrollThreadToBottom,
+  waitForModelTextReply,
   closeSession,
 } from './helpers.js';
 
@@ -58,35 +62,20 @@ describe('group chat topic reply mode', () => {
     const msg = testMessage('topic-mode');
     await sendMentionMessage(page, agent, 'Claude', msg);
 
-    // Wait for bot to respond
-    await agent.aiWaitFor(
-      `聊天中"${msg}"消息附近出现了来自机器人的回复`,
-      { timeoutMs: 90_000, checkIntervalMs: 5_000 },
-    );
+    // 关键：用 openThreadForMessage（走「话题」tab）找到并打开这个测试话题。
+    // 如果 bot 用的是普通内联回复而不是话题回复，这条消息根本不会出现在
+    // 「话题」筛选结果里 —— 所以这一步成功本身就证明了话题模式启用。
+    await openThreadForMessage(agent, { msgHint: msg, timeoutMs: 120_000, page });
 
-    await page.waitForTimeout(5000);
+    await scrollThreadToBottom(agent);
 
-    // Verify topic reply mode by checking the thread structure.
-    // In topic mode (reply_in_thread=true), bot replies are nested under
-    // the original message as a thread. Indicators include:
-    // - "查看更早 N 条话题回复" (when many replies)
-    // - "回复话题" input at bottom of thread
-    // - "N 条话题回复" counter
-    // - Bot replies shown indented under the original message, not as
-    //   separate top-level messages in the main chat
-    //
-    // We click into the message to open the thread panel, which confirms
-    // topic mode is active.
-    await agent.aiAct(
-      `点击消息"${msg}"区域或附近的话题入口，打开话题详情`,
-    );
-    await page.waitForTimeout(3000);
-
-    await agent.aiAssert(
-      '右侧打开了话题详情面板，里面包含了机器人的回复（如卡片或文本消息），' +
-        '这说明机器人的回复是以话题形式组织的',
-    );
-  }, 240_000);
+    // 双重验证：既是话题模式（上面走通了），也要模型真的在话题里回了 ACK marker。
+    await waitForModelTextReply(agent, {
+      botName: 'Claude',
+      marker: expectedReplyMarker(msg),
+      timeoutMs: 180_000,
+    });
+  }, 360_000);
 
   // "Only @mentioned bot responds" is covered by feishu-group-mention.e2e.ts
   // with a more robust approach (dedicated test with thread panel verification).

@@ -13,8 +13,10 @@ import {
   checkPrerequisites,
   STORAGE_STATE_PATH,
   testMessage,
+  expectedReplyMarker,
   sendMessage,
   waitForStreamingCard,
+  waitForModelTextReply,
   navigateToMessenger,
   openChat,
   closeSession,
@@ -51,7 +53,12 @@ describe('feishu bot reply (smoke test)', () => {
     await navigateToMessenger(page);
     await openChat(page, agent, 'Claude');
     await sendMessage(agent, msg);
-    await waitForStreamingCard(agent);
-    await agent.aiAssert('聊天中有来自机器人的回复消息');
-  }, 240_000);
+    await waitForStreamingCard(agent, { msgHint: msg, page });
+    // 流式卡片只证明 CLI 被拉起了；必须等到模型真正输出一条文本气泡才算成功。
+    await waitForModelTextReply(agent, {
+      botName: 'Claude',
+      marker: expectedReplyMarker(msg),
+      timeoutMs: 180_000,
+    });
+  }, 360_000);
 });

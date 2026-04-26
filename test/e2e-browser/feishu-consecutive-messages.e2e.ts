@@ -14,9 +14,11 @@ import {
   checkPrerequisites,
   STORAGE_STATE_PATH,
   testMessage,
+  expectedReplyMarker,
   sendMessage,
   waitForStreamingCard,
   waitForCardStatus,
+  waitForModelTextReply,
   scrollThreadToBottom,
   navigateToMessenger,
   openChat,
@@ -59,7 +61,7 @@ describe('consecutive messages', () => {
     await sendMessage(agent, msg1);
 
     // Wait for the streaming card to appear (session starts)
-    await waitForStreamingCard(agent, { msgHint: msg1, timeoutMs: 120_000 });
+    await waitForStreamingCard(agent, { msgHint: msg1, timeoutMs: 120_000, page });
 
     // Wait for the first message to be processing (card shows "工作中")
     await waitForCardStatus(agent, '工作中', { timeoutMs: 60_000 });
@@ -72,16 +74,30 @@ describe('consecutive messages', () => {
     await sendThreadReply(agent, page, msg3);
 
     // Wait for the CLI to eventually become idle after processing all messages
-    await waitForCardStatus(agent, '就绪', { timeoutMs: 300_000 });
+    await waitForCardStatus(agent, '等待输入', { timeoutMs: 300_000 });
 
     // Scroll thread to bottom to see all responses
     await scrollThreadToBottom(agent);
     await page.waitForTimeout(2000);
 
-    // Verify multiple responses — the CLI should have processed all 3 messages
-    // and produced responses for each (visible as card updates or reply messages)
-    await agent.aiAssert(
-      '话题面板中可以看到机器人对消息做出了多次回复（至少有 2 条不同的机器人响应消息或卡片更新）',
-    );
+    // CLI 空闲只代表 worker 停了，必须真看到模型给每条消息都回了 ACK marker。
+    // 3 条消息 → 3 个不同 marker → 必须都落到话题里。
+    await waitForModelTextReply(agent, {
+      botName: 'Claude',
+      marker: expectedReplyMarker(msg1),
+      timeoutMs: 120_000,
+    });
+    await scrollThreadToBottom(agent);
+    await waitForModelTextReply(agent, {
+      botName: 'Claude',
+      marker: expectedReplyMarker(msg2),
+      timeoutMs: 120_000,
+    });
+    await scrollThreadToBottom(agent);
+    await waitForModelTextReply(agent, {
+      botName: 'Claude',
+      marker: expectedReplyMarker(msg3),
+      timeoutMs: 120_000,
+    });
   }, 600_000);
 });

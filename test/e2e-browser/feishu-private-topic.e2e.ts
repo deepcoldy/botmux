@@ -18,6 +18,7 @@ import {
   checkPrerequisites,
   STORAGE_STATE_PATH,
   testMessage,
+  messageTag,
   sendMessage,
   navigateToMessenger,
   openChat,
@@ -58,7 +59,7 @@ describe('private chat topic reply mode', () => {
     await sendMessage(agent, msg);
 
     // Wait for bot to respond
-    await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg });
+    await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg, page });
 
     // Go back to main chat view to check thread indicator
     await page.keyboard.press('Escape');
@@ -71,7 +72,7 @@ describe('private chat topic reply mode', () => {
     await page.waitForTimeout(3000);
 
     await agent.aiAssert(
-      `消息"${msg}"所在区域可以看到包含"话题回复"的文字（例如"查看更早 N 条话题回复"或"N 条话题回复"或"回复话题"），` +
+      `消息"${messageTag(msg)}"所在区域可以看到包含"话题回复"的文字（例如"查看更早 N 条话题回复"或"N 条话题回复"或"回复话题"），` +
         '说明机器人使用了话题模式回复',
     );
   }, 300_000);
