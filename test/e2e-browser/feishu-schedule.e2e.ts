@@ -19,11 +19,14 @@ import {
   checkPrerequisites,
   STORAGE_STATE_PATH,
   testMessage,
+  expectedReplyMarker,
   sendMessage,
   sendThreadReply,
   navigateToMessenger,
   openChat,
   waitForStreamingCard,
+  waitForCardStatus,
+  waitForModelTextReply,
   scrollThreadToBottom,
   closeSession,
 } from './helpers.js';
@@ -79,13 +82,11 @@ describe('scheduled task thread continuity', () => {
     await waitForStreamingCard(agent, {
       timeoutMs: 90_000,
       msgHint: setupMsg,
+      page,
     });
 
     // Wait for bot to be ready so it can process /schedule commands.
-    await agent.aiWaitFor('话题面板中的流式卡片标题包含"就绪"', {
-      timeoutMs: 120_000,
-      checkIntervalMs: 5_000,
-    });
+    await waitForCardStatus(agent, '等待输入', { timeoutMs: 120_000 });
 
     // Step 2: Create a scheduled task inside this thread.
     await scrollThreadToBottom(agent);
@@ -127,11 +128,15 @@ describe('scheduled task thread continuity', () => {
       { timeoutMs: 60_000, checkIntervalMs: 5_000 },
     );
 
-    // The bot should produce a response in the same thread.
+    // The bot should produce a response in the same thread. 必须真拿到模型文本回复——
+    // "🕐 定时任务 开始执行" 是 botmux 发的系统提示，不能当作模型的回复。
+    // setupMsg 自带 ACK marker，触发任务后模型重跑该指令 → 同样的 marker 会再出现在话题里。
     await scrollThreadToBottom(agent);
-    await agent.aiAssert(
-      '话题面板中在"🕐 定时任务"提示消息之后，有来自机器人的回复内容（流式卡片或文本）',
-    );
+    await waitForModelTextReply(agent, {
+      botName: 'Claude',
+      marker: expectedReplyMarker(setupMsg),
+      timeoutMs: 180_000,
+    });
 
     // Negative assertion: the main chat (not thread panel) should NOT show a new
     // top-level "🕐 定时任务" message — this is the thread-continuity fix.

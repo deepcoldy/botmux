@@ -28,6 +28,7 @@ import {
   getGroupChatName,
   scrollThreadToBottom,
   waitForStreamingCard,
+  waitForModelTextReply,
   closeSession,
 } from './helpers.js';
 
@@ -63,7 +64,8 @@ describe('bot-to-bot collaboration (@Aiden ↔ @CoCo)', () => {
   });
 
   it('Aiden and CoCo collaborate with 3+ rounds of back-and-forth', async () => {
-    const msg = testMessage('collab');
+    // Plain tag — the collab prompt supplies its own bot instructions below.
+    const msg = testMessage('collab', { plain: true });
 
     // Step 1: Send @Aiden a message asking it to collaborate with @CoCo
     // The prompt explicitly instructs Aiden to @mention CoCo and have
@@ -78,52 +80,42 @@ describe('bot-to-bot collaboration (@Aiden ↔ @CoCo)', () => {
     );
 
     // Step 2: Wait for Aiden to respond (streaming card in thread)
-    await waitForStreamingCard(agent, { timeoutMs: 120_000, msgHint: msg });
+    await waitForStreamingCard(agent, { timeoutMs: 120_000, msgHint: msg, page });
 
     // Step 3: Wait for Aiden's card to show activity
     await scrollThreadToBottom(agent);
     await agent.aiWaitFor(
-      '话题面板中有一个流式卡片，其标题栏中包含"工作中"或"就绪"字样',
+      '右侧话题详情面板中有一个来自 Aiden 的流式卡片，其标题栏包含"工作中"或"等待输入"字样',
       { timeoutMs: 120_000, checkIntervalMs: 5_000 },
     );
 
-    // Step 4: Wait for CoCo to join the conversation.
-    // When Aiden @mentions CoCo, the daemon creates a new session for CoCo
-    // in the same thread. We should see a second streaming card from CoCo.
+    // Step 4: Wait for both bots to actually produce model-generated text replies.
+    // 只看到卡片或"已收到"确认并不能证明模型真的回话了——必须分别等到 Aiden 和 CoCo
+    // 的文本气泡里出现完整句子。
     await scrollThreadToBottom(agent);
-    await agent.aiWaitFor(
-      '话题面板中出现了来自 CoCo 的回复（包括流式卡片、文本消息、或"已收到"等确认消息）',
-      { timeoutMs: 180_000, checkIntervalMs: 10_000 },
-    );
+    await waitForModelTextReply(agent, {
+      botName: 'Aiden',
+      timeoutMs: 240_000,
+    });
 
-    // Step 5: Wait for enough back-and-forth.
-    // Give bots time to exchange multiple rounds. Each round takes
-    // ~30-60s (bot processes message, sends reply, signal propagates).
-    // We wait up to 5 minutes for 3+ rounds.
+    await scrollThreadToBottom(agent);
+    await waitForModelTextReply(agent, {
+      botName: 'CoCo',
+      timeoutMs: 240_000,
+    });
+
+    // Step 5: Give bots time for another round, then scroll and verify.
     await page.waitForTimeout(60_000);
-    await scrollThreadToBottom(agent);
-
-    // Check for another round
-    await page.waitForTimeout(60_000);
-    await scrollThreadToBottom(agent);
-
-    // Step 6: Verify both bots participated.
-    // The key verification is that the bot-mention signal pipeline works:
-    // Aiden → signal file → daemon → CoCo picks up and responds.
     await scrollThreadToBottom(agent);
     await page.waitForTimeout(3000);
 
-    // Verify both bots have content in the thread
+    // Step 6: 结构性校验——两个机器人都真写出了内容，且 CoCo 出现在 Aiden 之后。
     await agent.aiAssert(
-      '话题面板中可以看到来自 Aiden 的回复内容（文本消息或流式卡片），' +
-        '同时也能看到来自 CoCo 的回复内容（文本消息或流式卡片）。' +
-        '两个机器人都在这个话题中有输出。',
+      '话题面板中可以看到至少一条来自 Aiden 的普通文本回复（完整的自然语言句子，不是流式卡片或"已收到"之类的系统提示），' +
+        '同时也能看到至少一条来自 CoCo 的普通文本回复（完整的自然语言句子，不是流式卡片或"已收到"之类的系统提示）。',
     );
-
-    // Verify CoCo's response came after Aiden's (proving the pipeline)
     await agent.aiAssert(
-      '话题面板中 CoCo 的回复出现在 Aiden 的消息之后，' +
-        '说明是 Aiden 触发了 CoCo 的参与。',
+      '话题面板中 CoCo 的首条文本回复出现在 Aiden 的首条文本回复之后，说明是 Aiden 触发了 CoCo 的参与。',
     );
-  }, 600_000); // 10 min — multi-bot collaboration takes time
+  }, 900_000); // 15 min — multi-bot collaboration + two model waits
 });
