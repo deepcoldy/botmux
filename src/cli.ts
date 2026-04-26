@@ -195,7 +195,9 @@ async function writeSingleBotConfig(): Promise<void> {
 
   writeFileSync(BOTS_JSON_FILE, JSON.stringify([bot], null, 2) + '\n');
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-  console.log(`\n下一步: botmux start`);
+  console.log(`\n下一步:`);
+  console.log(`  1. botmux start              启动 daemon（飞书后台配长连接前必须先启动）`);
+  console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : '当前平台暂不支持'}，无需 sudo）`);
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
