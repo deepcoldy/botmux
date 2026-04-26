@@ -5,9 +5,10 @@ import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 /** Resolve the JSONL transcript path Claude Code writes user/assistant turns to.
- *  Claude Code's project-hash scheme replaces both `/` and `.` with `-`. */
+ *  Claude Code's project-hash scheme replaces every non-[A-Za-z0-9-] char with `-`
+ *  (observed: `/foo/life_workspace` → `-foo-life-workspace`; `/`, `.`, `_` all become `-`). */
 export function claudeJsonlPathForSession(sessionId: string, cwd: string): string {
-  const projectHash = cwd.replace(/[/.]/g, '-');
+  const projectHash = cwd.replace(/[^A-Za-z0-9-]/g, '-');
   return join(homedir(), '.claude', 'projects', projectHash, `${sessionId}.jsonl`);
 }
 

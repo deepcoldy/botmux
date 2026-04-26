@@ -609,13 +609,30 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const extra = (process.env.CLI_EXTRA_ARGS ?? '').trim();
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
 
+  // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
+  // botmux 必须带这个 flag（话题里没法弹交互式审批），所以为 root 自动注入
+  // IS_SANDBOX=1 走 Claude Code 的受控环境逃生舱。用户显式设了就尊重不覆盖。
+  const claudeRootBypass =
+    cfg.cliId === 'claude-code' &&
+    process.getuid?.() === 0 &&
+    !process.env.IS_SANDBOX
+      ? { IS_SANDBOX: '1' }
+      : {};
+  if ((claudeRootBypass as { IS_SANDBOX?: string }).IS_SANDBOX) {
+    log('Detected root user — injecting IS_SANDBOX=1 for Claude Code');
+  }
+
   log(`Spawning: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
 
   backend.spawn(cliAdapter.resolvedBin, args, {
     cwd: cfg.workingDir,
     cols: PTY_COLS,
     rows: PTY_ROWS,
-    env: { ...process.env, CLAUDECODE: undefined } as unknown as Record<string, string>,
+    env: {
+      ...process.env,
+      CLAUDECODE: undefined,
+      ...claudeRootBypass,
+    } as unknown as Record<string, string>,
   });
 
   // Write CLI PID marker so the MCP server can verify it was spawned by botmux.
