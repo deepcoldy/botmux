@@ -140,7 +140,7 @@ export async function sendUserMessage(larkAppId: string, openId: string, content
   return messageId;
 }
 
-export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ userCount: number }> {
+export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
   const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.chat.get({
     path: { chat_id: chatId },
@@ -148,8 +148,11 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
   if (res.code !== 0) {
     throw new Error(`Failed to get chat info: ${res.msg} (code: ${res.code})`);
   }
-  // user_count excludes bots, only real users
-  return { userCount: Number(res.data?.user_count ?? 0) };
+  // user_count excludes bots, only real users; bot_count is the bot member count.
+  return {
+    userCount: Number(res.data?.user_count ?? 0),
+    botCount: Number(res.data?.bot_count ?? 0),
+  };
 }
 
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<void> {

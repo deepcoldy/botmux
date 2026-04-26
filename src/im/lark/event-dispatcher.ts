@@ -90,42 +90,30 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   }
 }
 
-// ─── Group user count cache ───────────────────────────────────────────────
+// ─── Group chat stats cache ───────────────────────────────────────────────
+//
+// chat.get returns both user_count (real users only) and bot_count (bots).
+// One API call, one cache — used to gate auto-replies in multi-bot/multi-user
+// groups (oncall chats often have 3rd-party oncall/form/AI-search bots).
 
-const chatUserCountCache = new Map<string, { count: number; fetchedAt: number }>();
 export const CHAT_CACHE_TTL = 5 * 60_000; // 5 minutes
+const chatStatsCache = new Map<string, { userCount: number; botCount: number; fetchedAt: number }>();
 
-export async function getGroupUserCount(larkAppId: string, chatId: string): Promise<number> {
+export async function getGroupStats(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
   const cacheKey = `${larkAppId}:${chatId}`;
-  const cached = chatUserCountCache.get(cacheKey);
+  const cached = chatStatsCache.get(cacheKey);
   if (cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
-    return cached.count;
+    return { userCount: cached.userCount, botCount: cached.botCount };
   }
   try {
     const info = await getChatInfo(larkAppId, chatId);
-    chatUserCountCache.set(cacheKey, { count: info.userCount, fetchedAt: Date.now() });
-    return info.userCount;
+    chatStatsCache.set(cacheKey, { userCount: info.userCount, botCount: info.botCount, fetchedAt: Date.now() });
+    return info;
   } catch (err) {
-    logger.debug(`Failed to get chat user count for ${chatId}: ${err}`);
-    return cached?.count ?? 999; // fallback: assume multi-person
-  }
-}
-
-const chatBotCountCache = new Map<string, { count: number; fetchedAt: number }>();
-
-export async function getGroupBotCount(larkAppId: string, chatId: string): Promise<number> {
-  const cacheKey = `${larkAppId}:${chatId}`;
-  const cached = chatBotCountCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
-    return cached.count;
-  }
-  try {
-    const bots = await listChatBotMembers(larkAppId, chatId);
-    chatBotCountCache.set(cacheKey, { count: bots.length, fetchedAt: Date.now() });
-    return bots.length;
-  } catch (err) {
-    logger.warn(`Failed to get chat bot count for ${chatId}: ${err}`);
-    return cached?.count ?? 999; // fallback: assume multiple bots → require @mention
+    logger.warn(`Failed to get chat stats for ${chatId}: ${err}`);
+    if (cached) return { userCount: cached.userCount, botCount: cached.botCount };
+    // Fallback: assume multi-person, multi-bot → require @mention to be safe.
+    return { userCount: 999, botCount: 999 };
   }
 }
 
@@ -290,13 +278,8 @@ export async function checkGroupMessageAccess(
   // No @mention — only allow if sender is the sole human in the group
   // AND this is the only bot in the chat. With multiple bots, require @mention
   // to disambiguate.
-  // Note: each daemon registers only 1 bot, so getAllBots().length is always 1.
-  // Use getGroupBotCount (API query) to get the real count of bots in the chat.
   if (isAllowed) {
-    const [userCount, botCount] = await Promise.all([
-      getGroupUserCount(larkAppId, chatId),
-      getGroupBotCount(larkAppId, chatId),
-    ]);
+    const { userCount, botCount } = await getGroupStats(larkAppId, chatId);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
     if (userCount <= 1 && botCount <= 1) {
       return 'allowed';
@@ -396,13 +379,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
         } else if (chatType === 'group' && rootId) {
           // Group thread replies:
-          // - Sole bot in chat + owns session → respond without @mention
-          // - Multiple bots in chat → always require @mention, even for session owners
+          // - 1v1-style chat (sole real user + sole bot) + owns session → respond without @mention
+          // - Multi-user OR multi-bot group → always require @mention, even for session owners
           // - Non-owner bots → require @mention to join/take over
           const ownsSession = handlers.isSessionOwner?.(rootId, larkAppId) ?? false;
-          const botCount = ownsSession ? await getGroupBotCount(larkAppId, chatId) : 0;
-          if (ownsSession && isAllowed && botCount <= 1) {
-            // Sole bot in chat + owns session → process without @mention
+          const stats = ownsSession ? await getGroupStats(larkAppId, chatId) : null;
+          if (ownsSession && isAllowed && stats && stats.userCount <= 1 && stats.botCount <= 1) {
+            // 1v1-style group + owns session → process without @mention
           } else {
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {
