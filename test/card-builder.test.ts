@@ -225,75 +225,76 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('工作中');
     });
 
-    it('should show green template and "就绪" for idle status', () => {
+    it('should show green template and "等待输入" for idle status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       expect(card.header.template).toBe('green');
-      expect(card.header.title.content).toContain('就绪');
+      expect(card.header.title.content).toContain('等待输入');
     });
 
     it('should include escaped title in header', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, 'Fix *bug*', '', 'idle'));
       expect(card.header.title.content).toContain('Fix \\*bug\\*');
-      expect(card.header.title.content).toContain('就绪');
+      expect(card.header.title.content).toContain('等待输入');
     });
   });
 
-  // ── Collapsed state (expanded=false or undefined) ──────────────────────
+  // ── Hidden display mode ────────────────────────────────────────────────
 
-  describe('collapsed state', () => {
+  describe('hidden display mode', () => {
     it('should NOT include markdown content element', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, false));
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'hidden'));
       const mdElements = card.elements.filter((e: any) => e.tag === 'markdown');
       expect(mdElements).toHaveLength(0);
     });
 
     it('should NOT include hr separator before actions', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, false));
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'hidden'));
       const hrElements = card.elements.filter((e: any) => e.tag === 'hr');
       expect(hrElements).toHaveLength(0);
     });
 
-    it('should show toggle button text as "展开输出"', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, false));
+    it('should show toggle button text as "显示输出"', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'hidden'));
       const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_stream');
-      expect(toggleBtn.text.content).toContain('展开输出');
+      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
+      expect(toggleBtn.text.content).toContain('显示输出');
     });
 
-    it('should default to collapsed when expanded is undefined', () => {
+    it('should default to hidden when displayMode is undefined', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working'));
       const mdElements = card.elements.filter((e: any) => e.tag === 'markdown');
       expect(mdElements).toHaveLength(0);
     });
   });
 
-  // ── Expanded state ─────────────────────────────────────────────────────
+  // ── Screenshot display mode ────────────────────────────────────────────
 
-  describe('expanded state', () => {
-    it('should include markdown content element', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, true));
+  describe('screenshot display mode', () => {
+    it('should include screenshot placeholder when no image is available', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
       const mdElements = card.elements.filter((e: any) => e.tag === 'markdown');
       expect(mdElements).toHaveLength(1);
-      expect(mdElements[0].content).toBe(CONTENT);
+      expect(mdElements[0].content).toBe('_(等待第一张截图…)_');
     });
 
-    it('should include hr separator after content', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, true));
+    it('should include hr separator after screenshot output', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
       expect(card.elements[0].tag).toBe('markdown');
       expect(card.elements[1].tag).toBe('hr');
     });
 
-    it('should show toggle button text as "收起输出"', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, true));
+    it('should show toggle button text as "隐藏输出"', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
       const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_stream');
-      expect(toggleBtn.text.content).toContain('收起输出');
+      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
+      expect(toggleBtn.text.content).toContain('隐藏输出');
     });
 
-    it('should show placeholder when screenContent is empty', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, true));
-      const mdEl = card.elements.find((e: any) => e.tag === 'markdown');
-      expect(mdEl.content).toBe('(等待输出…)');
+    it('should include export text and refresh buttons', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'screenshot'));
+      const actions = findActions(card);
+      expect(actions.find((a: any) => a.value?.action === 'export_text')).toBeDefined();
+      expect(actions.find((a: any) => a.value?.action === 'refresh_screenshot')).toBeDefined();
     });
   });
 
@@ -301,23 +302,23 @@ describe('buildStreamingCard', () => {
 
   describe('cardNonce embedding', () => {
     it('should embed card_nonce in toggle button value when provided', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, false, 'nonce_123'));
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden', 'nonce_123'));
       const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_stream');
+      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
       expect(toggleBtn.value.card_nonce).toBe('nonce_123');
     });
 
     it('should NOT include card_nonce when not provided', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, false));
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden'));
       const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_stream');
+      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
       expect(toggleBtn.value).not.toHaveProperty('card_nonce');
     });
 
     it('should NOT include card_nonce when undefined is passed explicitly', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, false, undefined));
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden', undefined));
       const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_stream');
+      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
       expect(toggleBtn.value).not.toHaveProperty('card_nonce');
     });
   });

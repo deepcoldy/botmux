@@ -67,16 +67,16 @@ describe('Interactive card parsing: Format A (API simplified)', () => {
 
   it('should extract button labels', () => {
     const card = {
-      title: '🖥️ Session — 就绪',
+      title: '🖥️ Session — 等待输入',
       elements: [[
-        { tag: 'button', text: '📖 展开输出', type: 'default' },
+        { tag: 'button', text: '📖 显示输出', type: 'default' },
         { tag: 'button', text: '🖥️ 打开终端', type: 'primary' },
         { tag: 'button', text: '❌ 关闭会话', type: 'danger' },
       ]],
     };
     const result = parseApiMessage(makeMsg('interactive', card));
-    expect(result.content).toContain('[卡片: 🖥️ Session — 就绪]');
-    expect(result.content).toContain('[📖 展开输出]');
+    expect(result.content).toContain('[卡片: 🖥️ Session — 等待输入]');
+    expect(result.content).toContain('[📖 显示输出]');
     expect(result.content).toContain('[🖥️ 打开终端]');
     expect(result.content).toContain('[❌ 关闭会话]');
   });
