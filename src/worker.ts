@@ -612,13 +612,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
   // botmux 必须带这个 flag（话题里没法弹交互式审批），所以为 root 自动注入
   // IS_SANDBOX=1 走 Claude Code 的受控环境逃生舱。用户显式设了就尊重不覆盖。
-  const claudeRootBypass =
+  const injectClaudeSandbox =
     cfg.cliId === 'claude-code' &&
     process.getuid?.() === 0 &&
-    !process.env.IS_SANDBOX
-      ? { IS_SANDBOX: '1' }
-      : {};
-  if ((claudeRootBypass as { IS_SANDBOX?: string }).IS_SANDBOX) {
+    !process.env.IS_SANDBOX;
+  if (injectClaudeSandbox) {
     log('Detected root user — injecting IS_SANDBOX=1 for Claude Code');
   }
 
@@ -631,7 +629,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     env: {
       ...process.env,
       CLAUDECODE: undefined,
-      ...claudeRootBypass,
+      ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
     } as unknown as Record<string, string>,
   });
 
