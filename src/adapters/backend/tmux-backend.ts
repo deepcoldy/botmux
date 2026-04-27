@@ -314,6 +314,9 @@ const TMUX_PASSTHROUGH_VARS = [
   'LARK_APP_SECRET',
   '__OWNER_OPEN_ID',
   'SESSION_DATA_DIR',
+  // Claude Code 的 root/sudo 逃生舱：worker.ts 检测到 root 时会注入 IS_SANDBOX=1，
+  // tmux 不透传这个变量的话，--dangerously-skip-permissions 会被拦截立即退出。
+  'IS_SANDBOX',
 ];
 
 /** Minimal shell-escape for tmux session names (alphanumeric + dash). */
