@@ -12,16 +12,24 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string): strin
   return join(homedir(), '.claude', 'projects', projectHash, `${sessionId}.jsonl`);
 }
 
-/** Substring that appears on every real user submission line and NOT on tool-result
- *  lines (those have array content: `"content":[{...}]`). */
-const USER_SUBMIT_MARKER = '"role":"user","content":"';
+/** Substrings that indicate Claude Code received our submit. We accept either:
+ *  - `"role":"user","content":"` — direct submission while idle (the canonical
+ *    user-message line; tool-result lines have array content `"content":[{...`
+ *    so they never match).
+ *  - `"operation":"enqueue"` — type-ahead submission while Claude is busy.
+ *    Claude Code logs a `{"type":"queue-operation","operation":"enqueue",...}`
+ *    line at the moment of submit and only later (after the current turn ends)
+ *    promotes it to a `queued_command` attachment — never to a `role:user`
+ *    string-content line. Without this marker, every type-ahead submit would
+ *    falsely report failure. */
+const SUBMIT_MARKERS = ['"role":"user","content":"', '"operation":"enqueue"'];
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
 }
 
-function deltaHasUserSubmit(path: string, fromByte: number): boolean {
+function deltaHasSubmit(path: string, fromByte: number): boolean {
   if (!existsSync(path)) return false;
   let size: number;
   try { size = statSync(path).size; } catch { return false; }
@@ -34,13 +42,14 @@ function deltaHasUserSubmit(path: string, fromByte: number): boolean {
   } finally {
     closeSync(fd);
   }
-  return buf.toString('utf8').includes(USER_SUBMIT_MARKER);
+  const text = buf.toString('utf8');
+  return SUBMIT_MARKERS.some(m => text.includes(m));
 }
 
-async function waitForUserSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
+async function waitForSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (deltaHasUserSubmit(path, baseByte)) return true;
+    if (deltaHasSubmit(path, baseByte)) return true;
     await new Promise(r => setTimeout(r, 100));
   }
   return false;
@@ -159,17 +168,18 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       if (!pty.claudeJsonlPath) return;
 
       // Retry budget: up to 2 extra Enters (3 sends total), each followed by
-      // an 800ms wait for the JSONL append. If the user is concurrently typing
-      // in the web terminal, a stray Enter may submit their half-typed text —
-      // but we only retry when the JSONL is provably unchanged, so the race
-      // window is bounded to cases where submit really did fail.
+      // an 800ms wait for the JSONL to record either a direct user-submit line
+      // or a type-ahead enqueue line. If the user is concurrently typing in the
+      // web terminal, a stray Enter may submit their half-typed text — but we
+      // only retry when the JSONL is provably unchanged, so the race window is
+      // bounded to cases where submit really did fail.
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForUserSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
+        if (await waitForSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
         sendEnter();
       }
       // Final grace check.
-      if (await waitForUserSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
-      // All retries exhausted and still no user line in JSONL. Signal failure
+      if (await waitForSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
+      // All retries exhausted and still no submit marker in JSONL. Signal failure
       // so the worker can notify the user in Lark instead of silently dropping.
       return { submitted: false };
     },
