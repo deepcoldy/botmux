@@ -17,7 +17,7 @@ export interface SkillDef {
 
 const SCHEDULE_SKILL = `---
 name: botmux-schedule
-description: 当用户要求创建定时任务/提醒（"每天X点提醒"、"30分钟后"、"每周一"、"remind me"、"schedule"）时触发。使用 botmux schedule 命令操作定时任务（增删查改），支持 Lark 话题内自动路由。
+description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 会在原话题自动续一条消息并触发新 CLI 会话。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
 ---
 
 # botmux-schedule — 定时任务
