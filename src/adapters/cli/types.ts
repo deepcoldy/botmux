@@ -27,6 +27,8 @@ export interface CliAdapter {
   buildArgs(opts: {
     sessionId: string;
     resume: boolean;
+    /** CLI-native session id used for resume when it differs from botmux's session id. */
+    resumeSessionId?: string;
     initialPrompt?: string;
     botName?: string;
     botOpenId?: string;
@@ -43,7 +45,7 @@ export interface CliAdapter {
    *  Code via session JSONL) return `{ submitted: false }` when all retries
    *  failed, so the worker can surface that to the user. `void` / undefined
    *  means "no verification performed, assume OK". */
-  writeInput(pty: PtyHandle, content: string): Promise<void | { submitted: boolean }>;
+  writeInput(pty: PtyHandle, content: string): Promise<void | { submitted: boolean; cliSessionId?: string }>;
 
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
    *  skill directory.  When set, `ensureSkills` will write/refresh skill files

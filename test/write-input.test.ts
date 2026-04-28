@@ -47,9 +47,9 @@ import { dirname, join } from 'node:path';
 
 const CODEX_HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
 
-function appendCodexHistory(content: string): void {
+function appendCodexHistory(content: string, sessionId?: string): void {
   mkdirSync(dirname(CODEX_HISTORY_PATH), { recursive: true });
-  appendFileSync(CODEX_HISTORY_PATH, JSON.stringify({ text: content }) + '\n');
+  appendFileSync(CODEX_HISTORY_PATH, JSON.stringify({ session_id: sessionId, text: content }) + '\n');
 }
 
 function resetCodexHistory(): void {
@@ -57,31 +57,31 @@ function resetCodexHistory(): void {
   writeFileSync(CODEX_HISTORY_PATH, '');
 }
 
-function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean }) {
+function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
   const confirmCodexSubmit = opts?.confirmCodexSubmit ?? true;
   let submittedText = '';
   return {
     write: vi.fn(),
     sendText: vi.fn((text: string) => { submittedText = text; }),
     sendSpecialKeys: vi.fn((key: string) => {
-      if (confirmCodexSubmit && key === 'Enter') appendCodexHistory(submittedText);
+      if (confirmCodexSubmit && key === 'Enter') appendCodexHistory(submittedText, opts?.codexSessionId);
     }),
     pasteText: vi.fn((text: string) => { submittedText = text; }),
   } satisfies PtyHandle;
 }
 
-function makeRawPty(opts?: { confirmCodexSubmit?: boolean }) {
+function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
   const confirmCodexSubmit = opts?.confirmCodexSubmit ?? true;
   let submittedText = '';
   return {
     write: vi.fn((data: string) => {
       if (data === '\r') {
-        if (confirmCodexSubmit) appendCodexHistory(submittedText);
+        if (confirmCodexSubmit) appendCodexHistory(submittedText, opts?.codexSessionId);
         return;
       }
       if (data.endsWith('\r')) {
         submittedText += data.slice(0, -1);
-        if (confirmCodexSubmit) appendCodexHistory(submittedText);
+        if (confirmCodexSubmit) appendCodexHistory(submittedText, opts?.codexSessionId);
         return;
       }
       submittedText += data;
@@ -268,6 +268,47 @@ describe('writeInput: edge cases', () => {
 });
 
 describe('codex writeInput submission confirmation', () => {
+  it('buildArgs resumes with the persisted Codex thread id', () => {
+    resetCodexHistory();
+    const adapter = createCodexAdapter('/bin/codex');
+
+    expect(adapter.buildArgs({
+      sessionId: 'botmux-session',
+      resume: true,
+      resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
+    })).toEqual([
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
+    ]);
+  });
+
+  it('buildArgs falls back to the latest history entry containing the botmux session id', () => {
+    resetCodexHistory();
+    appendCodexHistory('<session_id>botmux-session</session_id>', 'old-codex-session');
+    appendCodexHistory('<session_id>other-session</session_id>', 'other-codex-session');
+    appendCodexHistory('<session_id>botmux-session</session_id>', 'new-codex-session');
+    const adapter = createCodexAdapter('/bin/codex');
+
+    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      'new-codex-session',
+    ]);
+  });
+
+  it('buildArgs starts fresh when resume has no known Codex thread id', () => {
+    resetCodexHistory();
+    const adapter = createCodexAdapter('/bin/codex');
+
+    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+    ]);
+  });
+
   it('confirms a multiline submit when history.jsonl appends the escaped prompt marker', async () => {
     resetCodexHistory();
     const pty = makeTmuxPty();
@@ -278,6 +319,15 @@ describe('codex writeInput submission confirmation', () => {
     expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('returns the Codex thread id recorded by history.jsonl', async () => {
+    resetCodexHistory();
+    const pty = makeTmuxPty({ codexSessionId: 'codex-thread-1' });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'codex-thread-1' });
   });
 
   it('retries Enter and reports failure when history.jsonl never records the prompt', async () => {

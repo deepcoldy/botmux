@@ -28,6 +28,8 @@ export interface Session {
   /** Latest uploaded screenshot image_key, persisted so card can re-render after restart. */
   currentImageKey?: string;
   currentTurnTitle?: string;
+  /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
+  cliSessionId?: string;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts. */
   adoptedFrom?: {
     tmuxTarget: string;
@@ -124,7 +126,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; cliSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number }
   | { type: 'message'; content: string }
   | { type: 'raw_input'; content: string }
   | { type: 'close' }

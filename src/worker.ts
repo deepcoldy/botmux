@@ -466,6 +466,20 @@ function markPromptReady(): void {
   flushPending();
 }
 
+function persistCliSessionId(cliSessionId: string): void {
+  if (!cliSessionId || !sessionId) return;
+  if (lastInitConfig) lastInitConfig.cliSessionId = cliSessionId;
+  try {
+    const session = sessionStore.getSession(sessionId);
+    if (!session || session.cliSessionId === cliSessionId) return;
+    session.cliSessionId = cliSessionId;
+    sessionStore.updateSession(session);
+    log(`Persisted CLI session id: ${cliSessionId}`);
+  } catch (err: any) {
+    log(`Failed to persist CLI session id: ${err.message}`);
+  }
+}
+
 /**
  * Drain the pending message queue sequentially.
  * Async with isFlushing mutex: awaits each writeInput, then immediately
@@ -497,6 +511,8 @@ async function flushPending(): Promise<void> {
           type: 'user_notify',
           message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 3 次仍未在会话 JSONL 中看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
         });
+      } else if (result?.cliSessionId) {
+        persistCliSessionId(result.cliSessionId);
       }
     }
   } finally {
@@ -600,6 +616,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const args = cliAdapter.buildArgs({
     sessionId: cfg.sessionId,
     resume: cfg.resume ?? false,
+    resumeSessionId: cfg.cliSessionId,
     initialPrompt: cfg.prompt || undefined,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,

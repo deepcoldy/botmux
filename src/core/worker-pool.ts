@@ -321,6 +321,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
+    cliSessionId: ds.session.cliSessionId,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,

@@ -20,11 +20,16 @@ function currentFileSize(path: string): number {
   try { return statSync(path).size; } catch { return 0; }
 }
 
-function deltaContains(path: string, fromByte: number, marker: string): boolean {
-  if (!existsSync(path)) return false;
+interface HistoryMatch {
+  found: boolean;
+  cliSessionId?: string;
+}
+
+function matchHistoryDelta(path: string, fromByte: number, marker: string): HistoryMatch {
+  if (!existsSync(path)) return { found: false };
   let size: number;
-  try { size = statSync(path).size; } catch { return false; }
-  if (size <= fromByte) return false;
+  try { size = statSync(path).size; } catch { return { found: false }; }
+  if (size <= fromByte) return { found: false };
   const len = size - fromByte;
   const buf = Buffer.alloc(len);
   const fd = openSync(path, 'r');
@@ -33,18 +38,32 @@ function deltaContains(path: string, fromByte: number, marker: string): boolean 
   } finally {
     closeSync(fd);
   }
-  return buf.toString('utf8').includes(marker);
+  const delta = buf.toString('utf8');
+  for (const line of delta.split('\n')) {
+    if (!line.includes(marker)) continue;
+    try {
+      const parsed = JSON.parse(line);
+      return {
+        found: true,
+        cliSessionId: typeof parsed.session_id === 'string' ? parsed.session_id : undefined,
+      };
+    } catch {
+      return { found: true };
+    }
+  }
+  return { found: false };
 }
 
 async function waitForHistoryAppend(
   path: string, fromByte: number, marker: string, timeoutMs: number,
-): Promise<boolean> {
+): Promise<HistoryMatch> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (deltaContains(path, fromByte, marker)) return true;
+    const match = matchHistoryDelta(path, fromByte, marker);
+    if (match.found) return match;
     await delay(100);
   }
-  return false;
+  return { found: false };
 }
 
 /** Build a JSON-escaped prefix of the content so substring-match against the
@@ -56,19 +75,51 @@ function historyMarker(content: string): string {
   return JSON.stringify(prefix).slice(1, -1);  // strip surrounding quotes
 }
 
+function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
+  if (!existsSync(HISTORY_PATH)) return undefined;
+  try {
+    const size = statSync(HISTORY_PATH).size;
+    const fd = openSync(HISTORY_PATH, 'r');
+    const buf = Buffer.alloc(size);
+    try {
+      readSync(fd, buf, 0, size, 0);
+    } finally {
+      closeSync(fd);
+    }
+    const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
+    const lines = buf.toString('utf8').trimEnd().split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!;
+      if (!line.includes(marker)) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (typeof parsed.session_id === 'string') return parsed.session_id;
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'codex');
   return {
     id: 'codex',
     resolvedBin: bin,
 
-    buildArgs() {
-      // Codex manages its own session IDs internally — we cannot pass ours.
-      // Resume is not supported; daemon always starts a fresh Codex session.
-      return [
+    buildArgs({ sessionId, resume, resumeSessionId }) {
+      const baseArgs = [
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
       ];
+      if (!resume) return baseArgs;
+
+      const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
+      if (!codexSessionId) return baseArgs;
+      return ['resume', ...baseArgs, codexSessionId];
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -110,10 +161,20 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) return;
+        const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800);
+        if (match.found) {
+          return match.cliSessionId
+            ? { submitted: true, cliSessionId: match.cliSessionId }
+            : undefined;
+        }
         if (!trySendEnter()) return { submitted: false };
       }
-      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) return;
+      const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800);
+      if (match.found) {
+        return match.cliSessionId
+          ? { submitted: true, cliSessionId: match.cliSessionId }
+          : undefined;
+      }
       return { submitted: false };
     },
 
