@@ -388,6 +388,9 @@ export function addTask(params: {
   rootMessageId?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
+  creatorChatId?: string;
+  creatorRootMessageId?: string;
+  creatorLarkAppId?: string;
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local';
@@ -404,6 +407,9 @@ export function addTask(params: {
     rootMessageId: params.rootMessageId,
     chatType: params.chatType,
     larkAppId: params.larkAppId,
+    creatorChatId: params.creatorChatId,
+    creatorRootMessageId: params.creatorRootMessageId,
+    creatorLarkAppId: params.creatorLarkAppId,
     nextRunAt,
     repeat: params.repeat,
     deliver: params.deliver ?? 'origin',

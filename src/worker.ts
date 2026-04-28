@@ -13,8 +13,10 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, unlinkSync, existsSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
+import { drainTranscript, joinAssistantText } from './services/claude-transcript.js';
+import { BridgeTurnQueue, makeFingerprint } from './services/bridge-turn-queue.js';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
@@ -24,6 +26,7 @@ import { claudeJsonlPathForSession } from './adapters/cli/claude-code.js';
 import type { CliAdapter } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
+import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
@@ -41,6 +44,10 @@ let backend: SessionBackend | null = null;
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
+/** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
+ *  web-terminal updates flow through the shared scrollback fan-out instead
+ *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
+let isPipeMode = false;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
@@ -57,6 +64,138 @@ let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 const pendingMessages: string[] = [];
+
+// ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
+//
+// In bridge mode the daemon adopted an existing CLI session that we do NOT
+// own; the model never sees botmux. We harvest assistant turns by tailing
+// Claude Code's transcript JSONL and forward only the bytes appended after
+// each Lark-driven user turn — never the historical content present at
+// attach time, never local-terminal-driven turns.
+//
+// Attribution lives in BridgeTurnQueue; this file only manages the
+// fs.watch wakeup, byte-offset bookkeeping, lazy baseline, and IPC emit.
+let bridgeJsonlPath: string | undefined;
+let bridgeOffset = 0;
+let bridgePendingTail = '';
+const bridgeQueue = new BridgeTurnQueue();
+let bridgeWatcher: FSWatcher | null = null;
+let bridgeFallbackTimer: NodeJS.Timeout | null = null;
+/** True once we successfully baselined the transcript file. Until then,
+ *  any data we see is treated as history — absorbed into the queue's seen
+ *  set without being attributed to a pending Lark turn. This protects the
+ *  first Lark turn from inheriting historical lines if Claude Code creates
+ *  the JSONL file *after* attach. */
+let bridgeBaselineDone = false;
+
+function bridgeAbsorbBaseline(): void {
+  if (!bridgeJsonlPath) return;
+  const result = drainTranscript(bridgeJsonlPath, 0);
+  bridgeOffset = result.newOffset;
+  bridgePendingTail = result.pendingTail;
+  bridgeQueue.absorb(result.events);
+  bridgeBaselineDone = true;
+}
+
+function bridgeIngest(): void {
+  if (!bridgeJsonlPath) return;
+  if (!bridgeBaselineDone) {
+    // Lazy baseline: file didn't exist at attach, baseline the moment it does.
+    if (!existsSyncSafe(bridgeJsonlPath)) return;
+    bridgeAbsorbBaseline();
+    return;
+  }
+  const result = drainTranscript(bridgeJsonlPath, bridgeOffset);
+  bridgeOffset = result.newOffset;
+  bridgePendingTail = result.pendingTail;
+  bridgeQueue.ingest(result.events);
+}
+
+function startBridgeWatcher(jsonlPath: string): void {
+  bridgeJsonlPath = jsonlPath;
+  // Try to baseline now. If the file doesn't exist yet, bridgeIngest will
+  // baseline lazily once Claude Code creates it (see bridgeBaselineDone).
+  if (existsSyncSafe(jsonlPath)) {
+    bridgeAbsorbBaseline();
+    log(`Bridge baselined: ${jsonlPath} (offset=${bridgeOffset})`);
+  } else {
+    log(`Bridge transcript not yet present at ${jsonlPath}; will baseline on first appearance`);
+  }
+  // fs.watch is best-effort wakeup — actual data source is the byte offset.
+  // The fallback poller covers fs.watch's gaps (NFS, rename-rotation, etc.)
+  // and also drives lazy baseline when the file shows up after attach.
+  try {
+    bridgeWatcher = fsWatch(jsonlPath, { persistent: false }, () => {
+      try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
+    });
+  } catch (err: any) {
+    log(`Bridge fs.watch unavailable (${err.message}); relying on fallback poller`);
+  }
+  bridgeFallbackTimer = setInterval(() => {
+    try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
+  }, 1000);
+}
+
+function stopBridgeWatcher(): void {
+  if (bridgeWatcher) {
+    try { bridgeWatcher.close(); } catch { /* ignore */ }
+    bridgeWatcher = null;
+  }
+  if (bridgeFallbackTimer) {
+    clearInterval(bridgeFallbackTimer);
+    bridgeFallbackTimer = null;
+  }
+}
+
+/**
+ * Push a pending turn for the next Lark message.
+ *
+ * Returns true on success, false if bridge-final-output isn't available for
+ * this message (transcript not yet baselined). On false, the worker still
+ * raw-writes the message into the pane — the user just won't get a
+ * transcript-driven final_output reply for it. This keeps the v3 promise:
+ * if we can't attribute correctly, we don't attribute at all.
+ *
+ * `messageText` is the raw Lark message body — we derive a short content
+ * fingerprint from it so the next *matching* user event in the transcript
+ * (and only that one) starts this turn. Local-terminal input that races
+ * with the pane-write will not match the fingerprint and won't hijack the
+ * Lark turn.
+ */
+function bridgeMarkPendingTurn(messageText: string): boolean {
+  if (!bridgeJsonlPath) return false;
+  if (!bridgeBaselineDone) {
+    log('Bridge baseline not ready — this turn will not have transcript-driven final_output');
+    return false;
+  }
+  const fingerprint = makeFingerprint(messageText);
+  bridgeQueue.mark(randomBytes(8).toString('hex'), fingerprint);
+  return true;
+}
+
+function bridgeDrainAndMaybeEmit(): void {
+  if (!bridgeJsonlPath) return;
+  bridgeIngest();
+  const ready = bridgeQueue.drainEmittable();
+  if (ready.length === 0) return;
+  // Re-read the transcript once to resolve assistant uuids → text.
+  // Cost: O(jsonl size) per emit batch — bounded; transcripts are typically <1MB.
+  const all = drainTranscript(bridgeJsonlPath, 0);
+  for (const turn of ready) {
+    const set = new Set(turn.assistantUuids);
+    const matched = all.events.filter(e => e.uuid && set.has(e.uuid));
+    const text = joinAssistantText(matched);
+    if (text.length > 0) {
+      const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
+      send({ type: 'final_output', content: text, lastUuid, turnId: turn.turnId });
+    }
+  }
+}
+
+/** Tiny safe-existence check that doesn't throw. */
+function existsSyncSafe(p: string): boolean {
+  try { return existsSync(p); } catch { return false; }
+}
 /** Suppress screen updates until first prompt detected (avoids history replay in card on --resume) */
 let awaitingFirstPrompt = true;
 
@@ -394,9 +533,11 @@ let trustHandled = false;
 function onPtyData(data: string): void {
   renderer?.write(data);
 
-  // In tmux mode, web clients have their own tmux attach — no relay needed.
-  // In non-tmux mode, broadcast to all WS clients via shared scrollback.
-  if (!isTmuxMode) {
+  // In tmux-attach mode, each web client has its own tmux attach PTY —
+  // no relay needed. In non-tmux mode AND in pipe mode (adopt-bridge),
+  // broadcast through the shared scrollback so all connected web clients
+  // render the same byte stream.
+  if (!isTmuxMode || isPipeMode) {
     // Track alt-buffer state so we can restore it in the scrollback prefix.
     // Scan for the *last* toggle in this chunk — that's the current state.
     let lastToggleIdx = -1;
@@ -523,9 +664,18 @@ async function flushPending(): Promise<void> {
 function sendToPty(content: string): void {
   if (!backend || !cliAdapter) return;
   pendingMessages.push(content);
+  // User-override semantics: a fresh Lark message while a TUI prompt is "active"
+  // takes precedence over the AI-detected prompt. The screen analyzer can be
+  // wrong (false positive on a question that has no rendered options) and a
+  // wedged blocking flag silently swallows every subsequent message — without
+  // this override the user has no way to recover from Lark. Mirrors the
+  // web-terminal text-input path (handleTuiTextInput).
   if (tuiPromptBlocking) {
-    log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — TUI prompt active`);
-    return;
+    log(`User override: incoming Lark message clears tuiPromptBlocking — "${content.substring(0, 80)}"`);
+    tuiPromptBlocking = false;
+    screenAnalyzer?.notifySelection('lark-input');
+    // Tear down the prompt card so the user doesn't see stale options.
+    send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
   }
   if (isPromptReady || isFlushing || cliAdapter.supportsTypeAhead) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
@@ -561,39 +711,68 @@ function stopScreenUpdates(): void {
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  // ── Adopt mode: attach to an existing tmux pane (no CLI spawn) ──
+  // ── Adopt mode: pipe-pane the user's existing tmux pane (no attach) ──
   if (cfg.adoptMode && cfg.adoptTmuxTarget) {
+    // We mark BOTH isTmuxMode and isPipeMode: the former keeps idle/spawn
+    // logic on the tmux track; the latter tells the WS handler to route
+    // updates through the shared scrollback fan-out (because there is no
+    // PTY-per-WS — we don't attach to anything).
     isTmuxMode = true;
+    isPipeMode = true;
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
-    const tmuxBe = new TmuxBackend('adopt-' + cfg.sessionId.slice(0, 8), { ownsSession: false });
-    backend = tmuxBe;
-    tmuxBe.attachToExisting(cfg.adoptTmuxTarget, {
+    const pipeBe = new TmuxPipeBackend(cfg.adoptTmuxTarget);
+    backend = pipeBe;
+    pipeBe.spawn('', [], {
       cwd: cfg.workingDir,
       cols,
       rows,
       env: process.env as Record<string, string>,
     });
 
-    // Minimal idle detection (output quiescence only)
-    idleDetector = new IdleDetector({ completionPattern: undefined, readyPattern: undefined } as any);
+    // Seed the shared scrollback with the pane's current screen so any
+    // already-connected (or future) WS clients render meaningful content
+    // immediately, instead of waiting for the next byte tmux pipes through.
+    try {
+      const initial = pipeBe.captureCurrentScreen();
+      if (initial.length > 0) onPtyData(initial);
+    } catch (err: any) {
+      log(`captureCurrentScreen failed: ${err.message}`);
+    }
+
+    // Bridge mode: tail Claude Code's transcript JSONL to harvest assistant
+    // turns out-of-band. Only enabled when the daemon supplied a path
+    // (claude-code adopt with a known sessionId).
+    if (cfg.bridgeJsonlPath) {
+      startBridgeWatcher(cfg.bridgeJsonlPath);
+    }
+
+    // Idle detection. In bridge mode we use Claude Code's real
+    // completion/ready patterns (e.g. "Worked for Xs") so tool-execution
+    // pauses don't trigger a premature emit. Other adopt cases keep the
+    // minimal output-quiescence-only detector.
+    const idleAdapter = cfg.bridgeJsonlPath
+      ? createCliAdapterSync('claude-code', undefined)
+      : ({ completionPattern: undefined, readyPattern: undefined } as any);
+    idleDetector = new IdleDetector(idleAdapter);
     idleDetector.onIdle(() => {
       log('Prompt detected (idle) — adopt mode');
+      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
       markPromptReady();
     });
 
     backend.onData(onPtyData);
     backend.onExit((code, signal) => {
-      log(`Adopted session exited (code: ${code}, signal: ${signal})`);
+      log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
       isPromptReady = false;
+      stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal });
     });
 
-    // CLI is already running — unblock screen updates immediately
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
-    log(`Adopt mode: attached to ${cfg.adoptTmuxTarget} (${cols}x${rows})`);
+    log(`Adopt mode (pipe): observing ${cfg.adoptTmuxTarget} (${cols}x${rows})`);
     return;
   }
 
@@ -743,8 +922,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
-      if (isTmuxMode && sessionId) {
-        // ── Tmux mode: per-client attach ──
+      if (isTmuxMode && !isPipeMode && sessionId) {
+        // ── Tmux-attach mode: per-client attach ──
         // Each WS client gets its own `tmux attach-session` PTY.
         // Scrollback is handled natively by tmux (history-limit).
         // In adopt mode, attach to the user's original pane; otherwise use bmx-* session.
@@ -1003,7 +1182,7 @@ window.addEventListener('resize',function(){fit.fit();sendResize()});
 })();
 
 // ── Read-only scroll handling ──
-if(!hasToken&&!${isTmuxMode}){
+if(!hasToken&&!${isTmuxMode && !isPipeMode}){
   // Non-tmux read-only: CLI mouse mode blocks local scroll, override with scrollLines
   document.getElementById('terminal').addEventListener('wheel',function(e){
     e.preventDefault();term.scrollLines(e.deltaY>0?3:-3);
@@ -1013,7 +1192,7 @@ if(!hasToken&&!${isTmuxMode}){
 // ── Scroll helper (shared by toolbar buttons & two-finger touch) ──
 function _sendScroll(up,n){
   n=n||3;
-  if(${isTmuxMode}){
+  if(${isTmuxMode && !isPipeMode}){
     // SGR mouse wheel: 64=up 65=down — tmux enters copy-mode and scrolls
     var seq='\\x1b[<'+(up?64:65)+';1;1M';
     for(var i=0;i<n;i++){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:seq}))}
@@ -1135,6 +1314,15 @@ process.on('message', async (raw: unknown) => {
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
       if (lastInitConfig?.adoptMode) {
+        // Bridge mode: capture transcript baseline BEFORE writing to the pane,
+        // so any assistant uuids appended after this point are attributed to
+        // *this* Lark turn (not local user activity in the pane). Mark may
+        // return false (baseline not ready) — we still write to the pane;
+        // user just won't get a final_output for this message.
+        if (bridgeJsonlPath) {
+          try { bridgeIngest(); } catch { /* best effort */ }
+          bridgeMarkPendingTurn(content);
+        }
         // Adopt mode: raw write to PTY (no adapter writeInput)
         if (backend) {
           if ('sendText' in backend && 'sendSpecialKeys' in backend) {

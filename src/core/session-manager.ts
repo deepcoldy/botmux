@@ -274,6 +274,38 @@ export function buildFollowUpContent(
   return parts.join('\n\n');
 }
 
+/**
+ * Build raw input content for adopt-bridge mode.
+ *
+ * Bridge mode injects the user's text into the existing CLI exactly as the
+ * local user would type it: NO `<session_id>`, NO `<botmux_reminder>`, NO
+ * Skills hint. The model is intentionally unaware of botmux — the daemon
+ * harvests final output via the transcript watcher and forwards it to Lark
+ * out-of-band.
+ *
+ * Attachments and @mentions are surfaced as plain prose so the user's intent
+ * carries over, but the format avoids any wording that would prompt the
+ * model to call `botmux send` / route through botmux tooling.
+ */
+export function buildBridgeInputContent(
+  content: string,
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[] },
+): string {
+  const parts: string[] = [content];
+
+  if (opts?.attachments && opts.attachments.length > 0) {
+    const lines = opts.attachments.map(a => `- ${a.name} (${a.path})`);
+    parts.push(`\n[附件]\n${lines.join('\n')}`);
+  }
+
+  if (opts?.mentions && opts.mentions.length > 0) {
+    const lines = opts.mentions.map(m => `- @${m.name}`);
+    parts.push(`\n[@提及]\n${lines.join('\n')}`);
+  }
+
+  return parts.join('\n');
+}
+
 // ─── Stream-card state persistence ───────────────────────────────────────────
 
 /** Sentinel value (CARD_POSTING_SENTINEL from worker-pool) we must skip — it marks an in-flight POST, not a real message_id. */
@@ -429,12 +461,42 @@ export async function executeScheduledTask(
 
   const { sendMessage, replyMessage } = await import('../im/lark/client.js');
 
-  // Decide where to route: preferred path is to reply inside the original thread.
-  // Fallback (legacy tasks without rootMessageId): post a new top-level message.
+  // Decide where to route the "🕐 task started" notification and where the
+  // session conversation lands.
+  //
+  // Cross-thread case: task created in thread A but execution targets chat/thread B
+  // (user passed --chat-id / --root-msg-id). Send the start notification only
+  // to the creator's thread (A) so the task owner has a record; the target
+  // chat (B) gets only the actual task output (via botmux send), staying clean.
+  //
+  // Same-thread case (legacy / typical): notification doubles as the conversation
+  // root in the bound thread — unchanged behavior.
+  //
+  // Fallback (no rootMessageId): post a new top-level message in target.
   let threadRootId: string;
   let isContinuation = false;
 
-  if (task.rootMessageId) {
+  const isCrossThread =
+    !!task.creatorRootMessageId &&
+    !!task.rootMessageId &&
+    task.creatorRootMessageId !== task.rootMessageId;
+
+  if (isCrossThread) {
+    // Notify creator (best-effort, never blocks execution)
+    const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+    replyMessage(
+      creatorAppId,
+      task.creatorRootMessageId!,
+      `🕐 定时任务「${task.name}」已在目标话题触发`,
+      'text',
+      true,
+    ).catch((err: any) => {
+      logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+    });
+    // Bind execution to the target thread without posting a start message there
+    threadRootId = task.rootMessageId!;
+    isContinuation = true;
+  } else if (task.rootMessageId) {
     try {
       // Reply in the original thread — the returned reply message id is just an
       // anchor for this run; the thread's root remains task.rootMessageId, which

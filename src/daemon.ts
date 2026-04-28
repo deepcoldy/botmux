@@ -45,6 +45,7 @@ import {
   formatAttachmentsHint,
   buildNewTopicPrompt,
   buildFollowUpContent,
+  buildBridgeInputContent,
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
@@ -554,13 +555,27 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {
     const dsBotCfgForMsg = getBot(ds.larkAppId).config;
-    const msgContent = buildFollowUpContent(parsed.content, ds.session.sessionId, {
-      attachments,
-      mentions: parsed.mentions,
-      isAdoptMode: !!ds.adoptedFrom,
-      cliId: dsBotCfgForMsg.cliId,
-      cliPathOverride: dsBotCfgForMsg.cliPathOverride,
-    });
+    // Bridge mode: adopted Claude Code session with a known sessionId — model
+    // sees the user's message as plain input, daemon harvests the assistant
+    // reply from the transcript out-of-band. No botmux_reminder / session_id
+    // injection here, otherwise the model would try to use botmux tools that
+    // it isn't actually equipped with in bridge mode.
+    const isBridge =
+      !!ds.adoptedFrom &&
+      dsBotCfgForMsg.cliId === 'claude-code' &&
+      !!ds.adoptedFrom.sessionId;
+    const msgContent = isBridge
+      ? buildBridgeInputContent(parsed.content, {
+          attachments,
+          mentions: parsed.mentions,
+        })
+      : buildFollowUpContent(parsed.content, ds.session.sessionId, {
+          attachments,
+          mentions: parsed.mentions,
+          isAdoptMode: !!ds.adoptedFrom,
+          cliId: dsBotCfgForMsg.cliId,
+          cliPathOverride: dsBotCfgForMsg.cliPathOverride,
+        });
     // Freeze the previous turn's card at "idle" before starting a new turn
     if (ds.streamCardId && ds.workerPort) {
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;

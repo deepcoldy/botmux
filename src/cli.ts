@@ -1411,6 +1411,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       chatId,
       rootMessageId,
       larkAppId,
+      creatorChatId: cur?.chatId,
+      creatorRootMessageId: cur?.rootMessageId,
+      creatorLarkAppId: cur?.larkAppId,
       chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       deliver,
     });

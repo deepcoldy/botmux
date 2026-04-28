@@ -129,91 +129,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'takeover' && ds && ds.adoptedFrom) {
-      const adopted = ds.adoptedFrom;
-      if (!adopted.sessionId) {
-        await sessionReply(rootId, '⚠️ 无法接管：未找到 CLI session ID');
-        return;
-      }
-
-      // Kill adopt worker (detaches from user's pane)
-      killWorker(ds);
-
-      // Capture adopt info before clearing state
-      const origPid = adopted.originalCliPid;
-      const paneTarget = adopted.tmuxTarget;
-      const resumeSessionId = adopted.sessionId;
-      const origCliId = adopted.cliId ?? 'claude-code';
-
-      // Clear adopt state, set up for standard botmux session
-      const originalSessionId = adopted.sessionId;
-      const originalCwd = adopted.cwd;
-      ds.adoptedFrom = undefined;
-      ds.session.adoptedFrom = undefined;
-      ds.workingDir = originalCwd;
-      ds.session.workingDir = originalCwd;
-      ds.hasHistory = true;
-
-      // Replace session ID with original CLI session ID for --resume.
-      // closeSession mutates the session object in-place (shared reference),
-      // so we must re-activate afterwards to prevent the new session from
-      // being saved as 'closed'.
-      sessionStore.closeSession(ds.session.sessionId);
-      ds.session.sessionId = originalSessionId;
-      ds.session.status = 'active';
-      ds.session.closedAt = undefined;
-      // Clear old port so the new worker gets a fresh one (old worker may still hold it)
-      ds.session.webPort = undefined;
-      // Clear streaming card state so the new worker creates a fresh card
-      ds.streamCardId = undefined;
-      ds.streamCardNonce = undefined;
-      ds.streamCardPending = undefined;
-      ds.lastScreenContent = undefined;
-      ds.lastScreenStatus = undefined;
-      ds.session.streamCardId = undefined;
-      ds.session.streamCardNonce = undefined;
-      ds.session.displayMode = undefined;
-      ds.session.currentImageKey = undefined;
-      ds.session.streamExpanded = undefined;
-      ds.session.currentTurnTitle = undefined;
-      ds.displayMode = undefined;
-      ds.currentImageKey = undefined;
-      sessionStore.updateSession(ds.session);
-
-      // Fork standard Botmux worker with resume — BEFORE killing original CLI,
-      // so the new worker reads the session file while it's still intact.
-      forkWorker(ds, '', true);
-
-      // Kill original CLI and echo notice AFTER forkWorker, with a delay to let
-      // the new worker read the session file first. Use SIGKILL to prevent the
-      // original CLI's shutdown handler from modifying the session file.
-      const resumeCmd: Record<string, string> = {
-        'claude-code': `claude --resume ${resumeSessionId}`,
-        'aiden': `aiden --resume ${resumeSessionId}`,
-        'coco': `coco --resume ${resumeSessionId}`,
-      };
-      const resumeHint = resumeCmd[origCliId] ?? `<cli> --resume ${resumeSessionId}`;
-      setTimeout(() => {
-        if (origPid) {
-          try { process.kill(origPid, 'SIGKILL'); } catch { /* already dead */ }
-        }
-        try {
-          const esc = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-          execSync(`tmux send-keys -t ${esc(paneTarget)} C-c`, { stdio: 'ignore', timeout: 2000 });
-          const notice = [
-            `printf '\\n\\033[1;33m⚠️  此会话已被 botmux 接管\\033[0m\\n`,
-            `session: ${resumeSessionId}\\n`,
-            `\\n`,
-            `如需恢复本地操作：\\n`,
-            `  1. 在飞书中 /close 关闭当前接管会话\\n`,
-            `  2. ${resumeHint}\\n`,
-            `\\n'`,
-          ].join('');
-          execSync(`tmux send-keys -t ${esc(paneTarget)} ${esc(notice)} Enter`, { stdio: 'ignore', timeout: 2000 });
-        } catch { /* pane may be gone — benign */ }
-      }, 1500);
-
-      await sessionReply(rootId, '🔄 已接管会话');
-      logger.info(`[${tag(ds)}] Takeover: resumed session ${originalSessionId} as standard botmux session`);
+      // The legacy takeover button was retired in the v3 adopt-bridge
+      // refactor: bridge mode forwards Claude's final answers from the
+      // transcript watcher without taking over the pane, so the old
+      // SIGKILL-original-PID path is incompatible. New cards no longer
+      // render this button (worker-pool.ts:setupWorkerHandlers sets
+      // showTakeover=false), but historical PATCH'd cards may still expose
+      // it — short-circuit here so a stray click can never kill the user's
+      // CLI again.
+      await sessionReply(
+        rootId,
+        '⚠️ 旧版"接管"按钮已停用。bridge 模式下原 CLI 由 botmux 桥接，无需接管即可在飞书中收到回答。如需 /resume 完整接管能力，请等待 /adopt --takeover 命令上线。',
+      );
+      logger.info(`[${tag(ds)}] Legacy takeover action ignored (bridge era; historical card)`);
     }
 
     if (actionType === 'tui_keys' && ds) {

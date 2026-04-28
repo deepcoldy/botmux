@@ -67,6 +67,10 @@ export interface DaemonSession {
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
   tuiToggledIndices?: number[];  // tracks toggled options for multi-select card PATCH
+  /** Last assistant uuid emitted via the adopt bridge final_output pipeline.
+   *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
+   *  the worker re-drains the transcript after a noisy idle). */
+  lastBridgeEmittedUuid?: string;
   /** Present when this session was created via /adopt (shared observation mode). */
   adoptedFrom?: {
     tmuxTarget: string;       // e.g. "0:2.0" — user's original tmux pane

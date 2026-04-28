@@ -20,10 +20,13 @@ vi.mock('node-pty', () => ({
   spawn: vi.fn(),
 }));
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
+import * as pty from 'node-pty';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
+const mockedExecSync = vi.mocked(execSync);
+const mockedPtySpawn = vi.mocked(pty.spawn);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -135,5 +138,101 @@ describe('TmuxBackend.pasteText', () => {
     const calls = getCalls();
     expect(calls[0].opts?.input).toBe(content);
     expect(calls[0].opts?.stdio).toEqual(['pipe', 'ignore', 'ignore']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adopt mode: input must address the real pane target, not the synthetic
+// session name. Without this, send-keys falls through to whichever pane
+// tmux happens to have active and the user's message lands in the wrong
+// CLI (the bug v3 turned up).
+// ---------------------------------------------------------------------------
+
+describe('TmuxBackend adopt-mode pane addressing', () => {
+  beforeEach(() => {
+    mockedExecFileSync.mockReset();
+    // execSync is called by attachToExisting (grouped-session setup,
+    // select-window, select-pane, zoom). Mock it as a no-op so each test
+    // only inspects the execFileSync calls (the real input commands).
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedPtySpawn.mockReset();
+    mockedPtySpawn.mockReturnValue({
+      onData: () => {},
+      onExit: () => {},
+      write: () => {},
+      resize: () => {},
+      kill: () => {},
+    } as any);
+  });
+
+  function adoptedBackend(target = '0:2.0') {
+    // Synthetic name mirrors what worker.ts uses in adopt mode.
+    const be = new TmuxBackend('adopt-deadbeef', { ownsSession: false });
+    be.attachToExisting(target, {
+      cwd: '/tmp',
+      cols: 200,
+      rows: 50,
+      env: process.env as Record<string, string>,
+    });
+    return be;
+  }
+
+  it('sendText addresses the adopted pane, not the synthetic session name', () => {
+    const be = adoptedBackend('0:3.1');
+    mockedExecFileSync.mockClear();
+    be.sendText('飞书消息');
+
+    const calls = getCalls();
+    expect(calls).toHaveLength(1);
+    const tIdx = calls[0].args.indexOf('-t');
+    // CRITICAL: target must be the real pane "0:3.1", NOT "adopt-deadbeef".
+    expect(calls[0].args[tIdx + 1]).toBe('0:3.1');
+    expect(calls[0].args[tIdx + 1]).not.toBe('adopt-deadbeef');
+  });
+
+  it('sendSpecialKeys addresses the adopted pane', () => {
+    const be = adoptedBackend('0:2.0');
+    mockedExecFileSync.mockClear();
+    be.sendSpecialKeys('Enter');
+
+    const calls = getCalls();
+    const tIdx = calls[0].args.indexOf('-t');
+    expect(calls[0].args[tIdx + 1]).toBe('0:2.0');
+  });
+
+  it('pasteText addresses the adopted pane on paste-buffer', () => {
+    const be = adoptedBackend('1:0.2');
+    mockedExecFileSync.mockClear();
+    be.pasteText('multi\nline\ntext');
+
+    const calls = getCalls();
+    const pasteCall = calls.find(c => c.args.includes('paste-buffer'))!;
+    const tIdx = pasteCall.args.indexOf('-t');
+    expect(pasteCall.args[tIdx + 1]).toBe('1:0.2');
+  });
+
+  it('non-adopt backend keeps using the bmx-* session name', () => {
+    const be = createBackend('bmx-real');
+    be.sendText('hello');
+    const calls = getCalls();
+    const tIdx = calls[0].args.indexOf('-t');
+    expect(calls[0].args[tIdx + 1]).toBe('bmx-real');
+  });
+
+  // getChildPid must resolve to ONE pane, not the first listed in a multi-
+  // pane window. tmux list-panes -F returns every pane in the window when
+  // the target is a pane address; display-message -p resolves exactly
+  // the target pane.
+  it('getChildPid uses display-message (single-pane resolver), not list-panes', () => {
+    const be = adoptedBackend('0:2.0');
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue('98765\n' as any);
+    const pid = be.getChildPid();
+    expect(pid).toBe(98765);
+    const cmd = mockedExecSync.mock.calls[0][0] as string;
+    expect(cmd).toContain('display-message');
+    expect(cmd).toContain('#{pane_pid}');
+    expect(cmd).not.toContain('list-panes');
   });
 });

@@ -220,8 +220,15 @@ describe('Adopt card actions', () => {
 
   // ── Takeover ────────────────────────────────────────────────────────────
 
-  describe('takeover action', () => {
-    it('should kill adopt worker, clear adoptedFrom, and fork standard worker with resume', async () => {
+  describe('takeover action (legacy button — disabled in v3 bridge)', () => {
+    // The v3 adopt-bridge refactor retired the legacy "接管" button:
+    // bridge mode forwards Claude's final answers via the transcript
+    // watcher without killing or replacing the user's CLI. New cards no
+    // longer render the button (showTakeover=false in worker-pool), but
+    // historical PATCHed cards may still expose it — the handler must
+    // refuse the action so a stray click can't kill the user's CLI.
+
+    it('legacy takeover with sessionId is now a no-op (no kill / no fork)', async () => {
       const ds = makeDaemonSession({
         adoptedFrom: {
           tmuxTarget: '0:1.0',
@@ -240,45 +247,29 @@ describe('Adopt card actions', () => {
 
       await handleCardAction(makeTakeoverEvent(ROOT_ID), deps, APP_ID);
 
-      // Should kill the adopt worker
-      expect(killWorker).toHaveBeenCalledWith(ds);
+      // Critically: must NOT kill worker, must NOT fork a new one,
+      // must NOT touch adoptedFrom or session id.
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.adoptedFrom).toBeDefined();
+      expect(ds.session.sessionId).toBe('uuid-adopt-test');
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
 
-      // adoptedFrom should be cleared
-      expect(ds.adoptedFrom).toBeUndefined();
-
-      // Session ID should be replaced with the original CLI session ID
-      expect(ds.session.sessionId).toBe('claude-session-xyz');
-
-      // Working dir should be set to original cwd
-      expect(ds.workingDir).toBe('/home/user/project');
-      expect(ds.session.workingDir).toBe('/home/user/project');
-
-      // hasHistory should be true
-      expect(ds.hasHistory).toBe(true);
-
-      // Should have closed old session and updated with new ID
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('uuid-adopt-test');
-      expect(sessionStore.updateSession).toHaveBeenCalled();
-
-      // Should fork standard worker with resume=true
-      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
-
-      // Should reply with success message
+      // Should reply with the deprecation notice
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('接管'),
+        expect.stringContaining('停用'),
         undefined,
         APP_ID,
       );
     });
 
-    it('should show error when adoptedFrom has no sessionId', async () => {
+    it('legacy takeover without sessionId is also a no-op', async () => {
       const ds = makeDaemonSession({
         adoptedFrom: {
           tmuxTarget: '0:1.0',
           originalCliPid: 12345,
           cwd: '/home/user/project',
-          // No sessionId
         },
       });
       const sessions = new Map<string, DaemonSession>();
@@ -288,17 +279,8 @@ describe('Adopt card actions', () => {
 
       await handleCardAction(makeTakeoverEvent(ROOT_ID), deps, APP_ID);
 
-      // Should NOT kill worker or fork a new one
       expect(killWorker).not.toHaveBeenCalled();
       expect(forkWorker).not.toHaveBeenCalled();
-
-      // Should show error
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('无法接管'),
-        undefined,
-        APP_ID,
-      );
     });
 
     it('should be a no-op when session has no adoptedFrom', async () => {

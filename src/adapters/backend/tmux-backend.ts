@@ -18,10 +18,23 @@ export class TmuxBackend implements SessionBackend {
   private readonly sessionName: string;
   private readonly ownsSession: boolean;
   private reattaching = false;
+  /** Tmux pane target when in adopt mode (e.g. "0:2.0") — set by attachToExisting.
+   *  When non-null, ALL pane-scoped tmux commands (send-keys / paste-buffer /
+   *  copy-mode / list-panes) must address this pane explicitly; using
+   *  `this.sessionName` would either resolve nothing (the name is synthetic
+   *  in adopt mode) or fall through to whichever pane tmux happens to have
+   *  active, which is exactly the bug we're avoiding. */
+  private adoptedPaneTarget: string | null = null;
 
   constructor(sessionName: string, opts?: { ownsSession?: boolean }) {
     this.sessionName = sessionName;
     this.ownsSession = opts?.ownsSession ?? true;
+  }
+
+  /** Target string to use for pane-scoped tmux commands. In adopt mode this
+   *  is the real pane address ("0:2.0"); otherwise the bmx-* session name. */
+  private get cmdTarget(): string {
+    return this.adoptedPaneTarget ?? this.sessionName;
   }
 
   // ─── Static helpers ───────────────────────────────────────────────────────
@@ -155,7 +168,7 @@ export class TmuxBackend implements SessionBackend {
    * For multiline text, use pasteText() instead (send-keys -l sends \n as Enter).
    */
   sendText(text: string): void {
-    execFileSync('tmux', ['send-keys', '-t', this.sessionName, '-l', '--', text], {
+    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-l', '--', text], {
       stdio: 'ignore',
       timeout: 5000,
     });
@@ -163,7 +176,7 @@ export class TmuxBackend implements SessionBackend {
 
   /** Send special keys (Enter, Escape, C-c, etc.) to the tmux pane. */
   sendSpecialKeys(...keys: string[]): void {
-    execFileSync('tmux', ['send-keys', '-t', this.sessionName, ...keys], {
+    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, ...keys], {
       stdio: 'ignore',
       timeout: 5000,
     });
@@ -175,7 +188,7 @@ export class TmuxBackend implements SessionBackend {
    * is in the alternate screen buffer (Claude Code, vim, etc.).
    */
   enterCopyMode(): void {
-    execFileSync('tmux', ['copy-mode', '-e', '-t', this.sessionName], {
+    execFileSync('tmux', ['copy-mode', '-e', '-t', this.cmdTarget], {
       stdio: 'ignore',
       timeout: 5000,
     });
@@ -183,7 +196,7 @@ export class TmuxBackend implements SessionBackend {
 
   /** Send a copy-mode X-command (e.g. 'halfpage-up', 'halfpage-down', 'cancel'). */
   sendCopyModeCommand(xCommand: string): void {
-    execFileSync('tmux', ['send-keys', '-t', this.sessionName, '-X', xCommand], {
+    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-X', xCommand], {
       stdio: 'ignore',
       timeout: 5000,
     });
@@ -200,7 +213,7 @@ export class TmuxBackend implements SessionBackend {
       stdio: ['pipe', 'ignore', 'ignore'],
       timeout: 5000,
     });
-    execFileSync('tmux', ['paste-buffer', '-t', this.sessionName, '-d'], {
+    execFileSync('tmux', ['paste-buffer', '-t', this.cmdTarget, '-d'], {
       stdio: 'ignore',
       timeout: 5000,
     });
@@ -224,11 +237,15 @@ export class TmuxBackend implements SessionBackend {
 
   getChildPid(): number | null {
     try {
+      // display-message resolves the *exact* target pane (single line out),
+      // unlike list-panes which returns every pane in the target's window
+      // when cmdTarget is a pane address — taking the first line of that
+      // would silently bind to whichever pane tmux happens to list first.
       const output = execSync(
-        `tmux list-panes -t ${shellescape(this.sessionName)} -F '#{pane_pid}'`,
+        `tmux display-message -p -t ${shellescape(this.cmdTarget)} '#{pane_pid}'`,
         { encoding: 'utf-8', timeout: 3000 },
       ).trim();
-      const pid = parseInt(output.split('\n')[0], 10);
+      const pid = parseInt(output, 10);
       return pid > 0 ? pid : null;
     } catch {
       return null;
@@ -279,9 +296,19 @@ export class TmuxBackend implements SessionBackend {
     // Zoom the target pane BEFORE attaching — this makes the pane fill the entire
     // window, so the PTY output (and web terminal) only shows this one pane.
     // If the pane is already the only one in the window, zoom is a no-op.
+    //
+    // We intentionally attach to the source session directly rather than
+    // creating a grouped viewer session: in tmux -CC + iTerm2 control mode
+    // the extra session disrupts the integration's window/pane bookkeeping
+    // and tearing it down on disconnect breaks the user's original layout
+    // (iTerm splits one source window's panes into separate native windows).
+    // The downside is the web terminal will follow whichever window the
+    // user's primary -CC client is currently focused on; that stickiness
+    // can be revisited later via `tmux pipe-pane` (out-of-band capture)
+    // without polluting the -CC client.
     try {
       execSync(`tmux resize-pane -Z -t ${shellescape(tmuxTarget)}`, { stdio: 'ignore' });
-    } catch { /* pane may not support zoom (single pane) — benign */ }
+    } catch { /* benign */ }
 
     this.process = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
       name: 'xterm-256color',
@@ -291,9 +318,6 @@ export class TmuxBackend implements SessionBackend {
       env: opts.env,
     });
   }
-
-  /** Tmux pane target when in adopt mode (e.g. "0:2.0") — used for zoom cleanup. */
-  private adoptedPaneTarget: string | null = null;
 
   getAttachInfo() {
     return { type: 'tmux' as const, sessionName: this.sessionName };

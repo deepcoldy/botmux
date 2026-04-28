@@ -98,6 +98,13 @@ export interface ScheduledTask {
   rootMessageId?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
+  /** Where the user originally created the task (for cross-thread tasks where
+   *  --chat-id / --root-msg-id retarget execution to a different chat).
+   *  When set and != chatId/rootMessageId, the "🕐 task started" notification
+   *  is posted here instead of (or in addition to) the execution target. */
+  creatorChatId?: string;
+  creatorRootMessageId?: string;
+  creatorLarkAppId?: string;
   enabled: boolean;
   createdAt: string;
   lastRunAt?: string;
@@ -126,7 +133,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; cliSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; cliSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string }
   | { type: 'message'; content: string }
   | { type: 'raw_input'; content: string }
   | { type: 'close' }
@@ -147,5 +154,5 @@ export type WorkerToDaemon =
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean }
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: 'working' | 'idle' | 'analyzing' }
-  | { type: 'user_notify'; message: string };
-
+  | { type: 'user_notify'; message: string }
+  | { type: 'final_output'; content: string; lastUuid: string; turnId: string };

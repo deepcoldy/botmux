@@ -57,6 +57,9 @@ function migrate(raw: any): ScheduledTask | null {
     rootMessageId: raw.rootMessageId,
     chatType: raw.chatType,
     larkAppId: raw.larkAppId,
+    creatorChatId: raw.creatorChatId,
+    creatorRootMessageId: raw.creatorRootMessageId,
+    creatorLarkAppId: raw.creatorLarkAppId,
     enabled: raw.enabled !== false,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
@@ -129,6 +132,9 @@ export function createTask(params: {
   rootMessageId?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
+  creatorChatId?: string;
+  creatorRootMessageId?: string;
+  creatorLarkAppId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local';
@@ -145,6 +151,9 @@ export function createTask(params: {
     rootMessageId: params.rootMessageId,
     chatType: params.chatType,
     larkAppId: params.larkAppId,
+    creatorChatId: params.creatorChatId,
+    creatorRootMessageId: params.creatorRootMessageId,
+    creatorLarkAppId: params.creatorLarkAppId,
     enabled: true,
     createdAt: new Date().toISOString(),
     nextRunAt: params.nextRunAt,

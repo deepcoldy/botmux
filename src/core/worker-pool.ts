@@ -16,6 +16,7 @@ import { updateMessage, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -350,9 +351,15 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
 
-  // Adopt mode flags — computed once, used in all buildStreamingCard calls
+  // Adopt mode flags — computed once, used in all buildStreamingCard calls.
+  // Bridge mode (the v3 default for /adopt) hides the legacy takeover
+  // button: the model never sees botmux, daemon harvests final output via
+  // the transcript watcher, and the old takeover path would SIGKILL the
+  // user's original CLI 1.5s after fork — incompatible with bridge intent.
+  // Explicit takeover will be re-introduced as `/adopt --takeover` in a
+  // follow-up patch with safe semantics (no implicit kill).
   const isAdopt = !!ds.adoptedFrom;
-  const showTakeover = isAdopt && !!ds.adoptedFrom?.sessionId;
+  const showTakeover = false;
 
   worker.on('message', async (msg: WorkerToDaemon) => {
     switch (msg.type) {
@@ -703,6 +710,22 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         }
         break;
       }
+
+      case 'final_output': {
+        // Adopt-bridge: worker harvested the assistant turn from Claude Code's
+        // transcript JSONL and forwarded it to us. Dedup by lastUuid so a
+        // re-drain after a noisy idle doesn't re-send the same answer.
+        if (!msg.content || !msg.content.trim()) break;
+        if (msg.lastUuid && ds.lastBridgeEmittedUuid === msg.lastUuid) {
+          logger.debug(`[${t}] final_output deduped (uuid ${msg.lastUuid.substring(0, 8)})`);
+          break;
+        }
+        // Worker pops the turn off its queue right after emit, so it will
+        // NOT re-send this payload on its own. Daemon owns retry on
+        // transient Lark failures.
+        deliverFinalOutput(ds, msg, t, 0);
+        break;
+      }
     }
   });
 
@@ -716,6 +739,60 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
     }
   });
 }
+
+// ─── Bridge final-output delivery (with retry) ──────────────────────────────
+
+const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+
+/** Deliver a bridge `final_output` to Lark. The worker emits each turn
+ *  exactly once (it pops the turn off its queue at emit time), so the
+ *  daemon owns retries on transient failures. After 3 attempts we log
+ *  and give up — the user's answer is lost; better than leaking memory
+ *  via an unbounded retry loop. */
+function deliverFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+  attempt: number,
+): void {
+  const cb = requireCallbacks();
+  setTimeout(async () => {
+    // Guard: if the user closed the session (or it was torn down for any
+    // other reason) between attempts, don't post a stale final answer to
+    // a closed thread.
+    if (ds.session.status === 'closed') {
+      logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
+      return;
+    }
+    try {
+      await cb.sessionReply(ds.session.rootMessageId, msg.content, 'text', ds.larkAppId);
+      ds.lastBridgeEmittedUuid = msg.lastUuid;
+      logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, attempt ${attempt + 1})`);
+    } catch (err: any) {
+      if (err instanceof MessageWithdrawnError) {
+        // Root message gone — no point retrying. Mark as emitted so any
+        // duplicate IPC is correctly deduped, and tear the session down.
+        ds.lastBridgeEmittedUuid = msg.lastUuid;
+        logger.warn(`[${t}] Root message withdrawn while forwarding final_output, closing session`);
+        cb.closeSession(ds);
+        return;
+      }
+      const next = attempt + 1;
+      if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
+        logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
+        // Don't commit the dedup marker — leave room for any future
+        // retransmit (e.g. daemon restart that re-fires the IPC).
+        return;
+      }
+      logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
+      deliverFinalOutput(ds, msg, t, next);
+    }
+  }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
+}
+
+/** Test-only alias so the retry pipeline can be exercised without a real
+ *  fork. Intentionally underscored to discourage non-test callers. */
+export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
@@ -767,13 +844,22 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     }
   });
 
+  // Bridge mode is gated on (Claude Code adopt + sessionId). For other CLIs
+  // or sessions without a known CLI sessionId we fall back to the legacy
+  // shared-pane behaviour (screen capture only).
+  const adoptedCliId = adopted.cliId ?? 'claude-code';
+  const bridgeJsonlPath =
+    adoptedCliId === 'claude-code' && adopted.sessionId
+      ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd)
+      : undefined;
+
   const initMsg: DaemonToWorker = {
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
     workingDir: adopted.cwd,
-    cliId: adopted.cliId ?? 'claude-code',
+    cliId: adoptedCliId,
     backendType: 'tmux',
     prompt: '',
     resume: false,
@@ -787,6 +873,7 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptPaneCols: adopted.paneCols,
     adoptPaneRows: adopted.paneRows,
+    bridgeJsonlPath,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
