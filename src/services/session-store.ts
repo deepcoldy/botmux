@@ -161,3 +161,36 @@ export function listSessions(): Session[] {
   load();
   return [...sessions.values()];
 }
+
+/**
+ * Cross-file lookup: find every active session attached to a thread, across
+ * all bots. Used when a not-yet-initialized bot is mentioned in a thread that
+ * another bot has already pinned to a working directory — the new bot inherits
+ * the pinned dir instead of re-prompting the user for repo selection.
+ *
+ * Reads other bots' session files directly (best-effort) instead of relying on
+ * any in-memory state, since each daemon process only owns its own bot.
+ */
+export function findActiveSessionsByRoot(rootMessageId: string): Session[] {
+  load();
+  const matches: Session[] = [];
+  for (const s of sessions.values()) {
+    if (s.rootMessageId === rootMessageId && s.status === 'active') matches.push(s);
+  }
+  const dataDir = config.session.dataDir;
+  const currentFp = getFilePath();
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (!file.startsWith('sessions') || !file.endsWith('.json')) continue;
+      const fp = join(dataDir, file);
+      if (fp === currentFp) continue;
+      try {
+        const data: Record<string, Session> = JSON.parse(readFileSync(fp, 'utf-8'));
+        for (const s of Object.values(data)) {
+          if (s.rootMessageId === rootMessageId && s.status === 'active') matches.push(s);
+        }
+      } catch { continue; }
+    }
+  } catch { /* ignore */ }
+  return matches;
+}

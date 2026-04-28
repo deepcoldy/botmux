@@ -1495,9 +1495,20 @@ async function cmdThreadMessages(rest: string[]): Promise<void> {
 
   const { listThreadMessages } = await import('./im/lark/client.js');
   const { parseApiMessage } = await import('./im/lark/message-parser.js');
+  const { expandMergeForward } = await import('./im/lark/merge-forward.js');
+  const appId = s.larkAppId;  // narrowed above; pin into a const so async closures keep the narrowing
   try {
-    const raw = await listThreadMessages(s.larkAppId, s.chatId, s.rootMessageId, limit);
-    const messages = raw.map(m => parseApiMessage(m));
+    const raw = await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
+    // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
+    // path in daemon.ts. Each merge_forward gets its own numberer (we don't
+    // download resources here — only [图片 N] placeholders matter).
+    const messages = await Promise.all(raw.map(async (m: any) => {
+      const parsed = parseApiMessage(m);
+      if (parsed.msgType === 'merge_forward') {
+        await expandMergeForward(appId, parsed.messageId, parsed);
+      }
+      return parsed;
+    }));
     console.log(JSON.stringify({ sessionId: sid, threadId: s.rootMessageId, messages, total: messages.length }, null, 2));
   } catch (err: any) {
     console.error(`获取话题消息失败: ${err.message}`);

@@ -7,11 +7,12 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
-import { replyMessage, resolveAllowedUsers, getMessageDetail } from './im/lark/client.js';
+import { replyMessage, resolveAllowedUsers } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
-import { parseEventMessage, parseApiMessage, extractResources, resolveNonsupportMessage, createImgNumberer, unwrapUserDslContent, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { expandMergeForward } from './im/lark/merge-forward.js';
 import { logger } from './utils/logger.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -52,7 +53,6 @@ import {
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate } from './im/lark/event-dispatcher.js';
-import { renderForwardedXml, type ForwardedNode } from './im/lark/forwarded-renderer.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -200,114 +200,6 @@ const cardDeps: CardHandlerDeps = {
   sessionReply,
   lastRepoScan,
 };
-
-// ─── Merge-forward expansion ────────────────────────────────────────────────
-
-/** Extract a useful one-liner from an AxiosError / generic error.
- *  Lark's SDK rethrows AxiosError whose default toString just says
- *  "Request failed with status code 400" — hiding the actual server reason. */
-function describeAxiosErr(err: any): string {
-  const detail = err?.response?.data ?? err?.message ?? String(err);
-  return typeof detail === 'string' ? detail : JSON.stringify(detail);
-}
-
-/**
- * Build a tree of ForwardedNode + collect attachment resources from a
- * merge_forward message. Lark's im.v1.message.get returns ALL descendants
- * in one shot via the `items` array, each with `upper_message_id` pointing
- * to its parent — so we make exactly one API call per top-level expand and
- * walk the tree purely in memory. Recursing per nested merge_forward via
- * separate API calls fails (Lark 230002 "Bot/User can NOT be out of the chat")
- * because the bot may be in the outer chat but not in the original chat the
- * nested merge_forward came from. The single-call design sidesteps that.
- */
-async function buildForwardedTree(
-  larkAppId: string,
-  rootMessageId: string,
-  numberer: ReturnType<typeof createImgNumberer>,
-  maxDepth: number,
-): Promise<{ nodes: ForwardedNode[]; extraResources: MessageResource[] }> {
-  // user_card_content combined with merge_forward triggers HTTP 500 — keep
-  // it off. Sub-messages come back in the simplified "Format A" card shape
-  // which extractCardContent already handles.
-  const detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false });
-  const allItems: any[] = detail?.items ?? [];
-  const extraResources: MessageResource[] = [];
-
-  // Index children by upper_message_id for O(1) lookup during the walk.
-  const childrenByParent = new Map<string, any[]>();
-  for (const msg of allItems) {
-    const parent = msg.upper_message_id ?? '';
-    if (!parent) continue;
-    const list = childrenByParent.get(parent) ?? [];
-    list.push(msg);
-    childrenByParent.set(parent, list);
-  }
-
-  function walk(parentId: string, depth: number): ForwardedNode[] {
-    const children = childrenByParent.get(parentId) ?? [];
-    const nodes: ForwardedNode[] = [];
-    for (const msg of children) {
-      const senderType: ForwardedNode['senderType'] =
-        msg.sender?.sender_type === 'app' ? 'app'
-        : msg.sender?.sender_type === 'user' ? 'user'
-        : 'unknown';
-      const senderOpenId = msg.sender?.id ?? '';
-
-      // Interactive sub-messages arrive via REST as a simplified fallback.
-      // Lark's im.message.get never returns user_dsl (even for the bot's own
-      // messages), so we can only unwrap when a user_dsl somehow got through.
-      // For third-party cards whose simplified form is the "请升级至最新版本"
-      // fallback, the real body is unrecoverable from REST.
-      if (msg.msg_type === 'interactive') {
-        const unwrapped = unwrapUserDslContent(msg.body?.content ?? '');
-        if (unwrapped !== null) {
-          msg.body = { ...(msg.body ?? {}), content: unwrapped };
-        }
-      }
-
-      // Resources first so the numberer assigns [图片 N] in attachment order;
-      // text extraction below reuses those numbers. Do NOT override messageId —
-      // Lark requires the parent merge_forward's message_id to download
-      // resources (error 234003 if sub-message ID is used).
-      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '', numberer);
-      extraResources.push(...subResources);
-
-      if (msg.msg_type === 'merge_forward' && depth < maxDepth) {
-        const inner = walk(msg.message_id, depth + 1);
-        nodes.push({ senderOpenId, senderType, children: inner });
-      } else {
-        const sub = parseApiMessage(msg, numberer);
-        nodes.push({ senderOpenId, senderType, content: sub.content });
-      }
-    }
-    return nodes;
-  }
-
-  return { nodes: walk(rootMessageId, 0), extraResources };
-}
-
-/**
- * Expand a merge_forward message by fetching sub-messages via Lark API.
- * Replaces parsed.content with an XML-rendered forward tree (deduplicated
- * participants, alias-referenced messages) and collects additional resources.
- */
-async function expandMergeForward(
-  larkAppId: string, messageId: string, parsed: LarkMessage,
-  numberer = createImgNumberer(),
-): Promise<{ extraResources: MessageResource[] }> {
-  const MAX_DEPTH = 5;
-  try {
-    const { nodes, extraResources } = await buildForwardedTree(larkAppId, messageId, numberer, MAX_DEPTH);
-    if (nodes.length === 0) return { extraResources };
-    parsed.content = renderForwardedXml(nodes);
-    parsed.msgType = 'merge_forward_expanded';
-    return { extraResources };
-  } catch (err) {
-    logger.warn(`Failed to expand merge_forward ${messageId}: ${describeAxiosErr(err)}`);
-    return { extraResources: [] };
-  }
-}
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
@@ -582,6 +474,21 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     // Oncall group: pin working dir from binding, skip repo selection entirely
     // (mirrors handleNewTopic — auto-create was missing this check).
     const oncallEntry = findOncallChat(larkAppId, chatId);
+
+    // Cross-bot inheritance: when another bot already pinned a working dir for
+    // this thread (typical: Bot A is mid-task and @mentions Bot B for review),
+    // inherit it so we can spawn immediately with the @-content as the prompt
+    // — same shape as a human-initiated start, no repo selection round-trip.
+    let inheritedFrom: { sessionId: string; larkAppId?: string; workingDir: string } | null = null;
+    if (!oncallEntry) {
+      const peers = sessionStore.findActiveSessionsByRoot(rootId);
+      const peer = peers.find(p => p.larkAppId !== larkAppId && !!p.workingDir);
+      if (peer && peer.workingDir) {
+        inheritedFrom = { sessionId: peer.sessionId, larkAppId: peer.larkAppId, workingDir: peer.workingDir };
+      }
+    }
+
+    const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir;
     const newDs: DaemonSession = {
       session,
       worker: null,
@@ -594,26 +501,30 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
       lastMessageAt: Date.now(),
       hasHistory: false,
-      pendingRepo: !oncallEntry,
+      pendingRepo: !pinnedWorkingDir,
       pendingPrompt: parsed.content,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
       ownerOpenId: senderOId,
       currentTurnTitle: parsed.content.substring(0, 50),
-      workingDir: oncallEntry?.workingDir,
+      workingDir: pinnedWorkingDir,
     };
-    if (oncallEntry) {
-      newDs.session.workingDir = oncallEntry.workingDir;
+    if (pinnedWorkingDir) {
+      newDs.session.workingDir = pinnedWorkingDir;
       sessionStore.updateSession(newDs.session);
     }
     activeSessions.set(sessionKey(rootId, larkAppId), newDs);
 
-    // Oncall-bound chat: spawn CLI immediately with the pinned working dir.
-    if (oncallEntry) {
+    // Pinned (oncall binding or inherited from peer bot in same thread):
+    // spawn CLI immediately, skip repo selection.
+    if (pinnedWorkingDir) {
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
-      logger.info(`[${tag(newDs)}] Oncall-bound chat ${chatId} → workingDir=${oncallEntry.workingDir}, skipped repo select`);
+      const reason = oncallEntry
+        ? `oncall-bound chat ${chatId}`
+        : `inherited from peer session ${inheritedFrom!.sessionId.substring(0, 8)} (app=${inheritedFrom!.larkAppId ?? 'unknown'})`;
+      logger.info(`[${tag(newDs)}] ${reason} → workingDir=${pinnedWorkingDir}, skipped repo select`);
       return;
     }
 

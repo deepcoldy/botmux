@@ -49,6 +49,7 @@ import {
   closeSession,
   updateSession,
   updateSessionPid,
+  findActiveSessionsByRoot,
 } from '../src/services/session-store.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -397,6 +398,70 @@ describe('Multi-bot isolation', () => {
     expect(sessions).toHaveLength(1);
     expect(sessions[0].title).toBe('App A Session');
     expect(existsSync(join(tempDir, 'sessions-app-A.json'))).toBe(true);
+  });
+});
+
+// ─── findActiveSessionsByRoot() — cross-bot lookup ───────────────────────
+
+describe('findActiveSessionsByRoot()', () => {
+  it('finds active sessions across per-bot files for the same rootMessageId', () => {
+    // Bot A pins workdir for thread root-x
+    init('app-A');
+    const sA = createSession('chat1', 'root-x', 'Bot A');
+    sA.workingDir = '/repo/foo';
+    sA.larkAppId = 'app-A';
+    updateSession(sA);
+
+    // Bot B pins different workdir for the same thread
+    init('app-B');
+    const sB = createSession('chat1', 'root-x', 'Bot B');
+    sB.workingDir = '/repo/bar';
+    sB.larkAppId = 'app-B';
+    updateSession(sB);
+
+    // From Bot C's perspective, both peers should be visible
+    init('app-C');
+    const found = findActiveSessionsByRoot('root-x');
+    expect(found.map(s => s.sessionId).sort()).toEqual([sA.sessionId, sB.sessionId].sort());
+    expect(found.find(s => s.sessionId === sA.sessionId)?.workingDir).toBe('/repo/foo');
+    expect(found.find(s => s.sessionId === sB.sessionId)?.workingDir).toBe('/repo/bar');
+  });
+
+  it('skips closed sessions', () => {
+    init('app-A');
+    const sA = createSession('chat1', 'root-x', 'Bot A');
+    closeSession(sA.sessionId);
+
+    init('app-B');
+    const found = findActiveSessionsByRoot('root-x');
+    expect(found).toEqual([]);
+  });
+
+  it('skips sessions for unrelated threads', () => {
+    init('app-A');
+    createSession('chat1', 'root-x', 'Match');
+    createSession('chat1', 'root-y', 'No Match');
+
+    init('app-B');
+    const found = findActiveSessionsByRoot('root-x');
+    expect(found).toHaveLength(1);
+    expect(found[0].title).toBe('Match');
+  });
+
+  it('also returns sessions from the current bot file', () => {
+    init('app-A');
+    const sA = createSession('chat1', 'root-x', 'Self');
+    // Don't switch — stay on app-A
+    const found = findActiveSessionsByRoot('root-x');
+    expect(found).toHaveLength(1);
+    expect(found[0].sessionId).toBe(sA.sessionId);
+  });
+
+  it('returns empty when no session matches the root', () => {
+    init('app-A');
+    createSession('chat1', 'root-x', 'A');
+    init('app-B');
+    expect(findActiveSessionsByRoot('root-nonexistent')).toEqual([]);
   });
 });
 

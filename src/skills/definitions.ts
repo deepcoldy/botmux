@@ -133,6 +133,7 @@ JSON 格式，字段：
 
 - 只返回属于当前话题的消息（按 rootMessageId 过滤）
 - senderType="app" 表示机器人发的消息（包括 Claude Code / Codex / 其它 bot），"user" 表示用户
+- **合并转发**消息会自动展开：\`msgType\` 变为 \`merge_forward_expanded\`，\`content\` 是 \`<forwarded_messages>...</forwarded_messages>\` XML（含 \`<participants>\` 别名表 + 嵌套 \`<msg from="A">\` 节点），与 daemon 实时事件路径一致
 - 需要先把 JSON 读进来再做总结，不要直接把 JSON 扔给用户
 `;
 
