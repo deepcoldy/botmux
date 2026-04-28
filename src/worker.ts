@@ -879,11 +879,11 @@ body{display:flex;flex-direction:column}
   color:#565f89;background:#1a1b26cc;padding:2px 8px;border-radius:4px}
 #status.ok{color:#9ece6a}
 #status.err{color:#f7768e}
-#readonly-banner{display:none;position:fixed;top:0;left:0;right:0;z-index:50;
-  padding:6px 12px;text-align:center;font:12px monospace;color:#f7768e;
-  background:rgba(247,118,142,0.12);border-bottom:1px solid rgba(247,118,142,0.35);
-  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);pointer-events:none}
-#readonly-banner.show{display:block}
+#readonly-banner{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:50;
+  padding:4px 10px;font:12px monospace;color:#f7768e;white-space:nowrap;cursor:pointer;
+  background:rgba(247,118,142,0.12);border:1px solid rgba(247,118,142,0.35);border-radius:4px;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+#readonly-banner.show{display:inline-block}
 </style>
 </head>
 <body>
@@ -909,7 +909,7 @@ body{display:flex;flex-direction:column}
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch)document.getElementById('vp').content='width=1100,viewport-fit=cover';
 var hasToken=${hasWrite};
-if(!hasToken)document.getElementById('readonly-banner').classList.add('show');
+if(!hasToken){var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
 
 var term=new Terminal({
   theme:{background:'#1a1b26',foreground:'#a9b1d6',cursor:'#c0caf5',
