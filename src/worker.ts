@@ -156,10 +156,14 @@ function maybeSwitchBridgeJsonl(): void {
   // appends on the old path, retainSecondaryPathIfStillReferenced() keeps
   // the old path in the polling rotation.
   if (bridgeJsonlPath && bridgeBaselineDone) {
-    try { drainPathInto(bridgeJsonlPath, bridgeOffset); } catch (err: any) {
+    let postDrainOffset = bridgeOffset;
+    try {
+      const drained = drainPathInto(bridgeJsonlPath, bridgeOffset);
+      postDrainOffset = drained.offset;
+    } catch (err: any) {
       log(`Bridge final-drain on fingerprint switch failed (${err.message}); continuing`);
     }
-    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, bridgeOffset);
+    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, postDrainOffset);
   }
 
   log(`Bridge transcript switched: ${bridgeJsonlPath} → ${matched} (Lark fingerprint observed in new jsonl — user likely ran /clear or /resume)`);
@@ -216,10 +220,14 @@ function maybeFollowSessionRotationViaPid(): boolean {
   // and its assistant text might still be on the way, the old path stays
   // in the polling rotation via bridgeSecondaryPaths.
   if (bridgeJsonlPath && bridgeBaselineDone) {
-    try { drainPathInto(bridgeJsonlPath, bridgeOffset); } catch (err: any) {
+    let postDrainOffset = bridgeOffset;
+    try {
+      const drained = drainPathInto(bridgeJsonlPath, bridgeOffset);
+      postDrainOffset = drained.offset;
+    } catch (err: any) {
       log(`Bridge final-drain on rotation failed (${err.message}); continuing`);
     }
-    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, bridgeOffset);
+    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, postDrainOffset);
   }
 
   log(`Bridge transcript switched (pid resolver): ${bridgeJsonlPath ?? '(none)'} → ${resolved.path}`);
