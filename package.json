@@ -43,7 +43,7 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
-    "@midscene/web": "^1.6.0",
+    "@midscene/web": "^1.7.6",
     "@playwright/test": "^1.58.2",
     "@types/node": "^20.0.0",
     "@types/ws": "^8.18.1",
