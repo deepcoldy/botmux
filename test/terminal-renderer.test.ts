@@ -11,7 +11,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
-import { resolveRenderDimensions } from '../src/worker.js';
+import { resolveRenderDimensions } from '../src/utils/render-dimensions.js';
 
 // xterm-headless processes writes asynchronously through an internal
 // queue. Accessing the buffer immediately after .write() can show stale

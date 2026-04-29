@@ -22,6 +22,16 @@ import { createServer as createHttpServer, type IncomingMessage } from 'node:htt
 import { WebSocketServer, WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
+import {
+  DEFAULT_RENDER_COLS,
+  DEFAULT_RENDER_ROWS,
+  MAX_RENDER_COLS,
+  MAX_RENDER_ROWS,
+  MIN_RENDER_COLS,
+  MIN_RENDER_ROWS,
+  clamp,
+  resolveRenderDimensions,
+} from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid } from './adapters/cli/claude-code.js';
 import type { CliAdapter } from './adapters/cli/types.js';
@@ -542,44 +552,18 @@ let awaitingFirstPrompt = true;
 // ─── PTY Dimensions ──────────────────────────────────────────────────────────
 // Default for botmux-spawned CLIs: narrow enough for the web terminal to
 // render comfortably and for the card PNG to fit Lark's typical card width.
-// Adopt mode overrides this to match the user's actual pane (often 200-270
-// cols) so the renderer doesn't wrap wide ANSI into a stair-stepped /
-// duplicated mess.
-const PTY_COLS = 160;
-const PTY_ROWS = 50;
-/** Hard upper bound on render dimensions — keeps a malformed pane size
- *  (or a malicious init) from spawning a multi-megabyte canvas. */
-const MAX_RENDER_COLS = 320;
-const MAX_RENDER_ROWS = 100;
-const MIN_RENDER_COLS = 80;
-const MIN_RENDER_ROWS = 24;
+// Adopt mode overrides this via resolveRenderDimensions() to match the
+// user's actual pane (often 200-270 cols) so the renderer doesn't wrap
+// wide ANSI into a stair-stepped / duplicated mess.
+const PTY_COLS = DEFAULT_RENDER_COLS;
+const PTY_ROWS = DEFAULT_RENDER_ROWS;
 /** Set in the `init` handler BEFORE startScreenUpdates() so the headless
  *  xterm + screenshot canvas are sized to the source pane from the start.
- *  Setting them later (after the renderer was built at 160x50) wouldn't
- *  retroactively re-size what xterm has already buffered, leaving the
- *  wrap artefacts in place. */
+ *  Setting them later (after the renderer was built at the default size)
+ *  wouldn't retroactively re-size what xterm has already buffered,
+ *  leaving the wrap artefacts in place. */
 let renderCols = PTY_COLS;
 let renderRows = PTY_ROWS;
-
-function clamp(value: number, lo: number, hi: number): number {
-  if (Number.isNaN(value)) return lo;
-  if (value === Infinity) return hi;
-  if (value === -Infinity) return lo;
-  return Math.max(lo, Math.min(hi, Math.round(value)));
-}
-
-/** Compute the render dimensions for a session — adopt mode pegs to the
- *  source pane, everything else uses PTY_COLS/PTY_ROWS. Exported for
- *  tests; pure / no side effects. */
-export function resolveRenderDimensions(cfg: { adoptMode?: boolean; adoptPaneCols?: number; adoptPaneRows?: number }): { cols: number; rows: number } {
-  if (cfg.adoptMode) {
-    return {
-      cols: clamp(cfg.adoptPaneCols ?? PTY_COLS, MIN_RENDER_COLS, MAX_RENDER_COLS),
-      rows: clamp(cfg.adoptPaneRows ?? PTY_ROWS, MIN_RENDER_ROWS, MAX_RENDER_ROWS),
-    };
-  }
-  return { cols: PTY_COLS, rows: PTY_ROWS };
-}
 
 // ─── Headless Terminal for Screen Capture ────────────────────────────────────
 
