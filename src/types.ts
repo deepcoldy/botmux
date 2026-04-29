@@ -155,4 +155,5 @@ export type WorkerToDaemon =
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: 'working' | 'idle' | 'analyzing' }
   | { type: 'user_notify'; message: string }
-  | { type: 'final_output'; content: string; lastUuid: string; turnId: string };
+  | { type: 'final_output'; content: string; lastUuid: string; turnId: string }
+  | { type: 'adopt_preamble'; userText: string; assistantText: string };

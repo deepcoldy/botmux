@@ -15,7 +15,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, extractLastAssistantTurn, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint } from './services/bridge-turn-queue.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -110,6 +110,33 @@ let bridgeFallbackTimer: NodeJS.Timeout | null = null;
  *  first Lark turn from inheriting historical lines if Claude Code creates
  *  the JSONL file *after* attach. */
 let bridgeBaselineDone = false;
+/** Once-per-attach flag so a re-baseline after fs.watch lazy-fire doesn't
+ *  re-send the preamble. Reset only when the bridge teardown happens. */
+let bridgePreambleSent = false;
+
+/** Cap the preamble text so an extremely long previous turn doesn't blow
+ *  past Lark's per-message limit. The user only needs enough to recall
+ *  context, not the entire transcript. */
+const PREAMBLE_USER_MAX = 500;
+const PREAMBLE_ASSISTANT_MAX = 4000;
+
+function truncatePreambleText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max) + '…';
+}
+
+function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
+  if (bridgePreambleSent) return;
+  const turn = extractLastAssistantTurn(events);
+  if (!turn) return;
+  bridgePreambleSent = true;
+  send({
+    type: 'adopt_preamble',
+    userText: truncatePreambleText(turn.userText, PREAMBLE_USER_MAX),
+    assistantText: truncatePreambleText(turn.assistantText, PREAMBLE_ASSISTANT_MAX),
+  });
+  log('Bridge adopt preamble emitted (last completed turn from baseline)');
+}
 
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
@@ -118,6 +145,11 @@ function bridgeAbsorbBaseline(): void {
   bridgePendingTail = result.pendingTail;
   bridgeQueue.absorb(result.events);
   bridgeBaselineDone = true;
+  // After absorb (uuids registered as seen so they won't re-emit as a Lark
+  // turn), surface the last completed user/assistant exchange to Lark as a
+  // one-shot preamble — this is what /adopt was missing for the user to
+  // pick up the conversation thread without scrolling the tmux pane.
+  maybeEmitAdoptPreamble(result.events);
 }
 
 /** Detect /clear / /resume: when Claude Code starts a new session in the
@@ -354,6 +386,7 @@ function stopBridgeWatcher(): void {
   bridgeCliCwd = undefined;
   bridgeObservedCliSessionId = undefined;
   bridgeSecondaryPaths.clear();
+  bridgePreambleSent = false;
 }
 
 /**

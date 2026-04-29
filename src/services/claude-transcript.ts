@@ -166,6 +166,89 @@ export function joinAssistantText(events: TranscriptEvent[]): string {
     .join('\n\n');
 }
 
+/** XML wrappers Claude Code uses for synthetic user events that aren't real
+ *  prompts (slash command invocation, local-command output caveat, etc.).
+ *  These should usually carry `isMeta:true` and we'd filter on that — this
+ *  list is a defense-in-depth check for jsonls where the flag is absent. */
+const SYNTHETIC_USER_PREFIXES = [
+  '<command-name>',
+  '<command-message>',
+  '<command-args>',
+  '<local-command-caveat>',
+  '<local-command-stdout>',
+  '<local-command-stderr>',
+];
+
+/** True when a `type:'user'` (or `message.role:'user'`) event represents a
+ *  *real* prompt the human typed — not Claude Code's internal machinery
+ *  (tool_result, slash-command wrappers, isMeta/isCompactSummary markers,
+ *  sidechain spawn events). The bridge attribution queue and the adopt
+ *  preamble extractor share this predicate to ensure they're seeing the
+ *  same notion of "user input". */
+export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  const flags = ev as any;
+  if (flags.isMeta === true) return false;
+  if (flags.isCompactSummary === true) return false;
+  if (flags.isSidechain === true) return false;
+  const content = ev.message?.content;
+  if (isPureToolResultUserEvent(content)) return false;
+  const text = normaliseForFingerprint(stringifyUserContent(content));
+  if (text.length === 0) return false;
+  if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
+  return true;
+}
+
+export interface AdoptPreamble {
+  /** The most recent meaningful user prompt's text (post-stringify, no
+   *  whitespace collapse — preserves the prompt's actual formatting). */
+  userText: string;
+  /** All assistant visible-text emitted between that user prompt and the
+   *  end of the events list, joined with blank lines. tool_use blocks are
+   *  excluded; sidechain assistant events are excluded. */
+  assistantText: string;
+}
+
+/** Walk the events forward and return the last *completed* user/assistant
+ *  exchange. "Completed" here means: a meaningful user prompt followed by
+ *  at least one assistant event with visible text. tool_use / tool_result
+ *  events do NOT reset the turn — they're intra-turn machinery, so a
+ *  prompt → tool_use → tool_result → assistant text sequence still counts
+ *  as a single turn. Returns null when there's no meaningful user yet, or
+ *  the last user wasn't followed by any visible assistant text (Claude is
+ *  mid-tool-use when /adopt fired).
+ *
+ *  Used by adopt-bridge to surface "the previous round" to the Lark thread
+ *  so the user has context for continuing the conversation. */
+export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamble | null {
+  let userText: string | null = null;
+  let assistantTexts: string[] = [];
+
+  for (const ev of events) {
+    if (!ev || typeof ev !== 'object') continue;
+    if (isMeaningfulUserEvent(ev)) {
+      // New turn boundary — reset the assistant accumulator.
+      userText = stringifyUserContent(ev.message?.content);
+      assistantTexts = [];
+      continue;
+    }
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'assistant') continue;
+    if ((ev as any).isSidechain === true) continue;
+    const text = extractAssistantText(ev);
+    if (text.length === 0) continue;
+    if (userText !== null) assistantTexts.push(text);
+  }
+
+  if (userText === null || assistantTexts.length === 0) return null;
+  return {
+    userText,
+    assistantText: assistantTexts.join('\n\n'),
+  };
+}
+
 /**
  * True when a user-role event carries ONLY tool_result blocks — Claude
  * Code's representation of "tool returned this output" between an

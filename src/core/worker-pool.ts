@@ -726,6 +726,29 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         deliverFinalOutput(ds, msg, t, 0);
         break;
       }
+
+      case 'adopt_preamble': {
+        // Adopt-bridge: surface the last completed user/assistant exchange
+        // from the adopted Claude session so the Lark thread has context
+        // to continue from. Best-effort — failure here just means the
+        // user won't see the preamble; adopt itself isn't blocked.
+        const userBlock = msg.userText.trim();
+        const assistantBlock = msg.assistantText.trim();
+        if (!userBlock && !assistantBlock) break;
+        const text = [
+          '📜 /adopt 前最后一轮',
+          '',
+          '👤 你：',
+          userBlock || '(空)',
+          '',
+          '🤖 Claude：',
+          assistantBlock || '(空)',
+        ].join('\n');
+        cb.sessionReply(ds.session.rootMessageId, text, 'text', ds.larkAppId).catch((err: any) => {
+          logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
+        });
+        break;
+      }
     }
   });
 

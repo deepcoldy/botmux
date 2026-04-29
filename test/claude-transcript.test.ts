@@ -18,6 +18,8 @@ import {
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
+  extractLastAssistantTurn,
+  isMeaningfulUserEvent,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -627,6 +629,143 @@ describe('fingerprint search: tool_result content must not false-match', () => {
       'utf8',
     );
     expect(jsonlContainsFingerprint(path, 'hello')).toBe(true);
+  });
+});
+
+// ─── isMeaningfulUserEvent / extractLastAssistantTurn ──────────────────────
+//
+// Powers the /adopt preamble: when /adopt fires, the bridge baselines the
+// transcript and surfaces the last completed user → assistant exchange to
+// Lark so the user can pick up the conversation without scrolling the
+// pane. The predicate centralises filtering of internal events
+// (tool_result, isMeta, isCompactSummary, sidechain, slash-command
+// wrappers) so the queue and the extractor never disagree about what
+// counts as "real user input".
+
+function userEv(content: any, extra: Record<string, unknown> = {}): TranscriptEvent {
+  return { type: 'user', message: { role: 'user', content }, ...extra } as TranscriptEvent;
+}
+function assistantEv(text: string, extra: Record<string, unknown> = {}): TranscriptEvent {
+  return {
+    type: 'assistant',
+    uuid: `a-${text.slice(0, 8)}`,
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+    ...extra,
+  } as TranscriptEvent;
+}
+function assistantToolUseEv(): TranscriptEvent {
+  return {
+    type: 'assistant',
+    uuid: 'a-tool-use',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read' }] as any },
+  } as TranscriptEvent;
+}
+function toolResultUserEv(): TranscriptEvent {
+  return {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't1', content: 'tool output' }] as any,
+    },
+  } as TranscriptEvent;
+}
+
+describe('isMeaningfulUserEvent', () => {
+  it('accepts plain string-content user events', () => {
+    expect(isMeaningfulUserEvent(userEv('hello there'))).toBe(true);
+  });
+  it('rejects pure tool_result user events', () => {
+    expect(isMeaningfulUserEvent(toolResultUserEv())).toBe(false);
+  });
+  it('rejects events flagged with isMeta', () => {
+    expect(isMeaningfulUserEvent(userEv('meta noise', { isMeta: true }))).toBe(false);
+  });
+  it('rejects events flagged with isCompactSummary', () => {
+    expect(isMeaningfulUserEvent(userEv('summary blob', { isCompactSummary: true }))).toBe(false);
+  });
+  it('rejects sidechain user events', () => {
+    expect(isMeaningfulUserEvent(userEv('sub-agent input', { isSidechain: true }))).toBe(false);
+  });
+  it('rejects empty / whitespace-only content', () => {
+    expect(isMeaningfulUserEvent(userEv(''))).toBe(false);
+    expect(isMeaningfulUserEvent(userEv('   \n  '))).toBe(false);
+  });
+  it('rejects slash-command wrappers even without isMeta flag', () => {
+    expect(isMeaningfulUserEvent(userEv('<command-name>/clear</command-name>'))).toBe(false);
+    expect(isMeaningfulUserEvent(userEv('<local-command-caveat>note</local-command-caveat>'))).toBe(false);
+    expect(isMeaningfulUserEvent(userEv('<command-message>...</command-message>'))).toBe(false);
+  });
+  it('rejects assistant-role events', () => {
+    expect(isMeaningfulUserEvent(assistantEv('hi'))).toBe(false);
+  });
+});
+
+describe('extractLastAssistantTurn', () => {
+  it('happy path: real prompt + multi-block assistant text + interleaved tool_use', () => {
+    const turn = extractLastAssistantTurn([
+      userEv('first prompt'),
+      assistantEv('first reply'),
+      userEv('second prompt — the latest'),
+      assistantEv('thinking it through'),
+      assistantToolUseEv(),
+      toolResultUserEv(),
+      assistantEv('here is the answer'),
+    ]);
+    expect(turn).not.toBeNull();
+    expect(turn!.userText).toBe('second prompt — the latest');
+    expect(turn!.assistantText).toBe('thinking it through\n\nhere is the answer');
+  });
+
+  it('returns null when last user prompt has no visible assistant text yet', () => {
+    // Mid-tool-use snapshot — Claude is busy when /adopt fired. We don't
+    // want to publish a half-formed turn ("(空)"), so return null and
+    // suppress the preamble.
+    const turn = extractLastAssistantTurn([
+      userEv('first prompt'),
+      assistantEv('first reply'),
+      userEv('second prompt'),
+      assistantToolUseEv(),
+      toolResultUserEv(),
+    ]);
+    expect(turn).toBeNull();
+  });
+
+  it('filters out isMeta / sidechain / wrapper noise when picking the last user', () => {
+    const turn = extractLastAssistantTurn([
+      userEv('genuine prompt'),
+      assistantEv('reply A'),
+      // Slash command + caveat: must NOT be treated as a fresh user turn.
+      userEv('<command-name>/clear</command-name>'),
+      userEv('<local-command-caveat>noise</local-command-caveat>', { isMeta: true }),
+      // Sidechain assistant message: must NOT be folded into the parent turn.
+      assistantEv('sub-agent reply', { isSidechain: true }),
+      // Continuation of the genuine prompt.
+      assistantEv('reply B'),
+    ]);
+    expect(turn).not.toBeNull();
+    expect(turn!.userText).toBe('genuine prompt');
+    expect(turn!.assistantText).toBe('reply A\n\nreply B');
+  });
+
+  it('regression: tool_result-only user after assistant text does NOT reset the turn', () => {
+    // The same false-reset bug pattern that motivated isPureToolResultUserEvent
+    // in the bridge queue. Here too, the extractor must keep accumulating.
+    const turn = extractLastAssistantTurn([
+      userEv('the prompt'),
+      assistantEv('first chunk'),
+      assistantToolUseEv(),
+      toolResultUserEv(), // <-- intra-turn machinery, not a new turn
+      assistantEv('second chunk'),
+    ]);
+    expect(turn).not.toBeNull();
+    expect(turn!.userText).toBe('the prompt');
+    expect(turn!.assistantText).toBe('first chunk\n\nsecond chunk');
+  });
+
+  it('returns null on empty events list / no meaningful user', () => {
+    expect(extractLastAssistantTurn([])).toBeNull();
+    expect(extractLastAssistantTurn([assistantEv('orphan reply')])).toBeNull();
+    expect(extractLastAssistantTurn([toolResultUserEv(), assistantEv('orphan')])).toBeNull();
   });
 });
 
