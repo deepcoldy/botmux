@@ -34,7 +34,7 @@ import {
   CARD_POSTING_SENTINEL,
 } from './core/worker-pool.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand } from './core/command-handler.js';
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
 import {
@@ -222,8 +222,9 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   logger.info(`New topic: "${content.substring(0, 60)}" (resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId}`);
 
   // Intercept daemon commands in new topics (no session needed for some commands)
-  if (cmdContent.startsWith('/')) {
-    const cmd = cmdContent.split(/\s+/)[0].toLowerCase();
+  const invocation = parseSlashCommandInvocation(cmdContent);
+  if (invocation) {
+    const { cmd, content: commandContent } = invocation;
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
       await sessionReply(messageId, `${cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。`, 'text', larkAppId);
       return;
@@ -255,7 +256,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         ownerOpenId: senderOpenId,
       });
       // Pass mention-stripped content so /command argument parsing works.
-      await handleCommand(cmd, messageId, { ...parsed, content: cmdContent }, commandDeps, larkAppId);
+      await handleCommand(cmd, messageId, { ...parsed, content: commandContent }, commandDeps, larkAppId);
       return;
     }
   }
@@ -363,12 +364,13 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   }
 
   // Intercept daemon commands
-  if (cmdContent.startsWith('/')) {
-    const cmd = cmdContent.split(/\s+/)[0].toLowerCase();
+  const invocation = parseSlashCommandInvocation(cmdContent);
+  if (invocation) {
+    const { cmd, content: commandContent } = invocation;
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
       const ds = activeSessions.get(sessionKey(rootId, larkAppId));
       if (ds?.worker && !ds.worker.killed) {
-        ds.worker.send({ type: 'raw_input', content: cmdContent } as DaemonToWorker);
+        ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
         ds.lastMessageAt = Date.now();
         logger.info(`[${rootId.substring(0, 12)}] Passthrough ${cmd} → worker`);
       } else {
@@ -386,7 +388,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
         return;
       }
       // Pass mention-stripped content so /command argument parsing works.
-      handleCommand(cmd, rootId, { ...parsed, content: cmdContent }, commandDeps, larkAppId);
+      handleCommand(cmd, rootId, { ...parsed, content: commandContent }, commandDeps, larkAppId);
       return;
     }
   }

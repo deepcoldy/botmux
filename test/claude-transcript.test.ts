@@ -7,7 +7,7 @@
  *   - extractAssistantText / joinAssistantText concatenate multi-block text.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,6 +15,8 @@ import {
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
+  findLatestJsonl,
+  findJsonlContainingFingerprint,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -160,5 +162,221 @@ describe('extractAssistantText / joinAssistantText', () => {
 
   it('returns empty string for empty input', () => {
     expect(joinAssistantText([])).toBe('');
+  });
+});
+
+describe('findLatestJsonl', () => {
+  let projectDir: string;
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), 'bmx-latest-'));
+  });
+
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  function writeJsonl(name: string, mtimeSec: number): string {
+    const full = join(projectDir, name);
+    writeFileSync(full, '');
+    utimesSync(full, mtimeSec, mtimeSec);
+    return full;
+  }
+
+  it('returns null when the directory does not exist', () => {
+    expect(findLatestJsonl('/no/such/dir')).toBeNull();
+  });
+
+  it('returns null when the directory has no jsonl files', () => {
+    writeFileSync(join(projectDir, 'README.md'), '');
+    writeFileSync(join(projectDir, 'something.txt'), '');
+    expect(findLatestJsonl(projectDir)).toBeNull();
+  });
+
+  it('picks the most recently modified jsonl', () => {
+    writeJsonl('old.jsonl', 1_000_000);
+    const newer = writeJsonl('new.jsonl', 2_000_000);
+    writeJsonl('older.jsonl', 500_000);
+    expect(findLatestJsonl(projectDir)).toBe(newer);
+  });
+
+  it('detects /clear scenario: a new jsonl appears, latest result follows it', () => {
+    const original = writeJsonl('aaa.jsonl', 1_000_000);
+    expect(findLatestJsonl(projectDir)).toBe(original);
+    // user runs /clear → Claude Code creates a brand-new sessionId.jsonl
+    const fresh = writeJsonl('bbb.jsonl', 2_000_000);
+    expect(findLatestJsonl(projectDir)).toBe(fresh);
+    expect(findLatestJsonl(projectDir)).not.toBe(original);
+  });
+
+  it('ignores non-.jsonl files even when they are newer', () => {
+    writeJsonl('session.jsonl', 1_000_000);
+    const txt = join(projectDir, 'note.txt');
+    writeFileSync(txt, '');
+    utimesSync(txt, 5_000_000, 5_000_000);
+    expect(findLatestJsonl(projectDir)).toBe(join(projectDir, 'session.jsonl'));
+  });
+});
+
+describe('findJsonlContainingFingerprint', () => {
+  let projectDir: string;
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), 'bmx-fp-'));
+  });
+
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  function writeJsonl(name: string, body: string, mtimeSec = 1_000_000): string {
+    const full = join(projectDir, name);
+    writeFileSync(full, body);
+    utimesSync(full, mtimeSec, mtimeSec);
+    return full;
+  }
+
+  it('returns null when nothing contains the fingerprint', () => {
+    writeJsonl('a.jsonl', '{"type":"user","message":{"role":"user","content":"hello world"}}\n');
+    expect(findJsonlContainingFingerprint(projectDir, 'lark-specific-string')).toBeNull();
+  });
+
+  it('finds the file whose payload includes the fingerprint', () => {
+    writeJsonl('a.jsonl', '{"type":"user","message":{"role":"user","content":"random chatter"}}\n');
+    const target = writeJsonl('b.jsonl', '{"type":"user","message":{"role":"user","content":"please review the new patch"}}\n');
+    expect(findJsonlContainingFingerprint(projectDir, 'please review the new patch')).toBe(target);
+  });
+
+  it('skips the excluded path (the current watcher target)', () => {
+    const userEv = '{"type":"user","message":{"role":"user","content":"please review the new patch"}}\n';
+    const current = writeJsonl('current.jsonl', userEv, 1_000_000);
+    const newer = writeJsonl('newer.jsonl', userEv, 2_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, 'please review the new patch', current)).toBe(newer);
+  });
+
+  it('prefers the newer jsonl when multiple contain the fingerprint', () => {
+    const userEv = '{"type":"user","message":{"role":"user","content":"hello world"}}\n';
+    writeJsonl('older.jsonl', userEv, 1_000_000);
+    const newer = writeJsonl('newer.jsonl', userEv, 5_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, 'hello world')).toBe(newer);
+  });
+
+  it('returns null when the directory does not exist', () => {
+    expect(findJsonlContainingFingerprint('/no/such/dir', 'anything')).toBeNull();
+  });
+
+  it('returns null on empty fingerprint (defensive — would otherwise match every file)', () => {
+    writeJsonl('a.jsonl', 'whatever');
+    expect(findJsonlContainingFingerprint(projectDir, '')).toBeNull();
+  });
+
+  it('matches across JSON-escaped newlines (multi-line Lark message)', () => {
+    // Lark message has real newlines: "please\nreview\nthe patch"
+    // makeFingerprint() collapses → "please review the patch"
+    // Claude jsonl writes content as a JSON-encoded string, so newlines are
+    // serialized as \n on disk. Raw includes() would miss; parse + normalise
+    // must succeed.
+    const fp = 'please review the patch';
+    const writer = (path: string) => {
+      const ev = { type: 'user', uuid: 'u1', message: { role: 'user', content: 'please\nreview\nthe patch — extra context appended' } };
+      writeFileSync(path, JSON.stringify(ev) + '\n');
+    };
+    const target = join(projectDir, 'multiline.jsonl');
+    writer(target);
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBe(target);
+  });
+
+  it('matches user content stored as an array of blocks', () => {
+    // Some user events use the array-of-blocks form: content: [{type:'text',text:'...'}]
+    // stringifyUserContent must extract text from the blocks before compare.
+    const fp = 'review my patch';
+    const ev = {
+      type: 'user',
+      uuid: 'u2',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'review my patch please' },
+          { type: 'image', source: { type: 'base64', data: '...' } },
+        ],
+      },
+    };
+    const target = join(projectDir, 'array-content.jsonl');
+    writeFileSync(target, JSON.stringify(ev) + '\n');
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBe(target);
+  });
+
+  it('does NOT match fingerprint that only appears in non-user events', () => {
+    // A jsonl where the fingerprint string appears in an assistant or
+    // system event but never in a user event must not be selected — we
+    // only key off user input to identify the active session.
+    const fp = 'spurious-fingerprint';
+    const target = join(projectDir, 'red-herring.jsonl');
+    writeFileSync(
+      target,
+      JSON.stringify({ type: 'user', uuid: 'u', message: { role: 'user', content: 'completely different' } }) + '\n' +
+      JSON.stringify({ type: 'assistant', uuid: 'a', message: { role: 'assistant', content: [{ type: 'text', text: 'spurious-fingerprint mentioned in reply' }] } }) + '\n',
+    );
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBeNull();
+  });
+
+  it('matches queue-operation enqueue content only when explicitly enabled', () => {
+    const fp = 'queued follow-up';
+    const target = join(projectDir, 'queued.jsonl');
+    writeFileSync(
+      target,
+      JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'queued follow-up for Claude' }) + '\n',
+    );
+    utimesSync(target, 1_000_000, 1_000_000);
+
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBeNull();
+    expect(findJsonlContainingFingerprint(projectDir, fp, { includeQueueOperations: true })).toBe(target);
+  });
+
+  it('can ignore stale jsonl files by mtime', () => {
+    writeJsonl(
+      'old.jsonl',
+      '{"type":"user","message":{"role":"user","content":"repeatable short prompt"}}\n',
+      1_000_000,
+    );
+    const fresh = writeJsonl(
+      'fresh.jsonl',
+      '{"type":"user","message":{"role":"user","content":"repeatable short prompt"}}\n',
+      2_000_000,
+    );
+
+    expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
+      minMtimeMs: 1_500_000_000,
+    })).toBe(fresh);
+  });
+
+  it('skips malformed jsonl lines gracefully', () => {
+    // A half-flushed line at the head + a real user event after it.
+    const fp = 'real fingerprint';
+    const target = join(projectDir, 'mixed.jsonl');
+    writeFileSync(
+      target,
+      'this-is-not-json-at-all\n' +
+      JSON.stringify({ type: 'user', uuid: 'u', message: { role: 'user', content: 'real fingerprint here' } }) + '\n',
+    );
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBe(target);
+  });
+
+  it('does not hijack on sibling pane traffic in the same cwd', () => {
+    const userPane = writeJsonl(
+      'user-session.jsonl',
+      '{"type":"user","message":{"role":"user","content":"please run the bridge tests"}}\n',
+      2_000_000,
+    );
+    writeJsonl(
+      'sibling-pane.jsonl',
+      '{"type":"user","message":{"role":"user","content":"refactor the UI components"}}\n'.repeat(50),
+      3_000_000,
+    );
+    expect(findJsonlContainingFingerprint(projectDir, 'please run the bridge tests')).toBe(userPane);
   });
 });

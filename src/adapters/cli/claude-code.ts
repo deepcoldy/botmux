@@ -1,8 +1,9 @@
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 
 /** Resolve the JSONL transcript path Claude Code writes user/assistant turns to.
  *  Claude Code's project-hash scheme replaces every non-[A-Za-z0-9-] char with `-`
@@ -55,6 +56,68 @@ async function waitForSubmit(path: string, baseByte: number, timeoutMs: number):
   return false;
 }
 
+function makeSubmitFingerprint(content: string, len = 30): string | undefined {
+  const collapsed = normaliseForFingerprint(content);
+  return collapsed.length > 0 ? collapsed.substring(0, len) : undefined;
+}
+
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Returns the absolute path to Claude Code's per-process session state file.
+ *  Claude writes `{pid, sessionId, cwd, procStart, ...}` here and refreshes it
+ *  as state changes — so it's the authoritative source of the current session
+ *  id, including after a `--resume` rotates the id mid-process. */
+export function claudePidStatePath(pid: number): string {
+  return join(homedir(), '.claude', 'sessions', `${pid}.json`);
+}
+
+/** Linux-only: read /proc/<pid>/stat field 22 (starttime). Returns null when
+ *  /proc isn't available or the stat line is unreadable/malformed; callers
+ *  decide whether to fail closed or skip validation for their platform. */
+function readProcStarttime(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // pid (comm) state ppid pgrp ... — comm may contain spaces/parens, so
+    // anchor on the LAST ')' before splitting the remaining fields.
+    const closeParen = raw.lastIndexOf(')');
+    if (closeParen < 0) return null;
+    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+    // Post-')' field 1 is state; starttime is field 22 → index 19 here.
+    return fields[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve Claude Code's authoritative current session id via
+ *  ~/.claude/sessions/<pid>.json. Validates pid + sessionId UUID + cwd so a
+ *  stale or unrelated pid file can't redirect us to the wrong jsonl. On Linux
+ *  also matches procStart against /proc/<pid>/stat to reject PID reuse. If
+ *  procStart is present but cannot be verified on Linux, fail closed; callers
+ *  fall back to fingerprint detection. */
+export function resolveJsonlFromPid(pid: number, expectedCwd: string): { path: string; cliSessionId: string } | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(readFileSync(claudePidStatePath(pid), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (parsed.pid !== pid) return null;
+  if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;
+  if (typeof parsed.cwd !== 'string' || parsed.cwd !== expectedCwd) return null;
+  if (typeof parsed.procStart === 'string') {
+    const live = readProcStarttime(pid);
+    if (live === null && process.platform === 'linux') return null;
+    if (live !== null && live !== parsed.procStart) return null;
+  }
+  return {
+    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd),
+    cliSessionId: parsed.sessionId,
+  };
+}
+
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed) for \d+[smh]/;
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
@@ -64,10 +127,14 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     resolvedBin: bin,
     supportsTypeAhead: true,
 
-    buildArgs({ sessionId, resume, botName, botOpenId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId }) {
       const args: string[] = [];
       if (resume) {
-        args.push('--resume', sessionId);
+        // Prefer Claude's most recently observed internal session id when we
+        // have one — `--resume` reads `<id>.jsonl`, and after a previous run
+        // rotated the id (which we now persist via the pid-file resolver) the
+        // botmux sessionId no longer matches Claude's actual transcript file.
+        args.push('--resume', resumeSessionId ?? sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
@@ -138,7 +205,32 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         else pty.write('\r');
       };
 
-      const baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
+      // Authoritative path resolver: ~/.claude/sessions/<pid>.json carries
+      // Claude's current sessionId, refreshed on every state change. Read it
+      // first so byte accounting locks onto the right transcript even when
+      // Claude has rotated mid-process. Fingerprint-based fallback below
+      // covers the case where the pid file isn't yet readable / fails
+      // validation.
+      let observedCliSessionId: string | undefined;
+      const applyResolved = (resolved: { path: string; cliSessionId: string }): boolean => {
+        if (resolved.cliSessionId !== observedCliSessionId) observedCliSessionId = resolved.cliSessionId;
+        if (resolved.path !== pty.claudeJsonlPath) {
+          pty.claudeJsonlPath = resolved.path;
+          return true;
+        }
+        return false;
+      };
+      if (pty.cliPid && pty.cliCwd) {
+        const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd);
+        if (resolved) applyResolved(resolved);
+      }
+      // baseByte is recomputed at this point (after any entry-time path swap)
+      // so future writes are measured against the right transcript. Inside
+      // confirmSubmit a mid-flight rotation does NOT advance baseByte — the
+      // submit may already be in the rotated jsonl from before our re-resolve.
+      let baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
+      const submitFingerprint = makeSubmitFingerprint(content);
+      const submitSearchMinMtime = Date.now() - 60_000;
 
       if (pty.sendText && pty.sendSpecialKeys) {
         const lines = content.split('\n');
@@ -165,7 +257,78 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       sendEnter();
 
       // Without a JSONL path we can't verify — trust the fixed delay and return.
-      if (!pty.claudeJsonlPath) return;
+      // Still surface any sessionId we observed via the pid resolver so the
+      // worker can persist it even on this unverified path.
+      if (!pty.claudeJsonlPath) {
+        return observedCliSessionId ? { submitted: true, cliSessionId: observedCliSessionId } : undefined;
+      }
+
+      const confirmSubmit = async (timeoutMs: number): Promise<boolean> => {
+        const startPath = pty.claudeJsonlPath;
+        if (!startPath) return false;
+
+        // First check: did our submit land past baseByte on the currently
+        // pinned path? Fast path for the common case (no rotation).
+        if (await waitForSubmit(startPath, baseByte, timeoutMs)) return true;
+
+        // Second: did Claude rotate sessionId mid-flight? The pid file is
+        // refreshed on every state change, so we re-read and check both:
+        //   a) the rotated jsonl already contains our submit (the rotation
+        //      happened between our type+Enter and this resolve — the
+        //      content lives in the new file from before we knew about it),
+        //   b) the rotated jsonl is empty / pre-existing but a fresh
+        //      append is on its way (briefly poll).
+        // We do NOT overwrite the original baseByte before the fingerprint
+        // check because (a) requires matching content that may already be in
+        // the rotated file. For (b), poll from the rotated file's own current
+        // size so an older, larger startPath cannot hide a delayed append.
+        if (pty.cliPid && pty.cliCwd) {
+          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd);
+          if (resolved) {
+            const switched = applyResolved(resolved);
+            const newPath = pty.claudeJsonlPath;
+            const rotatedBaseByte = switched && newPath ? currentFileSize(newPath) : baseByte;
+            if (switched && newPath && submitFingerprint) {
+              if (jsonlContainsFingerprint(newPath, submitFingerprint, { includeQueueOperations: true })) {
+                // Sync baseByte to end-of-file so subsequent confirms in
+                // this writeInput pass don't re-trigger on the same line.
+                baseByte = currentFileSize(newPath);
+                return true;
+              }
+            }
+            if (newPath) {
+              if (await waitForSubmit(newPath, rotatedBaseByte, switched ? 200 : 0)) {
+                if (switched) baseByte = currentFileSize(newPath);
+                return true;
+              }
+            }
+          }
+        }
+
+        // Final fallback when the pid file is unavailable / fails validation:
+        // scan the project dir for a recently-written jsonl whose tail
+        // contains our content fingerprint. Stricter than mtime-based
+        // detection so a sibling pane in the same dir can't hijack us.
+        if (submitFingerprint) {
+          const searchPath = pty.claudeJsonlPath ?? startPath;
+          const matched = findJsonlContainingFingerprint(dirname(searchPath), submitFingerprint, {
+            excludePath: searchPath,
+            minMtimeMs: submitSearchMinMtime,
+            includeQueueOperations: true,
+          });
+          if (matched) {
+            pty.claudeJsonlPath = matched;
+            return true;
+          }
+        }
+        return false;
+      };
+
+      const buildResult = (submitted: boolean): { submitted: boolean; cliSessionId?: string } => {
+        return observedCliSessionId
+          ? { submitted, cliSessionId: observedCliSessionId }
+          : { submitted };
+      };
 
       // Retry budget: up to 2 extra Enters (3 sends total), each followed by
       // an 800ms wait for the JSONL to record either a direct user-submit line
@@ -174,14 +337,20 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       // only retry when the JSONL is provably unchanged, so the race window is
       // bounded to cases where submit really did fail.
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
+        if (await confirmSubmit(800)) {
+          return observedCliSessionId ? buildResult(true) : undefined;
+        }
         sendEnter();
       }
       // Final grace check.
-      if (await waitForSubmit(pty.claudeJsonlPath, baseByte, 800)) return;
+      if (await confirmSubmit(800)) {
+        return observedCliSessionId ? buildResult(true) : undefined;
+      }
       // All retries exhausted and still no submit marker in JSONL. Signal failure
       // so the worker can notify the user in Lark instead of silently dropping.
-      return { submitted: false };
+      // We still surface observedCliSessionId so the worker can persist Claude's
+      // current id even when this particular submit didn't land.
+      return buildResult(false);
     },
 
     completionPattern: COMPLETION_RE,

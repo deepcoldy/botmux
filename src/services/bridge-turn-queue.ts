@@ -23,7 +23,11 @@
  * Baseline (`absorb()`) takes a batch of historical events and registers
  * their uuids as already-seen so future ingest doesn't double-attribute.
  */
-import type { TranscriptEvent } from './claude-transcript.js';
+import { stringifyUserContent, normaliseForFingerprint, type TranscriptEvent } from './claude-transcript.js';
+
+// Re-export so existing callers (worker.ts, tests) don't need to change
+// their import path now that these helpers live in claude-transcript.ts.
+export { normaliseForFingerprint };
 
 export interface BridgePendingTurn {
   turnId: string;
@@ -37,20 +41,6 @@ export interface BridgePendingTurn {
   contentFingerprint?: string;
 }
 
-/** Stringify a transcript user event's content to a flat string for
- *  fingerprint matching. Handles both legacy string content and the
- *  array-of-blocks form. */
-function stringifyUserContent(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  for (const block of content as any[]) {
-    if (typeof block?.text === 'string') parts.push(block.text);
-    else if (typeof block?.content === 'string') parts.push(block.content);
-  }
-  return parts.join('\n');
-}
-
 function isPureToolResultUserEvent(content: unknown): boolean {
   if (!Array.isArray(content) || content.length === 0) return false;
   return content.every((block: any) => block?.type === 'tool_result');
@@ -60,16 +50,6 @@ function assistantHasVisibleText(content: unknown): boolean {
   if (typeof content === 'string') return content.length > 0;
   if (!Array.isArray(content)) return false;
   return content.some((block: any) => block?.type === 'text' && typeof block.text === 'string' && block.text.length > 0);
-}
-
-/** Collapse whitespace + trim. Used both when building the fingerprint
- *  from the Lark message and when normalising the transcript's user
- *  content for the substring check — same normalisation on both sides
- *  keeps the match stable when Claude Code preserves newlines that the
- *  fingerprint doesn't.
- *  Exported for tests. */
-export function normaliseForFingerprint(s: string): string {
-  return s.replace(/\s+/g, ' ').trim();
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window

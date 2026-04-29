@@ -128,7 +128,7 @@ vi.mock('../src/utils/user-token.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -240,6 +240,42 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     for (const cmd of PASSTHROUGH_COMMANDS) {
       expect(DAEMON_COMMANDS.has(cmd), `${cmd} must not be in both sets`).toBe(false);
     }
+  });
+});
+
+describe('parseSlashCommandInvocation', () => {
+  it('parses a normal daemon command', () => {
+    expect(parseSlashCommandInvocation('/adopt 0:2.0')).toEqual({
+      cmd: '/adopt',
+      content: '/adopt 0:2.0',
+    });
+  });
+
+  it('ignores placeholder command examples', () => {
+    expect(parseSlashCommandInvocation('/adopt <pane>')).toBeNull();
+    expect(parseSlashCommandInvocation('/adopt --takeover [<pane>]')).toBeNull();
+  });
+
+  it('ignores multi-line slash command lists', () => {
+    const content = [
+      '/adopt <pane>',
+      '/adopt --takeover [<pane>]',
+      '/adopt --takeover --kill-origin <pane?>',
+      '这三个没人会用的吧？',
+    ].join('\n');
+    expect(parseSlashCommandInvocation(content)).toBeNull();
+  });
+
+  it('allows multiline schedule commands without a second slash-command line', () => {
+    const content = '/schedule add 明天 9 点\n生成昨天的 PR 总结';
+    expect(parseSlashCommandInvocation(content)).toEqual({
+      cmd: '/schedule',
+      content,
+    });
+  });
+
+  it('ignores non-command text', () => {
+    expect(parseSlashCommandInvocation('请解释 /adopt 怎么设计')).toBeNull();
   });
 });
 

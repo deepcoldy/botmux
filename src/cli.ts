@@ -1240,6 +1240,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --files <path>                  附件（可重复）
        --mention <open_id:name>        @提及（可重复）
        --card | --text                 强制卡片 / 纯文本（默认按 md 语法自动判断）
+       --top-level                     发顶层消息（不回复进当前话题）
+       --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
   bots list                            列出当前群聊中的机器人（含 open_id）
   thread messages [--limit N]          拉取当前话题的消息历史 (JSON)
 
@@ -1689,6 +1691,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   const contentFile = argValue(rest, '--content-file');
   const forceCard = rest.includes('--card');
   const forceText = rest.includes('--text');
+  // Publish-mode flags: post a fresh top-level message in a chat instead of
+  // replying into the bound thread. Lets a session "publish" to a different
+  // chat (e.g. a public release-notes group) while keeping its own thread
+  // for streaming-card / progress UI.
+  const sendTopLevel = rest.includes('--top-level');
+  const overrideChatId = argValue(rest, '--chat-id');
 
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
@@ -1743,9 +1751,19 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { registerBot, loadBotConfigs, findOncallChat } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
 
-  const { replyMessage, uploadImage, uploadFile } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
-  const oncallEntry = s.chatId ? findOncallChat(appId, s.chatId) : undefined;
+  // Effective target chat for top-level mode (defaults to session's chat)
+  const targetChatId = overrideChatId ?? s.chatId;
+  // Oncall addressing only meaningful for thread replies inside the session's
+  // own chat — skip when publishing top-level or to a different chat.
+  const oncallEntry = !sendTopLevel && !overrideChatId && s.chatId
+    ? findOncallChat(appId, s.chatId) : undefined;
+  // Dispatch helper: top-level send vs reply-in-thread, single decision point
+  const dispatch = (content: string, msgType: string): Promise<string> =>
+    sendTopLevel
+      ? sendMessage(appId, targetChatId, content, msgType)
+      : replyMessage(appId, s.rootMessageId, content, msgType, true);
 
   try {
     // Upload images in parallel
@@ -1875,7 +1893,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         config: { update_multi: true },
         body: { direction: 'vertical', elements },
       });
-      messageId = await replyMessage(appId, s.rootMessageId, cardJson, 'interactive', true);
+      messageId = await dispatch(cardJson, 'interactive');
     } else {
       // Plain-text path: build post content, paragraph per line.
       const postContent: any[][] = text ? text.split('\n').map((line: string) => {
@@ -1920,14 +1938,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
 
       const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
-      messageId = await replyMessage(appId, s.rootMessageId, postJson, 'post', true);
+      messageId = await dispatch(postJson, 'post');
     }
 
     // Send file attachments as separate messages
     const fileIds: string[] = [];
     for (const fp of files) {
       const fileKey = await uploadFile(appId, fp);
-      const fid = await replyMessage(appId, s.rootMessageId, JSON.stringify({ file_key: fileKey }), 'file', true);
+      const fid = await dispatch(JSON.stringify({ file_key: fileKey }), 'file');
       fileIds.push(fid);
     }
 

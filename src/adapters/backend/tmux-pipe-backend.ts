@@ -35,6 +35,13 @@ function shellescape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+/** Convert `\n` to `\r\n` while leaving existing `\r\n` alone. Exported for
+ *  unit tests; used to normalise tmux capture-pane output before sending it
+ *  to xterm.js (which treats bare LF as "down one row, keep column"). */
+export function normaliseCaptureLineEndings(s: string): string {
+  return s.replace(/\r?\n/g, '\r\n');
+}
+
 export class TmuxPipeBackend implements SessionBackend {
   /** Real tmux pane address (e.g. "0:2.0"). */
   private readonly paneTarget: string;
@@ -63,16 +70,25 @@ export class TmuxPipeBackend implements SessionBackend {
     this.cols = opts.cols;
     this.rows = opts.rows;
 
-    // Step 1: create the fifo. mkfifo is POSIX; falls back to mknod on
-    // platforms where mkfifo isn't available, but linux/darwin both have it.
+    // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
     spawnSync('mkfifo', [this.fifoPath], { stdio: 'ignore' });
 
-    // Step 2: open the read end first (non-blocking) so tmux's writer-side
-    // cat doesn't block on its open(). On a fifo, opening O_RDONLY without
-    // a writer normally blocks, and opening O_WRONLY without a reader
-    // blocks too — using O_RDWR or O_NONBLOCK avoids the chicken-and-egg.
-    const fd = fs.openSync(this.fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
-    this.readStream = fs.createReadStream('', { fd, autoClose: false });
+    // Step 2: open the read end with O_RDWR (no O_NONBLOCK).
+    //
+    // Why O_RDWR? Avoids the fifo open chicken-and-egg: opening O_RDONLY
+    // alone blocks until a writer arrives, opening O_WRONLY alone blocks
+    // until a reader arrives. Holding both ends ourselves makes either
+    // peer's open() return immediately.
+    //
+    // Why NOT O_NONBLOCK? libuv's ReadStream issues blocking read() calls
+    // from its threadpool — that's how it stays responsive without
+    // burning CPU. With O_NONBLOCK the very first read() on an empty
+    // fifo returns EAGAIN, which libuv surfaces as an error, and the
+    // stream dies before tmux ever gets a chance to write a byte. (This
+    // exact bug ate the bridge final_output pipeline on first ship: an
+    // strace showed worker only read its IPC fd, never the fifo.)
+    const fd = fs.openSync(this.fifoPath, fs.constants.O_RDWR);
+    this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
 
     this.readStream.on('data', (chunk) => {
       const data = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
@@ -80,9 +96,11 @@ export class TmuxPipeBackend implements SessionBackend {
         try { cb(data); } catch { /* listener crash shouldn't kill the stream */ }
       }
     });
-    this.readStream.on('error', () => {
-      // Fifo errors aren't fatal — the user's CLI is still running, we just
-      // lose realtime updates until kill() resets the subscription.
+    this.readStream.on('error', (err: any) => {
+      // Errors are best-effort logged via the worker's stderr (we can't
+      // pull a logger in a backend without circular imports). Don't fire
+      // exit — the user's CLI is still alive, we just lost realtime view.
+      process.stderr.write(`[tmux-pipe-backend] read error: ${err?.message ?? err}\n`);
     });
 
     // Step 3: ask tmux to replicate the pane's bytes into our fifo.
@@ -95,7 +113,6 @@ export class TmuxPipeBackend implements SessionBackend {
       );
       this.pipeAttached = true;
     } catch (err: any) {
-      // Pane may not exist any more — surface as exit so the worker tears down.
       this.fireExit(1, null);
       throw err;
     }
@@ -213,16 +230,52 @@ export class TmuxPipeBackend implements SessionBackend {
   /** Snapshot the current screen of the adopted pane WITH ANSI escapes,
    *  including history (-S - = start of scrollback). New web-terminal
    *  connections receive this string so xterm.js renders the existing
-   *  session state instead of a blank screen. */
+   *  session state instead of a blank screen.
+   *
+   *  IMPORTANT: tmux capture-pane separates rows with bare `\n`, no `\r`.
+   *  xterm.js (and any VT100-compliant emulator) treats a bare LF as
+   *  "move down one row, keep column" — every captured line lands further
+   *  to the right than the previous one, producing the staircase artefact
+   *  observed in early pipe-mode dogfooding. Normalising every `\n` to
+   *  `\r\n` makes the snapshot render correctly. The live pipe-pane stream
+   *  itself doesn't need this fix — applications write proper `\r\n` (and
+   *  Claude Code uses cursor-positioning instead of bare LF anyway). */
   captureCurrentScreen(): string {
     if (this.exited) return '';
     try {
-      return execSync(
+      const altOn = this.isPaneInAltBuffer();
+      const raw = execSync(
         `tmux capture-pane -e -p -t ${shellescape(this.paneTarget)} -S -`,
         { encoding: 'utf-8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 },
       );
+      const normalised = normaliseCaptureLineEndings(raw);
+      if (altOn) {
+        // The pane's CLI (e.g. Claude Code, vim) is in the alternate screen
+        // buffer. capture-pane returns the alt-buffer's content but no
+        // mode-switch escape sequence — we have to bracket the snapshot
+        // with `enter alt screen + home + clear` so xterm.js renders it in
+        // the alt buffer instead of leaking it into the main buffer where
+        // it would persist after the application exits.
+        return `\x1b[?1049h\x1b[H\x1b[2J${normalised}`;
+      }
+      return normalised;
     } catch {
       return '';
+    }
+  }
+
+  /** Cheap probe: is the adopted pane currently in the alternate screen
+   *  buffer? Used by captureCurrentScreen to decide whether the snapshot
+   *  needs an alt-buffer-enter prefix for correct rendering. */
+  private isPaneInAltBuffer(): boolean {
+    try {
+      const out = execSync(
+        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{alternate_on}'`,
+        { encoding: 'utf-8', timeout: 2000 },
+      ).trim();
+      return out === '1';
+    } catch {
+      return false;
     }
   }
 

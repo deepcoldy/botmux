@@ -39,7 +39,7 @@ vi.mock('node:fs', async () => {
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
-import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { TmuxPipeBackend, normaliseCaptureLineEndings } from '../src/adapters/backend/tmux-pipe-backend.js';
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedExecFileSync = vi.mocked(execFileSync);
@@ -157,15 +157,80 @@ describe('TmuxPipeBackend.captureCurrentScreen', () => {
     const be = new TmuxPipeBackend('0:2.0');
     be.spawn('', [], spawnOpts());
     mockedExecSync.mockClear();
-    mockedExecSync.mockReturnValue('\x1b[1mhello\x1b[0m' as any);
+    // First call → alternate_on probe (returns '0' = main buffer)
+    // Second call → capture-pane payload
+    mockedExecSync
+      .mockReturnValueOnce('0\n' as any)
+      .mockReturnValueOnce('\x1b[1mhello\x1b[0m' as any);
     const out = be.captureCurrentScreen();
     expect(out).toBe('\x1b[1mhello\x1b[0m');
-    const cmd = String(mockedExecSync.mock.calls[0][0]);
-    expect(cmd).toContain('capture-pane');
+    const captureCall = mockedExecSync.mock.calls.find(c => String(c[0]).includes('capture-pane'));
+    expect(captureCall).toBeDefined();
+    const cmd = String(captureCall![0]);
     expect(cmd).toContain('-e');
     expect(cmd).toContain('-p');
     expect(cmd).toContain('-S -');
     expect(cmd).toContain("'0:2.0'");
+  });
+
+  it('normalises bare \\n to \\r\\n so xterm.js does not staircase', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedExecSync
+      .mockReturnValueOnce('0\n' as any)  // alternate_on probe
+      .mockReturnValueOnce('line1\nline2\nline3\n' as any);
+    const out = be.captureCurrentScreen();
+    // Each \n must become \r\n; existing \r\n must not be doubled.
+    expect(out).toBe('line1\r\nline2\r\nline3\r\n');
+  });
+
+  it('preserves existing \\r\\n untouched', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedExecSync
+      .mockReturnValueOnce('0\n' as any)
+      .mockReturnValueOnce('a\r\nb\nc\r\n' as any);
+    expect(be.captureCurrentScreen()).toBe('a\r\nb\r\nc\r\n');
+  });
+
+  it('prefixes alt-buffer enter sequence when pane is in alt screen', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedExecSync
+      .mockReturnValueOnce('1\n' as any)        // alternate_on=1 (Claude TUI)
+      .mockReturnValueOnce('claude prompt\n' as any);
+    const out = be.captureCurrentScreen();
+    // Must start with: enter alt buffer + home + clear, then the snapshot.
+    expect(out.startsWith('\x1b[?1049h\x1b[H\x1b[2J')).toBe(true);
+    expect(out.endsWith('claude prompt\r\n')).toBe(true);
+  });
+
+  it('does NOT prefix alt-buffer enter when pane is on main buffer', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedExecSync
+      .mockReturnValueOnce('0\n' as any)        // alternate_on=0 (zsh prompt)
+      .mockReturnValueOnce('$ ls\n' as any);
+    const out = be.captureCurrentScreen();
+    expect(out).toBe('$ ls\r\n');
+    expect(out).not.toContain('\x1b[?1049h');
+  });
+});
+
+describe('normaliseCaptureLineEndings', () => {
+  it('handles mixed line endings idempotently', () => {
+    expect(normaliseCaptureLineEndings('a\nb')).toBe('a\r\nb');
+    expect(normaliseCaptureLineEndings('a\r\nb')).toBe('a\r\nb');
+    expect(normaliseCaptureLineEndings('\n\n\n')).toBe('\r\n\r\n\r\n');
+    expect(normaliseCaptureLineEndings('')).toBe('');
   });
 });
 

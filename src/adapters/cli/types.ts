@@ -10,6 +10,13 @@ export interface PtyHandle {
    *  Used by writeInput to verify a paste+Enter actually committed (new user-content
    *  line appended) and retry Enter if not — rather than trusting fixed sleep timing. */
   claudeJsonlPath?: string;
+  /** PID of the spawned CLI child process; set by worker so the claude-code adapter
+   *  can read `~/.claude/sessions/<pid>.json` to follow Claude's authoritative
+   *  current session id (which can rotate on resume / mid-session). */
+  cliPid?: number;
+  /** Working directory the CLI was spawned in; cross-checked against the pid file's
+   *  cwd field to reject pid reuse / unrelated processes. */
+  cliCwd?: string;
 }
 
 export interface CliAdapter {

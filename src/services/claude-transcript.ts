@@ -11,7 +11,8 @@
  * The functions are pure (no fs.watch — that's the worker's wakeup concern)
  * to keep them unit-testable.
  */
-import { existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
+import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
@@ -163,4 +164,242 @@ export function joinAssistantText(events: TranscriptEvent[]): string {
     .map(extractAssistantText)
     .filter(s => s.length > 0)
     .join('\n\n');
+}
+
+/**
+ * Stringify a transcript user event's content to a flat string. Handles
+ * both legacy bare-string content and the array-of-blocks form.
+ *
+ * Lives here (not in bridge-turn-queue.ts) so the in-process attribution
+ * state machine and the on-disk fingerprint search use *exactly* the
+ * same text — otherwise multi-line / array-content Lark messages stop
+ * matching one path or the other and bridges silently break.
+ */
+export function stringifyUserContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content as any[]) {
+    if (typeof block?.text === 'string') parts.push(block.text);
+    else if (typeof block?.content === 'string') parts.push(block.content);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Collapse whitespace + trim. Same normalisation applied on both sides
+ * of the fingerprint compare (the Lark message that produces the
+ * fingerprint, and the transcript user content we search through),
+ * so newlines / tabs / double-spaces don't break the match.
+ */
+export function normaliseForFingerprint(s: string): string {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Find the most recently-modified `.jsonl` file in a Claude Code project
+ * directory. Helper kept for diagnostics and tests. The adopt-bridge
+ * watcher does NOT use mtime to follow session switches — see
+ * `findJsonlContainingFingerprint` for the safer fingerprint-based variant
+ * that ignores unrelated panes writing in the same project directory.
+ *
+ * Returns null when the directory doesn't exist or has no jsonl files.
+ */
+export function findLatestJsonl(dir: string): string | null {
+  if (!existsSync(dir)) return null;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let latestPath: string | null = null;
+  let latestMtime = -Infinity;
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    const full = join(dir, name);
+    try {
+      const st = statSync(full);
+      if (!st.isFile()) continue;
+      if (st.mtimeMs > latestMtime) {
+        latestMtime = st.mtimeMs;
+        latestPath = full;
+      }
+    } catch {
+      // File disappeared between readdir and stat — ignore.
+    }
+  }
+  return latestPath;
+}
+
+/**
+ * Search every `.jsonl` file in `dir` for one whose contents include the
+ * given fingerprint. Used by the bridge watcher to detect a session
+ * switch (`/clear` / `/resume`) caused by the user's pane: when a Lark
+ * message is pending and its content fingerprint shows up in a NEW jsonl
+ * file, that file is the user's current session and we should switch.
+ *
+ * Pinning the switch decision to fingerprint match (rather than mtime)
+ * avoids hijacking by sibling Claude Code panes in the same project
+ * directory — they'll write busy jsonls but won't ever contain our Lark
+ * fingerprint.
+ *
+ * Optional `excludePath` skips the file we're already watching so the
+ * caller's "did it change?" comparison is cheap.
+ *
+ * Reads only the trailing 1 MB of each candidate (fingerprints land near
+ * the end of the jsonl when Claude has just written them) — long-lived
+ * sessions can grow to tens of MB so a full read would be wasteful.
+ * Callers should still gate on "an unstarted pending turn exists" rather
+ * than calling this on every poll tick.
+ */
+export interface JsonlFingerprintSearchOptions {
+  /** Skip the file the caller is already watching/checking. */
+  excludePath?: string;
+  /** Ignore older files when the caller is looking for a just-written submit. */
+  minMtimeMs?: number;
+  /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
+  includeQueueOperations?: boolean;
+}
+
+/** Scan a single jsonl file's tail for a Lark message fingerprint. Same
+ *  parsing rules as `findJsonlContainingFingerprint` (decode role:user content,
+ *  optionally also queue-operation/enqueue, normalise whitespace, then
+ *  substring-match the fingerprint). Used by the claude-code adapter when
+ *  the pid resolver has just switched to a rotated jsonl that may already
+ *  contain the just-submitted user event. */
+export function jsonlContainsFingerprint(
+  path: string,
+  fingerprint: string,
+  opts?: { includeQueueOperations?: boolean },
+): boolean {
+  if (fingerprint.length === 0 || !existsSync(path)) return false;
+  let size: number;
+  try { size = statSync(path).size; } catch { return false; }
+  if (size === 0) return false;
+  const includeQueueOps = opts?.includeQueueOperations ?? false;
+  const len = Math.min(size, 1024 * 1024);
+  let buf: Buffer;
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  const text = buf.toString('utf8');
+  const lines = text.split('\n');
+  // Skip the leading partial line when we read a strict tail (size > len).
+  const startIdx = size > len ? 1 : 0;
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let ev: any;
+    try { ev = JSON.parse(line); } catch { continue; }
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    let lineText = '';
+    if (role === 'user') {
+      lineText = stringifyUserContent(ev.message?.content);
+    } else if (
+      includeQueueOps &&
+      ev.type === 'queue-operation' &&
+      ev.operation === 'enqueue'
+    ) {
+      lineText = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+    } else {
+      continue;
+    }
+    const normalisedText = normaliseForFingerprint(lineText);
+    if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) return true;
+  }
+  return false;
+}
+
+export function findJsonlContainingFingerprint(
+  dir: string,
+  fingerprint: string,
+  excludePathOrOptions?: string | JsonlFingerprintSearchOptions,
+): string | null {
+  if (!existsSync(dir) || fingerprint.length === 0) return null;
+  const opts: JsonlFingerprintSearchOptions =
+    typeof excludePathOrOptions === 'string'
+      ? { excludePath: excludePathOrOptions }
+      : (excludePathOrOptions ?? {});
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  // Walk newest-first so a recently-rotated jsonl is found before older
+  // ones; if two files contain the fingerprint (rare, e.g. user pasted
+  // the same message into two panes) we prefer the more recent.
+  const candidates: Array<{ path: string; mtime: number }> = [];
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    const full = join(dir, name);
+    if (opts.excludePath && full === opts.excludePath) continue;
+    try {
+      const st = statSync(full);
+      if (!st.isFile()) continue;
+      if (opts.minMtimeMs !== undefined && st.mtimeMs < opts.minMtimeMs) continue;
+      candidates.push({ path: full, mtime: st.mtimeMs });
+    } catch { /* ignore */ }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const { path } of candidates) {
+    try {
+      const fd = openSync(path, 'r');
+      try {
+        const size = statSync(path).size;
+        // Read at most the trailing 1MB — fingerprints land near the end
+        // of the jsonl when Claude just wrote them. Cheaper than reading
+        // an entire long-lived session.
+        const len = Math.min(size, 1024 * 1024);
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, size - len);
+        const text = buf.toString('utf8');
+        // We must NOT do a raw includes() here: Claude writes user content
+        // as a JSON-encoded string, so any newline in the Lark message is
+        // serialized as `\n` on disk while our fingerprint has it
+        // collapsed to a single space. Parse each complete jsonl line,
+        // pick role:user events, and apply the same stringify+normalise
+        // we use in BridgeTurnQueue.ingest. Skip the leading partial line
+        // when we read a strict tail (size > len), since it likely begins
+        // mid-line.
+        const lines = text.split('\n');
+        const startIdx = size > len ? 1 : 0;
+        for (let i = startIdx; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          let ev: any;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (!ev || typeof ev !== 'object') continue;
+          const role = ev.message?.role ?? ev.type;
+          let text = '';
+          if (role === 'user') {
+            text = stringifyUserContent(ev.message?.content);
+          } else if (
+            opts.includeQueueOperations &&
+            ev.type === 'queue-operation' &&
+            ev.operation === 'enqueue'
+          ) {
+            text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+          } else {
+            continue;
+          }
+          const normalisedText = normaliseForFingerprint(text);
+          if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) return path;
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch { /* unreadable — skip */ }
+  }
+  return null;
 }

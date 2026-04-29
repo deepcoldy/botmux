@@ -19,6 +19,12 @@ export class PtyBackend implements SessionBackend {
   /** Claude Code session JSONL path — set by worker for claude-code sessions so
    *  the claude-code adapter can verify paste+Enter submissions via file growth. */
   claudeJsonlPath?: string;
+  /** PID of the spawned Claude Code child — used by the claude-code adapter to
+   *  follow Claude's authoritative session id via ~/.claude/sessions/<pid>.json. */
+  cliPid?: number;
+  /** Working directory the CLI was spawned in — cross-checked against the pid
+   *  file's cwd field so a recycled PID can't mislead the resolver. */
+  cliCwd?: string;
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     this.process = pty.spawn(bin, args, {

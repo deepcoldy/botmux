@@ -15,8 +15,9 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { drainTranscript, joinAssistantText } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint } from './services/bridge-turn-queue.js';
+import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
@@ -76,6 +77,11 @@ const pendingMessages: string[] = [];
 // Attribution lives in BridgeTurnQueue; this file only manages the
 // fs.watch wakeup, byte-offset bookkeeping, lazy baseline, and IPC emit.
 let bridgeJsonlPath: string | undefined;
+/** Directory enclosing bridgeJsonlPath. We poll this dir for newer jsonl
+ *  files so the bridge follows `/clear` / `/resume` in the user's CLI —
+ *  those create a brand-new sessionId.jsonl, and a watcher pinned to the
+ *  original path would silently stop receiving events. */
+let bridgeJsonlDir: string | undefined;
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
@@ -97,7 +103,64 @@ function bridgeAbsorbBaseline(): void {
   bridgeBaselineDone = true;
 }
 
+/** Detect /clear / /resume: when Claude Code starts a new session in the
+ *  user's pane it writes to a brand-new sessionId.jsonl. We *cannot* use
+ *  "latest-mtime jsonl in the project dir" as the switch trigger — that
+ *  hijacks our watcher whenever a sibling Claude pane in the same cwd
+ *  writes anything. Instead, switch only when:
+ *
+ *    1. We have an unstarted pending Lark turn (otherwise no signal to
+ *       chase, and switching would risk grabbing another pane's reply).
+ *    2. The pending turn's content fingerprint shows up in a candidate
+ *       jsonl other than our current one — that's the user's current
+ *       session because they JUST typed our pane-write into it.
+ *
+ *  Pending turns are preserved across the switch so the next ingest can
+ *  match the fingerprint and start the turn in the new file. */
+function maybeSwitchBridgeJsonl(): void {
+  if (!bridgeJsonlDir) return;
+  const pending = bridgeQueue.peek();
+  const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
+  if (!candidate || !candidate.contentFingerprint) return;
+
+  const matched = findJsonlContainingFingerprint(
+    bridgeJsonlDir,
+    candidate.contentFingerprint,
+    bridgeJsonlPath,
+  );
+  if (!matched) return;
+
+  log(`Bridge transcript switched: ${bridgeJsonlPath} → ${matched} (Lark fingerprint observed in new jsonl — user likely ran /clear or /resume)`);
+  if (bridgeWatcher) {
+    try { bridgeWatcher.close(); } catch { /* ignore */ }
+    bridgeWatcher = null;
+  }
+  // Critically: do NOT clear pending turns. The switch was triggered by
+  // the fingerprint of the FIRST pending turn already living in `matched`,
+  // so the immediate next ingest from offset 0 will find that user event
+  // and start the turn. Clearing here would race-drop exactly the message
+  // we're trying to deliver.
+  bridgeJsonlPath = matched;
+  bridgeOffset = 0;
+  bridgePendingTail = '';
+  // baselineDone=false would absorb the new file's existing content
+  // (including the pending turn's user event) as history — defeating the
+  // switch. Skip baseline; fall straight into ingest from offset 0 so
+  // BridgeTurnQueue.ingest() can attribute the matching user/assistant.
+  bridgeBaselineDone = true;
+  try {
+    bridgeWatcher = fsWatch(matched, { persistent: false }, () => {
+      try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
+    });
+  } catch (err: any) {
+    log(`Bridge fs.watch unavailable on new target (${err.message}); relying on fallback poller`);
+  }
+}
+
 function bridgeIngest(): void {
+  // Check for /clear / /resume FIRST — failing to follow the user means we
+  // ingest stale events from a frozen jsonl forever.
+  maybeSwitchBridgeJsonl();
   if (!bridgeJsonlPath) return;
   if (!bridgeBaselineDone) {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.
@@ -113,6 +176,7 @@ function bridgeIngest(): void {
 
 function startBridgeWatcher(jsonlPath: string): void {
   bridgeJsonlPath = jsonlPath;
+  bridgeJsonlDir = dirname(jsonlPath);
   // Try to baseline now. If the file doesn't exist yet, bridgeIngest will
   // baseline lazily once Claude Code creates it (see bridgeBaselineDone).
   if (existsSyncSafe(jsonlPath)) {
@@ -645,6 +709,11 @@ async function flushPending(): Promise<void> {
       const msg = pendingMessages.shift()!;
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       const result = await cliAdapter.writeInput(backend, msg);
+      // Persist any sessionId the adapter observed via authoritative sources
+      // (Claude's pid file, Codex's history). Done independently of submit
+      // outcome — the rotation is real even when the current Enter didn't
+      // land, and we want next-resume to use the right id.
+      if (result?.cliSessionId) persistCliSessionId(result.cliSessionId);
       if (result && result.submitted === false) {
         const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
         log(`writeInput: submit not confirmed after retries — notifying user. preview="${preview}"`);
@@ -652,8 +721,6 @@ async function flushPending(): Promise<void> {
           type: 'user_notify',
           message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 3 次仍未在会话 JSONL 中看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
         });
-      } else if (result?.cliSessionId) {
-        persistCliSessionId(result.cliSessionId);
       }
     }
   } finally {
@@ -843,6 +910,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     } catch (err: any) {
       log(`Failed to write CLI PID marker: ${err.message}`);
     }
+  }
+
+  // Wire pid + cwd so the claude-code adapter's writeInput can read
+  // ~/.claude/sessions/<pid>.json — Claude's authoritative current sessionId.
+  // The pinned claudeJsonlPath above is still used as the initial guess; the
+  // resolver corrects it on first write when Claude has rotated under us.
+  if (cfg.cliId === 'claude-code' && cliPid) {
+    (backend as TmuxBackend | PtyBackend).cliPid = cliPid;
+    (backend as TmuxBackend | PtyBackend).cliCwd = cfg.workingDir;
   }
 
   // On tmux re-attach, keep awaitingFirstPrompt = true so screen updates are

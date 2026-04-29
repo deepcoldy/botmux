@@ -38,6 +38,41 @@ export const PASSTHROUGH_COMMANDS = new Set(['/compact', '/model', '/clear', '/p
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+export interface SlashCommandInvocation {
+  cmd: string;
+  content: string;
+}
+
+const MULTILINE_COMMANDS = new Set(['/schedule']);
+
+/** Parse a user-authored slash command after leading @mentions have already
+ *  been stripped. Messages that look like command examples or command lists
+ *  are intentionally left for the CLI instead of being intercepted by the
+ *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
+ *  trigger real daemon actions. */
+export function parseSlashCommandInvocation(content: string): SlashCommandInvocation | null {
+  const trimmed = content.trimStart();
+  if (!trimmed.startsWith('/')) return null;
+
+  const lines = trimmed.split(/\r?\n/);
+  const firstLine = (lines[0] ?? '').trimEnd();
+  const [cmdRaw] = firstLine.split(/\s+/);
+  const cmd = cmdRaw?.toLowerCase();
+  if (!cmd) return null;
+
+  // Treat angle-bracket placeholders as documentation, not an invocation.
+  if (/<[^>\r\n]+>/.test(firstLine)) return null;
+
+  const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
+  if (restNonBlank.length > 0) {
+    // A list of slash commands is almost certainly discussion / planning text.
+    if (restNonBlank.some(l => l.startsWith('/'))) return null;
+    if (!MULTILINE_COMMANDS.has(cmd)) return null;
+  }
+
+  return { cmd, content: trimmed };
+}
+
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
 }

@@ -267,6 +267,290 @@ describe('writeInput: edge cases', () => {
   });
 });
 
+describe('claude-code writeInput submission confirmation', () => {
+  function makeClaudeJsonlPaths(prefix: string): { oldPath: string; newPath: string } {
+    const projectDir = join(homedir(), '.claude', 'projects', `-${prefix}-project`);
+    mkdirSync(projectDir, { recursive: true });
+    const oldPath = join(projectDir, 'old-session.jsonl');
+    const newPath = join(projectDir, 'new-session.jsonl');
+    writeFileSync(oldPath, '');
+    return { oldPath, newPath };
+  }
+
+  function writeClaudePidFile(pid: number, body: Record<string, unknown>): void {
+    const dir = join(homedir(), '.claude', 'sessions');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${pid}.json`), JSON.stringify({ pid, ...body }));
+  }
+
+  function makeJsonlForSession(prefix: string, sessionId: string, cwd: string): string {
+    const projectHash = cwd.replace(/[^A-Za-z0-9-]/g, '-');
+    const projectDir = join(homedir(), '.claude', 'projects', projectHash);
+    mkdirSync(projectDir, { recursive: true });
+    const path = join(projectDir, `${sessionId}.jsonl`);
+    writeFileSync(path, '');
+    return path;
+  }
+
+  it('follows a new Claude JSONL when the submitted user event lands there', async () => {
+    const { oldPath, newPath } = makeClaudeJsonlPaths('follow-user');
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let wroteNewTranscript = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteNewTranscript) return;
+        wroteNewTranscript = true;
+        writeFileSync(
+          newPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello from the moved session' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'hello from the moved session');
+
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(newPath);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows a new Claude JSONL when type-ahead is recorded as a queue enqueue', async () => {
+    const { oldPath, newPath } = makeClaudeJsonlPaths('follow-queue');
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let wroteNewTranscript = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteNewTranscript) return;
+        wroteNewTranscript = true;
+        writeFileSync(
+          newPath,
+          JSON.stringify({
+            type: 'queue-operation',
+            operation: 'enqueue',
+            content: 'queued prompt after session switch',
+          }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'queued prompt after session switch');
+
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(newPath);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('pid resolver: switches to Claude\'s authoritative session JSONL on entry', async () => {
+    const cwd = '/tmp/pid-resolver-happy';
+    const oldSessionId = '11111111-1111-4111-8111-111111111111';
+    const newSessionId = '22222222-2222-4222-8222-222222222222';
+    const oldPath = makeJsonlForSession('pid-resolver-happy', oldSessionId, cwd);
+    const newPath = makeJsonlForSession('pid-resolver-happy', newSessionId, cwd);
+    // Pid file already points at the rotated session — entry resolver should
+    // re-pin to newPath, then the simulated submit lands there.
+    writeClaudePidFile(7777, { sessionId: newSessionId, cwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: 7777,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendFileSync(
+          newPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'rotated prompt body' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'rotated prompt body');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: newSessionId });
+    expect(pty.claudeJsonlPath).toBe(newPath);
+  });
+
+  it('pid resolver: ignores file when cwd does not match (falls back to fingerprint)', async () => {
+    const cwd = '/tmp/pid-resolver-cwd';
+    const otherCwd = '/tmp/some-other-project';
+    const oldSessionId = '33333333-3333-4333-8333-333333333333';
+    const decoySessionId = '44444444-4444-4444-8444-444444444444';
+    const oldPath = makeJsonlForSession('pid-resolver-cwd', oldSessionId, cwd);
+    // pid file claims a session from a different cwd — resolver must reject it.
+    writeClaudePidFile(8888, { sessionId: decoySessionId, cwd: otherCwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: 8888,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendFileSync(
+          oldPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'submit on pinned path' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'submit on pinned path');
+
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(oldPath);
+  });
+
+  it('pid resolver: ignores file when procStart does not match /proc/<pid>/stat', async () => {
+    const cwd = '/tmp/pid-resolver-procstart';
+    const oldSessionId = '55555555-5555-4555-8555-555555555555';
+    const decoySessionId = '66666666-6666-4666-8666-666666666666';
+    const oldPath = makeJsonlForSession('pid-resolver-procstart', oldSessionId, cwd);
+    const fakePid = 42424;
+    // Stage a fake /proc/<pid>/stat in the mocked fs so readProcStarttime
+    // returns a starttime — procStart in the pid file deliberately differs,
+    // so the resolver must reject the rotation.
+    mkdirSync(`/proc/${fakePid}`, { recursive: true });
+    writeFileSync(
+      `/proc/${fakePid}/stat`,
+      `${fakePid} (claude) S 1 1 1 0 -1 4194304 100 0 0 0 1 1 0 0 20 0 1 0 999999 12345 678 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n`,
+    );
+    writeClaudePidFile(fakePid, { sessionId: decoySessionId, cwd, procStart: '111' });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: fakePid,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendFileSync(
+          oldPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'pinned despite stale procStart' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'pinned despite stale procStart');
+
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(oldPath);
+  });
+
+  it('pid resolver: re-reads pid file mid-flight when sessionId rotates between type and Enter', async () => {
+    const cwd = '/tmp/pid-resolver-rotate';
+    const startSessionId = '77777777-7777-4777-8777-777777777777';
+    const rotatedSessionId = '88888888-8888-4888-8888-888888888888';
+    const startPath = makeJsonlForSession('pid-resolver-rotate', startSessionId, cwd);
+    const rotatedPath = makeJsonlForSession('pid-resolver-rotate', rotatedSessionId, cwd);
+    // Initial pid file points at the starting session.
+    writeClaudePidFile(9999, { sessionId: startSessionId, cwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: startPath,
+      cliPid: 9999,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        // Simulate Claude rotating sessionId at submit time: the user line
+        // lands in the rotated jsonl AND the pid file is updated. The
+        // adapter must re-resolve and return the new id.
+        writeClaudePidFile(9999, { sessionId: rotatedSessionId, cwd });
+        appendFileSync(
+          rotatedPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'sent during rotation' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'sent during rotation');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
+    expect(pty.claudeJsonlPath).toBe(rotatedPath);
+    // Critically: the rotation must be detected on the FIRST Enter — no extra
+    // retries, otherwise live users would see a multi-submit duplicate.
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('pid resolver: polls rotated JSONL from its own baseline when append follows pid update', async () => {
+    const cwd = '/tmp/pid-resolver-rotate-delayed';
+    const startSessionId = '99999999-9999-4999-8999-999999999999';
+    const rotatedSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const startPath = makeJsonlForSession('pid-resolver-rotate-delayed', startSessionId, cwd);
+    const rotatedPath = makeJsonlForSession('pid-resolver-rotate-delayed', rotatedSessionId, cwd);
+    // Make the starting transcript larger than the rotated one. A stale
+    // baseByte from startPath would otherwise hide the delayed append.
+    writeFileSync(startPath, `${'x'.repeat(4096)}\n`);
+    writeClaudePidFile(12345, { sessionId: startSessionId, cwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let scheduledAppend = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: startPath,
+      cliPid: 12345,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || scheduledAppend) return;
+        scheduledAppend = true;
+        writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
+        setTimeout(() => {
+          appendFileSync(
+            rotatedPath,
+            JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
+          );
+        }, 850);
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'delayed append after pid rotate');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
+    expect(pty.claudeJsonlPath).toBe(rotatedPath);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('pid resolver: missing pid file → falls back to fingerprint search', async () => {
+    const { oldPath, newPath } = makeClaudeJsonlPaths('pid-resolver-missing');
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let wroteNewTranscript = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: 6543, // No pid file written → resolver returns null
+      cliCwd: '/tmp/pid-resolver-missing-cwd',
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteNewTranscript) return;
+        wroteNewTranscript = true;
+        writeFileSync(
+          newPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'fallback by fingerprint' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'fallback by fingerprint');
+
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(newPath);
+  });
+});
+
 describe('codex writeInput submission confirmation', () => {
   it('buildArgs resumes with the persisted Codex thread id', () => {
     resetCodexHistory();
