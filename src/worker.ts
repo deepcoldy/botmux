@@ -45,7 +45,7 @@ import {
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid } from './adapters/cli/claude-code.js';
-import type { CliAdapter } from './adapters/cli/types.js';
+import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
@@ -2004,6 +2004,18 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         ? createCliAdapterSync('codex', undefined)
         : ({ completionPattern: undefined, readyPattern: undefined } as any);
     idleDetector = new IdleDetector(idleAdapter);
+    // Codex adopt write path: route Lark messages through the codex
+    // adapter's writeInput so they pick up the 200 ms paste-detection
+    // delay + Enter-retry + ~/.codex/history.jsonl verification loop
+    // (see src/adapters/cli/codex.ts:125-178). Without it, Codex TUI's
+    // "\n treated as Enter" handling leaves multi-line submits stuck
+    // in the input box. Other adopt CLIs keep the simpler raw
+    // sendText+Enter path — claude-code adopt has its own bridge
+    // verify path; gemini / coco / opencode / aiden haven't surfaced
+    // this failure mode and we don't want to risk regressing them.
+    if (cfg.cliId === 'codex') {
+      cliAdapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+    }
     idleDetector.onIdle(() => {
       log('Prompt detected (idle) — adopt mode');
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
@@ -2659,9 +2671,40 @@ process.on('message', async (raw: unknown) => {
           try { codexBridgeIngest(); } catch { /* best effort */ }
           codexBridgeMarkPendingTurn(content);
         }
-        // Adopt mode: raw write to PTY (no adapter writeInput)
+        // Adopt mode write:
+        //   - codex routes through cliAdapter.writeInput so the adapter's
+        //     paste-detection delay + Enter-retry + history.jsonl verify
+        //     loop handles Codex TUI's "\n treated as Enter" submit
+        //     behaviour. Without it, Lark messages get stranded in the
+        //     input box (user-reported "卡在输入框中").
+        //   - everything else keeps the simple raw sendText+Enter — the
+        //     claude-code adopt bridge has its own dual-write recovery
+        //     path, and the other CLIs' adopt flows haven't surfaced
+        //     this submit-detection issue.
         if (backend) {
-          if ('sendText' in backend && 'sendSpecialKeys' in backend) {
+          if (lastInitConfig?.cliId === 'codex' && cliAdapter) {
+            // writeInput is async but we're already inside an async
+            // message handler. Errors are best-effort logged; the bridge
+            // ingest path is unaffected because mark already happened
+            // above (codexBridgeMarkPendingTurn / bridgeMarkPendingTurn).
+            try {
+              const result = await cliAdapter.writeInput(backend as unknown as PtyHandle, content);
+              if (result?.cliSessionId) {
+                persistCliSessionId(result.cliSessionId);
+                codexBridgeNotifyCliSessionId(result.cliSessionId);
+              }
+              if (result && result.submitted === false) {
+                const preview = content.length > 60 ? content.slice(0, 60) + '…' : content;
+                log(`Codex adopt writeInput: submit not confirmed after retries — notifying user. preview="${preview}"`);
+                send({
+                  type: 'user_notify',
+                  message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 3 次仍未在 Codex history 中看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
+                });
+              }
+            } catch (err: any) {
+              log(`Codex adopt writeInput error: ${err.message}`);
+            }
+          } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
             (backend as any).sendText(content);
             (backend as any).sendSpecialKeys('Enter');
           } else {
