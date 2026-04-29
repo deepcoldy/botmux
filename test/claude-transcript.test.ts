@@ -17,6 +17,7 @@ import {
   joinAssistantText,
   findLatestJsonl,
   findJsonlContainingFingerprint,
+  jsonlContainsFingerprint,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -552,3 +553,80 @@ describe('bridge rotation: drain + emit before switch', () => {
     expect(joinAssistantText(matched)).toBe('late but valid reply');
   });
 });
+
+// ─── Fingerprint tool_result false-positive guard ─────────────────────────
+//
+// Live failure observed: user sent "hello" via Lark to an /adopt-bridged
+// Claude. Bridge fingerprint fallback found "hello" in an unrelated
+// sibling jsonl whose tool_result block contained log output mentioning
+// "hello", and switched the watcher away from the correct adopt target
+// — final_output was lost. The fix is to skip pure tool_result user
+// events in both fingerprint scanners, matching what
+// BridgeTurnQueue.ingest already does.
+
+describe('fingerprint search: tool_result content must not false-match', () => {
+  it('jsonlContainsFingerprint ignores tool_result blocks', () => {
+    const path = join(dir, 'sibling.jsonl');
+    appendFileSync(
+      path,
+      // role:user with content as array of tool_result blocks. The
+      // tool_result.content includes the substring "hello" (e.g. a log
+      // line that was the result of an earlier Bash tool_use). No real
+      // user typed "hello" here, so the fingerprint must NOT match.
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: 'log dump line that mentions hello and other stuff' },
+          ],
+        },
+      }) + '\n',
+      'utf8',
+    );
+    expect(jsonlContainsFingerprint(path, 'hello')).toBe(false);
+  });
+
+  it('findJsonlContainingFingerprint skips tool_result-only sibling jsonls', () => {
+    const sibling = join(dir, 'sibling-tool.jsonl');
+    const realUser = join(dir, 'real-user.jsonl');
+    appendFileSync(
+      sibling,
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: 'noise mentioning hello in tool output' },
+          ],
+        },
+      }) + '\n',
+      'utf8',
+    );
+    // A *real* user event in another file with the actual fingerprint —
+    // this is what should be returned, not the tool_result-only sibling.
+    appendFileSync(
+      realUser,
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'hello bridge' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(findJsonlContainingFingerprint(dir, 'hello')).toBe(realUser);
+  });
+
+  it('jsonlContainsFingerprint still matches genuine string-content user events', () => {
+    const path = join(dir, 'genuine-user.jsonl');
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'hello bridge — typed by the user' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(jsonlContainsFingerprint(path, 'hello')).toBe(true);
+  });
+});
+

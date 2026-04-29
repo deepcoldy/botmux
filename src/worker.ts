@@ -203,14 +203,22 @@ function maybeSwitchBridgeJsonl(): void {
  *  because the pid file is updated on every Claude state change so it
  *  catches /clear / /resume / Claude restart cases that have no Lark
  *  fingerprint to match against. */
-function maybeFollowSessionRotationViaPid(): boolean {
-  if (!bridgeCliPid || !bridgeCliCwd) return false;
+/** Tri-state result so callers can distinguish "pid file unreadable, fall
+ *  back to fingerprint heuristic" from "pid file confirmed current path"
+ *  vs "pid file said rotate to a new path". The fingerprint fallback must
+ *  only run on `unavailable` — when pid resolver gave us an answer we
+ *  trust it as the source of truth, otherwise short Lark fingerprints
+ *  (e.g. "hello") can hijack the watcher to an unrelated sibling jsonl. */
+type PidFollowResult = 'unavailable' | 'same' | 'switched';
+
+function maybeFollowSessionRotationViaPid(): PidFollowResult {
+  if (!bridgeCliPid || !bridgeCliCwd) return 'unavailable';
   const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
-  if (!resolved) return false;
+  if (!resolved) return 'unavailable';
   if (bridgeObservedCliSessionId !== resolved.cliSessionId) {
     bridgeObservedCliSessionId = resolved.cliSessionId;
   }
-  if (resolved.path === bridgeJsonlPath) return false;
+  if (resolved.path === bridgeJsonlPath) return 'same';
 
   // Drain-before-switch: pull in any unread bytes from the OLD path so a
   // trailing assistant append doesn't vanish. We do NOT emit here — emit
@@ -253,7 +261,7 @@ function maybeFollowSessionRotationViaPid(): boolean {
   } catch (err: any) {
     log(`Bridge fs.watch unavailable on rotated target (${err.message}); relying on fallback poller`);
   }
-  return true;
+  return 'switched';
 }
 
 function bridgeIngest(): void {
@@ -265,11 +273,17 @@ function bridgeIngest(): void {
   // Authoritative pid-resolver check first — covers /clear / /resume /
   // daemon-resume rotations that the fingerprint fallback below can't see
   // (no Lark fingerprint has been written into the new jsonl yet).
-  maybeFollowSessionRotationViaPid();
-  // Fingerprint-based fallback: covers cases where the pid file is
-  // unreadable (validation failed, /proc unavailable, etc.) but a Lark
-  // message has shown up in a sibling jsonl.
-  maybeSwitchBridgeJsonl();
+  const pidFollow = maybeFollowSessionRotationViaPid();
+  // Fingerprint fallback ONLY when pid resolver couldn't tell us anything
+  // ('unavailable'). When pid resolver returned 'same' or 'switched' we
+  // already have an authoritative answer; running fingerprint search here
+  // would let a short message ("hello") false-match a sibling Claude
+  // pane's tool_result content and hijack the watcher. With pid resolver
+  // working, the bridge is always pinned to Claude's own pid → sessionId
+  // record.
+  if (pidFollow === 'unavailable') {
+    maybeSwitchBridgeJsonl();
+  }
   if (!bridgeJsonlPath) return;
   if (!bridgeBaselineDone) {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.

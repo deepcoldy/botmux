@@ -23,7 +23,7 @@
  * Baseline (`absorb()`) takes a batch of historical events and registers
  * their uuids as already-seen so future ingest doesn't double-attribute.
  */
-import { stringifyUserContent, normaliseForFingerprint, type TranscriptEvent } from './claude-transcript.js';
+import { stringifyUserContent, normaliseForFingerprint, isPureToolResultUserEvent, type TranscriptEvent } from './claude-transcript.js';
 
 // Re-export so existing callers (worker.ts, tests) don't need to change
 // their import path now that these helpers live in claude-transcript.ts.
@@ -46,11 +46,6 @@ export interface BridgePendingTurn {
    *  uuid → text resolution would fail and the reply would be silently
    *  dropped. */
   sourceJsonlPath?: string;
-}
-
-function isPureToolResultUserEvent(content: unknown): boolean {
-  if (!Array.isArray(content) || content.length === 0) return false;
-  return content.every((block: any) => block?.type === 'tool_result');
 }
 
 function assistantHasVisibleText(content: unknown): boolean {

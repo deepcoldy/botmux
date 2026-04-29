@@ -167,6 +167,26 @@ export function joinAssistantText(events: TranscriptEvent[]): string {
 }
 
 /**
+ * True when a user-role event carries ONLY tool_result blocks — Claude
+ * Code's representation of "tool returned this output" between an
+ * assistant tool_use and the assistant's continuation. Both the bridge
+ * attribution queue and the on-disk fingerprint search must skip these:
+ *
+ *   - the queue would treat tool output as fresh local input and disable
+ *     collection mid-turn,
+ *   - the fingerprint search would false-positive on log content that
+ *     happens to contain the Lark fingerprint substring (e.g. a short
+ *     "hello" message hijacked by an unrelated jsonl whose tool_result
+ *     dumped a log line containing "hello"). Re-exported by
+ *     bridge-turn-queue.ts so both consumers share the same predicate
+ *     and never drift apart.
+ */
+export function isPureToolResultUserEvent(content: unknown): boolean {
+  if (!Array.isArray(content) || content.length === 0) return false;
+  return content.every((block: any) => block?.type === 'tool_result');
+}
+
+/**
  * Stringify a transcript user event's content to a flat string. Handles
  * both legacy bare-string content and the array-of-blocks form.
  *
@@ -304,6 +324,11 @@ export function jsonlContainsFingerprint(
     const role = ev.message?.role ?? ev.type;
     let lineText = '';
     if (role === 'user') {
+      // Skip pure tool_result events — Claude Code records them as
+      // role:user but they're internal turn machinery, not the user's
+      // actual prompt. A tool_result that dumps log output containing
+      // the fingerprint substring would otherwise hijack the search.
+      if (isPureToolResultUserEvent(ev.message?.content)) continue;
       lineText = stringifyUserContent(ev.message?.content);
     } else if (
       includeQueueOps &&
@@ -383,6 +408,11 @@ export function findJsonlContainingFingerprint(
           const role = ev.message?.role ?? ev.type;
           let text = '';
           if (role === 'user') {
+            // Skip pure tool_result events — see jsonlContainsFingerprint
+            // for the full rationale; in short, tool_result content is
+            // log output, not user input, and would false-match short
+            // fingerprints like "hello" in unrelated jsonls.
+            if (isPureToolResultUserEvent(ev.message?.content)) continue;
             text = stringifyUserContent(ev.message?.content);
           } else if (
             opts.includeQueueOperations &&
