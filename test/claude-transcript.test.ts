@@ -454,4 +454,101 @@ describe('bridge rotation: drain + emit before switch', () => {
     const matched = drainedFromSource.events.filter(e => e.uuid && ready[0].assistantUuids.includes(e.uuid));
     expect(joinAssistantText(matched)).toBe('reply text from rotated jsonl');
   });
+
+  it('rotation drain+switch does NOT emit ready turns; only idle path emits', () => {
+    // Codex review of 4036fcc P1.1: drainEmittable's contract is "has visible
+    // text", not "model finished". If the rotation helper invoked emit
+    // during a non-idle fs.watch / poll tick, half-finished assistant text
+    // would be flushed to Lark prematurely. The rotation helpers must only
+    // ingest into the queue; emit is reserved for idle-driven ticks.
+    const oldPath = join(dir, 'old-session.jsonl');
+    writeFileSync(oldPath, '');
+
+    const queue = new BridgeTurnQueue();
+    queue.mark('t1', 'hello bridge');
+
+    // Mid-turn snapshot: user landed + a *partial* assistant text block.
+    // (Claude often emits multiple assistant events within one turn —
+    // drainEmittable can't distinguish "finished" from "still streaming".)
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hello bridge — please reply' } }) + '\n' +
+      JSON.stringify({ type: 'assistant', uuid: 'a-partial', message: { role: 'assistant', content: [{ type: 'text', text: 'thinking...' }] } }) + '\n',
+      'utf8',
+    );
+
+    // Simulate the rotation-helper code path: drain into queue, do NOT
+    // call drainEmittable. The original-design "emit only at idle" rule
+    // means publication is gated on the idle handler.
+    const r = drainTranscript(oldPath, 0);
+    queue.ingest(r.events, oldPath);
+
+    // Until idle fires, the turn must remain in the queue (not be popped
+    // and emitted by the rotation tick).
+    expect(queue.peek()).toHaveLength(1);
+    expect(queue.peek()[0].started).toBe(true);
+    expect(queue.peek()[0].assistantUuids).toEqual(['a-partial']);
+  });
+
+  it('keeps polling old path until in-flight turn arrives, then emits', () => {
+    // Codex P1.2: after rotation switches the primary path away, an
+    // in-flight turn whose assistant text hasn't landed yet must still
+    // get its append picked up. Modeled here as the secondary-path
+    // polling loop the worker uses: drain each retained path on every
+    // tick, queue ingests with that path as the source stamp.
+    const oldPath = join(dir, 'old-session.jsonl');
+    const newPath = join(dir, 'new-session.jsonl');
+    writeFileSync(oldPath, '');
+    writeFileSync(newPath, '');
+
+    const queue = new BridgeTurnQueue();
+    queue.mark('t1', 'hello bridge');
+
+    // tick 1 — user lands on old path; turn starts there.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hello bridge — please reply' } }) + '\n',
+      'utf8',
+    );
+    let oldOffset = 0;
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+      oldOffset = r.newOffset;
+    }
+    // Rotation: pid file now points at newPath. We drain old once more
+    // (still no assistant) and retain it as a secondary path because the
+    // turn started there.
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+      oldOffset = r.newOffset;
+    }
+    const secondaryPaths = new Map<string, number>();
+    if (queue.peek().some(t => t.sourceJsonlPath === oldPath)) {
+      secondaryPaths.set(oldPath, oldOffset);
+    }
+    expect(secondaryPaths.has(oldPath)).toBe(true);
+
+    // tick 2 — assistant finally lands on old path (Claude finished
+    // mid-rotation). The secondary-path drain picks it up.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'late but valid reply' }] } }) + '\n',
+      'utf8',
+    );
+    for (const [path, off] of secondaryPaths) {
+      const r = drainTranscript(path, off);
+      queue.ingest(r.events, path);
+      secondaryPaths.set(path, r.newOffset);
+    }
+
+    // Idle tick: emit. Turn resolves text from oldPath via sourceJsonlPath.
+    const ready = queue.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].sourceJsonlPath).toBe(oldPath);
+    const drained = drainTranscript(ready[0].sourceJsonlPath!, 0);
+    const matched = drained.events.filter(e => e.uuid && ready[0].assistantUuids.includes(e.uuid));
+    expect(joinAssistantText(matched)).toBe('late but valid reply');
+  });
 });

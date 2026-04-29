@@ -92,6 +92,13 @@ let bridgeCliCwd: string | undefined;
 /** Last sessionId we observed via the pid resolver — used to detect
  *  rotations cheaply (string compare instead of stat()ing every jsonl). */
 let bridgeObservedCliSessionId: string | undefined;
+/** Old jsonl paths we keep polling AFTER a rotation switched
+ *  bridgeJsonlPath away — needed when a started turn was stamped with the
+ *  old path but its assistant text hasn't been written yet. We continue to
+ *  drain each entry on every tick so trailing appends to that file land in
+ *  the queue against the right turn, and prune the entry once no pending
+ *  turn references the path anymore. */
+const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
@@ -140,16 +147,19 @@ function maybeSwitchBridgeJsonl(): void {
   );
   if (!matched) return;
 
-  // Same drain-before-switch protocol as the pid resolver path: any
-  // assistant events appended to the OLD path right before the switch
-  // would otherwise vanish (fs.watch is best-effort). Drain + emit first.
+  // Drain-before-switch: pull in any unread bytes from the old path so a
+  // late assistant append doesn't vanish. We do NOT emit here — emission
+  // only happens at idle (bridgeDrainAndMaybeEmit), otherwise drainEmittable
+  // would publish a half-finished assistant turn during fs.watch / poll
+  // ticks (drainEmittable's contract is "has visible text", not "model
+  // finished"). If the drained user/assistant events still need follow-up
+  // appends on the old path, retainSecondaryPathIfStillReferenced() keeps
+  // the old path in the polling rotation.
   if (bridgeJsonlPath && bridgeBaselineDone) {
     try { drainPathInto(bridgeJsonlPath, bridgeOffset); } catch (err: any) {
       log(`Bridge final-drain on fingerprint switch failed (${err.message}); continuing`);
     }
-    try { emitReadyTurns(); } catch (err: any) {
-      log(`Bridge final-emit on fingerprint switch failed (${err.message}); continuing`);
-    }
+    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, bridgeOffset);
   }
 
   log(`Bridge transcript switched: ${bridgeJsonlPath} → ${matched} (Lark fingerprint observed in new jsonl — user likely ran /clear or /resume)`);
@@ -198,20 +208,18 @@ function maybeFollowSessionRotationViaPid(): boolean {
   }
   if (resolved.path === bridgeJsonlPath) return false;
 
-  // Critical: drain any unread bytes from the OLD path BEFORE switching.
-  // fs.watch is best-effort, and there could be assistant events still
-  // sitting at end-of-file that the fallback poller hasn't seen yet. If
-  // we switch first, those events will never be drained and an in-flight
-  // reply gets silently dropped. After draining we emit any turn that's
-  // now complete (its assistantUuids resolve from the OLD path because
-  // BridgePendingTurn.sourceJsonlPath was stamped at turn-start).
+  // Drain-before-switch: pull in any unread bytes from the OLD path so a
+  // trailing assistant append doesn't vanish. We do NOT emit here — emit
+  // is reserved for idle ticks (bridgeDrainAndMaybeEmit), otherwise we'd
+  // publish a half-finished assistant during fs.watch / poll-driven
+  // bridgeIngest calls. If a started turn still references the old path
+  // and its assistant text might still be on the way, the old path stays
+  // in the polling rotation via bridgeSecondaryPaths.
   if (bridgeJsonlPath && bridgeBaselineDone) {
     try { drainPathInto(bridgeJsonlPath, bridgeOffset); } catch (err: any) {
       log(`Bridge final-drain on rotation failed (${err.message}); continuing`);
     }
-    try { emitReadyTurns(); } catch (err: any) {
-      log(`Bridge final-emit on rotation failed (${err.message}); continuing`);
-    }
+    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, bridgeOffset);
   }
 
   log(`Bridge transcript switched (pid resolver): ${bridgeJsonlPath ?? '(none)'} → ${resolved.path}`);
@@ -241,6 +249,11 @@ function maybeFollowSessionRotationViaPid(): boolean {
 }
 
 function bridgeIngest(): void {
+  // Drain secondary paths first so any trailing assistant text on an old
+  // jsonl reaches the queue before the rotation check considers retiring
+  // the path. Strictly read-only on the polling rotation; never triggers
+  // a rotate or shifts the primary path.
+  drainSecondaryPaths();
   // Authoritative pid-resolver check first — covers /clear / /resume /
   // daemon-resume rotations that the fingerprint fallback below can't see
   // (no Lark fingerprint has been written into the new jsonl yet).
@@ -318,6 +331,7 @@ function stopBridgeWatcher(): void {
   bridgeCliPid = undefined;
   bridgeCliCwd = undefined;
   bridgeObservedCliSessionId = undefined;
+  bridgeSecondaryPaths.clear();
 }
 
 /**
@@ -350,6 +364,10 @@ function bridgeDrainAndMaybeEmit(): void {
   if (!bridgeJsonlPath) return;
   bridgeIngest();
   emitReadyTurns();
+  // Prune AFTER emit so a path is only retired once its turn has actually
+  // been published. During non-idle ticks (fs.watch / 1s poll) we never
+  // emit, so we never prune — the path stays put until idle resolves it.
+  pruneSecondaryPaths();
 }
 
 /** Pop ready turns and emit their final_output. Resolves uuid → text via
@@ -392,6 +410,58 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
   const result = drainTranscript(path, fromOffset);
   bridgeQueue.ingest(result.events, path);
   return { offset: result.newOffset, tail: result.pendingTail };
+}
+
+/** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
+ *  whose sourceJsonlPath equals oldPath may still be waiting on assistant
+ *  text that hasn't landed yet. Add oldPath to the secondary polling set
+ *  so subsequent ingests continue to drain it; the offset is whatever was
+ *  reached by the final pre-switch drain so we don't re-scan history. The
+ *  entry is later pruned after each idle emit when no started turn
+ *  references it anymore. */
+function retainSecondaryPathIfStillReferenced(oldPath: string, postDrainOffset: number): void {
+  const stillReferenced = bridgeQueue.peek().some(t => t.sourceJsonlPath === oldPath);
+  if (!stillReferenced) return;
+  const existing = bridgeSecondaryPaths.get(oldPath);
+  // Don't rewind a higher existing offset — multiple rotations through
+  // the same file shouldn't replay drained bytes.
+  if (existing === undefined || postDrainOffset > existing) {
+    bridgeSecondaryPaths.set(oldPath, postDrainOffset);
+  }
+  log(`Bridge retaining secondary path ${oldPath} (offset=${postDrainOffset}) for in-flight turn`);
+}
+
+/** Drain every secondary path once. Mirrors bridgeIngest's primary-path
+ *  drain but never touches bridgeJsonlPath / bridgeOffset and never
+ *  triggers further rotation checks — it's strictly a "catch up trailing
+ *  events on an old file" pass. */
+function drainSecondaryPaths(): void {
+  for (const [path, offset] of bridgeSecondaryPaths) {
+    try {
+      const result = drainTranscript(path, offset);
+      if (result.events.length > 0) bridgeQueue.ingest(result.events, path);
+      bridgeSecondaryPaths.set(path, result.newOffset);
+    } catch (err: any) {
+      log(`Bridge secondary-path drain failed (${path}): ${err.message}`);
+    }
+  }
+}
+
+/** Drop secondary paths whose started turns are no longer in the queue —
+ *  i.e. they've been emitted (or discarded). Called after each idle emit so
+ *  pruning never races with an in-flight turn. */
+function pruneSecondaryPaths(): void {
+  if (bridgeSecondaryPaths.size === 0) return;
+  const referenced = new Set<string>();
+  for (const t of bridgeQueue.peek()) {
+    if (t.sourceJsonlPath) referenced.add(t.sourceJsonlPath);
+  }
+  for (const path of [...bridgeSecondaryPaths.keys()]) {
+    if (!referenced.has(path)) {
+      bridgeSecondaryPaths.delete(path);
+      log(`Bridge dropped secondary path ${path} (no remaining turns)`);
+    }
+  }
 }
 
 /** Tiny safe-existence check that doesn't throw. */
