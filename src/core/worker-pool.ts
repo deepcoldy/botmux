@@ -874,6 +874,12 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     adoptPaneCols: adopted.paneCols,
     adoptPaneRows: adopted.paneRows,
     bridgeJsonlPath,
+    // Adopt PID + cwd let the worker re-resolve Claude's authoritative
+    // current sessionId via ~/.claude/sessions/<pid>.json on every poll —
+    // catches /clear / /resume rotations that the fingerprint-based
+    // fallback alone can miss when no Lark message has been sent yet.
+    adoptCliPid: adoptedCliId === 'claude-code' ? adopted.originalCliPid : undefined,
+    adoptCwd: adoptedCliId === 'claude-code' ? adopted.cwd : undefined,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

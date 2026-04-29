@@ -23,7 +23,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
-import { claudeJsonlPathForSession } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveJsonlFromPid } from './adapters/cli/claude-code.js';
 import type { CliAdapter } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -82,6 +82,16 @@ let bridgeJsonlPath: string | undefined;
  *  those create a brand-new sessionId.jsonl, and a watcher pinned to the
  *  original path would silently stop receiving events. */
 let bridgeJsonlDir: string | undefined;
+/** PID + cwd of the adopted Claude Code process. Lets every poll re-read
+ *  ~/.claude/sessions/<pid>.json — Claude's own authoritative record of the
+ *  current sessionId — and switch the watched jsonl when Claude rotates
+ *  (via /clear, /resume, --resume etc.) without waiting for a Lark message
+ *  to land in the new file. */
+let bridgeCliPid: number | undefined;
+let bridgeCliCwd: string | undefined;
+/** Last sessionId we observed via the pid resolver — used to detect
+ *  rotations cheaply (string compare instead of stat()ing every jsonl). */
+let bridgeObservedCliSessionId: string | undefined;
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
@@ -157,9 +167,57 @@ function maybeSwitchBridgeJsonl(): void {
   }
 }
 
+/** Authoritative rotation follow: re-read ~/.claude/sessions/<cliPid>.json
+ *  and switch bridgeJsonlPath whenever Claude's recorded sessionId differs
+ *  from what we're watching. Same source as the writeInput pid resolver,
+ *  with the same cwd + procStart validation. Returns true on switch.
+ *
+ *  This replaces the original mtime-based "latest jsonl" hack and runs
+ *  *before* the fingerprint-based fallback (`maybeSwitchBridgeJsonl`),
+ *  because the pid file is updated on every Claude state change so it
+ *  catches /clear / /resume / Claude restart cases that have no Lark
+ *  fingerprint to match against. */
+function maybeFollowSessionRotationViaPid(): boolean {
+  if (!bridgeCliPid || !bridgeCliCwd) return false;
+  const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
+  if (!resolved) return false;
+  if (bridgeObservedCliSessionId !== resolved.cliSessionId) {
+    bridgeObservedCliSessionId = resolved.cliSessionId;
+  }
+  if (resolved.path === bridgeJsonlPath) return false;
+
+  log(`Bridge transcript switched (pid resolver): ${bridgeJsonlPath ?? '(none)'} → ${resolved.path}`);
+  if (bridgeWatcher) {
+    try { bridgeWatcher.close(); } catch { /* ignore */ }
+    bridgeWatcher = null;
+  }
+  // Preserve any pending Lark turn so the next ingest can attribute it
+  // when Claude appends our user event to the new jsonl. Skip baseline:
+  // we want to read from offset 0 so the pending turn's user event is
+  // visible to BridgeTurnQueue.ingest().
+  bridgeJsonlPath = resolved.path;
+  bridgeJsonlDir = dirname(resolved.path);
+  bridgeOffset = 0;
+  bridgePendingTail = '';
+  bridgeBaselineDone = true;
+  try {
+    bridgeWatcher = fsWatch(resolved.path, { persistent: false }, () => {
+      try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
+    });
+  } catch (err: any) {
+    log(`Bridge fs.watch unavailable on rotated target (${err.message}); relying on fallback poller`);
+  }
+  return true;
+}
+
 function bridgeIngest(): void {
-  // Check for /clear / /resume FIRST — failing to follow the user means we
-  // ingest stale events from a frozen jsonl forever.
+  // Authoritative pid-resolver check first — covers /clear / /resume /
+  // daemon-resume rotations that the fingerprint fallback below can't see
+  // (no Lark fingerprint has been written into the new jsonl yet).
+  maybeFollowSessionRotationViaPid();
+  // Fingerprint-based fallback: covers cases where the pid file is
+  // unreadable (validation failed, /proc unavailable, etc.) but a Lark
+  // message has shown up in a sibling jsonl.
   maybeSwitchBridgeJsonl();
   if (!bridgeJsonlPath) return;
   if (!bridgeBaselineDone) {
@@ -174,22 +232,40 @@ function bridgeIngest(): void {
   bridgeQueue.ingest(result.events);
 }
 
-function startBridgeWatcher(jsonlPath: string): void {
+function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string }): void {
   bridgeJsonlPath = jsonlPath;
   bridgeJsonlDir = dirname(jsonlPath);
+  bridgeCliPid = opts?.cliPid;
+  bridgeCliCwd = opts?.cliCwd;
+  // Authoritative: prefer Claude's own pid-state record over the path the
+  // adopt scan computed. If Claude has already rotated since adopt fired
+  // (e.g. user ran /clear before any Lark message arrived), this swaps the
+  // initial path before baseline so we don't waste a baseline on a frozen
+  // file.
+  if (bridgeCliPid && bridgeCliCwd) {
+    const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
+    if (resolved) {
+      bridgeObservedCliSessionId = resolved.cliSessionId;
+      if (resolved.path !== bridgeJsonlPath) {
+        log(`Bridge transcript adjusted at start (pid resolver): ${bridgeJsonlPath} → ${resolved.path}`);
+        bridgeJsonlPath = resolved.path;
+        bridgeJsonlDir = dirname(resolved.path);
+      }
+    }
+  }
   // Try to baseline now. If the file doesn't exist yet, bridgeIngest will
   // baseline lazily once Claude Code creates it (see bridgeBaselineDone).
-  if (existsSyncSafe(jsonlPath)) {
+  if (existsSyncSafe(bridgeJsonlPath)) {
     bridgeAbsorbBaseline();
-    log(`Bridge baselined: ${jsonlPath} (offset=${bridgeOffset})`);
+    log(`Bridge baselined: ${bridgeJsonlPath} (offset=${bridgeOffset})`);
   } else {
-    log(`Bridge transcript not yet present at ${jsonlPath}; will baseline on first appearance`);
+    log(`Bridge transcript not yet present at ${bridgeJsonlPath}; will baseline on first appearance`);
   }
   // fs.watch is best-effort wakeup — actual data source is the byte offset.
   // The fallback poller covers fs.watch's gaps (NFS, rename-rotation, etc.)
   // and also drives lazy baseline when the file shows up after attach.
   try {
-    bridgeWatcher = fsWatch(jsonlPath, { persistent: false }, () => {
+    bridgeWatcher = fsWatch(bridgeJsonlPath, { persistent: false }, () => {
       try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
     });
   } catch (err: any) {
@@ -209,6 +285,9 @@ function stopBridgeWatcher(): void {
     clearInterval(bridgeFallbackTimer);
     bridgeFallbackTimer = null;
   }
+  bridgeCliPid = undefined;
+  bridgeCliCwd = undefined;
+  bridgeObservedCliSessionId = undefined;
 }
 
 /**
@@ -811,7 +890,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // turns out-of-band. Only enabled when the daemon supplied a path
     // (claude-code adopt with a known sessionId).
     if (cfg.bridgeJsonlPath) {
-      startBridgeWatcher(cfg.bridgeJsonlPath);
+      startBridgeWatcher(cfg.bridgeJsonlPath, {
+        cliPid: cfg.adoptCliPid,
+        cliCwd: cfg.adoptCwd,
+      });
     }
 
     // Idle detection. In bridge mode we use Claude Code's real
