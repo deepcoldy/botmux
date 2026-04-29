@@ -45,13 +45,39 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
+  // Mirrors the real buildStreamingCard signature:
+  //   (sessionId, rootId, terminalUrl, title, screenContent, status,
+  //    cliId?, displayMode='hidden', cardNonce?, imageKey?, adoptMode?, showTakeover?)
+  // The legacy `streamExpanded` boolean has been replaced by `displayMode`
+  // ('hidden' | 'screenshot'). Tests still parse `expanded` from the rendered
+  // card body for back-compat — derive it from displayMode.
   buildStreamingCard: vi.fn(
-    (_sid: string, _rid: string, _url: string, _title: string, content: string, status: string, _cliId: string, expanded?: boolean, cardNonce?: string) =>
-      JSON.stringify({ type: 'streaming', expanded: !!expanded, content, status, cardNonce }),
+    (
+      _sid: string, _rid: string, _url: string, _title: string,
+      content: string, status: string, _cliId: string,
+      displayMode: 'hidden' | 'screenshot' = 'hidden',
+      cardNonce?: string,
+      _imageKey?: string,
+      adoptMode?: boolean,
+      showTakeover?: boolean,
+    ) =>
+      JSON.stringify({
+        type: 'streaming',
+        expanded: displayMode === 'screenshot',
+        displayMode,
+        content,
+        status,
+        cardNonce,
+        adoptMode: !!adoptMode,
+        showTakeover: !!showTakeover,
+      }),
   ),
   buildSessionCard: vi.fn(
-    (_sid: string, _rid: string, _url: string, _title: string, _cliId: string) =>
-      JSON.stringify({ type: 'session', url: _url }),
+    (
+      _sid: string, _rid: string, _url: string, _title: string,
+      _cliId: string, showManageButtons?: boolean, adoptMode?: boolean,
+    ) =>
+      JSON.stringify({ type: 'session', url: _url, showManageButtons: !!showManageButtons, adoptMode: !!adoptMode }),
   ),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
@@ -93,6 +119,12 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
+  // card-handler now persists streaming-card state on every toggle so it
+  // survives daemon restart; the integration tests don't care about disk
+  // state, just that the call is satisfied.
+  persistStreamCardState: vi.fn(),
+  buildBridgeInputContent: vi.fn((s: string) => s),
+  buildFollowUpContent: vi.fn((s: string) => s),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -141,7 +173,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
     cliVersion: '1.0',
     lastMessageAt: Date.now(),
     hasHistory: false,
-    streamExpanded: false,
+    displayMode: 'hidden',
     streamCardNonce: NONCE_CURRENT,
     lastScreenContent: '',
     lastScreenStatus: 'working',
@@ -214,7 +246,7 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(fakeLark.patches).toHaveLength(2);
       const toggledCard = parseCard(fakeLark.patches[1].args[2]);
       expect(toggledCard.expanded).toBe(true);
@@ -226,7 +258,7 @@ describe('Card integration: full event flow', () => {
   describe('Scenario 2: concurrent screen_update + toggle', () => {
     it('should serialize: toggle queues behind in-flight screen_update PATCH', async () => {
       const CARD_ID = 'om_stream_card_2';
-      const ds = makeDaemonSession({ streamCardId: CARD_ID, streamExpanded: false });
+      const ds = makeDaemonSession({ streamCardId: CARD_ID, displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
@@ -248,7 +280,7 @@ describe('Card integration: full event flow', () => {
 
       // Toggle should NOT have sent another PATCH — it should be queued
       expect(fakeLark.patches).toHaveLength(1);
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(ds.pendingCardJson).toBeTruthy();
       expect(parseCard(ds.pendingCardJson!).expanded).toBe(true);
 
@@ -268,7 +300,7 @@ describe('Card integration: full event flow', () => {
 
     it('should apply latest-wins: multiple toggles while PATCH in-flight', async () => {
       const CARD_ID = 'om_stream_card_3';
-      const ds = makeDaemonSession({ streamCardId: CARD_ID, streamExpanded: false });
+      const ds = makeDaemonSession({ streamCardId: CARD_ID, displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
@@ -284,17 +316,17 @@ describe('Card integration: full event flow', () => {
       // Toggle 1: false → true (queued)
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
 
       // Toggle 2: true → false (overwrites queued)
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
-      expect(ds.streamExpanded).toBe(false);
+      expect(ds.displayMode).toBe('hidden');
 
       // Toggle 3: false → true (overwrites again)
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
 
       // Still only 1 PATCH sent (the original screen_update)
       expect(fakeLark.patches).toHaveLength(1);
@@ -317,7 +349,7 @@ describe('Card integration: full event flow', () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_new_card',
         streamCardNonce: NONCE_CURRENT,
-        streamExpanded: false,
+        displayMode: 'hidden',
       });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
@@ -328,14 +360,14 @@ describe('Card integration: full event flow', () => {
       await flush();
 
       // Should NOT have toggled or sent any PATCH
-      expect(ds.streamExpanded).toBe(false);
+      expect(ds.displayMode).toBe('hidden');
       expect(fakeLark.patches).toHaveLength(0);
 
       // User clicks toggle on current card — carries current nonce
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(fakeLark.patches).toHaveLength(1);
     });
 
@@ -346,7 +378,7 @@ describe('Card integration: full event flow', () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_card_turn2',
         streamCardNonce: NONCE_TURN2,
-        streamExpanded: false,
+        displayMode: 'hidden',
       });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
@@ -355,13 +387,13 @@ describe('Card integration: full event flow', () => {
       // Toggle with turn1 nonce → ignored
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_TURN1), deps, APP_ID);
       await flush();
-      expect(ds.streamExpanded).toBe(false);
+      expect(ds.displayMode).toBe('hidden');
       expect(fakeLark.patches).toHaveLength(0);
 
       // Toggle with turn2 nonce → works
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_TURN2), deps, APP_ID);
       await flush();
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(fakeLark.patches).toHaveLength(1);
     });
   });
@@ -470,7 +502,7 @@ describe('Card integration: full event flow', () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_card_compat',
         streamCardNonce: NONCE_CURRENT,
-        streamExpanded: false,
+        displayMode: 'hidden',
       });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
@@ -480,7 +512,7 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeToggleEvent(ROOT_ID, undefined), deps, APP_ID);
       await flush();
 
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(fakeLark.patches).toHaveLength(1);
       expect(parseCard(fakeLark.patches[0].args[2]).expanded).toBe(true);
     });
@@ -489,7 +521,7 @@ describe('Card integration: full event flow', () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_card_no_nonce',
         streamCardNonce: undefined,
-        streamExpanded: false,
+        displayMode: 'hidden',
       });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
@@ -499,7 +531,7 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeToggleEvent(ROOT_ID, 'some_nonce'), deps, APP_ID);
       await flush();
 
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(fakeLark.patches).toHaveLength(1);
     });
 
@@ -515,7 +547,7 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(fakeLark.patches).toHaveLength(0);
     });
 
@@ -532,7 +564,7 @@ describe('Card integration: full event flow', () => {
 
     it('screen_update PATCH interleaved with toggle PATCH: correct final state', async () => {
       const CARD_ID = 'om_interleave';
-      const ds = makeDaemonSession({ streamCardId: CARD_ID, streamExpanded: false });
+      const ds = makeDaemonSession({ streamCardId: CARD_ID, displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
@@ -555,7 +587,7 @@ describe('Card integration: full event flow', () => {
       // toggle (queued, overwrites screen_update #2)
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
 
       // Still just 1 PATCH in-flight
       expect(fakeLark.patches).toHaveLength(1);
@@ -573,6 +605,100 @@ describe('Card integration: full event flow', () => {
       await flush();
       expect(ds.cardPatchInFlight).toBe(false);
       expect(ds.pendingCardJson).toBeUndefined();
+    });
+  });
+
+  // ── Scenario 7: adopt mode keeps the right buttons across rebuilds ────
+  // Codex review of 59c9670: every card-handler path that re-renders the
+  // streaming card must propagate adoptMode. Otherwise toggling /
+  // refreshing / pressing a quick-action key on an adopt session would
+  // silently rebuild the card with the default `❌ 关闭会话` button,
+  // which would tear down the user's underlying CLI on click.
+  describe('Scenario 7: adopt-mode card rebuild propagation', () => {
+    function makeAdoptSession(overrides?: Partial<DaemonSession>): DaemonSession {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_adopt_card',
+        ...overrides,
+      });
+      ds.adoptedFrom = {
+        tmuxTarget: '0:1.0',
+        originalCliPid: 1234,
+        sessionId: 'adopt-cli-uuid',
+        cliId: 'claude-code',
+        cwd: '/tmp/adopt',
+        paneCols: 270,
+        paneRows: 57,
+      };
+      return ds;
+    }
+
+    it('toggle on adopt session rebuilds card with adoptMode=true', async () => {
+      const ds = makeAdoptSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      // Toggle returns the rebuilt card body (see card-handler.ts:337).
+      const result = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
+      await flush();
+
+      // The handler must propagate adoptMode so the rebuilt card keeps
+      // the `⏏ 断开` button — `❌ 关闭会话` would tear down the user's CLI.
+      expect(result).toBeDefined();
+      expect((result as any).adoptMode).toBe(true);
+    });
+
+    it('term_action on adopt session returns a card with adoptMode=true', async () => {
+      const ds = makeAdoptSession({ displayMode: 'screenshot' });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const event = {
+        token: 'tok',
+        action: { tag: 'button', value: { action: 'term_action', root_id: ROOT_ID, session_id: ds.session.sessionId, key: 'enter' } },
+        operator: { open_id: 'ou_user' },
+        host: 'im_message_card_action',
+      } as any;
+      const result = await handleCardAction(event, deps, APP_ID);
+      // term_action returns the freshly rebuilt card body — must carry adoptMode.
+      expect(result).toBeDefined();
+      expect((result as any).adoptMode).toBe(true);
+    });
+
+    it('refresh_screenshot on adopt session returns a card with adoptMode=true', async () => {
+      const ds = makeAdoptSession({ displayMode: 'screenshot' });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const event = {
+        token: 'tok',
+        action: { tag: 'button', value: { action: 'refresh_screenshot', root_id: ROOT_ID, session_id: ds.session.sessionId } },
+        operator: { open_id: 'ou_user' },
+        host: 'im_message_card_action',
+      } as any;
+      const result = await handleCardAction(event, deps, APP_ID);
+      expect(result).toBeDefined();
+      expect((result as any).adoptMode).toBe(true);
+    });
+
+    it('restart on adopt session is hard-rejected (does not kill user CLI)', async () => {
+      const ds = makeAdoptSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
+      await flush();
+
+      // worker.send must NOT have received a 'restart' IPC, and
+      // forkWorker must NOT have been called — defense-in-depth against
+      // a stale pre-fix card whose button still says "重启".
+      expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'restart' });
+      expect(forkWorker).not.toHaveBeenCalled();
+      // sessionReply was used to surface the rejection message.
+      expect(deps.sessionReply).toHaveBeenCalled();
     });
   });
 });
