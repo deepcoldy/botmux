@@ -18,6 +18,8 @@ import { join } from 'node:path';
 import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
+import { drainCodexRollout, findCodexRolloutBySessionId } from './services/codex-transcript.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -124,6 +126,26 @@ let bridgeBaselineDone = false;
 /** Once-per-attach flag so a re-baseline after fs.watch lazy-fire doesn't
  *  re-send the preamble. Reset only when the bridge teardown happens. */
 let bridgePreambleSent = false;
+
+// ─── Codex bridge state ──────────────────────────────────────────────────
+//
+// Parallel to the Claude bridge above. Codex's transcript layout is
+// different enough (separate file location, different event schema) that
+// trying to share storage / readers would obscure both — so we keep state
+// independent. Marker file (`<DATA_DIR>/turn-sends/<sid>.jsonl`) and the
+// gate function are CLI-agnostic and shared.
+let codexBridgeRolloutPath: string | undefined;
+let codexBridgeOffset = 0;
+let codexBridgePendingTail = '';
+let codexBridgeBaselineDone = false;
+const codexBridgeQueue = new CodexBridgeQueue();
+let codexBridgeWatcher: FSWatcher | null = null;
+let codexBridgeTimer: NodeJS.Timeout | null = null;
+/** Codex sessionId we received via writeInput but haven't yet resolved a
+ *  rollout file for. The poller keeps retrying — the file appears on
+ *  Codex's first user submit, but with some race delay after our submit
+ *  returns. Cleared once attached. */
+let codexBridgePendingSessionId: string | undefined;
 
 /** Cap the preamble text so an extremely long previous turn doesn't blow
  *  past Lark's per-message limit. The user only needs enough to recall
@@ -801,6 +823,162 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
   return { offset: result.newOffset, tail: result.pendingTail };
 }
 
+// ─── Codex bridge wiring ─────────────────────────────────────────────────
+//
+// Codex's bridge fallback is intentionally simpler than Claude's: no /adopt
+// surface, no pid-resolver / quiet-rotation / fingerprint-jsonl-switch
+// machinery. The reader watches one rollout file (located by cliSessionId)
+// and the queue's only responsibility is "user fingerprint match → start;
+// assistant_final → close". Everything else (mark / emit gate / send
+// marker IO / type-ahead serialisation / one-write-per-idle break) is
+// shared with the Claude path.
+
+function codexBridgeFallbackActive(): boolean {
+  if (lastInitConfig?.adoptMode) return false;
+  return lastInitConfig?.cliId === 'codex';
+}
+
+function codexBridgeStartTimer(): void {
+  if (codexBridgeTimer) return;
+  // Single 1s ticker that handles three jobs: late-attach (poll for the
+  // rollout file once we know cliSessionId), ingest (fs.watch backup),
+  // and idle-window emit. The last is critical for the late-attach race:
+  // if the rollout path appears AFTER the CLI's idle event has fired,
+  // the idle callback's emit already ran (and saw an empty queue), so
+  // the next emit chance would be at the next idle — i.e. the user has
+  // to send another message before the previous turn's fallback shows
+  // up. Emitting here when isPromptReady=true closes that window.
+  // Codex's queue only releases turns on `assistant_final` (the model's
+  // declared end-of-turn), so a tick-driven emit can't accidentally
+  // publish a half-streamed response.
+  codexBridgeTimer = setInterval(() => {
+    try {
+      if (!codexBridgeRolloutPath && codexBridgePendingSessionId) {
+        const path = findCodexRolloutBySessionId(codexBridgePendingSessionId);
+        if (path) {
+          codexBridgePendingSessionId = undefined;
+          codexBridgeAttach(path, 'fresh-empty');
+        }
+      }
+      codexBridgeIngest();
+      if (isPromptReady) emitReadyCodexTurns();
+    } catch (err: any) {
+      log(`Codex bridge tick error: ${err.message}`);
+    }
+  }, 1000);
+}
+
+function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fresh-empty'): void {
+  codexBridgeRolloutPath = rolloutPath;
+  if (mode === 'fresh-empty') {
+    // Brand-new session OR late-attach right after first submit. Either
+    // way we want to ingest from offset 0 — pending turns marked before
+    // attach are still in the queue, so the user_message that just landed
+    // (or is about to land) will fingerprint-match them.
+    codexBridgeOffset = 0;
+    codexBridgePendingTail = '';
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge fresh-empty: ${rolloutPath}`);
+  } else if (existsSync(rolloutPath)) {
+    const result = drainCodexRollout(rolloutPath, 0);
+    codexBridgeOffset = result.newOffset;
+    codexBridgePendingTail = result.pendingTail;
+    codexBridgeQueue.absorb(result.events);
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+  } else {
+    // baseline-existing requested but file missing — degrade to fresh
+    // semantics so the lazy-appearing file isn't accidentally absorbed.
+    codexBridgeOffset = 0;
+    codexBridgePendingTail = '';
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge transcript not yet present at ${rolloutPath}; treating as fresh`);
+  }
+  try {
+    codexBridgeWatcher = fsWatch(rolloutPath, { persistent: false }, () => {
+      try { codexBridgeIngest(); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
+    });
+  } catch (err: any) {
+    log(`Codex bridge fs.watch unavailable (${err.message}); relying on poller`);
+  }
+}
+
+/** Called from flushPending after writeInput first returns a cliSessionId.
+ *  Tries to locate the rollout file immediately; if it's not on disk yet,
+ *  remembers the sid so the 1s poller can keep retrying. */
+function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
+  if (!codexBridgeFallbackActive() || codexBridgeRolloutPath) return;
+  const path = findCodexRolloutBySessionId(cliSessionId);
+  if (path) {
+    codexBridgePendingSessionId = undefined;
+    codexBridgeAttach(path, 'fresh-empty');
+  } else {
+    codexBridgePendingSessionId = cliSessionId;
+    codexBridgeStartTimer();
+  }
+}
+
+function codexBridgeIngest(): void {
+  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  const result = drainCodexRollout(codexBridgeRolloutPath, codexBridgeOffset);
+  codexBridgeOffset = result.newOffset;
+  codexBridgePendingTail = result.pendingTail;
+  codexBridgeQueue.ingest(result.events);
+}
+
+/** Mark a pending Lark turn for Codex. Crucially this works even before a
+ *  rollout path is known — the queue is path-agnostic, and ingest after
+ *  late-attach picks up the user_message and matches the fingerprint. */
+function codexBridgeMarkPendingTurn(messageText: string): boolean {
+  if (!codexBridgeFallbackActive()) return false;
+  const turnId = `codex-${randomBytes(8).toString('hex')}`;
+  codexBridgeQueue.mark(turnId, messageText);
+  return true;
+}
+
+function codexBridgeDrainAndMaybeEmit(): void {
+  if (!codexBridgeFallbackActive()) return;
+  if (codexBridgeRolloutPath && codexBridgeBaselineDone) {
+    try { codexBridgeIngest(); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
+  }
+  emitReadyCodexTurns();
+}
+
+function emitReadyCodexTurns(): void {
+  const ready = codexBridgeQueue.drainEmittable();
+  if (ready.length === 0) return;
+  const markers = readSendMarkers();
+  const remaining = codexBridgeQueue.peek();
+  const nextPendingMarkTimeMs = remaining.length > 0 ? remaining[0].markTimeMs : undefined;
+  for (let i = 0; i < ready.length; i++) {
+    const turn = ready[i];
+    const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
+    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: false }, nextBoundaryMs, markers, false)) {
+      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (model called botmux send within window)`);
+      continue;
+    }
+    if (!turn.finalText) continue;
+    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+  }
+}
+
+function stopCodexBridge(): void {
+  if (codexBridgeWatcher) {
+    try { codexBridgeWatcher.close(); } catch { /* ignore */ }
+    codexBridgeWatcher = null;
+  }
+  if (codexBridgeTimer) {
+    clearInterval(codexBridgeTimer);
+    codexBridgeTimer = null;
+  }
+  codexBridgeRolloutPath = undefined;
+  codexBridgeOffset = 0;
+  codexBridgePendingTail = '';
+  codexBridgeBaselineDone = false;
+  codexBridgeQueue.clearPending();
+  codexBridgePendingSessionId = undefined;
+}
+
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
  *  whose sourceJsonlPath equals oldPath may still be waiting on assistant
  *  text that hasn't landed yet. Add oldPath to the secondary polling set
@@ -1312,10 +1490,16 @@ async function flushPending(): Promise<void> {
   // so BridgeTurnQueue.ingest never starts the pending turn for them and
   // the assistant text would be dropped on the floor. Serialise instead —
   // worker holds messages in pendingMessages until the CLI reaches idle.
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !(bridgeJsonlPath && !lastInitConfig?.adoptMode);
+  const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
+  const codexBridgeActive = codexBridgeFallbackActive();
+  const bridgeFallbackActive = claudeBridgeActive || codexBridgeActive;
+  // Type-ahead must be disabled for any active bridge fallback (claude or
+  // codex). Claude type-ahead's queued submits never become role:user
+  // events; Codex doesn't declare supportsTypeAhead so this is mostly a
+  // belt-and-braces gate, but keep symmetry so future adapters with
+  // type-ahead get the same protection automatically.
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !bridgeFallbackActive;
   if (!isPromptReady && !typeAheadAllowed) return;
-
-  const bridgeFallbackActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
 
   isFlushing = true;
   if (isPromptReady) {
@@ -1333,9 +1517,15 @@ async function flushPending(): Promise<void> {
       // falls inside [markTimeMs(N), markTimeMs(N+1)). Marking earlier
       // (at IPC arrival) would let a slow-finishing turn N's send leak
       // into turn N+1's window and falsely suppress its emit.
-      if (bridgeFallbackActive) {
+      if (claudeBridgeActive) {
         try { bridgeIngest(); } catch { /* best-effort */ }
         bridgeMarkPendingTurn(msg);
+      } else if (codexBridgeActive) {
+        // Codex mark works even before the rollout path is known: the
+        // queue is path-agnostic, and the late-attach below will start
+        // ingest from offset 0 so the user_message that lands shortly
+        // after still fingerprint-matches this turn.
+        codexBridgeMarkPendingTurn(msg);
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       const result = await cliAdapter.writeInput(backend, msg);
@@ -1343,7 +1533,13 @@ async function flushPending(): Promise<void> {
       // (Claude's pid file, Codex's history). Done independently of submit
       // outcome — the rotation is real even when the current Enter didn't
       // land, and we want next-resume to use the right id.
-      if (result?.cliSessionId) persistCliSessionId(result.cliSessionId);
+      if (result?.cliSessionId) {
+        persistCliSessionId(result.cliSessionId);
+        // First successful Codex submit also reveals the rollout path.
+        // Late-attach now so subsequent assistant_final events get
+        // attributed to this turn.
+        if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+      }
       if (result && result.submitted === false) {
         const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
         log(`writeInput: submit not confirmed after retries — notifying user. preview="${preview}"`);
@@ -1383,8 +1579,9 @@ function sendToPty(content: string): void {
     // Tear down the prompt card so the user doesn't see stale options.
     send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
   }
-  // See flushPending: bridge fallback gates type-ahead off.
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !(bridgeJsonlPath && !lastInitConfig?.adoptMode);
+  // See flushPending: bridge fallback gates type-ahead off (claude OR codex).
+  const bridgeFallbackActive = (!!bridgeJsonlPath && !lastInitConfig?.adoptMode) || codexBridgeFallbackActive();
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !bridgeFallbackActive;
   if (isPromptReady || isFlushing || typeAheadAllowed) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
@@ -1594,6 +1791,30 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
   }
 
+  // Codex bridge fallback: same intent as the Claude block above but a
+  // different transcript layout. Resume-with-known-cliSessionId can attach
+  // immediately; new sessions / resume-without-id rely on flushPending to
+  // late-attach once writeInput returns the cliSessionId.
+  if (cfg.cliId === 'codex') {
+    if (cfg.cliSessionId) {
+      const rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
+      if (rolloutPath) {
+        codexBridgeAttach(rolloutPath, 'baseline-existing');
+      } else {
+        // Resume but the rollout file isn't where we expected — start the
+        // poller so we keep looking; if the user submits and a new file
+        // appears, late-attach kicks in via writeInput's cliSessionId.
+        codexBridgePendingSessionId = cfg.cliSessionId;
+        codexBridgeStartTimer();
+      }
+    } else {
+      // Brand-new Codex session: no path until first submit. Start the
+      // poller anyway so the CLI is ready to attach the moment we have
+      // a cliSessionId.
+      codexBridgeStartTimer();
+    }
+  }
+
   // Set up idle detection
   idleDetector = new IdleDetector(cliAdapter);
   idleDetector.onIdle(() => {
@@ -1604,6 +1825,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // turn" before we've had a chance to emit the previous one.
     if (bridgeJsonlPath) {
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+    }
+    if (codexBridgeFallbackActive()) {
+      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
     }
     markPromptReady();
   });
@@ -1641,6 +1865,7 @@ function killCli(): void {
   // restart with the proper mode based on the new cfg. Leaving it running
   // would dangle a watcher pinned to a stale jsonl path.
   stopBridgeWatcher();
+  stopCodexBridge();
   // Clean up CLI PID marker
   if (cliPidMarker) {
     try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
