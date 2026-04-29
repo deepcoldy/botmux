@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -43,6 +43,68 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe('codexSessionIdFromRolloutPath', () => {
+  it('extracts sessionId suffix from a canonical rollout path', () => {
+    expect(codexSessionIdFromRolloutPath(
+      '/root/.codex/sessions/2026/04/29/rollout-2026-04-29T07-04-39-019dd80d-d922-7a11-8339-0208d8c5b4ec.jsonl',
+    )).toBe('019dd80d-d922-7a11-8339-0208d8c5b4ec');
+  });
+
+  it('returns undefined for non-rollout paths', () => {
+    expect(codexSessionIdFromRolloutPath('/var/log/syslog')).toBeUndefined();
+    expect(codexSessionIdFromRolloutPath('/root/.codex/history.jsonl')).toBeUndefined();
+  });
+
+  it('returns undefined when filename is malformed', () => {
+    expect(codexSessionIdFromRolloutPath('/root/.codex/sessions/foo/bar.jsonl')).toBeUndefined();
+    expect(codexSessionIdFromRolloutPath('rollout-no-suffix-just-text.jsonl')).toBeUndefined();
+  });
+});
+
+describe('splitCodexEventsByCutoff', () => {
+  const ev = (uuid: string, kind: 'user' | 'assistant_final', timestampMs: number, text = 't'): CodexBridgeEvent =>
+    ({ uuid, timestampMs, kind, text });
+
+  it('partitions by strict less-than: events at cutoff land in live', () => {
+    const events = [ev('a', 'user', 50), ev('b', 'user', 100), ev('c', 'assistant_final', 150)];
+    const out = splitCodexEventsByCutoff(events, 100);
+    expect(out.history.map(e => e.uuid)).toEqual(['a']);
+    expect(out.live.map(e => e.uuid)).toEqual(['b', 'c']);
+  });
+
+  it('all-history when every event predates cutoff', () => {
+    const events = [ev('a', 'user', 10), ev('b', 'assistant_final', 20)];
+    const out = splitCodexEventsByCutoff(events, 100);
+    expect(out.history.map(e => e.uuid)).toEqual(['a', 'b']);
+    expect(out.live).toEqual([]);
+  });
+
+  it('all-live when every event is at-or-after cutoff', () => {
+    const events = [ev('a', 'user', 100), ev('b', 'assistant_final', 200)];
+    const out = splitCodexEventsByCutoff(events, 100);
+    expect(out.history).toEqual([]);
+    expect(out.live.map(e => e.uuid)).toEqual(['a', 'b']);
+  });
+
+  it('preserves event order within each partition', () => {
+    const events = [
+      ev('hist1', 'user', 10),
+      ev('live1', 'user', 200),
+      ev('hist2', 'assistant_final', 50),
+      ev('live2', 'assistant_final', 250),
+    ];
+    const out = splitCodexEventsByCutoff(events, 100);
+    expect(out.history.map(e => e.uuid)).toEqual(['hist1', 'hist2']);
+    expect(out.live.map(e => e.uuid)).toEqual(['live1', 'live2']);
+  });
+
+  it('empty input returns empty partitions', () => {
+    const out = splitCodexEventsByCutoff([], 100);
+    expect(out.history).toEqual([]);
+    expect(out.live).toEqual([]);
+  });
 });
 
 describe('drainCodexRollout', () => {

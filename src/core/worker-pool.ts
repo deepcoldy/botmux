@@ -873,9 +873,13 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     }
   });
 
-  // Bridge mode is gated on (Claude Code adopt + sessionId). For other CLIs
-  // or sessions without a known CLI sessionId we fall back to the legacy
-  // shared-pane behaviour (screen capture only).
+  // Bridge mode is gated per-CLI:
+  //   - claude-code: needs sessionId to compute jsonl path. PID + cwd let
+  //     the worker follow Claude's `/clear` / `/resume` rotations.
+  //   - codex: worker resolves the rollout path either from cliSessionId
+  //     (passed below when known) or by reading the Codex pid's open fds
+  //     in /proc — so we always pass the pid for codex adopt.
+  // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   const bridgeJsonlPath =
     adoptedCliId === 'claude-code' && adopted.sessionId
@@ -889,6 +893,7 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     rootMessageId: ds.session.rootMessageId,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
+    cliSessionId: adoptedCliId === 'codex' ? adopted.sessionId : undefined,
     backendType: 'tmux',
     prompt: '',
     resume: false,
@@ -903,12 +908,11 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     adoptPaneCols: adopted.paneCols,
     adoptPaneRows: adopted.paneRows,
     bridgeJsonlPath,
-    // Adopt PID + cwd let the worker re-resolve Claude's authoritative
-    // current sessionId via ~/.claude/sessions/<pid>.json on every poll —
-    // catches /clear / /resume rotations that the fingerprint-based
-    // fallback alone can miss when no Lark message has been sent yet.
-    adoptCliPid: adoptedCliId === 'claude-code' ? adopted.originalCliPid : undefined,
-    adoptCwd: adoptedCliId === 'claude-code' ? adopted.cwd : undefined,
+    // PID + cwd: claude uses for `~/.claude/sessions/<pid>.json` resolver;
+    // codex uses for `/proc/<pid>/fd` rollout discovery (works even if
+    // session-discovery couldn't probe sessionId up-front).
+    adoptCliPid: (adoptedCliId === 'claude-code' || adoptedCliId === 'codex') ? adopted.originalCliPid : undefined,
+    adoptCwd: (adoptedCliId === 'claude-code' || adoptedCliId === 'codex') ? adopted.cwd : undefined,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

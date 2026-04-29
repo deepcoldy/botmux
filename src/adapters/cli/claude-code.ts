@@ -64,9 +64,15 @@ function makeSubmitFingerprint(content: string, len = 30): string | undefined {
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Returns the absolute path to Claude Code's per-process session state file.
- *  Claude writes `{pid, sessionId, cwd, procStart, ...}` here and refreshes it
- *  as state changes — so it's the authoritative source of the current session
- *  id, including after a `--resume` rotates the id mid-process. */
+ *  Claude writes `{pid, sessionId, cwd, procStart, status, updatedAt, ...}`
+ *  here. Empirical scope (Claude Code 2.1.123): `status` and `updatedAt`
+ *  refresh on every state change, but `sessionId` is written ONCE at
+ *  process start. `--resume` is a fresh spawn → fresh pid file with the
+ *  resumed id; in-pane `/clear` does NOT rewrite the pid file's
+ *  `sessionId` even though it rotates the on-disk jsonl. Callers that
+ *  rely on this for rotation tracking must therefore treat a "matching
+ *  sessionId" answer as "no spawn-time rotation observed", not "no
+ *  rotation at all" — the latter requires fingerprint corroboration. */
 export function claudePidStatePath(pid: number): string {
   return join(homedir(), '.claude', 'sessions', `${pid}.json`);
 }
@@ -205,12 +211,12 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         else pty.write('\r');
       };
 
-      // Authoritative path resolver: ~/.claude/sessions/<pid>.json carries
-      // Claude's current sessionId, refreshed on every state change. Read it
-      // first so byte accounting locks onto the right transcript even when
-      // Claude has rotated mid-process. Fingerprint-based fallback below
-      // covers the case where the pid file isn't yet readable / fails
-      // validation.
+      // Pid-state path resolver: ~/.claude/sessions/<pid>.json carries
+      // the spawn-time sessionId (written once at process start; see
+      // claudePidStatePath). Read it first so byte accounting locks onto
+      // the resume target right away when Claude was started with
+      // `--resume`. In-pane `/clear` won't appear here — that's covered
+      // by the fingerprint-based mid-flight rotation check below.
       let observedCliSessionId: string | undefined;
       const applyResolved = (resolved: { path: string; cliSessionId: string }): boolean => {
         if (resolved.cliSessionId !== observedCliSessionId) observedCliSessionId = resolved.cliSessionId;
@@ -271,8 +277,10 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         // pinned path? Fast path for the common case (no rotation).
         if (await waitForSubmit(startPath, baseByte, timeoutMs)) return true;
 
-        // Second: did Claude rotate sessionId mid-flight? The pid file is
-        // refreshed on every state change, so we re-read and check both:
+        // Second: did Claude rotate sessionId mid-flight? The pid file
+        // is rewritten by `--resume` (fresh spawn) but NOT by in-pane
+        // `/clear` — so this catches the resume case. We re-read and
+        // check both:
         //   a) the rotated jsonl already contains our submit (the rotation
         //      happened between our type+Enter and this resolve — the
         //      content lives in the new file from before we knew about it),

@@ -9,6 +9,7 @@ import { readFileSync, readlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
+import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -200,7 +201,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
     const cwd = readCwd(match.pid);
     if (!cwd) continue;
 
-    // 5. Try to read Claude Code session metadata
+    // 5. Try to read CLI session metadata
     let sessionId: string | undefined;
     let startedAt: number | undefined;
     if (match.cliId === 'claude-code') {
@@ -209,6 +210,13 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
         sessionId = meta.sessionId;
         startedAt = meta.startedAt;
       }
+    } else if (match.cliId === 'codex') {
+      // Codex has no per-pid state file — bind via the open rollout fd in
+      // /proc. Worker-side has the same probe as a fallback so this is
+      // best-effort: we resolve here so the daemon-side adopt UI shows
+      // an accurate "currently in session X" hint.
+      const rollout = findCodexRolloutByPid(match.pid);
+      if (rollout) sessionId = rollout.cliSessionId;
     }
 
     // 6. Get pane dimensions

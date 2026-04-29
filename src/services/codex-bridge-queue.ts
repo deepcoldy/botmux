@@ -1,26 +1,33 @@
 /**
  * Codex bridge fallback's pending-turn queue.
  *
- * Lighter than Claude's BridgeTurnQueue because Codex's bridge has no /adopt
- * surface and no local-terminal dual-write: the worker is the only writer,
- * so any user_message in the rollout that doesn't match a pending Lark turn
- * by fingerprint is either history (resume / late-attach) or somebody else's
- * session — either way, ignore it. The Claude queue's "synthesise a local
- * turn and forward to Lark" branch would just spam the thread here.
+ * Two operating modes via `setLocalTurns()`:
+ *
+ *   - **non-adopt** (default): worker owns the PTY and the only legitimate
+ *     user input source is Lark. user_message events that don't match a
+ *     pending fingerprint are history (resume / late-attach) and get
+ *     silently dropped. Synthesising local turns here would replay
+ *     yesterday's prompts to the Lark thread.
+ *
+ *   - **adopt**: Codex is the user's externally-running process; the user
+ *     can type directly into the iTerm pane (or via Lark). Both should
+ *     reach the Lark thread. user_message events that don't match a
+ *     pending Lark fingerprint AND happen after `localLowerBoundMs - 5s`
+ *     synthesise a local turn — formatted by the worker as
+ *     "🖥️ 终端本地对话".
  *
  * Attribution rule:
- *   - mark()           — push a pending turn entry (state: not started),
- *                        anchored to a fingerprint of the Lark message.
+ *   - mark()           — push a pending turn anchored to Lark fingerprint.
  *   - ingest(events)   —
  *       * 'user' event whose text matches the head pending turn's
- *         fingerprint → that turn becomes 'started' (collecting). User
- *         events with no fingerprint match are silently dropped (history
- *         or local input).
+ *         fingerprint → that turn becomes 'started' (collecting).
+ *       * 'user' event with no match: dropped, OR (adopt-only) synthesised
+ *         as a started local turn ahead of any unstarted Lark turn so
+ *         emit ordering reflects when the event landed.
  *       * 'assistant_final' event → the currently-collecting turn closes
  *         with finalText set; eligible for emit on the next drain.
  *   - drainEmittable() — pop FIFO any leading turn that is started AND
- *     has finalText. Started turns that don't yet have finalText (model
- *     mid-turn at idle wakeup, e.g. between idle ticks) stay queued.
+ *     has finalText.
  */
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
 import type { CodexBridgeEvent } from './codex-transcript.js';
@@ -35,18 +42,39 @@ export interface CodexPendingTurn {
   markTimeMs?: number;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
+  /** Set when this turn was synthesised from a user_message that didn't
+   *  match any pending Lark fingerprint. Adopt-only. The worker emit path
+   *  formats these with both userText and finalText under a "终端本地对话"
+   *  header — same rationale as Claude's BridgeTurnQueue local turns. */
+  isLocal?: boolean;
+  /** For local turns: the user's typed text, surfaced alongside the
+   *  assistant reply so the Lark thread sees both sides of the exchange. */
+  userText?: string;
 }
 
 export class CodexBridgeQueue {
   private seen = new Set<string>();
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
+  private localTurnsEnabled = false;
+  /** Lower bound (ms) for synthesising local turns — protects against a
+   *  fresh-empty attach replaying historical iTerm conversation as
+   *  "live" local input. Typically set to the moment adopt was wired up. */
+  private localLowerBoundMs = 0;
 
   /** Register events as historical without producing pending-turn side
    *  effects. Used at attach time when resume mode wants to swallow prior
    *  conversation as already-processed. */
   absorb(events: CodexBridgeEvent[]): void {
     for (const ev of events) this.seen.add(ev.uuid);
+  }
+
+  /** Toggle adopt-mode local-turn synthesis. `lowerBoundMs` (typically
+   *  Date.now() at adopt-time) protects against a fresh-empty attach
+   *  feeding historical user_messages back as "live" local turns. */
+  setLocalTurns(enabled: boolean, lowerBoundMs: number = Date.now()): void {
+    this.localTurnsEnabled = enabled;
+    this.localLowerBoundMs = lowerBoundMs;
   }
 
   /** Push a pending Lark turn anchored to the message text. The fingerprint
@@ -79,21 +107,37 @@ export class CodexBridgeQueue {
       this.seen.add(ev.uuid);
       if (ev.kind === 'user') {
         const next = this.queue.find(t => !t.started);
-        if (!next) continue;
-        // Time lower bound: a user_message older than the turn's mark
-        // (minus a small skew tolerance) cannot have been triggered by
-        // this Lark turn. Without this, fresh-empty attach over a long
-        // resume rollout could let a historical prompt with the same
-        // fingerprint start the current pending turn and emit yesterday's
-        // assistant reply. 5s skew absorbs clock drift between worker
-        // mark() and Codex's transcript timestamp.
-        if (next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - 5_000) continue;
-        if (next.contentFingerprint) {
-          const userText = normaliseForFingerprint(ev.text);
-          if (!userText.includes(next.contentFingerprint)) continue;
+        let consumedNext = false;
+        if (next) {
+          const tooOld = next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - 5_000;
+          let fingerprintOk = true;
+          if (next.contentFingerprint) {
+            const userText = normaliseForFingerprint(ev.text);
+            fingerprintOk = userText.includes(next.contentFingerprint);
+          }
+          if (!tooOld && fingerprintOk) {
+            next.started = true;
+            this.collecting = next;
+            consumedNext = true;
+          }
         }
-        next.started = true;
-        this.collecting = next;
+        if (!consumedNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - 5_000) {
+          // Adopt mode local input: user typed in iTerm, no Lark
+          // fingerprint match. Synthesise a local turn so the assistant
+          // reply still reaches Lark. Insert AHEAD of any unstarted Lark
+          // turn so emit order matches when the event hit the transcript.
+          const localTurn: CodexPendingTurn = {
+            turnId: `codex-local-${ev.uuid}`,
+            started: true,
+            isLocal: true,
+            userText: ev.text,
+            markTimeMs: ev.timestampMs,
+          };
+          const insertAt = this.queue.findIndex(t => !t.started);
+          if (insertAt === -1) this.queue.push(localTurn);
+          else this.queue.splice(insertAt, 0, localTurn);
+          this.collecting = localTurn;
+        }
       } else if (ev.kind === 'assistant_final') {
         if (this.collecting) {
           this.collecting.finalText = ev.text;
