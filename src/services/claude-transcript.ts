@@ -662,6 +662,35 @@ export function findJsonlsContainingExactContent(
 }
 
 /**
+ * Partition transcript events into history (timestamp ≤ cutoff) and live
+ * (timestamp > cutoff, or no parseable timestamp). Used by the bridge
+ * watcher when it switches to a new jsonl that may contain pre-existing
+ * conversation: anything older than the cutoff (e.g. iTerm-typed turns
+ * the user produced before the Lark mark fired) belongs in the seen-set
+ * via `BridgeTurnQueue.absorb` so the worker doesn't replay them as
+ * "🖥️ 终端本地对话" cards. Anything newer is fed through `ingest()` so
+ * the freshly-written Lark user event can match its pending fingerprint.
+ *
+ * Events with malformed / missing timestamps fall into `live`: better
+ * to forward an unattributable event once than to silently drop a real
+ * reply because Claude omitted a timestamp.
+ */
+export function splitTranscriptEventsByCutoff(
+  events: TranscriptEvent[],
+  cutoffMs: number,
+): { history: TranscriptEvent[]; live: TranscriptEvent[] } {
+  const history: TranscriptEvent[] = [];
+  const live: TranscriptEvent[] = [];
+  for (const ev of events) {
+    let evMs = Number.NaN;
+    if (typeof ev.timestamp === 'string') evMs = Date.parse(ev.timestamp);
+    if (Number.isFinite(evMs) && evMs <= cutoffMs) history.push(ev);
+    else live.push(ev);
+  }
+  return { history, live };
+}
+
+/**
  * Read the first event timestamp out of a jsonl. Reads only the leading
  * 4 KB — Claude's `file-history-snapshot` and `SessionStart` events both
  * land in the first few hundred bytes. Returns the parsed millis, or

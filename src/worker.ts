@@ -15,7 +15,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
@@ -337,10 +337,15 @@ function bridgeMarkStalePidStateForAcceptedSid(acceptedSid: string): void {
 }
 
 /** Apply a fingerprint-driven switch: drain old path, retire watcher,
- *  pivot bridgeJsonlPath to `matched`, install a new fs.watch. Logging
- *  string is caller-supplied so the switch reason ("known-sid",
- *  "exact-content recovery") shows up clearly in the daemon log. */
-function bridgeApplyFingerprintSwitch(matched: string, reason: string): void {
+ *  pivot bridgeJsonlPath to `matched`, split the new path's existing
+ *  content by `cutoffMs` (history → absorbed into the seen set, live →
+ *  ingested), and install a new fs.watch. The split-live step is what
+ *  prevents the "switched into a long-lived /clear file → all prior
+ *  iTerm-typed turns get re-emitted as 🖥️ 终端本地对话" symptom: any
+ *  user/assistant events written before the Lark mark are pre-existing
+ *  pane history, not events to forward. `cutoffMs` should be the same
+ *  `markTimeMs - 5s` used for the fingerprint scan's lower bound. */
+function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs: number): void {
   // Drain-before-switch: pull in any unread bytes from the old path so a
   // late assistant append doesn't vanish. We do NOT emit here — emission
   // only happens at idle (bridgeDrainAndMaybeEmit), otherwise drainEmittable
@@ -370,13 +375,22 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string): void {
   // turn. Clearing here would race-drop exactly the message we're
   // trying to deliver.
   bridgeJsonlPath = matched;
-  bridgeOffset = 0;
+  bridgeJsonlDir = dirname(matched);
   bridgePendingTail = '';
-  // baselineDone=false would absorb the new file's existing content
-  // (including the pending turn's user event) as history — defeating the
-  // switch. Skip baseline; fall straight into ingest from offset 0 so
-  // BridgeTurnQueue.ingest() can attribute the matching user/assistant.
+  // Split-live: drain `matched` from offset 0, partition by cutoffMs.
+  // History (pre-mark) is absorbed into the seen set so the iTerm-side
+  // turns the user accumulated before this Lark message DON'T re-emit
+  // as "🖥️ 终端本地对话" cards. Live (post-mark) goes through ingest
+  // so the Lark fingerprint can start its turn. Mirrors what
+  // performRotationSwitch already does for fd-rotation rotations.
+  const drained = drainTranscript(matched, 0);
+  bridgeOffset = drained.newOffset;
+  bridgePendingTail = drained.pendingTail;
+  const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
+  bridgeQueue.absorb(history);
+  if (live.length > 0) bridgeQueue.ingest(live, matched);
   bridgeBaselineDone = true;
+  log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
   bridgeRememberSessionIdForPath(matched);
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(matched));
   try {
@@ -450,7 +464,22 @@ function maybeSwitchBridgeJsonl(): boolean {
     const reason = decision.reason === 'known-sid-substring'
       ? 'known-sid fingerprint match'
       : 'unknown-sid exact-content recovery (in-pane /clear with stale pid file)';
-    bridgeApplyFingerprintSwitch(decision.path, reason);
+    // Boundary alignment with the fingerprint scanner:
+    //
+    //   scanner.minEventTimestampMs is INCLUSIVE — events with
+    //     timestamp >= (markTimeMs - 5s) are eligible to start the turn.
+    //   splitTranscriptEventsByCutoff puts timestamp <= cutoffMs in
+    //     history (absorbed) and > cutoffMs in live (ingested).
+    //
+    // If we hand split the same value as the scanner's lower bound, an
+    // event AT exactly that timestamp (e.g. the user's just-arrived
+    // Lark user event) is matched-eligible by the scanner — driving
+    // the switch — but absorbed as history by split, leaving the
+    // pending turn unstarted and the message silent. Subtract 1ms to
+    // make split's history strictly older than the scanner's
+    // eligibility floor.
+    const historyCutoffMs = ((candidate.markTimeMs ?? Date.now()) - 5_000) - 1;
+    bridgeApplyFingerprintSwitch(decision.path, reason, historyCutoffMs);
     return true;
   }
   if (decision.action === 'abstain') {
@@ -593,14 +622,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   const result = drainTranscript(newPath, 0);
   bridgeOffset = result.newOffset;
   bridgePendingTail = result.pendingTail;
-  const history: TranscriptEvent[] = [];
-  const live: TranscriptEvent[] = [];
-  for (const ev of result.events) {
-    let evMs = Number.NaN;
-    if (typeof ev.timestamp === 'string') evMs = Date.parse(ev.timestamp);
-    if (Number.isFinite(evMs) && evMs <= cutoffMs) history.push(ev);
-    else live.push(ev);
-  }
+  const { history, live } = splitTranscriptEventsByCutoff(result.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, newPath);
   bridgeBaselineDone = true;

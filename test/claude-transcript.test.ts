@@ -22,6 +22,7 @@ import {
   isMeaningfulUserEvent,
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
+  splitTranscriptEventsByCutoff,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -1156,5 +1157,121 @@ describe('findJsonlsContainingExactContent', () => {
   it('returns empty list on missing dir / empty content', () => {
     expect(findJsonlsContainingExactContent(join(dir, 'nope'), 'x')).toEqual([]);
     expect(findJsonlsContainingExactContent(dir, '')).toEqual([]);
+  });
+});
+
+// ─── splitTranscriptEventsByCutoff ─────────────────────────────────────────
+//
+// Lock down the split-live behaviour the bridge fingerprint switch and the
+// pid-fd rotation switch both depend on. Without this, switching to a
+// long-lived /clear-induced jsonl re-emits every prior iTerm-typed turn as
+// a "🖥️ 终端本地对话" card (the user-reported "把之前所有轮的会话给我先发
+// 过来" symptom).
+describe('splitTranscriptEventsByCutoff', () => {
+  const cutoffMs = Date.parse('2026-04-29T13:00:00.000Z');
+  const userEv = (timestamp: string | undefined, uuid: string, content = 'msg'): TranscriptEvent => ({
+    type: 'user',
+    uuid,
+    timestamp,
+    message: { role: 'user', content },
+  } as TranscriptEvent);
+  const assistantEv = (timestamp: string | undefined, uuid: string, text = 'reply'): TranscriptEvent => ({
+    type: 'assistant',
+    uuid,
+    timestamp,
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+  } as TranscriptEvent);
+  // Backwards-compat alias for the simpler tests below — most cases
+  // don't care about role, only timestamp.
+  const ev = userEv;
+
+  it('partitions events by timestamp <= cutoff', () => {
+    const before = ev('2026-04-29T12:00:00.000Z', 'a');
+    const at = ev('2026-04-29T13:00:00.000Z', 'b');
+    const after = ev('2026-04-29T13:00:01.000Z', 'c');
+    const { history, live } = splitTranscriptEventsByCutoff([before, at, after], cutoffMs);
+    expect(history.map((e) => e.uuid)).toEqual(['a', 'b']);
+    expect(live.map((e) => e.uuid)).toEqual(['c']);
+  });
+
+  it('events with no timestamp fall into live (better forward once than drop)', () => {
+    const noTs = ev(undefined, 'd');
+    const { history, live } = splitTranscriptEventsByCutoff([noTs], cutoffMs);
+    expect(history).toEqual([]);
+    expect(live).toEqual([noTs]);
+  });
+
+  it('events with malformed timestamp fall into live', () => {
+    const bad = ev('not-a-date', 'e');
+    const { history, live } = splitTranscriptEventsByCutoff([bad], cutoffMs);
+    expect(history).toEqual([]);
+    expect(live).toEqual([bad]);
+  });
+
+  it('all-history input: live array empty', () => {
+    const a = ev('2026-04-29T11:00:00.000Z', 'a');
+    const b = ev('2026-04-29T11:30:00.000Z', 'b');
+    const { history, live } = splitTranscriptEventsByCutoff([a, b], cutoffMs);
+    expect(history).toEqual([a, b]);
+    expect(live).toEqual([]);
+  });
+
+  it('all-live input: history array empty', () => {
+    const a = ev('2026-04-29T13:01:00.000Z', 'a');
+    const b = ev('2026-04-29T13:02:00.000Z', 'b');
+    const { history, live } = splitTranscriptEventsByCutoff([a, b], cutoffMs);
+    expect(history).toEqual([]);
+    expect(live).toEqual([a, b]);
+  });
+
+  it('the post-/clear scenario: history of iTerm turns absorbed, fresh Lark user event ingested', () => {
+    // Mirrors the production flow: user has been talking in iTerm in the
+    // post-/clear jsonl for a while; sends a Lark message; the file now
+    // contains all the iTerm history PLUS the freshly-written Lark
+    // user event. Cutoff is markTimeMs - 5s. After the split:
+    //   - all iTerm-typed user/assistant events go to history → absorbed
+    //     (no "🖥️ 终端本地对话" replay)
+    //   - the Lark user event is in live → ingest can match its
+    //     fingerprint and start the pending turn
+    const itermUserPriorA = userEv('2026-04-29T11:00:00.000Z', 'iterm-u-a', 'hi from iterm');
+    const itermAsstPriorA = assistantEv('2026-04-29T11:00:01.000Z', 'iterm-a-a', 'hello');
+    const itermUserPriorB = userEv('2026-04-29T12:00:00.000Z', 'iterm-u-b', 'another iterm prompt');
+    const itermAsstPriorB = assistantEv('2026-04-29T12:00:01.000Z', 'iterm-a-b', 'sure');
+    const larkUser = userEv('2026-04-29T13:00:05.000Z', 'lark-u', 'who are you');
+    const { history, live } = splitTranscriptEventsByCutoff(
+      [itermUserPriorA, itermAsstPriorA, itermUserPriorB, itermAsstPriorB, larkUser],
+      cutoffMs,
+    );
+    expect(history.map((e) => e.uuid)).toEqual([
+      'iterm-u-a', 'iterm-a-a', 'iterm-u-b', 'iterm-a-b',
+    ]);
+    expect(live.map((e) => e.uuid)).toEqual(['lark-u']);
+  });
+
+  it("regression: split history cutoff must be < scanner's inclusive lower bound so a boundary event lands in live", () => {
+    // The fingerprint scanner accepts events with timestamp >=
+    // (markTimeMs - 5_000) — INCLUSIVE. If split's history cutoff used
+    // the same value, an event at exactly that timestamp (e.g. a
+    // freshly-written Lark user event whose `timestamp` happens to
+    // align with our 5s skew) would be eligible for fingerprint match
+    // (driving the switch) AND absorbed as history (preventing the
+    // pending turn from ever starting). The worker must therefore pass
+    // `(markTimeMs - 5_000) - 1` as the split cutoff. This test locks
+    // that contract: with the worker's actual cutoff calculation, a
+    // boundary event lands in live.
+    const markTimeMs = 1_700_000_000_000;
+    const scannerLowerBoundMs = markTimeMs - 5_000;       // scanner accepts >= this
+    const splitHistoryCutoffMs = scannerLowerBoundMs - 1; // worker passes this
+    const boundaryLarkEvent = userEv(
+      new Date(scannerLowerBoundMs).toISOString(),
+      'lark-boundary',
+      'who are you',
+    );
+    const { history, live } = splitTranscriptEventsByCutoff(
+      [boundaryLarkEvent],
+      splitHistoryCutoffMs,
+    );
+    expect(history).toEqual([]);
+    expect(live).toEqual([boundaryLarkEvent]);
   });
 });
