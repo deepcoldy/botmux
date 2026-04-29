@@ -253,6 +253,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.session.title || getCliDisplayName(botCfg.cliId),
           botCfg.cliId,
           true, // showManageButtons — DM card includes restart & close
+          !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
         );
         sendUserMessage(ds.larkAppId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
           logger.warn(`[${tag(ds)}] Failed to DM write link: ${err}`),

@@ -23,7 +23,7 @@
  * Baseline (`absorb()`) takes a batch of historical events and registers
  * their uuids as already-seen so future ingest doesn't double-attribute.
  */
-import { stringifyUserContent, normaliseForFingerprint, isPureToolResultUserEvent, type TranscriptEvent } from './claude-transcript.js';
+import { stringifyUserContent, normaliseForFingerprint, isMeaningfulUserEvent, type TranscriptEvent } from './claude-transcript.js';
 
 // Re-export so existing callers (worker.ts, tests) don't need to change
 // their import path now that these helpers live in claude-transcript.ts.
@@ -46,6 +46,11 @@ export interface BridgePendingTurn {
    *  uuid → text resolution would fail and the reply would be silently
    *  dropped. */
   sourceJsonlPath?: string;
+  /** Wall-clock millis when mark() was called. Lets the fingerprint-based
+   *  rotation fallback bound its scan to events written after we marked
+   *  the turn — short fingerprints ("hello", "test") would otherwise risk
+   *  matching pre-existing user lines in unrelated sibling jsonls. */
+  markTimeMs?: number;
 }
 
 function assistantHasVisibleText(content: unknown): boolean {
@@ -81,9 +86,13 @@ export class BridgeTurnQueue {
   /** Push a new pending turn for the next Lark message. `contentFingerprint`
    *  (when set) restricts which user event can start this turn — only a
    *  user event whose content contains the fingerprint qualifies. Pass
-   *  `undefined` to start on the next user event regardless (legacy). */
-  mark(turnId: string, contentFingerprint?: string): void {
-    this.queue.push({ turnId, started: false, assistantUuids: [], contentFingerprint });
+   *  `undefined` to start on the next user event regardless (legacy).
+   *
+   *  `markTimeMs` is captured here so the rotation fallback can bound its
+   *  fingerprint scan to events written after this point — protects short
+   *  fingerprints from matching old history in unrelated sibling jsonls. */
+  mark(turnId: string, contentFingerprint?: string, markTimeMs: number = Date.now()): void {
+    this.queue.push({ turnId, started: false, assistantUuids: [], contentFingerprint, markTimeMs });
   }
 
   /** Drop all pending turns. Used when the worker discovers it can't
@@ -111,10 +120,17 @@ export class BridgeTurnQueue {
       this.seen.add(uuid);
       const role = ev.message?.role ?? ev.type;
       if (role === 'user') {
-        // Claude Code records tool results as role:user entries between the
-        // assistant's tool_use and final text. They are part of the same turn,
-        // not local user input, so they must not stop collection.
-        if (isPureToolResultUserEvent(ev.message?.content)) continue;
+        // Skip ALL non-meaningful user events: tool_result (intra-turn
+        // machinery), `<command-name>/clear</command-name>` and other
+        // slash-command wrappers (Claude rewrites them after /clear /
+        // /resume — same in-process rotation that broke bridge tracking
+        // before), isMeta / isCompactSummary markers, sidechain spawns,
+        // empty content. These are NOT real user input; treating them as
+        // turn boundaries would (a) drop `collecting` mid-stream and lose
+        // assistant text after them, and (b) let a synthetic line that
+        // accidentally contains the fingerprint substring start the
+        // wrong turn.
+        if (!isMeaningfulUserEvent(ev)) continue;
         const next = this.queue.find(t => !t.started);
         if (next) {
           // If this turn has a fingerprint, gate on a content match. Both

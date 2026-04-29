@@ -458,6 +458,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               readOnlyUrl,
               ds.session.title || getCliDisplayName(botCfg.cliId),
               botCfg.cliId,
+              undefined,
+              !!ds.adoptedFrom,
             );
             await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
           } catch (fallbackErr) {

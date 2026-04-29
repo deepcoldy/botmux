@@ -189,6 +189,44 @@ describe('buildSessionCard', () => {
       expect(actions).toHaveLength(3);
     });
   });
+
+  // ── Adopt session (adoptMode = true) ──────────────────────────────────
+  // Live failure reported by user: the FIRST card after /adopt showed
+  // "❌ 关闭会话" + action=close, which would tear down the user's CLI
+  // (botmux never owned it in adopt mode). Must instead show "⏏ 断开"
+  // + action=disconnect, which only kills the bridge worker.
+  describe('adopt session (adoptMode=true)', () => {
+    it('group adopt card uses "⏏ 断开" + action=disconnect, not "关闭会话" + close', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, false, true));
+      const actions = findActions(card);
+      const disconnectBtn = actions.find((a: any) => a.value?.action === 'disconnect');
+      expect(disconnectBtn).toBeDefined();
+      expect(disconnectBtn.type).toBe('danger');
+      expect(disconnectBtn.text.content).toContain('断开');
+      // The legacy "❌ 关闭会话" + action=close MUST NOT appear.
+      const closeBtn = actions.find((a: any) => a.value?.action === 'close');
+      expect(closeBtn).toBeUndefined();
+      expect(JSON.stringify(card)).not.toContain('关闭会话');
+    });
+
+    it('DM adopt card (showManage=true + adopt=true) also uses 断开 button', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'claude-code', true, true));
+      const actions = findActions(card);
+      const disconnectBtn = actions.find((a: any) => a.value?.action === 'disconnect');
+      expect(disconnectBtn).toBeDefined();
+      const closeBtn = actions.find((a: any) => a.value?.action === 'close');
+      expect(closeBtn).toBeUndefined();
+    });
+
+    it('non-adopt card retains the original "❌ 关闭会话" button (regression)', () => {
+      // Without adoptMode, behaviour must be unchanged.
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
+      const actions = findActions(card);
+      const closeBtn = actions.find((a: any) => a.value?.action === 'close');
+      expect(closeBtn).toBeDefined();
+      expect(closeBtn.text.content).toContain('关闭会话');
+    });
+  });
 });
 
 // ─── buildStreamingCard ───────────────────────────────────────────────────

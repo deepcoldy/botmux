@@ -24,6 +24,7 @@ function escapeMd(s: string): string {
 /**
  * Build a Feishu interactive card with terminal button + action buttons.
  * @param showManageButtons - When true, include restart & close buttons (used in DM cards with write token).
+ * @param adoptMode - When true, the danger button reads "⏏ 断开" with action `disconnect` (only tears down botmux's bridge worker, leaves the user's tmux pane / Claude process alone). Mutually exclusive with `showManageButtons` (DM management isn't surfaced for adopt sessions). Without this flag the card uses the original "❌ 关闭会话" button which closes the underlying CLI — wrong for adopt where we never owned the CLI in the first place.
  */
 export function buildSessionCard(
   sessionId: string,
@@ -32,6 +33,7 @@ export function buildSessionCard(
   title: string,
   cliId?: CliId,
   showManageButtons?: boolean,
+  adoptMode?: boolean,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const actions: any[] = [
@@ -57,7 +59,9 @@ export function buildSessionCard(
     });
   }
   if (showManageButtons) {
-    // DM card: include restart button
+    // DM card: include restart button. Adopt sessions skip this — restarting
+    // would mean killing the user's Claude process which the daemon never
+    // owned in the first place.
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
@@ -65,12 +69,21 @@ export function buildSessionCard(
       value: { action: 'restart', root_id: rootId, session_id: sessionId },
     });
   }
-  actions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: '❌ 关闭会话' },
-    type: 'danger',
-    value: { action: 'close', root_id: rootId, session_id: sessionId },
-  });
+  if (adoptMode) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '⏏ 断开' },
+      type: 'danger',
+      value: { action: 'disconnect', root_id: rootId, session_id: sessionId },
+    });
+  } else {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '❌ 关闭会话' },
+      type: 'danger',
+      value: { action: 'close', root_id: rootId, session_id: sessionId },
+    });
+  }
   const card = {
     config: { wide_screen_mode: true },
     header: {

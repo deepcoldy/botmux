@@ -361,6 +361,11 @@ export interface JsonlFingerprintSearchOptions {
   excludePath?: string;
   /** Ignore older files when the caller is looking for a just-written submit. */
   minMtimeMs?: number;
+  /** Drop events whose `timestamp` field is older than this (millis since
+   *  epoch). Defends against short fingerprints ("hello", "test") matching
+   *  old user lines in unrelated sibling jsonls — file mtime alone isn't
+   *  enough since a sibling Claude pane could be actively writing. */
+  minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
 }
@@ -374,13 +379,14 @@ export interface JsonlFingerprintSearchOptions {
 export function jsonlContainsFingerprint(
   path: string,
   fingerprint: string,
-  opts?: { includeQueueOperations?: boolean },
+  opts?: { includeQueueOperations?: boolean; minEventTimestampMs?: number },
 ): boolean {
   if (fingerprint.length === 0 || !existsSync(path)) return false;
   let size: number;
   try { size = statSync(path).size; } catch { return false; }
   if (size === 0) return false;
   const includeQueueOps = opts?.includeQueueOperations ?? false;
+  const minEventTimestampMs = opts?.minEventTimestampMs;
   const len = Math.min(size, 1024 * 1024);
   let buf: Buffer;
   try {
@@ -404,6 +410,15 @@ export function jsonlContainsFingerprint(
     let ev: any;
     try { ev = JSON.parse(line); } catch { continue; }
     if (!ev || typeof ev !== 'object') continue;
+    // Per-event timestamp guard: short fingerprints would otherwise
+    // false-match old user events in unrelated sibling jsonls (file
+    // mtime can be recent if a sibling Claude pane is actively writing
+    // its own turns). We compare against `event.timestamp` rather than
+    // file mtime to be precise.
+    if (minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
+      const evMs = Date.parse(ev.timestamp);
+      if (Number.isFinite(evMs) && evMs < minEventTimestampMs) continue;
+    }
     const role = ev.message?.role ?? ev.type;
     let lineText = '';
     if (role === 'user') {
@@ -488,6 +503,14 @@ export function findJsonlContainingFingerprint(
           let ev: any;
           try { ev = JSON.parse(line); } catch { continue; }
           if (!ev || typeof ev !== 'object') continue;
+          // Per-event timestamp guard — see jsonlContainsFingerprint for
+          // the full rationale. Required to keep short fingerprints
+          // ("hello", "test") from matching old user lines in unrelated
+          // sibling jsonls.
+          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
+            const evMs = Date.parse(ev.timestamp);
+            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
+          }
           const role = ev.message?.role ?? ev.type;
           let text = '';
           if (role === 'user') {

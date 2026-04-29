@@ -172,10 +172,22 @@ function maybeSwitchBridgeJsonl(): void {
   const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
   if (!candidate || !candidate.contentFingerprint) return;
 
+  // Bound the search to events written after the turn was marked. Short
+  // fingerprints ("hello", "test") would otherwise match old user lines
+  // in unrelated sibling jsonls. 5s skew absorbs clock drift between the
+  // mark and Claude's transcript write.
+  const minEventTimestampMs = candidate.markTimeMs !== undefined
+    ? candidate.markTimeMs - 5_000
+    : undefined;
+
   const matched = findJsonlContainingFingerprint(
     bridgeJsonlDir,
     candidate.contentFingerprint,
-    bridgeJsonlPath,
+    {
+      excludePath: bridgeJsonlPath,
+      includeQueueOperations: true,
+      minEventTimestampMs,
+    },
   );
   if (!matched) return;
 
@@ -302,18 +314,19 @@ function bridgeIngest(): void {
   // the path. Strictly read-only on the polling rotation; never triggers
   // a rotate or shifts the primary path.
   drainSecondaryPaths();
-  // Authoritative pid-resolver check first — covers /clear / /resume /
-  // daemon-resume rotations that the fingerprint fallback below can't see
-  // (no Lark fingerprint has been written into the new jsonl yet).
+  // Pid-resolver: catches *spawn-time* rotations (new Claude PID → new
+  // pid file → new sessionId), e.g. daemon restart that re-issues
+  // `--resume <id>` and Claude rotates the internal id.
   const pidFollow = maybeFollowSessionRotationViaPid();
-  // Fingerprint fallback ONLY when pid resolver couldn't tell us anything
-  // ('unavailable'). When pid resolver returned 'same' or 'switched' we
-  // already have an authoritative answer; running fingerprint search here
-  // would let a short message ("hello") false-match a sibling Claude
-  // pane's tool_result content and hijack the watcher. With pid resolver
-  // working, the bridge is always pinned to Claude's own pid → sessionId
-  // record.
-  if (pidFollow === 'unavailable') {
+  // Fingerprint fallback: catches *in-process* rotations Claude makes
+  // via /clear or /resume from the user's pane. Claude's pid file has
+  // its sessionId field set ONCE at process start (see binary persistence
+  // schema) and is NOT rewritten on /clear, so pid resolver returning
+  // 'same' is NOT proof that no rotation happened. We skip the
+  // fingerprint scan only when pid resolver actively switched the path
+  // — in that case the authoritative source already moved us, and
+  // running fingerprint on top would risk a redundant flip.
+  if (pidFollow !== 'switched') {
     maybeSwitchBridgeJsonl();
   }
   if (!bridgeJsonlPath) return;

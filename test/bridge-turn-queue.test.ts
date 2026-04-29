@@ -306,4 +306,63 @@ describe('BridgeTurnQueue', () => {
       expect(q.peek()[0].sourceJsonlPath).toBeUndefined();
     });
   });
+
+  describe('synthetic / non-meaningful user events', () => {
+    function syntheticUser(content: string, extra: Record<string, unknown> = {}): TranscriptEvent {
+      return { type: 'user', uuid: `sx-${content.slice(0, 10)}`, message: { role: 'user', content }, ...extra } as TranscriptEvent;
+    }
+
+    it('isMeta user event does NOT reset collecting (regression for /clear in-process rotation)', () => {
+      // After Claude rotates jsonl on /clear, the new file starts with
+      // <local-command-caveat>...</local-command-caveat> (isMeta:true) +
+      // <command-name>/clear</command-name>, then the real Lark user
+      // prompt, then assistant text. If the queue treats those synthetic
+      // events as fresh user turns, `collecting` gets cleared and the
+      // assistant text after them disappears.
+      const q = new BridgeTurnQueue();
+      q.mark('t1', 'test');
+      q.ingest([
+        syntheticUser('<local-command-caveat>noise</local-command-caveat>', { isMeta: true }),
+        syntheticUser('<command-name>/clear</command-name>'),
+        user('u-real', 'test'),
+        assistant('a-real', 'reply after clear'),
+      ]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].assistantUuids).toEqual(['a-real']);
+    });
+
+    it('synthetic user events arriving mid-turn do NOT drop collecting', () => {
+      // Even hypothetically — Claude could write a meta event between
+      // assistant text events. The current ingest must preserve the
+      // active collecting through any non-meaningful user event.
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([
+        user('u1'),
+        assistant('a1', 'first chunk'),
+        syntheticUser('<command-name>/foo</command-name>'),
+        assistant('a2', 'second chunk'),
+      ]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].assistantUuids).toEqual(['a1', 'a2']);
+    });
+
+    it('mark() captures a default markTimeMs', () => {
+      const q = new BridgeTurnQueue();
+      const before = Date.now();
+      q.mark('t1', 'fp');
+      const after = Date.now();
+      const ts = q.peek()[0].markTimeMs!;
+      expect(ts).toBeGreaterThanOrEqual(before);
+      expect(ts).toBeLessThanOrEqual(after);
+    });
+
+    it('mark() honours an explicit markTimeMs', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1', 'fp', 1234567890);
+      expect(q.peek()[0].markTimeMs).toBe(1234567890);
+    });
+  });
 });

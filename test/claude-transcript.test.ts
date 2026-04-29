@@ -632,6 +632,134 @@ describe('fingerprint search: tool_result content must not false-match', () => {
   });
 });
 
+// ─── /clear in-process rotation: bridge must follow new jsonl ─────────────
+//
+// Live failure: pid file's sessionId is set ONCE at process start
+// (Claude Code's persistence schema) — `/clear` and `/resume` rotate to a
+// new jsonl in the same project dir but DON'T rewrite the pid file's
+// sessionId. So pid resolver returning 'same' is NOT proof that no
+// rotation happened. The fingerprint fallback must run anyway, with the
+// per-event timestamp guard protecting against short fingerprints
+// matching old user lines in unrelated sibling jsonls.
+
+describe('fingerprint fallback: /clear rotation + short fingerprint guard', () => {
+  it('finds the new post-/clear jsonl despite pid file still pointing at old sessionId', () => {
+    const oldPath = join(dir, 'old-session-d82e0b04.jsonl');
+    const newPath = join(dir, 'new-session-dd529008.jsonl');
+    // Pre-populate old session with the prior turn (pid resolver still
+    // points here because /clear doesn't update the pid file).
+    appendFileSync(
+      oldPath,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:02.778Z',
+        message: { role: 'user', content: 'Hello again,how are you' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'a1',
+        timestamp: '2026-04-29T05:45:06.133Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Doing well' }] },
+      }) + '\n',
+      'utf8',
+    );
+    // After /clear, Claude rotates to a new jsonl. First lines are the
+    // synthetic local-command-caveat + command-name wrappers, then the
+    // real user prompt + assistant reply.
+    appendFileSync(
+      newPath,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        isMeta: true,
+        message: { role: 'user', content: '<local-command-caveat>noise</local-command-caveat>' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.027Z',
+        message: { role: 'user', content: '<command-name>/clear</command-name>' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:32.224Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'a2',
+        timestamp: '2026-04-29T05:45:34.239Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'reply after clear' }] },
+      }) + '\n',
+      'utf8',
+    );
+
+    // Lark turn's mark time was right before the user pressed enter on
+    // "test" (~05:45:32 UTC). The fallback must find "test" in newPath
+    // and NOT in oldPath (whose user events are older).
+    const markTimeMs = Date.parse('2026-04-29T05:45:30.000Z');
+    const matched = findJsonlContainingFingerprint(dir, 'test', {
+      excludePath: oldPath,
+      minEventTimestampMs: markTimeMs - 5_000,
+      includeQueueOperations: true,
+    });
+    expect(matched).toBe(newPath);
+  });
+
+  it('time guard rejects sibling jsonl whose stale user event coincidentally contains the fingerprint', () => {
+    const watched = join(dir, 'watched.jsonl');
+    const sibling = join(dir, 'sibling-old.jsonl');
+    // Watched (current) path is empty — no user events yet in this turn.
+    writeFileSync(watched, '');
+    // Sibling jsonl (another Claude pane) has an OLD user event whose
+    // content contains "test". Without the timestamp guard the
+    // fingerprint scan would hijack us into the wrong file.
+    appendFileSync(
+      sibling,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T03:00:00.000Z', // hours before mark
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    const markTimeMs = Date.parse('2026-04-29T05:45:30.000Z');
+    const matched = findJsonlContainingFingerprint(dir, 'test', {
+      excludePath: watched,
+      minEventTimestampMs: markTimeMs - 5_000,
+      includeQueueOperations: true,
+    });
+    expect(matched).toBeNull();
+  });
+
+  it('jsonlContainsFingerprint also honours minEventTimestampMs', () => {
+    const path = join(dir, 'mixed.jsonl');
+    appendFileSync(
+      path,
+      // Old hit: should be rejected by time guard.
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T03:00:00.000Z',
+        message: { role: 'user', content: 'hello world from yesterday' },
+      }) + '\n' +
+      // Fresh hit: this is the one we want.
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:32.000Z',
+        message: { role: 'user', content: 'hello world fresh' },
+      }) + '\n',
+      'utf8',
+    );
+    const markTimeMs = Date.parse('2026-04-29T05:45:30.000Z');
+    expect(jsonlContainsFingerprint(path, 'hello world', {
+      minEventTimestampMs: markTimeMs - 5_000,
+    })).toBe(true);
+    // Bumping mark to after both events disqualifies both.
+    expect(jsonlContainsFingerprint(path, 'hello world', {
+      minEventTimestampMs: Date.parse('2026-04-29T06:00:00.000Z'),
+    })).toBe(false);
+  });
+});
+
 // ─── isMeaningfulUserEvent / extractLastAssistantTurn ──────────────────────
 //
 // Powers the /adopt preamble: when /adopt fires, the bridge baselines the
