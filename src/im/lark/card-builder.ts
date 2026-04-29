@@ -58,10 +58,11 @@ export function buildSessionCard(
       value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
     });
   }
-  if (showManageButtons) {
+  if (showManageButtons && !adoptMode) {
     // DM card: include restart button. Adopt sessions skip this — restarting
     // would mean killing the user's Claude process which the daemon never
-    // owned in the first place.
+    // owned in the first place. The handler also hard-rejects restart on
+    // adopt sessions as a defense-in-depth (see card-handler.ts).
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },

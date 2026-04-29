@@ -95,6 +95,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const ds = activeSessions.get(sKey);
 
     if (actionType === 'restart' && ds) {
+      // Adopt sessions: hard-reject. botmux never owned the user's CLI;
+      // restarting would mean killing their tmux pane / Claude process,
+      // which violates the bridge invariant. Defense in depth — buildSessionCard
+      // already omits the restart button when adoptMode=true, but a stale
+      // pre-fix card or a malformed action payload could still arrive.
+      if (ds.adoptedFrom) {
+        logger.warn(`[${tag(ds)}] Rejected restart on adopt session — would kill user's pane`);
+        await sessionReply(rootId, '⚠️ adopt 模式不支持重启（不会触动你自己的 tmux pane / CLI 进程）');
+        return;
+      }
       const botCfg = getBot(ds.larkAppId).config;
       if (ds.worker) {
         // Worker alive — tell it to restart CLI
@@ -298,6 +308,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           next,
           clickedNonce,
           frozen.imageKey,
+          !!ds.adoptedFrom,
+          false,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to toggle frozen card: ${err}`),
@@ -331,6 +343,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           next,
           ds.streamCardNonce,
           ds.currentImageKey,
+          !!ds.adoptedFrom,
+          false,
         );
         scheduleCardPatch(ds, cardJson);
         logger.info(`[${tag(ds)}] Display mode → ${next}`);
@@ -383,6 +397,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
+          !!ds.adoptedFrom,
+          false,
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -417,6 +433,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
+          !!ds.adoptedFrom,
+          false,
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

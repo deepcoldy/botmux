@@ -218,6 +218,25 @@ describe('buildSessionCard', () => {
       expect(closeBtn).toBeUndefined();
     });
 
+    it('DM adopt card omits the restart button entirely', () => {
+      // Adopt mode never owned the user's CLI — restarting would kill
+      // their tmux pane / Claude process. The button must NOT render in
+      // the DM management card under adoptMode.
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'claude-code', true, true));
+      const actions = findActions(card);
+      const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
+      expect(restartBtn).toBeUndefined();
+      expect(JSON.stringify(card)).not.toContain('重启');
+    });
+
+    it('non-adopt DM card still has the restart button (regression)', () => {
+      // Behaviour unchanged for non-adopt DMs.
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'claude-code', true));
+      const actions = findActions(card);
+      const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
+      expect(restartBtn).toBeDefined();
+    });
+
     it('non-adopt card retains the original "❌ 关闭会话" button (regression)', () => {
       // Without adoptMode, behaviour must be unchanged.
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));

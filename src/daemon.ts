@@ -588,6 +588,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
         ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId,
         prevMode, ds.streamCardNonce, ds.currentImageKey,
+        !!ds.adoptedFrom, false,
       );
       // Freeze through the serialization queue to avoid racing with an in-flight PATCH.
       // scheduleCardPatch replaces any stale pending item (latest-wins).
