@@ -26,8 +26,11 @@ const INPUT_ECHO_RE = /^[❯>]\s+\S/;
 /** Empty or whitespace-only */
 const BLANK_RE = /^\s*$/;
 
-/** Safety clamp — even if the xterm is resized wider, don't read past this. */
-const SNAPSHOT_COLS = 160;
+/** Hard upper bound — protects snapshot/PNG memory if a pane is reported as
+ *  unreasonably wide. Below this, the actual read width is the xterm's real
+ *  cols (PTY_COLS=160 for spawned sessions, source pane width for adopt
+ *  mode 200-270). Bumping past 320 risks a >5MB canvas per screenshot. */
+const SNAPSHOT_COLS = 320;
 
 export class TerminalRenderer {
   private terminal: InstanceType<typeof Terminal>;

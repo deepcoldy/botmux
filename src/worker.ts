@@ -540,10 +540,46 @@ function existsSyncSafe(p: string): boolean {
 let awaitingFirstPrompt = true;
 
 // ─── PTY Dimensions ──────────────────────────────────────────────────────────
-// Matches SNAPSHOT_COLS / SHOT_COLS (160). Narrow enough for the web terminal
-// to render comfortably; the card PNG crops at this width anyway.
+// Default for botmux-spawned CLIs: narrow enough for the web terminal to
+// render comfortably and for the card PNG to fit Lark's typical card width.
+// Adopt mode overrides this to match the user's actual pane (often 200-270
+// cols) so the renderer doesn't wrap wide ANSI into a stair-stepped /
+// duplicated mess.
 const PTY_COLS = 160;
 const PTY_ROWS = 50;
+/** Hard upper bound on render dimensions — keeps a malformed pane size
+ *  (or a malicious init) from spawning a multi-megabyte canvas. */
+const MAX_RENDER_COLS = 320;
+const MAX_RENDER_ROWS = 100;
+const MIN_RENDER_COLS = 80;
+const MIN_RENDER_ROWS = 24;
+/** Set in the `init` handler BEFORE startScreenUpdates() so the headless
+ *  xterm + screenshot canvas are sized to the source pane from the start.
+ *  Setting them later (after the renderer was built at 160x50) wouldn't
+ *  retroactively re-size what xterm has already buffered, leaving the
+ *  wrap artefacts in place. */
+let renderCols = PTY_COLS;
+let renderRows = PTY_ROWS;
+
+function clamp(value: number, lo: number, hi: number): number {
+  if (Number.isNaN(value)) return lo;
+  if (value === Infinity) return hi;
+  if (value === -Infinity) return lo;
+  return Math.max(lo, Math.min(hi, Math.round(value)));
+}
+
+/** Compute the render dimensions for a session — adopt mode pegs to the
+ *  source pane, everything else uses PTY_COLS/PTY_ROWS. Exported for
+ *  tests; pure / no side effects. */
+export function resolveRenderDimensions(cfg: { adoptMode?: boolean; adoptPaneCols?: number; adoptPaneRows?: number }): { cols: number; rows: number } {
+  if (cfg.adoptMode) {
+    return {
+      cols: clamp(cfg.adoptPaneCols ?? PTY_COLS, MIN_RENDER_COLS, MAX_RENDER_COLS),
+      rows: clamp(cfg.adoptPaneRows ?? PTY_ROWS, MIN_RENDER_ROWS, MAX_RENDER_ROWS),
+    };
+  }
+  return { cols: PTY_COLS, rows: PTY_ROWS };
+}
 
 // ─── Headless Terminal for Screen Capture ────────────────────────────────────
 
@@ -616,8 +652,10 @@ function stopScreenAnalyzer(): void {
 
 const SCREENSHOT_INTERVAL_MS = 10_000;
 const POST_ACTION_DELAY_MS = 1_000;
-const SHOT_COLS = 160;
-const SHOT_ROWS = 50;
+// PNG dimensions key off the renderer's actual size (renderCols / renderRows),
+// which adopt-mode peg to the source pane so wrap artefacts don't appear.
+// Re-clamping at MAX_RENDER_COLS/ROWS guards against a malformed init
+// payload sneaking past the resolver into a runaway canvas.
 
 let displayMode: DisplayMode = 'hidden';
 let screenshotTimer: ReturnType<typeof setInterval> | null = null;
@@ -669,7 +707,9 @@ async function captureAndUpload(): Promise<void> {
 
   let png: Buffer;
   try {
-    png = captureToPng(term, { cols: SHOT_COLS, rows: SHOT_ROWS, startY });
+    const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
+    const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+    png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
   } catch (err: any) {
     log(`Screenshot render failed: ${err.message}`);
     return;
@@ -1031,7 +1071,12 @@ function sendToPty(content: string): void {
 // ─── Screen Update Timer ─────────────────────────────────────────────────────
 
 function startScreenUpdates(): void {
-  renderer = new TerminalRenderer(PTY_COLS, PTY_ROWS);
+  // renderCols / renderRows were set by the init handler from cfg, so
+  // adopt-mode panes (e.g. 270x57) get an xterm-headless of matching
+  // width. With a too-narrow renderer, ANSI meant for the source pane
+  // would wrap and the screenshot would show duplicated / stair-stepped
+  // content (the live failure that prompted this fix).
+  renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
   screenUpdateTimer = setInterval(() => {
     if (!renderer || awaitingFirstPrompt) return;
@@ -1639,7 +1684,15 @@ process.on('message', async (raw: unknown) => {
       // Capture credentials for direct image upload from worker
       larkAppIdForUpload = msg.larkAppId;
       larkAppSecretForUpload = msg.larkAppSecret;
-      log(`Init: session=${sessionId}, cwd=${msg.workingDir}`);
+      // Resolve render dimensions BEFORE startScreenUpdates() — the
+      // headless xterm and PNG canvas need to know the source pane size
+      // up-front. Setting them later (after the renderer was built at
+      // 160x50) wouldn't unwrap content xterm has already buffered, so
+      // adopt-mode wide-pane content would still come out stair-stepped.
+      const dims = resolveRenderDimensions(msg);
+      renderCols = dims.cols;
+      renderRows = dims.rows;
+      log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
         const port = await startWebServer('0.0.0.0', msg.webPort);
