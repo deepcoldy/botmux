@@ -216,6 +216,8 @@ describe('completionPattern', () => {
       '\u2733 Churned for 8s',
       '\u2733 Sauteed for 2s',
       '\u2733 Sautéed for 2s',
+      '\u2733 Baked for 29s',
+      '\u2733 Brewed for 42s',
     ];
     for (const line of lines) {
       expect(adapter.completionPattern!.test(line), `should match: ${line}`).toBe(true);
@@ -356,4 +358,3 @@ describe('altScreen property', () => {
     expect(createCodexAdapter('/bin/codex').altScreen).toBe(false);
   });
 });
-

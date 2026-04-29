@@ -128,6 +128,17 @@ describe('IdleDetector: completion pattern', () => {
     expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
+
+  it('should detect completion in current chunk even when pushed out of tail', () => {
+    const detector = new IdleDetector(makeCli({ completionPattern: /COMPLETE/ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('COMPLETE' + 'x'.repeat(600));
+    vi.advanceTimersByTime(500);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
 });
 
 // ─── Quiescence detection ─────────────────────────────────────────────────
@@ -269,7 +280,7 @@ describe('IdleDetector: feed()', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
 
-  it('should ignore data after already idle', () => {
+  it('should start a new detection cycle after already idle', () => {
     const detector = new IdleDetector(makeCli({ completionPattern: /DONE$/ }));
     const cb = vi.fn();
     detector.onIdle(cb);
@@ -278,11 +289,12 @@ describe('IdleDetector: feed()', () => {
     vi.advanceTimersByTime(500);
     expect(cb).toHaveBeenCalledTimes(1);
 
-    // Feed more data after idle — should be ignored
-    cb.mockClear();
+    // Adopted panes can receive local terminal input after botmux has already
+    // marked the CLI idle. New data should re-arm the detector so transcript
+    // fallback can emit when that local work finishes.
     detector.feed('more data DONE');
     vi.advanceTimersByTime(500);
-    expect(cb).not.toHaveBeenCalled();
+    expect(cb).toHaveBeenCalledTimes(2);
     detector.dispose();
   });
 
@@ -300,17 +312,16 @@ describe('IdleDetector: feed()', () => {
     detector.dispose();
   });
 
-  it('should not detect pattern pushed out of 500-char tail', () => {
+  it('should fall back to quiescence if later data cancels a completion timer', () => {
     const detector = new IdleDetector(makeCli({ completionPattern: /^MARKER/ }));
     const cb = vi.fn();
     detector.onIdle(cb);
 
     detector.feed('MARKER');
-    // Now push MARKER out of the tail buffer
+    // New data before the 500ms completion delay means the CLI is still
+    // painting output, so the detector falls back to quiescence.
     detector.feed('y'.repeat(500));
-    vi.advanceTimersByTime(10000);
-    // The pattern /^MARKER/ won't match from tail since it's been overwritten
-    // It will go through quiescence instead
+    vi.advanceTimersByTime(2000);
     expect(cb).toHaveBeenCalled();
     detector.dispose();
   });

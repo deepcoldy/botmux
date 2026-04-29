@@ -30,7 +30,16 @@ export class IdleDetector {
   }
 
   feed(data: string): void {
-    if (this.isIdle) return;
+    // A botmux-owned submit calls reset() before writing input, but adopted
+    // panes can also receive local terminal input while we are already idle.
+    // Treat any later PTY data as a fresh cycle so that local work can become
+    // idle and flush transcript-driven fallback output.
+    if (this.isIdle) {
+      this.isIdle = false;
+      this.outputTail = '';
+      this.readySeen = false;
+      this.lastSpinnerAt = Date.now();
+    }
 
     const stripped = this.stripAnsi(data);
     this.outputTail = (this.outputTail + stripped).slice(-500);
@@ -47,12 +56,15 @@ export class IdleDetector {
 
     // Track spinner — but not if it's part of completion marker,
     // and not after ready pattern is seen (status bar chars like · are not real spinners)
-    if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(this.outputTail)) && !this.readySeen) {
+    if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(stripped) || this.completionPattern?.test(this.outputTail)) && !this.readySeen) {
       this.lastSpinnerAt = Date.now();
     }
 
     // Strategy 1: CLI-specific completion marker
-    if (this.completionPattern?.test(this.outputTail)) {
+    // Check the current chunk too: a single full-screen redraw can contain
+    // the completion line and enough trailing status text to push it out of
+    // the 500-char tail before this check runs.
+    if (this.completionPattern?.test(stripped) || this.completionPattern?.test(this.outputTail)) {
       this.clearTimer();
       this.quiescenceTimer = setTimeout(() => {
         this.quiescenceTimer = null;

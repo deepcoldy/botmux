@@ -124,7 +124,7 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string): { path: s
   };
 }
 
-const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed) for \d+[smh]/;
+const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed|Baked|Brewed) for \d+[smh]/;
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'claude');
