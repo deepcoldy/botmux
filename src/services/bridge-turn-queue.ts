@@ -39,6 +39,13 @@ export interface BridgePendingTurn {
    *  start the turn. Local-terminal input (whose content won't contain
    *  the Lark fingerprint) leaves the turn unstarted. */
   contentFingerprint?: string;
+  /** JSONL file the turn's user event was first seen in. Stamped by ingest()
+   *  when the turn transitions to started. Lets the emit step re-read text
+   *  from the original transcript even after a sessionId rotation has
+   *  pointed bridgeJsonlPath at a *different* file — without this stamp,
+   *  uuid → text resolution would fail and the reply would be silently
+   *  dropped. */
+  sourceJsonlPath?: string;
 }
 
 function isPureToolResultUserEvent(content: unknown): boolean {
@@ -94,8 +101,15 @@ export class BridgeTurnQueue {
   }
 
   /** Process newly-appended events. Idempotent on uuid: events with seen
-   *  uuids are skipped, so callers can safely replay. */
-  ingest(events: TranscriptEvent[]): void {
+   *  uuids are skipped, so callers can safely replay.
+   *
+   *  `sourceJsonlPath` (when provided) is stamped onto a turn at the moment
+   *  it transitions from "pending" to "started" — so that emit-time text
+   *  resolution reads the same transcript file the user/assistant uuids
+   *  were originally observed in. Without this, a sessionId rotation
+   *  between ingest and emit would silently drop the reply, since the
+   *  global current jsonl path would no longer contain those uuids. */
+  ingest(events: TranscriptEvent[], sourceJsonlPath?: string): void {
     for (const ev of events) {
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
@@ -121,6 +135,10 @@ export class BridgeTurnQueue {
             }
           }
           next.started = true;
+          // Pin the source jsonl on first start. Don't overwrite a turn
+          // that was somehow re-ingested from a different file — once
+          // stamped, the path stays for the lifetime of the turn.
+          if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
           this.collecting = next;
         } else {
           // Local-terminal input — disable collection so the assistant

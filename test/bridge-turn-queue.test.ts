@@ -264,4 +264,46 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].turnId).toBe('t3');
     expect(ready[0].assistantUuids).toEqual(['a3']);
   });
+
+  describe('sourceJsonlPath stamping', () => {
+    it('stamps the path provided at start-time onto the started turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), assistant('a1', 'hi')], '/tmp/sessionA.jsonl');
+      const turn = q.peek()[0];
+      expect(turn.started).toBe(true);
+      expect(turn.sourceJsonlPath).toBe('/tmp/sessionA.jsonl');
+    });
+
+    it('keeps the original sourceJsonlPath after a later ingest from a different file', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      // Turn starts in fileA — assistant text from later file ingests must
+      // NOT overwrite the source stamp, otherwise emit-time text resolution
+      // would chase the wrong jsonl after a sessionId rotation.
+      q.ingest([user('u1')], '/tmp/sessionA.jsonl');
+      q.ingest([assistant('a1', 'partial')], '/tmp/sessionB.jsonl');
+      expect(q.peek()[0].sourceJsonlPath).toBe('/tmp/sessionA.jsonl');
+    });
+
+    it('drainEmittable surfaces sourceJsonlPath so emit can pick the right file', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.mark('t2');
+      // Two turns started in two different jsonls (rotation between turns)
+      q.ingest([user('u1'), assistant('a1', 'reply 1')], '/tmp/sessionA.jsonl');
+      q.ingest([user('u2'), assistant('a2', 'reply 2')], '/tmp/sessionB.jsonl');
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(2);
+      expect(ready[0].sourceJsonlPath).toBe('/tmp/sessionA.jsonl');
+      expect(ready[1].sourceJsonlPath).toBe('/tmp/sessionB.jsonl');
+    });
+
+    it('back-compat: sourceJsonlPath is undefined when ingest is called without a path', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), assistant('a1', 'reply')]);
+      expect(q.peek()[0].sourceJsonlPath).toBeUndefined();
+    });
+  });
 });

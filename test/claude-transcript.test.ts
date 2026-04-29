@@ -380,3 +380,78 @@ describe('findJsonlContainingFingerprint', () => {
     expect(findJsonlContainingFingerprint(projectDir, 'please run the bridge tests')).toBe(userPane);
   });
 });
+
+// ─── Bridge rotation integration ───────────────────────────────────────────
+//
+// Reproduces the P1 case from review of 0926f3d: when sessionId rotation
+// switches the watched jsonl mid-flight, any unread bytes on the OLD path
+// must still drive an emit. The fix is two-part:
+//   1. drainPathInto(oldPath) before switching — pulls trailing events into
+//      the queue so they participate in attribution.
+//   2. BridgePendingTurn.sourceJsonlPath stamped at start-time — lets emit-
+//      time uuid → text resolution read from the original transcript even
+//      after the global current path has moved.
+// The test exercises both via the real filesystem (no fs.watch / IPC).
+import { BridgeTurnQueue } from '../src/services/bridge-turn-queue.js';
+
+describe('bridge rotation: drain + emit before switch', () => {
+  it('does not lose an in-flight reply when pid resolver switches paths', () => {
+    const oldPath = join(dir, 'old-session.jsonl');
+    const newPath = join(dir, 'new-session.jsonl');
+    writeFileSync(oldPath, '');
+    writeFileSync(newPath, '');
+
+    const queue = new BridgeTurnQueue();
+    queue.mark('t1', 'hello bridge');
+
+    // Claude writes the user event AND the assistant reply to the OLD jsonl.
+    // The fallback poller hasn't seen the assistant yet — only the user
+    // event has been ingested. Then a sessionId rotation flips the pid
+    // file, the resolver wants to switch to newPath, and the assistant
+    // line is "still" on oldPath.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hello bridge — please reply' } }) + '\n',
+      'utf8',
+    );
+    let oldOffset = 0;
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+      oldOffset = r.newOffset;
+    }
+    // Turn should be started but text not yet known.
+    const startedTurn = queue.peek().find(t => t.turnId === 't1');
+    expect(startedTurn?.started).toBe(true);
+    expect(startedTurn?.sourceJsonlPath).toBe(oldPath);
+    expect(startedTurn?.assistantUuids).toEqual([]);
+
+    // Now Claude appends the assistant text to oldPath — fs.watch missed
+    // it (best-effort). The pid resolver fires before the fallback poll.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'reply text from rotated jsonl' }] } }) + '\n',
+      'utf8',
+    );
+
+    // Pre-switch protocol: drain remaining bytes on oldPath one last time.
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+    }
+
+    // Switch to newPath: future ingests stamp newPath, but emits for
+    // turns started on oldPath must still resolve there.
+    const ready = queue.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].sourceJsonlPath).toBe(oldPath);
+    expect(ready[0].assistantUuids).toEqual(['a1']);
+
+    // Emit-time text resolution: read the source path of each turn, NOT
+    // the global current path. Without sourceJsonlPath, draining newPath
+    // here would return zero events and the reply would be lost.
+    const drainedFromSource = drainTranscript(ready[0].sourceJsonlPath!, 0);
+    const matched = drainedFromSource.events.filter(e => e.uuid && ready[0].assistantUuids.includes(e.uuid));
+    expect(joinAssistantText(matched)).toBe('reply text from rotated jsonl');
+  });
+});

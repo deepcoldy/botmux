@@ -140,6 +140,18 @@ function maybeSwitchBridgeJsonl(): void {
   );
   if (!matched) return;
 
+  // Same drain-before-switch protocol as the pid resolver path: any
+  // assistant events appended to the OLD path right before the switch
+  // would otherwise vanish (fs.watch is best-effort). Drain + emit first.
+  if (bridgeJsonlPath && bridgeBaselineDone) {
+    try { drainPathInto(bridgeJsonlPath, bridgeOffset); } catch (err: any) {
+      log(`Bridge final-drain on fingerprint switch failed (${err.message}); continuing`);
+    }
+    try { emitReadyTurns(); } catch (err: any) {
+      log(`Bridge final-emit on fingerprint switch failed (${err.message}); continuing`);
+    }
+  }
+
   log(`Bridge transcript switched: ${bridgeJsonlPath} → ${matched} (Lark fingerprint observed in new jsonl — user likely ran /clear or /resume)`);
   if (bridgeWatcher) {
     try { bridgeWatcher.close(); } catch { /* ignore */ }
@@ -186,6 +198,22 @@ function maybeFollowSessionRotationViaPid(): boolean {
   }
   if (resolved.path === bridgeJsonlPath) return false;
 
+  // Critical: drain any unread bytes from the OLD path BEFORE switching.
+  // fs.watch is best-effort, and there could be assistant events still
+  // sitting at end-of-file that the fallback poller hasn't seen yet. If
+  // we switch first, those events will never be drained and an in-flight
+  // reply gets silently dropped. After draining we emit any turn that's
+  // now complete (its assistantUuids resolve from the OLD path because
+  // BridgePendingTurn.sourceJsonlPath was stamped at turn-start).
+  if (bridgeJsonlPath && bridgeBaselineDone) {
+    try { drainPathInto(bridgeJsonlPath, bridgeOffset); } catch (err: any) {
+      log(`Bridge final-drain on rotation failed (${err.message}); continuing`);
+    }
+    try { emitReadyTurns(); } catch (err: any) {
+      log(`Bridge final-emit on rotation failed (${err.message}); continuing`);
+    }
+  }
+
   log(`Bridge transcript switched (pid resolver): ${bridgeJsonlPath ?? '(none)'} → ${resolved.path}`);
   if (bridgeWatcher) {
     try { bridgeWatcher.close(); } catch { /* ignore */ }
@@ -194,7 +222,9 @@ function maybeFollowSessionRotationViaPid(): boolean {
   // Preserve any pending Lark turn so the next ingest can attribute it
   // when Claude appends our user event to the new jsonl. Skip baseline:
   // we want to read from offset 0 so the pending turn's user event is
-  // visible to BridgeTurnQueue.ingest().
+  // visible to BridgeTurnQueue.ingest(). Turns already started on the
+  // old path keep their stamped sourceJsonlPath, so when their assistant
+  // text eventually arrives there too it still resolves correctly.
   bridgeJsonlPath = resolved.path;
   bridgeJsonlDir = dirname(resolved.path);
   bridgeOffset = 0;
@@ -229,7 +259,7 @@ function bridgeIngest(): void {
   const result = drainTranscript(bridgeJsonlPath, bridgeOffset);
   bridgeOffset = result.newOffset;
   bridgePendingTail = result.pendingTail;
-  bridgeQueue.ingest(result.events);
+  bridgeQueue.ingest(result.events, bridgeJsonlPath);
 }
 
 function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string }): void {
@@ -319,20 +349,49 @@ function bridgeMarkPendingTurn(messageText: string): boolean {
 function bridgeDrainAndMaybeEmit(): void {
   if (!bridgeJsonlPath) return;
   bridgeIngest();
+  emitReadyTurns();
+}
+
+/** Pop ready turns and emit their final_output. Resolves uuid → text via
+ *  each turn's own `sourceJsonlPath` (stamped at turn-start) so an in-flight
+ *  reply that started in an old jsonl still gets picked up after a sessionId
+ *  rotation has switched the global `bridgeJsonlPath` to a different file.
+ *  Falls back to `bridgeJsonlPath` for legacy turns without a stamped source.
+ *
+ *  Caches per-path drains so a batch of turns from the same file only reads
+ *  the transcript once (O(jsonl size) per distinct path). */
+function emitReadyTurns(): void {
   const ready = bridgeQueue.drainEmittable();
   if (ready.length === 0) return;
-  // Re-read the transcript once to resolve assistant uuids → text.
-  // Cost: O(jsonl size) per emit batch — bounded; transcripts are typically <1MB.
-  const all = drainTranscript(bridgeJsonlPath, 0);
+  const cache = new Map<string, ReturnType<typeof drainTranscript>>();
   for (const turn of ready) {
+    const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
+    if (!path) continue;
+    let drained = cache.get(path);
+    if (!drained) {
+      drained = drainTranscript(path, 0);
+      cache.set(path, drained);
+    }
     const set = new Set(turn.assistantUuids);
-    const matched = all.events.filter(e => e.uuid && set.has(e.uuid));
+    const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));
     const text = joinAssistantText(matched);
     if (text.length > 0) {
       const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
       send({ type: 'final_output', content: text, lastUuid, turnId: turn.turnId });
     }
   }
+}
+
+/** Drain `path` from `fromOffset` and feed the events to the bridge queue
+ *  with that path as the source stamp. Pure side-effects on bridgeQueue +
+ *  the returned cursor; does NOT touch bridgeJsonlPath / bridgeOffset, so
+ *  callers can use it to flush the old path during a rotation without
+ *  disturbing the watcher's normal cursor. Returns the new offset for the
+ *  caller to commit (or discard, if it's about to switch paths). */
+function drainPathInto(path: string, fromOffset: number): { offset: number; tail: string } {
+  const result = drainTranscript(path, fromOffset);
+  bridgeQueue.ingest(result.events, path);
+  return { offset: result.newOffset, tail: result.pendingTail };
 }
 
 /** Tiny safe-existence check that doesn't throw. */
