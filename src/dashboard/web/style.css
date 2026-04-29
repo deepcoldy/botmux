@@ -42,3 +42,9 @@ dialog#drawer { border: none; border-radius: 8px; padding: 0; max-width: 600px; 
 dialog#drawer article { padding: 1rem 1.5rem; }
 dialog#drawer code { background: var(--header-bg); padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 12px; }
 .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.8rem 0; }
+.cell-in       { color: #1a7f37; text-align: center; }
+.cell-out      { color: #999;    text-align: center; }
+.cell-error    { color: #cf222e; text-align: center; }
+.cell-unknown  { color: #bf8700; text-align: center; }
+.checkbox-row  { display: block; padding: 0.3rem 0; }
+.empty         { color: var(--muted); padding: 1rem; text-align: center; }

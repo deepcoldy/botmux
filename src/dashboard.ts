@@ -215,6 +215,73 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ─── Groups (Phase B) ────────────────────────────────────────────────────
+
+    if (req.method === 'GET' && url.pathname === '/api/groups') {
+      // Fan out: each online daemon returns the chats its bot is in.
+      // Merge by chatId; populate memberBots with inChat flags for every configured bot.
+      const out = new Map<string, any>();
+      const onlineBots = registry.list();
+      await Promise.all(onlineBots.map(async d => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
+          if (!r.ok) return;
+          const j = await r.json() as { chats?: any[] };
+          for (const c of j.chats ?? []) {
+            const cur = out.get(c.chatId) ?? { ...c, memberBots: [] as any[] };
+            cur.memberBots.push({ larkAppId: d.larkAppId, botName: d.botName, inChat: true });
+            out.set(c.chatId, cur);
+          }
+        } catch { /* skip offline daemons silently — best-effort */ }
+      }));
+      // Fill in inChat:false slots for bots NOT returned for a given chat (matrix view)
+      for (const c of out.values()) {
+        const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
+        for (const b of onlineBots) {
+          if (!present.has(b.larkAppId)) {
+            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, inChat: false });
+          }
+        }
+      }
+      return jsonRes(res, 200, {
+        chats: [...out.values()].sort((a, b) => (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId)),
+        bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
+      });
+    }
+
+    let m2: RegExpMatchArray | null;
+    if (req.method === 'POST' && (m2 = url.pathname.match(/^\/api\/groups\/([^/]+)\/add-bots$/))) {
+      const chatId = decodeURIComponent(m2[1]);
+      // Read body once; we'll forward it to the proxy daemon
+      let raw: string;
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        JSON.parse(raw); // validate is JSON
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      // Find a daemon whose bot is already in this chat
+      let proxy: { larkAppId: string; ipcPort: number } | undefined;
+      for (const d of registry.list()) {
+        try {
+          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups/${encodeURIComponent(chatId)}/membership`);
+          if (!r.ok) continue;
+          const j = await r.json() as { inChat?: boolean };
+          if (j.inChat) { proxy = d; break; }
+        } catch { /* skip */ }
+      }
+      if (!proxy) return jsonRes(res, 200, { ok: false, error: 'no_proxy_bot' });
+      const upstream = await fetch(
+        `http://127.0.0.1:${proxy.ipcPort}/api/groups/${encodeURIComponent(chatId)}/add-bots`,
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw },
+      );
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Public SSE — relays aggregator's listener events
     if (req.method === 'GET' && url.pathname === '/events') {
       res.writeHead(200, {
