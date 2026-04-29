@@ -13,10 +13,11 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, unlinkSync, existsSync, watch as fsWatch, type FSWatcher } from 'node:fs';
+import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, extractLastAssistantTurn, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint } from './services/bridge-turn-queue.js';
+import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -130,12 +131,84 @@ let bridgePreambleSent = false;
 const PREAMBLE_USER_MAX = 500;
 const PREAMBLE_ASSISTANT_MAX = 4000;
 
+/** Same intent as the preamble caps, but for live local-terminal turns
+ *  forwarded to Lark. A long paste typed locally shouldn't be allowed to
+ *  blow past Lark's per-message limit. */
+const LOCAL_TURN_USER_MAX = 1000;
+const LOCAL_TURN_ASSISTANT_MAX = 8000;
+
 function truncatePreambleText(text: string, max: number): string {
   if (text.length <= max) return text;
   return text.slice(0, max) + '…';
 }
 
+/** Compose a `final_output` payload for a turn synthesised from a user
+ *  prompt the human typed directly into the adopted pane. Shows both the
+ *  user text and assistant text so the Lark thread doesn't see an orphan
+ *  reply with no context. Returns `null` when neither side has anything
+ *  visible — the worker should suppress the emit in that case. */
+function formatLocalTurnContent(userText: string, assistantText: string): string | null {
+  const u = truncatePreambleText(userText.trim(), LOCAL_TURN_USER_MAX);
+  const a = truncatePreambleText(assistantText.trim(), LOCAL_TURN_ASSISTANT_MAX);
+  if (!u && !a) return null;
+  return [
+    '🖥️ 终端本地对话（在 adopted pane 中直接输入，已同步至飞书）',
+    '',
+    '👤 你：',
+    u || '(空)',
+    '',
+    `🤖 ${cliName()}：`,
+    a || '(空)',
+  ].join('\n');
+}
+
+// ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
+//
+// `botmux send` (cli.ts cmdSend) appends a line `{sentAtMs, messageId}\n` to
+// `<DATA_DIR>/turn-sends/<sid>.jsonl` every time the model successfully posts
+// a reply to its OWN session thread. The worker reads these markers at idle
+// and suppresses transcript-driven final_output for any turn whose time
+// window already contains a send — i.e. the model didn't forget, no fallback
+// needed. Append-only over a shared file (instead of a per-turn marker) is
+// type-ahead safe: type-ahead'd turns each have their own [markTimeMs,
+// nextTurn.markTimeMs) window, and a stray send only fills its own bucket.
+function bridgeMarkerPath(): string | undefined {
+  if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
+  return join(process.env.SESSION_DATA_DIR, 'turn-sends', `${sessionId}.jsonl`);
+}
+
+function readSendMarkers(): BridgeSendMarker[] {
+  const path = bridgeMarkerPath();
+  if (!path || !existsSync(path)) return [];
+  try {
+    const out: BridgeSendMarker[] = [];
+    for (const line of readFileSync(path, 'utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (typeof parsed?.sentAtMs === 'number') out.push(parsed);
+      } catch { /* skip malformed line */ }
+    }
+    return out;
+  } catch (err: any) {
+    log(`Bridge marker read failed: ${err.message}`);
+    return [];
+  }
+}
+
+function clearSendMarkers(): void {
+  const path = bridgeMarkerPath();
+  if (!path) return;
+  try { unlinkSync(path); } catch { /* already gone or fs.unavailable; not fatal */ }
+}
+
 function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
+  // Preamble is an /adopt-only signal: it tells the user "here's the last
+  // turn from the Claude session you just attached to, so the Lark thread
+  // has context to continue from". In non-adopt sessions the user IS the
+  // Lark thread (every turn was already pushed there as a card), so
+  // surfacing the last turn again on daemon restart is just noise.
+  if (!lastInitConfig?.adoptMode) return;
   if (bridgePreambleSent) return;
   const turn = extractLastAssistantTurn(events);
   if (!turn) return;
@@ -157,9 +230,10 @@ function bridgeAbsorbBaseline(): void {
   bridgeBaselineDone = true;
   // After absorb (uuids registered as seen so they won't re-emit as a Lark
   // turn), surface the last completed user/assistant exchange to Lark as a
-  // one-shot preamble — this is what /adopt was missing for the user to
-  // pick up the conversation thread without scrolling the tmux pane.
-  maybeEmitAdoptPreamble(result.events);
+  // one-shot preamble — but only for real /adopt sessions. Non-adopt
+  // claude-code fallback bridge also uses baseline-existing on daemon
+  // restart/resume; it must not emit the "/adopt 前最后一轮" message.
+  if (lastInitConfig?.adoptMode) maybeEmitAdoptPreamble(result.events);
 }
 
 /** Detect /clear / /resume: when Claude Code starts a new session in the
@@ -176,11 +250,11 @@ function bridgeAbsorbBaseline(): void {
  *
  *  Pending turns are preserved across the switch so the next ingest can
  *  match the fingerprint and start the turn in the new file. */
-function maybeSwitchBridgeJsonl(): void {
-  if (!bridgeJsonlDir) return;
+function maybeSwitchBridgeJsonl(): boolean {
+  if (!bridgeJsonlDir) return false;
   const pending = bridgeQueue.peek();
   const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
-  if (!candidate || !candidate.contentFingerprint) return;
+  if (!candidate || !candidate.contentFingerprint) return false;
 
   // Bound the search to events written after the turn was marked. Short
   // fingerprints ("hello", "test") would otherwise match old user lines
@@ -199,7 +273,7 @@ function maybeSwitchBridgeJsonl(): void {
       minEventTimestampMs,
     },
   );
-  if (!matched) return;
+  if (!matched) return false;
 
   // Drain-before-switch: pull in any unread bytes from the old path so a
   // late assistant append doesn't vanish. We do NOT emit here — emission
@@ -245,6 +319,194 @@ function maybeSwitchBridgeJsonl(): void {
   } catch (err: any) {
     log(`Bridge fs.watch unavailable on new target (${err.message}); relying on fallback poller`);
   }
+  return true;
+}
+
+/** /clear or /resume in the user's adopted pane creates (or touches) a new
+ *  jsonl in the same Claude project directory. Neither pid-resolver nor
+ *  fingerprint switch will fire when the rotation happened mid-process AND
+ *  there's no pending Lark turn to anchor on (pure local-terminal use), so
+ *  this fallback owns that case.
+ *
+ *  Detection priority:
+ *    1. Linux first-class: read `/proc/<pid>/fd` and pick the .jsonl the
+ *       adopted Claude process actually has open. This is bound to the real
+ *       PID — a sibling Claude pane in the same cwd has a different PID and
+ *       therefore cannot hijack the result.
+ *    2. Cross-platform fallback: directory-level mtime heuristic, gated on
+ *       (a) our current jsonl quiet ≥ QUIET_ROTATION_MS, (b) candidate
+ *       newer by ≥ QUIET_ROTATION_MS, (c) adopted Claude pid alive. Less
+ *       robust than fd lookup but the best available without /proc.
+ *
+ *  When a rotation is detected, the new jsonl is drained from offset 0 and
+ *  events are split by timestamp against `rotationCutoffMs` (the old
+ *  jsonl's last-write time): events before the cutoff are *history*
+ *  (absorbed into the seen-set, not emitted), events after are *live*
+ *  (ingested → local-turn synthesis runs). This is what lets /resume to a
+ *  long-history jsonl NOT replay the entire past as one giant local turn,
+ *  while /clear's first new turn still gets forwarded.
+ *
+ *  Critically, we do NOT call `bridgeAbsorbBaseline` here — that helper
+ *  also fires `maybeEmitAdoptPreamble`, which on rotation would surface
+ *  the *previous session's* last turn as if it were a fresh "/adopt 前最
+ *  后一轮" preamble. Preamble belongs only to initial attach. */
+const QUIET_ROTATION_MS = 8_000;
+
+function statSafe(path: string): { mtimeMs: number; size: number } | null {
+  try {
+    const st = statSync(path);
+    if (!st.isFile()) return null;
+    return { mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** List `.jsonl` files inside `dir` that are currently held open by `pid`.
+ *  Returns [] on non-Linux platforms or if /proc lookup fails — the caller
+ *  treats an empty result as "fd info unavailable, fall back to mtime". */
+function findOpenJsonlsForPid(pid: number, dir: string): string[] {
+  if (!Number.isInteger(pid) || pid <= 0) return [];
+  if (process.platform !== 'linux') return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(`/proc/${pid}/fd`);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const name of entries) {
+    let target: string;
+    try {
+      target = readlinkSync(`/proc/${pid}/fd/${name}`);
+    } catch {
+      continue;
+    }
+    if (!target.endsWith('.jsonl')) continue;
+    if (dirname(target) !== dir) continue;
+    out.push(target);
+  }
+  return out;
+}
+
+/** Pick the most recently modified path among `paths`. Returns null if
+ *  none of them stat. */
+function newestPath(paths: string[]): string | null {
+  let best: { path: string; mtimeMs: number } | null = null;
+  for (const p of paths) {
+    const st = statSafe(p);
+    if (!st) continue;
+    if (!best || st.mtimeMs > best.mtimeMs) best = { path: p, mtimeMs: st.mtimeMs };
+  }
+  return best?.path ?? null;
+}
+
+/** Switch bridgeJsonlPath to `newPath` and split-baseline its existing
+ *  content: events with timestamp ≤ `cutoffMs` are absorbed as history
+ *  (seen-set only, no emission), events strictly after are ingested so
+ *  local turn synthesis runs against them. The old path is retained in
+ *  the secondary polling rotation if any started turn still references
+ *  it. Does NOT emit `adopt_preamble` — that's an initial-attach signal,
+ *  not a rotation signal. */
+function performRotationSwitch(newPath: string, cutoffMs: number, reason: string): void {
+  // Drain-before-switch: pull any unread bytes from the old path so a
+  // late assistant append doesn't vanish. Mirrors the other rotation
+  // helpers.
+  if (bridgeJsonlPath && bridgeBaselineDone) {
+    let postDrainOffset = bridgeOffset;
+    try {
+      const drained = drainPathInto(bridgeJsonlPath, bridgeOffset);
+      postDrainOffset = drained.offset;
+    } catch (err: any) {
+      log(`Bridge final-drain on rotation (${reason}) failed (${err.message}); continuing`);
+    }
+    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, postDrainOffset);
+  }
+
+  log(`Bridge transcript switched (${reason}): ${bridgeJsonlPath ?? '(none)'} → ${newPath}`);
+  if (bridgeWatcher) {
+    try { bridgeWatcher.close(); } catch { /* ignore */ }
+    bridgeWatcher = null;
+  }
+  bridgeJsonlPath = newPath;
+  bridgeJsonlDir = dirname(newPath);
+  bridgePendingTail = '';
+
+  // Drain the new path from 0 ourselves (do NOT call bridgeAbsorbBaseline
+  // — that would emit the preamble we want to suppress on rotation).
+  const result = drainTranscript(newPath, 0);
+  bridgeOffset = result.newOffset;
+  bridgePendingTail = result.pendingTail;
+  const history: TranscriptEvent[] = [];
+  const live: TranscriptEvent[] = [];
+  for (const ev of result.events) {
+    let evMs = Number.NaN;
+    if (typeof ev.timestamp === 'string') evMs = Date.parse(ev.timestamp);
+    if (Number.isFinite(evMs) && evMs <= cutoffMs) history.push(ev);
+    else live.push(ev);
+  }
+  bridgeQueue.absorb(history);
+  if (live.length > 0) bridgeQueue.ingest(live, newPath);
+  bridgeBaselineDone = true;
+  log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
+
+  try {
+    bridgeWatcher = fsWatch(newPath, { persistent: false }, () => {
+      try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
+    });
+  } catch (err: any) {
+    log(`Bridge fs.watch unavailable on rotated target (${err.message}); relying on fallback poller`);
+  }
+}
+
+function maybeFollowQuietRotation(): void {
+  if (!bridgeJsonlDir || !bridgeJsonlPath) return;
+  // Need a known pid to do safe rotation tracking; if we don't have one,
+  // we can't bind to the adopted Claude process and a directory-mtime
+  // switch would risk sibling-pane hijack.
+  if (bridgeCliPid === undefined) return;
+  if (!isPidAlive(bridgeCliPid)) return;
+
+  const currentStat = statSafe(bridgeJsonlPath);
+  if (!currentStat) return;
+
+  // Path 1: Linux fd-based detection — definitive, can't be hijacked.
+  // Read /proc/<pid>/fd, find every .jsonl Claude has open in our cwd's
+  // project dir, pick the one with the most recent mtime. Differs from
+  // bridgeJsonlPath ⇒ rotation.
+  const opened = findOpenJsonlsForPid(bridgeCliPid, bridgeJsonlDir);
+  if (opened.length > 0) {
+    const newest = newestPath(opened);
+    if (newest && newest !== bridgeJsonlPath) {
+      performRotationSwitch(newest, currentStat.mtimeMs, `pid fd → ${bridgeCliPid}`);
+    }
+    // fd lookup succeeded — even if it confirmed the current path, the
+    // mtime fallback below would only add risk. Stop here.
+    return;
+  }
+
+  // Path 2: non-Linux fallback (or /proc unavailable). Directory-mtime
+  // heuristic with three guards. Less robust than fd lookup; sibling
+  // panes could in principle race the conditions, but the QUIET windows
+  // make it unlikely in practice.
+  const now = Date.now();
+  if (now - currentStat.mtimeMs < QUIET_ROTATION_MS) return;
+  const latest = findLatestJsonl(bridgeJsonlDir);
+  if (!latest || latest === bridgeJsonlPath) return;
+  const latestStat = statSafe(latest);
+  if (!latestStat) return;
+  if (latestStat.mtimeMs - currentStat.mtimeMs < QUIET_ROTATION_MS) return;
+  performRotationSwitch(latest, currentStat.mtimeMs, `quiet mtime fallback (${Math.round((now - currentStat.mtimeMs) / 1000)}s quiet)`);
 }
 
 /** Authoritative rotation follow: re-read ~/.claude/sessions/<cliPid>.json
@@ -336,8 +598,17 @@ function bridgeIngest(): void {
   // fingerprint scan only when pid resolver actively switched the path
   // — in that case the authoritative source already moved us, and
   // running fingerprint on top would risk a redundant flip.
-  if (pidFollow !== 'switched') {
-    maybeSwitchBridgeJsonl();
+  let switched = pidFollow === 'switched';
+  if (!switched) {
+    switched = maybeSwitchBridgeJsonl();
+  }
+  // Quiet-rotation fallback: catches /clear or /resume in pure-local
+  // sessions (no pending Lark turn → no fingerprint to match against).
+  // Without this, a user who hits /clear in the adopted pane and then
+  // continues in the terminal would never get those replies forwarded
+  // to Lark — the watcher stays stuck on the old, frozen jsonl.
+  if (!switched) {
+    maybeFollowQuietRotation();
   }
   if (!bridgeJsonlPath) return;
   if (!bridgeBaselineDone) {
@@ -352,11 +623,12 @@ function bridgeIngest(): void {
   bridgeQueue.ingest(result.events, bridgeJsonlPath);
 }
 
-function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string }): void {
+function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string; mode?: 'baseline-existing' | 'fresh-empty' }): void {
   bridgeJsonlPath = jsonlPath;
   bridgeJsonlDir = dirname(jsonlPath);
   bridgeCliPid = opts?.cliPid;
   bridgeCliCwd = opts?.cliCwd;
+  const mode = opts?.mode ?? 'baseline-existing';
   // Authoritative: prefer Claude's own pid-state record over the path the
   // adopt scan computed. If Claude has already rotated since adopt fired
   // (e.g. user ran /clear before any Lark message arrived), this swaps the
@@ -373,9 +645,18 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
       }
     }
   }
-  // Try to baseline now. If the file doesn't exist yet, bridgeIngest will
-  // baseline lazily once Claude Code creates it (see bridgeBaselineDone).
-  if (existsSyncSafe(bridgeJsonlPath)) {
+  if (mode === 'fresh-empty') {
+    // Non-adopt fallback: brand-new session, jsonl gets created on the first
+    // user submit. We must NOT lazy-absorb the file when it appears — that
+    // would treat the first turn's user/assistant events as history and the
+    // worker would never emit a final_output for them. Instead declare
+    // baseline=done with offset=0 up front: the very first events drained
+    // from the file are eligible for attribution against pending Lark turns.
+    bridgeOffset = 0;
+    bridgePendingTail = '';
+    bridgeBaselineDone = true;
+    log(`Bridge fresh-empty mode: ${bridgeJsonlPath} (waiting for file to appear; no baseline absorb)`);
+  } else if (existsSyncSafe(bridgeJsonlPath)) {
     bridgeAbsorbBaseline();
     log(`Bridge baselined: ${bridgeJsonlPath} (offset=${bridgeOffset})`);
   } else {
@@ -459,8 +740,24 @@ function bridgeDrainAndMaybeEmit(): void {
 function emitReadyTurns(): void {
   const ready = bridgeQueue.drainEmittable();
   if (ready.length === 0) return;
+  const adoptMode = lastInitConfig?.adoptMode === true;
+  // Send markers (`botmux send` landed in own thread) + the queue's first
+  // still-unready turn. The latter caps the LAST ready turn's window —
+  // without it, a model that's still mid-tool-use for turn N+1 could leak
+  // a send credit into turn N's window via shouldSuppressBridgeEmit.
+  const markers = adoptMode ? [] : readSendMarkers();
+  const remainingPending = bridgeQueue.peek();
+  const nextPendingMarkTimeMs = remainingPending.length > 0 ? remainingPending[0].markTimeMs : undefined;
   const cache = new Map<string, ReturnType<typeof drainTranscript>>();
-  for (const turn of ready) {
+  for (let i = 0; i < ready.length; i++) {
+    const turn = ready[i];
+    const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
+    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
+      const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
+      log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
+      continue;
+    }
+
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
     let drained = cache.get(path);
@@ -470,11 +767,25 @@ function emitReadyTurns(): void {
     }
     const set = new Set(turn.assistantUuids);
     const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));
-    const text = joinAssistantText(matched);
-    if (text.length > 0) {
-      const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
-      send({ type: 'final_output', content: text, lastUuid, turnId: turn.turnId });
+    const assistantText = joinAssistantText(matched);
+    if (assistantText.length === 0) continue;
+    const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
+
+    if (turn.isLocal) {
+      // Local turn (adopt mode only): also surface the user prompt so the
+      // Lark thread shows both sides of the exchange. User text comes from
+      // the same drained transcript via the userUuid stamped at start time.
+      const userEv = turn.userUuid
+        ? drained.events.find(e => e.uuid === turn.userUuid)
+        : undefined;
+      const userText = userEv ? stringifyUserContent(userEv.message?.content) : '';
+      const content = formatLocalTurnContent(userText, assistantText);
+      if (!content) continue;
+      send({ type: 'final_output', content, lastUuid, turnId: turn.turnId });
+      continue;
     }
+
+    send({ type: 'final_output', content: assistantText, lastUuid, turnId: turn.turnId });
   }
 }
 
@@ -996,7 +1307,15 @@ async function flushPending(): Promise<void> {
   if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
   // Type-ahead adapters flush even while the CLI is busy; others wait for idle.
-  if (!isPromptReady && !cliAdapter.supportsTypeAhead) return;
+  // Bridge fallback (non-adopt) disables type-ahead: queued submits land
+  // in jsonl as `attachment(queued_command)` events, NOT `role:user` lines,
+  // so BridgeTurnQueue.ingest never starts the pending turn for them and
+  // the assistant text would be dropped on the floor. Serialise instead —
+  // worker holds messages in pendingMessages until the CLI reaches idle.
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !(bridgeJsonlPath && !lastInitConfig?.adoptMode);
+  if (!isPromptReady && !typeAheadAllowed) return;
+
+  const bridgeFallbackActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
 
   isFlushing = true;
   if (isPromptReady) {
@@ -1007,6 +1326,17 @@ async function flushPending(): Promise<void> {
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const msg = pendingMessages.shift()!;
+      // Bridge fallback: mark immediately before writeInput. Doing it here
+      // (instead of at enqueue time) means markTimeMs anchors to the
+      // moment the message actually starts hitting the PTY — so any
+      // `botmux send` whose sentAtMs lands during turn N's processing
+      // falls inside [markTimeMs(N), markTimeMs(N+1)). Marking earlier
+      // (at IPC arrival) would let a slow-finishing turn N's send leak
+      // into turn N+1's window and falsely suppress its emit.
+      if (bridgeFallbackActive) {
+        try { bridgeIngest(); } catch { /* best-effort */ }
+        bridgeMarkPendingTurn(msg);
+      }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       const result = await cliAdapter.writeInput(backend, msg);
       // Persist any sessionId the adapter observed via authoritative sources
@@ -1022,6 +1352,15 @@ async function flushPending(): Promise<void> {
           message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 3 次仍未在会话 JSONL 中看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
         });
       }
+      // Bridge fallback: stop after one writeInput. Subsequent submits
+      // would be type-ahead'd into Claude's queue, which jsonl records as
+      // queued_command attachments (not role:user lines) — BridgeTurnQueue
+      // can't attribute those, so the fallback would silently drop them.
+      // We resume on the next idle, by which point Claude has finished
+      // and the next message can be a normal role:user submit. Scoped to
+      // bridgeFallbackActive so non-bridge CLIs (codex/gemini/...) keep
+      // the original "one idle drains all pending" behaviour.
+      if (bridgeFallbackActive && pendingMessages.length > 0) break;
     }
   } finally {
     isFlushing = false;
@@ -1044,7 +1383,9 @@ function sendToPty(content: string): void {
     // Tear down the prompt card so the user doesn't see stale options.
     send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
   }
-  if (isPromptReady || isFlushing || cliAdapter.supportsTypeAhead) {
+  // See flushPending: bridge fallback gates type-ahead off.
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !(bridgeJsonlPath && !lastInitConfig?.adoptMode);
+  if (isPromptReady || isFlushing || typeAheadAllowed) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
@@ -1236,10 +1577,34 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log('Re-attached to existing tmux session');
   }
 
+  // Bridge fallback: claude-code only. Tail Claude's transcript JSONL so a
+  // turn the model finishes WITHOUT calling `botmux send` still gets its
+  // assistant text forwarded to Lark (the gate in emitReadyTurns suppresses
+  // the emit when a send did happen). Adopt mode wires this up separately
+  // (with baseline-existing); here we use fresh-empty for new sessions so
+  // the file Claude creates on first submit isn't absorbed as history,
+  // and baseline-existing on resume so prior-run turns ARE absorbed (we
+  // don't want to re-emit yesterday's conversation as fresh turns).
+  if (cfg.cliId === 'claude-code' && cfg.sessionId) {
+    const claudeJsonl = claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
+    startBridgeWatcher(claudeJsonl, {
+      cliPid: cliPid ?? undefined,
+      cliCwd: cfg.workingDir,
+      mode: cfg.resume ? 'baseline-existing' : 'fresh-empty',
+    });
+  }
+
   // Set up idle detection
   idleDetector = new IdleDetector(cliAdapter);
   idleDetector.onIdle(() => {
     log('Prompt detected (idle)');
+    // Bridge drain MUST run before markPromptReady() — the latter calls
+    // flushPending() which can immediately fire the next queued message
+    // (type-ahead adapters), shifting bridgeQueue's notion of "current
+    // turn" before we've had a chance to emit the previous one.
+    if (bridgeJsonlPath) {
+      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+    }
     markPromptReady();
   });
 
@@ -1272,6 +1637,10 @@ function killCli(): void {
   stopScreenUpdates();
   backend?.kill();
   backend = null;
+  // Tear down the bridge watcher (if any). spawnCli will rebuild it on
+  // restart with the proper mode based on the new cfg. Leaving it running
+  // would dangle a watcher pinned to a stale jsonl path.
+  stopBridgeWatcher();
   // Clean up CLI PID marker
   if (cliPidMarker) {
     try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
@@ -1687,6 +2056,8 @@ process.on('message', async (raw: unknown) => {
         // Queue the initial prompt — flushed when CLI shows idle.
         // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the
         // prompt into CLI args, so we skip queuing to avoid double-send.
+        // Bridge mark is deferred to flushPending — see flushPending
+        // comment for why marking at enqueue is wrong.
         if (msg.prompt && !cliAdapter?.passesInitialPromptViaArgs) {
           pendingMessages.push(msg.prompt);
         }
@@ -1727,6 +2098,11 @@ process.on('message', async (raw: unknown) => {
           idleDetector?.reset();
         }
       } else {
+        // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
+        // so markTimeMs anchors to the actual PTY-write moment, not IPC
+        // arrival. Marking now would race with a still-running previous
+        // turn whose `botmux send` could sneak its sentAtMs past this
+        // turn's markTimeMs and falsely suppress its fallback.
         sendToPty(content);
       }
       break;
@@ -1812,6 +2188,11 @@ process.on('message', async (raw: unknown) => {
       // destroySession kills tmux session permanently; kill() only detaches
       backend?.destroySession?.();
       killCli();
+      // Bridge marker file outlives a single CLI process (we keep it across
+      // restarts so a mid-flight send is still credited), but a real close
+      // tears down the session — purge the file so a future re-use of the
+      // same sessionId starts clean.
+      clearSendMarkers();
       cleanup();
       process.exit(0);
     }

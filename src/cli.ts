@@ -17,7 +17,7 @@
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -1830,6 +1830,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? new RegExp(`@(${namedMentions.map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'gi')
       : null;
 
+    // Capture sentAtMs BEFORE dispatch — the worker's bridge fallback gates
+    // on `sentAtMs ∈ [turn.markTimeMs, nextTurn.markTimeMs)`. If we recorded
+    // it after dispatch (which can take seconds), a slow Lark RTT could push
+    // this send's timestamp past the next turn's mark and falsely suppress
+    // that turn's fallback emit. Pre-dispatch timestamp captures the moment
+    // we committed to sending — that's the boundary the gate cares about.
+    const sentAtMs = Date.now();
     let messageId: string;
     if (useCard) {
       // Inline @mention → <at id=open_id></at>; explicit --mention args that
@@ -1939,6 +1946,22 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
       messageId = await dispatch(postJson, 'post');
+    }
+
+    // Bridge fallback marker — append-only jsonl per session. The worker
+    // gates its non-adopt transcript-driven fallback on whether any send
+    // happened within the current Lark turn's window. Only when this send
+    // landed in the session's own thread (not --top-level, not --chat-id
+    // override) does it cancel that turn's fallback.
+    if (!sendTopLevel && !overrideChatId) {
+      try {
+        const markerDir = join(resolveDataDir(), 'turn-sends');
+        if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+        // sentAtMs was captured pre-dispatch (see above). messageId is the
+        // confirmed Lark message id from the now-successful dispatch.
+        const line = JSON.stringify({ sentAtMs, messageId }) + '\n';
+        appendFileSync(join(markerDir, `${sid}.jsonl`), line);
+      } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
     }
 
     // Send file attachments as separate messages

@@ -734,6 +734,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // from the adopted Claude session so the Lark thread has context
         // to continue from. Best-effort — failure here just means the
         // user won't see the preamble; adopt itself isn't blocked.
+        if (!ds.adoptedFrom) {
+          logger.warn(`[${t}] Ignored adopt_preamble from non-adopt worker`);
+          break;
+        }
         const userBlock = msg.userText.trim();
         const assistantBlock = msg.assistantText.trim();
         if (!userBlock && !assistantBlock) break;

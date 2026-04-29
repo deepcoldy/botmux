@@ -9,13 +9,18 @@
  * Attribution rule:
  *   - mark()           — pushes a new pending turn entry (state: not started)
  *   - ingest(events)   — for each new user/assistant event:
- *       * user event → the earliest unstarted pending turn becomes 'started'
- *         (its assistantUuids will collect from now on). A user event with
- *         no unstarted pending turn is treated as local terminal input and
- *         disables collection so subsequent assistant events don't bleed
- *         into a previous Lark turn.
+ *       * user event → the earliest unstarted pending turn whose fingerprint
+ *         matches becomes 'started' (its assistantUuids will collect from
+ *         now on). A user event that does NOT match any pending fingerprint
+ *         (or arrives with no pending Lark turn at all) is treated as
+ *         **local terminal input**: a synthetic local turn is created on
+ *         the spot, started immediately, and inserted ahead of any
+ *         still-unstarted Lark turns so emit ordering reflects when the
+ *         user event actually landed in the transcript. The local turn is
+ *         emitted with `isLocal: true` so the worker can format it with a
+ *         "user typed in the terminal" marker for the Lark thread.
  *       * assistant text event (non-sidechain) → appended to the
- *         currently-collecting turn, if any.
+ *         currently-collecting turn (Lark or local), if any.
  *   - drainEmittable() — pops any leading turn that has been started AND has
  *     accumulated at least one visible assistant-text uuid. Started turns with no text
  *     yet (Claude is mid-tool-use) stay queued for the next idle.
@@ -33,6 +38,17 @@ export interface BridgePendingTurn {
   turnId: string;
   started: boolean;
   assistantUuids: string[];
+  /** Set when this turn was synthesised from a local-terminal user event
+   *  (no matching Lark fingerprint). Causes the worker emit path to format
+   *  the Lark message with both user text and assistant text under a
+   *  "🖥️ 终端本地对话" header — otherwise the user would see an orphan
+   *  reply with no prompt for context. Lark-driven turns keep this unset. */
+  isLocal?: boolean;
+  /** Transcript uuid of the user event that started this turn. Stored for
+   *  local turns so emit can fetch the user-typed content from the source
+   *  jsonl alongside the assistant uuids. Lark turns don't need it because
+   *  the user content is already known on the daemon side. */
+  userUuid?: string;
   /** A short substring of the Lark message that we expect to find inside
    *  the next matching `user` event's content. When set, only a user event
    *  whose stringified content contains this fingerprint is allowed to
@@ -131,7 +147,19 @@ export class BridgeTurnQueue {
         // accidentally contains the fingerprint substring start the
         // wrong turn.
         if (!isMeaningfulUserEvent(ev)) continue;
+        // Defensive: if the previous local turn never accumulated any
+        // assistant text (Claude crashed / was killed / user cancelled
+        // mid-response), drop it now so its empty `assistantUuids` doesn't
+        // head-of-line block every subsequent emit. Lark turns are NOT
+        // dropped here — they may still be in tool-use legitimately, and
+        // Lark-side timeout is tracked separately by the daemon.
+        if (this.collecting && this.collecting.isLocal && this.collecting.assistantUuids.length === 0) {
+          const idx = this.queue.indexOf(this.collecting);
+          if (idx >= 0) this.queue.splice(idx, 1);
+          this.collecting = null;
+        }
         const next = this.queue.find(t => !t.started);
+        let consumedNext = false;
         if (next) {
           // If this turn has a fingerprint, gate on a content match. Both
           // sides are normalised (whitespace-collapsed + trimmed) before
@@ -139,23 +167,42 @@ export class BridgeTurnQueue {
           // newlines still matches a fingerprint built from the same text.
           if (next.contentFingerprint) {
             const userText = normaliseForFingerprint(stringifyUserContent(ev.message?.content));
-            if (!userText.includes(next.contentFingerprint)) {
-              // Treat as local input — keep next unstarted, disable collection.
-              this.collecting = null;
-              continue;
+            if (userText.includes(next.contentFingerprint)) {
+              next.started = true;
+              if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+              this.collecting = next;
+              consumedNext = true;
             }
+            // Mismatch falls through to the local-turn branch below.
+          } else {
+            // Legacy mark() with no fingerprint — start on the next user.
+            next.started = true;
+            if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+            this.collecting = next;
+            consumedNext = true;
           }
-          next.started = true;
-          // Pin the source jsonl on first start. Don't overwrite a turn
-          // that was somehow re-ingested from a different file — once
-          // stamped, the path stays for the lifetime of the turn.
-          if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
-          this.collecting = next;
-        } else {
-          // Local-terminal input — disable collection so the assistant
-          // events that follow this user line aren't attributed to a stale
-          // collecting turn from before.
-          this.collecting = null;
+        }
+        if (!consumedNext) {
+          // Local-terminal input. Synthesise a started turn so the
+          // assistant text that follows is captured (and pushed to the
+          // Lark thread) instead of being silently dropped — that's the
+          // /adopt symptom users hit when typing directly in the iterm
+          // pane. Insert AHEAD of any still-unstarted Lark turn so
+          // chronological order is preserved: this user event landed in
+          // the transcript before the next Lark turn's user event will.
+          const localTurn: BridgePendingTurn = {
+            turnId: `local-${uuid}`,
+            started: true,
+            isLocal: true,
+            userUuid: uuid,
+            assistantUuids: [],
+            sourceJsonlPath,
+            markTimeMs: Date.now(),
+          };
+          const insertAt = this.queue.findIndex(t => !t.started);
+          if (insertAt === -1) this.queue.push(localTurn);
+          else this.queue.splice(insertAt, 0, localTurn);
+          this.collecting = localTurn;
         }
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
