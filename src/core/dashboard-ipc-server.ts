@@ -3,6 +3,8 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { logger } from '../utils/logger.js';
 import * as sessionStore from '../services/session-store.js';
 import { listActiveSessions, findActiveBySessionId, closeSession } from './worker-pool.js';
+import { replyMessage } from '../im/lark/client.js';
+import { locateLimiter } from './dashboard-locate.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -147,6 +149,50 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) => {
+  const sid = params.sessionId;
+  const acq = locateLimiter.tryAcquire(sid);
+  if (!acq.ok) {
+    res.writeHead(429, {
+      'content-type': 'application/json',
+      'retry-after': String(Math.ceil(acq.retryAfterMs / 1000)),
+    });
+    res.end(JSON.stringify({ ok: false, error: 'rate_limited', retryAfterMs: acq.retryAfterMs }));
+    return;
+  }
+  // Resolve owning session (active first, then closed-store fallback)
+  const ds = findActiveBySessionId(sid);
+  const closed = ds ? null : sessionStore.getSession(sid);
+  const ctx = ds
+    ? {
+        larkAppId: ds.larkAppId,
+        rootMessageId: ds.session.rootMessageId,
+        title: ds.session.title || `Dashboard 定位 (${sid.slice(0, 8)})`,
+      }
+    : closed
+      ? {
+          larkAppId: closed.larkAppId ?? '',
+          rootMessageId: closed.rootMessageId,
+          title: closed.title || `Dashboard 定位 (${sid.slice(0, 8)})`,
+        }
+      : null;
+  if (!ctx || !ctx.larkAppId) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  try {
+    const messageId = await replyMessage(
+      ctx.larkAppId,
+      ctx.rootMessageId,
+      `📍 Dashboard 定位 ${ctx.title}`,
+      'text',
+      true,
+    );
+    jsonRes(res, 200, { ok: true, messageId });
+  } catch (err) {
+    jsonRes(res, 502, { ok: false, error: String(err) });
+  }
 });
 
 export function startIpcServer(opts: { port: number; host: string }): Promise<IpcServerHandle> {

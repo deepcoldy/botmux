@@ -51,3 +51,14 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(body.ok).toBe(true);
   });
 });
+
+describe('POST /api/sessions/:sessionId/locate rate limit', () => {
+  it('returns 429 on second call within window', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    // First call expected 404 because no session exists — but it consumes the limiter slot.
+    await fetch(`http://127.0.0.1:${handle.port}/api/sessions/sX-test/locate`, { method: 'POST' });
+    const second = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/sX-test/locate`, { method: 'POST' });
+    expect(second.status).toBe(429);
+    expect(second.headers.get('retry-after')).toBeTruthy();
+  });
+});
