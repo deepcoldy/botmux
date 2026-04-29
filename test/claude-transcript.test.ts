@@ -20,6 +20,8 @@ import {
   jsonlContainsFingerprint,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
+  readFirstEventTimestamp,
+  findJsonlsContainingExactContent,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -634,13 +636,17 @@ describe('fingerprint search: tool_result content must not false-match', () => {
 
 // ─── /clear in-process rotation: bridge must follow new jsonl ─────────────
 //
-// Live failure: pid file's sessionId is set ONCE at process start
-// (Claude Code's persistence schema) — `/clear` and `/resume` rotate to a
-// new jsonl in the same project dir but DON'T rewrite the pid file's
-// sessionId. So pid resolver returning 'same' is NOT proof that no
-// rotation happened. The fingerprint fallback must run anyway, with the
-// per-event timestamp guard protecting against short fingerprints
-// matching old user lines in unrelated sibling jsonls.
+// Live failure: pid file's sessionId is set ONCE at process start. Verified
+// empirically on Claude Code 2.1.123: in-pane `/clear` rotates to a new
+// jsonl in the same project dir, refreshes the pid file's `updatedAt` /
+// `status`, but does NOT rewrite `sessionId`. So pid resolver returning
+// 'same' is NOT proof that no rotation happened. The fingerprint fallback
+// must run anyway, with the per-event timestamp guard protecting against
+// short fingerprints matching old user lines in unrelated sibling jsonls.
+//
+// (`--resume` is a fresh spawn and DOES rewrite the pid file's sessionId,
+// so it's covered by the pid resolver alone — separate scope from this
+// test.)
 
 describe('fingerprint fallback: /clear rotation + short fingerprint guard', () => {
   it('finds the new post-/clear jsonl despite pid file still pointing at old sessionId', () => {
@@ -897,3 +903,258 @@ describe('extractLastAssistantTurn', () => {
   });
 });
 
+// ─── findJsonlContainingFingerprint: acceptCandidate skip-and-continue ─────
+//
+// Sibling-pane hijack guard wants to reject candidates whose sessionId
+// isn't trusted. The newest jsonl in the project dir is usually the busy
+// sibling, so the scanner must keep going past a rejected candidate to find
+// a legitimate older one (e.g. a fresh /clear-induced jsonl).
+describe('findJsonlContainingFingerprint: acceptCandidate', () => {
+  it('skips a rejected candidate and returns a later valid one', () => {
+    const newer = join(dir, 'newer.jsonl');
+    const older = join(dir, 'older.jsonl');
+    appendFileSync(
+      newer,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    appendFileSync(
+      older,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:30:00.000Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    // Make `newer.jsonl` win the mtime sort but reject it via the
+    // callback. Expect the scanner to fall through to `older.jsonl`.
+    const future = Date.now() / 1000 + 60;
+    utimesSync(newer, future, future);
+    utimesSync(older, future - 30, future - 30);
+
+    const got = findJsonlContainingFingerprint(dir, 'test', {
+      acceptCandidate: (path) => path === older,
+    });
+    expect(got).toBe(older);
+  });
+
+  it('returns null when every fingerprint match is rejected', () => {
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    const got = findJsonlContainingFingerprint(dir, 'test', {
+      acceptCandidate: () => false,
+    });
+    expect(got).toBeNull();
+  });
+
+  it('default behaviour preserved when acceptCandidate is omitted', () => {
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    const got = findJsonlContainingFingerprint(dir, 'test');
+    expect(got).toBe(path);
+  });
+});
+
+// ─── readFirstEventTimestamp ───────────────────────────────────────────────
+describe('readFirstEventTimestamp', () => {
+  it('returns the first parseable timestamp from a top-level field', () => {
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.091Z',
+        message: { role: 'user', content: 'hello' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.091Z'));
+  });
+
+  it('falls through to snapshot.timestamp for file-history-snapshot leading event', () => {
+    // Mirrors Claude Code's actual emit order: file-history-snapshot at the
+    // top (no top-level timestamp; it lives under .snapshot.timestamp),
+    // then SessionStart with a top-level timestamp.
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'file-history-snapshot',
+        snapshot: { timestamp: '2026-04-29T05:45:14.092Z' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.200Z',
+        attachment: { hookName: 'SessionStart:clear' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.092Z'));
+  });
+
+  it('returns undefined when the file is missing or unreadable', () => {
+    expect(readFirstEventTimestamp(join(dir, 'nope.jsonl'))).toBeUndefined();
+  });
+
+  it('returns undefined when the leading chunk has no parseable timestamp', () => {
+    appendFileSync(path, '{"type":"unknown","no":"timestamp"}\n', 'utf8');
+    expect(readFirstEventTimestamp(path)).toBeUndefined();
+  });
+});
+
+// ─── findJsonlsContainingExactContent ──────────────────────────────────────
+//
+// The unknown-sid /clear recovery path must accept ONLY candidates whose
+// user/queue events normalise to the pending Lark turn's *full* normalised
+// content — substring matches (the failure mode of the existing fingerprint
+// scanner) are explicitly off-limits, so "test" must not match "run tests"
+// across sibling pane jsonls. The search must also collect every match so
+// the caller can abstain when more than one untrusted file looks valid.
+describe('findJsonlsContainingExactContent', () => {
+  it('returns the single matching path when exactly one jsonl has the exact content', () => {
+    const a = join(dir, 'a.jsonl');
+    const b = join(dir, 'b.jsonl');
+    appendFileSync(
+      a,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'who are you' },
+      }) + '\n',
+      'utf8',
+    );
+    appendFileSync(
+      b,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'something else entirely' },
+      }) + '\n',
+      'utf8',
+    );
+    const got = findJsonlsContainingExactContent(dir, 'who are you');
+    expect(got).toEqual([a]);
+  });
+
+  it('rejects substring-only matches: "test" does NOT match "run tests" in a sibling jsonl', () => {
+    const sibling = join(dir, 'sibling.jsonl');
+    appendFileSync(
+      sibling,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'run tests' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.193Z',
+        message: { role: 'user', content: 'test bridge' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(findJsonlsContainingExactContent(dir, 'test')).toEqual([]);
+  });
+
+  it('returns ALL exact matches when multiple files contain the same normalised content (caller abstains)', () => {
+    const a = join(dir, 'a.jsonl');
+    const b = join(dir, 'b.jsonl');
+    for (const p of [a, b]) {
+      appendFileSync(
+        p,
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-04-29T05:45:14.092Z',
+          message: { role: 'user', content: 'hello' },
+        }) + '\n',
+        'utf8',
+      );
+    }
+    const got = findJsonlsContainingExactContent(dir, 'hello');
+    expect(got.length).toBe(2);
+    expect(got).toEqual(expect.arrayContaining([a, b]));
+  });
+
+  it('respects acceptCandidate to filter the candidate set', () => {
+    const knownSid = '11111111-1111-4111-8111-111111111111';
+    const known = join(dir, `${knownSid}.jsonl`);
+    const unknown = join(dir, 'unknown.jsonl');
+    for (const p of [known, unknown]) {
+      appendFileSync(
+        p,
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-04-29T05:45:14.092Z',
+          message: { role: 'user', content: 'who are you' },
+        }) + '\n',
+        'utf8',
+      );
+    }
+    const onlyUnknown = findJsonlsContainingExactContent(dir, 'who are you', {
+      acceptCandidate: (path) => !path.includes(knownSid),
+    });
+    expect(onlyUnknown).toEqual([unknown]);
+  });
+
+  it('respects minEventTimestampMs (rejects events older than the gate)', () => {
+    const a = join(dir, 'a.jsonl');
+    appendFileSync(
+      a,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:00:00.000Z',
+        message: { role: 'user', content: 'who are you' },
+      }) + '\n',
+      'utf8',
+    );
+    const cutoffMs = Date.parse('2026-04-29T06:00:00.000Z');
+    expect(
+      findJsonlsContainingExactContent(dir, 'who are you', {
+        minEventTimestampMs: cutoffMs,
+      }),
+    ).toEqual([]);
+  });
+
+  it('matches a queue-operation/enqueue event when includeQueueOperations is set', () => {
+    const a = join(dir, 'a.jsonl');
+    appendFileSync(
+      a,
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        content: 'queued message',
+      }) + '\n',
+      'utf8',
+    );
+    expect(
+      findJsonlsContainingExactContent(dir, 'queued message', {
+        includeQueueOperations: true,
+      }),
+    ).toEqual([a]);
+    expect(
+      findJsonlsContainingExactContent(dir, 'queued message'),
+    ).toEqual([]); // off by default
+  });
+
+  it('returns empty list on missing dir / empty content', () => {
+    expect(findJsonlsContainingExactContent(join(dir, 'nope'), 'x')).toEqual([]);
+    expect(findJsonlsContainingExactContent(dir, '')).toEqual([]);
+  });
+});

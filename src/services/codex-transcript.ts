@@ -24,11 +24,49 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const CODEX_SESSIONS_ROOT = join(homedir(), '.codex', 'sessions');
+
+/** Extract the cliSessionId encoded in a rollout filename. Codex's session
+ *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
+ *  the UUID alone — the `<ts>` segment between "rollout-" and the sid
+ *  contains its own dashes that would otherwise let a greedy match swallow
+ *  parts of the sid. Returns undefined for paths that don't match. */
+export function codexSessionIdFromRolloutPath(path: string): string | undefined {
+  const m = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
+  return m ? m[1] : undefined;
+}
+
+/** Find the rollout file an externally-running Codex process has open by
+ *  walking `/proc/<pid>/fd/*`. The Codex process keeps fd open on its
+ *  current rollout for the entire lifetime of the session, so this is the
+ *  authoritative way to bind a Codex pid to its sessionId — far more
+ *  reliable than scanning `~/.codex/sessions` by mtime (which would race
+ *  with sibling Codex panes in the same project).
+ *
+ *  Linux-only: relies on `/proc`. macOS/BSD callers should fall back to
+ *  the cliSessionId path (read from `~/.codex/history.jsonl`'s last
+ *  matching cwd entry) — but the use case for /proc-based discovery is
+ *  /adopt, which already runs on Linux servers in practice. */
+export function findCodexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const fdDir = `/proc/${pid}/fd`;
+  if (!existsSync(fdDir)) return undefined;
+  let entries: string[];
+  try { entries = readdirSync(fdDir); } catch { return undefined; }
+  for (const fd of entries) {
+    let target: string;
+    try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
+    if (!target.endsWith('.jsonl')) continue;
+    if (!target.includes('/.codex/sessions/')) continue;
+    const sid = codexSessionIdFromRolloutPath(target);
+    if (sid) return { path: target, cliSessionId: sid };
+  }
+  return undefined;
+}
 
 export interface CodexBridgeEvent {
   /** Synthetic uuid for dedup: `<absPath>:<byteOffset>` of the line start.
@@ -45,6 +83,27 @@ export interface CodexBridgeEvent {
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). */
   text: string;
+}
+
+/** Split a drained event list into "history" (older than the live cutoff)
+ *  and "live" (cutoff or newer). The Codex adopt bridge uses this when
+ *  it discovers the rollout file LATE (after the user already typed in
+ *  iTerm or sent a Lark message): drain-from-0 produces a mix of pre-
+ *  adopt history and post-adopt live events. The worker then `absorb()`s
+ *  the history (so it isn't replayed) and `ingest()`s the live partition
+ *  (so the local-turn synthesis / fingerprint match still works). Pure
+ *  function — no I/O, easy to test against fixed timestamps. */
+export function splitCodexEventsByCutoff(
+  events: readonly CodexBridgeEvent[],
+  liveSinceMs: number,
+): { history: CodexBridgeEvent[]; live: CodexBridgeEvent[] } {
+  const history: CodexBridgeEvent[] = [];
+  const live: CodexBridgeEvent[] = [];
+  for (const ev of events) {
+    if (ev.timestampMs < liveSinceMs) history.push(ev);
+    else live.push(ev);
+  }
+  return { history, live };
 }
 
 export interface CodexDrainResult {

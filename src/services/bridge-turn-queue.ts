@@ -55,6 +55,14 @@ export interface BridgePendingTurn {
    *  start the turn. Local-terminal input (whose content won't contain
    *  the Lark fingerprint) leaves the turn unstarted. */
   contentFingerprint?: string;
+  /** Full normalised content of the Lark message. Used by the rotation
+   *  fallback's recovery path to gate a switch into an UNKNOWN sessionId
+   *  on exact equality with a user/queue event in that file — much
+   *  stronger than the substring fingerprint check, which can't tell
+   *  "test" from "run tests" across sibling panes. Stored in addition to
+   *  `contentFingerprint` (not instead of) because in-pane known-sid
+   *  candidates still benefit from the cheaper substring path. */
+  contentNormalized?: string;
   /** JSONL file the turn's user event was first seen in. Stamped by ingest()
    *  when the turn transitions to started. Lets the emit step re-read text
    *  from the original transcript even after a sessionId rotation has
@@ -107,8 +115,15 @@ export class BridgeTurnQueue {
    *  `markTimeMs` is captured here so the rotation fallback can bound its
    *  fingerprint scan to events written after this point — protects short
    *  fingerprints from matching old history in unrelated sibling jsonls. */
-  mark(turnId: string, contentFingerprint?: string, markTimeMs: number = Date.now()): void {
-    this.queue.push({ turnId, started: false, assistantUuids: [], contentFingerprint, markTimeMs });
+  mark(turnId: string, contentFingerprint?: string, markTimeMs: number = Date.now(), contentNormalized?: string): void {
+    this.queue.push({
+      turnId,
+      started: false,
+      assistantUuids: [],
+      contentFingerprint,
+      contentNormalized,
+      markTimeMs,
+    });
   }
 
   /** Drop all pending turns. Used when the worker discovers it can't

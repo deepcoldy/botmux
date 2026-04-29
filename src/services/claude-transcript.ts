@@ -368,6 +368,14 @@ export interface JsonlFingerprintSearchOptions {
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
+  /** Called on each candidate that already passed the fingerprint match.
+   *  Returning `false` skips the candidate and continues searching older
+   *  files in the directory (mtime-descending walk). Used by the bridge
+   *  watcher to reject sibling-pane jsonls whose sessionId we don't trust,
+   *  without losing the chance to find a legitimate /clear rotation buried
+   *  under a busier sibling. Default (no callback): accept the first
+   *  fingerprint match like the original behaviour. */
+  acceptCandidate?: (path: string) => boolean;
 }
 
 /** Scan a single jsonl file's tail for a Lark message fingerprint. Same
@@ -530,7 +538,17 @@ export function findJsonlContainingFingerprint(
             continue;
           }
           const normalisedText = normaliseForFingerprint(text);
-          if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) return path;
+          if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
+            // Allow caller to veto this candidate (e.g., sibling-pane
+            // hijack guard rejecting an untrusted sessionId). On veto,
+            // break out of the line loop so we move to the next, older
+            // candidate instead of returning `null` after the first
+            // fingerprint hit.
+            if (opts.acceptCandidate && !opts.acceptCandidate(path)) {
+              break;
+            }
+            return path;
+          }
         }
       } finally {
         closeSync(fd);
@@ -538,4 +556,168 @@ export function findJsonlContainingFingerprint(
     } catch { /* unreadable — skip */ }
   }
   return null;
+}
+
+/**
+ * Stronger sibling-pane recovery anchor than the substring fingerprint
+ * search. Walks every `.jsonl` in `dir` and returns the paths whose
+ * trailing 1MB contains a user/queue event whose normalised text is
+ * EXACTLY equal to `normalisedContent` (not a substring), respecting
+ * `excludePath`, `minMtimeMs`, `minEventTimestampMs`,
+ * `includeQueueOperations`, and `acceptCandidate` the same way as
+ * `findJsonlContainingFingerprint`.
+ *
+ * Returns *all* matches in mtime-descending order — callers must
+ * abstain when the result has length > 1, since multiple files containing
+ * the same exact normalised content cannot be disambiguated without
+ * stronger evidence (and forcing a switch would risk picking the wrong
+ * pane). The caller's typical pattern is:
+ *
+ *   - 1 match → switch to it (legitimate post-/clear recovery)
+ *   - 0 matches → no recovery this tick; wait for stronger signal
+ *   - >1 match → log and abstain; surface a diagnostic to the user
+ *
+ * Used by the bridge fingerprint fallback's recovery path for in-pane
+ * `/clear`: substring matches risk hijacking on short fingerprints (the
+ * literal text "test" matches "run tests" / "test bridge"), but full
+ * equality on a Lark message we just wrote is a much stronger anchor.
+ */
+export function findJsonlsContainingExactContent(
+  dir: string,
+  normalisedContent: string,
+  options?: JsonlFingerprintSearchOptions,
+): string[] {
+  if (!existsSync(dir) || normalisedContent.length === 0) return [];
+  const opts: JsonlFingerprintSearchOptions = options ?? {};
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const candidates: Array<{ path: string; mtime: number }> = [];
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    const full = join(dir, name);
+    if (opts.excludePath && full === opts.excludePath) continue;
+    try {
+      const st = statSync(full);
+      if (!st.isFile()) continue;
+      if (opts.minMtimeMs !== undefined && st.mtimeMs < opts.minMtimeMs) continue;
+      candidates.push({ path: full, mtime: st.mtimeMs });
+    } catch { /* ignore */ }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  const matches: string[] = [];
+  for (const { path } of candidates) {
+    if (opts.acceptCandidate && !opts.acceptCandidate(path)) continue;
+    try {
+      const fd = openSync(path, 'r');
+      try {
+        const size = statSync(path).size;
+        const len = Math.min(size, 1024 * 1024);
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, size - len);
+        const text = buf.toString('utf8');
+        const lines = text.split('\n');
+        const startIdx = size > len ? 1 : 0;
+        let hit = false;
+        for (let i = startIdx; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          let ev: any;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (!ev || typeof ev !== 'object') continue;
+          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
+            const evMs = Date.parse(ev.timestamp);
+            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
+          }
+          const role = ev.message?.role ?? ev.type;
+          let raw = '';
+          if (role === 'user') {
+            if (isPureToolResultUserEvent(ev.message?.content)) continue;
+            raw = stringifyUserContent(ev.message?.content);
+          } else if (
+            opts.includeQueueOperations &&
+            ev.type === 'queue-operation' &&
+            ev.operation === 'enqueue'
+          ) {
+            raw = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+          } else {
+            continue;
+          }
+          const normalised = normaliseForFingerprint(raw);
+          if (normalised === normalisedContent) {
+            hit = true;
+            break;
+          }
+        }
+        if (hit) matches.push(path);
+      } finally {
+        closeSync(fd);
+      }
+    } catch { /* unreadable — skip */ }
+  }
+  return matches;
+}
+
+/**
+ * Read the first event timestamp out of a jsonl. Reads only the leading
+ * 4 KB — Claude's `file-history-snapshot` and `SessionStart` events both
+ * land in the first few hundred bytes. Returns the parsed millis, or
+ * undefined when no parseable timestamp is found in the leading chunk
+ * (corrupted file, partial first line, format change).
+ *
+ * NOTE: not currently wired into the bridge rotation flow. The bridge
+ * fingerprint fallback (`decideFingerprintSwitch` in
+ * `bridge-rotation-policy.ts`) deliberately rejects candidates outside
+ * the pid-derived trust set rather than relying on freshness heuristics
+ * — file-creation timestamps cannot prove ownership across panes in
+ * the same project dir. Kept here as a reusable primitive for
+ * diagnostics and future /clear-recovery work.
+ */
+export function readFirstEventTimestamp(path: string): number | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, 'r');
+  } catch {
+    return undefined;
+  }
+  try {
+    const len = 4096;
+    const buf = Buffer.alloc(len);
+    let bytesRead = 0;
+    try {
+      bytesRead = readSync(fd, buf, 0, len, 0);
+    } catch {
+      return undefined;
+    }
+    if (bytesRead <= 0) return undefined;
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+    const lines = text.split('\n');
+    // Drop the trailing partial line if we read exactly `len` bytes — it
+    // may not be a complete JSON object. When the whole file is shorter
+    // than `len` bytes the last line is complete and we keep it.
+    const usable = bytesRead === len ? lines.slice(0, -1) : lines;
+    for (const line of usable) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let ev: any;
+      try { ev = JSON.parse(trimmed); } catch { continue; }
+      // Top-level `timestamp` field — covers both regular events
+      // (user/assistant/attachment) and `file-history-snapshot` records
+      // whose `timestamp` lives under `snapshot.timestamp` instead.
+      const tsStr = typeof ev?.timestamp === 'string'
+        ? ev.timestamp
+        : typeof ev?.snapshot?.timestamp === 'string'
+          ? ev.snapshot.timestamp
+          : undefined;
+      if (!tsStr) continue;
+      const ms = Date.parse(tsStr);
+      if (Number.isFinite(ms)) return ms;
+    }
+    return undefined;
+  } finally {
+    closeSync(fd);
+  }
 }

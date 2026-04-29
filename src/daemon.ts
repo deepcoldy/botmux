@@ -557,15 +557,15 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {
     const dsBotCfgForMsg = getBot(ds.larkAppId).config;
-    // Bridge mode: adopted Claude Code session with a known sessionId — model
-    // sees the user's message as plain input, daemon harvests the assistant
-    // reply from the transcript out-of-band. No botmux_reminder / session_id
-    // injection here, otherwise the model would try to use botmux tools that
-    // it isn't actually equipped with in bridge mode.
-    const isBridge =
-      !!ds.adoptedFrom &&
-      dsBotCfgForMsg.cliId === 'claude-code' &&
-      !!ds.adoptedFrom.sessionId;
+    // Adopt mode: the adopted CLI is the user's external process and was
+    // never injected with botmux's skill / system prompt. Sending it the
+    // `<user_message>` / `<botmux_reminder>` / `<session_id>` wrappers
+    // surfaces those tags verbatim in its UI (the user reported Codex
+    // showing raw XML on every Lark message). Use the bridge raw-input
+    // builder for ALL adopt sessions regardless of cliId — transcript
+    // harvest (Claude bridge or Codex bridge) handles the reply path
+    // out-of-band.
+    const isBridge = !!ds.adoptedFrom;
     const msgContent = isBridge
       ? buildBridgeInputContent(parsed.content, {
           attachments,
@@ -574,7 +574,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       : buildFollowUpContent(parsed.content, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
-          isAdoptMode: !!ds.adoptedFrom,
+          isAdoptMode: false,
           cliId: dsBotCfgForMsg.cliId,
           cliPathOverride: dsBotCfgForMsg.cliPathOverride,
         });

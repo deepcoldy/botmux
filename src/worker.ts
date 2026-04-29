@@ -15,11 +15,19 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, makeFingerprint } from './services/bridge-turn-queue.js';
+import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, type TranscriptEvent } from './services/claude-transcript.js';
+import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import {
+  shouldRunQuietRotation,
+  evaluatePidResolverPullback,
+  decideFingerprintSwitch,
+  sessionIdFromJsonlPath,
+  SESSION_ID_FILENAME_RE,
+  type PidFollowResult,
+} from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
-import { drainCodexRollout, findCodexRolloutBySessionId } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff } from './services/codex-transcript.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -96,15 +104,37 @@ let bridgeJsonlPath: string | undefined;
  *  original path would silently stop receiving events. */
 let bridgeJsonlDir: string | undefined;
 /** PID + cwd of the adopted Claude Code process. Lets every poll re-read
- *  ~/.claude/sessions/<pid>.json — Claude's own authoritative record of the
- *  current sessionId — and switch the watched jsonl when Claude rotates
- *  (via /clear, /resume, --resume etc.) without waiting for a Lark message
- *  to land in the new file. */
+ *  ~/.claude/sessions/<pid>.json — Claude's own pid-state record. Empirical
+ *  scope (Claude Code 2.1.123): the pid file's `sessionId` is set ONCE at
+ *  process start. `--resume` (which spawns a new process) does rotate the
+ *  recorded sessionId; `/clear` / in-pane `/resume` do NOT — those rely on
+ *  the fingerprint fallback (which anchors on a pending Lark turn) to
+ *  follow the new jsonl. */
 let bridgeCliPid: number | undefined;
 let bridgeCliCwd: string | undefined;
 /** Last sessionId we observed via the pid resolver — used to detect
  *  rotations cheaply (string compare instead of stat()ing every jsonl). */
 let bridgeObservedCliSessionId: string | undefined;
+/** Sibling-pane hijack guard state.
+ *
+ *  Every sessionId we have evidence of belonging to our adopted Claude pid:
+ *  initial attach path, pid resolver hits, `/proc/<pid>/fd` hits. The
+ *  fingerprint fallback's two-phase decision (`decideFingerprintSwitch`
+ *  in `src/services/bridge-rotation-policy.ts`) consumes this set:
+ *  Phase 1 substring match runs against trusted sids only; Phase 2
+ *  exact-content recovery runs against UNTRUSTED sids only. Unknown
+ *  sessionIds never pass Phase 1 even when the file looks freshly
+ *  created — freshness/timestamp signals cannot prove pane ownership
+ *  across siblings in the same project dir. */
+const bridgeKnownSessionIds = new Set<string>();
+/** Set when the fingerprint fallback accepts a candidate whose sessionId
+ *  doesn't match the pid file's current sessionId (Claude's pid file isn't
+ *  refreshed by in-pane `/clear`, so it keeps reporting the spawn-time sid
+ *  even after the user rotated). Suppresses pid resolver from pulling the
+ *  watcher back to that spawn-time sid every tick. Cleared when pid file
+ *  reports a NEW sid (fresh `--resume` / spawn), at which point a real
+ *  rotation has happened and we should follow it. */
+let bridgeStalePidStateSessionId: string | undefined;
 /** Old jsonl paths we keep polling AFTER a rotation switched
  *  bridgeJsonlPath away — needed when a started turn was stamped with the
  *  old path but its assistant text hasn't been written yet. We continue to
@@ -146,6 +176,16 @@ let codexBridgeTimer: NodeJS.Timeout | null = null;
  *  Codex's first user submit, but with some race delay after our submit
  *  returns. Cleared once attached. */
 let codexBridgePendingSessionId: string | undefined;
+/** Adopt-only: PID of the externally-running Codex process. Used by the
+ *  poller to fall back to /proc/<pid>/fd discovery when sessionId is
+ *  unknown (e.g. discovery probe missed the rollout fd). */
+let codexAdoptPendingPid: number | undefined;
+/** Adopt-only: wall-clock millis at adopt-spawn time. Late-attach uses
+ *  this as the cutoff for splitting an existing rollout into "history"
+ *  (absorb) vs "live" (ingest) — so events the user produced AFTER adopt
+ *  but BEFORE the rollout was located still reach the Lark thread. 5s
+ *  skew tolerance is applied on top, mirroring the Lark/Claude bridges. */
+let codexAdoptStartMs: number | undefined;
 
 /** Cap the preamble text so an extremely long previous turn doesn't blow
  *  past Lark's per-message limit. The user only needs enough to recall
@@ -243,6 +283,30 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
   log('Bridge adopt preamble emitted (last completed turn from baseline)');
 }
 
+/** Extract the sessionId from a Claude jsonl path and add it to the
+ *  known-sid set. Validates the filename against Claude's UUID-shaped
+ *  sessionId pattern so non-Claude jsonls in the project dir (accidental
+ *  drops, third-party tooling) can't poison the trust set. No-op on
+ *  parse failure. */
+function bridgeRememberSessionIdForPath(path: string | undefined): void {
+  if (!path) return;
+  const sid = sessionIdFromJsonlPath(path);
+  if (!SESSION_ID_FILENAME_RE.test(sid)) return;
+  bridgeKnownSessionIds.add(sid);
+}
+
+/** Cheap per-tick probe: read /proc/<bridgeCliPid>/fd and add every jsonl
+ *  the adopted Claude pid currently has open into the known-sid set. fd
+ *  observation is intermittent (Claude opens-writes-closes per event), so
+ *  running this every tick raises our chances of catching a post-/clear
+ *  sessionId before the user's next Lark message arrives. No-op when there
+ *  is no pid or /proc isn't available. */
+function bridgeProbeOpenSessionIds(): void {
+  if (bridgeCliPid === undefined || !bridgeJsonlDir) return;
+  const opened = findOpenJsonlsForPid(bridgeCliPid, bridgeJsonlDir);
+  for (const path of opened) bridgeRememberSessionIdForPath(path);
+}
+
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
   const result = drainTranscript(bridgeJsonlPath, 0);
@@ -258,45 +322,25 @@ function bridgeAbsorbBaseline(): void {
   if (lastInitConfig?.adoptMode) maybeEmitAdoptPreamble(result.events);
 }
 
-/** Detect /clear / /resume: when Claude Code starts a new session in the
- *  user's pane it writes to a brand-new sessionId.jsonl. We *cannot* use
- *  "latest-mtime jsonl in the project dir" as the switch trigger — that
- *  hijacks our watcher whenever a sibling Claude pane in the same cwd
- *  writes anything. Instead, switch only when:
- *
- *    1. We have an unstarted pending Lark turn (otherwise no signal to
- *       chase, and switching would risk grabbing another pane's reply).
- *    2. The pending turn's content fingerprint shows up in a candidate
- *       jsonl other than our current one — that's the user's current
- *       session because they JUST typed our pane-write into it.
- *
- *  Pending turns are preserved across the switch so the next ingest can
- *  match the fingerprint and start the turn in the new file. */
-function maybeSwitchBridgeJsonl(): boolean {
-  if (!bridgeJsonlDir) return false;
-  const pending = bridgeQueue.peek();
-  const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
-  if (!candidate || !candidate.contentFingerprint) return false;
+/** Record `bridgeStalePidStateSessionId` if the pid file's current sid
+ *  disagrees with the just-accepted candidate's sid. Stops the next pid
+ *  resolver tick from pulling the watcher back to the stale spawn-time
+ *  path Claude wrote into the pid file — which it never refreshes on
+ *  in-pane `/clear`. No-op when pid file is unavailable or already
+ *  agrees. */
+function bridgeMarkStalePidStateForAcceptedSid(acceptedSid: string): void {
+  if (bridgeCliPid === undefined || bridgeCliCwd === undefined) return;
+  const pidResolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
+  if (pidResolved && pidResolved.cliSessionId !== acceptedSid) {
+    bridgeStalePidStateSessionId = pidResolved.cliSessionId;
+  }
+}
 
-  // Bound the search to events written after the turn was marked. Short
-  // fingerprints ("hello", "test") would otherwise match old user lines
-  // in unrelated sibling jsonls. 5s skew absorbs clock drift between the
-  // mark and Claude's transcript write.
-  const minEventTimestampMs = candidate.markTimeMs !== undefined
-    ? candidate.markTimeMs - 5_000
-    : undefined;
-
-  const matched = findJsonlContainingFingerprint(
-    bridgeJsonlDir,
-    candidate.contentFingerprint,
-    {
-      excludePath: bridgeJsonlPath,
-      includeQueueOperations: true,
-      minEventTimestampMs,
-    },
-  );
-  if (!matched) return false;
-
+/** Apply a fingerprint-driven switch: drain old path, retire watcher,
+ *  pivot bridgeJsonlPath to `matched`, install a new fs.watch. Logging
+ *  string is caller-supplied so the switch reason ("known-sid",
+ *  "exact-content recovery") shows up clearly in the daemon log. */
+function bridgeApplyFingerprintSwitch(matched: string, reason: string): void {
   // Drain-before-switch: pull in any unread bytes from the old path so a
   // late assistant append doesn't vanish. We do NOT emit here — emission
   // only happens at idle (bridgeDrainAndMaybeEmit), otherwise drainEmittable
@@ -315,17 +359,16 @@ function maybeSwitchBridgeJsonl(): boolean {
     }
     retainSecondaryPathIfStillReferenced(bridgeJsonlPath, postDrainOffset);
   }
-
-  log(`Bridge transcript switched: ${bridgeJsonlPath} → ${matched} (Lark fingerprint observed in new jsonl — user likely ran /clear or /resume)`);
+  log(`Bridge transcript switched: ${bridgeJsonlPath} → ${matched} (${reason})`);
   if (bridgeWatcher) {
     try { bridgeWatcher.close(); } catch { /* ignore */ }
     bridgeWatcher = null;
   }
   // Critically: do NOT clear pending turns. The switch was triggered by
-  // the fingerprint of the FIRST pending turn already living in `matched`,
-  // so the immediate next ingest from offset 0 will find that user event
-  // and start the turn. Clearing here would race-drop exactly the message
-  // we're trying to deliver.
+  // the FIRST pending turn already living in `matched`, so the immediate
+  // next ingest from offset 0 will find that user event and start the
+  // turn. Clearing here would race-drop exactly the message we're
+  // trying to deliver.
   bridgeJsonlPath = matched;
   bridgeOffset = 0;
   bridgePendingTail = '';
@@ -334,6 +377,8 @@ function maybeSwitchBridgeJsonl(): boolean {
   // switch. Skip baseline; fall straight into ingest from offset 0 so
   // BridgeTurnQueue.ingest() can attribute the matching user/assistant.
   bridgeBaselineDone = true;
+  bridgeRememberSessionIdForPath(matched);
+  bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(matched));
   try {
     bridgeWatcher = fsWatch(matched, { persistent: false }, () => {
       try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
@@ -341,32 +386,111 @@ function maybeSwitchBridgeJsonl(): boolean {
   } catch (err: any) {
     log(`Bridge fs.watch unavailable on new target (${err.message}); relying on fallback poller`);
   }
-  return true;
 }
 
-/** /clear or /resume in the user's adopted pane creates (or touches) a new
- *  jsonl in the same Claude project directory. Neither pid-resolver nor
- *  fingerprint switch will fire when the rotation happened mid-process AND
- *  there's no pending Lark turn to anchor on (pure local-terminal use), so
- *  this fallback owns that case.
+/** Detect /clear / /resume: when Claude Code starts a new session in the
+ *  user's pane it writes to a brand-new sessionId.jsonl. Two-phase scan:
+ *
+ *  - Phase 1 (known-sid substring): cheap path for trusted candidates
+ *    only. Same content fingerprint substring search as before — safe
+ *    here because we've gated it on the pid-derived trust set, so a
+ *    sibling pane in the same project dir (different sessionId) can
+ *    never be the match even when its content includes the fingerprint.
+ *
+ *  - Phase 2 (unknown-sid exact-content recovery): in-pane `/clear`
+ *    creates a new sessionId Claude does NOT write into its pid file.
+ *    If the fd probe didn't catch the brief open window, the new sid is
+ *    untrusted and Phase 1 rejects it. Phase 2 falls back to scanning
+ *    every UNTRUSTED candidate jsonl for a user/queue event whose
+ *    NORMALISED content equals our just-marked Lark message in full
+ *    (not a substring) — strong enough that "test" doesn't false-match
+ *    "run tests". When exactly one untrusted candidate matches, accept
+ *    it; when multiple match, abstain and surface an unambiguous log
+ *    line so the user can take recovery action.
+ *
+ *  Pending turns are preserved across the switch so the next ingest
+ *  can match and start the turn in the new file. */
+function maybeSwitchBridgeJsonl(): boolean {
+  if (!bridgeJsonlDir) return false;
+  const pending = bridgeQueue.peek();
+  const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
+  if (!candidate || !candidate.contentFingerprint) return false;
+
+  // Bound the search to events written after the turn was marked. Short
+  // fingerprints ("hello", "test") would otherwise match old user lines
+  // in unrelated sibling jsonls. 5s skew absorbs clock drift between the
+  // mark and Claude's transcript write.
+  const minEventTimestampMs = candidate.markTimeMs !== undefined
+    ? candidate.markTimeMs - 5_000
+    : undefined;
+
+  const fingerprintScanOptions = {
+    excludePath: bridgeJsonlPath,
+    includeQueueOperations: true,
+    minEventTimestampMs,
+  };
+  const decision = decideFingerprintSwitch({
+    contentFingerprint: candidate.contentFingerprint,
+    contentNormalized: candidate.contentNormalized,
+    knownSessionIds: bridgeKnownSessionIds,
+    findSubstring: (acceptCandidate) =>
+      findJsonlContainingFingerprint(bridgeJsonlDir!, candidate.contentFingerprint!, {
+        ...fingerprintScanOptions,
+        acceptCandidate,
+      }),
+    findExact: (acceptCandidate) =>
+      candidate.contentNormalized
+        ? findJsonlsContainingExactContent(bridgeJsonlDir!, candidate.contentNormalized, {
+            ...fingerprintScanOptions,
+            acceptCandidate,
+          })
+        : [],
+  });
+  if (decision.action === 'switch') {
+    const reason = decision.reason === 'known-sid-substring'
+      ? 'known-sid fingerprint match'
+      : 'unknown-sid exact-content recovery (in-pane /clear with stale pid file)';
+    bridgeApplyFingerprintSwitch(decision.path, reason);
+    return true;
+  }
+  if (decision.action === 'abstain') {
+    log(`Bridge fingerprint switch ABSTAINED (${decision.reason}): ${decision.candidates.length} unknown jsonls have an exact-content match for the pending Lark turn (${decision.candidates.join(', ')}). User should re-/adopt or send a longer disambiguating message.`);
+    return false;
+  }
+  return false;
+}
+
+/** Last-resort rotation follower for the case where pid resolver returned
+ *  `'unavailable'` (no /proc, missing/invalid pid file). Originally also
+ *  ran on `'same'` to catch in-pane `/clear` with no pending Lark turn,
+ *  but that path is now intentionally dropped — the directory-mtime
+ *  heuristic in Path 2 below cannot tell our pane's rotation from a
+ *  sibling Claude pane in the same cwd, and the sibling-pane hijack
+ *  silently corrupts every multi-pane adopt setup (see
+ *  `bridge-rotation-policy.ts`). The Lark-message-driven /clear recovery
+ *  flow (fingerprint fallback) covers the dominant case.
  *
  *  Detection priority:
  *    1. Linux first-class: read `/proc/<pid>/fd` and pick the .jsonl the
- *       adopted Claude process actually has open. This is bound to the real
- *       PID — a sibling Claude pane in the same cwd has a different PID and
- *       therefore cannot hijack the result.
- *    2. Cross-platform fallback: directory-level mtime heuristic, gated on
- *       (a) our current jsonl quiet ≥ QUIET_ROTATION_MS, (b) candidate
- *       newer by ≥ QUIET_ROTATION_MS, (c) adopted Claude pid alive. Less
- *       robust than fd lookup but the best available without /proc.
+ *       adopted Claude process actually has open. Bound to the real PID
+ *       — a sibling Claude pane has a different PID and cannot hijack
+ *       the result. Note: Claude Code opens-writes-closes per event, so
+ *       this often returns 0 entries between writes; the gate above
+ *       ensures we still skip Path 2 in that case when pid resolver
+ *       confirmed our path.
+ *    2. Cross-platform fallback: directory-level mtime heuristic, gated
+ *       on (a) our current jsonl quiet ≥ QUIET_ROTATION_MS, (b) candidate
+ *       newer by ≥ QUIET_ROTATION_MS, (c) adopted Claude pid alive. Only
+ *       runs when Path 1 returns 0 entries AND pid resolver was
+ *       unavailable.
  *
- *  When a rotation is detected, the new jsonl is drained from offset 0 and
- *  events are split by timestamp against `rotationCutoffMs` (the old
- *  jsonl's last-write time): events before the cutoff are *history*
+ *  When a rotation is detected, the new jsonl is drained from offset 0
+ *  and events are split by timestamp against `rotationCutoffMs` (the
+ *  old jsonl's last-write time): events before the cutoff are *history*
  *  (absorbed into the seen-set, not emitted), events after are *live*
- *  (ingested → local-turn synthesis runs). This is what lets /resume to a
- *  long-history jsonl NOT replay the entire past as one giant local turn,
- *  while /clear's first new turn still gets forwarded.
+ *  (ingested → local-turn synthesis runs). This is what lets a rotation
+ *  to a long-history jsonl NOT replay the entire past as one giant
+ *  local turn.
  *
  *  Critically, we do NOT call `bridgeAbsorbBaseline` here — that helper
  *  also fires `maybeEmitAdoptPreamble`, which on rotation would surface
@@ -508,6 +632,14 @@ function maybeFollowQuietRotation(): void {
   // bridgeJsonlPath ⇒ rotation.
   const opened = findOpenJsonlsForPid(bridgeCliPid, bridgeJsonlDir);
   if (opened.length > 0) {
+    // Every fd-observed jsonl belongs to our pid — feed all of them
+    // into the sibling-pane hijack guard's trust list, not just the
+    // newest. This is how a post-/clear sessionId enters the trust
+    // set: Claude opens the new jsonl briefly during the /clear
+    // handshake; if a fd probe lands in that window, fingerprint
+    // fallback can later accept the new sessionId on the user's next
+    // Lark message.
+    for (const path of opened) bridgeRememberSessionIdForPath(path);
     const newest = newestPath(opened);
     if (newest && newest !== bridgeJsonlPath) {
       performRotationSwitch(newest, currentStat.mtimeMs, `pid fd → ${bridgeCliPid}`);
@@ -531,23 +663,43 @@ function maybeFollowQuietRotation(): void {
   performRotationSwitch(latest, currentStat.mtimeMs, `quiet mtime fallback (${Math.round((now - currentStat.mtimeMs) / 1000)}s quiet)`);
 }
 
-/** Authoritative rotation follow: re-read ~/.claude/sessions/<cliPid>.json
- *  and switch bridgeJsonlPath whenever Claude's recorded sessionId differs
+/** Pid-state rotation follow: re-read ~/.claude/sessions/<cliPid>.json
+ *  and switch bridgeJsonlPath whenever the recorded sessionId differs
  *  from what we're watching. Same source as the writeInput pid resolver,
- *  with the same cwd + procStart validation. Returns true on switch.
+ *  with the same cwd + procStart validation.
  *
- *  This replaces the original mtime-based "latest jsonl" hack and runs
- *  *before* the fingerprint-based fallback (`maybeSwitchBridgeJsonl`),
- *  because the pid file is updated on every Claude state change so it
- *  catches /clear / /resume / Claude restart cases that have no Lark
- *  fingerprint to match against. */
+ *  Empirical scope (Claude Code 2.1.123): the pid file's `sessionId` is
+ *  written ONCE at process start. `--resume` rewrites it (it's a fresh
+ *  spawn → fresh pid file). In-pane `/clear` does NOT rewrite it —
+ *  `updatedAt` and `status` change but `sessionId` stays. So this probe
+ *  catches spawn-time / `--resume` rotations; `/clear` (and in-pane
+ *  `/resume` if Claude treats it the same) is left to the fingerprint
+ *  fallback that anchors on a pending Lark turn. Returns a tri-state
+ *  result rather than a bool so the caller can distinguish 'switched'
+ *  (we moved) from 'same' (path confirmed) from 'unavailable' (no
+ *  reliable answer) — the downstream gates use that distinction. */
 /** Tri-state result so callers can distinguish "pid file unreadable, fall
  *  back to fingerprint heuristic" from "pid file confirmed current path"
- *  vs "pid file said rotate to a new path". The fingerprint fallback must
- *  only run on `unavailable` — when pid resolver gave us an answer we
- *  trust it as the source of truth, otherwise short Lark fingerprints
- *  (e.g. "hello") can hijack the watcher to an unrelated sibling jsonl. */
-type PidFollowResult = 'unavailable' | 'same' | 'switched';
+ *  vs "pid file said rotate to a new path".
+ *
+ *  Used by two downstream gates:
+ *  - Fingerprint fallback (`maybeSwitchBridgeJsonl`): runs whenever the
+ *    pid resolver did not actively switch (`!= 'switched'`). Safe even
+ *    on `'same'` because the fingerprint scan requires a pending Lark
+ *    turn — no risk of hijacking to a sibling pane.
+ *  - Quiet-mtime fallback (`maybeFollowQuietRotation`): runs only on
+ *    `'unavailable'`. The mtime heuristic can't distinguish our pane's
+ *    rotation from a sibling pane in the same cwd, so even when pid
+ *    resolver's `'same'` is not proof against in-process /clear (it
+ *    isn't — Claude doesn't refresh `sessionId` on /clear), we still
+ *    skip the heuristic. The cost is that a pure-local /clear with no
+ *    pending Lark turn won't auto-follow until the user sends a Lark
+ *    message; the alternative (running mtime fallback on 'same') would
+ *    silently corrupt every multi-pane adopt setup.
+ *
+ *  Type imported from `./services/bridge-rotation-policy` — the gate
+ *  function lives there so it's testable without dragging worker fs/IPC
+ *  side-effects into the unit suite. */
 
 function maybeFollowSessionRotationViaPid(): PidFollowResult {
   if (!bridgeCliPid || !bridgeCliCwd) return 'unavailable';
@@ -556,7 +708,26 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   if (bridgeObservedCliSessionId !== resolved.cliSessionId) {
     bridgeObservedCliSessionId = resolved.cliSessionId;
   }
+  // Pid resolver always reports the spawn-time sessionId — this is a sid
+  // that genuinely belongs to our adopted Claude pid, so remember it for
+  // the sibling-pane hijack guard.
+  bridgeRememberSessionIdForPath(resolved.path);
   if (resolved.path === bridgeJsonlPath) return 'same';
+  // Stale-pid suppression: when the fingerprint fallback accepted a
+  // post-/clear jsonl (Claude's pid file isn't refreshed by in-pane
+  // /clear, so it keeps reporting the spawn-time sid), pid resolver
+  // would otherwise pull the watcher back to that spawn-time sid every
+  // tick — re-creating the flap loop the user reported. The decision
+  // lives in `bridge-rotation-policy.evaluatePidResolverPullback` so
+  // the four-cell matrix can be unit-tested in isolation.
+  const pullback = evaluatePidResolverPullback({
+    resolvedCliSessionId: resolved.cliSessionId,
+    resolvedPath: resolved.path,
+    currentBridgeJsonlPath: bridgeJsonlPath,
+    stalePidStateSessionId: bridgeStalePidStateSessionId,
+  });
+  if (pullback.clearStale) bridgeStalePidStateSessionId = undefined;
+  if (pullback.suppress) return 'same';
 
   // Drain-before-switch: pull in any unread bytes from the OLD path so a
   // trailing assistant append doesn't vanish. We do NOT emit here — emit
@@ -608,28 +779,56 @@ function bridgeIngest(): void {
   // the path. Strictly read-only on the polling rotation; never triggers
   // a rotate or shifts the primary path.
   drainSecondaryPaths();
+  // Cheap probe: catch any jsonls our adopted pid currently has open
+  // and add their sessionIds to the sibling-pane hijack guard's trust
+  // list. Runs every tick (independent of rotation gates) because
+  // Claude opens-writes-closes the jsonl per event — fd observation
+  // is therefore intermittent, and more ticks = more chances to
+  // catch a post-/clear sessionId. This is the only hook by which
+  // an in-pane /clear becomes followable: without an fd-probe hit
+  // the fingerprint fallback will reject the new (unknown) sessionId
+  // and the user must re-adopt to recover.
+  bridgeProbeOpenSessionIds();
   // Pid-resolver: catches *spawn-time* rotations (new Claude PID → new
   // pid file → new sessionId), e.g. daemon restart that re-issues
   // `--resume <id>` and Claude rotates the internal id.
   const pidFollow = maybeFollowSessionRotationViaPid();
   // Fingerprint fallback: catches *in-process* rotations Claude makes
-  // via /clear or /resume from the user's pane. Claude's pid file has
-  // its sessionId field set ONCE at process start (see binary persistence
-  // schema) and is NOT rewritten on /clear, so pid resolver returning
-  // 'same' is NOT proof that no rotation happened. We skip the
-  // fingerprint scan only when pid resolver actively switched the path
-  // — in that case the authoritative source already moved us, and
-  // running fingerprint on top would risk a redundant flip.
+  // via /clear or /resume from the user's pane. Empirically (verified
+  // on Claude Code 2.1.123) the pid file's `sessionId` field is set
+  // ONCE at process start; /clear refreshes `updatedAt` but does NOT
+  // rewrite `sessionId`, so pid resolver returning 'same' is NOT proof
+  // that no rotation happened. We skip the fingerprint scan only when
+  // pid resolver actively switched the path — in that case the
+  // authoritative source already moved us, and running fingerprint on
+  // top would risk a redundant flip. Sibling-pane hijack protection is
+  // NOT delegated to the markTimeMs-5s event filter (short fingerprints
+  // substring-match unrelated content like "test" → "run tests"); the
+  // real gate is the sibling guard inside `maybeSwitchBridgeJsonl` that
+  // rejects every candidate whose sessionId isn't in the pid-derived
+  // trust set.
   let switched = pidFollow === 'switched';
   if (!switched) {
     switched = maybeSwitchBridgeJsonl();
   }
-  // Quiet-rotation fallback: catches /clear or /resume in pure-local
-  // sessions (no pending Lark turn → no fingerprint to match against).
-  // Without this, a user who hits /clear in the adopted pane and then
-  // continues in the terminal would never get those replies forwarded
-  // to Lark — the watcher stays stuck on the old, frozen jsonl.
-  if (!switched) {
+  // Quiet-rotation fallback: directory-mtime heuristic that picks the
+  // newest jsonl in the same project dir when our current path goes
+  // quiet. Originally the safety net for "user runs /clear purely in
+  // iTerm with no pending Lark turn, so fingerprint fallback can't
+  // anchor on anything". Trade-off: when the user has a SIBLING Claude
+  // pane in the same cwd, that pane's busier jsonl always wins this
+  // race and the bridge gets hijacked, ingesting the sibling pane's
+  // user/assistant events as `isLocal: true` local turns and forwarding
+  // them to the adopted Lark thread (the user-reported "/adopt 一对话
+  // 出来一堆历史会话" symptom).
+  //
+  // We accept the asymmetry: sibling-pane hijack is silent, persistent
+  // and corrupts every adopted multi-pane setup; pure-local /clear
+  // without a pending Lark turn is a narrow corner case the user can
+  // unstick by sending one Lark message (which arms fingerprint
+  // fallback). So we ONLY consult the mtime heuristic when the pid
+  // probe was unavailable (non-Linux, missing/invalid pid file).
+  if (shouldRunQuietRotation(pidFollow, switched)) {
     maybeFollowQuietRotation();
   }
   if (!bridgeJsonlPath) return;
@@ -651,15 +850,19 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   bridgeCliPid = opts?.cliPid;
   bridgeCliCwd = opts?.cliCwd;
   const mode = opts?.mode ?? 'baseline-existing';
-  // Authoritative: prefer Claude's own pid-state record over the path the
-  // adopt scan computed. If Claude has already rotated since adopt fired
-  // (e.g. user ran /clear before any Lark message arrived), this swaps the
-  // initial path before baseline so we don't waste a baseline on a frozen
-  // file.
+  // Pid-state record ranks above the path the adopt scan computed. If
+  // Claude was launched with `--resume` (or the adopt scan picked a
+  // stale jsonl), the pid file points at the actual current sessionId
+  // and we swap to it before baseline so we don't waste a baseline on
+  // a frozen file. Note: in-pane `/clear` between adopt and worker
+  // spawn would NOT show up here (pid file's `sessionId` is set once
+  // at process start) — that case is recovered later by the
+  // fingerprint fallback once a Lark turn arrives.
   if (bridgeCliPid && bridgeCliCwd) {
     const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
     if (resolved) {
       bridgeObservedCliSessionId = resolved.cliSessionId;
+      bridgeRememberSessionIdForPath(resolved.path);
       if (resolved.path !== bridgeJsonlPath) {
         log(`Bridge transcript adjusted at start (pid resolver): ${bridgeJsonlPath} → ${resolved.path}`);
         bridgeJsonlPath = resolved.path;
@@ -667,6 +870,11 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
       }
     }
   }
+  // Remember the initial path's sessionId — this is the ground-truth
+  // anchor for the sibling-pane hijack guard. Subsequent fingerprint
+  // candidates are accepted only if their sessionId is in this set
+  // (populated here, by pid resolver hits, and by per-tick fd probes).
+  bridgeRememberSessionIdForPath(bridgeJsonlPath);
   if (mode === 'fresh-empty') {
     // Non-adopt fallback: brand-new session, jsonl gets created on the first
     // user submit. We must NOT lazy-absorb the file when it appears — that
@@ -711,6 +919,8 @@ function stopBridgeWatcher(): void {
   bridgeCliPid = undefined;
   bridgeCliCwd = undefined;
   bridgeObservedCliSessionId = undefined;
+  bridgeKnownSessionIds.clear();
+  bridgeStalePidStateSessionId = undefined;
   bridgeSecondaryPaths.clear();
   bridgePreambleSent = false;
 }
@@ -737,7 +947,15 @@ function bridgeMarkPendingTurn(messageText: string): boolean {
     return false;
   }
   const fingerprint = makeFingerprint(messageText);
-  bridgeQueue.mark(randomBytes(8).toString('hex'), fingerprint);
+  // Full normalised content powers the unknown-sid recovery path. When a
+  // user runs `/clear` and the bridge can't see the new sessionId yet
+  // (pid file lags, fd probe missed the brief open window), we fall back
+  // to scanning every untrusted candidate jsonl for an EXACT equality
+  // with this normalised string — substantially harder for a sibling
+  // pane to false-match than the 30-char substring fingerprint.
+  const normalised = normaliseForFingerprint(messageText);
+  const contentNormalized = normalised.length > 0 ? normalised : undefined;
+  bridgeQueue.mark(randomBytes(8).toString('hex'), fingerprint, Date.now(), contentNormalized);
   return true;
 }
 
@@ -834,7 +1052,9 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
-  if (lastInitConfig?.adoptMode) return false;
+  // True for both adopt and non-adopt Codex sessions. The two modes
+  // differ in: emit gate (adopt skips marker check), local-turn synthesis
+  // (adopt only), and how the rollout path is resolved.
   return lastInitConfig?.cliId === 'codex';
 }
 
@@ -853,11 +1073,32 @@ function codexBridgeStartTimer(): void {
   // publish a half-streamed response.
   codexBridgeTimer = setInterval(() => {
     try {
-      if (!codexBridgeRolloutPath && codexBridgePendingSessionId) {
-        const path = findCodexRolloutBySessionId(codexBridgePendingSessionId);
+      if (!codexBridgeRolloutPath) {
+        // Two discovery paths, in order: cliSessionId (known via writeInput
+        // result for non-adopt or daemon-side probe for adopt) → exact
+        // file by name; PID (adopt only) → walk /proc/<pid>/fd. Adopt
+        // attaches via split-live (history absorbed, live ingested);
+        // non-adopt uses fresh-empty (queue's markTimeMs - 5s lower bound
+        // gates historical fingerprint matches without needing a split).
+        let path: string | undefined;
+        if (codexBridgePendingSessionId) {
+          path = findCodexRolloutBySessionId(codexBridgePendingSessionId);
+        }
+        if (!path && codexAdoptPendingPid) {
+          const probed = findCodexRolloutByPid(codexAdoptPendingPid);
+          if (probed) path = probed.path;
+        }
         if (path) {
           codexBridgePendingSessionId = undefined;
-          codexBridgeAttach(path, 'fresh-empty');
+          codexAdoptPendingPid = undefined;
+          // Adopt mode: split-live partitions drained events by
+          // codexAdoptStartMs so anything the user did AFTER adopt but
+          // BEFORE we found the rollout still emits (history is absorbed,
+          // live is ingested). Non-adopt: fresh-empty as before — queue's
+          // markTimeMs - 5s lower bound is enough since there's no
+          // local-turn synthesis on that path.
+          const mode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
+          codexBridgeAttach(path, mode);
         }
       }
       codexBridgeIngest();
@@ -868,7 +1109,7 @@ function codexBridgeStartTimer(): void {
   }, 1000);
 }
 
-function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fresh-empty'): void {
+function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fresh-empty' | 'split-live'): void {
   codexBridgeRolloutPath = rolloutPath;
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -879,6 +1120,33 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
     log(`Codex bridge fresh-empty: ${rolloutPath}`);
+  } else if (mode === 'split-live' && existsSync(rolloutPath)) {
+    // Adopt mode: drain everything, then split by adoptStartMs. History
+    // (pre-adopt) is `absorb()`-ed so it can't replay; live (post-adopt)
+    // is `ingest()`-ed so a Lark turn already marked or an iTerm-typed
+    // local turn that landed before we found the rollout still gets
+    // attributed. Without this split, baseline-existing would absorb()
+    // the live events too, silently dropping anything the user did
+    // between adopt and rollout-discovery — that's the user-reported
+    // "iTerm 手动输入飞书没收到" symptom under late-attach.
+    const result = drainCodexRollout(rolloutPath, 0);
+    const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
+    const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
+    codexBridgeQueue.absorb(history);
+    codexBridgeQueue.ingest(live);
+    codexBridgeOffset = result.newOffset;
+    codexBridgePendingTail = result.pendingTail;
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge split-live: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
+  } else if (mode === 'split-live') {
+    // split-live requested but file missing — degrade to fresh: the file
+    // will appear later via fs.watch / poller, and ingest from offset 0
+    // will pick up everything as live (consistent with split semantics
+    // when there's no history to absorb).
+    codexBridgeOffset = 0;
+    codexBridgePendingTail = '';
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
   } else if (existsSync(rolloutPath)) {
     const result = drainCodexRollout(rolloutPath, 0);
     codexBridgeOffset = result.newOffset;
@@ -947,17 +1215,31 @@ function codexBridgeDrainAndMaybeEmit(): void {
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
-  const markers = readSendMarkers();
+  const adoptMode = lastInitConfig?.adoptMode === true;
+  // Adopt mode: model is the user's external Codex, no botmux send to
+  // gate against — every assistant turn (Lark-driven OR locally typed)
+  // should reach the thread. Skip marker IO entirely.
+  const markers = adoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
   const nextPendingMarkTimeMs = remaining.length > 0 ? remaining[0].markTimeMs : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    if (!turn.finalText) continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: false }, nextBoundaryMs, markers, false)) {
-      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (model called botmux send within window)`);
+    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
+      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       continue;
     }
-    if (!turn.finalText) continue;
+    if (turn.isLocal) {
+      // Local turn (adopt only): user typed in iTerm. Surface both sides
+      // so the Lark thread sees a complete exchange instead of an orphan
+      // reply. formatLocalTurnContent caps both texts to keep within
+      // Lark's per-message limit.
+      const content = formatLocalTurnContent(turn.userText ?? '', turn.finalText);
+      if (!content) continue;
+      send({ type: 'final_output', content, lastUuid: turn.turnId, turnId: turn.turnId });
+      continue;
+    }
     send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
   }
 }
@@ -976,7 +1258,10 @@ function stopCodexBridge(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
+  codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
+  codexAdoptPendingPid = undefined;
+  codexAdoptStartMs = undefined;
 }
 
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
@@ -1650,27 +1935,57 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       log(`captureCurrentScreen failed: ${err.message}`);
     }
 
-    // Bridge mode: tail Claude Code's transcript JSONL to harvest assistant
-    // turns out-of-band. Only enabled when the daemon supplied a path
-    // (claude-code adopt with a known sessionId).
+    // Bridge mode: tail the adopted CLI's transcript to harvest assistant
+    // turns out-of-band. Two paths:
+    //   - claude-code: cfg.bridgeJsonlPath is set when adopt knew the sid.
+    //   - codex: locate rollout via cliSessionId (daemon's discovery probe)
+    //     or by reading /proc/<pid>/fd. Both modes enable adopt-only local
+    //     turn synthesis so iTerm-typed conversation also reaches Lark.
     if (cfg.bridgeJsonlPath) {
       startBridgeWatcher(cfg.bridgeJsonlPath, {
         cliPid: cfg.adoptCliPid,
         cliCwd: cfg.adoptCwd,
       });
+    } else if (cfg.cliId === 'codex') {
+      const adoptStartMs = Date.now();
+      codexAdoptStartMs = adoptStartMs;
+      codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+      let rolloutPath: string | undefined;
+      if (cfg.cliSessionId) rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
+      if (!rolloutPath && cfg.adoptCliPid) {
+        const probed = findCodexRolloutByPid(cfg.adoptCliPid);
+        if (probed) rolloutPath = probed.path;
+      }
+      if (rolloutPath) {
+        // Adopt-time attach: split-live so any iTerm activity that
+        // happened in the brief window between adopt detection and worker
+        // spawn (or between codex's own startup writes and now) lands as
+        // live, not absorbed history.
+        codexBridgeAttach(rolloutPath, 'split-live');
+      } else {
+        // Couldn't locate yet — start poller. The 1s timer keeps trying
+        // both findCodexRolloutBySessionId (if cliSessionId is set) and
+        // findCodexRolloutByPid (passed via the discovery hooks below).
+        if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+        codexAdoptPendingPid = cfg.adoptCliPid;
+        codexBridgeStartTimer();
+      }
     }
 
-    // Idle detection. In bridge mode we use Claude Code's real
+    // Idle detection. In bridge mode we use the adopted CLI's real
     // completion/ready patterns (e.g. "Worked for Xs") so tool-execution
     // pauses don't trigger a premature emit. Other adopt cases keep the
     // minimal output-quiescence-only detector.
     const idleAdapter = cfg.bridgeJsonlPath
       ? createCliAdapterSync('claude-code', undefined)
-      : ({ completionPattern: undefined, readyPattern: undefined } as any);
+      : cfg.cliId === 'codex'
+        ? createCliAdapterSync('codex', undefined)
+        : ({ completionPattern: undefined, readyPattern: undefined } as any);
     idleDetector = new IdleDetector(idleAdapter);
     idleDetector.onIdle(() => {
       log('Prompt detected (idle) — adopt mode');
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
       markPromptReady();
     });
 
@@ -1759,9 +2074,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   }
 
   // Wire pid + cwd so the claude-code adapter's writeInput can read
-  // ~/.claude/sessions/<pid>.json — Claude's authoritative current sessionId.
-  // The pinned claudeJsonlPath above is still used as the initial guess; the
-  // resolver corrects it on first write when Claude has rotated under us.
+  // ~/.claude/sessions/<pid>.json — the spawn-time pid-state record. Its
+  // `sessionId` is set ONCE at process start (Claude Code 2.1.123); a
+  // `--resume` lookup will surface here, but in-pane `/clear` won't, so a
+  // 'matching sessionId' answer is "no spawn-time rotation observed", not
+  // "no rotation at all". The pinned claudeJsonlPath above is still the
+  // initial guess; the resolver corrects it on first write when Claude was
+  // started with `--resume`.
   if (cfg.cliId === 'claude-code' && cliPid) {
     (backend as TmuxBackend | PtyBackend).cliPid = cliPid;
     (backend as TmuxBackend | PtyBackend).cliCwd = cfg.workingDir;
@@ -2310,6 +2629,13 @@ process.on('message', async (raw: unknown) => {
         if (bridgeJsonlPath) {
           try { bridgeIngest(); } catch { /* best effort */ }
           bridgeMarkPendingTurn(content);
+        } else if (codexBridgeFallbackActive()) {
+          // Codex adopt: same idea, different bridge. ingest first so any
+          // in-flight events from a local-typed prior turn close before
+          // this Lark turn's fingerprint window opens. Mark works even
+          // pre-attach (queue is path-agnostic).
+          try { codexBridgeIngest(); } catch { /* best effort */ }
+          codexBridgeMarkPendingTurn(content);
         }
         // Adopt mode: raw write to PTY (no adapter writeInput)
         if (backend) {
