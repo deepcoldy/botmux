@@ -14,6 +14,8 @@ const ts = new Date()
 
 const runDir = `midscene_run/runs/${ts}`;
 process.env.MIDSCENE_RUN_DIR = runDir;
+// 让 vitest globalSetup 识别当前是 e2e 模式，触发遗留 schedule 任务清扫。
+process.env.BOTMUX_E2E = '1';
 
 console.log(`[run-e2e] MIDSCENE_RUN_DIR=${runDir}`);
 

@@ -37,6 +37,7 @@ describe('scheduled task thread continuity', () => {
   let page: Page;
   let agent: PlaywrightAgent;
   let createdTaskId: string | undefined;
+  let scheduleLabel: string | undefined;
 
   beforeAll(async () => {
     checkPrerequisites();
@@ -54,7 +55,10 @@ describe('scheduled task thread continuity', () => {
   });
 
   afterAll(async () => {
-    // Clean up the scheduled task before closing the session
+    // Primary cleanup: send `/schedule remove` via the UI. This exercises the
+    // same path users would take and confirms the command still works
+    // end-to-end. Errors are logged (not swallowed) so flaky teardown surfaces
+    // in CI instead of letting tasks leak silently.
     if (createdTaskId && agent && page) {
       try {
         await scrollThreadToBottom(agent);
@@ -63,10 +67,32 @@ describe('scheduled task thread continuity', () => {
         await page.keyboard.type(`/schedule remove ${createdTaskId}`, { delay: 30 });
         await page.keyboard.press('Enter');
         await page.waitForTimeout(3000);
-      } catch {
-        // Best-effort cleanup — don't fail teardown
+      } catch (err) {
+        console.warn(
+          `[feishu-schedule] UI cleanup failed for task ${createdTaskId}: ${(err as Error).message}`,
+        );
       }
     }
+
+    // Defensive cleanup: directly remove this run's task via schedule-store.
+    // Even if the UI flow above failed, or aiString never extracted a valid
+    // taskId, scanning by `name === scheduleLabel` catches the leftover.
+    try {
+      const { cleanupTasksByLabel } = await import('./schedule-cleanup.js');
+      const { removed, warnings } = await cleanupTasksByLabel(
+        scheduleLabel ?? '',
+        [createdTaskId],
+      );
+      if (removed.length > 0) {
+        console.warn(
+          `[feishu-schedule] programmatic cleanup removed ${removed.length} task(s): ${removed.join(', ')}`,
+        );
+      }
+      for (const w of warnings) console.warn(`[feishu-schedule] cleanup warning: ${w}`);
+    } catch (err) {
+      console.warn(`[feishu-schedule] programmatic cleanup failed: ${(err as Error).message}`);
+    }
+
     await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
@@ -75,6 +101,7 @@ describe('scheduled task thread continuity', () => {
 
   it('scheduled task replies inside the original thread when triggered', async () => {
     const label = `sched-${Date.now()}`;
+    scheduleLabel = label;
 
     // Step 1: Start a session to get a thread.
     const setupMsg = testMessage('sched-setup');
