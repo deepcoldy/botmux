@@ -258,9 +258,14 @@ ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {
 // to act as creator, then forwards here.
 ipcRoute('POST', '/api/groups/create', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown };
+  let body: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; transferOwnerTo?: unknown };
   try {
-    body = await readJsonBody<{ name?: string; larkAppIds?: string[]; userOpenIds?: string[] }>(req);
+    body = await readJsonBody<{
+      name?: string;
+      larkAppIds?: string[];
+      userOpenIds?: string[];
+      transferOwnerTo?: string;
+    }>(req);
   } catch {
     return jsonRes(res, 400, { error: 'bad_json' });
   }
@@ -268,22 +273,43 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
   if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
     return jsonRes(res, 400, { error: 'larkAppIds_required' });
   }
-  // userOpenIds is optional; pre-validated upstream by the dashboard route.
+  // userOpenIds and transferOwnerTo are optional; pre-validated upstream by
+  // the dashboard route. transferOwnerTo's open_id MUST be in the calling
+  // bot's app scope (caller is responsible for that — Lark open_ids are
+  // app-scoped; see dashboard/operator-selector.ts).
   const userIds = Array.isArray(body.userOpenIds) && body.userOpenIds.every(x => typeof x === 'string')
     ? (body.userOpenIds as string[])
     : [];
+  const transferTo = typeof body.transferOwnerTo === 'string' && body.transferOwnerTo.trim()
+    ? body.transferOwnerTo.trim()
+    : null;
   try {
     const r = await groupsStore.createChat(cachedLarkAppId, {
       name,
       botIds: body.larkAppIds as string[],
       userIds,
     });
+    let ownerTransferredTo: string | null = null;
+    let transferError: string | null = null;
+    if (transferTo) {
+      // Skip transfer if Feishu rejected the invite — transferring to a
+      // non-member returns "user not in chat" anyway.
+      if (r.invalidUserIds.includes(transferTo)) {
+        transferError = 'invitee_rejected';
+      } else {
+        const tr = await groupsStore.transferChatOwner(cachedLarkAppId, r.chatId, transferTo);
+        if (tr.ok) ownerTransferredTo = transferTo;
+        else transferError = tr.error;
+      }
+    }
     jsonRes(res, 200, {
       ok: true,
       chatId: r.chatId,
       invalidBotIds: r.invalidBotIds,
       invalidUserIds: r.invalidUserIds,
       creator: cachedLarkAppId,
+      ownerTransferredTo,
+      transferError,
     });
   } catch (e) {
     jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });

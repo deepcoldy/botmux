@@ -118,9 +118,16 @@ export async function renderGroupsPage(root: HTMLElement) {
     const invalidUsers = (resp.invalidUserIds ?? []) as string[];
     const auto = resp.autoInvitedOpenId as string | null | undefined;
     const rejected = !!resp.autoInviteRejected;
+    const ownerTo = resp.ownerTransferredTo as string | null | undefined;
+    const transferErr = resp.transferError as string | null | undefined;
     let inviteNote: string;
     if (auto) {
-      inviteNote = `<p class="hint-ok">已自动邀请你（<code>${escapeHtml(auto)}</code>）作为成员，新群应该会出现在你的飞书侧边栏。</p>`;
+      const transferLine = ownerTo
+        ? `<br><small>群主已从机器人转让给你。</small>`
+        : transferErr
+          ? `<br><small class="hint-warn-inline">⚠ 自动转让群主失败（${escapeHtml(transferErr)}），你现在是成员但群主仍是机器人。</small>`
+          : '';
+      inviteNote = `<p class="hint-ok">已自动邀请你（<code>${escapeHtml(auto)}</code>）作为成员，新群应该会出现在你的飞书侧边栏。${transferLine}</p>`;
     } else if (rejected) {
       inviteNote = `<p class="hint-warn">飞书拒绝了自动邀请（你的 open_id 在创建者 bot 的 scope 下不可用）。<strong>你目前不是新群成员</strong>，需要让群里的某个机器人手动把你加进来。</p>`;
     } else {

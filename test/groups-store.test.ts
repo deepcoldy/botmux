@@ -8,6 +8,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // chat.create is configurable per test via this stub so we can test both the
 // happy path and error responses.
 const chatCreateStub = vi.fn();
+// chat.update mocks the owner-transfer call.
+const chatUpdateStub = vi.fn();
 
 // Mock bot-registry's getBotClient — that's where groups-store imports from.
 vi.mock('../src/bot-registry.js', () => ({
@@ -31,6 +33,7 @@ vi.mock('../src/bot-registry.js', () => ({
             },
           }),
           create: chatCreateStub,
+          update: chatUpdateStub,
         },
         chatMembers: {
           isInChat: vi.fn().mockResolvedValue({ code: 0, data: { is_in_chat: true } }),
@@ -44,10 +47,10 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
 }));
 
-import { listChats, isInChat, addBotToChat, createChat } from '../src/services/groups-store.js';
+import { listChats, isInChat, addBotToChat, createChat, transferChatOwner } from '../src/services/groups-store.js';
 
 describe('groups-store wrappers', () => {
-  beforeEach(() => { chatCreateStub.mockClear(); });
+  beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); });
 
   it('listChats returns ChatBrief array', async () => {
     const out = await listChats('appA');
@@ -140,6 +143,30 @@ describe('groups-store wrappers', () => {
       userIds: ['ou_real', 'ou_ghost'],
     });
     expect(r.invalidUserIds).toEqual(['ou_ghost']);
+  });
+
+  it('transferChatOwner posts owner_id with user_id_type=open_id', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_human');
+    expect(r).toEqual({ ok: true });
+    const call = chatUpdateStub.mock.calls[0][0];
+    expect(call.path.chat_id).toBe('oc_chat');
+    expect(call.params.user_id_type).toBe('open_id');
+    expect(call.data.owner_id).toBe('ou_human');
+  });
+
+  it('transferChatOwner returns error on non-zero Lark response', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 230002, msg: 'user not in chat' });
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_ghost');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/user not in chat/);
+  });
+
+  it('transferChatOwner catches thrown errors', async () => {
+    chatUpdateStub.mockRejectedValueOnce(new Error('network down'));
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_x');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/network down/);
   });
 
   it('createChat omits user_id_list and user_id_type when no userIds provided', async () => {

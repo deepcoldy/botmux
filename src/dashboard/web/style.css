@@ -58,3 +58,4 @@ dialog#g-drawer fieldset legend { padding: 0 0.3rem; color: var(--muted); font-s
 .hint-ok       { background: #ddf4e4; border-left: 3px solid #1a7f37; padding: 0.4rem 0.6rem; border-radius: 3px; margin: 0.5rem 0; font-size: 13px; }
 .hint-warn     { background: #fff8c5; border-left: 3px solid #bf8700; padding: 0.4rem 0.6rem; border-radius: 3px; margin: 0.5rem 0; font-size: 13px; }
 .btn-link.primary { background: #1f6feb; color: white; border-color: #1f6feb; font-weight: 600; }
+.hint-warn-inline { color: #9a6700; }

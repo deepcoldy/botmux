@@ -111,6 +111,41 @@ export async function createChat(
 }
 
 /**
+ * Transfer ownership of a chat from the calling bot to a Feishu user.  Used
+ * after `createChat` so the dashboard operator (who's been invited as a
+ * member) ends up as the actual owner — otherwise the bot stays group owner
+ * and the user can't manage the chat.
+ *
+ * Calls /open-apis/im/v1/chats/:chat_id with `owner_id` in the body and
+ * `user_id_type=open_id`. The caller's bot must currently be the owner; this
+ * is the case right after createChat since the creator bot is the implicit
+ * owner.
+ *
+ * `newOwnerOpenId` must be in the calling bot's app scope — Lark open_ids are
+ * app-scoped, see operator-selector.ts for why.
+ */
+export async function transferChatOwner(
+  ownerLarkAppId: string,
+  chatId: string,
+  newOwnerOpenId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const client = getBotClient(ownerLarkAppId);
+  try {
+    const res: any = await (client as any).im.v1.chat.update({
+      path: { chat_id: chatId },
+      params: { user_id_type: 'open_id' },
+      data: { owner_id: newOwnerOpenId },
+    });
+    if (res.code !== 0 && res.code !== undefined) {
+      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/**
  * Add bot apps to a chat using a "proxy" bot that's already a member.
  * Uses /open-apis/im/v1/chats/:chat_id/members with member_id_type=app_id.
  * Returns per-id result derived from the API's invalid_id_list.

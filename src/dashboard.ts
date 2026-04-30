@@ -358,6 +358,10 @@ const server = createServer(async (req, res) => {
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
         larkAppIds: parsed.larkAppIds,
         userOpenIds: [...merged],
+        // Auto-transfer ownership to the auto-invited operator. Same
+        // app-scope guarantee as the invite — the open_id we resolved came
+        // from a session whose larkAppId is the creator daemon.
+        transferOwnerTo: autoInvited ?? undefined,
       };
       const upstream = await fetch(
         `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,
@@ -376,6 +380,8 @@ const server = createServer(async (req, res) => {
         if (autoInvited && invalidUsers.includes(autoInvited)) {
           upstreamJson.autoInvitedOpenId = null;
           upstreamJson.autoInviteRejected = true;
+          // ownerTransferredTo is already null from daemon (it skips transfer
+          // when invitee_rejected), so nothing more to do here.
         } else {
           upstreamJson.autoInvitedOpenId = autoInvited;
         }
