@@ -282,6 +282,34 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Create a new chat — pick any online daemon as the creator/owner.
+    if (req.method === 'POST' && url.pathname === '/api/groups/create') {
+      let raw: string;
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        JSON.parse(raw);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const online = registry.list();
+      if (online.length === 0) {
+        return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
+      }
+      // First online daemon = creator. The body's larkAppIds list may include
+      // the creator; the daemon-side createChat filters that out before the
+      // Feishu call.
+      const creator = online[0];
+      const upstream = await fetch(
+        `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw },
+      );
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Public SSE — relays aggregator's listener events
     if (req.method === 'GET' && url.pathname === '/events') {
       res.writeHead(200, {

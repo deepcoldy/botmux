@@ -253,6 +253,29 @@ ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {
   }
 });
 
+// Create a brand-new chat with this bot as creator/owner and `larkAppIds` as
+// initial bot members. The dashboard's public route picks any online daemon
+// to act as creator, then forwards here.
+ipcRoute('POST', '/api/groups/create', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { name?: unknown; larkAppIds?: unknown };
+  try {
+    body = await readJsonBody<{ name?: string; larkAppIds?: string[] }>(req);
+  } catch {
+    return jsonRes(res, 400, { error: 'bad_json' });
+  }
+  const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
+  if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
+    return jsonRes(res, 400, { error: 'larkAppIds_required' });
+  }
+  try {
+    const r = await groupsStore.createChat(cachedLarkAppId, { name, botIds: body.larkAppIds as string[] });
+    jsonRes(res, 200, { ok: true, chatId: r.chatId, invalidBotIds: r.invalidBotIds, creator: cachedLarkAppId });
+  } catch (e) {
+    jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });
+  }
+});
+
 // ─── SSE event stream ──────────────────────────────────────────────────────
 
 ipcRoute('GET', '/api/events', (_req, res) => {
