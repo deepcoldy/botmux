@@ -18,6 +18,7 @@ import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
+import { buildMarkdownCard } from '../im/lark/md-card.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -1030,7 +1031,13 @@ function deliverFinalOutput(
       return;
     }
     try {
-      await cb.sessionReply(ds.session.rootMessageId, msg.content, 'text', ds.larkAppId);
+      // Wrap the model's reply in the same card chrome `botmux send` uses
+      // (schema 2.0 + footer with botmux link + 发送给 owner) so a turn
+      // delivered via this fallback path looks identical in the Lark thread
+      // to one the model sent itself. Markdown rendering, tables, code
+      // blocks all flow through the shared `buildCardBodyElements`.
+      const cardJson = buildMarkdownCard(msg.content, ds.session.ownerOpenId);
+      await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, attempt ${attempt + 1})`);
     } catch (err: any) {
