@@ -245,7 +245,9 @@ const server = createServer(async (req, res) => {
       // Fan out: each online daemon returns the chats its bot is in.
       // Merge by chatId; populate memberBots with inChat flags for every configured bot.
       const out = new Map<string, any>();
-      const onlineBots = registry.list();
+      // Sort by botIndex so the matrix columns + the create-group bot picker
+      // both match the order in bots.json (fs.readdir order is unstable).
+      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
       await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
