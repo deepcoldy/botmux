@@ -372,7 +372,7 @@ function preflightNodeSanity(): void {
   }
 }
 
-function cmdStart(): void {
+async function cmdStart(): Promise<void> {
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
@@ -380,6 +380,7 @@ function cmdStart(): void {
   }
   ensureConfigDir();
   preflightNodeSanity();
+  await ensureSystemDependencies();
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
@@ -483,7 +484,7 @@ function cmdStop(): void {
   if (!stopped) console.log('daemon 未在运行。');
 }
 
-function cmdRestart(): void {
+async function cmdRestart(): Promise<void> {
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
@@ -491,6 +492,7 @@ function cmdRestart(): void {
   }
   ensureConfigDir();
   preflightNodeSanity();
+  await ensureSystemDependencies();
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
@@ -500,6 +502,20 @@ function cmdRestart(): void {
   runPm2(['start', cfg]);
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
+  }
+}
+
+/** Wraps `ensureDependencies()` so the cmdStart/cmdRestart paths get a clean
+ *  exit on tmux failure. Fonts failures are non-fatal and surface as warnings
+ *  printed by ensureDependencies itself. */
+async function ensureSystemDependencies(): Promise<void> {
+  const { ensureDependencies } = await import('./setup/index.js');
+  try {
+    await ensureDependencies();
+  } catch (err: any) {
+    console.error('');
+    console.error(err?.message ?? String(err));
+    process.exit(1);
   }
 }
 
@@ -2117,9 +2133,9 @@ switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
   case 'setup':   await cmdSetup(); break;
-  case 'start':   cmdStart(); break;
+  case 'start':   await cmdStart(); break;
   case 'stop':    cmdStop(); break;
-  case 'restart': cmdRestart(); break;
+  case 'restart': await cmdRestart(); break;
   case 'logs':    cmdLogs(); break;
   case 'status':  cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
