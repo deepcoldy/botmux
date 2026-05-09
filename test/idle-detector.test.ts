@@ -602,3 +602,74 @@ describe('IdleDetector: edge cases', () => {
     detector.dispose();
   });
 });
+
+// ─── fireIdle (transcript-driven) ──────────────────────────────────────────
+
+describe('IdleDetector: fireIdle()', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('fires the registered callback synchronously', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    // Note: readyPattern is NOT yet seen — fireIdle short-circuits regardless,
+    // because the transcript event is the authoritative signal.
+    detector.fireIdle();
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('is idempotent within a turn (does not re-fire while already idle)', () => {
+    const detector = new IdleDetector(makeCli({}));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.fireIdle();
+    detector.fireIdle();
+    detector.fireIdle();
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('cancels a pending quiescence timer so we do not double-fire', () => {
+    const detector = new IdleDetector(makeCli({}));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    // Arm quiescence with some output, then fire idle externally before
+    // the timer matures — the timer should be torn down.
+    detector.feed('streaming output ');
+    detector.fireIdle();
+    expect(cb).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(5000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('re-arms after reset() so a new turn can fire idle again', () => {
+    const detector = new IdleDetector(makeCli({}));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.fireIdle();
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.reset();
+    detector.fireIdle();
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('works even when readyPattern was never matched (transcript bypasses screen scrape)', () => {
+    // The whole point of the transcript-driven path: when the CLI's status
+    // bar changes between versions and our readyPattern stops matching,
+    // an explicit fireIdle from the transcript watcher still surfaces the
+    // turn instead of stranding it forever.
+    const detector = new IdleDetector(makeCli({ readyPattern: /THIS_NEVER_APPEARS/ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.feed('lots of output that does not contain the magic ready token');
+    vi.advanceTimersByTime(10_000);
+    expect(cb).toHaveBeenCalledTimes(0);  // regex+quiescence both gated off
+    detector.fireIdle();                    // transcript event arrives
+    expect(cb).toHaveBeenCalledTimes(1);   // ← the bug class this fixes
+    detector.dispose();
+  });
+});

@@ -1308,6 +1308,15 @@ function codexBridgeIngest(): void {
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   codexBridgeQueue.ingest(result.events);
+  // Transcript-driven idle: an `assistant_final` event is the CLI declaring
+  // end-of-turn, far more reliable than the screen-pattern heuristic
+  // (CoCo's status bar varies by --yolo flag, version, theme; codex has
+  // its own moving targets). Pushing idle here lets the bridge emit
+  // immediately instead of waiting for readyPattern + quiescence to
+  // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
+  if (result.events.some(e => e.kind === 'assistant_final')) {
+    idleDetector?.fireIdle();
+  }
 }
 
 /** Mark a pending Lark turn for Codex. Crucially this works even before a

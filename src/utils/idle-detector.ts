@@ -89,6 +89,16 @@ export class IdleDetector {
     this.clearTimer();
   }
 
+  /** External idle source — lets transcript-driven detectors (Claude jsonl
+   *  Stop, Codex rollout assistant_final, CoCo events.jsonl finish_reason
+   *  stop) push idle without waiting for screen-pattern + quiescence to
+   *  agree. Idempotent within a turn (gated by isIdle); reset() re-arms it
+   *  for the next turn — same lifecycle as the internal markIdle path. */
+  fireIdle(): void {
+    if (this.isIdle) return;
+    this.markIdle();
+  }
+
   dispose(): void {
     this.clearTimer();
     this.idleCallback = null;
