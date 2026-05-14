@@ -227,6 +227,7 @@ export class TmuxBackend implements SessionBackend {
    * For multiline text, use pasteText() instead (send-keys -l sends \n as Enter).
    */
   sendText(text: string): void {
+    this.exitCopyModeIfNeeded();
     execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-l', '--', text], {
       stdio: 'ignore',
       timeout: 5000,
@@ -236,6 +237,7 @@ export class TmuxBackend implements SessionBackend {
 
   /** Send special keys (Enter, Escape, C-c, etc.) to the tmux pane. */
   sendSpecialKeys(...keys: string[]): void {
+    this.exitCopyModeIfNeeded();
     execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, ...keys], {
       stdio: 'ignore',
       timeout: 5000,
@@ -271,6 +273,7 @@ export class TmuxBackend implements SessionBackend {
    * Safe for multiline content (unlike sendText where \n becomes Enter).
    */
   pasteText(text: string): void {
+    this.exitCopyModeIfNeeded();
     execFileSync('tmux', ['load-buffer', '-'], {
       input: text,
       stdio: ['pipe', 'ignore', 'ignore'],
@@ -282,6 +285,27 @@ export class TmuxBackend implements SessionBackend {
       timeout: 5000,
       env: tmuxEnv(),
     });
+  }
+
+  private exitCopyModeIfNeeded(): void {
+    try {
+      const inMode = execFileSync('tmux', ['display-message', '-p', '-t', this.cmdTarget, '#{pane_in_mode}'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 1000,
+        env: tmuxEnv(),
+      }).trim();
+
+      if (inMode === '1') {
+        execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-X', 'cancel'], {
+          stdio: 'ignore',
+          timeout: 1000,
+          env: tmuxEnv(),
+        });
+      }
+    } catch {
+      // Pane may be gone or tmux may be restarting; keep the original write path best-effort.
+    }
   }
 
   resize(cols: number, rows: number): void {

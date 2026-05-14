@@ -126,6 +126,7 @@ export class TmuxPipeBackend implements SessionBackend {
 
   sendText(text: string): void {
     if (this.exited) return;
+    this.exitCopyModeIfNeeded();
     execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
       stdio: 'ignore',
       timeout: 5000,
@@ -135,6 +136,7 @@ export class TmuxPipeBackend implements SessionBackend {
 
   sendSpecialKeys(...keys: string[]): void {
     if (this.exited) return;
+    this.exitCopyModeIfNeeded();
     execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
       stdio: 'ignore',
       timeout: 5000,
@@ -144,6 +146,7 @@ export class TmuxPipeBackend implements SessionBackend {
 
   pasteText(text: string): void {
     if (this.exited) return;
+    this.exitCopyModeIfNeeded();
     execFileSync('tmux', ['load-buffer', '-'], {
       input: text,
       stdio: ['pipe', 'ignore', 'ignore'],
@@ -155,6 +158,29 @@ export class TmuxPipeBackend implements SessionBackend {
       timeout: 5000,
       env: tmuxEnv(),
     });
+  }
+
+  private exitCopyModeIfNeeded(): void {
+    if (this.exited) return;
+
+    try {
+      const inMode = execFileSync('tmux', ['display-message', '-p', '-t', this.paneTarget, '#{pane_in_mode}'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 1000,
+        env: tmuxEnv(),
+      }).trim();
+
+      if (inMode === '1') {
+        execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-X', 'cancel'], {
+          stdio: 'ignore',
+          timeout: 1000,
+          env: tmuxEnv(),
+        });
+      }
+    } catch {
+      // Pane may be gone or tmux may be restarting; keep the original write path best-effort.
+    }
   }
 
   enterCopyMode(): void {

@@ -37,11 +37,13 @@ function createBackend(sessionName = 'bmx-test1234'): TmuxBackend {
 }
 
 function getCalls(): Array<{ cmd: string; args: string[]; opts?: any }> {
-  return mockedExecFileSync.mock.calls.map((call: any[]) => ({
-    cmd: call[0] as string,
-    args: call[1] as string[],
-    opts: call[2],
-  }));
+  return mockedExecFileSync.mock.calls
+    .map((call: any[]) => ({
+      cmd: call[0] as string,
+      args: call[1] as string[],
+      opts: call[2],
+    }))
+    .filter(call => !call.args.includes('display-message'));
 }
 
 // ---------------------------------------------------------------------------

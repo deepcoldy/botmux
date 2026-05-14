@@ -46,6 +46,11 @@ const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedUnlinkSync = vi.mocked(unlinkSync);
 
+function getExecFileCalls() {
+  return mockedExecFileSync.mock.calls
+    .filter(call => !(call[1] as string[]).includes('display-message'));
+}
+
 function spawnOpts() {
   return {
     cwd: '/tmp',
@@ -90,7 +95,7 @@ describe('TmuxPipeBackend input addressing', () => {
     mockedExecFileSync.mockClear();
     be.sendText('飞书消息');
 
-    const call = mockedExecFileSync.mock.calls[0];
+    const call = getExecFileCalls()[0];
     expect(call[0]).toBe('tmux');
     const args = call[1] as string[];
     const tIdx = args.indexOf('-t');
@@ -105,7 +110,7 @@ describe('TmuxPipeBackend input addressing', () => {
     mockedExecFileSync.mockClear();
     be.sendSpecialKeys('Enter');
 
-    const args = mockedExecFileSync.mock.calls[0][1] as string[];
+    const args = getExecFileCalls()[0][1] as string[];
     const tIdx = args.indexOf('-t');
     expect(args[tIdx + 1]).toBe('1:0.2');
     expect(args).toContain('Enter');
@@ -117,7 +122,7 @@ describe('TmuxPipeBackend input addressing', () => {
     mockedExecFileSync.mockClear();
     be.pasteText('multi\nline');
 
-    const calls = mockedExecFileSync.mock.calls;
+    const calls = getExecFileCalls();
     expect(calls[0][1]).toContain('load-buffer');
     expect((calls[0][2] as any).input).toBe('multi\nline');
 
@@ -132,7 +137,7 @@ describe('TmuxPipeBackend input addressing', () => {
     be.spawn('', [], spawnOpts());
     mockedExecFileSync.mockClear();
     be.write('hi');
-    const args = mockedExecFileSync.mock.calls[0][1] as string[];
+    const args = getExecFileCalls()[0][1] as string[];
     expect(args).toContain('-l');  // literal mode
     expect(args).toContain('hi');
   });
