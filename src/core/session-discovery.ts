@@ -6,12 +6,15 @@
  */
 import { execSync } from 'node:child_process';
 import { readFileSync, readlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, platform } from 'node:os';
+import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
+
+// macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
+const IS_LINUX = platform() === 'linux';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -46,39 +49,98 @@ function shellescape(s: string): string {
 }
 
 /**
- * Read the comm name for a PID from /proc.
- * Returns undefined if the process no longer exists.
+ * 读取进程的 comm 名（不含路径）。Linux 走 /proc/<pid>/comm 快路径；
+ * macOS / 其它 Unix 走 `ps -o comm=` 兜底。
+ *
+ * 注意 macOS 的 `ps -o comm=` 返回完整可执行路径（如 `/usr/local/bin/claude`），
+ * 所以这里统一做一次 basename，让上层匹配 CLI_COMM_MAP 的逻辑保持不变。
+ *
+ * 返回 undefined 表示进程不存在或读不到。
  */
 function readComm(pid: number): string | undefined {
+  if (IS_LINUX) {
+    try {
+      return readFileSync(`/proc/${pid}/comm`, 'utf-8').trim();
+    } catch {
+      // 落到下面的 ps 兜底
+    }
+  }
   try {
-    return readFileSync(`/proc/${pid}/comm`, 'utf-8').trim();
+    const out = execSync(`ps -o comm= -p ${pid}`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (!out) return undefined;
+    return out.includes('/') ? basename(out) : out;
   } catch {
     return undefined;
   }
 }
 
 /**
- * Read the cwd for a PID via /proc/<pid>/cwd symlink.
- * Returns undefined if unavailable.
+ * 读取进程的工作目录。Linux 走 /proc/<pid>/cwd 软链；
+ * macOS / 其它 Unix 走 `lsof -a -d cwd -p <pid> -Fn` 兜底。
+ *
+ * lsof -Fn 的输出格式：
+ *   p<pid>
+ *   fcwd
+ *   n<path>
+ * 这里只解析以 n 开头的那一行。
+ *
+ * 返回 undefined 表示读不到。
  */
 function readCwd(pid: number): string | undefined {
+  if (IS_LINUX) {
+    try {
+      return readlinkSync(`/proc/${pid}/cwd`);
+    } catch {
+      // 落到下面的 lsof 兜底
+    }
+  }
   try {
-    return readlinkSync(`/proc/${pid}/cwd`);
+    const out = execSync(`lsof -a -d cwd -p ${pid} -Fn`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    for (const line of out.split('\n')) {
+      if (line.startsWith('n')) return line.slice(1);
+    }
+    return undefined;
   } catch {
     return undefined;
   }
 }
 
-/** Get direct child PIDs of a process via `ps --ppid`. */
+/**
+ * 获取一个进程的直接子进程 PID。
+ *
+ * 既不能用 GNU `ps --ppid`（BSD ps 不支持长选项），也不能用 `pgrep -P`
+ * （macOS BSD pgrep 把 `-P` 当过滤器，要求**必须**搭配一个 pattern 位置参数，
+ * 不传 pattern 返回空）。
+ *
+ * 改成一次 `ps -A -o pid= -o ppid=` 把全表拿回来 JS 端过滤 —— 两个平台
+ * 的 ps 都接受这个写法。fork-exec 一次代价可接受，因为 discovery 本身是
+ * 低频操作（只在用户 /adopt 时跑一遍）。
+ */
 function getChildPids(pid: number): number[] {
   try {
-    const out = execSync(`ps --ppid ${pid} -o pid=`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
-    return out
-      .split('\n')
-      .map(s => s.trim())
-      .filter(Boolean)
-      .map(Number)
-      .filter(n => !isNaN(n));
+    const out = execSync('ps -A -o pid= -o ppid=', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const children: number[] = [];
+    for (const line of out.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const parts = trimmed.split(/\s+/);
+      if (parts.length < 2) continue;
+      const childPid = Number(parts[0]);
+      const parentPid = Number(parts[1]);
+      if (!isNaN(childPid) && !isNaN(parentPid) && parentPid === pid) {
+        children.push(childPid);
+      }
+    }
+    return children;
   } catch {
     return [];
   }
@@ -199,7 +261,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
     // 3b. Filter by CLI type if requested
     if (filterCliId && match.cliId !== filterCliId) continue;
 
-    // 4. Read CLI working directory from /proc
+    // 4. Read CLI working directory (Linux: /proc; macOS: lsof)
     const cwd = readCwd(match.pid);
     if (!cwd) continue;
 
@@ -270,3 +332,9 @@ export function validateAdoptTarget(tmuxTarget: string, expectedPid: number): bo
   const match = findCliProcess(panePid, 3);
   return match !== undefined && match.pid === expectedPid;
 }
+
+// 仅供单测使用 —— 暴露内部 helper，方便覆盖跨平台 (Linux /proc vs macOS ps/lsof/pgrep)
+// 的回归路径。生产代码不要直接消费这些导出。
+export const __testOnly_readComm = readComm;
+export const __testOnly_readCwd = readCwd;
+export const __testOnly_getChildPids = getChildPids;
