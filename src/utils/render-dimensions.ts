@@ -38,6 +38,11 @@ export interface RenderDimensions {
   rows: number;
 }
 
+export interface ScreenshotViewport {
+  startY: number;
+  rows: number;
+}
+
 export interface RenderDimensionConfig {
   adoptMode?: boolean;
   adoptPaneCols?: number;
@@ -63,4 +68,29 @@ export function resolveRenderDimensions(cfg: RenderDimensionConfig): RenderDimen
     };
   }
   return { cols: DEFAULT_RENDER_COLS, rows: DEFAULT_RENDER_ROWS };
+}
+
+/**
+ * Feishu card image elements have a practical display-height cap. Very tall
+ * terminal screenshots (50-100 rows, common when adopting a user's large tmux
+ * pane) can be shown as a top-cropped preview in the card, which hides the
+ * terminal input/status area at the bottom. Keep the screenshot compact and
+ * biased to the tail of the viewport where TUI prompts/statuslines live.
+ */
+export const DEFAULT_CARD_SCREENSHOT_ROWS = 24;
+
+/** Pick the terminal viewport slice used for the Lark card screenshot. */
+export function resolveScreenshotViewport(
+  terminalRows: number,
+  baseY: number,
+  maxRows: number = DEFAULT_CARD_SCREENSHOT_ROWS,
+): ScreenshotViewport {
+  const safeRows = Math.max(1, Math.round(Number.isFinite(terminalRows) ? terminalRows : DEFAULT_RENDER_ROWS));
+  const safeBaseY = Math.max(0, Math.round(Number.isFinite(baseY) ? baseY : 0));
+  const safeMaxRows = Math.max(1, Math.round(Number.isFinite(maxRows) ? maxRows : DEFAULT_CARD_SCREENSHOT_ROWS));
+  const rows = Math.min(safeRows, safeMaxRows);
+  return {
+    startY: safeBaseY + Math.max(0, safeRows - rows),
+    rows,
+  };
 }

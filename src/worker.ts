@@ -40,9 +40,9 @@ import {
   MAX_RENDER_COLS,
   MAX_RENDER_ROWS,
   MIN_RENDER_COLS,
-  MIN_RENDER_ROWS,
   clamp,
   resolveRenderDimensions,
+  resolveScreenshotViewport,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
@@ -1610,7 +1610,10 @@ async function captureAndUpload(): Promise<void> {
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   const term = renderer.xterm;
-  const startY = term.buffer.active.baseY;
+  const { startY, rows: screenshotRows } = resolveScreenshotViewport(
+    term.rows,
+    term.buffer.active.baseY,
+  );
 
   // Hash dedup — same content → skip upload. Not logged: this is the expected
   // "nothing changed" path and would dominate the log signal.
@@ -1622,7 +1625,7 @@ async function captureAndUpload(): Promise<void> {
   let png: Buffer;
   try {
     const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-    const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+    const shotRows = clamp(screenshotRows, 1, MAX_RENDER_ROWS);
     png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
   } catch (err: any) {
     logError(`Screenshot render failed: ${err?.message ?? err}`);

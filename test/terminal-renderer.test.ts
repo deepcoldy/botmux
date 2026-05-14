@@ -11,7 +11,11 @@
  */
 import { describe, it, expect } from 'vitest';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
-import { resolveRenderDimensions } from '../src/utils/render-dimensions.js';
+import {
+  DEFAULT_CARD_SCREENSHOT_ROWS,
+  resolveRenderDimensions,
+  resolveScreenshotViewport,
+} from '../src/utils/render-dimensions.js';
 
 // xterm-headless processes writes asynchronously through an internal
 // queue. Accessing the buffer immediately after .write() can show stale
@@ -53,6 +57,23 @@ describe('resolveRenderDimensions (worker init helper)', () => {
   it('non-finite dimensions snap to lower clamp (no NaN propagation)', () => {
     expect(resolveRenderDimensions({ adoptMode: true, adoptPaneCols: NaN, adoptPaneRows: Infinity }))
       .toEqual({ cols: 80, rows: 100 });
+  });
+});
+
+describe('resolveScreenshotViewport (Lark card screenshot helper)', () => {
+  it('uses the full viewport when it is already compact', () => {
+    expect(resolveScreenshotViewport(24, 10)).toEqual({ startY: 10, rows: 24 });
+  });
+
+  it('tail-crops tall terminal panes so bottom status/input lines stay visible', () => {
+    expect(resolveScreenshotViewport(57, 100)).toEqual({
+      startY: 100 + (57 - DEFAULT_CARD_SCREENSHOT_ROWS),
+      rows: DEFAULT_CARD_SCREENSHOT_ROWS,
+    });
+  });
+
+  it('accepts an explicit row cap for tests and future callers', () => {
+    expect(resolveScreenshotViewport(50, 7, 20)).toEqual({ startY: 37, rows: 20 });
   });
 });
 
