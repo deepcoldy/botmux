@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
 import { readdirSync, statSync, existsSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, resolve } from 'node:path';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -28,45 +28,126 @@ export interface ProjectInfo {
   branch: string;     // current branch name
 }
 
-function getGitBranch(dir: string): string {
+/** zsh-prompt-style ref resolution: branch → tag → short SHA → 'unknown'.
+ *  `git rev-parse --abbrev-ref HEAD` returns the literal string `HEAD`
+ *  when detached, which is the signal to fall through to tag/SHA lookup. */
+function getGitRef(dir: string): string {
   try {
-    return execSync('git rev-parse --abbrev-ref HEAD', { cwd: dir, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd: dir, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (branch && branch !== 'HEAD') return branch;
+  } catch { /* fall through */ }
+  try {
+    const tag = execSync('git describe --tags --exact-match HEAD', {
+      cwd: dir, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (tag) return tag;
+  } catch { /* not at a tag */ }
+  try {
+    const sha = execSync('git rev-parse --short HEAD', {
+      cwd: dir, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (sha) return sha;
+  } catch { /* fall through */ }
+  return 'unknown';
+}
+
+/** Tag-or-short-SHA for a detached HEAD. The SHA is supplied by the
+ *  caller (parsed from `git worktree list --porcelain`'s `HEAD` line) so
+ *  we only need one extra exec per detached worktree. */
+function describeDetachedHead(worktreePath: string, headSha: string): string {
+  try {
+    const tag = execSync('git describe --tags --exact-match HEAD', {
+      cwd: worktreePath, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (tag) return tag;
+  } catch { /* not at a tag */ }
+  return headSha ? headSha.slice(0, 7) : 'unknown';
+}
+
+/** Absolute path of the repo's shared `.git` directory. Sibling worktrees
+ *  of the same repo always resolve to the same value — we use it as the
+ *  dedup key so the scanner doesn't double-register a repo when both its
+ *  main and a linked worktree sit in the scan root. */
+function getGitCommonDir(dir: string): string {
+  try {
+    const out = execSync('git rev-parse --git-common-dir', {
+      cwd: dir, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    return resolve(dir, out);
   } catch {
-    return 'unknown';
+    return dir;
   }
 }
 
-function getWorktrees(repoPath: string): ProjectInfo[] {
+/** Discover all worktrees of the repo that `anyWorktreePath` belongs to.
+ *  Index 0 is the main worktree (`type:'repo'`), the rest are linked
+ *  worktrees (`type:'worktree'`).
+ *
+ *  All entries share the main worktree's basename as their `name` — that
+ *  way the display is stable regardless of which sibling worktree the
+ *  scanner happens to discover first via readdir, and the linked
+ *  worktree's directory basename (often a random checkout name) doesn't
+ *  leak into the UI. Renderers distinguish entries via the `branch` field
+ *  and the `type:'worktree'` flag. */
+function scanRepoFromAnyWorktree(anyWorktreePath: string): ProjectInfo[] {
+  const fallback: ProjectInfo[] = [{
+    name: basename(anyWorktreePath),
+    path: anyWorktreePath,
+    type: 'repo',
+    branch: getGitRef(anyWorktreePath),
+  }];
+
+  let output: string;
   try {
-    const output = execSync('git worktree list --porcelain', { cwd: repoPath, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const worktrees: ProjectInfo[] = [];
-    let currentPath = '';
-    let currentBranch = '';
-
-    for (const line of output.split('\n')) {
-      if (line.startsWith('worktree ')) {
-        currentPath = line.slice('worktree '.length);
-      } else if (line.startsWith('branch ')) {
-        currentBranch = line.slice('branch '.length).replace('refs/heads/', '');
-      } else if (line === '') {
-        // End of a worktree entry — skip the main worktree (same as repoPath)
-        if (currentPath && currentPath !== repoPath) {
-          worktrees.push({
-            name: `${basename(repoPath)}/${basename(currentPath)}`,
-            path: currentPath,
-            type: 'worktree',
-            branch: currentBranch || 'unknown',
-          });
-        }
-        currentPath = '';
-        currentBranch = '';
-      }
-    }
-
-    return worktrees;
+    output = execSync('git worktree list --porcelain', {
+      cwd: anyWorktreePath, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    });
   } catch {
-    return [];
+    return fallback;
   }
+
+  const entries: { path: string; branch: string }[] = [];
+  let currentPath = '';
+  let currentHead = '';
+  let currentBranch = '';
+  for (const line of output.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      currentPath = line.slice('worktree '.length);
+    } else if (line.startsWith('HEAD ')) {
+      currentHead = line.slice('HEAD '.length);
+    } else if (line.startsWith('branch ')) {
+      currentBranch = line.slice('branch '.length).replace('refs/heads/', '');
+    } else if (line === '') {
+      if (currentPath) {
+        // Branch attached → use it. Otherwise (detached / bare) fall back
+        // to tag → short SHA, mirroring zsh git prompts.
+        const ref = currentBranch
+          || (currentHead ? describeDetachedHead(currentPath, currentHead) : 'unknown');
+        entries.push({ path: currentPath, branch: ref });
+      }
+      currentPath = '';
+      currentHead = '';
+      currentBranch = '';
+    }
+  }
+  if (entries.length === 0) return fallback;
+
+  const main = entries[0]!;
+  const repoName = basename(main.path);
+  const result: ProjectInfo[] = [
+    { name: repoName, path: main.path, type: 'repo', branch: main.branch },
+  ];
+  for (const wt of entries.slice(1)) {
+    result.push({
+      name: repoName,
+      path: wt.path,
+      type: 'worktree',
+      branch: wt.branch,
+    });
+  }
+  return result;
 }
 
 /**
@@ -75,7 +156,8 @@ function getWorktrees(repoPath: string): ProjectInfo[] {
  */
 export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo[] {
   const projects: ProjectInfo[] = [];
-  const seen = new Set<string>();
+  const seenRepos = new Set<string>();   // by git-common-dir, dedups sibling worktrees on disk
+  const seenPaths = new Set<string>();   // by absolute path
 
   function walk(dir: string, depth: number): void {
     if (depth > maxDepth) return;
@@ -91,22 +173,14 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
     // an empty `.git/` (no HEAD inside) is rejected so the scanner keeps
     // recursing into the directory and finds the real repos below.
     if (entries.includes('.git') && isValidGitMarker(dir)) {
-      const realPath = dir;
-      if (!seen.has(realPath)) {
-        seen.add(realPath);
-        projects.push({
-          name: basename(realPath),
-          path: realPath,
-          type: 'repo',
-          branch: getGitBranch(realPath),
-        });
+      const commonDir = getGitCommonDir(dir);
+      if (seenRepos.has(commonDir)) return;
+      seenRepos.add(commonDir);
 
-        // Also scan for worktrees
-        for (const wt of getWorktrees(realPath)) {
-          if (!seen.has(wt.path)) {
-            seen.add(wt.path);
-            projects.push(wt);
-          }
+      for (const p of scanRepoFromAnyWorktree(dir)) {
+        if (!seenPaths.has(p.path)) {
+          seenPaths.add(p.path);
+          projects.push(p);
         }
       }
       return; // Don't recurse into git repos
@@ -131,7 +205,9 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
   // Sort: repos first, then worktrees, alphabetically within each group
   projects.sort((a, b) => {
     if (a.type !== b.type) return a.type === 'repo' ? -1 : 1;
-    return a.name.localeCompare(b.name);
+    const byName = a.name.localeCompare(b.name);
+    if (byName !== 0) return byName;
+    return a.branch.localeCompare(b.branch);
   });
 
   logger.info(`Scanned ${baseDir}: found ${projects.length} project(s)`);
@@ -157,7 +233,9 @@ export function scanMultipleProjects(baseDirs: string[], maxDepth: number = 3): 
   // Sort: repos first, then worktrees, alphabetically within each group
   merged.sort((a, b) => {
     if (a.type !== b.type) return a.type === 'repo' ? -1 : 1;
-    return a.name.localeCompare(b.name);
+    const byName = a.name.localeCompare(b.name);
+    if (byName !== 0) return byName;
+    return a.branch.localeCompare(b.branch);
   });
 
   return merged;

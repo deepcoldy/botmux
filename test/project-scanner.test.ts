@@ -395,7 +395,11 @@ describe('scanProjects', () => {
     expect(repo.path).toBe(repoPath);
 
     const wt = results.find(r => r.type === 'worktree')!;
-    expect(wt.name).toBe('my-repo/my-repo-worktree-abc');
+    // The linked worktree's name is the MAIN worktree's basename — not its
+    // own directory basename (see issue #7). Renderers append `(branch)`
+    // and a `[worktree]` tag themselves, so the scanner only needs to keep
+    // `name` and `branch` separate.
+    expect(wt.name).toBe('my-repo');
     expect(wt.path).toBe(worktreePath);
     expect(wt.branch).toBe('feature-branch');
   });
@@ -419,6 +423,181 @@ describe('scanProjects', () => {
 
     expect(results).toHaveLength(1);
     expect(results[0]!.type).toBe('repo');
+  });
+
+  // ─── Main vs linked worktree attribution (issue #7) ─────────────────────
+
+  it('should attribute the repo to the main worktree even when a linked worktree is discovered first by readdir', () => {
+    // Reproduces issue #7: two sibling worktrees of the same underlying repo
+    // sit side-by-side in the scan root. Alphabetically the LINKED worktree
+    // ("aaa-feature", `.git` is a gitlink file) comes before the MAIN
+    // worktree ("zzz-main", `.git` is a real directory). The scanner walked
+    // into the linked one first and registered it as `type:'repo'`, then
+    // listed the main worktree under it with name `aaa-feature/zzz-main`.
+    // After the fix: the main worktree must be the `repo`, the linked one
+    // the `worktree`, regardless of readdir order.
+    const linkedPath = mkWorktreeGitlink('aaa-feature', '/some/.git/worktrees/aaa-feature');
+    const mainPath = mkRepo('zzz-main');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        // Both worktrees share the same common-dir — the main's .git/.
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('rev-parse --abbrev-ref HEAD')) {
+        if (opts?.cwd === linkedPath) return 'feature/aaa\n';
+        return 'main\n';
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        // git convention: main worktree is always the first entry.
+        return [
+          `worktree ${mainPath}`,
+          'branch refs/heads/main',
+          '',
+          `worktree ${linkedPath}`,
+          'branch refs/heads/feature/aaa',
+          '',
+        ].join('\n');
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+
+    // Exactly 2 entries: one repo + one worktree, no duplicates.
+    expect(results).toHaveLength(2);
+    expect(results.filter(r => r.type === 'repo')).toHaveLength(1);
+    expect(results.filter(r => r.type === 'worktree')).toHaveLength(1);
+
+    const repo = results.find(r => r.type === 'repo')!;
+    expect(repo.name).toBe('zzz-main');           // NOT 'aaa-feature'
+    expect(repo.path).toBe(mainPath);
+    expect(repo.branch).toBe('main');
+
+    const wt = results.find(r => r.type === 'worktree')!;
+    expect(wt.path).toBe(linkedPath);
+    expect(wt.branch).toBe('feature/aaa');
+    // Linked worktree's name is the MAIN worktree's basename — branch is
+    // surfaced via the `branch` field, not baked into `name` (renderers
+    // append it themselves).
+    expect(wt.name).toBe('zzz-main');
+  });
+
+  it('should NOT leak the linked-worktree directory basename into the display name', () => {
+    // Worktree directory basenames are often unrelated to branch names
+    // (random checkout dirs, timestamps, etc.). The scanner must use the
+    // MAIN worktree's basename — never the linked dir's — so the display
+    // is stable and meaningful.
+    const mainPath = mkRepo('repo');
+    const garbageBasename = 'tmp-checkout-7zKx';
+    const linkedPath = mkWorktreeGitlink(garbageBasename, '/some/.git/worktrees/x');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('rev-parse --abbrev-ref HEAD')) {
+        if (opts?.cwd === linkedPath) return 'release/2026.05\n';
+        return 'main\n';
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        return [
+          `worktree ${mainPath}`,
+          'branch refs/heads/main',
+          '',
+          `worktree ${linkedPath}`,
+          'branch refs/heads/release/2026.05',
+          '',
+        ].join('\n');
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+    const wt = results.find(r => r.type === 'worktree')!;
+
+    expect(wt.name).toBe('repo');
+    expect(wt.name).not.toContain(garbageBasename);
+    // Branch still available via the dedicated field for renderers.
+    expect(wt.branch).toBe('release/2026.05');
+  });
+
+  // ─── Detached HEAD: tag / short-sha fallback ─────────────────────────────
+
+  it('should report the tag name when a worktree has detached HEAD pointing at a tag', () => {
+    // zsh-style ref resolution: branch → tag → short sha. When `git
+    // worktree list --porcelain` emits `detached` (instead of `branch
+    // refs/heads/...`), look up the tag via `git describe --tags
+    // --exact-match HEAD` from inside that worktree.
+    const mainPath = mkRepo('repo');
+    const detachedPath = mkWorktreeGitlink('checkout-v1', '/some/.git/worktrees/x');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        return [
+          `worktree ${mainPath}`,
+          'HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          'branch refs/heads/main',
+          '',
+          `worktree ${detachedPath}`,
+          'HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          'detached',
+          '',
+        ].join('\n');
+      }
+      if (cmdStr.includes('describe --tags --exact-match HEAD')) {
+        if (opts?.cwd === detachedPath) return 'v1.2.3\n';
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+    const wt = results.find(r => r.type === 'worktree')!;
+
+    expect(wt.path).toBe(detachedPath);
+    expect(wt.branch).toBe('v1.2.3');
+  });
+
+  it('should fall back to the short SHA when a worktree has detached HEAD not pointing at any tag', () => {
+    const mainPath = mkRepo('repo');
+    const detachedPath = mkWorktreeGitlink('checkout-loose', '/some/.git/worktrees/y');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        return [
+          `worktree ${mainPath}`,
+          'HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          'branch refs/heads/main',
+          '',
+          `worktree ${detachedPath}`,
+          'HEAD c0ffee1234567890abcdef0000000000deadbeef',
+          'detached',
+          '',
+        ].join('\n');
+      }
+      if (cmdStr.includes('describe --tags --exact-match HEAD')) {
+        // Not at any tag — git exits non-zero.
+        throw new Error('fatal: no tag exactly matches HEAD');
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+    const wt = results.find(r => r.type === 'worktree')!;
+
+    expect(wt.path).toBe(detachedPath);
+    // First 7 chars of the HEAD SHA from the porcelain output.
+    expect(wt.branch).toBe('c0ffee1');
   });
 
   // ─── Deduplication ──────────────────────────────────────────────────────
