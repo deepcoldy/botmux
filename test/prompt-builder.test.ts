@@ -74,6 +74,15 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
+  it('should include heredoc guidance for non-Claude CLIs', () => {
+    const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).toContain('第一行');
+    expect(prompt).toContain('第二行');
+    expect(prompt).toContain('botmux send "第一行\\n第二行"');
+    expect(prompt).toContain('字面量');
+  });
+
   it('should NOT embed <session_id> for CLIs with injectsSessionContext (claude-code)', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'claude-code');
     expect(prompt).not.toContain('<session_id>');

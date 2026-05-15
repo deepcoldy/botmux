@@ -86,6 +86,18 @@ describe('claude-code buildArgs', () => {
     expect(args).not.toContain('hello');
     expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
+
+  it('injects heredoc guidance into append-system-prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    const idx = args.indexOf('--append-system-prompt');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const prompt = args[idx + 1];
+    expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).toContain('第一行');
+    expect(prompt).toContain('第二行');
+    expect(prompt).toContain('botmux send "第一行\\n第二行"');
+    expect(prompt).toContain('字面量');
+  });
 });
 
 describe('aiden buildArgs', () => {
