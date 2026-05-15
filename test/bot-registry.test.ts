@@ -348,6 +348,7 @@ describe('loadBotConfigs', () => {
     fsMock.readFileSync.mockReturnValue(JSON.stringify([{
       larkAppId: 'app_full',
       larkAppSecret: 'secret_full',
+      name: 'codex-main',
       cliId: 'gemini',
       cliPathOverride: '/usr/local/bin/gemini',
       backendType: 'tmux',
@@ -359,6 +360,7 @@ describe('loadBotConfigs', () => {
     const configs = mod.loadBotConfigs();
     expect(configs).toHaveLength(1);
     const c = configs[0];
+    expect(c.name).toBe('codex-main');
     expect(c.cliId).toBe('gemini');
     expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
     expect(c.backendType).toBe('tmux');

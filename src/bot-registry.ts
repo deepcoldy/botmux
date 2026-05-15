@@ -15,6 +15,8 @@ export interface OncallChat {
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
+  /** Optional status/PM2 label. PM2 process name is rendered as `botmux-<name>`. */
+  name?: string;
   cliId: CliId;
   cliPathOverride?: string;
   backendType?: 'pty' | 'tmux';
@@ -222,6 +224,7 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
+      name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
       backendType: entry.backendType,

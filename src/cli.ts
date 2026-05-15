@@ -27,6 +27,14 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { loadOncallChatsByApp, pickBotEntryByName } from './utils/bot-routing.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
+import {
+  applyBotConfigEdits,
+  botProcessName,
+  CLI_ID_CHOICES,
+  parseBotSelection,
+  removeBotConfig,
+  type BotConfigEditInput,
+} from './setup/bot-config-editor.js';
 import { logger } from './utils/logger.js';
 
 // CLI subcommands (send/thread/bots/list/etc) print JSON to stdout for
@@ -115,7 +123,7 @@ function ecosystemConfig(): string {
 
   const apps: any[] = bots.map((_bot: any, i: number) => ({
     ...baseApp,
-    name: `${PM2_NAME}-${i}`,
+    name: botProcessName(_bot, i, PM2_NAME),
     error_file: join(LOG_DIR, `daemon-${i}-error.log`),
     out_file: join(LOG_DIR, `daemon-${i}-out.log`),
     env: { SESSION_DATA_DIR: DATA_DIR, BOTMUX_BOT_INDEX: String(i) },
@@ -153,6 +161,13 @@ function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<
 
 // ─── Setup helpers ──────────────────────────────────────────────────────────
 
+function printInputHelp(title: string, lines: string[]): void {
+  console.log(`\n${title}`);
+  for (const line of lines) {
+    console.log(`  ${line}`);
+  }
+}
+
 function printLarkPermissions(): void {
   console.log('请先在飞书开放平台创建应用: https://open.feishu.cn/app\n');
   console.log('需要的权限:');
@@ -167,21 +182,127 @@ function printLarkPermissions(): void {
 }
 
 async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any>> {
+  printInputHelp('LARK_APP_ID', [
+    '飞书开放平台应用的 App ID，用来区分是哪一个机器人接收事件。',
+    '在应用凭证页复制，通常以 cli_ 开头。',
+  ]);
   const appId = await ask(rl, 'LARK_APP_ID: ');
+
+  printInputHelp('LARK_APP_SECRET', [
+    '同一个飞书应用的 App Secret，用来建立长连接和调用飞书接口。',
+    `会保存在本机 ${BOTS_JSON_FILE}，不要粘贴到公开位置。`,
+  ]);
   const appSecret = await ask(rl, 'LARK_APP_SECRET: ');
 
+  printInputHelp('botmux status 显示名称', [
+    '可选。用于本机 PM2 进程名，方便在 botmux status / logs 中识别机器人。',
+    '最终显示为 botmux-<名称>；留空时默认使用 botmux-<序号>。',
+  ]);
+  const name = (await ask(rl, 'botmux status 显示名称（可选，如 codex-main；实际显示 botmux-codex-main）: ')).trim();
+
   console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
+  printInputHelp('CLI 适配器', [
+    '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
+  ]);
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
-  const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex', '5': 'gemini', '6': 'opencode' };
-  const cliId = cliIdMap[cliChoice] ?? (cliChoice || 'claude-code');
+  const cliId = CLI_ID_CHOICES[cliChoice] ?? (cliChoice || 'claude-code');
+
+  printInputHelp('默认工作目录', [
+    '可选。新会话默认进入的目录，适合填写常用项目根目录或项目集合目录。',
+    '留空时默认使用 ~；也可以用逗号分隔多个候选目录。',
+  ]);
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
+
+  printInputHelp('允许的用户', [
+    '可选。限制哪些飞书用户可以操作机器人，支持邮箱前缀或 open_id，多个值用逗号分隔。',
+    '留空表示不限制；oncall 群绑定仍会按现有逻辑处理群内提问。',
+  ]);
   const allowedUsers = await ask(rl, '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ');
 
   const bot: Record<string, any> = { larkAppId: appId, larkAppSecret: appSecret, cliId };
+  if (name) bot.name = name;
   if (workingDir) bot.workingDir = workingDir;
   if (allowedUsers) bot.allowedUsers = allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
 
   return bot;
+}
+
+function formatOptionalValue(v: unknown): string {
+  if (Array.isArray(v)) return v.join(',');
+  if (typeof v === 'string' && v) return v;
+  return '未设置';
+}
+
+function formatBotConfigLine(bot: Record<string, any>, index: number): string {
+  const cliId = bot.cliId ?? 'claude-code';
+  return `${index + 1}. ${botProcessName(bot, index, PM2_NAME)}  ${bot.larkAppId} (${cliId})`;
+}
+
+async function promptEditBotConfig(
+  rl: ReturnType<typeof createInterface>,
+  bot: Record<string, any>,
+): Promise<Record<string, any>> {
+  console.log('\n字段留空表示保留当前值；可选字段输入 - 表示清空。\n');
+  const input: BotConfigEditInput = {};
+
+  printInputHelp('botmux status 显示名称', [
+    '可选。用于本机 PM2 进程名，方便在 botmux status / logs 中识别机器人。',
+    '留空保留当前值；输入 - 清空自定义名称并恢复 botmux-<序号>。',
+  ]);
+  input.name = await ask(rl, `botmux status 显示名称 [${formatOptionalValue(bot.name)}]: `);
+
+  printInputHelp('LARK_APP_ID', [
+    '飞书开放平台应用的 App ID。修改后，这个配置项会切到另一个飞书应用。',
+    '留空保留当前值；修改会二次确认，因为历史会话和群聊状态不会自动迁移。',
+  ]);
+  input.larkAppId = await ask(rl, `LARK_APP_ID [${bot.larkAppId}]: `);
+
+  printInputHelp('LARK_APP_SECRET', [
+    '当前 App ID 对应的 App Secret。只更新密钥时填写这一项即可。',
+    '留空保留当前值。',
+  ]);
+  input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
+
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
+  printInputHelp('CLI 适配器', [
+    '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
+    '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
+  ]);
+  input.cliChoice = await ask(rl, `CLI 适配器 [${bot.cliId ?? 'claude-code'}]: `);
+
+  printInputHelp('会话后端 backendType', [
+    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着。',
+    '留空保留当前值；输入 - 回到自动检测；只接受 pty 或 tmux。',
+  ]);
+  input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
+
+  printInputHelp('默认工作目录', [
+    '可选。新会话默认进入的目录，支持逗号分隔多个候选目录。',
+    '留空保留当前值；输入 - 清空并回到默认 ~。',
+  ]);
+  input.workingDir = await ask(rl, `默认工作目录 [${formatOptionalValue(bot.workingDir)}]: `);
+
+  printInputHelp('允许的用户', [
+    '可选。限制哪些飞书用户可以操作机器人，支持邮箱前缀或 open_id，多个值用逗号分隔。',
+    '留空保留当前值；输入 - 清空限制。',
+  ]);
+  input.allowedUsers = await ask(rl, `允许的用户 [${formatOptionalValue(bot.allowedUsers)}]: `);
+
+  printInputHelp('Git 仓库扫描目录', [
+    '可选。用于项目选择/扫描时从指定目录发现 Git 仓库。',
+    '留空保留当前值；输入 - 清空扫描目录。',
+  ]);
+  input.projectScanDir = await ask(rl, `Git 仓库扫描目录 [${formatOptionalValue(bot.projectScanDir)}]: `);
+
+  const edited = applyBotConfigEdits(bot, input);
+  if (edited.larkAppId !== bot.larkAppId) {
+    console.log('\n⚠️  LARK_APP_ID 变更后，旧 appId 下的历史会话/群聊状态数据不会自动迁移。');
+    const confirm = (await ask(rl, `确认将 LARK_APP_ID 从 ${bot.larkAppId} 改为 ${edited.larkAppId}? (y/N): `)).trim().toLowerCase();
+    if (confirm !== 'y' && confirm !== 'yes') {
+      edited.larkAppId = bot.larkAppId;
+    }
+  }
+  return edited;
 }
 
 /** Parse .env file to extract bot config for migration to bots.json */
@@ -201,7 +322,7 @@ function parseDotEnvToBotConfig(): Record<string, any> {
     larkAppSecret: vars.LARK_APP_SECRET || '',
   };
   if (vars.CLI_ID) bot.cliId = vars.CLI_ID;
-  if (vars.CLI_PATH) bot.cliPathOverride = vars.CLI_PATH;
+  if (vars.CLI_PATH?.trim()) bot.cliPathOverride = vars.CLI_PATH.trim();
   if (vars.BACKEND_TYPE) bot.backendType = vars.BACKEND_TYPE;
   if (vars.WORKING_DIR) bot.workingDir = vars.WORKING_DIR;
   if (vars.ALLOWED_USERS) bot.allowedUsers = vars.ALLOWED_USERS.split(',').map((s: string) => s.trim()).filter(Boolean);
@@ -243,12 +364,18 @@ async function cmdSetup(): Promise<void> {
     const bots = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')) as any[];
     console.log(`已配置 ${bots.length} 个机器人：`);
     for (let i = 0; i < bots.length; i++) {
-      console.log(`  ${i + 1}. ${bots[i].larkAppId} (${bots[i].cliId ?? 'claude-code'})`);
+      console.log(`  ${formatBotConfigLine(bots[i], i)}`);
     }
     console.log('');
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  (1/2) [1]: ');
+    printInputHelp('操作选择', [
+      '1) 添加新机器人：保留现有配置，在 bots.json 末尾追加一项。',
+      '2) 重新配置：备份当前 bots.json，然后只写入一个新的机器人配置。',
+      '3) 编辑现有机器人：按序号、appId 或 botmux status 名称修改某一项。',
+      '4) 删除机器人：从本机 bots.json 移除某一项；不会删除飞书开放平台应用。',
+    ]);
+    const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  3) 编辑现有机器人  4) 删除机器人  (1/2/3/4) [1]: ');
 
     if (action === '2') {
       renameSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
@@ -259,6 +386,71 @@ async function cmdSetup(): Promise<void> {
       rl.close();
       writeFileSync(BOTS_JSON_FILE, JSON.stringify([newBot], null, 2) + '\n');
       console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
+      console.log(`\n下一步: botmux restart`);
+      return;
+    }
+
+    if (action === '3') {
+      printInputHelp('选择要编辑的机器人', [
+        '可输入上方列表里的序号、飞书 appId，或 botmux status 中显示的 PM2 名称。',
+        '示例：1、cli_xxx、botmux-1、botmux-codex-main。',
+      ]);
+      const selected = await ask(rl, '选择要编辑的机器人（序号、appId 或 botmux status 中的 name）: ');
+      const editIndex = parseBotSelection(selected, bots);
+      if (editIndex === undefined) {
+        rl.close();
+        console.error(`\n❌ 未找到机器人: ${selected}`);
+        return;
+      }
+
+      console.log(`\n── 编辑 ${formatBotConfigLine(bots[editIndex], editIndex)} ──\n`);
+      const edited = await promptEditBotConfig(rl, bots[editIndex]);
+      rl.close();
+
+      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+      bots[editIndex] = edited;
+      writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
+      console.log(`\n✅ 已更新 ${formatBotConfigLine(edited, editIndex)}`);
+      console.log(`   配置文件: ${BOTS_JSON_FILE}`);
+      console.log(`   旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+      console.log(`\n下一步: botmux restart`);
+      return;
+    }
+
+    if (action === '4') {
+      if (bots.length === 0) {
+        rl.close();
+        console.error('\n❌ 当前没有可删除的机器人配置');
+        return;
+      }
+
+      printInputHelp('选择要删除的机器人', [
+        '可输入上方列表里的序号、飞书 appId，或 botmux status 中显示的 PM2 名称。',
+        '删除只移除本机 bots.json 中的配置项；不会删除飞书开放平台应用、历史消息或本地会话数据。',
+      ]);
+      const selected = await ask(rl, '选择要删除的机器人（序号、appId 或 botmux status 中的 name）: ');
+      const result = removeBotConfig(bots, selected);
+      if (!result) {
+        rl.close();
+        console.error(`\n❌ 未找到机器人: ${selected}`);
+        return;
+      }
+
+      console.log(`\n将删除: ${formatBotConfigLine(result.removed, result.index)}`);
+      console.log('删除后，未设置自定义 name 的机器人在 botmux status 中的序号名称可能会随数组顺序变化。');
+      const confirm = (await ask(rl, '确认删除这个机器人配置？(y/N): ')).trim().toLowerCase();
+      rl.close();
+      if (confirm !== 'y' && confirm !== 'yes') {
+        console.log('\n已取消删除。');
+        return;
+      }
+
+      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+      writeFileSync(BOTS_JSON_FILE, JSON.stringify(result.bots, null, 2) + '\n');
+      console.log(`\n✅ 已删除 ${formatBotConfigLine(result.removed, result.index)}`);
+      console.log(`   剩余机器人: ${result.bots.length} 个`);
+      console.log(`   配置文件: ${BOTS_JSON_FILE}`);
+      console.log(`   旧配置已备份: ${BOTS_JSON_FILE}.bak`);
       console.log(`\n下一步: botmux restart`);
       return;
     }
@@ -277,6 +469,10 @@ async function cmdSetup(): Promise<void> {
     // --- Single-bot mode (.env exists) ---
     console.log(`当前使用单机器人配置: ${ENV_FILE}`);
     const rl = createInterface({ input: process.stdin, output: process.stdout });
+    printInputHelp('操作选择', [
+      '1) 添加新机器人：把当前 .env 迁移成 bots.json，再追加一个新机器人。',
+      '2) 覆盖当前配置：备份当前 .env，然后按新的输入生成单机器人 bots.json。',
+    ]);
     const action = await ask(rl, '操作: 1) 添加新机器人  2) 覆盖当前配置  (1/2): ');
 
     if (action === '2') {
@@ -571,7 +767,14 @@ function cmdLogs(): void {
 
   let target: string;
   if (botIdx !== undefined) {
-    target = `${PM2_NAME}-${botIdx}`;
+    const numericIdx = /^\d+$/.test(botIdx) ? Number(botIdx) : undefined;
+    const selectedIdx =
+      numericIdx !== undefined && numericIdx >= 0 && numericIdx < bots.length
+        ? numericIdx
+        : parseBotSelection(botIdx, bots);
+    target = selectedIdx !== undefined
+      ? botProcessName(bots[selectedIdx], selectedIdx, PM2_NAME)
+      : botIdx;
   } else {
     // Show all botmux logs via pm2 regex match
     target = `/^${PM2_NAME}/`;
@@ -1446,11 +1649,11 @@ function showHelp(): void {
 botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 命令:
-  setup       交互式配置（首次使用 / 添加机器人）
+  setup       交互式配置（首次使用 / 添加 / 编辑 / 删除机器人）
   start       启动 daemon
   stop        停止 daemon
   restart     重启 daemon（自动恢复活跃会话）
-  logs        查看 daemon 日志（--lines N, --bot <index>）
+  logs        查看 daemon 日志（--lines N, --bot <index|name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
   dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
