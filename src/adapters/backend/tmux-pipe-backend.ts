@@ -59,13 +59,30 @@ export class TmuxPipeBackend implements SessionBackend {
   private pipeAttached = false;
   private readonly createSession: boolean;
   private readonly ownsSession: boolean;
-  private readonly isReattach: boolean;
+  private readonly _isReattach: boolean;
+
+  /** Claude Code session JSONL path — set by worker for claude-code sessions so
+   *  the claude-code adapter can verify paste+Enter submissions via file growth. */
+  claudeJsonlPath?: string;
+  /** PID of the spawned Claude Code child — used by the claude-code adapter to
+   *  follow Claude's authoritative session id via ~/.claude/sessions/<pid>.json. */
+  cliPid?: number;
+  /** Working directory the CLI was spawned in — cross-checked against the pid
+   *  file's cwd field so a recycled PID can't mislead the resolver. */
+  cliCwd?: string;
+
+  /** Whether this backend re-attached to an existing bmx-* tmux session
+   *  (rather than creating a new detached one). Mirrors TmuxBackend.isReattach
+   *  so the worker can branch on reattach behaviour without a private-cast. */
+  get isReattach(): boolean {
+    return this._isReattach;
+  }
 
   constructor(paneTarget: string, opts?: { createSession?: boolean; ownsSession?: boolean; isReattach?: boolean }) {
     this.paneTarget = paneTarget;
     this.createSession = opts?.createSession ?? false;
     this.ownsSession = opts?.ownsSession ?? false;
-    this.isReattach = opts?.isReattach ?? false;
+    this._isReattach = opts?.isReattach ?? false;
     // Per-instance fifo so concurrent adopt sessions don't collide.
     this.fifoPath = join(tmpdir(), `botmux-pipe-${randomBytes(8).toString('hex')}.fifo`);
   }
@@ -80,6 +97,11 @@ export class TmuxPipeBackend implements SessionBackend {
 
     if (this.createSession) {
       this.createDetachedSession(bin, args, opts);
+    } else if (this.ownsSession && this._isReattach) {
+      // Backfill tmux options on an existing bmx-* session — daemon may have
+      // been upgraded since the session was originally created, and options
+      // like set-clipboard / window-size largest are idempotent to re-apply.
+      this.applySessionOptions();
     }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.

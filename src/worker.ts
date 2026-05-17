@@ -2450,7 +2450,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     send({ type: 'claude_exit', code, signal });
   });
 
-  if (isPipeMode && backend instanceof TmuxPipeBackend && (backend as any).isReattach) {
+  if (isPipeMode && backend instanceof TmuxPipeBackend && backend.isReattach) {
     log(`Re-attached to existing tmux session via pipe-pane: ${TmuxBackend.sessionName(cfg.sessionId)}`);
     try {
       const initial = backend.captureCurrentScreen();
