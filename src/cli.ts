@@ -257,15 +257,9 @@ function printCopyHint(filePath: string): void {
 }
 
 function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
-  // 数据源: 飞书内部 wiki UBOXwH01CixfxfkqxUpcKgvQnsg "[Botmux] 5分钟创建一个
-  // 真正好用的飞书助理" 的"权限申请"段, 加 botmux 维护者实测确认 PersonalAgent
-  // 应用扫码建出来时已经默认订阅 im.message.receive_v1 / card.action.trigger
-  // 事件并开通 bot 能力. 但 lark-channel-bridge README 当前仍要求用户手动补
-  // 事件订阅, 跟我们结论不一致 — 不排除飞书最近升级了 PersonalAgent 预配 (那个
-  // README 是旧版), 也不排除存在租户/版本差异让某些用户的 PersonalAgent 没预配.
-  //
-  // 折中: 主线流程只列"必须手动"的两步 (权限 + 重定向 URL), 末尾再给"如果
-  // bot 收不到消息" 的兜底 fallback 链接, 让用户能自查事件订阅 / bot 能力.
+  // PersonalAgent 应用扫码建出来时已默认订阅 im.message.receive_v1 +
+  // card.action.trigger, 并开通 bot 能力, 主线只剩两步: 申请权限 + 重定向
+  // URL (按需). README "Step 8 收不到消息时" 段提供 fallback 自查链接.
   const host = brand === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn';
   const home = `https://${host}/app/${appId}`;
   let scopesJsonPath = '';
@@ -276,32 +270,23 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
     console.log(`\n⚠️  写权限 JSON 失败 (${(err as Error).message}), 请手动从仓库源码 src/setup/lark-scopes.json 拷.`);
   }
 
-  console.log('\n⚠️  扫码 / 粘贴只完成了"建应用 + 拿凭证". 还有这些步骤要在开放平台浏览器里点:\n');
+  console.log('\n剩余两步在开放平台完成:\n');
 
   console.log('  1. 申请权限 (一次性导入完整 JSON 提交审批)');
-  console.log(`     深链: ${home}/auth → 进入「权限管理」→「批量导入/导出权限」→ 粘贴 → 提交`);
+  console.log(`     申请链接: ${home}/auth → 进入「权限管理」→「批量导入/导出权限」→ 粘贴 → 提交`);
   if (scopesJsonPath) {
     console.log(`     权限 JSON: ${scopesJsonPath}`);
     printCopyHint(scopesJsonPath);
   }
   console.log('');
 
-  console.log('  2. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 调云文档/日历等)');
-  console.log(`     深链: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
+  console.log('  2. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息)');
+  console.log(`     申请链接: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
   console.log('     填入: http://127.0.0.1:9768/callback');
-  console.log('     不打算用 `/login` 跨用户调 API 的话, 这一步可以跳过.\n');
+  console.log('     不需要 `/login` 拿卡片消息的话, 这一步可以跳过.\n');
 
   console.log('  完成后 `botmux start` (或 `botmux restart`)，启动检查不会卡住，');
   console.log('  缺权限只 WARN，去开放平台补齐后 daemon 自动恢复。\n');
-
-  // Fallback 自查清单 — 维护者实测 PersonalAgent 默认配好下面两项, 但飞书
-  // 没承诺过这是稳定行为. 收不到消息时让用户能自查.
-  console.log('  ─── 如果机器人配置好后收不到消息, 自查下面两点 ───');
-  console.log('  a. 事件订阅: PersonalAgent 默认订阅 im.message.receive_v1 + card.action.trigger,');
-  console.log(`     如缺失, 请到 ${home}/dev-config/event-sub 手动添加`);
-  console.log('  b. 机器人能力: PersonalAgent 默认已开通,');
-  console.log(`     如缺失, 请到 ${home}/feature/bot 启用 (应用功能 → 机器人)`);
-  console.log('');
 }
 
 /**
@@ -410,34 +395,23 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   const cliId = CLI_ID_CHOICES[cliChoice] ?? (cliChoice || 'claude-code');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
 
-  // 扫码场景: registerApp 已经免费给了扫码人 open_id, 直接拿来当 allowedUsers
-  // 默认值, 用户回车就用"只允许自己". 想多人共用回退到逗号分隔输入. 手动 fallback
-  // 路径没 open_id, 提示文案跟之前一致.
-  const ownerPrompt = creds.userOpenId
-    ? `允许的用户 [默认: 你自己 (${creds.userOpenId.substring(0, 12)}…)，回车采用; 多人用逗号分隔; 输入 - 表示不限制]: `
-    : '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ';
-  const allowedUsersInput = (await ask(rl, ownerPrompt)).trim();
-  let allowedUsers: string;
-  if (creds.userOpenId) {
-    if (allowedUsersInput === '-') allowedUsers = '';
-    else if (allowedUsersInput === '') allowedUsers = creds.userOpenId;
-    else allowedUsers = allowedUsersInput;
-  } else {
-    allowedUsers = allowedUsersInput;
-  }
-
-  // brand 必须持久化: cmdStart 的 validate / event-dispatcher 走的 deep link
-  // 都看这个字段; 不写就只能硬编码 feishu, lark 租户用户会被打成凭证无效.
-  // 为了向后兼容 (旧 bots.json 没 brand 字段), reader 应当 default 到 'feishu'.
+  // 不再持久化 brand 字段: setup 阶段 brand=lark 直接被 obtainCredentials 中止,
+  // 落盘的永远是 'feishu', 写进配置是死字段. 等 lark 完整接入再加回来, 那时
+  // 同步打开 daemon 链路的 brand 透传. botBrand() helper 读不到字段会 default
+  // 到 'feishu', 兼容旧版同时支持将来扩展.
   const bot: Record<string, any> = {
     larkAppId: creds.appId,
     larkAppSecret: creds.appSecret,
-    brand: creds.brand,
     cliId,
+    // 总是写 workingDir, 留空用 '~'. 用户手动编辑 bots.json 时一眼能看到字段
+    // 在哪儿, 不用去 README 查字段名.
+    workingDir: workingDir.trim() || '~',
   };
   if (name) bot.name = name;
-  if (workingDir) bot.workingDir = workingDir;
-  if (allowedUsers) bot.allowedUsers = allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
+  // 不再问 allowedUsers — 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id);
+  // 想改成多人共用 / 不限制, 用户后续手动编辑 ~/.botmux/bots.json 的 allowedUsers
+  // 字段即可. 手动 fallback 场景没 open_id, 字段直接不写 (== 不限制).
+  if (creds.userOpenId) bot.allowedUsers = [creds.userOpenId];
 
   return normalizeBotConfig(bot);
 }
