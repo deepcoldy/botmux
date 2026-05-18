@@ -59,7 +59,7 @@ export const logger = {
   /** Switch the logger into CLI mode:
    *   - info/debug become no-ops by default (silent stdout for JSON output).
    *   - DEBUG=1 re-enables info/debug *but routes them to stderr* so that
-   *     `DEBUG=1 botmux thread messages` still emits clean JSON on stdout.
+   *     `DEBUG=1 botmux history` still emits clean JSON on stdout.
    *  warn/error always reach stderr.
    *  Called once by the CLI entrypoint; daemon never calls this. */
   setSilent(s: boolean): void {

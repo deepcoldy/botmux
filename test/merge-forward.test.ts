@@ -114,9 +114,10 @@ describe('expandMergeForward: resources', () => {
       { type: 'image', key: 'img_xyz', name: 'img_xyz.jpg' },
       { type: 'file', key: 'file_abc', name: 'report.pdf' },
     ]);
-    // Numbered placeholders use the same indices as the resource list
+    // Image and file counters are independent (matches formatAttachmentsHint's
+    // per-type numbering — `<image n="1">` + `<file n="1">`).
     expect(parsed.content).toContain('[图片 1]');
-    expect(parsed.content).toContain('[文件 2: report.pdf]');
+    expect(parsed.content).toContain('[文件 1: report.pdf]');
   });
 });
 

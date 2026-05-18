@@ -163,16 +163,18 @@ describe('Claude Code image/attachment message submission', () => {
     }
   });
 
-  it('message-parser: formatAttachmentsHint produces expected multi-line format', () => {
+  it('message-parser: formatAttachmentsHint produces expected XML format', () => {
     const hint = formatAttachmentsHint([
       { type: 'image', path: '/tmp/attachments/img_abc.jpg', name: 'img_abc.jpg' },
     ]);
-    expect(hint).toContain('\n\n附件');
-    expect(hint).toContain('- /tmp/attachments/img_abc.jpg');
+    // Post 8c32d08: prompt is XML, attachments are <attachments><image .../></attachments>.
+    expect(hint).toContain('<attachments hint="');
+    expect(hint).toContain('<image n="1" path="/tmp/attachments/img_abc.jpg"');
+    expect(hint).toContain('</attachments>');
     // Verify the \n count — this is what gets written to PTY
     const newlines = (hint.match(/\n/g) || []).length;
     console.log(`[format] Attachment hint has ${newlines} newlines: ${JSON.stringify(hint)}`);
-    expect(newlines).toBeGreaterThanOrEqual(3); // \n\n before 附件, \n before path
+    expect(newlines).toBeGreaterThanOrEqual(2); // \n after opening tag, \n before closing tag
   });
 
   it('multi-line content structure matches what daemon sends to worker', () => {
@@ -183,15 +185,17 @@ describe('Claude Code image/attachment message submission', () => {
     console.log(`[structure] Full content:\n${content}`);
     console.log(`[structure] JSON: ${JSON.stringify(content)}`);
 
-    // Verify structure
+    // Verify structure — post 8c32d08 the daemon emits user text followed
+    // immediately by an <attachments> XML block (no Chinese "附件：" preamble).
     expect(content).toContain('看起来表格不是很整齐呢？');
-    expect(content).toContain('附件（使用 Read 工具查看）：');
-    expect(content).toContain('- /root/.botmux/data/attachments/');
+    expect(content).toContain('<attachments hint="');
+    expect(content).toContain('<image n="1" path="/root/.botmux/data/attachments/');
+    expect(content).toContain('</attachments>');
 
     // Count newlines — these are the problematic characters for PTY write
     const newlines = (content.match(/\n/g) || []).length;
     console.log(`[structure] Total newlines in content: ${newlines}`);
-    expect(newlines).toBeGreaterThanOrEqual(3);
+    expect(newlines).toBeGreaterThanOrEqual(2);
   });
 
   it('SCENARIO: multi-line image reply submitted via writeInput', async () => {

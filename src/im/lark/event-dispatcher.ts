@@ -6,11 +6,10 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { getBot, getAllBots, isChatOncallBoundForAnyBot } from '../../bot-registry.js';
+import { getBot, getAllBots, isChatOncallBoundForAnyBot, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { getChatInfo, getChatMode, listChatBotMembers, replyMessage } from './client.js';
+import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
-import { isBotMentionMessageHandled, markBotMentionMessageHandled } from '../../utils/bot-mention-dedup.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { stripLeadingMentions } from './message-parser.js';
 
@@ -90,6 +89,133 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
     logger.info(`Bot open_id: ${bot.botOpenId}`);
   } else {
     throw new Error('No open_id in bot info response');
+  }
+}
+
+// ─── Required-scope check ───────────────────────────────────────────────────
+//
+// Bot-to-bot @mention 投递依赖 "获取群组中其他机器人和用户@当前机器人的消息"
+// 权限（scope: im:message.group_at_msg.include_bot:readonly）。该权限关闭
+// 后飞书不会把跨 bot 的事件推到 WSClient，botmux 的 handleThreadReply 收
+// 不到，看上去就是"另一个 bot @ 我没反应"——而 botmux 已经把本地 signal-file
+// 转发删了，不再有兜底。启动时主动校验一下，缺了就向 allowedUsers[0] 私信
+// 提示。
+//
+// 校验通过飞书 "Get application info" API（应用身份）：
+//   GET /open-apis/application/v6/applications/{app_id}?lang=zh_cn
+// 返回的 data.app.scopes 是个 {scope, description, ...} 数组，遍历找
+// scope 字段是否包含目标 key。
+//
+// 鸡生蛋约束：调这个 API 自身需要 admin:app.info:readonly 或
+// application:application:self_manage 中任一权限。后者免审批，是
+// 推荐路径——拿不到 app info 时（飞书返回 99991672）我们就主动私信
+// admin 提示开通 self_manage，下次重启就能自检。
+
+const REQUIRED_BOT_AT_SCOPE = 'im:message.group_at_msg.include_bot:readonly';
+const SELF_MANAGE_SCOPE = 'application:application:self_manage';
+
+function getAdminOpenId(bot: BotState): string | undefined {
+  return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, contextTag: string): Promise<void> {
+  try {
+    await sendUserMessage(larkAppId, adminOpenId, content, 'text');
+    logger.info(`[${larkAppId}] notified admin ${adminOpenId.substring(0, 12)} about ${contextTag}`);
+  } catch (err: any) {
+    logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}: ${err?.message ?? err}`);
+  }
+}
+
+export async function checkRequiredScopes(larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  try {
+    const tokenRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (tokenData.code !== 0) {
+      logger.debug(`[${larkAppId}] scope check skipped: tenant_access_token failed (${tokenData.msg})`);
+      return;
+    }
+    const infoRes = await fetch(
+      `https://open.feishu.cn/open-apis/application/v6/applications/${bot.config.larkAppId}?lang=zh_cn`,
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` } },
+    );
+    const infoData = await infoRes.json() as any;
+
+    // 99991672 = 应用身份缺权限。最常见就是 admin:app.info:readonly /
+    // application:application:self_manage 都没拿到，导致根本查不到自己的
+    // scope 列表。这种"鸡生蛋"情况单独提示：让 admin 开通免审批的
+    // self_manage 后下次重启就能自检了。
+    if (infoData.code === 99991672) {
+      const selfManageAuthUrl = `https://open.feishu.cn/app/${bot.config.larkAppId}/auth?q=${encodeURIComponent(SELF_MANAGE_SCOPE)}&op_from=openapi&token_type=tenant`;
+      const targetAuthUrl = `https://open.feishu.cn/app/${bot.config.larkAppId}/auth?q=${encodeURIComponent(REQUIRED_BOT_AT_SCOPE)}&op_from=openapi&token_type=tenant`;
+      logger.warn(
+        `[${larkAppId}] scope 自检 API 被拒（99991672）：应用缺少 ${SELF_MANAGE_SCOPE}（免审批）。` +
+        `开通后下次 daemon 重启即可自动核验跨 bot @ 必需权限 ${REQUIRED_BOT_AT_SCOPE}。申请链接：${selfManageAuthUrl}`,
+      );
+      const adminOpenId = getAdminOpenId(bot);
+      if (!adminOpenId) {
+        logger.warn(`[${larkAppId}] 没有 resolved 的 admin open_id，self_manage 提示仅出现在 daemon 日志`);
+        return;
+      }
+      const dm =
+        `⚠️ botmux 想自动核验机器人 "${bot.botName ?? larkAppId}" 是否开通了跨 bot @ 必需权限，但发现应用自身缺少一个**免审批**的辅助权限，因此查不到 scope 列表。\n\n` +
+        `**操作步骤（点链接 → 申请开通 → 重启 daemon）**：\n` +
+        `1. 开通 ${SELF_MANAGE_SCOPE}（免审批，自动通过）：\n   ${selfManageAuthUrl}\n\n` +
+        `2. 顺便确认/开通真正的目标权限 ${REQUIRED_BOT_AT_SCOPE}（"获取群组中其他机器人和用户@当前机器人的消息"，免审批，自动通过）：\n   ${targetAuthUrl}\n\n` +
+        `3. \`botmux restart\`，启动后 botmux 会自动复核，结果会再次发到这里。\n\n` +
+        `**为什么需要**：botmux 多机器人协作（A 机器人 @ B 机器人）依赖目标权限把跨 bot 事件推送过来；不开通则跨 bot @ 完全失效。`;
+      await dmAdmin(larkAppId, adminOpenId, dm, 'self_manage scope (auto-approved) missing');
+      return;
+    }
+
+    if (infoData.code !== 0) {
+      logger.debug(`[${larkAppId}] scope check skipped: app info failed (code=${infoData.code} msg=${infoData.msg ?? ''})`);
+      return;
+    }
+    // Lark 文档示例把 scopes 放在 data.app.scopes；为防响应结构变化，
+    // 同时兜底 data.scopes / data.application.scopes，取到的第一个非空数组为准。
+    const scopesRaw: any[] =
+      infoData.data?.app?.scopes
+      ?? infoData.data?.application?.scopes
+      ?? infoData.data?.scopes
+      ?? [];
+    if (!Array.isArray(scopesRaw) || scopesRaw.length === 0) {
+      logger.debug(`[${larkAppId}] scope check inconclusive: scopes array empty or shape unexpected — skipping`);
+      return;
+    }
+    const grantedScopes = scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[];
+    if (grantedScopes.includes(REQUIRED_BOT_AT_SCOPE)) {
+      logger.info(`[${larkAppId}] required scope present: ${REQUIRED_BOT_AT_SCOPE}`);
+      return;
+    }
+
+    // Missing — log + DM
+    logger.error(
+      `[${larkAppId}] 缺少必需权限 ${REQUIRED_BOT_AT_SCOPE}（"获取群组中其他机器人和用户@当前机器人的消息"）。` +
+      `跨 bot @ 消息无法到达本 bot，多 bot 协作会失效。请到飞书开放平台 → 应用 → 权限管理里申请该权限，开通后 \`botmux restart\`。`,
+    );
+    const adminOpenId = getAdminOpenId(bot);
+    if (!adminOpenId) {
+      logger.warn(`[${larkAppId}] no resolved admin open_id in allowedUsers; missing-scope warning visible only in daemon log`);
+      return;
+    }
+    const authUrl = `https://open.feishu.cn/app/${bot.config.larkAppId}/auth?q=${encodeURIComponent(REQUIRED_BOT_AT_SCOPE)}&op_from=openapi&token_type=tenant`;
+    const dm =
+      `⚠️ botmux 启动检查发现机器人 "${bot.botName ?? larkAppId}" 缺少必需权限\n\n` +
+      `权限名：获取群组中其他机器人和用户@当前机器人的消息\n` +
+      `scope: ${REQUIRED_BOT_AT_SCOPE}\n\n` +
+      `没开通的话，跨机器人 @ 收不到事件，botmux 多机器人协作的整套场景都失效。\n\n` +
+      `**操作步骤**：\n` +
+      `1. 点链接申请权限（免审批，自动通过）：${authUrl}\n` +
+      `2. \`botmux restart\``;
+    await dmAdmin(larkAppId, adminOpenId, dm, 'required scope missing');
+  } catch (err: any) {
+    logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);
   }
 }
 
@@ -509,7 +635,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // (their own thread replies). With chat-scope sessions a bot can also
         // post top-level (its first reply in a chat-scope group), so we still
         // route them through `decideRouting` rather than gating on root_id.
-        if (sender?.sender_type === 'app') {
+        //
+        // 飞书在跨 bot 卡片消息场景实测会把发送方标成 sender_type='bot'（不是
+        // 文档里写的 'app'），所以这里两个值都接受，否则那条路径会落到下面的
+        // user-message 通用分支，绕开 /close self-message 特判、foreign-bot
+        // chat-scope gate（isKnownPeerBot）和"Bot-to-bot @mention detected"
+        // 日志。
+        const senderType = sender?.sender_type;
+        const isBotSenderType = senderType === 'app' || senderType === 'bot';
+        if (isBotSenderType) {
           const senderOpenId = sender.sender_id?.open_id;
           const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
           // Self messages: only echoed `/close` commands matter.
@@ -527,13 +661,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
           // Foreign bot: only route on @mention of us.
           if (!isBotMentioned(larkAppId, message, undefined)) return;
-          // Cross-path dedup: signal-file watcher may have already enqueued
-          // this turn (Bot A's `botmux send --mention` writes both a Lark
-          // message and a signal file; whichever path lands first wins).
-          if (isBotMentionMessageHandled(messageId)) {
-            logger.debug(`[bot-mention] WS path skipping ${messageId.substring(0, 12)}: already handled by signal-file watcher`);
-            return;
-          }
           const ctx = await decideRouting(larkAppId, message);
           // Chat-scope foreign-bot @mention without an existing session: gate to
           // vetted botmux peers (registered in our bot-openids cross-ref). This
@@ -546,7 +673,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               return;
             }
           }
-          markBotMentionMessageHandled(messageId);
           logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
           handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId })
             .catch(err => logger.error(`Error handling bot @mention: ${err}`));

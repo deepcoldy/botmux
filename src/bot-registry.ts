@@ -12,6 +12,23 @@ export interface OncallChat {
   workingDir: string;
 }
 
+/**
+ * Per-bot default for new group chats:
+ *   - `enabled`     — when true, group chats first observed after `since` are
+ *                     auto-bound to oncall on their first new-topic.
+ *   - `workingDir`  — the working directory used for the auto-bind. Required
+ *                     when enabled (oncall semantics: chatId ↔ workingDir).
+ *   - `since`       — epoch ms when the flag was switched on. Used to gate
+ *                     "new vs old" against chat-first-seen-store. Chats that
+ *                     existed before `since` are left untouched, matching
+ *                     "新群聊生效，老群聊不变".
+ */
+export interface BotDefaultOncall {
+  enabled: boolean;
+  workingDir: string;
+  since: number;
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -26,6 +43,16 @@ export interface BotConfig {
   projectScanDir?: string;
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
+  /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
+  defaultOncall?: BotDefaultOncall;
+  /**
+   * Chat IDs that have ever been auto-bound by `defaultOncall`. Append-only.
+   * Once a chat appears here, the default is permanently "spent" for it — even
+   * if the user later unbinds via Groups & Bots / `/oncall unbind`, the
+   * default will not re-bind it. This preserves the manual-override semantics
+   * Codex flagged in review.
+   */
+  defaultOncallAutoboundChats?: string[];
 }
 
 export interface BotState {
@@ -221,6 +248,27 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
         }));
     }
 
+    // defaultOncall: per-bot default for auto-binding new group chats.
+    // Tolerate missing fields: an entry with `enabled:true` but no workingDir
+    // is treated as disabled (dashboard PUT enforces workingDir on save, but
+    // hand-edited bots.json could be inconsistent — never crash on parse).
+    let defaultOncall: BotDefaultOncall | undefined;
+    const rawDefault = entry.defaultOncall;
+    if (rawDefault && typeof rawDefault === 'object') {
+      const enabled = rawDefault.enabled === true;
+      const workingDir = typeof rawDefault.workingDir === 'string' ? rawDefault.workingDir : '';
+      const since = typeof rawDefault.since === 'number' && Number.isFinite(rawDefault.since)
+        ? rawDefault.since
+        : 0;
+      defaultOncall = { enabled: enabled && !!workingDir, workingDir, since };
+    }
+
+    let defaultOncallAutoboundChats: string[] | undefined;
+    if (Array.isArray(entry.defaultOncallAutoboundChats)) {
+      defaultOncallAutoboundChats = entry.defaultOncallAutoboundChats
+        .filter((x: any): x is string => typeof x === 'string');
+    }
+
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
@@ -233,6 +281,8 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
       allowedUsers: entry.allowedUsers,
       projectScanDir: entry.projectScanDir,
       oncallChats,
+      defaultOncall,
+      defaultOncallAutoboundChats,
     });
   }
 

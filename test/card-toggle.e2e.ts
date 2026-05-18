@@ -42,9 +42,13 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
+  // 8th positional arg is now `displayMode: 'hidden' | 'screenshot'` (4ed74e3
+  // migrated cards from `expanded:boolean` to a tri-mode enum). The mock
+  // surfaces it as `displayMode` so assertions can inspect the queued/sent
+  // PATCH payloads.
   buildStreamingCard: vi.fn(
-    (_sid: string, _rid: string, _url: string, _title: string, _content: string, _status: string, _cliId: string, expanded?: boolean) =>
-      JSON.stringify({ expanded: !!expanded, content: _content, status: _status }),
+    (_sid: string, _rid: string, _url: string, _title: string, _content: string, _status: string, _cliId: string, displayMode?: string) =>
+      JSON.stringify({ displayMode: displayMode ?? 'hidden', content: _content, status: _status }),
   ),
   buildSessionCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
@@ -132,13 +136,14 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
     larkAppId: APP_ID,
     chatId: 'oc_chat',
     chatType: 'group',
+    scope: 'thread',
     spawnedAt: Date.now(),
     cliVersion: '1.0',
     lastMessageAt: Date.now(),
     hasHistory: false,
     streamCardId: 'om_card_latest',
     streamCardNonce: NONCE_LATEST,
-    streamExpanded: false,
+    displayMode: 'hidden',
     lastScreenContent: 'some terminal output',
     lastScreenStatus: 'working',
     currentTurnTitle: 'Test task',
@@ -165,8 +170,8 @@ function flush(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
 }
 
-function parseExpanded(cardJson: string): boolean {
-  return JSON.parse(cardJson).expanded;
+function parseDisplayMode(cardJson: string): string {
+  return JSON.parse(cardJson).displayMode;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -181,35 +186,37 @@ describe('Streaming card toggle_stream', () => {
 
   describe('Bug 1: clicking toggle on OLD frozen card', () => {
     it('should NOT toggle when card_nonce differs from streamCardNonce (stale card)', async () => {
-      const ds = makeDaemonSession({ streamExpanded: false });
+      const ds = makeDaemonSession({ displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
 
       await handleCardAction(makeToggleAction(NONCE_OLD), makeDeps(sessions), APP_ID);
 
-      expect(ds.streamExpanded).toBe(false);
+      // Stale-nonce click goes down the frozen-card branch which never touches
+      // ds.displayMode; the live card's PATCH queue stays empty.
+      expect(ds.displayMode).toBe('hidden');
       expect(patchCalls).toHaveLength(0);
     });
 
     it('should toggle when card_nonce matches streamCardNonce (current card)', async () => {
-      const ds = makeDaemonSession({ streamExpanded: false });
+      const ds = makeDaemonSession({ displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
 
       await handleCardAction(makeToggleAction(NONCE_LATEST), makeDeps(sessions), APP_ID);
 
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(patchCalls).toHaveLength(1);
-      expect(parseExpanded(patchCalls[0].cardJson)).toBe(true);
+      expect(parseDisplayMode(patchCalls[0].cardJson)).toBe('screenshot');
     });
 
     it('should toggle when card_nonce is absent (backwards compat)', async () => {
-      const ds = makeDaemonSession({ streamExpanded: false });
+      const ds = makeDaemonSession({ displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
 
       await handleCardAction(makeToggleAction(undefined), makeDeps(sessions), APP_ID);
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
     });
   });
 
@@ -221,7 +228,7 @@ describe('Streaming card toggle_stream', () => {
       // Correct behavior: toggle should NOT fire a second concurrent PATCH.
       // It should queue and fire AFTER the in-flight one completes.
 
-      const ds = makeDaemonSession({ streamExpanded: false, cardPatchInFlight: true });
+      const ds = makeDaemonSession({ displayMode: 'hidden', cardPatchInFlight: true });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
 
@@ -230,19 +237,19 @@ describe('Streaming card toggle_stream', () => {
       await handleCardAction(makeToggleAction(NONCE_LATEST), makeDeps(sessions), APP_ID);
       await flush();
 
-      // streamExpanded should be toggled to true immediately
-      expect(ds.streamExpanded).toBe(true);
+      // displayMode should be flipped to 'screenshot' immediately
+      expect(ds.displayMode).toBe('screenshot');
 
       // But there should NOT be a new PATCH call while in-flight is true.
       // Instead, the card JSON should be queued on ds.pendingCardJson.
       // When the in-flight PATCH completes, the pending one flushes.
       expect(ds.pendingCardJson, 'toggle should queue a pending PATCH, not send immediately').toBeTruthy();
-      const pendingExpanded = parseExpanded(ds.pendingCardJson!);
-      expect(pendingExpanded, 'queued PATCH should have expanded=true').toBe(true);
+      const pendingMode = parseDisplayMode(ds.pendingCardJson!);
+      expect(pendingMode, 'queued PATCH should reflect screenshot mode').toBe('screenshot');
     });
 
     it('queued PATCH flushes after in-flight completes', async () => {
-      const ds = makeDaemonSession({ streamExpanded: false });
+      const ds = makeDaemonSession({ displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
 
@@ -253,22 +260,22 @@ describe('Streaming card toggle_stream', () => {
       expect(patchCalls).toHaveLength(1);
       expect(ds.cardPatchInFlight).toBe(true);
 
-      // Step 2: Second toggle while first is in-flight
+      // Step 2: Second toggle while first is in-flight — flips back to 'hidden'
       await handleCardAction(makeToggleAction(NONCE_LATEST), makeDeps(sessions), APP_ID);
       await flush();
-      expect(ds.streamExpanded).toBe(false); // toggled back
+      expect(ds.displayMode).toBe('hidden');
 
       // Should NOT have sent a second PATCH (queue instead)
       expect(patchCalls, 'should not send second PATCH while first is in-flight').toHaveLength(1);
       expect(ds.pendingCardJson).toBeTruthy();
-      expect(parseExpanded(ds.pendingCardJson!)).toBe(false);
+      expect(parseDisplayMode(ds.pendingCardJson!)).toBe('hidden');
 
       // Step 3: First PATCH completes → queued PATCH flushes
       patchCalls[0].resolve();
       await flush();
 
       expect(patchCalls, 'queued PATCH should have flushed').toHaveLength(2);
-      expect(parseExpanded(patchCalls[1].cardJson)).toBe(false);
+      expect(parseDisplayMode(patchCalls[1].cardJson)).toBe('hidden');
       expect(ds.pendingCardJson, 'pending should be cleared after flush').toBeUndefined();
 
       // Step 4: Second PATCH completes
@@ -278,33 +285,33 @@ describe('Streaming card toggle_stream', () => {
     });
 
     it('multiple queued PATCHes: only the LATEST is flushed (latest-wins)', async () => {
-      const ds = makeDaemonSession({ streamExpanded: false });
+      const ds = makeDaemonSession({ displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
 
-      // Toggle 1: false→true → sends PATCH (in-flight)
+      // Toggle 1: hidden→screenshot → sends PATCH (in-flight)
       await handleCardAction(makeToggleAction(NONCE_LATEST), makeDeps(sessions), APP_ID);
       await flush();
       expect(patchCalls).toHaveLength(1);
 
-      // Toggle 2: true→false → queued (PATCH in-flight)
+      // Toggle 2: screenshot→hidden → queued (PATCH in-flight)
       await handleCardAction(makeToggleAction(NONCE_LATEST), makeDeps(sessions), APP_ID);
       await flush();
 
-      // Toggle 3: false→true → replaces queued
+      // Toggle 3: hidden→screenshot → replaces queued
       await handleCardAction(makeToggleAction(NONCE_LATEST), makeDeps(sessions), APP_ID);
       await flush();
 
-      expect(ds.streamExpanded).toBe(true);
+      expect(ds.displayMode).toBe('screenshot');
       expect(patchCalls, 'only one PATCH sent').toHaveLength(1);
-      expect(parseExpanded(ds.pendingCardJson!), 'latest queued should be expanded=true').toBe(true);
+      expect(parseDisplayMode(ds.pendingCardJson!), 'latest queued should be screenshot').toBe('screenshot');
 
       // Resolve first → only ONE queued PATCH flushes (the latest)
       patchCalls[0].resolve();
       await flush();
 
       expect(patchCalls).toHaveLength(2);
-      expect(parseExpanded(patchCalls[1].cardJson), 'flushed PATCH should be the latest state').toBe(true);
+      expect(parseDisplayMode(patchCalls[1].cardJson), 'flushed PATCH should be the latest state').toBe('screenshot');
     });
   });
 });

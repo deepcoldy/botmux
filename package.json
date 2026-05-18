@@ -15,7 +15,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc && pnpm dashboard:bundle",
+    "build": "tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle",
     "dashboard:bundle": "esbuild src/dashboard/web/app.ts --bundle --outfile=dist/dashboard-web/app.js --platform=browser --format=iife --minify && cp src/dashboard/web/index.html dist/dashboard-web/index.html && cp src/dashboard/web/style.css dist/dashboard-web/style.css",
     "daemon": "tsx src/index-daemon.ts",
     "daemon:start": "node dist/cli.js start",
@@ -32,7 +32,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "@larksuiteoapi/node-sdk": "^1.64.0",
     "@napi-rs/canvas": "^0.1.65",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/headless": "^6.0.0",
@@ -41,6 +41,7 @@
     "markdown-it": "^14.1.1",
     "node-pty": "^1.1.0",
     "pm2": "^6.0.0",
+    "qrcode-terminal": "^0.12.0",
     "ws": "^8.19.0",
     "zod": "^3.23.0"
   },
@@ -49,6 +50,7 @@
     "@playwright/test": "^1.58.2",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^20.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.0",
     "memfs": "^4.57.1",

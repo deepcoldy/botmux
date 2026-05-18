@@ -491,6 +491,50 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // ─── Per-bot defaults (Bot Defaults tab) ─────────────────────────────────
+    // GET  /api/bots                         — fan out to each daemon, return
+    //                                          [{larkAppId, botName, defaultOncall, ...}]
+    // PUT  /api/bots/:appId/default-oncall   — proxy to that bot's daemon
+
+    if (req.method === 'GET' && url.pathname === '/api/bots') {
+      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+      const out = await Promise.all(onlineBots.map(async d => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
+          if (!r.ok) {
+            return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: `http_${r.status}` };
+          }
+          const j = await r.json() as any;
+          return {
+            larkAppId: d.larkAppId,
+            botName: d.botName ?? j.botName,
+            online: true,
+            defaultOncall: j.defaultOncall,
+            autoboundChatCount: j.autoboundChatCount ?? 0,
+          };
+        } catch (e: any) {
+          return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
+        }
+      }));
+      return jsonRes(res, 200, { bots: out });
+    }
+
+    let mBotDef: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotDef = url.pathname.match(/^\/api\/bots\/([^/]+)\/default-oncall$/))) {
+      const appId = decodeURIComponent(mBotDef[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-default-oncall`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Create a new chat — pick a creator from the user-selected larkAppIds
     // (Feishu makes the calling bot the implicit first member, so picking
     // anything else would silently add an unwanted bot). Auto-invite the

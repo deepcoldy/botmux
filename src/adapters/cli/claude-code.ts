@@ -127,16 +127,27 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string): { path: s
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed.pid !== pid) return null;
   if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;
-  // Compare on realpath: Claude's pid file always records the canonical cwd
-  // (Node's process.cwd() returns getcwd(3)), but `expectedCwd` may still be
-  // the symlink we spawned under. A raw equality check would reject a
-  // legitimate match when workingDir is e.g. /home/x → /data00/home/x.
-  if (typeof parsed.cwd !== 'string' || realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
+  if (typeof parsed.cwd !== 'string') return null;
+  // Identity check: procStart matching against /proc/<pid>/stat field 22 is
+  // the strong signal that this pid file belongs to the live process (rules
+  // out pid reuse). When that holds, Claude's recorded cwd is authoritative
+  // even if it disagrees with `expectedCwd` — the worker's cliCwd can drift
+  // (e.g. a schedule resumes a session with a different workingDir than the
+  // original spawn, but Claude itself loads the session with its own cwd).
+  // When procStart is unavailable/unverifiable, fall back to cwd equality as
+  // the only remaining sanity check. Realpath both sides so a symlinked
+  // workingDir (/home/x → /data00/home/x) still matches Claude's canonical
+  // cwd from getcwd(3).
+  let procStartVerified = false;
   if (typeof parsed.procStart === 'string') {
     const live = readProcStarttime(pid);
     if (live === null && process.platform === 'linux') return null;
-    if (live !== null && live !== parsed.procStart) return null;
+    if (live !== null) {
+      if (live !== parsed.procStart) return null;
+      procStartVerified = true;
+    }
   }
+  if (!procStartVerified && realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
   return {
     path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd),
     cliSessionId: parsed.sessionId,
@@ -189,6 +200,44 @@ export function findOpenClaudeSessionIds(pid: number): string[] {
     }
   }
   return [...out];
+}
+
+/** Fingerprint search that fans out from the pinned project dir to every
+ *  sibling under `~/.claude/projects/`. Used as the writeInput fallback
+ *  when the pinned `claudeJsonlPath` doesn't contain the submit marker —
+ *  Claude may have written to a different project hash than the worker
+ *  expected (e.g. a schedule resumed the session with a workingDir that
+ *  differs from Claude's internal cwd, so the worker computes the wrong
+ *  -project-hash- but Claude appends to the original session's hash dir).
+ *  Tries the primary dir first (fast path, unchanged behavior); only fans
+ *  out when no match is found there. Per-dir, `findJsonlContainingFingerprint`
+ *  still applies its newest-first ordering and the minMtimeMs guard, so a
+ *  stale historical match in some unrelated project can't false-positive. */
+function findJsonlAcrossProjectsRoot(
+  searchPath: string,
+  fingerprint: string,
+  options: { minMtimeMs?: number; includeQueueOperations?: boolean },
+): string | null {
+  const primaryDir = dirname(searchPath);
+  const primary = findJsonlContainingFingerprint(primaryDir, fingerprint, {
+    excludePath: searchPath,
+    ...options,
+  });
+  if (primary) return primary;
+  const projectsRoot = dirname(primaryDir);
+  if (!existsSync(projectsRoot)) return null;
+  let siblings: string[];
+  try { siblings = readdirSync(projectsRoot); } catch { return null; }
+  for (const name of siblings) {
+    const sib = join(projectsRoot, name);
+    if (sib === primaryDir) continue;
+    const matched = findJsonlContainingFingerprint(sib, fingerprint, {
+      excludePath: searchPath,
+      ...options,
+    });
+    if (matched) return matched;
+  }
+  return null;
 }
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed|Baked|Brewed) for \d+[smh]/;
@@ -250,10 +299,12 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         '',
         '使用指南：',
         '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。',
-        '- 发送纯文本即可：`botmux send "消息"` 或用 heredoc 传多行。格式自动处理。',
+        '- 发送纯文本即可：`botmux send "消息"`。格式自动处理。',
+        '- 多行消息必须用 heredoc，禁止写成 `botmux send "第一行\\n第二行"`；否则 `\\n` 可能按字面量显示在飞书里。',
+        "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
         '- 附带图片：`botmux send --images /path/to/img.png "说明文字"`',
         '- 附带文件：`botmux send --files /path/to/file.pdf "请查收"`',
-        '- 需要上下文时用 `botmux thread messages` 读取之前的对话。',
+        '- 需要上下文时用 `botmux history` 读取之前的对话。',
         '- 查看可协作的机器人：`botmux bots list`',
         '</botmux_routing>',
         ...identityBlock,
@@ -396,9 +447,12 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         }
 
         // Final fallback when the pid file is unavailable / fails validation:
-        // scan the project dir for a recently-written jsonl whose tail
-        // contains our content fingerprint. Stricter than mtime-based
+        // scan the pinned project dir for a recently-written jsonl whose
+        // tail contains our content fingerprint. Stricter than mtime-based
         // detection so a sibling pane in the same dir can't hijack us.
+        // Per-attempt scope is intentionally narrow (dirname only) — the
+        // cross-project fan-out only runs once at end-of-writeInput and in
+        // the recheck closure, not per retry, to keep the worst case bounded.
         if (submitFingerprint) {
           const searchPath = pty.claudeJsonlPath ?? startPath;
           const matched = findJsonlContainingFingerprint(dirname(searchPath), submitFingerprint, {
@@ -436,6 +490,24 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       if (await confirmSubmit(800)) {
         return observedCliSessionId ? buildResult(true) : undefined;
       }
+      // Last-resort cross-project fan-out, run ONCE before declaring failure:
+      // catches the case where workingDir/cwd drift made every per-attempt
+      // scan look in the wrong project dir AND the pid resolver also failed
+      // (e.g. pid file missing, /proc unavailable). minMtimeMs filtering and
+      // newest-first ordering keep the cost bounded — only jsonls touched in
+      // the last 60s are actually read, which is typically a handful even
+      // across all sibling project dirs. Per-attempt scans stay narrow
+      // (dirname only) so this work doesn't repeat 4×.
+      if (submitFingerprint && pty.claudeJsonlPath) {
+        const matched = findJsonlAcrossProjectsRoot(pty.claudeJsonlPath, submitFingerprint, {
+          minMtimeMs: submitSearchMinMtime,
+          includeQueueOperations: true,
+        });
+        if (matched) {
+          pty.claudeJsonlPath = matched;
+          return observedCliSessionId ? buildResult(true) : undefined;
+        }
+      }
       // All retries exhausted and still no submit marker in JSONL. Signal failure
       // so the worker can notify the user in Lark instead of silently dropping.
       // We still surface observedCliSessionId so the worker can persist Claude's
@@ -457,13 +529,14 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, { includeQueueOperations: true })) {
           return true;
         }
-        // Fan out to sibling jsonls in the project dir (excluding the pinned
-        // path which we already checked). Same minMtime guard as the in-band
-        // fingerprint fallback so a stale historical match can't suppress.
+        // Fan out to sibling jsonls in the project dir, then across every
+        // sibling project dir under `~/.claude/projects/` (catches workingDir
+        // drift like worker thinking `-foo-bar/` while Claude actually appends
+        // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
+        // fallback so a stale historical match can't suppress the warning.
         const searchPath = currentPath ?? pty.claudeJsonlPath;
         if (!searchPath) return false;
-        const matched = findJsonlContainingFingerprint(dirname(searchPath), submitFingerprint, {
-          excludePath: searchPath,
+        const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });

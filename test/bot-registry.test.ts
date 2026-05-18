@@ -439,4 +439,66 @@ describe('loadBotConfigs', () => {
     const configs = mod.loadBotConfigs();
     expect(configs).toEqual([]);
   });
+
+  // ── defaultOncall parsing ────────────────────────────────────────────────
+
+  it('should parse a fully-formed defaultOncall entry', () => {
+    process.env.BOTS_CONFIG = '/tmp/default_oncall.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'app_d',
+      larkAppSecret: 's',
+      defaultOncall: { enabled: true, workingDir: '/projects/x', since: 1700000000000 },
+      defaultOncallAutoboundChats: ['oc_one', 'oc_two'],
+    }]));
+
+    const c = mod.loadBotConfigs()[0];
+    expect(c.defaultOncall).toEqual({
+      enabled: true,
+      workingDir: '/projects/x',
+      since: 1700000000000,
+    });
+    expect(c.defaultOncallAutoboundChats).toEqual(['oc_one', 'oc_two']);
+  });
+
+  it('should coerce defaultOncall.enabled=true to false when workingDir is blank', () => {
+    // Hand-edited configs can be inconsistent: enabled but no dir. Treat as
+    // off so we never auto-bind into a blank path.
+    process.env.BOTS_CONFIG = '/tmp/default_oncall_blank.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'app_d',
+      larkAppSecret: 's',
+      defaultOncall: { enabled: true, workingDir: '', since: 100 },
+    }]));
+
+    const c = mod.loadBotConfigs()[0];
+    expect(c.defaultOncall?.enabled).toBe(false);
+    expect(c.defaultOncall?.workingDir).toBe('');
+  });
+
+  it('should leave defaultOncall undefined when the field is absent', () => {
+    process.env.BOTS_CONFIG = '/tmp/no_default.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'app_d', larkAppSecret: 's',
+    }]));
+
+    const c = mod.loadBotConfigs()[0];
+    expect(c.defaultOncall).toBeUndefined();
+    expect(c.defaultOncallAutoboundChats).toBeUndefined();
+  });
+
+  it('should drop non-string entries from defaultOncallAutoboundChats', () => {
+    process.env.BOTS_CONFIG = '/tmp/autobound_mixed.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'app_d',
+      larkAppSecret: 's',
+      defaultOncallAutoboundChats: ['oc_ok', 42, null, 'oc_also'],
+    }]));
+
+    const c = mod.loadBotConfigs()[0];
+    expect(c.defaultOncallAutoboundChats).toEqual(['oc_ok', 'oc_also']);
+  });
 });

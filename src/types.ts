@@ -69,6 +69,9 @@ export interface LarkMention {
 export interface LarkMessage {
   messageId: string;
   rootId: string;
+  /** Immediate parent — set when the user used the Lark "quote/reply"
+   *  UI to reference a specific earlier message. Empty otherwise. */
+  parentId?: string;
   senderId: string;
   senderType: string;
   msgType: string;
@@ -171,5 +174,18 @@ export type WorkerToDaemon =
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: 'working' | 'idle' | 'analyzing' }
   | { type: 'user_notify'; message: string }
-  | { type: 'final_output'; content: string; lastUuid: string; turnId: string }
+  | {
+      type: 'final_output';
+      content: string;
+      lastUuid: string;
+      turnId: string;
+      // Discriminator for the daemon-side renderer. Default ('bridge' /
+      // omitted) renders `content` through the regular markdown card. The
+      // local-turn variants ship the user prompt as a separate field so
+      // the daemon can lay it out in a quoted block (rather than the
+      // worker stitching label + user + assistant into one markdown blob,
+      // which mixes presentation with payload).
+      kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
+      userText?: string;
+    }
   | { type: 'adopt_preamble'; userText: string; assistantText: string };

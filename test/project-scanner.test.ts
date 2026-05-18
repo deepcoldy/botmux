@@ -395,7 +395,7 @@ describe('scanProjects', () => {
     expect(repo.path).toBe(repoPath);
 
     const wt = results.find(r => r.type === 'worktree')!;
-    expect(wt.name).toBe('my-repo/my-repo-worktree-abc');
+    expect(wt.name).toBe('my-repo');
     expect(wt.path).toBe(worktreePath);
     expect(wt.branch).toBe('feature-branch');
   });
@@ -419,6 +419,160 @@ describe('scanProjects', () => {
 
     expect(results).toHaveLength(1);
     expect(results[0]!.type).toBe('repo');
+  });
+
+  // ─── Main vs linked worktree attribution ────────────────────────────────
+
+  it('should attribute the repo to the main worktree even when a linked worktree is discovered first by readdir', () => {
+    // Linked worktree ("aaa-feature", `.git` gitlink) sits alphabetically
+    // before the main worktree ("zzz-main", `.git` directory). After the
+    // common-dir dedup, the main must register as `repo` regardless of
+    // readdir order.
+    const linkedPath = mkWorktreeGitlink('aaa-feature', '/some/.git/worktrees/aaa-feature');
+    const mainPath = mkRepo('zzz-main');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('rev-parse --abbrev-ref HEAD')) {
+        if (opts?.cwd === linkedPath) return 'feature/aaa\n';
+        return 'main\n';
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        return [
+          `worktree ${mainPath}`,
+          'branch refs/heads/main',
+          '',
+          `worktree ${linkedPath}`,
+          'branch refs/heads/feature/aaa',
+          '',
+        ].join('\n');
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+
+    expect(results).toHaveLength(2);
+    expect(results.filter(r => r.type === 'repo')).toHaveLength(1);
+    expect(results.filter(r => r.type === 'worktree')).toHaveLength(1);
+
+    const repo = results.find(r => r.type === 'repo')!;
+    expect(repo.name).toBe('zzz-main');
+    expect(repo.path).toBe(mainPath);
+    expect(repo.branch).toBe('main');
+
+    const wt = results.find(r => r.type === 'worktree')!;
+    expect(wt.path).toBe(linkedPath);
+    expect(wt.branch).toBe('feature/aaa');
+    expect(wt.name).toBe('zzz-main');
+  });
+
+  it('should NOT leak the linked-worktree directory basename into the display name', () => {
+    const mainPath = mkRepo('repo');
+    const garbageBasename = 'tmp-checkout-7zKx';
+    const linkedPath = mkWorktreeGitlink(garbageBasename, '/some/.git/worktrees/x');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('rev-parse --abbrev-ref HEAD')) {
+        if (opts?.cwd === linkedPath) return 'release/2026.05\n';
+        return 'main\n';
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        return [
+          `worktree ${mainPath}`,
+          'branch refs/heads/main',
+          '',
+          `worktree ${linkedPath}`,
+          'branch refs/heads/release/2026.05',
+          '',
+        ].join('\n');
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+    const wt = results.find(r => r.type === 'worktree')!;
+
+    expect(wt.name).toBe('repo');
+    expect(wt.name).not.toContain(garbageBasename);
+    expect(wt.branch).toBe('release/2026.05');
+  });
+
+  // ─── Detached HEAD: tag / short-sha fallback ─────────────────────────────
+
+  it('should report the tag name when a worktree has detached HEAD pointing at a tag', () => {
+    const mainPath = mkRepo('repo');
+    const detachedPath = mkWorktreeGitlink('checkout-v1', '/some/.git/worktrees/x');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        return [
+          `worktree ${mainPath}`,
+          'HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          'branch refs/heads/main',
+          '',
+          `worktree ${detachedPath}`,
+          'HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          'detached',
+          '',
+        ].join('\n');
+      }
+      if (cmdStr.includes('describe --tags --exact-match HEAD')) {
+        if (opts?.cwd === detachedPath) return 'v1.2.3\n';
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+    const wt = results.find(r => r.type === 'worktree')!;
+
+    expect(wt.path).toBe(detachedPath);
+    expect(wt.branch).toBe('v1.2.3');
+  });
+
+  it('should fall back to the short SHA when a worktree has detached HEAD not pointing at any tag', () => {
+    const mainPath = mkRepo('repo');
+    const detachedPath = mkWorktreeGitlink('checkout-loose', '/some/.git/worktrees/y');
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        return [
+          `worktree ${mainPath}`,
+          'HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          'branch refs/heads/main',
+          '',
+          `worktree ${detachedPath}`,
+          'HEAD c0ffee1234567890abcdef0000000000deadbeef',
+          'detached',
+          '',
+        ].join('\n');
+      }
+      if (cmdStr.includes('describe --tags --exact-match HEAD')) {
+        throw new Error('fatal: no tag exactly matches HEAD');
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+    const wt = results.find(r => r.type === 'worktree')!;
+
+    expect(wt.path).toBe(detachedPath);
+    expect(wt.branch).toBe('c0ffee1');
   });
 
   // ─── Deduplication ──────────────────────────────────────────────────────

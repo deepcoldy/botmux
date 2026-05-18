@@ -142,7 +142,8 @@ BACKEND_TYPE=pty botmux start
 CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一组开箱即用的 Skill：
 
 - `botmux send` — 向当前话题发消息（支持文本、图片、文件、@mention）
-- `botmux thread messages` — 读取当前话题的历史消息
+- `botmux history` — 读取当前会话历史消息（话题群拉话题内、普通群拉整群）
+- `botmux quoted <message_id>` — 用户用引用 UI @ 机器人时，按需读取被引用的那条消息
 - `botmux bots list` — 查询当前群聊的机器人及 open_id
 - `botmux schedule` — 增删改查定时任务
 
@@ -172,78 +173,72 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 
 ## 5 分钟快速接入
 
+> 💡 **TL;DR**：跑 `botmux setup` 选「扫码建应用」一步完成 Step 1+2（拿 AppID/AppSecret）。PersonalAgent 应用建出来时事件订阅和 bot 能力都已默认配好，只剩 Step 4 权限申请 + Step 5（按需）重定向 URL + Step 6 发版三步要在浏览器手动点；setup 完成后会自动写 JSON 文件 + 打印一键复制命令 + 各步骤的深链。
+
 ### Step 1: 创建飞书应用
 
-打开 [飞书开放平台](https://open.larkoffice.com/app)，点击「创建企业自建应用」。
+**推荐路径**：`botmux setup` 选「1) 扫码建应用」，飞书扫码完成后自动落盘 AppID/AppSecret，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 的官方 device flow。
+
+> ⚠️ **目前仅支持飞书 (feishu.cn) 租户**。扫码检测到 Lark 国际版 (larksuite.com) 会中止 setup —— daemon runtime (Lark Client/WSClient/event-dispatcher 等) 需要一并接入 lark 域，会在单独 PR 跟进。
+
+**手动路径**：打开 [飞书开放平台](https://open.larkoffice.com/app)，点击「创建企业自建应用」。
 
 ![创建应用](docs/setup/create-app.png)
 
 ### Step 2: 获取凭证
 
+> 扫码路径自动完成此步，可直接跳到 Step 3。
+
 进入应用详情 →「凭证与基础信息」，复制 **App ID** 和 **App Secret**。
 
 ![获取凭证](docs/setup/credentials.png)
 
-### Step 3: 添加权限
-
-进入「权限管理」→「批量导入/导出权限」，粘贴以下 JSON 一次性导入所有权限：
-
-![权限管理](docs/setup/permissions.png)
-
-<details>
-<summary>点击展开批量导入 JSON</summary>
-
-```json
-{
-  "scopes": {
-    "tenant": [
-      "contact:user.base:readonly",
-      "contact:user.id:readonly",
-      "im:chat:read",
-      "im:chat.members:bot_access",
-      "im:chat.members:read",
-      "im:message",
-      "im:message:readonly",
-      "im:message:send_as_bot",
-      "im:message:update",
-      "im:message.group_at_msg",
-      "im:message.group_at_msg:readonly",
-      "im:message.group_msg",
-      "im:message.p2p_msg:readonly",
-      "im:message.reactions:write_only",
-      "im:resource"
-    ]
-  }
-}
-```
-</details>
-
-### Step 4: 安装 & 启动 botmux
+### Step 3: 安装 & 启动 botmux
 
 ```bash
 # 安装
 npm install -g botmux
 
-# 交互式配置 — 输入 Step 2 的 App ID 和 App Secret
+# 交互式配置 — 选「1) 扫码建应用」或「2) 手动粘 AppID/Secret」
+# 凭证拿到后自动取一次 tenant_access_token 校验，通过才落盘 bots.json
+# setup 末尾会把完整权限 JSON 写到 ~/.botmux/lark-scopes.json 并打印一键复制命令
 botmux setup
 
-# 启动（飞书后台配置长连接订阅前需要先启动，否则无法检测到连接）
+# 启动（如果之后需要确认事件订阅，飞书后台会要求 daemon 已在跑才能识别长连接）
+# start 前再校验一次凭证；权限未配齐不会阻塞 daemon，只 WARN
 botmux start
 ```
 
-### Step 5: 配置事件订阅
+### Step 4: 添加权限
 
-回到飞书开放平台，进入「事件与回调」：
+setup 完成后，按 terminal 提示的一键复制命令把权限 JSON 复制到剪贴板，进入「权限管理」→「批量导入/导出权限」粘贴 → 提交审批。可用性范围选「仅自己可见」会自动通过：
 
-1. **订阅方式**：点击编辑图标，选择「使用长连接接收事件」（需要 botmux 已启动，飞书会检测长连接是否建立）
+![权限管理](docs/setup/permissions.png)
 
-![配置长连接](docs/setup/event-websocket.png)
+完整 JSON 已经写到 `~/.botmux/lark-scopes.json`，源仓库版本在 [src/setup/lark-scopes.json](src/setup/lark-scopes.json)（与本仓库内部 wiki 文档同步，覆盖 tenant + user 双套域 ≈ 290 项）。
 
-2. **添加事件**：点击「添加事件」，搜索添加 `im.message.receive_v1`（接收消息 v2.0）
+```bash
+# macOS 本地
+cat ~/.botmux/lark-scopes.json | pbcopy
+# Linux 桌面 (本地有 X 服务器)
+cat ~/.botmux/lark-scopes.json | xclip -selection clipboard
+# SSH / 无 DISPLAY：直接 cat, 在本地 terminal 鼠标选中即写本地剪贴板
+cat ~/.botmux/lark-scopes.json
+# SSH 上 OSC 52 直接写本地剪贴板 (iTerm2 / kitty / WezTerm / Alacritty / tmux 1.5+)
+base64 -w0 < ~/.botmux/lark-scopes.json | awk 'BEGIN{printf "\033]52;c;"}{printf "%s",$0}END{printf "\a"}'
+```
 
-![添加事件](docs/setup/event-receive-msg.png)
+> 扫码建出来的 PersonalAgent 应用，botmux 维护者实测默认已订阅 `im.message.receive_v1` + `card.action.trigger` 并开通 bot 能力，所以主线流程不再要求手动配。但飞书没在公开文档里承诺这是稳定行为，**如果配好后机器人完全收不到消息**，参见下方「Step 8: 机器人收不到消息时的自查」。
 
-3. **启用回调**：切换到「回调配置」tab，开启「卡片回传交互」（`card.action.trigger`）
+### Step 5: 添加重定向 URL（按需）
+
+如果之后要在飞书里 `/login` 让 botmux 以你的身份调云文档/日历/Wiki 等 API，进入「安全设置」→「重定向 URL」填入：
+
+```
+http://127.0.0.1:9768/callback
+```
+
+只用 bot 收发消息的话这一步可以跳过。
 
 ### Step 6: 发版
 
@@ -259,7 +254,16 @@ botmux start
 
 ![添加机器人到群](docs/setup/add-bot-to-group.png)
 
-### Step 8: 开机自启（推荐）
+### Step 8: 机器人收不到消息时的自查（fallback）
+
+PersonalAgent 默认配好事件订阅 + bot 能力，正常情况下不用动。如果按上面步骤走完 bot **完全收不到任何消息**（连私聊都不回），分别确认这两项：
+
+- **事件订阅**：开放平台 → 你的应用 → 事件与回调 → 应当订阅 `im.message.receive_v1` + `card.action.trigger`（默认已订阅，如缺失就手动添加）。订阅方式必须是「使用长连接接收事件」(WebSocket)，且 botmux daemon 已经在跑。
+- **机器人能力**：开放平台 → 你的应用 → 应用功能 → 机器人 应当已开通（默认开通），名字/头像可以改。
+
+确认后重启 daemon：`botmux restart`。
+
+### Step 9: 开机自启（推荐）
 
 确认机器人能正常收发消息之后，跑一次：
 
@@ -371,7 +375,8 @@ botmux autostart enable
 |------|------|
 | `botmux send [content]` | 向当前话题发消息。支持 stdin / heredoc / `--content-file` 传内容，`--images`/`--files`/`--mention` 附加资源 |
 | `botmux bots list` | 列出当前群聊中的机器人（含 open_id，供 `--mention` 使用） |
-| `botmux thread messages [--limit N]` | 拉取当前话题的消息历史（JSON） |
+| `botmux history [--limit N]` | 拉取当前会话的消息历史（JSON）；话题群 → 话题内，普通群 → 整群 |
+| `botmux quoted <message_id>` | 拉取被引用的单条消息（JSON），ID 取自 daemon 注入的 `[用户引用了消息 用 botmux quoted om_xxx 查看]` 提示行 |
 | `botmux schedule add <schedule> <prompt>` | 创建定时任务（自动绑定当前话题） |
 | `botmux schedule list/remove/pause/resume/run` | 管理定时任务 |
 

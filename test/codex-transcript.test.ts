@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -104,6 +104,50 @@ describe('splitCodexEventsByCutoff', () => {
     const out = splitCodexEventsByCutoff([], 100);
     expect(out.history).toEqual([]);
     expect(out.live).toEqual([]);
+  });
+});
+
+describe('extractLastCodexTurn', () => {
+  const mk = (kind: 'user' | 'assistant_final', text: string) => ({ kind, text });
+
+  it('returns last user/assistant_final pair from a typical history', () => {
+    const out = extractLastCodexTurn([
+      mk('user', 'u1'), mk('assistant_final', 'a1'),
+      mk('user', 'u2'), mk('assistant_final', 'a2'),
+    ]);
+    expect(out).toEqual({ userText: 'u2', assistantText: 'a2' });
+  });
+
+  it('pairs the last assistant_final with the nearest preceding user', () => {
+    // u1 没回复 → 配 (u2, a) 而不是 (u1, a)
+    const out = extractLastCodexTurn([
+      mk('user', 'u1'),
+      mk('user', 'u2'),
+      mk('assistant_final', 'a'),
+    ]);
+    expect(out).toEqual({ userText: 'u2', assistantText: 'a' });
+  });
+
+  it('returns undefined when there is no assistant_final', () => {
+    expect(extractLastCodexTurn([mk('user', 'u1'), mk('user', 'u2')])).toBeUndefined();
+  });
+
+  it('returns undefined when assistant_final has no preceding user', () => {
+    // 罕见但可能：rollout 起手就是 assistant message（例如 resume 截断）
+    expect(extractLastCodexTurn([mk('assistant_final', 'a')])).toBeUndefined();
+  });
+
+  it('returns undefined for empty input', () => {
+    expect(extractLastCodexTurn([])).toBeUndefined();
+  });
+
+  it('ignores trailing user that has no reply yet', () => {
+    // ...u1 a1 u2  → 最后一对完整 turn 仍是 (u1, a1)
+    const out = extractLastCodexTurn([
+      mk('user', 'u1'), mk('assistant_final', 'a1'),
+      mk('user', 'u2'),
+    ]);
+    expect(out).toEqual({ userText: 'u1', assistantText: 'a1' });
   });
 });
 

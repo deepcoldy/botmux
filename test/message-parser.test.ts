@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, stripLeadingMentions } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer } from '../src/im/lark/message-parser.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -101,10 +101,18 @@ describe('Interactive card parsing: Format A (API simplified)', () => {
     expect(result.content).toBe('[卡片: Empty Card]');
   });
 
-  it('should handle card with no title and no useful elements', () => {
+  it('should handle card with no title — image-only elements speak for themselves', () => {
+    // 没有 title 时不再 push 多余的 `[卡片]` 占位行；image 占位本身已足以说明
+    // 来源，并且对接收 bot 的 prompt 而言少一行噪声。
     const card = { elements: [[{ tag: 'img', image_key: 'img_xxx' }]] };
     const result = parseApiMessage(makeMsg('interactive', card));
-    expect(result.content).toBe('[卡片]\n[图片]');
+    expect(result.content).toBe('[图片]');
+  });
+
+  it('should fall back to "[卡片]" when title is absent AND no elements yield any content', () => {
+    const card = { elements: [] };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('[卡片]');
   });
 });
 
@@ -318,5 +326,133 @@ describe('stripLeadingMentions', () => {
       { name: 'CoCo' },
     ]);
     expect(out).toBe('/close');
+  });
+});
+
+// ─── Shared numberer: cmdQuoted invariant ─────────────────────────────────
+// cmdQuoted renders a single quoted message by chaining extractResources →
+// parseApiMessage. Both calls must share one numberer so the `[图片 N]`
+// placeholders inside the rendered `content` align 1:1 with the indices of
+// the returned `resources` array. If they used independent numberers
+// (the bug Codex caught), a multi-image post would emit `[图片 1] [图片 2]`
+// inside content but resources[0]/resources[1] would still be the same two
+// keys — alignment LOOKS right by accident at N=2 but breaks the moment we
+// add a 2nd numbering source (e.g. nested merge_forward).
+
+describe('cmdQuoted shared-numberer invariant', () => {
+  it('post with two images: [图片 1]/[图片 2] in content map to resources[0]/[1] keys when one numberer is shared', () => {
+    const postContent = JSON.stringify({
+      zh_cn: {
+        title: '截图',
+        content: [
+          [{ tag: 'text', text: '第一张：' }, { tag: 'img', image_key: 'img_aaa' }],
+          [{ tag: 'text', text: '第二张：' }, { tag: 'img', image_key: 'img_bbb' }],
+        ],
+      },
+    });
+    const msg = {
+      message_id: 'om_post',
+      msg_type: 'post',
+      create_time: '1000',
+      sender: { id: 'ou_u', sender_type: 'user' },
+      body: { content: postContent },
+    };
+
+    // Match the cmdQuoted call order exactly: extractResources first, then
+    // parseApiMessage. Same numberer instance threaded through both.
+    const numberer = createImgNumberer();
+    const resources = extractResources(msg.msg_type, msg.body.content, numberer);
+    const parsed = parseApiMessage(msg, numberer);
+
+    expect(resources).toEqual([
+      { type: 'image', key: 'img_aaa', name: 'img_aaa.jpg' },
+      { type: 'image', key: 'img_bbb', name: 'img_bbb.jpg' },
+    ]);
+    expect(parsed.content).toContain('[图片 1]');
+    expect(parsed.content).toContain('[图片 2]');
+    expect(parsed.content.indexOf('[图片 1]')).toBeLessThan(parsed.content.indexOf('[图片 2]'));
+  });
+
+  it('post with one image + one file: image and file counters are independent ([图片 1] + [文件 1])', () => {
+    // Regression: extractResources used to share a global counter so this
+    // would emit `[图片 1]` + `[文件 2]`, but formatAttachmentsHint emits
+    // <image n="1"> + <file n="1"> — the bot saw [文件 2] in prompt but only
+    // <file n="1"> in attachments and read the wrong file. Per-type counters
+    // align placeholders with the attachment footer.
+    const postContent = JSON.stringify({
+      zh_cn: {
+        title: '混合',
+        content: [
+          [{ tag: 'text', text: '图：' }, { tag: 'img', image_key: 'img_aaa' }],
+          [{ tag: 'text', text: '文件：' }, { tag: 'file', file_key: 'file_bbb', file_name: 'spec.pdf' }],
+        ],
+      },
+    });
+    const msg = {
+      message_id: 'om_mixed',
+      msg_type: 'post',
+      create_time: '1000',
+      sender: { id: 'ou_u', sender_type: 'user' },
+      body: { content: postContent },
+    };
+    const numberer = createImgNumberer();
+    const resources = extractResources(msg.msg_type, msg.body.content, numberer);
+    const parsed = parseApiMessage(msg, numberer);
+    expect(resources).toEqual([
+      { type: 'image', key: 'img_aaa', name: 'img_aaa.jpg' },
+      { type: 'file', key: 'file_bbb', name: 'spec.pdf' },
+    ]);
+    expect(parsed.content).toContain('[图片 1]');
+    expect(parsed.content).toContain('[文件 1: spec.pdf]');
+  });
+
+  it('image message: [图片 1] in content matches the single resource', () => {
+    const imgContent = JSON.stringify({ image_key: 'img_zzz' });
+    const msg = {
+      message_id: 'om_img',
+      msg_type: 'image',
+      create_time: '1000',
+      sender: { id: 'ou_u', sender_type: 'user' },
+      body: { content: imgContent },
+    };
+    const numberer = createImgNumberer();
+    const resources = extractResources(msg.msg_type, msg.body.content, numberer);
+    const parsed = parseApiMessage(msg, numberer);
+    expect(resources).toEqual([{ type: 'image', key: 'img_zzz', name: 'img_zzz.jpg' }]);
+    expect(parsed.content).toBe('[图片 1]');
+  });
+});
+
+// ─── parseEventMessage: parentId surfacing for quote-reply ────────────────
+
+describe('parseEventMessage: parentId surfacing', () => {
+  function makeEvent(extras: Partial<{ parent_id: string; root_id: string }>) {
+    return {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_msg',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'hello' }),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+        ...extras,
+      },
+    };
+  }
+
+  it('surfaces parent_id on the parsed message when the user used quote-reply', () => {
+    const { parsed } = parseEventMessage(makeEvent({ parent_id: 'om_quoted', root_id: 'om_quoted' }));
+    expect(parsed.parentId).toBe('om_quoted');
+  });
+
+  it('leaves parentId undefined when the event has no parent_id', () => {
+    const { parsed } = parseEventMessage(makeEvent({}));
+    expect(parsed.parentId).toBeUndefined();
+  });
+
+  it('treats empty-string parent_id as absent', () => {
+    const { parsed } = parseEventMessage(makeEvent({ parent_id: '' }));
+    expect(parsed.parentId).toBeUndefined();
   });
 });

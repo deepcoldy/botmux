@@ -25,10 +25,12 @@
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
 import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
+import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 
 const CODEX_SESSIONS_ROOT = join(homedir(), '.codex', 'sessions');
+const IS_LINUX = platform() === 'linux';
 
 /** Extract the cliSessionId encoded in a rollout filename. Codex's session
  *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
@@ -40,32 +42,59 @@ export function codexSessionIdFromRolloutPath(path: string): string | undefined 
   return m ? m[1] : undefined;
 }
 
-/** Find the rollout file an externally-running Codex process has open by
- *  walking `/proc/<pid>/fd/*`. The Codex process keeps fd open on its
- *  current rollout for the entire lifetime of the session, so this is the
- *  authoritative way to bind a Codex pid to its sessionId — far more
- *  reliable than scanning `~/.codex/sessions` by mtime (which would race
- *  with sibling Codex panes in the same project).
+/** Find the rollout file an externally-running Codex process has open. The
+ *  Codex process keeps fd open on its current rollout for the entire
+ *  lifetime of the session, so this is the authoritative way to bind a
+ *  Codex pid to its sessionId — far more reliable than scanning
+ *  `~/.codex/sessions` by mtime (which would race with sibling Codex panes
+ *  in the same project).
  *
- *  Linux-only: relies on `/proc`. macOS/BSD callers should fall back to
- *  the cliSessionId path (read from `~/.codex/history.jsonl`'s last
- *  matching cwd entry) — but the use case for /proc-based discovery is
- *  /adopt, which already runs on Linux servers in practice. */
+ *  Linux: `/proc/<pid>/fd/*` fast path.
+ *  macOS / BSD: `lsof -p <pid> -Fn` 兜底（同 session-discovery 里的 readCwd）。
+ *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
 export function findCodexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  const fdDir = `/proc/${pid}/fd`;
-  if (!existsSync(fdDir)) return undefined;
-  let entries: string[];
-  try { entries = readdirSync(fdDir); } catch { return undefined; }
-  for (const fd of entries) {
-    let target: string;
-    try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-    if (!target.endsWith('.jsonl')) continue;
-    if (!target.includes('/.codex/sessions/')) continue;
-    const sid = codexSessionIdFromRolloutPath(target);
-    if (sid) return { path: target, cliSessionId: sid };
+  if (IS_LINUX) {
+    const fdDir = `/proc/${pid}/fd`;
+    if (existsSync(fdDir)) {
+      let entries: string[];
+      try { entries = readdirSync(fdDir); } catch { return undefined; }
+      for (const fd of entries) {
+        let target: string;
+        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
+        const hit = matchCodexRolloutPath(target);
+        if (hit) return hit;
+      }
+      return undefined;
+    }
+    // /proc 不可读时落到下面的 lsof 兜底（极少见，但兜一下）
+  }
+  // BSD ps 的 lsof：每个 fd 输出一行 `f<n>` 加一行 `n<path>`，socket / pipe
+  // 之类的内部条目以 `n->0x...` 或 `n<garbage>` 开头，所以只接受 `n/` 开头。
+  let out: string;
+  try {
+    out = execSync(`lsof -p ${pid} -Fn`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    return undefined;
+  }
+  for (const line of out.split('\n')) {
+    if (!line.startsWith('n/')) continue;
+    const target = line.slice(1);
+    const hit = matchCodexRolloutPath(target);
+    if (hit) return hit;
   }
   return undefined;
+}
+
+function matchCodexRolloutPath(target: string): { path: string; cliSessionId: string } | undefined {
+  if (!target.endsWith('.jsonl')) return undefined;
+  if (!target.includes('/.codex/sessions/')) return undefined;
+  const sid = codexSessionIdFromRolloutPath(target);
+  if (!sid) return undefined;
+  return { path: target, cliSessionId: sid };
 }
 
 export interface CodexBridgeEvent {
@@ -83,6 +112,35 @@ export interface CodexBridgeEvent {
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). */
   text: string;
+}
+
+/** Extract the last completed user/assistant turn from a Codex / CoCo bridge
+ *  event sequence. Used by /adopt to surface the previous turn as a
+ *  preamble card in the Lark thread — gives the user context to continue
+ *  from. CoCo events share the same shape (uuid/timestampMs/kind/text),
+ *  so this works for both bridges.
+ *
+ *  Algorithm: scan tail-first for the most recent `assistant_final`, then
+ *  pair it with the most recent `user` event that precedes it. Returns
+ *  undefined when either side is missing — typically a fresh session whose
+ *  user typed something but the model hasn't replied yet. */
+export function extractLastCodexTurn(
+  events: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+): { userText: string; assistantText: string } | undefined {
+  let assistantIdx = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].kind === 'assistant_final') { assistantIdx = i; break; }
+  }
+  if (assistantIdx < 0) return undefined;
+  let userIdx = -1;
+  for (let i = assistantIdx - 1; i >= 0; i--) {
+    if (events[i].kind === 'user') { userIdx = i; break; }
+  }
+  if (userIdx < 0) return undefined;
+  return {
+    userText: events[userIdx].text,
+    assistantText: events[assistantIdx].text,
+  };
 }
 
 /** Split a drained event list into "history" (older than the live cutoff)

@@ -78,4 +78,16 @@ input.row-select { cursor: pointer; }
 .oncall-row-body input[type=text] { flex: 1; min-width: 220px; padding: 0.25rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
 .oncall-row-body input[type=text]:disabled { background: #f6f8fa; color: var(--muted); }
 .oncall-status { font-size: 12px; color: var(--muted); }
+
+/* Bot Defaults tab */
+.bd-card { border: 1px solid var(--border); border-radius: 6px; padding: 0.8rem 1rem; margin-bottom: 0.8rem; max-width: 760px; }
+.bd-card header { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.4rem; }
+.bd-card header strong { font-size: 15px; }
+.bd-card header small { color: var(--muted); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; }
+.bd-body .bd-row { margin: 0.5rem 0 0.3rem; }
+.bd-body .bd-row label { display: block; }
+.bd-body .bd-row span { display: block; margin-bottom: 0.2rem; color: var(--muted); font-size: 12px; }
+.bd-body .bd-row input[type=text] { width: 100%; padding: 0.3rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
+.bd-body .bd-row input[type=text]:disabled { background: #f6f8fa; color: var(--muted); }
+.bd-meta { display: flex; gap: 1rem; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 0.3rem 0; }
 .oncall-status.hint-ok { background: transparent; border: none; padding: 0; margin: 0; color: #1a7f37; }

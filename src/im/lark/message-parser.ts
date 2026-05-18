@@ -122,9 +122,15 @@ export interface MessageResource {
 }
 
 /**
- * Stateful numbering that keeps `[图片 N]` placeholders in the rendered text
- * aligned with the attachment footer. The same key always gets the same
- * number, so duplicates across merge_forward sub-messages collapse correctly.
+ * Stateful numbering that keeps `[图片 N]` / `[文件 N]` placeholders in the
+ * rendered text aligned with the attachment footer. The same key always gets
+ * the same number, so duplicates across merge_forward sub-messages collapse
+ * correctly.
+ *
+ * Image and file counters are INDEPENDENT — `formatAttachmentsHint` emits
+ * `<image n=...>` and `<file n=...>` separately numbered, so a message with
+ * one image and one file should render as `[图片 1]` + `[文件 1]`, not
+ * `[图片 1]` + `[文件 2]`. Keys are typed via the `image:` / `file:` prefix.
  */
 export interface ImgNumberer {
   assign(key: string): { num: number; isNew: boolean };
@@ -132,14 +138,18 @@ export interface ImgNumberer {
 
 export function createImgNumberer(): ImgNumberer {
   const map = new Map<string, number>();
-  let counter = 0;
+  let imgCounter = 0;
+  let fileCounter = 0;
   return {
     assign(key: string) {
       const existing = map.get(key);
       if (existing !== undefined) return { num: existing, isNew: false };
-      counter++;
-      map.set(key, counter);
-      return { num: counter, isNew: true };
+      // Key prefix selects the counter so image/file numbering stays
+      // independent (mirrors formatAttachmentsHint's per-type imgN/fileN).
+      // Unknown prefixes share the image counter as a safe default.
+      const num = key.startsWith('file:') ? ++fileCounter : ++imgCounter;
+      map.set(key, num);
+      return { num, isNew: true };
     },
   };
 }
@@ -172,8 +182,11 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       for (const block of contentBlocks) {
         const nodes = Array.isArray(block) ? block : [block];
         for (const node of nodes) {
-          if (node.tag === 'img' && node.image_key) {
+          if ((node.tag === 'img' || node.tag === 'media') && node.image_key) {
             pushIfNew(resources, { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
+          }
+          if (node.tag === 'file' && node.file_key) {
+            pushIfNew(resources, { type: 'file', key: node.file_key, name: node.file_name ?? node.file_key });
           }
         }
       }
@@ -244,6 +257,7 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   const parsed: LarkMessage = {
     messageId: message.message_id,
     rootId: message.root_id ?? '',
+    parentId: message.parent_id || undefined,
     senderId: sender.sender_id?.open_id ?? '',
     senderType: sender.sender_type,
     msgType: message.message_type,
@@ -435,9 +449,12 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
 
     // --- Format A: Lark API simplified format ---
     // { title: "...", elements: [[{tag,text}, ...], ...] }
+    // 只有 title 存在时才 push 标识行；没 title 的卡片（例如 markdown 自动转
+    // 卡片的 outgoing 消息）让 elements 内容自己说话，避免在正文前堆一行
+    // 多余的 `[卡片]`。整张卡片真的没内容时下方 `parts.join('\n') || '[卡片]'`
+    // 会兜底返回占位。
     const title = card.title ?? card.header?.title?.content;
     if (title) parts.push(`[卡片: ${title}]`);
-    else parts.push('[卡片]');
 
     // v2 cards nest elements under `body`; fall back to legacy top-level.
     const rootElements = Array.isArray(card.body?.elements)

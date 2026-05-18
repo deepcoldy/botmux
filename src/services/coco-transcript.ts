@@ -1,8 +1,10 @@
 /**
  * Reader for CoCo's per-session events JSONL.
  *
- * CoCo stores each session under:
- *   ~/.cache/coco/sessions/<sessionId>/events.jsonl
+ * CoCo (Rust, 用 `dirs` crate 选 cache dir) 的会话路径按平台分叉：
+ *   Linux: ~/.cache/coco/sessions/<sessionId>/events.jsonl
+ *   macOS: ~/Library/Caches/coco/sessions/<sessionId>/events.jsonl
+ * Windows 这里不考虑（botmux 跟 tmux 强绑，跑不了 Windows）。
  *
  * The bridge fallback only needs the original user prompt and the final
  * assistant message. Those appear as event objects containing
@@ -12,11 +14,22 @@
  * turn fingerprints against the user's prompt, not injected context.
  */
 import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
+import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 
-const COCO_SESSIONS_ROOT = join(homedir(), '.cache', 'coco', 'sessions');
+// macOS 上 Rust `dirs` crate 把 cache 放在 ~/Library/Caches/，跟 Linux 的
+// ~/.cache 不同。这里硬编码两条平台路径，对不上的话 adopt 完全读不到
+// events.jsonl（user-visible: Lark 收不到模型回复）。
+const COCO_SESSIONS_ROOT = platform() === 'darwin'
+  ? join(homedir(), 'Library', 'Caches', 'coco', 'sessions')
+  : join(homedir(), '.cache', 'coco', 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const IS_LINUX = platform() === 'linux';
+// substring anchor —— 同时匹配 Linux 的 `/.cache/coco/sessions/` 和 macOS 的
+// `/Library/Caches/coco/sessions/` 两种路径形态。anchor 后紧跟一段 UUID 才认
+// 账（matchCocoSessionPath 里 SESSION_UUID_RE 校验），避免误命中。
+const COCO_SESSIONS_ANCHOR = '/coco/sessions/';
 
 export interface CocoBridgeEvent {
   /** Synthetic uuid for dedup: `<absPath>:<byteOffset>` of the line start. */
@@ -39,41 +52,63 @@ export function cocoEventsPathForSession(sessionId: string): string {
   return join(COCO_SESSIONS_ROOT, sessionId, 'events.jsonl');
 }
 
-/** Walk `/proc/<pid>/fd` to find which CoCo session a running CoCo process is
- *  bound to. Unlike Codex (which keeps its rollout fd open continuously),
- *  CoCo opens-writes-closes `events.jsonl` per event, so we look for ANY open
- *  file under the session dir — `session.log` and `traces.jsonl` are held
- *  open for the session's lifetime and reveal the same `<sid>` segment.
+/** Find which CoCo session a running CoCo process is bound to by scanning
+ *  its open file handles. Unlike Codex (which keeps its rollout fd open
+ *  continuously), CoCo opens-writes-closes `events.jsonl` per event, so we
+ *  look for ANY open file under the session dir — `session.log` and
+ *  `traces.jsonl` are held open for the session's lifetime and reveal the
+ *  same `<sid>` segment.
  *
- *  procfs may report `<path> (deleted)` for a previously-unlinked file kept
- *  alive by the open fd; strip that suffix before matching. Linux-only —
- *  returns undefined elsewhere or when /proc lookup fails. */
+ *  Linux: `/proc/<pid>/fd` 快路径，procfs 会把 unlinked-but-open 的 fd 标
+ *  ` (deleted)`，跳过它们以免读到失效 inode（曾被 e2e 清理触发）。
+ *  macOS / BSD: `lsof -p <pid> -Fn` 兜底。macOS 上 lsof 不给 deleted 标记，
+ *  但 worker 端在 `codexBridgeAttach` 之前还有 `existsSync(sessionDir)` 的
+ *  二次校验，所以这里不会让一个失效 sid 跑死循环。 */
 export function findCocoSessionByPid(
   pid: number,
 ): { sessionId: string; eventsPath: string } | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (process.platform !== 'linux') return undefined;
-  const fdDir = `/proc/${pid}/fd`;
-  if (!existsSync(fdDir)) return undefined;
-  let entries: string[];
-  try { entries = readdirSync(fdDir); } catch { return undefined; }
-  const prefix = COCO_SESSIONS_ROOT + '/';
-  for (const fd of entries) {
-    let target: string;
-    try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-    // Skip handles whose backing file has been unlinked. procfs marks these
-    // with a literal " (deleted)" suffix. Returning a sid from a deleted
-    // session dir lets adopt run forever waiting on an events.jsonl that
-    // CoCo writes to a dangling inode — empirically observed when an e2e
-    // test wiped the session dir without restarting CoCo.
-    if (target.endsWith(' (deleted)')) continue;
-    if (!target.startsWith(prefix)) continue;
-    const sid = target.slice(prefix.length).split('/')[0];
-    if (sid && SESSION_UUID_RE.test(sid)) {
-      return { sessionId: sid, eventsPath: cocoEventsPathForSession(sid) };
+  if (IS_LINUX) {
+    const fdDir = `/proc/${pid}/fd`;
+    if (existsSync(fdDir)) {
+      let entries: string[];
+      try { entries = readdirSync(fdDir); } catch { return undefined; }
+      for (const fd of entries) {
+        let target: string;
+        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
+        // procfs 标 deleted 的 fd 跳过 —— 后面 lsof 路径上没这个保护，因
+        // 为 macOS lsof 不给标记；worker 端 sessionDir existsSync 兜底。
+        if (target.endsWith(' (deleted)')) continue;
+        const hit = matchCocoSessionPath(target);
+        if (hit) return hit;
+      }
+      return undefined;
     }
   }
+  let out: string;
+  try {
+    out = execSync(`lsof -p ${pid} -Fn`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    return undefined;
+  }
+  for (const line of out.split('\n')) {
+    if (!line.startsWith('n/')) continue;
+    const target = line.slice(1);
+    const hit = matchCocoSessionPath(target);
+    if (hit) return hit;
+  }
   return undefined;
+}
+
+function matchCocoSessionPath(target: string): { sessionId: string; eventsPath: string } | undefined {
+  const idx = target.indexOf(COCO_SESSIONS_ANCHOR);
+  if (idx < 0) return undefined;
+  const sid = target.slice(idx + COCO_SESSIONS_ANCHOR.length).split('/')[0];
+  if (!sid || !SESSION_UUID_RE.test(sid)) return undefined;
+  return { sessionId: sid, eventsPath: cocoEventsPathForSession(sid) };
 }
 
 function messageText(content: unknown): string {

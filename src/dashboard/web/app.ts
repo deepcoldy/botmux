@@ -3,12 +3,14 @@ import { bootstrap, store } from './store.js';
 import { renderSessionsPage } from './sessions.js';
 import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
+import { renderBotDefaultsPage } from './bot-defaults.js';
 
 const root = document.getElementById('root')!;
 
 function route() {
   const hash = location.hash || '#/';
   if (hash.startsWith('#/groups')) renderGroupsPage(root);
+  else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
   else renderSessionsPage(root);
 

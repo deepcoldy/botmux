@@ -51,7 +51,7 @@ export function ensureCjkFontsInstalled(): void {
   });
   proc.on('exit', code => {
     if (code === 0) {
-      logger.info('[font-installer] CJK 字体安装成功；重启 daemon 后截图即可正确渲染中文（pnpm daemon:restart）。');
+      logger.info('[font-installer] CJK 字体安装成功；重启 daemon 后截图即可正确渲染中文（botmux restart）。');
     } else {
       const hint = stderr.includes('password is required') || stderr.includes('a terminal is required')
         ? '（当前用户没有免密 sudo 权限）'

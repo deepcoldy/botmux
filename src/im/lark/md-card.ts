@@ -260,3 +260,78 @@ export function buildMarkdownCard(md: string, recipientOpenId?: string): string 
     body: { direction: 'vertical', elements },
   });
 }
+
+/** Prefix every line with `> ` so Feishu's markdown widget renders it as a
+ *  blockquote even when the body contains blank lines. Empty lines become a
+ *  bare `>` to keep the quote block contiguous. */
+function quoteLines(text: string): string {
+  return text
+    .split('\n')
+    .map(line => (line.length === 0 ? '>' : `> ${line}`))
+    .join('\n');
+}
+
+/**
+ * Build a contextual reply card: a title strip, an optional quoted user
+ * prompt, and the assistant body rendered through the same markdown-it
+ * pipeline as `buildMarkdownCard`. Used by:
+ *   • `/adopt` 前最后一轮 preamble — surfaces the last turn of the
+ *     adopted CLI session.
+ *   • Local-terminal turns synced back to Lark — when the user types
+ *     directly into the adopted pane, both sides of the exchange are
+ *     posted so the thread sees a complete conversation.
+ *
+ * Empty `userText` is rendered as a `(空)` placeholder inside the quote so
+ * the visual layout stays consistent; pass `undefined` to omit the user
+ * section entirely (headless variant).
+ */
+export function buildContextualReplyCard(opts: {
+  title: string;
+  userText?: string;
+  assistantText: string;
+  assistantLabel: string;
+  recipientOpenId?: string;
+}): string {
+  const { title, userText, assistantText, assistantLabel, recipientOpenId } = opts;
+  const elements: any[] = [];
+
+  elements.push({
+    tag: 'markdown',
+    text_size: 'heading_2_v2',
+    content: title,
+  });
+
+  if (userText !== undefined) {
+    const u = userText.trim();
+    elements.push({
+      tag: 'markdown',
+      content: `**👤 你**\n\n${quoteLines(u || '(空)')}`,
+    });
+  }
+
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'markdown',
+    content: `**🤖 ${assistantLabel}**`,
+  });
+
+  const bodyElements = assistantText.trim()
+    ? buildCardBodyElements(assistantText)
+    : [{ tag: 'markdown', content: '*(空)*' }];
+  for (const el of bodyElements) elements.push(el);
+
+  const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
+  if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'markdown',
+    text_size: 'notation_small_v2',
+    content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+  });
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true },
+    body: { direction: 'vertical', elements },
+  });
+}

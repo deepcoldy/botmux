@@ -10,12 +10,14 @@
  *   newlines into separate submits.
  * - Claude Code (raw PTY): keeps the explicit \x1b[200~...\x1b[201~ wrapping
  *   since we control the markers directly there.
- * - CoCo (tmux): same as Claude Code — CoCo is a Claude Code fork (Ink TUI)
- *   and the old "single sendText with embedded LF" path silently dropped
- *   submits because tmux `send-keys -l` treats \n as Enter and paste-burst
- *   detection swallowed the trailing Enter. After the 2026-05 fix CoCo
- *   types per-line via sendText + `\` + Enter soft-newlines and verifies
- *   via ~/.cache/coco/history.jsonl.
+ * - CoCo (tmux): single pasteText with whole content + delayed Enter — tmux
+ *   `load-buffer` + `paste-buffer -d` wraps in bracketed paste markers when
+ *   the pane has them on (Ink default). PR #4 / 59afae5 (May 2026) moved
+ *   off the per-line typing model that claude-code uses: Trae CLI 0.120.31
+ *   fresh-spawn treated the rapid send-keys -l burst as an open-ended paste
+ *   and swallowed the trailing Enter as a soft-newline, stranding the
+ *   message in the input box. Submit is verified via ~/.cache/coco/history.jsonl.
+ * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
  * - Other adapters (Aiden/Codex/Gemini/OpenCode): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
@@ -107,7 +109,7 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Codex, Gemini, OpenCode. (Claude Code and CoCo type per-line; tested below.) */
+ *  Codex, Gemini, OpenCode. */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['codex', createCodexAdapter('/bin/codex')],
@@ -115,14 +117,28 @@ const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['opencode', createOpenCodeAdapter('/bin/opencode')],
 ];
 
-/** Adapters that share Claude Code's per-line + soft-newline typing path. */
+/** Adapters that type per-line + `\` soft-newline + Enter (Claude Code idiom). */
 const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
   ['claude-code', createClaudeCodeAdapter('/bin/claude')],
+];
+
+/** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
+ *  delayed Enter — CoCo / Trae CLI. See coco.ts for the Trae 0.120.31 burst
+ *  bug this works around. */
+const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
+];
+
+/** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
+ *  in non-tmux mode — claude-code and coco. */
+const BRACKETED_PASTE_FALLBACK_ADAPTERS: AdapterEntry[] = [
+  ...HUMAN_TYPING_ADAPTERS,
+  ...PASTE_BUFFER_ADAPTERS,
 ];
 
 const ALL_ADAPTERS: AdapterEntry[] = [
   ...HUMAN_TYPING_ADAPTERS,
+  ...PASTE_BUFFER_ADAPTERS,
   ...PLAIN_ADAPTERS,
 ];
 
@@ -131,12 +147,20 @@ const ALL_ADAPTERS: AdapterEntry[] = [
 // =========================================================================
 
 describe('writeInput: single-line, tmux mode', () => {
-  it.each(ALL_ADAPTERS)('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
+  it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, 'hello world');
     expect(pty.sendText).toHaveBeenCalledWith('hello world');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it.each(PASTE_BUFFER_ADAPTERS)('%s: pasteText + delayed Enter, no sendText', async (_name, adapter) => {
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, 'hello world');
+    expect(pty.pasteText).toHaveBeenCalledWith('hello world');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.sendText).not.toHaveBeenCalled();
   });
 });
 
@@ -148,8 +172,7 @@ describe('writeInput: single-line, non-tmux mode', () => {
     expect(allWritten).toBe('hello world\r');
   });
 
-  it('claude-code: wraps in bracketed paste + CR', async () => {
-    const adapter = createClaudeCodeAdapter('/bin/claude');
+  it.each(BRACKETED_PASTE_FALLBACK_ADAPTERS)('%s: wraps in bracketed paste + CR', async (_name, adapter) => {
     const pty = makeRawPty();
     await adapter.writeInput(pty, 'hello world');
     const allWritten = pty.write.mock.calls.map(c => c[0]).join('');
@@ -194,6 +217,17 @@ describe('writeInput: multiline, tmux mode', () => {
     expect(backslashCalls).toBe(2);
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
   });
+
+  it.each(PASTE_BUFFER_ADAPTERS)('%s: single pasteText(whole) + delayed Enter, no sendText', async (_name, adapter) => {
+    // Coco's tmux path uses load-buffer + paste-buffer -d (PtyHandle.pasteText)
+    // for the whole content, then a single delayed Enter. tmux wraps in
+    // bracketed-paste markers automatically when the Ink TUI has them on.
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendText).not.toHaveBeenCalled();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
 });
 
 describe('writeInput: multiline, non-tmux mode', () => {
@@ -204,7 +238,7 @@ describe('writeInput: multiline, non-tmux mode', () => {
     expect(allWritten).toBe(MULTILINE + '\r');
   });
 
-  it.each(HUMAN_TYPING_ADAPTERS)('%s: wraps in bracketed paste + CR', async (_name, adapter) => {
+  it.each(BRACKETED_PASTE_FALLBACK_ADAPTERS)('%s: wraps in bracketed paste + CR', async (_name, adapter) => {
     const pty = makeRawPty();
     await adapter.writeInput(pty, MULTILINE);
     const allWritten = pty.write.mock.calls.map(c => c[0]).join('');
@@ -236,6 +270,15 @@ describe('writeInput: multiline preserves unicode and session IDs', () => {
 
     expect(pty.sendText).toHaveBeenCalledWith('帮我看看');
     expect(pty.sendText).toHaveBeenCalledWith('Session ID: dece91fd-abc');
+    expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+  });
+
+  it.each(PASTE_BUFFER_ADAPTERS)('%s: whole content round-trips via pasteText intact (tmux)', async (_name, adapter) => {
+    const pty = makeTmuxPty();
+    const followUp = '帮我看看\n\nSession ID: dece91fd-abc';
+    await adapter.writeInput(pty, followUp);
+
+    expect(pty.pasteText).toHaveBeenCalledWith(followUp);
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
   });
 });
@@ -420,6 +463,57 @@ describe('claude-code writeInput submission confirmation', () => {
 
     expect(result).toBeUndefined();
     expect(pty.claudeJsonlPath).toBe(oldPath);
+  });
+
+  it('pid resolver: accepts cwd mismatch when procStart matches (worker cliCwd drift)', async () => {
+    // Failure mode this guards against: a botmux session created with
+    // workingDir=A is later resumed by a scheduled task with workingDir=B
+    // (e.g. an ai-news cron). Claude itself was spawned in B but the loaded
+    // session retains its original cwd=A, so the pid file reports cwd=A
+    // while the worker's `cliCwd` is B. With strict cwd equality the
+    // resolver rejects, the pinned JSONL stays at the wrong project hash,
+    // and every submit hits the 20s "submit not confirmed" warning.
+    // procStart matching against /proc/<pid>/stat is the strong signal that
+    // the pid file belongs to the live process, so cwd disagreement should
+    // be tolerated and the pid file's cwd believed.
+    const workerCwd = '/tmp/pid-resolver-cwd-drift-worker';
+    const claudeCwd = '/tmp/pid-resolver-cwd-drift-claude';
+    const oldSessionId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const rotatedSessionId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const oldPath = makeJsonlForSession('pid-resolver-cwd-drift', oldSessionId, workerCwd);
+    const rotatedPath = makeJsonlForSession('pid-resolver-cwd-drift', rotatedSessionId, claudeCwd);
+    const fakePid = 31337;
+    mkdirSync(`/proc/${fakePid}`, { recursive: true });
+    writeFileSync(
+      `/proc/${fakePid}/stat`,
+      `${fakePid} (claude) S 1 1 1 0 -1 4194304 100 0 0 0 1 1 0 0 20 0 1 0 555555 12345 678 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n`,
+    );
+    writeClaudePidFile(fakePid, {
+      sessionId: rotatedSessionId,
+      cwd: claudeCwd,
+      procStart: '555555',
+    });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: fakePid,
+      cliCwd: workerCwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendFileSync(
+          rotatedPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'submit on rotated path' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'submit on rotated path');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
+    expect(pty.claudeJsonlPath).toBe(rotatedPath);
   });
 
   it('pid resolver: ignores file when procStart does not match /proc/<pid>/stat', async () => {
@@ -679,56 +773,26 @@ describe('codex writeInput submission confirmation', () => {
 });
 
 describe('coco writeInput submission confirmation', () => {
-  // CoCo's typing path is per-line (soft-newline like Claude Code), so a
-  // PTY mock that records "submittedText" off the LAST sendText sees only
-  // the trailing line — not useful for content-prefix matching against
-  // history.jsonl. We capture every sendText call and reconstruct the full
-  // submission once we see Enter, then append a coco-shaped history line
-  // when configured to confirm.
-  // Reconstructs the multiline content from per-line sendText calls. Real
-  // coco does this internally (Ink input buffer): every literal sendText
-  // line becomes a content segment, `\` sentinels followed by Enter become
-  // \n separators. On the final Enter the whole buffer is appended to
-  // history.jsonl as a single `"content":"…"` field.
-  function reconstructFromCalls(calls: string[]): string {
-    let buf = '';
-    let pendingBackslash = false;
-    for (const c of calls) {
-      if (c === '\\') {
-        // Consecutive `\\` (no segment in between): commit the prior pending
-        // newline before starting a new one. This is what coco does for a
-        // blank line in the middle of multiline content.
-        if (pendingBackslash) buf += '\n';
-        pendingBackslash = true;
-        continue;
-      }
-      if (pendingBackslash) { buf += '\n'; pendingBackslash = false; }
-      buf += c;
-    }
-    if (pendingBackslash) buf += '\n';
-    return buf;
-  }
-
-  function makeCocoTmuxPty(opts?: { confirmCocoSubmit?: boolean }) {
+  // CoCo's tmux path (post PR #4 / 59afae5): single pasteText with the whole
+  // content, then a delayed Enter; if ~/.cache/coco/history.jsonl doesn't
+  // append our prefix within the budget, retry Enter up to 3 more times.
+  // The mock records the last-pasted text and, on the first Enter (when
+  // configured to confirm), writes a coco-shaped history line with that
+  // content so the adapter's prefix-match path can succeed.
+  function makeCocoPasteTmuxPty(opts?: { confirmCocoSubmit?: boolean }) {
     const confirmCocoSubmit = opts?.confirmCocoSubmit ?? true;
-    const captured: string[] = [];
+    let lastPasted = '';
     let submittedOnce = false;
-    let pendingBackslashAtEnter = false;
     return {
       write: vi.fn(),
-      sendText: vi.fn((text: string) => {
-        captured.push(text);
-        if (text === '\\') pendingBackslashAtEnter = true;
-        else pendingBackslashAtEnter = false;
-      }),
+      sendText: vi.fn(),
       sendSpecialKeys: vi.fn((key: string) => {
         if (key !== 'Enter') return;
-        if (pendingBackslashAtEnter) { pendingBackslashAtEnter = false; return; }
         if (!confirmCocoSubmit || submittedOnce) return;
         submittedOnce = true;
-        appendCocoHistory(reconstructFromCalls(captured));
+        appendCocoHistory(lastPasted);
       }),
-      pasteText: vi.fn(),
+      pasteText: vi.fn((text: string) => { lastPasted = text; }),
     } satisfies PtyHandle;
   }
 
@@ -736,35 +800,33 @@ describe('coco writeInput submission confirmation', () => {
     resetCocoHistory();
     appendCocoHistory('seed prior submit so file exists');
     const adapter = createCocoAdapter('/bin/coco');
-    const pty = makeCocoTmuxPty();
+    const pty = makeCocoPasteTmuxPty();
     const result = await adapter.writeInput(pty, MULTILINE);
 
     // Successful submit returns undefined (no warning needed)
     expect(result).toBeUndefined();
-    // Per-line typing: 'first line', then `\` Enter `\` Enter (soft-newlines
-    // for the blank line in the middle), then 'Session ID: abc-123', then
-    // the final submit Enter. Exactly 3 Enter calls — any extra would be
-    // a retry from the verify loop, which means the mock didn't actually
-    // confirm the submit.
-    expect(pty.sendText).toHaveBeenCalledWith('first line');
-    expect(pty.sendText).toHaveBeenCalledWith('Session ID: abc-123');
+    // tmux paste-buffer path: single pasteText with the whole content, then
+    // exactly one Enter (no retries — the mock confirmed via history.jsonl).
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendText).not.toHaveBeenCalled();
     const enterCalls = pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter').length;
-    expect(enterCalls).toBe(3);  // 2 soft-newlines + final submit, no retries
+    expect(enterCalls).toBe(1);
   });
 
   it('retries Enter and reports failure when history.jsonl never records the prompt', async () => {
     resetCocoHistory();
     appendCocoHistory('seed prior submit so file exists');
     const adapter = createCocoAdapter('/bin/coco');
-    const pty = makeCocoTmuxPty({ confirmCocoSubmit: false });
+    const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
     const result = await adapter.writeInput(pty, MULTILINE);
 
     expect(result).toMatchObject({ submitted: false });
     expect(typeof (result as any)?.recheck).toBe('function');
     expect((result as any).recheck()).toBe(false);
-    // 2 soft-newline Enters + initial submit Enter + 3 retries = 6 Enter calls
+    // pasteText called once, then 1 initial submit Enter + 3 retry Enters = 4
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     const enterCalls = pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter').length;
-    expect(enterCalls).toBe(6);
+    expect(enterCalls).toBe(4);
   });
 
   it('matches HTML-escaped angle brackets that Go marshalling emits (regression)', async () => {
@@ -816,7 +878,7 @@ describe('coco writeInput submission confirmation', () => {
     const { rmSync } = await import('node:fs');
     try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
     const adapter = createCocoAdapter('/bin/coco');
-    const pty = makeCocoTmuxPty({ confirmCocoSubmit: false });
+    const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
     const result = await adapter.writeInput(pty, 'hello');
     expect(result).toBeUndefined();
   });

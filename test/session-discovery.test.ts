@@ -23,6 +23,10 @@ vi.mock('node:fs', () => ({
 
 vi.mock('node:os', () => ({
   homedir: () => '/home/testuser',
+  // session-discovery 用 platform() 决定 Linux /proc 快路径 vs macOS ps/lsof 兜底。
+  // 既有 mock 数据全部按 Linux 形态准备，所以这里固定为 'linux'。
+  // macOS 兜底路径的覆盖见 test/session-discovery.smoke.test.ts。
+  platform: () => 'linux',
 }));
 
 import { execSync } from 'node:child_process';
@@ -87,15 +91,15 @@ function setupMocks(opts: {
       return paneLines;
     }
 
-    // ps --ppid
-    const psMatch = cmdStr.match(/ps --ppid (\d+)/);
-    if (psMatch) {
-      const ppid = Number(psMatch[1]);
-      const children = childMap[ppid];
-      if (!children || children.length === 0) {
-        throw new Error('no children');
+    // `ps -A -o pid= -o ppid=` —— 返回全表，由调用方过滤。我们这里把
+    // childMap 全展开成两列。
+    if (cmdStr.includes('ps -A -o pid= -o ppid=')) {
+      const rows: string[] = [];
+      for (const [ppidStr, kids] of Object.entries(childMap)) {
+        const ppid = Number(ppidStr);
+        for (const kid of kids) rows.push(`${kid} ${ppid}`);
       }
-      return children.map(p => `  ${p}`).join('\n') + '\n';
+      return rows.join('\n') + (rows.length ? '\n' : '');
     }
 
     // tmux display (pane dimensions)

@@ -18,7 +18,7 @@ import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
-import { buildMarkdownCard } from '../im/lark/md-card.js';
+import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -985,26 +985,25 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'adopt_preamble': {
         // Adopt-bridge: surface the last completed user/assistant exchange
-        // from the adopted Claude session so the Lark thread has context
-        // to continue from. Best-effort — failure here just means the
-        // user won't see the preamble; adopt itself isn't blocked.
+        // from the adopted CLI session so the Lark thread has context to
+        // continue from. Best-effort — failure here just means the user
+        // won't see the preamble; adopt itself isn't blocked. Card chrome
+        // matches the regular markdown-card path (schema 2.0 + footer) so
+        // the assistant body renders with proper code blocks / tables /
+        // lists instead of arriving as a wall of plain text.
         if (!ds.adoptedFrom) {
           logger.warn(`[${t}] Ignored adopt_preamble from non-adopt worker`);
           break;
         }
-        const userBlock = msg.userText.trim();
-        const assistantBlock = msg.assistantText.trim();
-        if (!userBlock && !assistantBlock) break;
-        const text = [
-          '📜 /adopt 前最后一轮',
-          '',
-          '👤 你：',
-          userBlock || '(空)',
-          '',
-          '🤖 Claude：',
-          assistantBlock || '(空)',
-        ].join('\n');
-        cb.sessionReply(sessionAnchorId(ds), text, 'text', ds.larkAppId).catch((err: any) => {
+        if (!msg.userText.trim() && !msg.assistantText.trim()) break;
+        const cardJson = buildContextualReplyCard({
+          title: '📜 /adopt 前最后一轮',
+          userText: msg.userText,
+          assistantText: msg.assistantText,
+          assistantLabel: getCliDisplayName(botCfg.cliId),
+          recipientOpenId: ds.session.ownerOpenId,
+        });
+        cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
         });
         break;
@@ -1066,10 +1065,26 @@ function deliverFinalOutput(
       // delivered via this fallback path looks identical in the Lark thread
       // to one the model sent itself. Markdown rendering, tables, code
       // blocks all flow through the shared `buildCardBodyElements`.
-      const cardJson = buildMarkdownCard(msg.content, ds.session.ownerOpenId);
+      //
+      // Local-turn variants (kind = 'local-turn' / 'local-turn-headless')
+      // also surface the user-side prompt synced from the adopted pane;
+      // they use the contextual card so the user prompt sits in a
+      // blockquote and only the assistant body goes through full markdown
+      // rendering.
+      const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
+        ? buildContextualReplyCard({
+            title: msg.kind === 'local-turn-headless'
+              ? '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）'
+              : '🖥️ 终端本地对话（在 adopted pane 中直接输入，已同步至飞书）',
+            userText: msg.kind === 'local-turn' ? msg.userText ?? '' : undefined,
+            assistantText: msg.content,
+            assistantLabel: getCliDisplayName(getBot(ds.larkAppId).config.cliId),
+            recipientOpenId: ds.session.ownerOpenId,
+          })
+        : buildMarkdownCard(msg.content, ds.session.ownerOpenId);
       await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
-      logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, attempt ${attempt + 1})`);
+      logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (err instanceof MessageWithdrawnError) {
         // Root message gone — no point retrying. Mark as emitted so any

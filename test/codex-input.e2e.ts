@@ -10,11 +10,34 @@
  */
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as pty from 'node-pty';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+
+// Codex 0.130 removed the "Yes, continue" trust dialog entirely (both with and
+// without --dangerously-bypass-approvals-and-sandbox). These tests spawn the
+// real codex binary to capture the dialog's PTY framing — meaningless on
+// versions that never emit it. The production TRUST_DIALOG_PATTERN in
+// worker.ts stays in place as a defensive layer for Claude Code (which still
+// prompts) and any older codex install.
+function codexEmitsTrustDialog(): boolean {
+  try {
+    const out = execFileSync('codex', ['--version'], { encoding: 'utf8' }).trim();
+    // Format observed: "codex-cli 0.130.0". Extract semver-like tail.
+    const m = out.match(/(\d+)\.(\d+)\.(\d+)/);
+    if (!m) return true; // unknown version → run the test, fail loudly if assumption wrong
+    const [maj, min] = [parseInt(m[1], 10), parseInt(m[2], 10)];
+    // Codex 0.130+ no longer shows the trust dialog.
+    return maj === 0 ? min < 130 : maj < 1;
+  } catch {
+    return false; // codex not installed → skip
+  }
+}
+
+const CODEX_HAS_TRUST_DIALOG = codexEmitsTrustDialog();
 
 // ─── Constants (match production worker.ts) ─────────────────────────────────
 
@@ -67,7 +90,7 @@ describe('Codex first input submission', () => {
     if (tmpDir) { try { rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
   });
 
-  it('chunk analysis: "Yes, continue" appears intact in a single PTY chunk', async () => {
+  it.skipIf(!CODEX_HAS_TRUST_DIALOG)('chunk analysis: "Yes, continue" appears intact in a single PTY chunk', async () => {
     /**
      * Verifies that "Yes, continue" can be matched per-chunk (unlike
      * "Do you trust the contents of this directory" which splits across chunks
@@ -116,7 +139,7 @@ describe('Codex first input submission', () => {
     expect(matchingChunk, '"Yes, continue" should appear in a single chunk').toBeTruthy();
   }, 30_000);
 
-  it('production flow: trust dialog detected and dismissed, prompt submitted', async () => {
+  it.skipIf(!CODEX_HAS_TRUST_DIALOG)('production flow: trust dialog detected and dismissed, prompt submitted', async () => {
     /**
      * Simulates the full production worker flow:
      * 1. Codex spawns → trust dialog appears

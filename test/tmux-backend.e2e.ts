@@ -98,7 +98,7 @@ describe('TmuxBackend', () => {
     expect(TmuxBackend.hasSession(TEST_SESSION)).toBe(false);
   }, TEST_TIMEOUT);
 
-  it.skipIf(!TmuxBackend.isAvailable())('destroySession kills tmux session', () => {
+  it.skipIf(!TmuxBackend.isAvailable())('destroySession kills tmux session', async () => {
     const backend = new TmuxBackend(TEST_SESSION);
     backend.spawn('/bin/bash', ['-c', 'sleep 60'], {
       cwd: '/tmp',
@@ -106,13 +106,17 @@ describe('TmuxBackend', () => {
       rows: 24,
       env: { ...process.env } as Record<string, string>,
     });
-    expect(TmuxBackend.hasSession(TEST_SESSION)).toBe(true);
+    // `tmux new-session` is async — under full-suite load the registration in
+    // the tmux server can lag behind pty.spawn returning. Poll briefly so the
+    // assertion measures the steady state, not the race.
+    await waitFor(() => TmuxBackend.hasSession(TEST_SESSION), 5000);
 
     backend.destroySession();
+    await waitFor(() => !TmuxBackend.hasSession(TEST_SESSION), 5000);
     expect(TmuxBackend.hasSession(TEST_SESSION)).toBe(false);
   }, TEST_TIMEOUT);
 
-  it.skipIf(!TmuxBackend.isAvailable())('listBotmuxSessions returns bmx- sessions', () => {
+  it.skipIf(!TmuxBackend.isAvailable())('listBotmuxSessions returns bmx- sessions', async () => {
     const backend = new TmuxBackend(TEST_SESSION);
     backend.spawn('/bin/bash', ['-c', 'sleep 60'], {
       cwd: '/tmp',
@@ -120,9 +124,8 @@ describe('TmuxBackend', () => {
       rows: 24,
       env: { ...process.env } as Record<string, string>,
     });
-
-    const sessions = TmuxBackend.listBotmuxSessions();
-    expect(sessions).toContain(TEST_SESSION);
+    await waitFor(() => TmuxBackend.listBotmuxSessions().includes(TEST_SESSION), 5000);
+    expect(TmuxBackend.listBotmuxSessions()).toContain(TEST_SESSION);
 
     backend.destroySession();
   }, TEST_TIMEOUT);

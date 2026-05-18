@@ -7,14 +7,17 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
+import { statSync } from 'node:fs';
 import { getChatMode, replyMessage, resolveAllowedUsers, sendMessage } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, isChatOncallBoundForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
+import { autoBindOncallFromDefault } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
+import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -48,6 +51,7 @@ import {
   getSessionWorkingDir,
   getProjectScanDir,
   getProjectScanDirs,
+  expandHome,
   downloadResources,
   formatAttachmentsHint,
   buildNewTopicPrompt,
@@ -61,8 +65,7 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, type RoutingContext } from './im/lark/event-dispatcher.js';
-import { isBotMentionMessageHandled, markBotMentionMessageHandled } from './utils/bot-mention-dedup.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
 import { markSessionActivity } from './core/session-activity.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -275,6 +278,45 @@ function getActiveCount(): number {
   return count;
 }
 
+/**
+ * Freeze the previous turn's streaming card at "idle" and mark a new turn so the
+ * next screen_update from the worker POSTs a fresh streaming card instead of
+ * PATCH-ing the previous one. Shared by the normal-message path and the
+ * passthrough slash-command path (/model, /clear, /compact, etc.) — without
+ * this, passthrough commands silently PATCH the previous card and the user
+ * sees no visible response.
+ */
+function beginNewTurn(ds: DaemonSession, title: string): void {
+  if (ds.streamCardId && ds.workerPort) {
+    const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+    const dsBotCfg = getBot(ds.larkAppId).config;
+    const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
+    const prevMode = ds.displayMode ?? 'hidden';
+    const frozenCard = buildStreamingCard(
+      ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
+      ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId,
+      prevMode, ds.streamCardNonce, ds.currentImageKey,
+      !!ds.adoptedFrom, false,
+    );
+    scheduleCardPatch(ds, frozenCard);
+
+    if (ds.streamCardNonce && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+      if (!ds.frozenCards) ds.frozenCards = new Map();
+      ds.frozenCards.set(ds.streamCardNonce, {
+        messageId: ds.streamCardId,
+        content: ds.lastScreenContent ?? '',
+        title: prevTitle,
+        displayMode: prevMode,
+        imageKey: ds.currentImageKey,
+      });
+      saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+    }
+  }
+  ds.streamCardPending = true;
+  ds.currentTurnTitle = title.substring(0, 50);
+  persistStreamCardState(ds);
+}
+
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
@@ -291,6 +333,65 @@ const cardDeps: CardHandlerDeps = {
 };
 
 // ─── Event handling ──────────────────────────────────────────────────────────
+
+/**
+ * Default-oncall is a uniform forward-only policy: whenever the toggle is
+ * on, ANY chat the bot is currently in — old or newly added, doesn't matter —
+ * gets auto-bound to the configured workingDir on its next observed topic,
+ * unless it's already bound (`findOncallChatForAnyBot` upstream) or the user
+ * has opted out via tombstone.
+ *
+ * Returns the binding entry on success, undefined when any precondition
+ * fails or the lock-internal authoritative check (in `autoBindOncallFromDefault`)
+ * sees a concurrent tombstone / existing binding.
+ */
+async function maybeAutoBindDefaultOncall(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+): Promise<OncallChat | undefined> {
+  if (chatType !== 'group') return undefined; // oncall is group-only by design
+  const bot = getBot(larkAppId);
+  const def = bot.config.defaultOncall;
+  if (!def?.enabled || !def.workingDir) return undefined;
+
+  // Fast-path tombstone check against the in-memory snapshot — avoids taking
+  // the lock when we already know we'd skip. The AUTHORITATIVE re-check lives
+  // inside autoBindOncallFromDefault under the file lock, so a race with a
+  // concurrent unbind (which writes the tombstone) is still safe.
+  const autobound = bot.config.defaultOncallAutoboundChats ?? [];
+  if (autobound.includes(chatId)) return undefined;
+
+  // Validate workingDir at fire time too — directory might have been
+  // deleted/moved since the dashboard save validated it. Skipping (vs.
+  // crashing) lets the user fix the path without losing other bot config.
+  const resolved = expandHome(def.workingDir);
+  let isDir = false;
+  try { isDir = statSync(resolved).isDirectory(); } catch { /* not a dir */ }
+  if (!isDir) {
+    logger.warn(
+      `[${larkAppId}] defaultOncall workingDir invalid (${resolved}); ` +
+      `skipping auto-bind for chat=${chatId}`,
+    );
+    return undefined;
+  }
+
+  const r = await autoBindOncallFromDefault(larkAppId, chatId, def.workingDir);
+  if (!r.ok) {
+    logger.warn(`[${larkAppId}] defaultOncall auto-bind failed: chat=${chatId} reason=${r.reason}`);
+    return undefined;
+  }
+  if (r.skipped) {
+    // Lock-internal authoritative check disagreed with our fast-path —
+    // tombstone or binding raced in. Fine, just don't surface a binding.
+    logger.info(`[${larkAppId}] defaultOncall auto-bind skipped chat=${chatId} reason=${r.skipped}`);
+    return undefined;
+  }
+  logger.info(
+    `[${larkAppId}] defaultOncall auto-bound chat=${chatId} → ${def.workingDir}`,
+  );
+  return r.entry;
+}
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId } = ctx;
@@ -395,6 +496,15 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     sessionReply(anchor, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', larkAppId);
   }
 
+  // First-turn quote-reply: when the user @s the bot via Lark's "quote" UI as
+  // the very first interaction (no active session yet), the same hint that
+  // handleThreadReply prepends needs to ride along here too. Without it, the
+  // bot never learns about the quoted message_id and `botmux quoted` is dead
+  // weight on first turns. `content` (post force-topic-strip) is what the
+  // worker will see; promptContent wraps it for prompt-building paths but
+  // leaves `content` untouched for title / log substring uses.
+  const promptContent = buildQuoteHint(parsed, scope, anchor) + content;
+
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
   // Create session in pending-repo state — don't spawn CLI yet.
@@ -419,7 +529,15 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   // Oncall group: pin working dir from the chat-level binding, even if a
   // sibling bot (running in another daemon) is the one that persisted it.
-  const oncallEntry = findOncallChatForAnyBot(chatId);
+  // Layered lookup:
+  //   1) any existing binding (this bot or sibling)
+  //   2) this bot's defaultOncall — auto-binds the chat if it's brand new
+  //      and the flag is on. Once auto-bound, the chat appears in oncallChats
+  //      so the next handleNewTopic sees it via (1).
+  let oncallEntry = findOncallChatForAnyBot(chatId);
+  if (!oncallEntry) {
+    oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, chatId, chatType);
+  }
 
   // Cross-bot / chat-scope inheritance: reuse a sibling session's workingDir
   // and skip the repo card. Same block lives in handleThreadReply's auto-create
@@ -444,7 +562,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     lastMessageAt: now,
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir,
-    pendingPrompt: content,
+    pendingPrompt: promptContent,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
     ownerOpenId: senderOpenId,
@@ -460,7 +578,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -485,10 +603,42 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
+}
+
+/** Reverse-lookup a foreign bot's display name for a sender open_id observed on
+ *  this app's WS events. Priority:
+ *    1) bot-openids-${larkAppId}.json — per-app cross-ref populated by
+ *       updateBotOpenIdCrossRef when @mentions go through us. Open_id is
+ *       per-app scoped, so this is the authoritative map for this larkAppId.
+ *    2) bots-info.json — fallback for bots not yet in our cross-ref but
+ *       registered as botmux peers (matches by their self-reported open_id;
+ *       only works when the peer's app id space coincides with ours).
+ *  Returns "Bot" if neither lookup hits — keeps the prefix readable rather
+ *  than blocking the message.
+ */
+function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
+  try {
+    const fp = join(config.session.dataDir, `bot-openids-${larkAppId}.json`);
+    if (existsSync(fp)) {
+      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
+      for (const [name, openId] of Object.entries(data)) {
+        if (openId === senderOpenId) return name;
+      }
+    }
+  } catch { /* fall through */ }
+  try {
+    const infoPath = join(config.session.dataDir, 'bots-info.json');
+    if (existsSync(infoPath)) {
+      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const hit = entries.find(e => e.botOpenId === senderOpenId);
+      if (hit) return hit.botName ?? getCliDisplayName(hit.cliId as CliId);
+    }
+  } catch { /* */ }
+  return 'Bot';
 }
 
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
@@ -500,6 +650,39 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
     resources.push(...extraResources);
+  }
+
+  // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
+  // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
+  // 不是用户直接发的——后续不需要按"对话用户"的方式处理。signal-file 路径
+  // 删掉之前由 processBotMentionSignal 拼，现在统一在这里拼。仅影响发给
+  // worker 的 prompt 内容，title / 命令解析 / 日志还是用原 parsed.content。
+  //
+  // 检测策略走双轨：
+  //   1) `sender.sender_type === 'app' | 'bot'` —— 飞书事件标注为机器人发送。
+  //      'app' 是文档里的常规值；'bot' 是实测中跨 bot @ 卡片消息到接收方时
+  //      飞书实际给的值（与 'app' 等价对待，少依赖一次 cross-ref 学习）。
+  //   2) sender 的 open_id 在我们本 app 的 cross-ref（bot-openids-<appId>.json）
+  //      里能匹配到一个 botmux 同伴名字 —— 兜底覆盖 sender_type 又变其他取值
+  //      或者全无的边角情况，前提是之前已通过 @mention 学习链路记录过对方。
+  const senderOpenIdForPrefix = parsed.senderId || data?.sender?.sender_id?.open_id;
+  const selfBotOpenId = getBot(larkAppId).botOpenId;
+  const isBotSenderType = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  const isForeignBot =
+    !!senderOpenIdForPrefix &&
+    senderOpenIdForPrefix !== selfBotOpenId &&
+    (isBotSenderType ||
+      isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
+  const botSenderPrefix = isForeignBot
+    ? `[来自 ${lookupForeignBotName(senderOpenIdForPrefix!, larkAppId)} 的 @mention]\n`
+    : '';
+
+  const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + parsed.content;
+  if (isForeignBot) {
+    logger.info(
+      `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +
+      `senderType=${parsed.senderType} via=${isBotSenderType ? 'sender_type' : 'cross-ref'}`,
+    );
   }
 
   const content = parsed.content.trim();
@@ -525,6 +708,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
       const ds = activeSessions.get(sessionKey(anchor, larkAppId));
       if (ds?.worker && !ds.worker.killed) {
+        // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
+        // shows up as a fresh streaming card instead of silently PATCH-ing the
+        // previous turn's card.
+        beginNewTurn(ds, commandContent);
         ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
         markSessionActivity(ds);
         logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
@@ -595,8 +782,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (ds?.pendingRepo) {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     let enriched = attachments.length > 0
-      ? `${parsed.content}${formatAttachmentsHint(attachments)}`
-      : parsed.content;
+      ? `${promptContent}${formatAttachmentsHint(attachments)}`
+      : promptContent;
     if (parsed.mentions && parsed.mentions.length > 0) {
       const mentionLines = parsed.mentions.map(m => {
         const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
@@ -645,7 +832,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
     // Oncall group: pin working dir from the chat-level binding, even if a
     // sibling bot (running in another daemon) is the one that persisted it.
-    const oncallEntry = findOncallChatForAnyBot(autoCreateChatId);
+    // Defaults auto-bind path mirrors handleNewTopic — keep both call sites
+    // in sync (this is the auto-create branch that fires when routing lands
+    // here without an active session, e.g. chat-scope first-reply paths).
+    let oncallEntry = findOncallChatForAnyBot(autoCreateChatId);
+    if (!oncallEntry) {
+      oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, autoCreateChatId, autoCreateChatType);
+    }
 
     // Cross-bot / chat-scope inheritance — see findInheritablePeer comments.
     const inheritedFrom = !oncallEntry
@@ -673,7 +866,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       lastMessageAt: now,
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir,
-      pendingPrompt: parsed.content,
+      pendingPrompt: promptContent,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
       ownerOpenId: senderOId,
@@ -690,7 +883,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -715,7 +908,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
     }
 
@@ -736,51 +929,19 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const isBridge = !!ds.adoptedFrom;
     const selfBot = getBot(ds.larkAppId);
     const msgContent = isBridge
-      ? buildBridgeInputContent(parsed.content, {
+      ? buildBridgeInputContent(promptContent, {
           attachments,
           mentions: parsed.mentions,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         })
-      : buildFollowUpContent(parsed.content, ds.session.sessionId, {
+      : buildFollowUpContent(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
           cliId: dsBotCfgForMsg.cliId,
           cliPathOverride: dsBotCfgForMsg.cliPathOverride,
         });
-    // Freeze the previous turn's card at "idle" before starting a new turn
-    if (ds.streamCardId && ds.workerPort) {
-      const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-      const dsBotCfg = getBot(ds.larkAppId).config;
-      const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
-      const prevMode = ds.displayMode ?? 'hidden';
-      const frozenCard = buildStreamingCard(
-        ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
-        ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId,
-        prevMode, ds.streamCardNonce, ds.currentImageKey,
-        !!ds.adoptedFrom, false,
-      );
-      // Freeze through the serialization queue to avoid racing with an in-flight PATCH.
-      // scheduleCardPatch replaces any stale pending item (latest-wins).
-      scheduleCardPatch(ds, frozenCard);
-
-      // Cache frozen card data so historical cards can still be toggled (expand/collapse)
-      if (ds.streamCardNonce && ds.streamCardId !== CARD_POSTING_SENTINEL) {
-        if (!ds.frozenCards) ds.frozenCards = new Map();
-        ds.frozenCards.set(ds.streamCardNonce, {
-          messageId: ds.streamCardId,
-          content: ds.lastScreenContent ?? '',
-          title: prevTitle,
-          displayMode: prevMode,
-          imageKey: ds.currentImageKey,
-        });
-        saveFrozenCards(ds.session.sessionId, ds.frozenCards);
-      }
-    }
-    // Mark new turn — next screen_update will create a fresh streaming card
-    ds.streamCardPending = true;
-    ds.currentTurnTitle = parsed.content.substring(0, 50);
-    persistStreamCardState(ds);
+    beginNewTurn(ds, parsed.content);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
@@ -806,7 +967,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // because worker=null at that point.
     const dsBotCfgForFork = getBot(ds.larkAppId).config;
     const selfBot = getBot(ds.larkAppId);
-    const wrappedPrompt = buildReforkPrompt(ds, parsed.content, {
+    const wrappedPrompt = buildReforkPrompt(ds, promptContent, {
       attachments,
       mentions: parsed.mentions,
       cliId: dsBotCfgForFork.cliId,
@@ -815,216 +976,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     });
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }
-}
-
-// ─── Bot-to-bot mention routing ───────────────────────────────────────────────
-
-interface BotMentionSignal {
-  rootMessageId: string;
-  chatId: string;
-  chatType?: string;
-  /** Sender session's routing scope; receivers use it to pick the right
-   *  activeSessions key. Older signals without this field default to 'thread'
-   *  (the legacy behaviour). */
-  scope?: 'thread' | 'chat';
-  senderAppId: string;
-  targetBotOpenId: string;
-  content: string;
-  messageId: string;
-  timestamp: number;
-}
-
-function processBotMentionSignal(signal: BotMentionSignal): void {
-  // Find the target bot by open_id
-  const targetBot = getAllBots().find(b => b.botOpenId === signal.targetBotOpenId);
-  if (!targetBot) {
-    logger.debug(`[bot-mention] No bot found for open_id ${signal.targetBotOpenId}`);
-    return;
-  }
-
-  // Cross-path dedup: WSClient may have already enqueued this turn. messageId
-  // is the canonical key (per-message, immune to ordering between WS push and
-  // fs watch).
-  if (isBotMentionMessageHandled(signal.messageId)) {
-    logger.debug(`[bot-mention] Signal-file path skipping ${signal.messageId.substring(0, 12)}: already handled by WSClient`);
-    return;
-  }
-
-  const targetAppId = targetBot.config.larkAppId;
-  // Anchor depends on sender's session scope: chat-scope sessions are keyed
-  // by chatId, thread-scope by rootMessageId.
-  const anchor = signal.scope === 'chat' ? signal.chatId : signal.rootMessageId;
-  const ds = activeSessions.get(sessionKey(anchor, targetAppId));
-
-  if (ds && ds.worker && !ds.worker.killed) {
-    // Target bot has an active session in this thread — send the message.
-    // Look up sender name from bots-info.json (each daemon only registers its own bot,
-    // so getAllBots() won't find other bots).
-    const senderName = lookupSenderName(signal.senderAppId);
-    const enrichedParts = [`[来自 ${senderName} 的 @mention]\n${signal.content}`];
-    if (!ds.adoptedFrom) {
-      const mentionBotCfg = getBot(ds.larkAppId).config;
-      const mentionAdapter = createCliAdapterSync(mentionBotCfg.cliId, mentionBotCfg.cliPathOverride);
-      if (!mentionAdapter.injectsSessionContext) {
-        enrichedParts.push(`Session ID: ${ds.session.sessionId}`);
-      }
-    }
-    const enrichedContent = enrichedParts.join('\n\n');
-    markSessionActivity(ds);
-    // Park the current streaming card so the new turn's POST can recall it.
-    // Without this the bot-to-bot mention path leaves old cards stranded —
-    // it bypasses the user-message freeze block in handleThreadReply.
-    parkStreamCard(ds);
-    ds.streamCardPending = true;
-    ds.currentTurnTitle = signal.content.substring(0, 50);
-    persistStreamCardState(ds);
-    markBotMentionMessageHandled(signal.messageId);
-    ds.worker.send({ type: 'message', content: enrichedContent } as DaemonToWorker);
-    logger.info(`[bot-mention] Routed message from ${signal.senderAppId} to ${targetAppId} (scope=${signal.scope ?? 'thread'}, anchor=${anchor.substring(0, 12)})`);
-    return;
-  }
-
-  // No active session. If the chat is part of an oncall workspace (this bot
-  // or any sibling has bound it), auto-spawn a new session pinned to the
-  // oncall workingDir. Lark WSClient does not deliver bot-sent events, so
-  // without this every bot-to-bot @mention into an oncall workspace where
-  // the target lacks an active session would silent-drop here.
-  const oncallEntry = findOncallChatForAnyBot(signal.chatId);
-  if (!oncallEntry) {
-    logger.debug(`[bot-mention] Target bot ${targetAppId} has no active worker at ${signal.scope ?? 'thread'}-scope anchor ${anchor.substring(0, 12)} and chat is not oncall-bound — leaving for WSClient auto-create path`);
-    return;
-  }
-  spawnSessionForBotMention(signal, targetBot, oncallEntry, anchor).catch(err => {
-    logger.error(`[bot-mention] Failed to auto-spawn session for target ${targetAppId}: ${err}`);
-  });
-}
-
-/** Look up sender bot's display name from bots-info.json. Each daemon only
- *  registers its own bot in getAllBots(), so cross-bot enrichment goes
- *  through the shared bots-info.json file. */
-function lookupSenderName(senderAppId: string): string {
-  try {
-    const infoPath = join(config.session.dataDir, 'bots-info.json');
-    if (!existsSync(infoPath)) return 'Bot';
-    const entries: Array<{ larkAppId: string; botName: string | null; cliId: string }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
-    const sender = entries.find(e => e.larkAppId === senderAppId);
-    if (!sender) return 'Bot';
-    return sender.botName ?? getCliDisplayName(sender.cliId as CliId);
-  } catch {
-    return 'Bot';
-  }
-}
-
-/** Auto-spawn a new session for a bot-mention signal landing in an oncall
- *  workspace where the target has no active session. Mirrors the auto-create
- *  path in handleThreadReply (workingDir pinned from the oncall binding,
- *  immediate forkWorker, no repo-selection card) — kept inline rather than
- *  shared so the bot-mention path stays free of the user-event scaffolding
- *  (mentions parsing, attachments, /command interception, etc.). */
-async function spawnSessionForBotMention(
-  signal: BotMentionSignal,
-  targetBot: BotState,
-  oncallEntry: OncallChat,
-  anchor: string,
-): Promise<void> {
-  const larkAppId = targetBot.config.larkAppId;
-  const chatType: 'group' | 'p2p' = signal.chatType === 'p2p' ? 'p2p' : 'group';
-  const scope: 'thread' | 'chat' = signal.scope ?? 'thread';
-  const title = signal.content.substring(0, 50);
-  // thread-scope: rootMessageId = anchor (real thread root). chat-scope: any
-  // value works as audit-only since routing keys off chatId.
-  const rootIdForStore = scope === 'thread' ? anchor : signal.messageId;
-  const session = sessionStore.createSession(signal.chatId, rootIdForStore, title, chatType);
-  const now = Date.now();
-  session.larkAppId = larkAppId;
-  session.lastMessageAt = new Date(now).toISOString();
-  session.scope = scope;
-  session.workingDir = oncallEntry.workingDir;
-  sessionStore.updateSession(session);
-
-  const senderName = lookupSenderName(signal.senderAppId);
-  const enrichedContent = `[来自 ${senderName} 的 @mention]\n${signal.content}`;
-
-  const botCfg = targetBot.config;
-  refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
-  const newDs: DaemonSession = {
-    session,
-    worker: null,
-    workerPort: null,
-    workerToken: null,
-    larkAppId,
-    chatId: signal.chatId,
-    chatType,
-    scope,
-    spawnedAt: Date.parse(session.createdAt) || now,
-    cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
-    lastMessageAt: now,
-    hasHistory: false,
-    pendingRepo: false,
-    workingDir: oncallEntry.workingDir,
-    currentTurnTitle: title,
-  };
-  activeSessions.set(sessionKey(anchor, larkAppId), newDs);
-  markBotMentionMessageHandled(signal.messageId);
-
-  const prompt = buildNewTopicPrompt(
-    enrichedContent,
-    session.sessionId,
-    botCfg.cliId,
-    botCfg.cliPathOverride,
-    [],
-    undefined,
-    await getAvailableBots(larkAppId, signal.chatId),
-    undefined,
-    { name: targetBot.botName, openId: targetBot.botOpenId },
-  );
-  forkWorker(newDs, prompt);
-  logger.info(`[bot-mention] Auto-spawned session for ${larkAppId} in oncall chat ${signal.chatId} (scope=${scope}, anchor=${anchor.substring(0, 12)}, dir=${oncallEntry.workingDir})`);
-}
-
-function isSignalForMe(signal: BotMentionSignal): boolean {
-  return getAllBots().some(b => b.botOpenId === signal.targetBotOpenId);
-}
-
-function startBotMentionWatcher(): void {
-  const signalDir = join(config.session.dataDir, 'bot-mentions');
-  if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
-
-  // Process any existing signal files (from before daemon started)
-  try {
-    for (const file of readdirSync(signalDir)) {
-      if (!file.endsWith('.json')) continue;
-      const filePath = join(signalDir, file);
-      try {
-        const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
-        if (!isSignalForMe(signal)) continue; // not for this daemon, leave for target
-        unlinkSync(filePath);
-        processBotMentionSignal(signal);
-      } catch (err) {
-        logger.debug(`[bot-mention] Failed to process signal ${file}: ${err}`);
-      }
-    }
-  } catch { /* ignore */ }
-
-  // Watch for new signal files
-  watch(signalDir, (event, filename) => {
-    if (event !== 'rename' || !filename?.endsWith('.json')) return;
-    const filePath = join(signalDir, filename);
-    // Small delay to ensure the file is fully written
-    setTimeout(() => {
-      try {
-        if (!existsSync(filePath)) return; // already processed or deleted
-        const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
-        if (!isSignalForMe(signal)) return; // not for this daemon, leave for target
-        unlinkSync(filePath);
-        processBotMentionSignal(signal);
-      } catch (err) {
-        logger.debug(`[bot-mention] Failed to process signal ${filename}: ${err}`);
-      }
-    }, 50);
-  });
-
-  logger.info(`[bot-mention] Watching for signals in ${signalDir}`);
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -1150,6 +1101,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.debug(`[${cfg.larkAppId}] Bot open_id probe failed (will retry): ${err.message}`);
     });
 
+    // Required-scope check: 启动后 best-effort 校验
+    // im:message.group_at_msg.include_bot:readonly。缺失会 logger.error +
+    // 私信 allowedUsers[0]。校验异步，跑失败不影响 daemon。
+    checkRequiredScopes(cfg.larkAppId).catch(err => {
+      logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
+    });
+
     // Start event dispatcher for this bot
     startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
       handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
@@ -1182,11 +1140,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
-
-  // Watch for bot-to-bot mention signals. Lark WSClient does not deliver
-  // events for bot-sent messages, so `botmux send --mention <other-bot>`
-  // writes a signal file that the daemon picks up and routes internally.
-  startBotMentionWatcher();
 
   // Graceful shutdown
   const shutdown = () => {

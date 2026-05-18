@@ -46,6 +46,11 @@ const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedUnlinkSync = vi.mocked(unlinkSync);
 
+function getExecFileCalls() {
+  return mockedExecFileSync.mock.calls
+    .filter(call => !(call[1] as string[]).includes('display-message'));
+}
+
 function spawnOpts() {
   return {
     cwd: '/tmp',
@@ -90,7 +95,7 @@ describe('TmuxPipeBackend input addressing', () => {
     mockedExecFileSync.mockClear();
     be.sendText('飞书消息');
 
-    const call = mockedExecFileSync.mock.calls[0];
+    const call = getExecFileCalls()[0];
     expect(call[0]).toBe('tmux');
     const args = call[1] as string[];
     const tIdx = args.indexOf('-t');
@@ -105,7 +110,7 @@ describe('TmuxPipeBackend input addressing', () => {
     mockedExecFileSync.mockClear();
     be.sendSpecialKeys('Enter');
 
-    const args = mockedExecFileSync.mock.calls[0][1] as string[];
+    const args = getExecFileCalls()[0][1] as string[];
     const tIdx = args.indexOf('-t');
     expect(args[tIdx + 1]).toBe('1:0.2');
     expect(args).toContain('Enter');
@@ -117,7 +122,7 @@ describe('TmuxPipeBackend input addressing', () => {
     mockedExecFileSync.mockClear();
     be.pasteText('multi\nline');
 
-    const calls = mockedExecFileSync.mock.calls;
+    const calls = getExecFileCalls();
     expect(calls[0][1]).toContain('load-buffer');
     expect((calls[0][2] as any).input).toBe('multi\nline');
 
@@ -132,7 +137,7 @@ describe('TmuxPipeBackend input addressing', () => {
     be.spawn('', [], spawnOpts());
     mockedExecFileSync.mockClear();
     be.write('hi');
-    const args = mockedExecFileSync.mock.calls[0][1] as string[];
+    const args = getExecFileCalls()[0][1] as string[];
     expect(args).toContain('-l');  // literal mode
     expect(args).toContain('hi');
   });
@@ -225,6 +230,80 @@ describe('TmuxPipeBackend.captureCurrentScreen', () => {
   });
 });
 
+describe('TmuxPipeBackend.captureViewport', () => {
+  it('uses no `-S`/`-E` flags so tmux returns viewport-only', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedExecSync
+      .mockReturnValueOnce('0\n' as any)
+      .mockReturnValueOnce('viewport line\n' as any);
+    const out = be.captureViewport();
+    expect(out).toBe('viewport line\r\n');
+    const captureCall = mockedExecSync.mock.calls.find(c => String(c[0]).includes('capture-pane'));
+    expect(captureCall).toBeDefined();
+    const cmd = String(captureCall![0]);
+    expect(cmd).toContain('-e');
+    expect(cmd).toContain('-p');
+    // Critically, no `-S` flag — otherwise -S -N pulls N scrollback rows
+    // on top of the viewport (tmux semantics) and the transient terminal
+    // ends up scrolled past the bottom.
+    expect(cmd).not.toContain('-S');
+    expect(cmd).not.toContain('-E');
+  });
+
+  it('still applies alt-buffer prefix when pane is in alt screen', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedExecSync
+      .mockReturnValueOnce('1\n' as any)
+      .mockReturnValueOnce('claude tui\n' as any);
+    const out = be.captureViewport();
+    expect(out.startsWith('\x1b[?1049h\x1b[H\x1b[2J')).toBe(true);
+    expect(out).toContain('claude tui\r\n');
+  });
+});
+
+describe('TmuxPipeBackend.getPaneSize', () => {
+  it('parses `#{pane_width} #{pane_height}` into {cols, rows}', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue('200 60\n' as any);
+    const size = be.getPaneSize();
+    expect(size).toEqual({ cols: 200, rows: 60 });
+    const cmd = String(mockedExecSync.mock.calls[0][0]);
+    expect(cmd).toContain('display-message');
+    expect(cmd).toContain("'#{pane_width} #{pane_height}'");
+  });
+
+  it('returns null when tmux errors (pane gone, server gone)', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockImplementation(() => { throw new Error('no server'); });
+    expect(be.getPaneSize()).toBeNull();
+  });
+
+  it('returns null on malformed output (NaN width/height)', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue('abc def\n' as any);
+    expect(be.getPaneSize()).toBeNull();
+  });
+
+  it('returns null after exited', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    be.kill();
+    expect(be.getPaneSize()).toBeNull();
+  });
+});
+
 describe('normaliseCaptureLineEndings', () => {
   it('handles mixed line endings idempotently', () => {
     expect(normaliseCaptureLineEndings('a\nb')).toBe('a\r\nb');
@@ -234,8 +313,93 @@ describe('normaliseCaptureLineEndings', () => {
   });
 });
 
+describe('TmuxPipeBackend managed session', () => {
+  it('creates detached session and applies botmux tmux options', () => {
+    const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
+    be.spawn('/bin/echo', ['hello'], spawnOpts());
+
+    const newSessionCall = mockedExecFileSync.mock.calls.find(call => {
+      const args = call[1] as string[];
+      return args.includes('new-session');
+    });
+    expect(newSessionCall).toBeDefined();
+    expect(newSessionCall![1]).toContain('-d');
+    expect(newSessionCall![1]).toContain('bmx-owned');
+
+    const optionCalls = mockedExecSync.mock.calls.map(c => String(c[0]));
+    expect(optionCalls.some(c => c.includes('set-option') && c.includes('status off'))).toBe(true);
+    expect(optionCalls.some(c => c.includes('set-option') && c.includes('mouse on'))).toBe(true);
+    expect(optionCalls.some(c => c.includes('set-option') && c.includes('history-limit 50000'))).toBe(true);
+    expect(optionCalls.some(c => c.includes('set-option') && c.includes('window-size largest'))).toBe(true);
+    expect(optionCalls.some(c => c.includes('set-option -s set-clipboard on'))).toBe(true);
+  });
+
+  it('resizes owned tmux sessions and only records adopted pane resize', () => {
+    const owned = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+    owned.resize(120, 40);
+    expect(mockedExecFileSync).toHaveBeenCalledWith('tmux', ['resize-window', '-t', 'bmx-owned', '-x', '120', '-y', '40'], expect.any(Object));
+
+    mockedExecFileSync.mockClear();
+    const adopted = new TmuxPipeBackend('0:2.0');
+    adopted.resize(100, 30);
+    expect(mockedExecFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe('TmuxPipeBackend lifecycle watcher', () => {
+  it('fires exit when the tmux pane disappears', () => {
+    vi.useFakeTimers();
+    try {
+      mockedExecSync.mockImplementation((cmd: any) => {
+        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) return '%1\n' as any;
+        return '' as any;
+      });
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecSync.mockImplementation((cmd: any) => {
+        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) {
+          throw new Error('no pane');
+        }
+        return '' as any;
+      });
+
+      vi.advanceTimersByTime(2_000);
+
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fires exit when tmux display-message succeeds with empty pane id', () => {
+    vi.useFakeTimers();
+    try {
+      mockedExecSync.mockImplementation((cmd: any) => {
+        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) return '%1\n' as any;
+        return '' as any;
+      });
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecSync.mockImplementation((cmd: any) => {
+        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) return '\n' as any;
+        return '' as any;
+      });
+
+      vi.advanceTimersByTime(2_000);
+
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('TmuxPipeBackend.kill', () => {
-  it('cancels pipe-pane subscription, unlinks the fifo, fires onExit', () => {
+  it('cancels pipe-pane subscription and unlinks the fifo without firing onExit', () => {
     const be = new TmuxPipeBackend('0:2.0');
     be.spawn('', [], spawnOpts());
     let exitFired = false;
@@ -253,7 +417,7 @@ describe('TmuxPipeBackend.kill', () => {
     expect(pipeCall).toContain("'0:2.0'");
 
     expect(mockedUnlinkSync).toHaveBeenCalledWith(expect.stringMatching(/botmux-pipe-.*\.fifo/));
-    expect(exitFired).toBe(true);
+    expect(exitFired).toBe(false);
   });
 
   it('is idempotent (second kill is a no-op)', () => {

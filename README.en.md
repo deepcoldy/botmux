@@ -71,78 +71,73 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ## 5-Minute Setup
 
+> 💡 **TL;DR**: run `botmux setup` and pick "scan-to-create" to finish Steps 1+2 in one shot (the official `@larksuiteoapi/node-sdk` device flow gives you the AppID/AppSecret). PersonalAgent apps come with event subscriptions and bot capability pre-configured, so only Step 4 (permissions) + Step 5 (optional redirect URL) + Step 6 (publish) require browser clicks; the setup wizard writes a JSON file with a one-line clipboard copy command and prints deep-links to each remaining step.
+
 ### Step 1: Create a Lark App
 
-Go to the [Lark Open Platform](https://open.larkoffice.com/app) and click "Create Custom App".
+**Recommended**: `botmux setup` → pick "1) Scan-to-create app". Scan with the Lark mobile app and the AppID/AppSecret are persisted automatically; no manual browser navigation. Falls back to manual paste on cancel/timeout/network error.
+
+> ⚠️ **Currently only Feishu (feishu.cn) tenants are supported.** If scan detects a Lark international (larksuite.com) tenant, setup aborts — the daemon runtime (Lark Client/WSClient/event-dispatcher) hasn't been wired up for the `larksuite.com` domain yet, so accepting Lark credentials would land users in a half-working state. A follow-up PR will add full Lark support.
+
+**Manual**: go to the [Lark Open Platform](https://open.larkoffice.com/app) and click "Create Custom App".
 
 ![Create App](docs/setup/create-app.png)
 
 ### Step 2: Get Credentials
 
+> The scan-to-create path completes this step automatically; skip to Step 3.
+
 Open the app details page → "Credentials & Basic Info", and copy the **App ID** and **App Secret**.
 
 ![Get Credentials](docs/setup/credentials.png)
 
-### Step 3: Add Permissions
-
-Go to "Permissions & Scopes" → "Batch Import/Export", and paste the following JSON to import all permissions at once:
-
-![Permissions](docs/setup/permissions.png)
-
-<details>
-<summary>Click to expand batch import JSON</summary>
-
-```json
-{
-  "scopes": {
-    "tenant": [
-      "contact:user.base:readonly",
-      "contact:user.id:readonly",
-      "im:chat:read",
-      "im:chat.members:bot_access",
-      "im:chat.members:read",
-      "im:message",
-      "im:message:readonly",
-      "im:message:send_as_bot",
-      "im:message:update",
-      "im:message.group_at_msg",
-      "im:message.group_at_msg:readonly",
-      "im:message.group_msg",
-      "im:message.p2p_msg:readonly",
-      "im:message.reactions:write_only",
-      "im:resource"
-    ]
-  }
-}
-```
-</details>
-
-### Step 4: Install & Start botmux
+### Step 3: Install & Start botmux
 
 ```bash
 # Install
 npm install -g botmux
 
-# Interactive setup — enter the App ID and App Secret from Step 2
+# Interactive setup — pick "1) Scan-to-create app" or "2) Paste AppID/Secret manually".
+# Credentials are validated with a tenant_access_token call before bots.json is written.
+# At the end of setup the wizard writes the full scope JSON to ~/.botmux/lark-scopes.json
+# and prints a one-line clipboard copy command for your platform.
 botmux setup
 
-# Start (must be running before configuring WebSocket subscription — Lark checks for an active connection)
+# Start (if you ever need to verify the event subscription, Lark requires the daemon to be running so it can detect the WebSocket connection)
+# Re-validates credentials before forking workers; missing scopes only WARN, do not block the daemon.
 botmux start
 ```
 
-### Step 5: Configure Event Subscription
+### Step 4: Add Permissions
 
-Back in the Lark Open Platform, go to "Events & Callbacks":
+Run the copy-to-clipboard command setup printed, then go to "Permissions & Scopes" → "Batch Import/Export" and paste. Submit for review — visibility "only me" auto-approves.
 
-1. **Subscription mode**: Click the edit icon, select "Receive events via persistent connection" (WebSocket) — requires botmux to be running so Lark can detect the connection
+![Permissions](docs/setup/permissions.png)
 
-![WebSocket subscription](docs/setup/event-websocket.png)
+The full JSON lives at `~/.botmux/lark-scopes.json` (also tracked in-repo at [src/setup/lark-scopes.json](src/setup/lark-scopes.json), kept in sync with the internal wiki, covers ~290 tenant + user scopes).
 
-2. **Add event**: Click "Add Event", search and add `im.message.receive_v1` (Receive messages v2.0)
+```bash
+# macOS (local)
+cat ~/.botmux/lark-scopes.json | pbcopy
+# Linux desktop (local X server)
+cat ~/.botmux/lark-scopes.json | xclip -selection clipboard
+# SSH / headless: just cat — selecting in your local terminal copies to your local clipboard
+cat ~/.botmux/lark-scopes.json
+# SSH via OSC 52 — write to local clipboard through terminal (iTerm2 / kitty / WezTerm / Alacritty / tmux 1.5+)
+base64 -w0 < ~/.botmux/lark-scopes.json | awk 'BEGIN{printf "\033]52;c;"}{printf "%s",$0}END{printf "\a"}'
+```
 
-![Add event](docs/setup/event-receive-msg.png)
+> Scan-created PersonalAgent apps have `im.message.receive_v1` + `card.action.trigger` subscribed and the bot capability enabled out of the box, per botmux maintainer testing. Lark hasn't documented this as stable behavior, so **if the bot receives no messages at all after setup**, see "Step 8: Troubleshoot — bot not receiving messages" below for a manual fallback.
 
-3. **Enable callback**: Switch to the "Callback Configuration" tab, turn on "Card action callback" (`card.action.trigger`)
+### Step 5: Add Redirect URL (optional)
+
+If you plan to use `/login` inside Lark to let botmux act on your behalf for docs / calendar / wiki / sheets, add a redirect URL under "Security Settings" → "Redirect URL":
+
+```
+http://127.0.0.1:9768/callback
+```
+
+Skip this step if you only need bot messaging.
 
 ### Step 6: Publish the App
 
@@ -158,7 +153,16 @@ Go to "Version Management & Release", click "Create Version" and publish. Set av
 
 ![Add bot to group](docs/setup/add-bot-to-group.png)
 
-### Step 8: Enable Boot-time Autostart (recommended)
+### Step 8: Troubleshoot — bot not receiving messages (fallback)
+
+PersonalAgent apps come with event subscriptions and bot capability pre-configured; in normal cases you don't touch this. If the bot **receives no messages at all** after setup (not even DMs), verify these two settings:
+
+- **Event subscription**: Open Platform → your app → Events & Callbacks → should be subscribed to `im.message.receive_v1` + `card.action.trigger`. If missing, add them manually. Subscription mode must be "Receive via persistent connection" (WebSocket), and the botmux daemon must be running.
+- **Bot capability**: Open Platform → your app → Features → Bot should be enabled (it is by default). Adjust name/avatar if needed.
+
+After verifying, restart: `botmux restart`.
+
+### Step 9: Enable Boot-time Autostart (recommended)
 
 Once the bot is sending and receiving messages cleanly, run:
 
@@ -252,7 +256,8 @@ When a CLI spawns inside a botmux session it automatically gets
 `~/.botmux/bin` on PATH plus a set of ready-to-use Skills:
 
 - `botmux send` — send a message to the current thread (text, images, files, @mention)
-- `botmux thread messages` — fetch thread history
+- `botmux history` — fetch session history (topic groups → in-thread, regular groups → whole chat)
+- `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s
 - `botmux schedule` — manage scheduled tasks
 
@@ -443,7 +448,8 @@ Run from inside a botmux-spawned CLI session — session context is auto-detecte
 |------------|-------------|
 | `botmux send [content]` | Send a message to the current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
 | `botmux bots list` | List bots in the current chat (includes `open_id` for `--mention`) |
-| `botmux thread messages [--limit N]` | Fetch thread message history (JSON) |
+| `botmux history [--limit N]` | Fetch session message history (JSON); topic groups → in-thread, regular groups → whole chat |
+| `botmux quoted <message_id>` | Fetch a single quoted message (JSON); the ID comes from the daemon-injected `[用户引用了消息 用 botmux quoted om_xxx 查看]` prefix |
 | `botmux schedule add <schedule> <prompt>` | Create a scheduled task bound to the current thread |
 | `botmux schedule list/remove/pause/resume/run` | Manage scheduled tasks |
 

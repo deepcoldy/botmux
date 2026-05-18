@@ -32,6 +32,43 @@ const BLANK_RE = /^\s*$/;
  *  mode 200-270). Bumping past 320 risks a >5MB canvas per screenshot. */
 const SNAPSHOT_COLS = 320;
 
+/**
+ * Read the current viewport of an xterm-headless Terminal as plain text.
+ *
+ * Extracted as a free function so transient renderers (capture-pane seeded)
+ * can reuse the same line-filtering + trimming logic without instantiating
+ * a full TerminalRenderer (which is built for long-lived buffer accumulation).
+ *
+ * `filter=true` drops the bare-prompt line and the input-echo line — the
+ * card text should show CLI output, not the live cursor reflection.
+ */
+export function readViewportText(
+  terminal: InstanceType<typeof Terminal>,
+  opts: { filter: boolean; readCols?: number; startY?: number; rows?: number },
+): string {
+  const buffer = terminal.buffer.active;
+  const readCols = Math.min(opts.readCols ?? SNAPSHOT_COLS, terminal.cols);
+  const baseY = opts.startY ?? buffer.baseY;
+  const rows = opts.rows ?? terminal.rows;
+  const endY = baseY + rows;
+
+  const lines: string[] = [];
+  for (let y = baseY; y < endY; y++) {
+    const line = buffer.getLine(y);
+    if (!line) continue;
+    const s = cleanBoxDrawing(line.translateToString(true, 0, readCols));
+    if (opts.filter && (BARE_PROMPT_RE.test(s) || INPUT_ECHO_RE.test(s))) continue;
+    lines.push(s);
+  }
+
+  if (opts.filter) {
+    while (lines.length > 0 && BLANK_RE.test(lines[0])) lines.shift();
+  }
+  while (lines.length > 0 && BLANK_RE.test(lines[lines.length - 1])) lines.pop();
+
+  return lines.join('\n');
+}
+
 export class TerminalRenderer {
   private terminal: InstanceType<typeof Terminal>;
   private lastHash = '';
@@ -68,26 +105,7 @@ export class TerminalRenderer {
   }
 
   private readViewport(filter: boolean): string {
-    const buffer = this.terminal.buffer.active;
-    const readCols = Math.min(SNAPSHOT_COLS, this.terminal.cols);
-    const baseY = buffer.baseY;
-    const endY = baseY + this.terminal.rows;
-
-    const lines: string[] = [];
-    for (let y = baseY; y < endY; y++) {
-      const line = buffer.getLine(y);
-      if (!line) continue;
-      const s = cleanBoxDrawing(line.translateToString(true, 0, readCols));
-      if (filter && (BARE_PROMPT_RE.test(s) || INPUT_ECHO_RE.test(s))) continue;
-      lines.push(s);
-    }
-
-    if (filter) {
-      while (lines.length > 0 && BLANK_RE.test(lines[0])) lines.shift();
-    }
-    while (lines.length > 0 && BLANK_RE.test(lines[lines.length - 1])) lines.pop();
-
-    return lines.join('\n');
+    return readViewportText(this.terminal, { filter });
   }
 
   resize(cols: number, rows: number): void {

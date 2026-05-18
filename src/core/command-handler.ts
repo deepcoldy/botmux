@@ -635,7 +635,7 @@ export async function handleCommand(
             break;
           }
           const resolvedPath = validation.resolvedPath;
-          const result = bindOncall(appId, chatId, target);
+          const result = await bindOncall(appId, chatId, target);
           if (!result.ok) {
             if (result.reason === 'bot_not_in_config') {
               await sessionReply(rootId, '⚠️ 无法在配置文件中找到当前机器人条目，绑定失败。');
@@ -657,17 +657,19 @@ export async function handleCommand(
         }
 
         if (sub === 'unbind' || sub === '解绑') {
-          const result = unbindOncall(appId, chatId);
+          const result = await unbindOncall(appId, chatId);
           if (!result.ok) {
-            if (result.reason === 'not_bound') {
-              await sessionReply(rootId, '当前群未绑定 oncall。');
-            } else {
-              await sessionReply(rootId, `⚠️ 解绑失败：${result.reason}`);
-            }
+            await sessionReply(rootId, `⚠️ 解绑失败：${result.reason}`);
             break;
           }
-          await sessionReply(rootId, '✅ 已解除 oncall 绑定。下次开新话题将恢复默认仓库选择卡片流程。');
-          logger.info(`[${t}] /oncall unbind chat=${chatId}`);
+          if (!result.wasBound) {
+            // Tombstone was still written — surface that softly so users
+            // understand subsequent default-oncall won't re-bind this chat.
+            await sessionReply(rootId, '当前群未绑定 oncall。（已记录解绑意图，default-oncall 不会再自动绑此群）');
+          } else {
+            await sessionReply(rootId, '✅ 已解除 oncall 绑定。下次开新话题将恢复默认仓库选择卡片流程。');
+          }
+          logger.info(`[${t}] /oncall unbind chat=${chatId} wasBound=${result.wasBound}`);
           break;
         }
 

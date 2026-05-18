@@ -6,6 +6,7 @@ import { logger } from '../utils/logger.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
+import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
@@ -370,16 +371,70 @@ ipcRoute('PUT', '/api/oncall/:chatId', async (req, res, p) => {
   catch (e: any) { return jsonRes(res, 400, { ok: false, error: `无法读取路径：${resolvedPath}（${e?.message ?? e}）` }); }
   if (!isDir) return jsonRes(res, 400, { ok: false, error: `路径不是目录：${resolvedPath}` });
 
-  const r = oncallStore.bindOncall(cachedLarkAppId, p.chatId, workingDir);
+  const r = await oncallStore.bindOncall(cachedLarkAppId, p.chatId, workingDir);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true, entry: r.entry, created: r.created, resolvedPath });
 });
 
 ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  const r = oncallStore.unbindOncall(cachedLarkAppId, p.chatId);
-  if (!r.ok) return jsonRes(res, r.reason === 'not_bound' ? 404 : 400, r);
-  jsonRes(res, 200, { ok: true });
+  // Idempotent: always succeeds. unbindOncall writes a tombstone into
+  // defaultOncallAutoboundChats so the auto-bind judge won't reinstate this
+  // chat on the next observation, even if it had no prior binding.
+  const r = await oncallStore.unbindOncall(cachedLarkAppId, p.chatId);
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true, wasBound: r.wasBound });
+});
+
+// ─── Per-bot defaultOncall (dashboard) ─────────────────────────────────────
+// GET  /api/bot-default-oncall → returns this daemon's current config
+// PUT  /api/bot-default-oncall  body: { enabled, workingDir }
+//
+// Forward-only policy: enabling does not backfill or distinguish "old vs new"
+// chats. Any group the bot is in — present or future — auto-binds on its
+// next observed topic if it has no existing oncall binding and is not in
+// the tombstone list. `since` is stamped purely as informational metadata
+// (UI shows "上次启用时间").
+
+ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
+  jsonRes(res, 200, {
+    larkAppId: cachedLarkAppId,
+    botName: getBotName(),
+    defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
+    autoboundChatCount: autoboundChats.length,
+  });
+});
+
+ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { enabled?: unknown; workingDir?: unknown };
+  try { body = await readJsonBody<{ enabled?: boolean; workingDir?: string }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const enabled = body.enabled === true;
+  const workingDir = typeof body.workingDir === 'string' ? body.workingDir.trim() : '';
+
+  // Validate workingDir when enabling. Allow blank workingDir only when
+  // disabling — the on-disk record keeps the last value so the UI can
+  // round-trip after a disable.
+  let resolvedPath = '';
+  if (enabled) {
+    if (!workingDir) return jsonRes(res, 400, { ok: false, error: 'workingDir_required' });
+    resolvedPath = resolve(expandHome(workingDir));
+    if (!existsSync(resolvedPath)) {
+      return jsonRes(res, 400, { ok: false, error: `目录不存在：${resolvedPath}` });
+    }
+    let isDir = false;
+    try { isDir = statSync(resolvedPath).isDirectory(); }
+    catch (e: any) { return jsonRes(res, 400, { ok: false, error: `无法读取路径：${resolvedPath}（${e?.message ?? e}）` }); }
+    if (!isDir) return jsonRes(res, 400, { ok: false, error: `路径不是目录：${resolvedPath}` });
+  }
+
+  const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled, workingDir });
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true, defaultOncall: r.defaultOncall, resolvedPath: resolvedPath || undefined });
 });
 
 // Create a brand-new chat with this bot as creator/owner and `larkAppIds` as
@@ -423,57 +478,15 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
     ? body.notifyOwnerOpenId.trim()
     : null;
   try {
-    const r = await groupsStore.createChat(cachedLarkAppId, {
+    const r = await createGroupWithBots({
+      creatorLarkAppId: cachedLarkAppId,
+      larkAppIds: body.larkAppIds as string[],
       name,
-      botIds: body.larkAppIds as string[],
-      userIds,
+      userOpenIds: userIds,
+      transferOwnerTo: transferTo ?? undefined,
+      notifyOwnerOpenId: notifyTo ?? undefined,
     });
-    let ownerTransferredTo: string | null = null;
-    let transferError: string | null = null;
-    if (transferTo) {
-      // Skip transfer if Feishu rejected the invite — transferring to a
-      // non-member returns "user not in chat" anyway.
-      if (r.invalidUserIds.includes(transferTo)) {
-        transferError = 'invitee_rejected';
-      } else {
-        const tr = await groupsStore.transferChatOwner(cachedLarkAppId, r.chatId, transferTo);
-        if (tr.ok) ownerTransferredTo = transferTo;
-        else transferError = tr.error;
-      }
-    }
-    // Send a bare @-mention into the new chat so the operator gets a Feishu
-    // push notification — that's the most reliable way to make the chat
-    // surface in their sidebar (membership alone isn't always enough on
-    // mobile). Skipped if invite was rejected (non-member) or no notifyTo.
-    let notifyMessageId: string | null = null;
-    let notifyError: string | null = null;
-    if (notifyTo) {
-      if (r.invalidUserIds.includes(notifyTo)) {
-        notifyError = 'invitee_rejected';
-      } else {
-        try {
-          notifyMessageId = await sendMessage(
-            cachedLarkAppId,
-            r.chatId,
-            `<at user_id="${notifyTo}"></at>`,
-            'text',
-          );
-        } catch (e: any) {
-          notifyError = e?.message ?? String(e);
-        }
-      }
-    }
-    jsonRes(res, 200, {
-      ok: true,
-      chatId: r.chatId,
-      invalidBotIds: r.invalidBotIds,
-      invalidUserIds: r.invalidUserIds,
-      creator: cachedLarkAppId,
-      ownerTransferredTo,
-      transferError,
-      notifyMessageId,
-      notifyError,
-    });
+    jsonRes(res, 200, r);
   } catch (e) {
     jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });
   }

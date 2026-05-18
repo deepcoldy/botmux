@@ -20,7 +20,7 @@ pnpm daemon:logs          # 查看日志
 - `bot-registry.ts` — 多机器人配置加载 + 状态管理
 - `config.ts` — 全局配置
 - `adapters/cli/` — CLI 适配器（参数构建、输入写入、Skill 目录），每种 CLI 一个文件
-- `skills/` — 开箱即用的 Skill 定义（`botmux-send`/`botmux-schedule`/`botmux-bots`/`botmux-thread-messages`）+ installer
+- `skills/` — 开箱即用的 Skill 定义（`botmux-send`/`botmux-schedule`/`botmux-bots`/`botmux-history`/`botmux-quoted`）+ installer
 - `adapters/backend/` — 会话后端：`PtyBackend`、`TmuxBackend`
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
 - `core/` — `worker-pool`、`command-handler`、`session-manager`、`cost-calculator`、`scheduler`

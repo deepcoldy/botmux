@@ -115,22 +115,26 @@ describe('findCocoSessionByPid', () => {
     expect(findCocoSessionByPid(1.5 as any)).toBeUndefined();
   });
 
-  it('returns undefined when /proc/<pid>/fd is unavailable', async () => {
+  it('returns undefined for a pid with no discoverable open coco fds', async () => {
     const { findCocoSessionByPid } = await import('../src/services/coco-transcript.js');
-    // pid 99999999 is essentially guaranteed not to exist on the test host;
-    // covers the "fdDir doesn't exist" branch without needing /proc mocking.
+    // pid 99999999 在测试主机上几乎保证不存在；Linux 走 /proc 时 fdDir
+    // 不存在直接返回 undefined，macOS / 其他平台走 lsof，对不存在的 pid
+    // 也会非零退出 → undefined。一条断言兜两条路径，避免 OS 分叉。
     expect(findCocoSessionByPid(99999999)).toBeUndefined();
   });
 });
 
 describe('cocoEventsPathForSession', () => {
-  it('builds the events.jsonl path under ~/.cache/coco/sessions/<sid>/', async () => {
+  it('builds the events.jsonl path under the platform-appropriate coco sessions dir', async () => {
     const { cocoEventsPathForSession } = await import('../src/services/coco-transcript.js');
     const sid = '8db7d911-96f3-4764-a310-e42ae4cb626f';
     const out = cocoEventsPathForSession(sid);
-    // Don't pin to a literal homedir — different test hosts. Just assert
-    // the structural shape every caller in the codebase relies on.
-    expect(out).toMatch(/\/\.cache\/coco\/sessions\/[0-9a-f-]{36}\/events\.jsonl$/);
+    // macOS 走 ~/Library/Caches/coco/sessions/<sid>/events.jsonl，Linux 走
+    // ~/.cache/coco/sessions/<sid>/events.jsonl —— 两种形态都接受，否则跨
+    // 平台 CI / 本地一边绿一边红。
+    expect(out).toMatch(
+      /(?:\/\.cache\/coco\/sessions\/|\/Library\/Caches\/coco\/sessions\/)[0-9a-f-]{36}\/events\.jsonl$/,
+    );
     expect(out).toContain(sid);
   });
 });

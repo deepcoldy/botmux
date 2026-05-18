@@ -72,33 +72,48 @@ function save(): void {
 }
 
 /**
- * Record `Date.now()` for each chatId not yet known, return the full map of
- * (chatId → firstSeenAt) for the requested ids. Batches the write so a fresh
- * 44-chat listChats only hits disk once.
+ * Per-chat result of a markSeen call. `preexisting=false` means we stamped
+ * this chat for the first time in *this* call — callers that need provenance
+ * (e.g. the defaultOncall auto-bind judge) must treat freshly-stamped chats
+ * as "unknown age" rather than "new", because a missed backfill manifests
+ * exactly the same way as a real first observation.
  */
-export function markSeenBulk(chatIds: readonly string[]): Map<string, number> {
-  // Safe no-op when init() hasn't been called yet (e.g. dashboard IPC server
-  // spun up in a test without a daemon backing it). Returning an empty map
-  // lets the /api/groups handler degrade to `firstSeenAt: null` instead of
-  // 502'ing the whole response.
+export interface SeenEntry { firstSeenAt: number; preexisting: boolean }
+
+/**
+ * Record `Date.now()` for each chatId not yet known, return per-chat
+ * (firstSeenAt, preexisting) for the requested ids. Batches the write so a
+ * fresh 44-chat listChats only hits disk once. Empty map is returned when
+ * the store hasn't been init()'d (test harnesses that spin the IPC server up
+ * without a daemon backing it).
+ */
+export function markSeenBulkDetailed(chatIds: readonly string[]): Map<string, SeenEntry> {
   if (!currentAppId) return new Map();
   load();
   const now = Date.now();
   let dirty = false;
+  const out = new Map<string, SeenEntry>();
   for (const id of chatIds) {
-    if (!firstSeen.has(id)) {
+    const prior = firstSeen.get(id);
+    if (prior !== undefined) {
+      out.set(id, { firstSeenAt: prior, preexisting: true });
+    } else {
       firstSeen.set(id, now);
       dirty = true;
+      out.set(id, { firstSeenAt: now, preexisting: false });
     }
   }
   if (dirty) {
     try { save(); }
     catch (err) { logger.error(`[chat-first-seen] save failed: ${err}`); }
   }
+  return out;
+}
+
+/** Back-compat shim — same semantics as before, returns only the timestamps. */
+export function markSeenBulk(chatIds: readonly string[]): Map<string, number> {
+  const detailed = markSeenBulkDetailed(chatIds);
   const out = new Map<string, number>();
-  for (const id of chatIds) {
-    const ts = firstSeen.get(id);
-    if (ts !== undefined) out.set(id, ts);
-  }
+  for (const [id, e] of detailed) out.set(id, e.firstSeenAt);
   return out;
 }

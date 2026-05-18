@@ -202,7 +202,7 @@ describe('PUT/DELETE /api/oncall/:chatId', () => {
 
   it('PUT happy path forwards to bindOncall and echoes resolvedPath', async () => {
     setLarkAppId('test-app');
-    const spy = vi.spyOn(oncallStore, 'bindOncall').mockReturnValue({
+    const spy = vi.spyOn(oncallStore, 'bindOncall').mockResolvedValue({
       ok: true,
       entry: { chatId: 'oc_1', workingDir: '/tmp' },
       created: true,
@@ -225,7 +225,7 @@ describe('PUT/DELETE /api/oncall/:chatId', () => {
 
   it('DELETE happy path forwards to unbindOncall', async () => {
     setLarkAppId('test-app');
-    const spy = vi.spyOn(oncallStore, 'unbindOncall').mockReturnValue({ ok: true });
+    const spy = vi.spyOn(oncallStore, 'unbindOncall').mockResolvedValue({ ok: true, wasBound: true });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/oncall/oc_1`, {
       method: 'DELETE',
@@ -233,23 +233,29 @@ describe('PUT/DELETE /api/oncall/:chatId', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
+    expect(body.wasBound).toBe(true);
     expect(spy).toHaveBeenCalledWith('test-app', 'oc_1');
     spy.mockRestore();
   });
 
-  it('DELETE returns 404 when chat is not bound', async () => {
+  it('DELETE is idempotent — succeeds even when chat was not bound, and surfaces wasBound=false', async () => {
+    // Updated semantics: unbind on a not-bound chat is no longer an error,
+    // because unbindOncall always writes a tombstone into
+    // defaultOncallAutoboundChats so the auto-bind judge won't reinstate
+    // the chat. The route reflects that with 200 + wasBound:false.
     setLarkAppId('test-app');
-    const spy = vi.spyOn(oncallStore, 'unbindOncall').mockReturnValue({
-      ok: false,
-      reason: 'not_bound',
+    const spy = vi.spyOn(oncallStore, 'unbindOncall').mockResolvedValue({
+      ok: true,
+      wasBound: false,
     });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/oncall/oc_1`, {
       method: 'DELETE',
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.reason).toBe('not_bound');
+    expect(body.ok).toBe(true);
+    expect(body.wasBound).toBe(false);
     spy.mockRestore();
   });
 });

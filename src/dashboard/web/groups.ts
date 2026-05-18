@@ -48,6 +48,25 @@ export function allExpectedInChat(row: any, expectedBotIds: Set<string>): boolea
   return true;
 }
 
+/** Render the bot-picker checkboxes shared by "Create new group" and
+ *  "Add bots". Always iterates `bots` in its given order (the aggregator
+ *  hands cache.bots back sorted by botIndex), so both modals show the
+ *  same order. `excludeIds` removes bots that are already in the chat
+ *  for the Add-bots flow. Exported for tests. */
+export function renderBotCheckboxes(
+  bots: Array<{ larkAppId: string; botName?: string }>,
+  excludeIds?: Set<string>,
+): string {
+  return bots
+    .filter(b => !excludeIds || !excludeIds.has(b.larkAppId))
+    .map(b => `
+      <label class="checkbox-row">
+        <input type="checkbox" name="bot" value="${escapeHtml(b.larkAppId)}">
+        ${escapeHtml(b.botName ?? b.larkAppId)} <small>(${escapeHtml(b.larkAppId)})</small>
+      </label>
+    `).join('');
+}
+
 export async function renderGroupsPage(root: HTMLElement) {
   root.innerHTML = PAGE_HTML;
   const head = root.querySelector<HTMLElement>('#g-head')!;
@@ -83,12 +102,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           </label>
           <fieldset>
             <legend>Bots</legend>
-            ${allBots.map((b: any) => `
-              <label class="checkbox-row">
-                <input type="checkbox" name="bot" value="${escapeHtml(b.larkAppId)}">
-                ${escapeHtml(b.botName ?? b.larkAppId)} <small>(${escapeHtml(b.larkAppId)})</small>
-              </label>
-            `).join('')}
+            ${renderBotCheckboxes(allBots)}
           </fieldset>
           <div class="actions">
             <button type="submit">Create</button>
@@ -305,7 +319,13 @@ export async function renderGroupsPage(root: HTMLElement) {
     const chatId = tr.dataset.chat!;
     const chat = cache.chats.find(c => c.chatId === chatId);
     if (!chat) return;
-    const missing = chat.memberBots.filter((m: any) => !m.inChat);
+    // Iterate cache.bots (botIndex-sorted by the aggregator) so this modal's
+    // order matches "Create new group" exactly. memberBots is only used to
+    // compute which bots to hide as already-in-chat.
+    const inChatSet = new Set<string>(
+      chat.memberBots.filter((m: any) => m.inChat).map((m: any) => m.larkAppId),
+    );
+    const missing = cache.bots.filter((b: any) => !inChatSet.has(b.larkAppId));
     if (!missing.length) {
       alert('All configured bots are already in this chat.');
       return;
@@ -315,12 +335,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         <header><h3>Add bots to ${escapeHtml(chat.name ?? chat.chatId)}</h3></header>
         <p>Select bots to add. The dashboard will pick a bot that's already in the chat as the proxy.</p>
         <form id="g-addform">
-          ${missing.map((m: any) => `
-            <label class="checkbox-row">
-              <input type="checkbox" name="bot" value="${escapeHtml(m.larkAppId)}">
-              ${escapeHtml(m.botName ?? m.larkAppId)} <small>(${escapeHtml(m.larkAppId)})</small>
-            </label>
-          `).join('')}
+          ${renderBotCheckboxes(cache.bots, inChatSet)}
           <div class="actions">
             <button type="submit">Confirm add</button>
             <button type="button" id="g-cancel">Cancel</button>

@@ -25,8 +25,8 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
-import { loadOncallChatsByApp, pickBotEntryByName } from './utils/bot-routing.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
+import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
@@ -39,6 +39,7 @@ import {
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
 import { logger } from './utils/logger.js';
+import { firstPositional } from './cli/arg-utils.js';
 
 // CLI subcommands (send/thread/bots/list/etc) print JSON to stdout for
 // callers to parse. Transitive logger.info calls from shared modules would
@@ -125,11 +126,6 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
   }
 }
 
-function writeBotsJson(bots: any[]): void {
-  ensureUniqueBotProcessNames(bots);
-  writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
-}
-
 function ecosystemConfig(): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
@@ -192,31 +188,216 @@ function printInputHelp(title: string, lines: string[]): void {
   }
 }
 
-function printLarkPermissions(): void {
-  console.log('请先在飞书开放平台创建应用: https://open.feishu.cn/app\n');
-  console.log('需要的权限:');
-  console.log('  - im:message (发送/接收消息)');
-  console.log('  - im:message.group_at_msg (群消息)');
-  console.log('  - im:resource (文件下载)');
-  console.log('  - im:chat (群信息)');
-  console.log('  - contact:user.base:readonly (用户信息)\n');
-  console.log('启用事件订阅 (WebSocket 模式):');
-  console.log('  - im.message.receive_v1');
-  console.log('  - card.action.trigger\n');
+// Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
+// the same name without passing BOTS_JSON_FILE explicitly each time.
+function writeBotsJsonAtomic(bots: any[]): void {
+  const normalized = bots.map(bot => normalizeBotConfig(bot));
+  ensureUniqueBotProcessNames(normalized);
+  writeBotsAtomic(BOTS_JSON_FILE, normalized);
 }
 
-async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any>> {
-  printInputHelp('LARK_APP_ID', [
-    '飞书开放平台应用的 App ID，用来区分是哪一个机器人接收事件。',
-    '在应用凭证页复制，通常以 cli_ 开头。',
-  ]);
-  const appId = await ask(rl, 'LARK_APP_ID: ');
+/**
+ * 从 bot 配置里取 brand. 旧的 bots.json (1.0 之前) 没这个字段, default 到 feishu
+ * 保留向后兼容. cmdStart 凭证校验 + printRemainingSteps 深链都靠它选 host.
+ */
+function botBrand(b: any): 'feishu' | 'lark' {
+  return b?.brand === 'lark' ? 'lark' : 'feishu';
+}
 
-  printInputHelp('LARK_APP_SECRET', [
-    '同一个飞书应用的 App Secret，用来建立长连接和调用飞书接口。',
-    `会保存在本机 ${BOTS_JSON_FILE}，不要粘贴到公开位置。`,
-  ]);
-  const appSecret = await ask(rl, 'LARK_APP_SECRET: ');
+/**
+ * 把 botmux 推荐的完整 scope JSON (从 src/setup/lark-scopes.json) 写到
+ * 用户配置目录, 同时给出跨平台一键复制命令. JSON 长 (293 项, 297 行),
+ * terminal 直接打印用户也复制不了, 写文件 + pbcopy/xclip 才是顺手的姿势.
+ *
+ * Returns: 写出的 JSON 文件绝对路径.
+ */
+function writeScopesJsonToConfigDir(): string {
+  // build script 会把 src/setup/lark-scopes.json copy 到 dist/setup/.
+  // dist 模式下 __dirname 是 dist/, 找 ./setup/lark-scopes.json; dev (tsx)
+  // 模式找 src/setup/lark-scopes.json 在源码同目录也成立.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const srcCandidates = [
+    join(here, 'setup', 'lark-scopes.json'),
+    join(here, '..', 'src', 'setup', 'lark-scopes.json'),
+  ];
+  let scopesPath = srcCandidates[0];
+  for (const p of srcCandidates) {
+    if (existsSync(p)) { scopesPath = p; break; }
+  }
+  const destPath = join(CONFIG_DIR, 'lark-scopes.json');
+  copyFileSync(scopesPath, destPath);
+  return destPath;
+}
+
+function printCopyHint(filePath: string): void {
+  // 环境感知: SSH/headless 没有 X server, xclip 一定报 "Can't open display".
+  // 这种场景下"剪贴板"在用户本地 (运行 SSH 客户端的那台机器), 远程机上能做的:
+  //   - 直接 cat, 让用户在本地 terminal 鼠标选中 (SSH 选中即写本地剪贴板)
+  //   - OSC 52: terminal app 代写本地剪贴板, iTerm2 / kitty / WezTerm /
+  //     Alacritty / tmux 1.5+ 都支持, gnome-terminal / Terminal.app 不支持
+  // 检测 DISPLAY (X11) 或 WAYLAND_DISPLAY 都没有, 或 SSH_* 环境变量存在
+  // → 当作 SSH 场景, 不推荐 xclip / pbcopy.
+  const isSsh = !!(process.env.SSH_CONNECTION || process.env.SSH_CLIENT || process.env.SSH_TTY);
+  const hasLocalGui = !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY) && !isSsh;
+  const isMacLocal = process.platform === 'darwin' && !isSsh;
+
+  console.log('  把 JSON 内容拷到本地剪贴板, 然后到飞书"批量导入/导出权限"页粘贴:');
+  if (isMacLocal) {
+    console.log(`    macOS 本地:  cat ${filePath} | pbcopy`);
+  } else if (hasLocalGui) {
+    console.log(`    Linux 本地 (X 服务器):  cat ${filePath} | xclip -selection clipboard`);
+  } else {
+    // SSH / headless: 鼠标选中是最稳的, OSC 52 作为高级选项
+    console.log(`    SSH 终端鼠标选中复制:  cat ${filePath}`);
+    console.log('       (终端把选中的字符直接写到你本地剪贴板, 不依赖远端剪贴板工具)');
+    console.log(`    或 OSC 52 (兼容 iTerm2 / kitty / WezTerm / Alacritty / tmux 1.5+):`);
+    console.log(`       base64 -w0 < ${filePath} | awk 'BEGIN{printf "\\033]52;c;"}{printf "%s",$0}END{printf "\\a"}'`);
+  }
+  console.log('');
+}
+
+function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
+  // 数据源: 飞书内部 wiki UBOXwH01CixfxfkqxUpcKgvQnsg "[Botmux] 5分钟创建一个
+  // 真正好用的飞书助理" 的"权限申请"段, 加 botmux 维护者实测确认 PersonalAgent
+  // 应用扫码建出来时已经默认订阅 im.message.receive_v1 / card.action.trigger
+  // 事件并开通 bot 能力. 但 lark-channel-bridge README 当前仍要求用户手动补
+  // 事件订阅, 跟我们结论不一致 — 不排除飞书最近升级了 PersonalAgent 预配 (那个
+  // README 是旧版), 也不排除存在租户/版本差异让某些用户的 PersonalAgent 没预配.
+  //
+  // 折中: 主线流程只列"必须手动"的两步 (权限 + 重定向 URL), 末尾再给"如果
+  // bot 收不到消息" 的兜底 fallback 链接, 让用户能自查事件订阅 / bot 能力.
+  const host = brand === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn';
+  const home = `https://${host}/app/${appId}`;
+  let scopesJsonPath = '';
+  try {
+    scopesJsonPath = writeScopesJsonToConfigDir();
+  } catch (err) {
+    // 不应阻止 setup 完成, 只 WARN
+    console.log(`\n⚠️  写权限 JSON 失败 (${(err as Error).message}), 请手动从仓库源码 src/setup/lark-scopes.json 拷.`);
+  }
+
+  console.log('\n⚠️  扫码 / 粘贴只完成了"建应用 + 拿凭证". 还有这些步骤要在开放平台浏览器里点:\n');
+
+  console.log('  1. 申请权限 (一次性导入完整 JSON 提交审批)');
+  console.log(`     深链: ${home}/auth → 进入「权限管理」→「批量导入/导出权限」→ 粘贴 → 提交`);
+  if (scopesJsonPath) {
+    console.log(`     权限 JSON: ${scopesJsonPath}`);
+    printCopyHint(scopesJsonPath);
+  }
+  console.log('');
+
+  console.log('  2. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 调云文档/日历等)');
+  console.log(`     深链: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
+  console.log('     填入: http://127.0.0.1:9768/callback');
+  console.log('     不打算用 `/login` 跨用户调 API 的话, 这一步可以跳过.\n');
+
+  console.log('  完成后 `botmux start` (或 `botmux restart`)，启动检查不会卡住，');
+  console.log('  缺权限只 WARN，去开放平台补齐后 daemon 自动恢复。\n');
+
+  // Fallback 自查清单 — 维护者实测 PersonalAgent 默认配好下面两项, 但飞书
+  // 没承诺过这是稳定行为. 收不到消息时让用户能自查.
+  console.log('  ─── 如果机器人配置好后收不到消息, 自查下面两点 ───');
+  console.log('  a. 事件订阅: PersonalAgent 默认订阅 im.message.receive_v1 + card.action.trigger,');
+  console.log(`     如缺失, 请到 ${home}/dev-config/event-sub 手动添加`);
+  console.log('  b. 机器人能力: PersonalAgent 默认已开通,');
+  console.log(`     如缺失, 请到 ${home}/feature/bot 启用 (应用功能 → 机器人)`);
+  console.log('');
+}
+
+/**
+ * 让用户选"扫码建应用"还是"手动粘 AppID/Secret".
+ *
+ * 默认走扫码: 调 SDK `registerApp` → 拿 client_id/client_secret. 失败 (用户拒绝/
+ * 超时/网络/取消) 一律降级到手动, 不阻塞流程.
+ *
+ * Codex review 边界:
+ * - secret 不进 argv / 日志 / 错误链 (registerApp 内部 safeMsg 已做; 手动模式下
+ *   AppSecret 通过 rl.question 异步读取, 不会出现在 process.argv)
+ * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
+ */
+async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
+  | { ok: true; appId: string; appSecret: string; brand: 'feishu' | 'lark'; userOpenId?: string }
+  | { ok: false; reason: 'cancelled' | 'lark_unsupported' }
+> {
+  console.log('── 飞书应用建立 ──\n');
+  console.log('1) 扫码建应用（推荐，一步拿到 AppID/Secret，需要飞书 App 扫码）');
+  console.log('2) 手动粘 AppID/Secret（已经在开放平台创建好应用了）\n');
+  const choice = (await ask(rl, '选择 [1]: ')).trim();
+
+  if (choice !== '2') {
+    // 动态导入避免冷启动加载 SDK
+    const { tryRegisterApp } = await import('./setup/register-app.js');
+    const result = await tryRegisterApp();
+    if (result.ok) {
+      // Lark 国际版需要 daemon 链路全程走 larksuite.com 域 (Client domain /
+      // WSClient / event-dispatcher 的 fetch URL / scope 深链 host). 当前
+      // botmux runtime 这几处都硬编码 feishu.cn, 所以即使扫码成功了也无法
+      // 真正跑起来. 干净做法是 setup 阶段就拒绝, 让用户用 feishu 租户. 单
+      // 独 PR 完整接入 lark 后再去掉这个分支.
+      if (result.brand === 'lark') {
+        console.log(`\n❌ 检测到 Lark 国际版 (larksuite.com) 租户。`);
+        console.log(`   botmux 当前 daemon 运行链路仅支持飞书 (feishu.cn) 租户,`);
+        console.log(`   Lark 国际版完整接入会在单独 PR 跟进 (BotConfig / Client domain /`);
+        console.log(`   WSClient / event-dispatcher 等需要一并支持).`);
+        console.log(`   请用飞书 (feishu.cn) 租户重试 setup。\n`);
+        return { ok: false, reason: 'lark_unsupported' };
+      }
+      console.log(`\n✅ 应用创建成功`);
+      console.log(`   App ID: ${result.appId}`);
+      console.log(`   租户类型: ${result.brand}`);
+      if (result.userOpenId) {
+        console.log(`   扫码人 open_id: ${result.userOpenId}（将默认作为 allowedUsers）`);
+      }
+      return {
+        ok: true,
+        appId: result.appId,
+        appSecret: result.appSecret,
+        brand: result.brand,
+        userOpenId: result.userOpenId,
+      };
+    }
+    console.log(`\n⚠️  扫码失败 (${result.error}): ${result.message}`);
+    if (result.error === 'aborted') {
+      // 用户主动取消整个 setup, 不再问手动 fallback
+      return { ok: false, reason: 'cancelled' };
+    }
+    console.log('   降级到手动输入 AppID/Secret。\n');
+  } else {
+    console.log('\n请在浏览器打开 https://open.feishu.cn/app 创建应用，然后回来粘 ID/Secret。\n');
+  }
+
+  // 手动 fallback. 不再提问租户类型 — 当前 daemon runtime 只支持 feishu,
+  // 让用户选 lark 是误导. 等 lark 完整接入再加回来.
+  const appId = (await ask(rl, 'AppID (cli_xxx): ')).trim();
+  const appSecret = (await ask(rl, 'AppSecret: ')).trim();
+
+  if (!appId || !appSecret) {
+    console.log('\n❌ AppID/AppSecret 不能为空，setup 中止。');
+    return { ok: false, reason: 'cancelled' };
+  }
+  return { ok: true, appId, appSecret, brand: 'feishu' };
+}
+
+/**
+ * 收集一个机器人完整配置 (凭证 + CLI/工作目录/allowedUsers).
+ *
+ * 顺序: 拿凭证 → tenant_access_token 验证 → 通过才返回 bot 对象. 验证失败
+ * 直接返回 null, 调用方负责"不写 bots.json". Codex review 边界 #2.
+ */
+async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any> | null> {
+  const creds = await obtainCredentials(rl);
+  if (!creds.ok) return null;
+
+  // 凭证立刻验证. 通不过不写 bots.json.
+  console.log('\n校验凭证（取 tenant_access_token）…');
+  const { validateCredentials } = await import('./setup/verify-permissions.js');
+  const v = await validateCredentials(creds.appId, creds.appSecret, creds.brand);
+  if (!v.ok) {
+    console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
+    console.log('   不写 bots.json。请重新运行 botmux setup。');
+    return null;
+  }
+  console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
   printInputHelp('botmux status 显示名称', [
     '可选。用于本机 PM2 进程名，方便在 botmux status / logs 中识别机器人。',
@@ -224,26 +405,36 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   ]);
   const name = (await ask(rl, 'botmux status 显示名称（可选，如 codex-main；实际显示 botmux-codex-main）: ')).trim();
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
-  printInputHelp('CLI 适配器', [
-    '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
-  ]);
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   const cliId = CLI_ID_CHOICES[cliChoice] ?? (cliChoice || 'claude-code');
-
-  printInputHelp('默认工作目录', [
-    '可选。新会话默认进入的目录，适合填写常用项目根目录或项目集合目录。',
-    '留空时默认使用 ~；也可以用逗号分隔多个候选目录。',
-  ]);
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
 
-  printInputHelp('允许的用户', [
-    '可选。限制哪些飞书用户可以操作机器人，支持邮箱前缀或 open_id，多个值用逗号分隔。',
-    '留空表示不限制；oncall 群绑定仍会按现有逻辑处理群内提问。',
-  ]);
-  const allowedUsers = await ask(rl, '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ');
+  // 扫码场景: registerApp 已经免费给了扫码人 open_id, 直接拿来当 allowedUsers
+  // 默认值, 用户回车就用"只允许自己". 想多人共用回退到逗号分隔输入. 手动 fallback
+  // 路径没 open_id, 提示文案跟之前一致.
+  const ownerPrompt = creds.userOpenId
+    ? `允许的用户 [默认: 你自己 (${creds.userOpenId.substring(0, 12)}…)，回车采用; 多人用逗号分隔; 输入 - 表示不限制]: `
+    : '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ';
+  const allowedUsersInput = (await ask(rl, ownerPrompt)).trim();
+  let allowedUsers: string;
+  if (creds.userOpenId) {
+    if (allowedUsersInput === '-') allowedUsers = '';
+    else if (allowedUsersInput === '') allowedUsers = creds.userOpenId;
+    else allowedUsers = allowedUsersInput;
+  } else {
+    allowedUsers = allowedUsersInput;
+  }
 
-  const bot: Record<string, any> = { larkAppId: appId, larkAppSecret: appSecret, cliId };
+  // brand 必须持久化: cmdStart 的 validate / event-dispatcher 走的 deep link
+  // 都看这个字段; 不写就只能硬编码 feishu, lark 租户用户会被打成凭证无效.
+  // 为了向后兼容 (旧 bots.json 没 brand 字段), reader 应当 default 到 'feishu'.
+  const bot: Record<string, any> = {
+    larkAppId: creds.appId,
+    larkAppSecret: creds.appSecret,
+    brand: creds.brand,
+    cliId,
+  };
   if (name) bot.name = name;
   if (workingDir) bot.workingDir = workingDir;
   if (allowedUsers) bot.allowedUsers = allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
@@ -361,20 +552,26 @@ function parseDotEnvToBotConfig(): Record<string, any> {
   return bot;
 }
 
-/** Write single-bot config to bots.json (fresh install or reconfigure) */
-async function writeSingleBotConfig(): Promise<void> {
-  console.log('── 飞书应用配置 ──\n');
-  printLarkPermissions();
-
+/**
+ * 收集一个机器人配置并写盘 (单机器人 fresh install / 重新配置).
+ *
+ * 失败路径 (扫码取消 / 凭证校验不通过): 不创建任何配置文件, 不动旧 .env.
+ * Codex review 边界 #2: 中途失败一律不留半截 JSON.
+ */
+async function writeSingleBotConfig(): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const bot = await promptBotConfig(rl);
   rl.close();
 
-  writeBotsJson([bot]);
+  if (!bot) return false;
+
+  writeBotsJsonAtomic([bot]);
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-  console.log(`\n下一步:`);
-  console.log(`  1. botmux start              启动 daemon（飞书后台配长连接前必须先启动）`);
+  printRemainingSteps(bot.larkAppId, botBrand(bot));
+  console.log(`下一步:`);
+  console.log(`  1. botmux start              启动 daemon`);
   console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : '当前平台暂不支持'}，无需 sudo）`);
+  return true;
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -399,118 +596,111 @@ async function cmdSetup(): Promise<void> {
     console.log('');
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    printInputHelp('操作选择', [
-      '1) 添加新机器人：保留现有配置，在 bots.json 末尾追加一项。',
-      '2) 重新配置：备份当前 bots.json，然后只写入一个新的机器人配置。',
-      '3) 编辑现有机器人：按序号、appId 或 botmux status 名称修改某一项。',
-      '4) 删除机器人：从本机 bots.json 移除某一项；不会删除飞书开放平台应用。',
-    ]);
     const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  3) 编辑现有机器人  4) 删除机器人  (1/2/3/4) [1]: ');
 
     if (action === '2') {
       console.log('\n── 重新配置 ──\n');
-      printLarkPermissions();
       const newBot = await promptBotConfig(rl);
       rl.close();
-      ensureUniqueBotProcessNames([newBot]);
-      renameSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak\n`);
-      writeBotsJson([newBot]);
-      console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-      console.log(`\n下一步: botmux restart`);
+      if (!newBot) {
+        console.log('\n⚠️  setup 中止，旧配置保留不动。');
+        return;
+      }
+      // Codex review #1: 先 copyFileSync 备份, 再原子写新文件. 之前先 rename
+      // 旧文件再 write, 一旦 write 失败 (磁盘/权限/进程被 kill) 用户就丢了
+      // bots.json. copy 之后写失败旧文件原地不动, .bak 是无害的同名副本.
+      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+      writeBotsJsonAtomic([newBot]);
+      console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
+      printRemainingSteps(newBot.larkAppId, botBrand(newBot));
+      console.log(`下一步: botmux restart\n`);
       return;
     }
 
     if (action === '3') {
-      printInputHelp('选择要编辑的机器人', [
-        '可输入上方列表里的序号、飞书 appId，或 botmux status 中显示的 PM2 名称。',
-        '示例：1、cli_xxx、botmux-1、botmux-codex-main。',
-      ]);
-      const selected = await ask(rl, '选择要编辑的机器人（序号、appId 或 botmux status 中的 name）: ');
-      const editIndex = parseBotSelection(selected, bots);
-      if (editIndex === undefined) {
+      console.log('\n── 编辑现有机器人 ──\n');
+      const selected = await ask(rl, '选择机器人（序号 / PM2 名 / AppID）: ');
+      const index = parseBotSelection(selected, bots);
+      if (index === undefined) {
         rl.close();
-        console.error(`\n❌ 未找到机器人: ${selected}`);
+        console.log('\n❌ 找不到指定机器人，配置未修改。');
         return;
       }
 
-      console.log(`\n── 编辑 ${formatBotConfigLine(bots[editIndex], editIndex)} ──\n`);
-      const edited = await promptEditBotConfig(rl, bots[editIndex]);
+      let edited: Record<string, any>;
+      try {
+        edited = await promptEditBotConfig(rl, bots[index]);
+      } catch (err: any) {
+        rl.close();
+        console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
+        return;
+      }
       rl.close();
 
+      const nextBots = bots.slice();
+      nextBots[index] = edited;
       copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      bots[editIndex] = edited;
-      writeBotsJson(bots);
-      console.log(`\n✅ 已更新 ${formatBotConfigLine(edited, editIndex)}`);
-      console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-      console.log(`   旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      console.log(`\n下一步: botmux restart`);
+      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+      writeBotsJsonAtomic(nextBots);
+      console.log(`✅ 已更新机器人 ${botProcessName(edited, index, PM2_NAME)} (${edited.larkAppId})`);
+      console.log(`下一步: botmux restart\n`);
       return;
     }
 
     if (action === '4') {
-      if (bots.length === 0) {
-        rl.close();
-        console.error('\n❌ 当前没有可删除的机器人配置');
-        return;
-      }
-
-      printInputHelp('选择要删除的机器人', [
-        '可输入上方列表里的序号、飞书 appId，或 botmux status 中显示的 PM2 名称。',
-        '删除只移除本机 bots.json 中的配置项；不会删除飞书开放平台应用、历史消息或本地会话数据。',
-      ]);
-      const selected = await ask(rl, '选择要删除的机器人（序号、appId 或 botmux status 中的 name）: ');
+      console.log('\n── 删除机器人 ──\n');
+      const selected = await ask(rl, '选择机器人（序号 / PM2 名 / AppID）: ');
       const result = removeBotConfig(bots, selected);
       if (!result) {
         rl.close();
-        console.error(`\n❌ 未找到机器人: ${selected}`);
+        console.log('\n❌ 找不到指定机器人，配置未修改。');
         return;
       }
-
-      console.log(`\n将删除: ${formatBotConfigLine(result.removed, result.index)}`);
-      console.log('删除后，未设置自定义 name 的机器人在 botmux status 中的序号名称可能会随数组顺序变化。');
-      const confirm = (await ask(rl, '确认删除这个机器人配置？(y/N): ')).trim().toLowerCase();
+      const confirm = (await ask(
+        rl,
+        `确认删除 ${botProcessName(result.removed, result.index, PM2_NAME)} (${result.removed.larkAppId})? (y/N): `,
+      )).trim().toLowerCase();
       rl.close();
       if (confirm !== 'y' && confirm !== 'yes') {
-        console.log('\n已取消删除。');
+        console.log('\n已取消，配置未修改。');
         return;
       }
 
       copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      writeBotsJson(result.bots);
-      console.log(`\n✅ 已删除 ${formatBotConfigLine(result.removed, result.index)}`);
-      console.log(`   剩余机器人: ${result.bots.length} 个`);
-      console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-      console.log(`   旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      console.log(`\n下一步: botmux restart`);
+      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+      writeBotsJsonAtomic(result.bots);
+      console.log(`✅ 已删除机器人 ${botProcessName(result.removed, result.index, PM2_NAME)} (${result.removed.larkAppId})`);
+      console.log(`下一步: botmux restart\n`);
       return;
     }
 
     console.log('\n── 添加新机器人 ──\n');
-    printLarkPermissions();
     const newBot = await promptBotConfig(rl);
     rl.close();
-    bots.push(newBot);
-    writeBotsJson(bots);
-    console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length} 个`);
+    if (!newBot) {
+      console.log('\n⚠️  setup 中止，bots.json 不动。');
+      return;
+    }
+    writeBotsJsonAtomic([...bots, newBot]);
+    console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    console.log(`\n下一步: botmux restart`);
+    printRemainingSteps(newBot.larkAppId, botBrand(newBot));
+    console.log(`下一步: botmux restart\n`);
 
   } else if (hasEnv) {
     // --- Single-bot mode (.env exists) ---
     console.log(`当前使用单机器人配置: ${ENV_FILE}`);
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    printInputHelp('操作选择', [
-      '1) 添加新机器人：把当前 .env 迁移成 bots.json，再追加一个新机器人。',
-      '2) 覆盖当前配置：备份当前 .env，然后按新的输入生成单机器人 bots.json。',
-    ]);
     const action = await ask(rl, '操作: 1) 添加新机器人  2) 覆盖当前配置  (1/2): ');
 
     if (action === '2') {
       rl.close();
-      await writeSingleBotConfig();
-      renameSync(ENV_FILE, ENV_FILE + '.bak');
-      console.log(`   旧 .env 已备份: ${ENV_FILE}.bak`);
+      const ok = await writeSingleBotConfig();
+      if (ok) {
+        renameSync(ENV_FILE, ENV_FILE + '.bak');
+        console.log(`   旧 .env 已备份: ${ENV_FILE}.bak`);
+      }
       return;
     }
 
@@ -524,17 +714,21 @@ async function cmdSetup(): Promise<void> {
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
     console.log('\n── 添加新机器人 ──\n');
-    printLarkPermissions();
     const newBot = await promptBotConfig(rl);
     rl.close();
+    if (!newBot) {
+      console.log('\n⚠️  setup 中止，.env 和 bots.json 都不动。');
+      return;
+    }
 
-    const bots = [existingBot, newBot];
-    writeBotsJson(bots);
+    // 写新文件成功后才备份 .env. 失败不动两边.
+    writeBotsJsonAtomic([existingBot, newBot]);
     renameSync(ENV_FILE, ENV_FILE + '.bak');
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
-    console.log(`\n下一步: botmux restart`);
+    printRemainingSteps(newBot.larkAppId, botBrand(newBot));
+    console.log(`下一步: botmux restart\n`);
 
   } else {
     // --- Fresh install ---
@@ -617,6 +811,40 @@ async function cmdStart(): Promise<void> {
   ensureConfigDir();
   preflightNodeSanity();
   await ensureSystemDependencies();
+
+  // 启动前快速校验每个 bot 的凭证. Codex review 边界 #5: 凭证无效是
+  // 唯一应该阻塞 start 的情况; scope/event 缺失在 daemon 起来后用 WARN
+  // + 私信处理 (event-dispatcher.checkRequiredScopes).
+  //
+  // 失败时打印明确的 appId 前缀和错误码, 不打印 secret, 不 spawn pm2 进程.
+  const botsForCheck = loadBotsJson();
+  if (botsForCheck.length > 0) {
+    const { validateCredentials } = await import('./setup/verify-permissions.js');
+    const invalid: Array<{ appId: string; reason: string }> = [];
+    for (const b of botsForCheck) {
+      if (!b.larkAppId || !b.larkAppSecret) {
+        invalid.push({ appId: b.larkAppId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
+        continue;
+      }
+      const v = await validateCredentials(b.larkAppId, b.larkAppSecret, botBrand(b));
+      if (!v.ok) {
+        if (v.error === 'invalid_credentials') {
+          invalid.push({ appId: b.larkAppId, reason: v.message });
+        } else {
+          // network / unknown — 不应该拦下启动, 走 WARN
+          console.warn(`⚠️  [${b.larkAppId}] 启动前凭证验证未成功（${v.error}）: ${v.message}`);
+          console.warn(`   daemon 仍会启动；启动后 dispatcher 会自行重试。`);
+        }
+      }
+    }
+    if (invalid.length > 0) {
+      console.error('\n❌ 以下机器人凭证无效，botmux start 中止：\n');
+      for (const e of invalid) console.error(`   - ${e.appId}: ${e.reason}`);
+      console.error('\n   修复方式: 运行 `botmux setup` 选 "重新配置" 重新走扫码/手动流程。');
+      process.exit(1);
+    }
+  }
+
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
@@ -729,8 +957,8 @@ async function cmdRestart(): Promise<void> {
   ensureConfigDir();
   preflightNodeSanity();
   await ensureSystemDependencies();
-  cleanupLegacyPm2();
   const cfg = ecosystemConfig();
+  cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
@@ -791,7 +1019,7 @@ function cmdLogs(): void {
     : '50';
 
   const bots = loadBotsJson();
-  // Support --bot <0-based-index|pm2-name|appId> to filter specific bot logs
+  // Support --bot <0-based-index|pm2-name|appId> to filter specific bot logs.
   const botIdx = process.argv.includes('--bot')
     ? process.argv[process.argv.indexOf('--bot') + 1]
     : undefined;
@@ -799,13 +1027,16 @@ function cmdLogs(): void {
   let target: string;
   if (botIdx !== undefined) {
     const numericIdx = /^\d+$/.test(botIdx) ? Number(botIdx) : undefined;
-    const selectedIdx =
-      numericIdx !== undefined && numericIdx >= 0 && numericIdx < bots.length
+    const selectedIdx = numericIdx === undefined
+      ? parseBotSelection(botIdx, bots)
+      : numericIdx >= 0 && numericIdx < bots.length
         ? numericIdx
-        : parseBotSelection(botIdx, bots);
+        : undefined;
     target = selectedIdx !== undefined
       ? botProcessName(bots[selectedIdx], selectedIdx, PM2_NAME)
-      : botIdx;
+      : numericIdx !== undefined
+        ? `${PM2_NAME}-${botIdx}`
+        : botIdx;
   } else {
     // Show all botmux logs via pm2 regex match
     target = `/^${PM2_NAME}/`;
@@ -843,7 +1074,7 @@ function cmdUpgrade(): void {
 async function cmdDashboard(): Promise<void> {
   const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
   if (!existsSync(SECRET_PATH)) {
-    console.error('Dashboard not initialised. Run `pnpm daemon:restart` first.');
+    console.error('Dashboard not initialised. Run `botmux restart` first.');
     process.exit(1);
   }
   const secret = readFileSync(SECRET_PATH, 'utf8').trim();
@@ -864,7 +1095,7 @@ async function cmdDashboard(): Promise<void> {
     });
   } catch {
     console.error(
-      `dashboard process not reachable on 127.0.0.1:${port} — \`pnpm daemon:restart\` will start it`,
+      `dashboard process not reachable on 127.0.0.1:${port} — \`botmux restart\` will start it`,
     );
     process.exit(1);
   }
@@ -1680,7 +1911,7 @@ function showHelp(): void {
 botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 命令:
-  setup       交互式配置（首次使用 / 添加 / 编辑 / 删除机器人）
+  setup       交互式配置（首次使用 / 添加机器人）
   start       启动 daemon
   stop        停止 daemon
   restart     重启 daemon（自动恢复活跃会话）
@@ -1715,7 +1946,12 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --top-level                     发顶层消息（不回复进当前话题）
        --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
   bots list                            列出当前群聊中的机器人（含 open_id）
-  thread messages [--limit N]          拉取当前话题的消息历史 (JSON)
+  history [--limit N]                  拉取当前会话的消息历史 (JSON)，话题群 → 话题内，普通群 → 整群
+  quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
+
+新建飞书群:
+  create-group --bot <name> [--bot ...] [--name "群名"]
+                                       用指定 bot 起新群；详见 \`botmux create-group --help\`
 
 配置目录: ~/.botmux/
 文档: https://github.com/deepcoldy/botmux
@@ -1946,45 +2182,50 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 }
 
-async function cmdThreadMessages(rest: string[]): Promise<void> {
+/** Resolve a CLI subcommand's larkAppId by walking the session marker. Common
+ *  prelude for `history` / `quoted` / similar commands that need to talk to
+ *  Lark on behalf of the session that spawned them. Exits with stderr on
+ *  failure so callers can stay focused on the happy path. */
+async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ sid: string; larkAppId: string; session: SessionData }> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
-  const limit = parseInt(argValue(rest, '--limit') ?? '50', 10);
-  const sessionIdArg = argValue(rest, '--session-id');
-
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
-    console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
+    console.error('无法推断 session-id。请在 Lark 话题/群里的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
   }
-
   const sessions = loadSessions();
   const s = sessions.get(sid);
   if (!s) {
     console.error(`未找到 session ${sid}`);
     process.exit(1);
   }
-
   if (!s.larkAppId) {
     console.error(`session ${sid} 缺少 larkAppId，无法获取消息`);
     process.exit(1);
   }
-
   // Ensure bot is registered so getBotClient works
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try {
     for (const cfg of loadBotConfigs()) registerBot(cfg);
   } catch { /* ignore */ }
+  return { sid, larkAppId: s.larkAppId, session: s };
+}
 
-  const { listThreadMessages, listChatMessagesSince } = await import('./im/lark/client.js');
+async function cmdHistory(rest: string[]): Promise<void> {
+  const limit = parseInt(argValue(rest, '--limit') ?? '50', 10);
+  const sessionIdArg = argValue(rest, '--session-id');
+  const { sid, larkAppId: appId, session: s } = await resolveSessionAppId(sessionIdArg);
+
+  const { listThreadMessages, listChatMessages } = await import('./im/lark/client.js');
   const { parseApiMessage } = await import('./im/lark/message-parser.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
-  const appId = s.larkAppId;  // narrowed above; pin into a const so async closures keep the narrowing
   try {
     // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
-    // chat container instead, since the session was created.
+    // chat container directly and let the caller cap with --limit. Thread-scope
+    // sessions walk the thread container by root_id.
     const isChatScope = s.scope === 'chat';
     const raw = isChatScope
-      ? await listChatMessagesSince(appId, s.chatId, Date.parse(s.createdAt) || 0, limit)
+      ? await listChatMessages(appId, s.chatId, limit)
       : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
     // path in daemon.ts. Each merge_forward gets its own numberer (we don't
@@ -1998,12 +2239,48 @@ async function cmdThreadMessages(rest: string[]): Promise<void> {
     }));
     console.log(JSON.stringify({
       sessionId: sid,
-      ...(isChatScope ? { chatId: s.chatId, scope: 'chat' } : { threadId: s.rootMessageId, scope: 'thread' }),
+      chatId: s.chatId,
+      scope: isChatScope ? 'chat' : 'thread',
+      ...(isChatScope ? {} : { rootMessageId: s.rootMessageId }),
       messages,
       total: messages.length,
     }, null, 2));
   } catch (err: any) {
     console.error(`获取消息失败: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+
+async function cmdQuoted(rest: string[]): Promise<void> {
+  const sessionIdArg = argValue(rest, '--session-id');
+  // Positional message_id is required. The id comes verbatim from the
+  // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
+  // injects when the user used the Lark quote-reply UI. Skip --session-id and
+  // its value so `botmux quoted --session-id <uuid> om_xxx` doesn't pick up
+  // the uuid as the message id.
+  const messageId = firstPositional(rest, ['--session-id']);
+  if (!messageId) {
+    console.error('用法: botmux quoted <message_id> [--session-id <id>]');
+    process.exit(1);
+  }
+
+  const { larkAppId: appId } = await resolveSessionAppId(sessionIdArg);
+
+  const { getMessageDetail } = await import('./im/lark/client.js');
+  const { expandMergeForward } = await import('./im/lark/merge-forward.js');
+  const { renderQuotedMessage } = await import('./cli/quoted-render.js');
+  try {
+    const detail = await getMessageDetail(appId, messageId);
+    const msg = detail?.items?.[0];
+    if (!msg) {
+      console.error(`未找到消息 ${messageId}`);
+      process.exit(1);
+    }
+    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward);
+    console.log(JSON.stringify(rendered, null, 2));
+  } catch (err: any) {
+    console.error(`获取被引用消息失败: ${err.message}`);
     process.exit(1);
   }
 }
@@ -2173,13 +2450,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     // "@Claude" in text only triggers IPC routing but Lark UI shows it as
     // plain text — confusing the user who thinks the @ didn't fire.
     //
-    // bot-to-bot @mention 实际有两条触发路径，最终都会落到下方的 mentions 数组、
-    // 进而写出 bot-mention signal 文件：
-    //   1) 显式 `botmux send --mention <open_id>`：mentionArgs 直接进 mentions。
-    //   2) 正文里出现 `@BotName`（注册过的 bot 名 + 大小写不敏感 + 严格边界）：
-    //      下面这段扫描命中后，从 cross-ref 拿到 sender-scoped open_id 注入 mentions。
-    // 两条路径殊途同归，daemon 端 processBotMentionSignal 不区分来源；同名歧义
-    // 由 utils/bot-routing.ts 的 pickBotEntryByName 在两条路径上统一兜底。
+    // bot-to-bot @mention 两条触发入口（显式 --mention / 正文 `@BotName`）都
+    // 落到下方的 mentions 数组，单 source of truth：让 Lark 在消息里渲染
+    // 真正的 @at 元素。对方 bot 的 daemon 通过 WSClient 原生事件接到（依赖
+    // "获取群组中其他机器人和用户@当前机器人的消息"权限），不再走任何本地
+    // 转发——botmux 历史上为绕过 Lark 不投递跨 bot 事件搞过 signal-file，
+    // 那套已经在该权限上线后整体下线。
     try {
       const dataDir = resolveDataDir();
       const botInfoPath = join(dataDir, 'bots-info.json');
@@ -2383,83 +2659,163 @@ async function cmdSend(rest: string[]): Promise<void> {
       fileIds.push(fid);
     }
 
-    // Bot-to-bot mention signals
-    const dataDir = resolveDataDir();
-    const botInfoPath = join(dataDir, 'bots-info.json');
-    type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
-    let botEntries: BotInfoEntry[] = [];
-    try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
-    // Disambiguate same-named bots by oncall binding to the outbound chat.
-    // Without this, Array.find on botName silently routes to whichever
-    // bots-info.json entry sorts first — typically the wrong one when a
-    // deployment runs two apps under the same display name (e.g. two CoCo
-    // bots, only one bound to this chat).
-    const oncallChatsByApp = loadOncallChatsByApp();
-
-    const openIdToAppId = new Map<string, string>();
-    for (const e of botEntries) if (e.botOpenId) openIdToAppId.set(e.botOpenId, e.larkAppId);
-    try {
-      for (const file of readdirSync(dataDir)) {
-        if (!file.startsWith('bot-openids-') || !file.endsWith('.json')) continue;
-        try {
-          const crossRef: Record<string, string> = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
-          for (const [botName, crossOpenId] of Object.entries(crossRef)) {
-            const entry = pickBotEntryByName(botEntries, botName, targetChatId, oncallChatsByApp);
-            if (entry) openIdToAppId.set(crossOpenId, entry.larkAppId);
-          }
-        } catch { /* */ }
-      }
-    } catch { /* */ }
-
-    const targetAppIds = new Set<string>();
-    for (const m of mentions) {
-      const ta = openIdToAppId.get(m.open_id);
-      if (ta && ta !== appId) targetAppIds.add(ta);
-    }
-    if (text && botEntries.length > 0) {
-      for (const entry of botEntries) {
-        if (!entry.botOpenId || entry.larkAppId === appId) continue;
-        const names = [entry.botName, entry.cliId].filter(Boolean) as string[];
-        for (const name of names) {
-          if (new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text)) {
-            targetAppIds.add(entry.larkAppId); break;
-          }
-        }
-      }
-    }
-    if (targetAppIds.size > 0) {
-      const signalDir = join(dataDir, 'bot-mentions');
-      if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
-      // Routing scope of the OUTBOUND message (not the sender's session):
-      //   - --top-level / --chat-id forced the message into chat-container
-      //     addressing → receivers should target their chat-scope session at
-      //     `effectiveChatId`, NOT the sender's thread root.
-      //   - otherwise inherit the sender's session scope, since the message
-      //     was a normal in-thread reply (or a chat-scope continuation).
-      const effectiveScope: 'thread' | 'chat' = (sendTopLevel || overrideChatId || isChatScope)
-        ? 'chat'
-        : (s.scope ?? 'thread');
-      const effectiveChatId = targetChatId;
-      for (const targetApp of targetAppIds) {
-        const te = botEntries.find(e => e.larkAppId === targetApp);
-        const signal = {
-          // Carry both addresses; receivers pick by `scope` but legacy fields
-          // remain for back-compat with older daemons.
-          rootMessageId: s.rootMessageId,
-          chatId: effectiveChatId,
-          chatType: s.chatType,
-          scope: effectiveScope,
-          senderAppId: appId, targetBotOpenId: te?.botOpenId ?? targetApp,
-          content: text, messageId, timestamp: Date.now(),
-        };
-        writeFileSync(join(signalDir, `${Date.now()}-${(te?.botOpenId ?? targetApp).slice(-8)}.json`), JSON.stringify(signal));
-      }
-    }
+    // Bot-to-bot 转发依赖飞书"获取群组中其他机器人和用户@当前机器人的消息"权限：
+    // 目标 bot 的 daemon 现在能从 WSClient 原生收到 sender_type='app' 的事件，
+    // 不需要 botmux 自己再写本地 signal 文件做转发。outgoing 消息里 @BotName /
+    // --mention 的 open_id 解析（在上方 mentions 数组里完成）仍然必要，它让
+    // Lark 在消息里渲染真正的 @at 元素，从而触发对方 bot 的 WS 事件投递。
 
     console.log(JSON.stringify({ success: true, messageId, sessionId: sid }));
   } catch (err: any) {
     console.error(`发送失败: ${err.message}`);
     process.exit(1);
+  }
+}
+
+// ─── Create-group subcommand ─────────────────────────────────────────────────
+
+async function cmdCreateGroup(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`
+botmux create-group — 用一组机器人新建飞书群
+
+用法:
+  botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
+
+参数:
+  --bot <ref>     至少一个，可多次。ref 推荐用 bot 显示名（同 botmux send 的 @<name>）或完整 larkAppId；
+                  cliId（如 claude-code）仅作 fallback —— 多个 bot 常共用同一个 cliId，重名命中只能取
+                  bots.json 中第一个。重名 → 取 bots.json 中第一个匹配，stderr 打 warning。
+                  重复 ref → 自动去重保留首次顺序。
+  --name <群名>   可选；不传则用飞书默认无名群。
+
+行为:
+  - 第一个解析到的 bot 作为 creator（决定建群身份 + 初始群主 + open_id app scope）。
+  - 邀请用户 / 转让群主 / @通知 对象都从 creator 的 resolvedAllowedUsers 取首个 open_id（email 自动转换；
+    转不出来或为空则跳过对应步骤，stderr warning）。
+  - 不依赖 botmux 会话，任何环境都能跑。
+
+输出协议（skill 友好）:
+  - 成功（即使 transfer/notify 部分失败）：stdout 单行 chatId，exit 0；stderr 打人类提示 + applink。
+  - 失败（缺 --bot / 解析失败 / chat.create 抛错）：stdout 空，exit 非零；stderr 打错误。
+`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+
+  const botRefs = argValues(rest, '--bot');
+  const name = argValue(rest, '--name');
+
+  if (botRefs.length === 0) {
+    console.error('用法: botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]');
+    console.error('至少传一个 --bot。');
+    process.exit(1);
+  }
+
+  // Load bot configs (bots.json order) and bots-info.json (for botName)
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  let botConfigs: Array<{ larkAppId: string; cliId: string }>;
+  try {
+    botConfigs = loadBotConfigs().map(c => ({ larkAppId: c.larkAppId, cliId: c.cliId }));
+  } catch (err: any) {
+    console.error(`加载 bots.json 失败: ${err?.message ?? err}`);
+    process.exit(1);
+  }
+  const dataDir = resolveDataDir();
+  const botInfoPath = join(dataDir, 'bots-info.json');
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  let botInfoEntries: BotInfoEntry[] = [];
+  try { if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
+
+  const { resolveBotRefs } = await import('./cli/create-group-resolver.js');
+  const resolved = resolveBotRefs(
+    botRefs,
+    botConfigs,
+    botInfoEntries.map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
+  );
+
+  for (const w of resolved.ambiguousWarnings) console.error(`⚠️  ${w}`);
+  if (resolved.invalid.length > 0) {
+    console.error(`无法解析的 --bot 引用: ${resolved.invalid.join(', ')}`);
+    console.error('可用 bot：');
+    for (const cfg of botConfigs) {
+      const info = botInfoEntries.find(b => b.larkAppId === cfg.larkAppId);
+      console.error(`  - ${info?.botName ?? '(unnamed)'}  cliId=${cfg.cliId}  ${cfg.larkAppId}`);
+    }
+    process.exit(1);
+  }
+  if (resolved.larkAppIds.length === 0) {
+    console.error('未解析到任何 bot，请检查 --bot 引用。');
+    process.exit(1);
+  }
+
+  const creatorLarkAppId = resolved.larkAppIds[0];
+
+  // Register bots so getBotClient works inside service
+  const fullConfigs = loadBotConfigs();
+  const needed = new Set(resolved.larkAppIds);
+  try {
+    for (const cfg of fullConfigs) if (needed.has(cfg.larkAppId)) registerBot(cfg);
+  } catch (err: any) {
+    console.error(`注册 bot 失败: ${err?.message ?? err}`);
+    process.exit(1);
+  }
+
+  // Derive user_open_id from creator's allowedUsers (creator app scope only).
+  // resolveAllowedUsers converts emails → open_ids via creator's Lark client.
+  const creatorCfg = fullConfigs.find(c => c.larkAppId === creatorLarkAppId);
+  const allowedRaw = creatorCfg?.allowedUsers ?? [];
+  const { resolveAllowedUsers } = await import('./im/lark/client.js');
+  let creatorAllowedOpenIds: string[] = [];
+  try {
+    creatorAllowedOpenIds = await resolveAllowedUsers(creatorLarkAppId, allowedRaw);
+  } catch (err: any) {
+    console.error(`⚠️  解析 creator allowedUsers 失败: ${err?.message ?? err}（继续创建空群）`);
+  }
+  const targetOpenId = creatorAllowedOpenIds[0];
+  if (!targetOpenId) {
+    console.error('⚠️  creator bot 的 allowedUsers 没有可用 open_id — 将创建仅含 bot 的群（跳过邀请/转让/@通知）。');
+  }
+
+  const { createGroupWithBots } = await import('./services/group-creator.js');
+  let result;
+  try {
+    result = await createGroupWithBots({
+      creatorLarkAppId,
+      larkAppIds: resolved.larkAppIds,
+      name: name?.trim() || undefined,
+      userOpenIds: targetOpenId ? [targetOpenId] : [],
+      transferOwnerTo: targetOpenId,
+      notifyOwnerOpenId: targetOpenId,
+    });
+  } catch (err: any) {
+    console.error(`建群失败: ${err?.message ?? err}`);
+    process.exit(1);
+  }
+
+  // Always stdout chatId on createChat success — even if transfer/notify
+  // partially failed, the chat exists and retrying would create duplicates.
+  process.stdout.write(`${result.chatId}\n`);
+
+  // Human-readable summary + warnings → stderr.
+  const link = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
+  console.error(`✅ 群已创建：${link}`);
+  if (result.invalidBotIds.length > 0) {
+    console.error(`⚠️  飞书拒绝邀请的 bot: ${result.invalidBotIds.join(', ')}`);
+  }
+  if (result.invalidUserIds.length > 0) {
+    console.error(`⚠️  飞书拒绝邀请的 user: ${result.invalidUserIds.join(', ')}`);
+  }
+  if (result.transferError) {
+    console.error(`⚠️  群主转让失败 (${result.transferError}) — 当前群主仍为 creator bot`);
+  } else if (result.ownerTransferredTo) {
+    console.error(`✅ 群主已转让给 ${result.ownerTransferredTo}`);
+  }
+  if (result.notifyError) {
+    console.error(`⚠️  @通知发送失败: ${result.notifyError}`);
+  } else if (result.notifyMessageId) {
+    console.error(`✅ @通知已发送 (msg ${result.notifyMessageId})`);
   }
 }
 
@@ -2550,11 +2906,20 @@ switch (command) {
   case 'resume':  await cmdResume(); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
+  case 'history':  await cmdHistory(process.argv.slice(3)); break;
+  case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'thread':   {
+    // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
+    // pre-rename scripts/skills surface the rename instead of "unknown command".
     const sub = process.argv[3] ?? '';
-    if (sub === 'messages' || sub === 'msgs') await cmdThreadMessages(process.argv.slice(4));
-    else { console.error(`用法: botmux thread messages [--limit N] [--session-id ID]`); process.exit(1); }
+    console.error(
+      sub === 'messages' || sub === 'msgs'
+        ? `\`botmux thread ${sub}\` 已重命名为 \`botmux history\` (跑普通群和话题群都用它)。`
+        : `\`botmux thread\` 已下线，请用 \`botmux history\``,
+    );
+    process.exit(1);
     break;
   }
   case 'autostart': {

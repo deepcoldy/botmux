@@ -40,45 +40,64 @@ function ensureFontRegistered(): void {
     }
   }
 
-  // 2. CJK monospace — primary for Latin + Han glyphs.
-  //    Linux: Noto Sans CJK（需要 fonts-noto-cjk 包，或 botmux setup 自动下载到 ~/.botmux/fonts/）；
-  //    macOS: 系统自带 PingFang/Hiragino。
+  // ── fontFamilyChain 顺序很关键 ──
+  // skia 按 chain 顺序逐字符找含该 glyph 的字体。Latin **必须放在 CJK 前面**，
+  // 否则 CJK 字体（Hiragino / Noto Sans CJK）自带的 ASCII glyph 会先抢走拉丁
+  // 字符的渲染权，宽度跟 cell grid 不匹配 → 截图里英文字符间距时疏时密。
+  // 顺序：BotmuxMono → Latin mono → CJK mono → Color emoji。
   const userFontDir = join(homedir(), '.botmux', 'fonts');
+
+  // 2. Latin monospace — DejaVu/Liberation/JetBrains Mono cover dingbats (❯,
+  //    ✓, etc.) and most box-drawing/geometric symbols not in CJK font.
+  //    macOS：用 Menlo / .SF NS Mono / Monaco（实测三者都能被 @napi-rs/canvas
+  //    注册）。注意 SFNSMono 注册后内部 family 名是 ".SF NS Mono"（带点前缀），
+  //    用 alias 显式指定别名以保证 fontFamilyChain 里 family name 与 ctx.font
+  //    解析路径一致。
+  const latinCandidates: Array<{ path: string; family: string; alias?: string }> = [
+    { path: join(userFontDir, 'JetBrainsMono-Regular.ttf'), family: 'JetBrains Mono' },
+    { path: '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', family: 'DejaVu Sans Mono' },
+    { path: '/usr/share/fonts/dejavu/DejaVuSansMono.ttf', family: 'DejaVu Sans Mono' },
+    { path: '/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf', family: 'Liberation Mono' },
+    { path: '/usr/share/fonts/liberation/LiberationMono-Regular.ttf', family: 'Liberation Mono' },
+    { path: '/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf', family: 'JetBrains Mono' },
+    // macOS 系统等宽。Menlo 优先（覆盖最全 + 兼容 box-drawing），SFNSMono / Monaco
+    // 兜底。这些路径在 macOS 12+ 都稳定存在。
+    { path: '/System/Library/Fonts/Menlo.ttc', family: 'Menlo' },
+    { path: '/System/Library/Fonts/SFNSMono.ttf', family: 'SF Mono', alias: 'SF Mono' },
+    { path: '/System/Library/Fonts/Monaco.ttf', family: 'Monaco' },
+  ];
+  for (const c of latinCandidates) {
+    if (tryRegister(c.path, c.alias)) {
+      // Best-effort bold companion. Same dir, replace -Regular with -Bold.
+      tryRegister(c.path.replace(/-Regular\.ttf$/, '-Bold.ttf'));
+      tryRegister(c.path.replace(/SansMono\.ttf$/, 'SansMono-Bold.ttf'));
+      fontFamilyChain.push(c.family);
+      break;
+    }
+  }
+
+  // 3. CJK monospace — Han + Hiragana/Katakana + Hangul.
+  //    Linux: Noto Sans CJK（需要 fonts-noto-cjk 包，或 botmux setup 自动下载到 ~/.botmux/fonts/）；
+  //    macOS: PingFang 在 macOS 26 上从 /System/Library/Fonts 移除了，回退 Hiragino Sans GB
+  //    （实测注册成功且 family name 与文件名一致）；STHeiti 作为更老系统的兜底。
   const cjkCandidates: Array<{ regular: string; bold?: string; family: string }> = [
     { regular: join(userFontDir, 'NotoSansMonoCJKsc-Regular.otf'), bold: join(userFontDir, 'NotoSansMonoCJKsc-Bold.otf'), family: 'Noto Sans Mono CJK SC' },
     { regular: '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
     { regular: '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
     { regular: '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
     { regular: '/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc', bold: '/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
-    { regular: '/System/Library/Fonts/PingFang.ttc', family: 'PingFang SC' },
-    { regular: '/System/Library/Fonts/STHeiti Light.ttc', family: 'Heiti SC' },
-    { regular: '/Library/Fonts/Hiragino Sans GB.ttc', family: 'Hiragino Sans GB' },
+    // macOS：Hiragino 含中文常用字 + 日文，PingFang 在 macOS 26 上已被移除，
+    // 不放到首选位（路径不在就 fall-through）。
     { regular: '/System/Library/Fonts/Hiragino Sans GB.ttc', family: 'Hiragino Sans GB' },
+    { regular: '/Library/Fonts/Hiragino Sans GB.ttc', family: 'Hiragino Sans GB' },
+    { regular: '/System/Library/Fonts/STHeiti Medium.ttc', family: 'Heiti TC' },
+    { regular: '/System/Library/Fonts/STHeiti Light.ttc', family: 'Heiti TC' },
+    { regular: '/System/Library/Fonts/PingFang.ttc', family: 'PingFang SC' },  // 旧 macOS 兜底
   ];
   for (const c of cjkCandidates) {
     if (tryRegister(c.regular)) {
       if (c.bold) tryRegister(c.bold);
       fontFamilyChain.push(c.family);
-      break;
-    }
-  }
-
-  // 3. Latin monospace — DejaVu/Liberation/JetBrains Mono cover dingbats (❯,
-  //    ✓, etc.) and most box-drawing/geometric symbols not in CJK font.
-  const latinCandidates: Array<[string, string]> = [
-    [join(userFontDir, 'JetBrainsMono-Regular.ttf'), 'JetBrains Mono'],
-    ['/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 'DejaVu Sans Mono'],
-    ['/usr/share/fonts/dejavu/DejaVuSansMono.ttf', 'DejaVu Sans Mono'],
-    ['/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf', 'Liberation Mono'],
-    ['/usr/share/fonts/liberation/LiberationMono-Regular.ttf', 'Liberation Mono'],
-    ['/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf', 'JetBrains Mono'],
-  ];
-  for (const [p, name] of latinCandidates) {
-    if (tryRegister(p)) {
-      // Best-effort bold companion. Same dir, replace -Regular with -Bold.
-      tryRegister(p.replace(/-Regular\.ttf$/, '-Bold.ttf'));
-      tryRegister(p.replace(/SansMono\.ttf$/, 'SansMono-Bold.ttf'));
-      fontFamilyChain.push(name);
       break;
     }
   }
@@ -103,6 +122,27 @@ function ensureFontRegistered(): void {
 function fontSpec(bold: boolean): string {
   const families = fontFamilyChain.map(f => `"${f}"`).join(', ');
   return `${bold ? 'bold ' : ''}${FONT_SIZE}px ${families}, monospace`;
+}
+
+/** Map "Misc Technical" / "Supplemental Arrows-C" 三角符号到等价的
+ *  "Geometric Shapes" 块字符。前者（U+23F4-F7、U+2BC7/8）几乎没有等宽字体
+ *  收录—— macOS 系统字体全员缺失，Linux 上 DejaVu/JetBrains 也没有，所以
+ *  渲染必出现空方框。后者（U+25B6 ▶ / U+25C0 ◀ / U+25B2 ▲ / U+25BC ▼）
+ *  是 Unicode 1.1 老字符，Menlo / Noto / DejaVu 全都有 glyph。
+ *
+ *  仅替换语义视觉等价的几个字符；U+23F8 ⏸ / U+23F9 ⏹ / U+23FA ⏺ 不动 ——
+ *  它们在 Apple Color Emoji 有彩色变体，且没有真正等价的老字符。 */
+const NARROW_SYMBOL_FALLBACK: Record<string, string> = {
+  '⏴': '◀',  // ⏴ → ◀
+  '⏵': '▶',  // ⏵ → ▶
+  '⏶': '▲',  // ⏶ → ▲
+  '⏷': '▼',  // ⏷ → ▼
+  '⯇': '◀',  // ⯇ → ◀
+  '⯈': '▶',  // ⯈ → ▶
+};
+
+function fallbackSymbol(ch: string): string {
+  return NARROW_SYMBOL_FALLBACK[ch] ?? ch;
 }
 
 /** Detect whether the leading codepoint is an emoji/symbol pictograph that
@@ -201,7 +241,7 @@ export function captureToPng(terminal: Terminal, opts: CaptureOpts): Buffer {
       const w = cell.getWidth();
       if (w === 0) { col++; continue; }
 
-      const ch = cell.getChars();
+      const ch = fallbackSymbol(cell.getChars());
       const x = PADDING + col * CELL_W;
       const y = PADDING + row * CELL_H;
 

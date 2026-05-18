@@ -27,7 +27,7 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -50,11 +50,13 @@ import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
+import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
+import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
@@ -189,6 +191,12 @@ let codexAdoptPendingPid: number | undefined;
  *  skew tolerance is applied on top, mirroring the Lark/Claude bridges. */
 let codexAdoptStartMs: number | undefined;
 
+/** Adopt-only: 一次性发送的 "/adopt 前最后一轮" preamble 是否已经触发过。
+ *  codexBridgeAttach 在 split-live 分支会查 history 取最后一对 user/assistant
+ *  发给 daemon —— late-attach poller 也会反复走这条分支（每秒一次），所以
+ *  必须有标志位防重发。镜像 claude 那套 bridgePreambleSent 的角色。 */
+let codexBridgePreambleSent = false;
+
 /** Cap the preamble text so an extremely long previous turn doesn't blow
  *  past Lark's per-message limit. The user only needs enough to recall
  *  context, not the entire transcript. */
@@ -206,40 +214,23 @@ function truncatePreambleText(text: string, max: number): string {
   return text.slice(0, max) + '…';
 }
 
-/** Compose a `final_output` payload for a turn synthesised from a user
- *  prompt the human typed directly into the adopted pane. Shows both the
- *  user text and assistant text so the Lark thread doesn't see an orphan
- *  reply with no context. Returns `null` when neither side has anything
- *  visible — the worker should suppress the emit in that case. */
-function formatLocalTurnContent(userText: string, assistantText: string): string | null {
+/** Prepare a local-turn `final_output` payload. The daemon owns the card
+ *  chrome (label/quote/markdown body), so we ship the user prompt and
+ *  assistant text as separate fields — see card-builder `buildContextualReplyCard`.
+ *  Returns null when both sides are empty so the caller can skip the emit. */
+function formatLocalTurnFields(userText: string, assistantText: string): { userText: string; content: string } | null {
   const u = truncatePreambleText(userText.trim(), LOCAL_TURN_USER_MAX);
   const a = truncatePreambleText(assistantText.trim(), LOCAL_TURN_ASSISTANT_MAX);
   if (!u && !a) return null;
-  return [
-    '🖥️ 终端本地对话（在 adopted pane 中直接输入，已同步至飞书）',
-    '',
-    '👤 你：',
-    u || '(空)',
-    '',
-    `🤖 ${cliName()}：`,
-    a || '(空)',
-  ].join('\n');
+  return { userText: u, content: a };
 }
 
-/** Compose a `final_output` payload for a HEADLESS local turn — assistant
- *  text arrived without a known user side. Typically: daemon restart cut
- *  off an in-flight model stream; the original user event was absorbed
- *  at baseline so we have no userUuid to resolve, but the rest of the
- *  reply still deserves to land in Lark. */
+/** Same as `formatLocalTurnFields` but for HEADLESS local turns — daemon
+ *  restart cut off an in-flight model stream so we have an assistant side
+ *  with no resolvable user prompt. */
 function formatHeadlessLocalTurnContent(assistantText: string): string | null {
   const a = truncatePreambleText(assistantText.trim(), LOCAL_TURN_ASSISTANT_MAX);
-  if (!a) return null;
-  return [
-    '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）',
-    '',
-    `🤖 ${cliName()}：`,
-    a,
-  ].join('\n');
+  return a || null;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -305,6 +296,28 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
     assistantText: truncatePreambleText(turn.assistantText, PREAMBLE_ASSISTANT_MAX),
   });
   log('Bridge adopt preamble emitted (last completed turn from baseline)');
+}
+
+/** Codex / CoCo 镜像版：split-live 攒齐 history 后挑最后一对 user/assistant_final
+ *  发回 daemon 渲染成 "📜 /adopt 前最后一轮" 卡片。语义、跳过条件、字数截断都
+ *  对齐 maybeEmitAdoptPreamble；区别只在事件取出方式（codex/coco 是结构化
+ *  event，不需要走 claude 那套 jsonl turn assembly）。 */
+function maybeEmitCodexAdoptPreamble(
+  history: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+): void {
+  if (!lastInitConfig?.adoptMode) return;
+  if (lastInitConfig?.adoptRestoredFromMetadata) return;
+  if (codexBridgePreambleSent) return;
+  const turn = extractLastCodexTurn(history);
+  if (!turn) return;
+  if (!turn.userText.trim() && !turn.assistantText.trim()) return;
+  codexBridgePreambleSent = true;
+  send({
+    type: 'adopt_preamble',
+    userText: truncatePreambleText(turn.userText, PREAMBLE_USER_MAX),
+    assistantText: truncatePreambleText(turn.assistantText, PREAMBLE_ASSISTANT_MAX),
+  });
+  log('Codex bridge adopt preamble emitted (last completed turn from split-live history)');
 }
 
 /** Extract the sessionId from a Claude jsonl path and add it to the
@@ -1110,16 +1123,29 @@ function emitReadyTurns(): void {
         // attachment.prompt) so type-ahead'd local input renders the same as
         // a normally-typed pane prompt.
         const userEv = drained.events.find(e => e.uuid === turn.userUuid);
-        const userText = userEv ? extractTurnStartText(userEv) : '';
-        const content = formatLocalTurnContent(userText, assistantText);
-        if (!content) continue;
-        send({ type: 'final_output', content, lastUuid, turnId: turn.turnId });
+        const rawUserText = userEv ? extractTurnStartText(userEv) : '';
+        const fields = formatLocalTurnFields(rawUserText, assistantText);
+        if (!fields) continue;
+        send({
+          type: 'final_output',
+          content: fields.content,
+          lastUuid,
+          turnId: turn.turnId,
+          kind: 'local-turn',
+          userText: fields.userText,
+        });
         continue;
       }
       // Headless local turn — see formatHeadlessLocalTurnContent for context.
       const headlessContent = formatHeadlessLocalTurnContent(assistantText);
       if (!headlessContent) continue;
-      send({ type: 'final_output', content: headlessContent, lastUuid, turnId: turn.turnId });
+      send({
+        type: 'final_output',
+        content: headlessContent,
+        lastUuid,
+        turnId: turn.turnId,
+        kind: 'local-turn-headless',
+      });
       continue;
     }
 
@@ -1259,6 +1285,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
     log(`Codex bridge split-live: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
+    maybeEmitCodexAdoptPreamble(history);
   } else if (mode === 'split-live') {
     // split-live requested but file missing — degrade to fresh: the file
     // will appear later via fs.watch / poller, and ingest from offset 0
@@ -1290,6 +1317,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
   } catch (err: any) {
     log(`Codex bridge fs.watch unavailable (${err.message}); relying on poller`);
   }
+  // macOS 上 fs.watch 对 codex/coco 的外部进程追加 rollout / events.jsonl
+  // 经常静默丢事件（FSEvents 跨进程不可靠），所以无论 watcher 是否 attach
+  // 成功，都必须起 1s poller 兜底 —— 不然 split-live 成功的 adopt session
+  // 在 macOS 上会卡死，永远收不到模型回复。Linux 上 poller 多 tick 也无害
+  // （codexBridgeIngest 在 offset 未推进时是 no-op）。
+  codexBridgeStartTimer();
 }
 
 /** Called from flushPending after writeInput first returns a cliSessionId.
@@ -1363,11 +1396,18 @@ function emitReadyCodexTurns(): void {
     if (turn.isLocal) {
       // Local turn (adopt only): user typed in iTerm. Surface both sides
       // so the Lark thread sees a complete exchange instead of an orphan
-      // reply. formatLocalTurnContent caps both texts to keep within
-      // Lark's per-message limit.
-      const content = formatLocalTurnContent(turn.userText ?? '', turn.finalText);
-      if (!content) continue;
-      send({ type: 'final_output', content, lastUuid: turn.turnId, turnId: turn.turnId });
+      // reply. formatLocalTurnFields caps both texts to keep within
+      // Lark's per-message limit; daemon owns the card chrome.
+      const fields = formatLocalTurnFields(turn.userText ?? '', turn.finalText);
+      if (!fields) continue;
+      send({
+        type: 'final_output',
+        content: fields.content,
+        lastUuid: turn.turnId,
+        turnId: turn.turnId,
+        kind: 'local-turn',
+        userText: fields.userText,
+      });
       continue;
     }
     send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
@@ -1472,6 +1512,10 @@ let renderRows = PTY_ROWS;
 // ─── Headless Terminal for Screen Capture ────────────────────────────────────
 
 let renderer: TerminalRenderer | null = null;
+/** Most recent unfiltered viewport text — kept in sync by the screen_update
+ *  timer for pipe-pane backends so ScreenAnalyzer (which is synchronous) has
+ *  a fresh snapshot to read without needing its own tmux capture-pane call. */
+let lastAnalyzerSnapshot = '';
 let screenUpdateTimer: ReturnType<typeof setInterval> | null = null;
 const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
@@ -1512,7 +1556,14 @@ function startScreenAnalyzer(): void {
       extraBody: sa.extraBody,
     },
     {
-      getSnapshot: () => renderer?.rawSnapshot() ?? '',
+      getSnapshot: () => {
+        // ScreenAnalyzer is called every ~5s for TUI-prompt detection. We
+        // can't make this async without overhauling the analyzer, so cache
+        // the last pipe-pane text snapshot here and refresh it eagerly.
+        // For pipe-pane backends, the cache is repopulated by the screen
+        // update timer; for others, fall through to the long-lived renderer.
+        return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+      },
       onAnalyzing: () => { /* no-op: only block when prompt is actually detected */ },
       onTuiPrompt: (description, options, multiSelect) => {
         tuiPromptBlocking = true;
@@ -1606,24 +1657,33 @@ async function captureAndUpload(): Promise<void> {
   // stray scheduleOneShotAfterAction firing after user toggled back to hidden.
   if (displayMode !== 'screenshot') { logScreenshotSkip(`displayMode=${displayMode}`); return; }
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
-  if (!renderer)                    { logScreenshotSkip('renderer=null'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
-
-  const term = renderer.xterm;
-  const startY = term.buffer.active.baseY;
-
-  // Hash dedup — same content → skip upload. Not logged: this is the expected
-  // "nothing changed" path and would dominate the log signal.
-  const snap = renderer.rawSnapshot();
-  const hash = createHash('md5').update(snap).digest('hex');
-  if (hash === lastShotHash) return;
-  lastShotHash = hash;
 
   let png: Buffer;
   try {
-    const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-    const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
-    png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+    // Preferred path: pipe-pane backends ask tmux for a fresh viewport
+    // snapshot and render it through a transient xterm-headless. This
+    // avoids the accumulated-buffer drift that produced duplicated /
+    // staircase content under the legacy long-lived renderer.
+    const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
+    if (pipeResult) {
+      if (pipeResult.ansi === lastShotHash) return;
+      lastShotHash = pipeResult.ansi;
+      png = pipeResult.png;
+    } else {
+      // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
+      // still drive the long-lived renderer.
+      if (!renderer) { logScreenshotSkip('renderer=null'); return; }
+      const term = renderer.xterm;
+      const startY = term.buffer.active.baseY;
+      const snap = renderer.rawSnapshot();
+      const hash = createHash('md5').update(snap).digest('hex');
+      if (hash === lastShotHash) return;
+      lastShotHash = hash;
+      const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
+      const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+      png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+    }
   } catch (err: any) {
     logError(`Screenshot render failed: ${err?.message ?? err}`);
     return;
@@ -2075,22 +2135,51 @@ function startScreenUpdates(): void {
   // content (the live failure that prompted this fix).
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
+  let lastTextSnapshotHash = '';
   screenUpdateTimer = setInterval(() => {
-    if (!renderer || awaitingFirstPrompt) return;
-    const { content, changed } = renderer.snapshot();
+    if (awaitingFirstPrompt) return;
     let status: 'working' | 'idle' | 'analyzing' = isPromptReady ? 'idle' : 'working';
     if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
-    // Send update when content changed OR status changed (e.g. idle → analyzing)
-    if (changed || status !== lastSentStatus) {
-      lastSentStatus = status;
-      send({ type: 'screen_update', content, status });
-    }
+
+    void (async () => {
+      let content: string;
+      let changed: boolean;
+
+      // Preferred path: pipe-pane backends pull a fresh viewport snapshot
+      // from tmux every tick. This eliminates the accumulated-buffer drift
+      // that produced duplicated/staircase text in 'text' display mode.
+      const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true });
+      if (pipeText) {
+        content = pipeText.content;
+        const hash = pipeText.ansi;
+        changed = hash !== lastTextSnapshotHash;
+        lastTextSnapshotHash = hash;
+        // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
+        // tmux call would otherwise need to fire twice per tick.
+        if (changed) {
+          const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
+          if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
+        }
+      } else if (renderer) {
+        const snap = renderer.snapshot();
+        content = snap.content;
+        changed = snap.changed;
+      } else {
+        return;
+      }
+
+      if (changed || status !== lastSentStatus) {
+        lastSentStatus = status;
+        send({ type: 'screen_update', content, status });
+      }
+    })();
   }, SCREEN_UPDATE_INTERVAL_MS);
 }
 
 function stopScreenUpdates(): void {
   if (screenUpdateTimer) { clearInterval(screenUpdateTimer); screenUpdateTimer = null; }
   if (renderer) { renderer.dispose(); renderer = null; }
+  lastAnalyzerSnapshot = '';
 }
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
@@ -2262,9 +2351,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log('tmux backend requested but functional probe failed — falling back to PTY backend');
     useTmux = false;
   }
-  isTmuxMode = useTmux;
-  const tmuxBe = useTmux ? new TmuxBackend(TmuxBackend.sessionName(cfg.sessionId)) : null;
-  backend = tmuxBe ?? new PtyBackend();
+  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, useTmux });
+  isTmuxMode = selectedBackend.isTmuxMode;
+  isPipeMode = selectedBackend.isPipeMode;
+  backend = selectedBackend.backend;
 
   // Claude Code appends a line to ~/.claude/projects/<cwd-hash>/<sid>.jsonl each
   // time the user submits. The adapter uses this file to verify paste+Enter
@@ -2345,10 +2435,6 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // On tmux re-attach, keep awaitingFirstPrompt = true so screen updates are
   // suppressed until the idle detector fires markNewTurn() — this prevents the
   // full tmux scrollback history from leaking into the streaming card.
-  if (tmuxBe?.isReattach) {
-    log('Re-attached to existing tmux session');
-  }
-
   // Bridge fallback: claude-code only. Tail Claude's transcript JSONL so a
   // turn the model finishes WITHOUT calling `botmux send` still gets its
   // assistant text forwarded to Lark (the gate in emitReadyTurns suppresses
@@ -2413,6 +2499,16 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     isPromptReady = false;
     send({ type: 'claude_exit', code, signal });
   });
+
+  if (isPipeMode && backend instanceof TmuxPipeBackend && backend.isReattach) {
+    log(`Re-attached to existing tmux session via pipe-pane: ${TmuxBackend.sessionName(cfg.sessionId)}`);
+    try {
+      const initial = backend.captureCurrentScreen();
+      if (initial.length > 0) onPtyData(initial);
+    } catch (err: any) {
+      log(`captureCurrentScreen failed: ${err.message}`);
+    }
+  }
 
   // Fallback: if the CLI takes too long to show its prompt (e.g. slow
   // plugin init), unblock screen updates so the card doesn't stay at

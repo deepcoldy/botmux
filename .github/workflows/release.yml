@@ -51,21 +51,25 @@ jobs:
 
       - name: Generate changelog
         id: changelog
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # actions/checkout 默认把 tag 存成轻量指针，需重新 fetch 才能拿到 annotated tag object
           git fetch origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" --force
-          PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
-          TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
-          if [ -z "$TAG_MSG" ]; then
-            if [ -z "$PREV_TAG" ]; then
-              TAG_MSG=$(git log --pretty=format:"- %s" HEAD)
-            else
-              TAG_MSG=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
-            fi
+          # 上一个 tag: stable 只跟 stable 比 (词法排序会把 canary 排到 stable 前面,
+          # 不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X 而不是 v2.24.3)
+          if [[ "$GITHUB_REF_NAME" == *"-"* ]]; then
+            PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | head -1)
+          else
+            PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
           fi
+          TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          # cliff.toml 渲染'本次合并' + '新贡献者'两段，GitHub PR 元数据由 GITHUB_TOKEN 拉取
+          CLIFF=$(npx --yes git-cliff --current)
           {
             echo 'body<<CHANGELOG_EOF'
-            echo "$TAG_MSG"
+            [ -n "$TAG_MSG" ] && echo "$TAG_MSG"
+            echo "$CLIFF"
             echo ""
             echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo 'CHANGELOG_EOF'
