@@ -416,7 +416,7 @@ dashboard 走单独 pm2 进程 `botmux-dashboard`，跟着 `pnpm daemon:restart`
 botmux setup
 ```
 
-已有 `~/.botmux/bots.json` 时，`botmux setup` 支持添加新机器人、重新配置、编辑现有机器人，以及删除机器人配置。编辑或删除时可用序号、`larkAppId` 或 `botmux status` 里的 PM2 名称（如 `botmux-1` 或自定义的 `botmux-claude-main`）选择目标；字段留空表示保留当前值，`name`、`backendType`、`workingDir`、`allowedUsers`、`projectScanDir` 等可选字段输入 `-` 表示清空。修改 `larkAppId` 会提示确认，因为旧 appId 下的历史会话和群聊状态数据不会自动迁移。删除机器人只移除本机 `bots.json` 中的一项，不删除飞书开放平台应用、历史消息或本地会话数据；修改完成后运行 `botmux restart` 生效。
+已有 `~/.botmux/bots.json` 时，`botmux setup` 支持添加新机器人、重新配置、编辑现有机器人，以及删除机器人配置。编辑或删除时可用序号、`larkAppId` 或 `botmux status` 里的 PM2 名称（如 `botmux-1` 或自定义的 `botmux-claude-main`）选择目标；字段留空表示保留当前值，`name`、`cliPathOverride`、`backendType`、`workingDir`、`allowedUsers`、`projectScanDir` 等可选字段输入 `-` 表示清空。修改 `larkAppId` 会提示确认，因为旧 appId 下的历史会话和群聊状态数据不会自动迁移。删除机器人只移除本机 `bots.json` 中的一项，不删除飞书开放平台应用、历史消息或本地会话数据；修改完成后运行 `botmux restart` 生效。
 
 **bots.json 格式：**
 

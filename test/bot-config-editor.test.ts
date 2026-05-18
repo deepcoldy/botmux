@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { applyBotConfigEdits, botProcessName, parseBotSelection, removeBotConfig } from '../src/setup/bot-config-editor.js';
+import {
+  applyBotConfigEdits,
+  assertUniqueBotProcessNames,
+  botProcessName,
+  normalizeBotConfig,
+  parseBotConfigsJson,
+  parseBotSelection,
+  removeBotConfig,
+} from '../src/setup/bot-config-editor.js';
 
 describe('parseBotSelection', () => {
   const bots = [
@@ -13,6 +21,20 @@ describe('parseBotSelection', () => {
 
   it('selects by pm2 status name', () => {
     expect(parseBotSelection('botmux-1', bots)).toBe(1);
+  });
+
+  it('does not select botmux-N when that bot has a custom pm2 status name', () => {
+    expect(parseBotSelection('botmux-1', [
+      { larkAppId: 'app_a', name: 'claude-main' },
+      { larkAppId: 'app_b', name: 'codex-main' },
+    ])).toBeUndefined();
+  });
+
+  it('selects a custom numeric pm2 status name even when it belongs to a different index', () => {
+    expect(parseBotSelection('botmux-1', [
+      { larkAppId: 'app_a', name: '1' },
+      { larkAppId: 'app_b', name: 'codex-main' },
+    ])).toBe(0);
   });
 
   it('selects by custom pm2 status name', () => {
@@ -41,6 +63,7 @@ describe('applyBotConfigEdits', () => {
       larkAppId: 'old_app',
       larkAppSecret: 'old_secret',
       cliId: 'claude-code',
+      cliPathOverride: '/opt/old/claude',
       workingDir: '~/old',
       oncallChats: [{ chatId: 'oc_1', workingDir: '~/repo' }],
     }, {
@@ -48,6 +71,7 @@ describe('applyBotConfigEdits', () => {
       larkAppId: 'new_app',
       larkAppSecret: 'new_secret',
       cliChoice: '4',
+      cliPathOverride: '/opt/new/codex',
       workingDir: '~/new',
       allowedUsers: 'alice,bob',
     });
@@ -57,6 +81,7 @@ describe('applyBotConfigEdits', () => {
       name: 'codex-main',
       larkAppSecret: 'new_secret',
       cliId: 'codex',
+      cliPathOverride: '/opt/new/codex',
       workingDir: '~/new',
       allowedUsers: ['alice', 'bob'],
       oncallChats: [{ chatId: 'oc_1', workingDir: '~/repo' }],
@@ -78,6 +103,7 @@ describe('applyBotConfigEdits', () => {
       larkAppSecret: '',
       cliChoice: '',
       name: '-',
+      cliPathOverride: '-',
       backendType: '-',
       allowedUsers: '-',
       projectScanDir: '-',
@@ -87,8 +113,93 @@ describe('applyBotConfigEdits', () => {
       larkAppId: 'app',
       larkAppSecret: 'secret',
       cliId: 'claude-code',
-      cliPathOverride: '/opt/legacy/claude',
     });
+  });
+
+  it('normalizes an existing custom name when editing other fields', () => {
+    const updated = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      name: 'Codex Main',
+      workingDir: '~/old',
+    }, {
+      workingDir: '~/new',
+    });
+
+    expect(updated).toEqual({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      name: 'Codex-Main',
+      workingDir: '~/new',
+    });
+  });
+});
+
+describe('normalizeBotConfig', () => {
+  it('normalizes custom names before add or reconfigure writes bots.json', () => {
+    expect(normalizeBotConfig({
+      larkAppId: 'app',
+      name: 'Codex Main',
+    })).toEqual({
+      larkAppId: 'app',
+      name: 'Codex-Main',
+    });
+  });
+
+  it('drops custom names that normalize to empty', () => {
+    expect(normalizeBotConfig({
+      larkAppId: 'app',
+      name: '...',
+    })).toEqual({
+      larkAppId: 'app',
+    });
+  });
+});
+
+describe('parseBotConfigsJson', () => {
+  it('parses a valid bots.json array', () => {
+    expect(parseBotConfigsJson('[{"larkAppId":"app"}]', '/tmp/bots.json')).toEqual([
+      { larkAppId: 'app' },
+    ]);
+  });
+
+  it('throws a clear error for invalid JSON', () => {
+    expect(() => parseBotConfigsJson('{bad json', '/tmp/bots.json'))
+      .toThrow(/Failed to parse \/tmp\/bots\.json/);
+  });
+
+  it('throws a clear error when bots.json is not an array', () => {
+    expect(() => parseBotConfigsJson('{"larkAppId":"app"}', '/tmp/bots.json'))
+      .toThrow(/must contain a JSON array/);
+  });
+});
+
+describe('assertUniqueBotProcessNames', () => {
+  it('rejects duplicate names after normalization', () => {
+    expect(() => assertUniqueBotProcessNames([
+      { larkAppId: 'app_a', name: 'Codex Main' },
+      { larkAppId: 'app_b', name: 'Codex-Main' },
+    ])).toThrow(/botmux-Codex-Main.*entries 1 and 2/);
+  });
+
+  it('rejects collisions between custom numeric names and unnamed index names', () => {
+    expect(() => assertUniqueBotProcessNames([
+      { larkAppId: 'app_a', name: '1' },
+      { larkAppId: 'app_b' },
+    ])).toThrow(/botmux-1.*entries 1 and 2/);
+  });
+
+  it('rejects the reserved dashboard pm2 process name', () => {
+    expect(() => assertUniqueBotProcessNames([
+      { larkAppId: 'app_a', name: 'dashboard' },
+    ])).toThrow(/botmux-dashboard.*reserved/);
+  });
+
+  it('allows unique pm2 process names', () => {
+    expect(() => assertUniqueBotProcessNames([
+      { larkAppId: 'app_a', name: 'claude-main' },
+      { larkAppId: 'app_b' },
+    ])).not.toThrow();
   });
 });
 

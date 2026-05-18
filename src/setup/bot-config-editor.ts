@@ -14,6 +14,7 @@ export interface BotConfigEditInput {
   larkAppId?: string;
   larkAppSecret?: string;
   cliChoice?: string;
+  cliPathOverride?: string;
   backendType?: string;
   workingDir?: string;
   allowedUsers?: string;
@@ -52,6 +53,55 @@ export function botProcessName(
   return `${prefix}-${name ?? index}`;
 }
 
+export function normalizeBotConfig<T extends Record<string, any>>(bot: T): T {
+  const out: Record<string, any> = { ...bot };
+  if (typeof out.name !== 'string') return out as T;
+
+  const name = normalizeBotProcessName(out.name);
+  if (name) out.name = name;
+  else delete out.name;
+  return out as T;
+}
+
+export function parseBotConfigsJson<T extends Record<string, any> = Record<string, any>>(
+  content: string,
+  filePath = 'bots.json',
+): T[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (err: any) {
+    throw new Error(`Failed to parse ${filePath}: ${err?.message ?? String(err)}`);
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error(`${filePath} must contain a JSON array of bot configs.`);
+  }
+  return parsed as T[];
+}
+
+export function assertUniqueBotProcessNames(
+  bots: Array<{ name?: unknown }>,
+  prefix = 'botmux',
+): void {
+  const seen = new Map<string, number>();
+  const reserved = new Set([`${prefix}-dashboard`]);
+  for (let i = 0; i < bots.length; i++) {
+    const name = botProcessName(bots[i], i, prefix);
+    if (reserved.has(name)) {
+      throw new Error(`Bot PM2 process name "${name}" is reserved. Set a different "name" value.`);
+    }
+    const firstIndex = seen.get(name);
+    if (firstIndex !== undefined) {
+      throw new Error(
+        `Duplicate bot PM2 process name "${name}" in bots.json entries ${firstIndex + 1} and ${i + 1}. ` +
+        'Set unique "name" values or clear one before restarting.',
+      );
+    }
+    seen.set(name, i);
+  }
+}
+
 function applyOptionalString(
   out: Record<string, any>,
   key: string,
@@ -77,7 +127,9 @@ export function parseBotSelection(
   const pm2Match = /^botmux-(\d+)$/.exec(raw);
   if (pm2Match) {
     const idx = Number(pm2Match[1]);
-    return Number.isInteger(idx) && idx >= 0 && idx < bots.length ? idx : undefined;
+    if (Number.isInteger(idx) && idx >= 0 && idx < bots.length && botProcessName(bots[idx], idx) === raw) {
+      return idx;
+    }
   }
 
   if (/^\d+$/.test(raw)) {
@@ -127,6 +179,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     out.cliId = CLI_ID_CHOICES[cliChoice] ?? cliChoice;
   }
 
+  applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
+
   if (input.backendType !== undefined) {
     const backendType = input.backendType.trim();
     if (backendType === '-') {
@@ -151,5 +205,5 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     }
   }
 
-  return out as T;
+  return normalizeBotConfig(out) as T;
 }

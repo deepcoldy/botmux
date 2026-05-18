@@ -29,8 +29,11 @@ import { loadOncallChatsByApp, pickBotEntryByName } from './utils/bot-routing.js
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import {
   applyBotConfigEdits,
+  assertUniqueBotProcessNames,
   botProcessName,
   CLI_ID_CHOICES,
+  normalizeBotConfig,
+  parseBotConfigsJson,
   parseBotSelection,
   removeBotConfig,
   type BotConfigEditInput,
@@ -102,14 +105,35 @@ function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
 
 function loadBotsJson(): any[] {
   if (existsSync(BOTS_JSON_FILE)) {
-    try { return JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')); } catch { return []; }
+    try {
+      return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE);
+    } catch (err: any) {
+      console.error(`❌ ${err?.message ?? String(err)}`);
+      process.exit(1);
+    }
   }
   return [];
+}
+
+function ensureUniqueBotProcessNames(bots: any[]): void {
+  try {
+    assertUniqueBotProcessNames(bots, PM2_NAME);
+  } catch (err: any) {
+    console.error(`❌ ${err?.message ?? String(err)}`);
+    console.error('   请修改 bots.json 中的 name，确保 botmux status/PM2 进程名唯一。');
+    process.exit(1);
+  }
+}
+
+function writeBotsJson(bots: any[]): void {
+  ensureUniqueBotProcessNames(bots);
+  writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
 }
 
 function ecosystemConfig(): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
+  ensureUniqueBotProcessNames(bots);
 
   const baseApp = {
     script: daemonScript,
@@ -224,7 +248,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   if (workingDir) bot.workingDir = workingDir;
   if (allowedUsers) bot.allowedUsers = allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
 
-  return bot;
+  return normalizeBotConfig(bot);
 }
 
 function formatOptionalValue(v: unknown): string {
@@ -269,6 +293,12 @@ async function promptEditBotConfig(
     '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
   ]);
   input.cliChoice = await ask(rl, `CLI 适配器 [${bot.cliId ?? 'claude-code'}]: `);
+
+  printInputHelp('CLI 可执行文件路径覆盖', [
+    '可选。CLI 不在 PATH 或重装后路径变化时填写绝对路径。',
+    '留空保留当前值；输入 - 清空覆盖并回到 PATH 查找。',
+  ]);
+  input.cliPathOverride = await ask(rl, `CLI 可执行文件路径覆盖 [${formatOptionalValue(bot.cliPathOverride)}]: `);
 
   printInputHelp('会话后端 backendType', [
     '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着。',
@@ -340,7 +370,7 @@ async function writeSingleBotConfig(): Promise<void> {
   const bot = await promptBotConfig(rl);
   rl.close();
 
-  writeFileSync(BOTS_JSON_FILE, JSON.stringify([bot], null, 2) + '\n');
+  writeBotsJson([bot]);
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
   console.log(`\n下一步:`);
   console.log(`  1. botmux start              启动 daemon（飞书后台配长连接前必须先启动）`);
@@ -361,7 +391,7 @@ async function cmdSetup(): Promise<void> {
 
   if (hasBots) {
     // --- Multi-bot mode (bots.json exists) ---
-    const bots = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')) as any[];
+    const bots = loadBotsJson();
     console.log(`已配置 ${bots.length} 个机器人：`);
     for (let i = 0; i < bots.length; i++) {
       console.log(`  ${formatBotConfigLine(bots[i], i)}`);
@@ -378,13 +408,14 @@ async function cmdSetup(): Promise<void> {
     const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  3) 编辑现有机器人  4) 删除机器人  (1/2/3/4) [1]: ');
 
     if (action === '2') {
-      renameSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak\n`);
       console.log('\n── 重新配置 ──\n');
       printLarkPermissions();
       const newBot = await promptBotConfig(rl);
       rl.close();
-      writeFileSync(BOTS_JSON_FILE, JSON.stringify([newBot], null, 2) + '\n');
+      ensureUniqueBotProcessNames([newBot]);
+      renameSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak\n`);
+      writeBotsJson([newBot]);
       console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
       console.log(`\n下一步: botmux restart`);
       return;
@@ -409,7 +440,7 @@ async function cmdSetup(): Promise<void> {
 
       copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
       bots[editIndex] = edited;
-      writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
+      writeBotsJson(bots);
       console.log(`\n✅ 已更新 ${formatBotConfigLine(edited, editIndex)}`);
       console.log(`   配置文件: ${BOTS_JSON_FILE}`);
       console.log(`   旧配置已备份: ${BOTS_JSON_FILE}.bak`);
@@ -446,7 +477,7 @@ async function cmdSetup(): Promise<void> {
       }
 
       copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      writeFileSync(BOTS_JSON_FILE, JSON.stringify(result.bots, null, 2) + '\n');
+      writeBotsJson(result.bots);
       console.log(`\n✅ 已删除 ${formatBotConfigLine(result.removed, result.index)}`);
       console.log(`   剩余机器人: ${result.bots.length} 个`);
       console.log(`   配置文件: ${BOTS_JSON_FILE}`);
@@ -460,7 +491,7 @@ async function cmdSetup(): Promise<void> {
     const newBot = await promptBotConfig(rl);
     rl.close();
     bots.push(newBot);
-    writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
+    writeBotsJson(bots);
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`\n下一步: botmux restart`);
@@ -498,7 +529,7 @@ async function cmdSetup(): Promise<void> {
     rl.close();
 
     const bots = [existingBot, newBot];
-    writeFileSync(BOTS_JSON_FILE, JSON.stringify(bots, null, 2) + '\n');
+    writeBotsJson(bots);
     renameSync(ENV_FILE, ENV_FILE + '.bak');
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
@@ -699,11 +730,11 @@ async function cmdRestart(): Promise<void> {
   preflightNodeSanity();
   await ensureSystemDependencies();
   cleanupLegacyPm2();
+  const cfg = ecosystemConfig();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
-  const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
@@ -760,7 +791,7 @@ function cmdLogs(): void {
     : '50';
 
   const bots = loadBotsJson();
-  // Support --bot <index> to filter specific bot logs
+  // Support --bot <0-based-index|pm2-name|appId> to filter specific bot logs
   const botIdx = process.argv.includes('--bot')
     ? process.argv[process.argv.indexOf('--bot') + 1]
     : undefined;
@@ -1653,7 +1684,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   start       启动 daemon
   stop        停止 daemon
   restart     重启 daemon（自动恢复活跃会话）
-  logs        查看 daemon 日志（--lines N, --bot <index|name|appId>）
+  logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
   dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
