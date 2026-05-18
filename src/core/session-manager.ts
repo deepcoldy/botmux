@@ -17,7 +17,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
-import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
+import type { LarkAttachment, LarkMention, LarkSender, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -157,6 +157,16 @@ function xmlEscape(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
+function formatSenderTag(sender?: LarkSender): string {
+  if (!sender) return '';
+  const attrs = [
+    `type="${xmlEscape(sender.type)}"`,
+    `open_id="${xmlEscape(sender.openId)}"`,
+    sender.name ? `name="${xmlEscape(sender.name)}"` : '',
+  ].filter(Boolean).join(' ');
+  return `<sender ${attrs} />`;
+}
+
 export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
   if (!attachments || attachments.length === 0) return '';
   let imgN = 0, fileN = 0;
@@ -178,6 +188,7 @@ export function buildNewTopicPrompt(
   availableBots?: Array<{ name: string; displayName: string; openId: string }>,
   followUps?: string[],
   botIdentity?: { name?: string; openId?: string },
+  sender?: LarkSender,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
@@ -220,6 +231,8 @@ export function buildNewTopicPrompt(
 
   const userBlock = `<user_message>\n${userMessage}\n</user_message>`;
   const parts: string[] = [userBlock];
+  const senderTag = formatSenderTag(sender);
+  if (senderTag) parts.push(senderTag);
 
   if (followUps && followUps.length > 0) {
     for (const fu of followUps) {
@@ -251,9 +264,11 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; sender?: LarkSender; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string },
 ): string {
   const parts: string[] = [`<user_message>\n${content}\n</user_message>`];
+  const senderTag = formatSenderTag(opts?.sender);
+  if (senderTag) parts.push(senderTag);
 
   const attachHint = opts?.attachments && opts.attachments.length > 0
     ? formatAttachmentsHint(opts.attachments)
@@ -392,6 +407,7 @@ export function buildReforkPrompt(
   opts?: {
     attachments?: LarkAttachment[];
     mentions?: LarkMention[];
+    sender?: LarkSender;
     cliId?: CliId;
     cliPathOverride?: string;
     selfMention?: { name?: string | null; openId?: string | null };
@@ -410,6 +426,7 @@ export function buildReforkPrompt(
     isAdoptMode: false,
     cliId: opts?.cliId,
     cliPathOverride: opts?.cliPathOverride,
+    sender: opts?.sender,
   });
 }
 

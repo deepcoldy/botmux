@@ -519,10 +519,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await getAvailableBots(ds.larkAppId, ds.chatId),
           ds.pendingFollowUps,
           { name: selfBot.botName, openId: selfBot.botOpenId },
+          ds.pendingSender,
         );
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
+        ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
         forkWorker(ds, prompt);
         const cwd = getSessionWorkingDir(ds);
@@ -615,10 +617,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
       targetDs.pendingFollowUps,
       { name: selfBot.botName, openId: selfBot.botOpenId },
+      targetDs.pendingSender,
     );
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
     targetDs.pendingMentions = undefined;
+    targetDs.pendingSender = undefined;
     targetDs.pendingFollowUps = undefined;
     forkWorker(targetDs, prompt);
     await sessionReply(rootId, `✅ 已选择 ${displayName}`);

@@ -1,5 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
-import type { Session, DaemonToWorker, LarkAttachment, LarkMention, DisplayMode } from '../types.js';
+import type { Session, DaemonToWorker, LarkAttachment, LarkMention, LarkSender, DisplayMode } from '../types.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -52,6 +52,7 @@ export interface DaemonSession {
   pendingPrompt?: string;        // original user message to send after repo is selected
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
+  pendingSender?: LarkSender;          // sender metadata from the initial message
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)

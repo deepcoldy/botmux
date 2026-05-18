@@ -19,7 +19,7 @@ import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { logger } from './utils/logger.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
-import type { DaemonToWorker, LarkMessage } from './types.js';
+import type { DaemonToWorker, LarkMessage, LarkSender } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import { sessionKey, sessionAnchorId } from './core/types.js';
@@ -333,6 +333,12 @@ const cardDeps: CardHandlerDeps = {
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
+function messageSender(parsed: LarkMessage, name?: string): LarkSender {
+  return name
+    ? { openId: parsed.senderId, type: parsed.senderType, name }
+    : { openId: parsed.senderId, type: parsed.senderType };
+}
+
 /**
  * Default-oncall is a uniform forward-only policy: whenever the toggle is
  * on, ANY chat the bot is currently in — old or newly added, doesn't matter —
@@ -555,6 +561,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingPrompt: content,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
+    pendingSender: messageSender(parsed),
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
     workingDir: pinnedWorkingDir,
@@ -568,7 +575,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, messageSender(parsed));
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -593,7 +600,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, messageSender(parsed));
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -663,9 +670,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     senderOpenIdForPrefix !== selfBotOpenId &&
     (isBotSenderType ||
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
-  const botSenderPrefix = isForeignBot
-    ? `[来自 ${lookupForeignBotName(senderOpenIdForPrefix!, larkAppId)} 的 @mention]\n`
-    : '';
+  const senderName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId) : undefined;
+  const botSenderPrefix = senderName ? `[来自 ${senderName} 的 @mention]\n` : '';
+  const sender = messageSender(parsed, senderName);
   const promptContent = botSenderPrefix + parsed.content;
   if (isForeignBot) {
     logger.info(
@@ -858,6 +865,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingPrompt: promptContent,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
+      pendingSender: sender,
       ownerOpenId: senderOId,
       currentTurnTitle: parsed.content.substring(0, 50),
       workingDir: pinnedWorkingDir,
@@ -872,7 +880,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, sender);
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -897,7 +905,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, sender);
       forkWorker(newDs, prompt);
     }
 
@@ -929,6 +937,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           isAdoptMode: false,
           cliId: dsBotCfgForMsg.cliId,
           cliPathOverride: dsBotCfgForMsg.cliPathOverride,
+          sender,
         });
     beginNewTurn(ds, parsed.content);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
@@ -962,6 +971,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       cliId: dsBotCfgForFork.cliId,
       cliPathOverride: dsBotCfgForFork.cliPathOverride,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+      sender,
     });
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }

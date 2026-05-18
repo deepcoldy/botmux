@@ -393,10 +393,12 @@ export async function handleCommand(
               await getAvailableBots(ds.larkAppId, ds.chatId),
               ds.pendingFollowUps,
               { name: selfBot.botName, openId: selfBot.botOpenId },
+              ds.pendingSender,
             );
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
+            ds.pendingSender = undefined;
             ds.pendingFollowUps = undefined;
             forkWorker(ds, prompt);
             await sessionReply(rootId, `✅ 已选择 ${displayName}`);
@@ -466,10 +468,12 @@ export async function handleCommand(
             await getAvailableBots(ds.larkAppId, ds.chatId),
             ds.pendingFollowUps,
             { name: selfBot.botName, openId: selfBot.botOpenId },
+            ds.pendingSender,
           );
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;
+          ds.pendingSender = undefined;
           ds.pendingFollowUps = undefined;
           forkWorker(ds, prompt);
           const cwd = getSessionWorkingDir(ds);

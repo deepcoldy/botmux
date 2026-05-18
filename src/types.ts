@@ -66,6 +66,12 @@ export interface LarkMention {
   openId?: string;    // open_id of the mentioned user/bot
 }
 
+export interface LarkSender {
+  openId: string;
+  type: string;
+  name?: string;
+}
+
 export interface LarkMessage {
   messageId: string;
   rootId: string;

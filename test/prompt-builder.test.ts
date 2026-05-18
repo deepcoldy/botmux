@@ -114,6 +114,22 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain('name="Alice"');
     expect(prompt).toContain('open_id="ou_alice"');
   });
+
+  it('should include sender metadata when provided', () => {
+    const prompt = buildNewTopicPrompt(
+      'hello',
+      SESSION_ID,
+      'claude-code',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { type: 'user', openId: 'ou_sender', name: 'Alice' },
+    );
+    expect(prompt).toContain('<sender type="user" open_id="ou_sender" name="Alice" />');
+  });
 });
 
 describe('buildFollowUpContent', () => {
@@ -156,6 +172,13 @@ describe('buildFollowUpContent', () => {
     expect(content).toContain('<mentions>');
     expect(content).toContain('name="Bob"');
     expect(content).toContain('open_id="ou_bob"');
+  });
+
+  it('should include sender metadata without requiring a name', () => {
+    const content = buildFollowUpContent('hello', SESSION_ID, {
+      sender: { type: 'user', openId: 'ou_sender' },
+    });
+    expect(content).toContain('<sender type="user" open_id="ou_sender" />');
   });
 
   it('should omit <session_id> but keep mentions in adopt mode', () => {
@@ -244,6 +267,15 @@ describe('buildReforkPrompt', () => {
     expect(out).toContain('path="/tmp/x.jpg"');
     expect(out).toContain('name="Alice"');
     expect(out).toContain('open_id="ou_alice"');
+  });
+
+  it('forwards sender metadata to the wrapper', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, 'hello', {
+      cliId: 'codex',
+      sender: { type: 'user', openId: 'ou_sender' },
+    });
+    expect(out).toContain('<sender type="user" open_id="ou_sender" />');
   });
 
   it('uses bridge content (no botmux tags) when ds.adoptedFrom is set', () => {
