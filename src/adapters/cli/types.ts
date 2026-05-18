@@ -125,4 +125,4 @@ export interface CliAdapter {
   readonly altScreen: boolean;
 }
 
-export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'gemini' | 'opencode';
+export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'cursor' | 'gemini' | 'opencode';

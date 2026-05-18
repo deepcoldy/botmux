@@ -348,9 +348,9 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
-  const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex', '5': 'gemini', '6': 'opencode' };
+  const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex', '5': 'cursor', '6': 'gemini', '7': 'opencode' };
   const cliId = cliIdMap[cliChoice] ?? (cliChoice || 'claude-code');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
 
