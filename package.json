@@ -29,7 +29,8 @@
     "test:e2e-browser:setup": "tsx test/e2e-browser/setup-login.ts",
     "test:e2e-browser": "tsx scripts/run-e2e.ts",
     "report:dashboard": "tsx scripts/report-dashboard.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.64.0",

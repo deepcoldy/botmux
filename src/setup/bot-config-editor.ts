@@ -5,8 +5,9 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '2': 'aiden',
   '3': 'coco',
   '4': 'codex',
-  '5': 'gemini',
-  '6': 'opencode',
+  '5': 'cursor',
+  '6': 'gemini',
+  '7': 'opencode',
 };
 
 export interface BotConfigEditInput {

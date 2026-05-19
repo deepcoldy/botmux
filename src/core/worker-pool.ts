@@ -17,6 +17,7 @@ import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromp
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -507,6 +508,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     larkAppSecret: botCfg.larkAppSecret,
     botName: bot.botName,
     botOpenId: bot.botOpenId,
+    locale: botLocale(botCfg),
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -544,14 +546,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const t = tag(ds);
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  const loc = botLocale(botCfg);
 
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
-  // Bridge mode (the v3 default for /adopt) hides the legacy takeover
-  // button: the model never sees botmux, daemon harvests final output via
-  // the transcript watcher, and the old takeover path would SIGKILL the
-  // user's original CLI 1.5s after fork — incompatible with bridge intent.
-  // Explicit takeover will be re-introduced as `/adopt --takeover` in a
-  // follow-up patch with safe semantics (no implicit kill).
+  // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
   const isAdopt = !!ds.adoptedFrom;
   const showTakeover = false;
 
@@ -601,6 +599,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.currentImageKey,
               isAdopt,
               showTakeover,
+              loc,
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             persistStreamCardState(ds);
@@ -642,6 +641,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             ds.currentImageKey,
             isAdopt,
             showTakeover,
+            loc,
           );
           ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
           persistStreamCardState(ds);
@@ -670,6 +670,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               botCfg.cliId,
               undefined,
               !!ds.adoptedFrom,
+              loc,
             );
             await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
           } catch (fallbackErr) {
@@ -743,6 +744,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             ds.currentImageKey,
             isAdopt,
             showTakeover,
+            loc,
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -788,6 +790,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             ds.currentImageKey,
             isAdopt,
             showTakeover,
+            loc,
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -818,6 +821,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           ds.currentImageKey,
           isAdopt,
           showTakeover,
+          loc,
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -852,6 +856,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             msg.description,
             msg.options,
             msg.multiSelect,
+            undefined,
+            loc,
           );
           const cardMsgId = await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
           ds.tuiPromptCardId = cardMsgId;
@@ -865,7 +871,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // TUI prompt is no longer showing — update card if it exists
         logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
         if (ds.tuiPromptCardId) {
-          const resolvedCard = buildTuiPromptResolvedCard(msg.selectedText ?? 'Done');
+          const resolvedCard = buildTuiPromptResolvedCard(msg.selectedText ?? tr('card.action.tui_done', undefined, loc), loc);
           updateMessage(ds.larkAppId, ds.tuiPromptCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to update TUI prompt card: ${err}`),
           );
@@ -902,7 +908,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // leave status='active' and still get the notice.
           if (ds.session.status !== 'closed') {
             try {
-              await cb.sessionReply(sessionAnchorId(ds), '\u23cf 已采纳的 CLI 会话已退出', 'text', ds.larkAppId);
+              await cb.sessionReply(sessionAnchorId(ds), tr('worker.adopted_session_exited', undefined, loc), 'text', ds.larkAppId);
             } catch { /* best effort */ }
           }
           break;
@@ -927,6 +933,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', botCfg.cliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
+              isAdopt, showTakeover, loc,
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -934,7 +941,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           killWorker(ds);
           const cliName = getCliDisplayName(botCfg.cliId);
           try {
-            await cb.sessionReply(sessionAnchorId(ds), `\u26a0\ufe0f ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
+            await cb.sessionReply(sessionAnchorId(ds), tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc), 'text', ds.larkAppId);
           } catch (replyErr) {
             if (replyErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -1196,6 +1203,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     larkAppSecret: botCfg.larkAppSecret,
     botName: bot.botName,
     botOpenId: bot.botOpenId,
+    locale: botLocale(botCfg),
     adoptMode: true,
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptPaneCols: adopted.paneCols,
@@ -1289,6 +1297,24 @@ export function killStalePids(activeSessions_: Session[]): void {
       for (const name of TmuxBackend.listBotmuxSessions()) {
         if (ownedNames.has(name) && !activeNames.has(name)) {
           logger.info(`Killing orphaned tmux session: ${name}`);
+          TmuxBackend.killSession(name);
+        }
+      }
+      // Per-bot CLI-mismatch cleanup: an active session whose persisted cliId
+      // no longer matches its bot's configured cliId would otherwise get
+      // resurrected on restart by TmuxBackend.spawn's reattach path (which
+      // ignores the bin/args we pass). Kill those tmux now so the session-
+      // manager restore step can fresh-spawn the new CLI on first message.
+      // (Mirror of the restoreActiveSessions guard, applied one layer earlier
+      // for tmux sessions whose daemon-side state is being rebuilt.)
+      for (const session of activeSessions_) {
+        const sessionCliId = session.cliId;
+        if (!sessionCliId || !session.larkAppId) continue;
+        let botCliId: CliId | undefined;
+        try { botCliId = getBot(session.larkAppId).config.cliId; } catch { continue; }
+        if (botCliId && sessionCliId !== botCliId) {
+          const name = TmuxBackend.sessionName(session.sessionId);
+          logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing tmux ${name}`);
           TmuxBackend.killSession(name);
         }
       }

@@ -115,7 +115,7 @@ export class BridgeTurnQueue {
    *  `markTimeMs` is captured here so the rotation fallback can bound its
    *  fingerprint scan to events written after this point — protects short
    *  fingerprints from matching old history in unrelated sibling jsonls. */
-  mark(turnId: string, contentFingerprint?: string, markTimeMs: number = Date.now(), contentNormalized?: string): void {
+  mark(turnId: string, contentFingerprint?: string, markTimeMs: number = Date.now(), contentNormalized?: string): string {
     this.queue.push({
       turnId,
       started: false,
@@ -124,6 +124,7 @@ export class BridgeTurnQueue {
       contentNormalized,
       markTimeMs,
     });
+    return turnId;
   }
 
   /** Drop all pending turns. Used when the worker discovers it can't
@@ -132,6 +133,40 @@ export class BridgeTurnQueue {
   clearPending(): BridgePendingTurn[] {
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
+    return dropped;
+  }
+
+  /** Drop a specific pending turn by turnId iff it has not yet started
+   *  collecting assistant text. Returns the dropped turn or null if not
+   *  found / already started. Used by the worker when a writeInput's
+   *  deferred recheck conclusively fails — the user has been notified
+   *  the message was lost, so keeping a fingerprint-bearing mark around
+   *  only fuels the per-tick rotation-fallback scan that already
+   *  spammed 99% CPU once (no jsonl line will ever match). */
+  dropPendingTurn(turnId: string): BridgePendingTurn | null {
+    const idx = this.queue.findIndex(t => t.turnId === turnId && !t.started);
+    if (idx === -1) return null;
+    const [dropped] = this.queue.splice(idx, 1);
+    return dropped;
+  }
+
+  /** Sweep pending (unstarted) turns whose mark is older than `maxAgeMs`.
+   *  Returns the dropped turns for logging. Belt-and-braces backstop for
+   *  any future code path that leaves an unstarted mark stranded — without
+   *  it, `maybeSwitchBridgeJsonl` would keep doing full-directory jsonl
+   *  scans every poll tick until the worker restarts. Started turns are
+   *  never expired here: once Claude actually wrote the user line, the
+   *  turn is collecting assistant text and we want to wait however long
+   *  the model takes. */
+  pruneExpired(maxAgeMs: number, now: number = Date.now()): BridgePendingTurn[] {
+    const dropped: BridgePendingTurn[] = [];
+    this.queue = this.queue.filter(t => {
+      if (t.started) return true;
+      if (t.markTimeMs === undefined) return true;
+      if (now - t.markTimeMs <= maxAgeMs) return true;
+      dropped.push(t);
+      return false;
+    });
     return dropped;
   }
 

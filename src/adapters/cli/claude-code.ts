@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
+import { t } from '../../i18n/index.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -256,56 +257,53 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       return `claude --resume ${cliSessionId ?? sessionId}`;
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale }) {
       const args: string[] = [];
       if (resume) {
-        // Prefer Claude's most recently observed internal session id when we
-        // have one — `--resume` reads `<id>.jsonl`, and after a previous run
-        // rotated the id (which we now persist via the pid-file resolver) the
-        // botmux sessionId no longer matches Claude's actual transcript file.
         args.push('--resume', resumeSessionId ?? sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
       args.push('--dangerously-skip-permissions');
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
+      const unknown = t('ai.identity.unknown', undefined, locale);
       const identityBlock =
         botName || botOpenId
           ? [
               '',
               '<identity>',
-              `  <name>${botName ?? '(未知)'}</name>`,
-              `  <open_id>${botOpenId ?? '(未知)'}</open_id>`,
+              `  <name>${botName ?? unknown}</name>`,
+              `  <open_id>${botOpenId ?? unknown}</open_id>`,
               '  <routing_rules>',
-              '    群里可能有多个机器人，消息里用 `@名字` 和 `open_id` 区分接收方。对照上面的 name/open_id 判断本条消息归属：',
-              '    - 只执行明确分给自己的那部分，别抢别的机器人的活',
-              '    - 整条消息都指派给别的机器人时，保持沉默不要回复',
-              '    - **默认不主动拉别的 bot 进来**。除非用户明确要求、或某段任务只能由对方做，否则一个人做完自己的部分就行。',
+              `    ${t('ai.identity.routing_intro', undefined, locale)}`,
+              `    ${t('ai.identity.rule_own_part', undefined, locale)}`,
+              `    ${t('ai.identity.rule_silent_when_other', undefined, locale)}`,
+              `    ${t('ai.identity.rule_no_proactive_pull', undefined, locale)}`,
               '',
-              '    **和别的机器人协作的硬性物理事实**：飞书话题群里其他 bot **默认收不到** 你 `botmux send` 出去的消息——',
-              '    要让某个 bot 接力干活，**必须** 显式 `--mention <对方 bot 的 open_id>`，不 --mention 对方 bot 完全不会被触发。',
-              '    - 协作伙伴的 open_id 会列在每条用户消息附带的 `<available_bots>` 块里，也可以 `botmux bots list` 查',
-              '    - 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；正文里写 `@对方名字` 时 botmux 也会自动补上 --mention，但显式传更稳',
-              '    - 该 --mention 的场景：用户明确要求让对方接力、把任务的某段交给对方、需要对方给最终结论或做独立操作',
-              '    - 不必 --mention 的场景：纯状态更新/确认/感谢——尽量合并到下一次有内容的消息里再带上，避免互相 ping 触发空转',
+              `    ${t('ai.identity.mention_intro', undefined, locale)}`,
+              `    ${t('ai.identity.mention_must', undefined, locale)}`,
+              `    ${t('ai.identity.mention_partners', undefined, locale)}`,
+              `    ${t('ai.identity.mention_usage', undefined, locale)}`,
+              `    ${t('ai.identity.mention_when_to', undefined, locale)}`,
+              `    ${t('ai.identity.mention_when_not', undefined, locale)}`,
               '  </routing_rules>',
               '</identity>',
             ]
           : [];
       args.push('--append-system-prompt', [
         '<botmux_routing>',
-        '你连接到了飞书（Lark）话题群。用户在飞书上阅读，看不到你的终端输出。',
-        '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
+        t('ai.routing.intro', undefined, locale),
+        t('ai.routing.must_use_botmux', undefined, locale),
         '',
-        '使用指南：',
-        '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。',
-        '- 发送纯文本即可：`botmux send "消息"`。格式自动处理。',
-        '- 多行消息必须用 heredoc，禁止写成 `botmux send "第一行\\n第二行"`；否则 `\\n` 可能按字面量显示在飞书里。',
-        "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
-        '- 附带图片：`botmux send --images /path/to/img.png "说明文字"`',
-        '- 附带文件：`botmux send --files /path/to/file.pdf "请查收"`',
-        '- 需要上下文时用 `botmux history` 读取之前的对话。',
-        '- 查看可协作的机器人：`botmux bots list`',
+        t('ai.routing.usage_heading', undefined, locale),
+        t('ai.routing.usage_send_when', undefined, locale),
+        t('ai.routing.usage_send_text', undefined, locale),
+        t('ai.routing.usage_heredoc', undefined, locale),
+        t('ai.routing.heredoc_example', undefined, locale),
+        t('ai.routing.usage_images', undefined, locale),
+        t('ai.routing.usage_files', undefined, locale),
+        t('ai.routing.usage_history', undefined, locale),
+        t('ai.routing.usage_bots_list', undefined, locale),
         '</botmux_routing>',
         ...identityBlock,
       ].join('\n'));

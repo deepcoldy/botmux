@@ -51,10 +51,11 @@
   
   <!-- Hub to Bots -->
   <g fill="none" stroke="url(#lineGrad)" stroke-width="3" stroke-dasharray="8 8" class="path-line">
-    <path d="M 590 350 C 740 350 740 200 890 200" />
-    <path d="M 590 350 C 740 350 740 275 890 275" />
-    <path d="M 590 350 C 740 350 740 350 890 350" />
-    <path d="M 590 350 C 740 350 740 425 890 425" />
+    <path d="M 590 350 C 740 350 740 170 890 170" />
+    <path d="M 590 350 C 740 350 740 236 890 236" />
+    <path d="M 590 350 C 740 350 740 302 890 302" />
+    <path d="M 590 350 C 740 350 740 368 890 368" />
+    <path d="M 590 350 C 740 350 740 434 890 434" />
     <path d="M 590 350 C 740 350 740 500 890 500" />
   </g>
 
@@ -81,7 +82,7 @@
   </g>
 
   <!-- Bot Nodes -->
-  <g transform="translate(900, 200)">
+  <g transform="translate(900, 170)">
     <rect x="0" y="-25" width="220" height="50" rx="8" fill="#111111" stroke="#3f3f46" stroke-width="1.5"/>
     <circle cx="15" cy="-10" r="4" fill="#ef4444"/>
     <circle cx="27" cy="-10" r="4" fill="#eab308"/>
@@ -89,7 +90,7 @@
     <text x="15" y="14" class="bot-text" fill="#f97316"><tspan fill="#a1a1aa">~ </tspan>claude</text>
   </g>
 
-  <g transform="translate(900, 275)">
+  <g transform="translate(900, 236)">
     <rect x="0" y="-25" width="220" height="50" rx="8" fill="#111111" stroke="#3f3f46" stroke-width="1.5"/>
     <circle cx="15" cy="-10" r="4" fill="#ef4444"/>
     <circle cx="27" cy="-10" r="4" fill="#eab308"/>
@@ -97,7 +98,15 @@
     <text x="15" y="14" class="bot-text" fill="#60a5fa"><tspan fill="#a1a1aa">~ </tspan>gemini</text>
   </g>
 
-  <g transform="translate(900, 350)">
+  <g transform="translate(900, 302)">
+    <rect x="0" y="-25" width="220" height="50" rx="8" fill="#111111" stroke="#3f3f46" stroke-width="1.5"/>
+    <circle cx="15" cy="-10" r="4" fill="#ef4444"/>
+    <circle cx="27" cy="-10" r="4" fill="#eab308"/>
+    <circle cx="39" cy="-10" r="4" fill="#22c55e"/>
+    <text x="15" y="14" class="bot-text" fill="#38bdf8"><tspan fill="#a1a1aa">~ </tspan>cursor</text>
+  </g>
+
+  <g transform="translate(900, 368)">
     <rect x="0" y="-25" width="220" height="50" rx="8" fill="#111111" stroke="#3f3f46" stroke-width="1.5"/>
     <circle cx="15" cy="-10" r="4" fill="#ef4444"/>
     <circle cx="27" cy="-10" r="4" fill="#eab308"/>
@@ -105,7 +114,7 @@
     <text x="15" y="14" class="bot-text" fill="#10b981"><tspan fill="#a1a1aa">~ </tspan>aiden</text>
   </g>
 
-  <g transform="translate(900, 425)">
+  <g transform="translate(900, 434)">
     <rect x="0" y="-25" width="220" height="50" rx="8" fill="#111111" stroke="#3f3f46" stroke-width="1.5"/>
     <circle cx="15" cy="-10" r="4" fill="#ef4444"/>
     <circle cx="27" cy="-10" r="4" fill="#eab308"/>

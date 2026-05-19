@@ -84,7 +84,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', gemini: 'Gemini', opencode: 'OpenCode' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -461,11 +461,44 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
  *
  *  Pending turns are preserved across the switch so the next ingest
  *  can match and start the turn in the new file. */
+/** Per-fingerprint rate limit for the full-directory fingerprint scan.
+ *  Without this, a wedged pending turn (e.g. writeInput's Enter eaten by a
+ *  Claude TUI prompt so the user line never lands in any jsonl) drives this
+ *  function every 1s from the fallback timer and every idle tick — each
+ *  call reads the trailing 1MB of every jsonl in the project dir (hundreds
+ *  of files, 100s of MB total), pegging the worker at 99% CPU until
+ *  restart. The cleanup paths in #1/#2 (dropPendingTurn / pruneExpired)
+ *  are what actually *removes* the stuck mark; this rate limit just keeps
+ *  the windows in between cheap.
+ *
+ *  10s is much wider than the milliseconds Claude needs to write a normal
+ *  user line, but `maybeSwitchBridgeJsonl` is only consulted when the
+ *  primary jsonl scan in `bridgeIngest` already failed to find the line —
+ *  i.e. Claude rotated the file via `/clear` / `/resume`. Those rotations
+ *  happen hours apart in practice, so a 10s detection delay is invisible. */
+const BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 10_000;
+const bridgeFingerprintScanLastMs = new Map<string, number>();
+
+/** Pending+unstarted bridge marks expire after this long. Defensive TTL:
+ *  every known path that creates a mark also has an explicit
+ *  `dropPendingTurn` path, but TTL guarantees self-healing if a future
+ *  code path forgets one. 120s is well past Claude's deferred recheck
+ *  window (20s) and any plausible jsonl-flush delay; the only marks left
+ *  this long are real failures. */
+const BRIDGE_PENDING_TURN_TTL_MS = 120_000;
+
 function maybeSwitchBridgeJsonl(): boolean {
   if (!bridgeJsonlDir) return false;
   const pending = bridgeQueue.peek();
   const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
   if (!candidate || !candidate.contentFingerprint) return false;
+  // Per-fingerprint rate limit — see BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS.
+  const lastScan = bridgeFingerprintScanLastMs.get(candidate.contentFingerprint);
+  const now = Date.now();
+  if (lastScan !== undefined && now - lastScan < BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS) {
+    return false;
+  }
+  bridgeFingerprintScanLastMs.set(candidate.contentFingerprint, now);
 
   // Bound the search to events written after the turn was marked. Short
   // fingerprints ("hello", "test") would otherwise match old user lines
@@ -845,6 +878,19 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
 }
 
 function bridgeIngest(): void {
+  // Defensive TTL: sweep any pending+unstarted mark whose Lark message
+  // never matched a user line in the transcript (writeInput failure
+  // surface that didn't get caught, future paths that forget to call
+  // dropPendingTurn). Without this, a stranded mark drives
+  // `maybeSwitchBridgeJsonl` to do full-directory jsonl scans every tick
+  // until daemon restart — the 99% CPU bug. The explicit dropPendingTurn
+  // path in scheduleSubmitFailureNotify handles the known offender;
+  // this catches everything else.
+  const expired = bridgeQueue.pruneExpired(BRIDGE_PENDING_TURN_TTL_MS);
+  for (const t of expired) {
+    if (t.contentFingerprint) bridgeFingerprintScanLastMs.delete(t.contentFingerprint);
+    log(`Bridge mark expired after ${Math.round(BRIDGE_PENDING_TURN_TTL_MS / 1000)}s without matching a jsonl user line (turnId=${t.turnId}) — dropped to prevent rotation-fallback scan loop.`);
+  }
   // Drain secondary paths first so any trailing assistant text on an old
   // jsonl reaches the queue before the rotation check considers retiring
   // the path. Strictly read-only on the polling rotation; never triggers
@@ -1024,29 +1070,36 @@ function stopBridgeWatcher(): void {
   bridgeKnownSessionIds.clear();
   bridgeStalePidStateSessionId = undefined;
   bridgeSecondaryPaths.clear();
+  bridgeFingerprintScanLastMs.clear();
   bridgePreambleSent = false;
 }
 
 /**
  * Push a pending turn for the next Lark message.
  *
- * Returns true on success, false if bridge-final-output isn't available for
- * this message (transcript not yet baselined). On false, the worker still
- * raw-writes the message into the pane — the user just won't get a
- * transcript-driven final_output reply for it. This keeps the v3 promise:
- * if we can't attribute correctly, we don't attribute at all.
+ * Returns the turnId on success, undefined if bridge-final-output isn't
+ * available for this message (transcript not yet baselined). On undefined
+ * the worker still raw-writes the message into the pane — the user just
+ * won't get a transcript-driven final_output reply for it. This keeps the
+ * v3 promise: if we can't attribute correctly, we don't attribute at all.
  *
  * `messageText` is the raw Lark message body — we derive a short content
  * fingerprint from it so the next *matching* user event in the transcript
  * (and only that one) starts this turn. Local-terminal input that races
  * with the pane-write will not match the fingerprint and won't hijack the
  * Lark turn.
+ *
+ * The turnId is returned so the writeInput failure path can call
+ * `bridgeQueue.dropPendingTurn(turnId)` after deferred recheck conclusively
+ * fails — otherwise an Enter-eaten-by-TUI submit leaves a fingerprint that
+ * no jsonl line will ever match, and `maybeSwitchBridgeJsonl` burns 99%
+ * CPU scanning all sibling jsonls for it on every poll tick.
  */
-function bridgeMarkPendingTurn(messageText: string): boolean {
-  if (!bridgeJsonlPath) return false;
+function bridgeMarkPendingTurn(messageText: string): string | undefined {
+  if (!bridgeJsonlPath) return undefined;
   if (!bridgeBaselineDone) {
     log('Bridge baseline not ready — this turn will not have transcript-driven final_output');
-    return false;
+    return undefined;
   }
   const fingerprint = makeFingerprint(messageText);
   // Full normalised content powers the unknown-sid recovery path. When a
@@ -1057,8 +1110,9 @@ function bridgeMarkPendingTurn(messageText: string): boolean {
   // pane to false-match than the 30-char substring fingerprint.
   const normalised = normaliseForFingerprint(messageText);
   const contentNormalized = normalised.length > 0 ? normalised : undefined;
-  bridgeQueue.mark(randomBytes(8).toString('hex'), fingerprint, Date.now(), contentNormalized);
-  return true;
+  const turnId = randomBytes(8).toString('hex');
+  bridgeQueue.mark(turnId, fingerprint, Date.now(), contentNormalized);
+  return turnId;
 }
 
 function bridgeDrainAndMaybeEmit(): void {
@@ -1986,11 +2040,19 @@ const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
  *  warning and runs the adapter-supplied `recheck` closure first; if the
  *  message has shown up in the transcript by then (slow path, hook delay),
  *  suppresses the warning entirely. Adapters without a recheck still fall
- *  through to the warning after the same delay so the UX is uniform. */
+ *  through to the warning after the same delay so the UX is uniform.
+ *
+ *  `bridgeTurnId` is the BridgeTurnQueue mark created right before the
+ *  failing writeInput. When the deferred recheck conclusively fails (= no
+ *  jsonl line will ever match this fingerprint), we drop the mark — leaving
+ *  it would keep `maybeSwitchBridgeJsonl` doing full-directory scans every
+ *  poll tick for a fingerprint that's permanently dead, the 99% CPU bug
+ *  this whole patch series is fixing. */
 function scheduleSubmitFailureNotify(
   msg: string,
   recheck: (() => boolean | Promise<boolean>) | undefined,
   transcriptLabel: string,
+  bridgeTurnId?: string,
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
@@ -2003,6 +2065,13 @@ function scheduleSubmitFailureNotify(
         }
       } catch (err: any) {
         log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
+      }
+    }
+    if (bridgeTurnId) {
+      const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
+      if (dropped) {
+        if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
+        log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}) — rotation-fallback scan will stop spinning on this fingerprint.`);
       }
     }
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -2053,9 +2122,10 @@ async function flushPending(): Promise<void> {
       // falls inside [markTimeMs(N), markTimeMs(N+1)). Marking earlier
       // (at IPC arrival) would let a slow-finishing turn N's send leak
       // into turn N+1's window and falsely suppress its emit.
+      let bridgeTurnId: string | undefined;
       if (claudeBridgeActive) {
         try { bridgeIngest(); } catch { /* best-effort */ }
-        bridgeMarkPendingTurn(msg);
+        bridgeTurnId = bridgeMarkPendingTurn(msg);
       } else if (codexBridgeActive) {
         // Codex mark works even before the rollout path is known: the
         // queue is path-agnostic, and the late-attach below will start
@@ -2077,7 +2147,7 @@ async function flushPending(): Promise<void> {
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
       }
       if (result && result.submitted === false) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL');
+        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId);
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's
       // bridge queue doesn't yet attribute queued_command-equivalents, so
@@ -2373,6 +2443,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     initialPrompt: cfg.prompt || undefined,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
+    locale: cfg.locale,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -2390,7 +2461,17 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log('Detected root user — injecting IS_SANDBOX=1 for Claude Code');
   }
 
-  log(`Spawning: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
+  // Predict reattach vs fresh so the log line tells the truth. When a bmx-*
+  // tmux session is still alive, TmuxBackend.spawn ignores the bin/args and
+  // just `tmux attach-session`s — logging `Spawning: <new bin>` in that case
+  // is misleading and has cost real debugging time. (CliId-mismatch reattach
+  // is now blocked upstream in restoreActiveSessions / killStalePids.)
+  const willReattachTmux = isTmuxMode && TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
+  if (willReattachTmux) {
+    log(`Re-attaching to existing tmux session: ${TmuxBackend.sessionName(cfg.sessionId)} (requested CLI: ${cliAdapter.resolvedBin})`);
+  } else {
+    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
+  }
 
   backend.spawn(cliAdapter.resolvedBin, args, {
     cwd: cfg.workingDir,
@@ -2928,6 +3009,13 @@ process.on('message', async (raw: unknown) => {
       lastInitConfig = msg;
       sessionId = msg.sessionId;
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
+      // Pin this worker's i18n locale early so every t() call below resolves
+      // against the bot's chosen language without each callsite needing to
+      // re-thread it.
+      if (msg.locale === 'zh' || msg.locale === 'en') {
+        const { setDefaultLocale } = await import('./i18n/index.js');
+        setDefaultLocale(msg.locale);
+      }
       // Scope session store to this bot's per-bot file
       if (msg.larkAppId) sessionStore.init(msg.larkAppId);
       // Capture credentials for direct image upload from worker
@@ -3162,5 +3250,28 @@ process.on('SIGTERM', () => { stopScreenshotLoop(); killCli(); cleanup(); proces
 process.on('SIGINT', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
 // If parent daemon dies, IPC channel closes — clean up
 process.on('disconnect', () => { log('Daemon disconnected'); stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+
+// Watchdog: belt-and-braces parent-death detection. SIGTERM and 'disconnect'
+// should both reach us when the daemon dies, but if main thread is stuck in
+// a sync path V8 silently buffers the signal and we end up as a ppid=1
+// orphan forever (we accumulated 841 such orphans before this guard, eating
+// ~65GB of RAM). setInterval itself depends on the event loop, so a
+// permanently-stuck thread would still orphan — but real-world stuck
+// patterns are periodic (e.g. the v2.9.2 bridge scan was 1s-on / 0.x-off),
+// so the 30s tick gets many landing windows. `unref()` keeps the timer
+// from preventing a normal exit. `getppid()` is the read fd from /proc/self
+// — cheap, sync, no allocation. The daemon-side SIGKILL grace window
+// (SHUTDOWN_GRACE_MS in daemon.ts) is the harder backstop.
+const ORIGINAL_PARENT_PID = process.ppid;
+setInterval(() => {
+  const currentPpid = process.ppid;
+  if (currentPpid !== ORIGINAL_PARENT_PID || currentPpid === 1) {
+    log(`Watchdog: parent pid changed (${ORIGINAL_PARENT_PID} → ${currentPpid}) — daemon died, exiting`);
+    stopScreenshotLoop();
+    try { killCli(); } catch { /* best-effort */ }
+    try { cleanup(); } catch { /* best-effort */ }
+    process.exit(0);
+  }
+}, 30_000).unref();
 
 log('Worker started, waiting for init...');

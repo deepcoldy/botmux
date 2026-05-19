@@ -40,6 +40,17 @@ import {
 } from './setup/bot-config-editor.js';
 import { logger } from './utils/logger.js';
 import { firstPositional } from './cli/arg-utils.js';
+import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
+import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+
+// Resolve the CLI's UI locale once from the global config file, so subsequent
+// CLI output (and any t() callers that don't pass an explicit locale) honour
+// the user's chosen language. Daemon entrypoint sets this separately for the
+// daemon process.
+{
+  const cfg = readGlobalConfig();
+  if (cfg.lang) setDefaultLocale(cfg.lang);
+}
 
 // CLI subcommands (send/thread/bots/list/etc) print JSON to stdout for
 // callers to parse. Transitive logger.info calls from shared modules would
@@ -390,7 +401,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   ]);
   const name = (await ask(rl, 'botmux status 显示名称（可选，如 codex-main；实际显示 botmux-codex-main）: ')).trim();
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   const cliId = CLI_ID_CHOICES[cliChoice] ?? (cliChoice || 'claude-code');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
@@ -452,7 +463,7 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
   printInputHelp('CLI 适配器', [
     '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
     '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
@@ -1903,6 +1914,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
+  lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
+       --bot N         仅改 bots.json 中第 N 个 bot 的 lang
+       --unset         清除（global 或 --bot N 配合）
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -2847,6 +2861,96 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   }
 }
 
+// ─── botmux lang ─────────────────────────────────────────────────────────────
+
+/**
+ * `botmux lang [zh|en] [--bot N] [--unset]`
+ *
+ * No arg → print effective locale + per-bot overrides.
+ * `zh|en` → write global `~/.botmux/config.json` (or, with `--bot N`, write
+ *   the per-bot `lang` field in `bots.json`).
+ * `--unset` → clear the global config's `lang` (or, with `--bot N`, drop
+ *   the per-bot override).
+ *
+ * On any write, hint the user to `botmux restart` so live daemons pick it up.
+ */
+function cmdLang(args: string[]): void {
+  ensureConfigDir();
+  const cfg = readGlobalConfig();
+  const globalLang: Locale | undefined = cfg.lang;
+
+  const botFlagIdx = args.indexOf('--bot');
+  const botFlag = botFlagIdx >= 0 ? parseInt(args[botFlagIdx + 1] ?? '', 10) : NaN;
+  const unset = args.includes('--unset');
+  const positional = args.filter((a, i) => {
+    if (a === '--bot') return false;
+    if (i > 0 && args[i - 1] === '--bot') return false;
+    if (a === '--unset') return false;
+    return true;
+  });
+  const target = positional[0]?.toLowerCase();
+
+  // No-arg → status
+  if (!target && !unset) {
+    const bots = loadBotsJson();
+    const effective = globalLang ?? 'zh';
+    console.log(`Global lang: ${globalLang ?? '(unset, defaults to zh)'}`);
+    console.log(`Effective for CLI:    ${effective}`);
+    console.log(`Config file:          ${globalConfigPath()}`);
+    if (bots.length > 0) {
+      console.log('\nPer-bot:');
+      bots.forEach((b: any, i: number) => {
+        const explicit: string | undefined = isLocale(b.lang) ? b.lang : undefined;
+        const eff = explicit ?? effective;
+        const tag = explicit ? `${explicit} (explicit override)` : `${eff} (inherits global)`;
+        console.log(`  ${i}. ${b.larkAppId} → ${tag}`);
+      });
+    }
+    return;
+  }
+
+  // Per-bot operations require an existing bots.json index.
+  if (!isNaN(botFlag)) {
+    const bots = loadBotsJson();
+    if (botFlag < 0 || botFlag >= bots.length) {
+      console.error(`--bot index out of range; bots.json has ${bots.length} entry(ies). Use \`botmux lang\` to see indices.`);
+      process.exit(1);
+    }
+    if (unset) {
+      delete bots[botFlag].lang;
+      writeBotsJsonAtomic(bots);
+      console.log(`✅ Cleared per-bot lang for bot ${botFlag} (${bots[botFlag].larkAppId}).`);
+    } else {
+      if (!isLocale(target)) {
+        console.error(`Unknown locale "${target}". Supported: ${SUPPORTED_LOCALES.join(', ')}.`);
+        process.exit(1);
+      }
+      bots[botFlag].lang = target;
+      writeBotsJsonAtomic(bots);
+      console.log(`✅ Set bot ${botFlag} (${bots[botFlag].larkAppId}) lang → ${target}.`);
+    }
+    console.log(`Run \`botmux restart\` for changes to take effect.`);
+    return;
+  }
+
+  // Global operations
+  if (unset) {
+    setGlobalLocale(null);
+    console.log(`✅ Cleared global lang (will default to zh).`);
+    console.log(`Run \`botmux restart\` for changes to take effect.`);
+    return;
+  }
+
+  if (!isLocale(target)) {
+    console.error(`Unknown locale "${target}". Supported: ${SUPPORTED_LOCALES.join(', ')}.`);
+    console.error(`Usage: botmux lang [zh|en] [--bot N] [--unset]`);
+    process.exit(1);
+  }
+  setGlobalLocale(target);
+  console.log(`✅ Set global lang → ${target}.`);
+  console.log(`Run \`botmux restart\` for changes to take effect.`);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 function getVersion(): string {
@@ -2884,6 +2988,7 @@ switch (command) {
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
+  case 'lang':     cmdLang(process.argv.slice(3)); break;
   case 'thread':   {
     // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
     // pre-rename scripts/skills surface the rename instead of "unknown command".

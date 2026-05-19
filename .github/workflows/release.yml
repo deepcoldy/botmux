@@ -42,6 +42,30 @@ jobs:
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "Publishing $VERSION → npm dist-tag=$NPM_TAG, prerelease=$PRERELEASE"
 
+      - name: Guard against downgrading npm latest
+        # 防止把比 npm 当前 latest 还小的版本号发到 latest dist-tag（曾发生
+        # `git tag | tail` 拿到字典序末尾 v2.9.x 被当成最新版的事故，
+        # CI 直接把 npm latest 从 2.27.4 覆盖到 2.9.x，导致所有
+        # `npm i botmux` 用户被回退）。只在 dist-tag=latest 时校验；
+        # canary/beta/rc/next 走旁路 dist-tag 不影响 latest。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CURRENT_LATEST=$(npm view botmux@latest version 2>/dev/null || echo "0.0.0")
+          echo "npm latest currently: $CURRENT_LATEST"
+          echo "this tag             : $VERSION"
+          # semver compare via Node's built-in semver in npm
+          if ! node -e "
+            const a='$VERSION', b='$CURRENT_LATEST';
+            const parse = s => s.split('.').map(Number);
+            const [a1,a2,a3] = parse(a), [b1,b2,b3] = parse(b);
+            const cmp = a1!==b1 ? a1-b1 : a2!==b2 ? a2-b2 : a3-b3;
+            if (cmp <= 0) { console.error('REFUSING to publish ' + a + ' as latest (current latest is ' + b + ', would downgrade users)'); process.exit(1); }
+            console.log('OK: ' + a + ' > ' + b);
+          "; then
+            exit 1
+          fi
+
       - run: pnpm build
 
       - name: Publish to npm

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# pre-push hook: 拦截会污染 npm latest 的倒退 tag
+#
+# 触发场景：push 一个纯净 vX.Y.Z 形式的 tag（即将被 CI 发到 npm
+# latest dist-tag）。如果该版本号小于等于仓库现有的最大稳定版本，
+# 拒绝 push——曾发生 `git tag | tail` 拿字典序末尾 v2.9.x 当成最新
+# 版本，CI 把 npm latest 从 2.27.4 覆盖到 2.9.x，导致所有
+# `npm i botmux` 用户被回退的事故。
+#
+# 启用方法（一次性）：
+#   git config core.hooksPath scripts/git-hooks
+#
+# 紧急绕过（不推荐，例如就是要发某个 hotfix 分支）：
+#   git push --no-verify ...
+#
+# stdin 格式（git pre-push 标准）：
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+
+set -e
+
+semver_le() {
+  # 返回 0 当 $1 <= $2（即 $1 是倒退）。仅处理 X.Y.Z 三位整数版本。
+  local a=$1 b=$2
+  IFS=. read -r a1 a2 a3 <<<"$a"
+  IFS=. read -r b1 b2 b3 <<<"$b"
+  if   (( a1 < b1 )); then return 0
+  elif (( a1 > b1 )); then return 1
+  elif (( a2 < b2 )); then return 0
+  elif (( a2 > b2 )); then return 1
+  elif (( a3 <= b3 )); then return 0
+  else return 1
+  fi
+}
+
+while read -r local_ref local_sha remote_ref _remote_sha; do
+  # 只关心 tag 的 push
+  case "$remote_ref" in
+    refs/tags/v*) ;;
+    *) continue ;;
+  esac
+
+  tag_name=${remote_ref#refs/tags/}
+  version=${tag_name#v}
+
+  # 带后缀的（canary / beta / rc / next 兜底）走旁路 dist-tag，不影响 latest，放行
+  case "$version" in
+    *-*) continue ;;
+  esac
+
+  # 必须是 X.Y.Z 三位整数
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "pre-push: tag $tag_name 格式不规范（期望 vX.Y.Z），拒绝" >&2
+    exit 1
+  fi
+
+  # 仓库现有最大稳定版本（排除带 - 后缀的 prerelease）
+  current_latest=$(git tag --list 'v*' --sort=-v:refname \
+    | grep -v -- '-' \
+    | grep -Fxv "$tag_name" \
+    | head -1 | sed 's/^v//')
+  current_latest=${current_latest:-0.0.0}
+
+  if semver_le "$version" "$current_latest"; then
+    cat >&2 <<EOF
+pre-push: 拒绝推送 $tag_name
+  当前仓库最大稳定 tag: v$current_latest
+  即将推送的 tag      : v$version （≤ 当前最大）
+
+这条 tag 一旦推到远端，CI 会把 npm latest dist-tag 覆盖为 v$version，
+导致所有 \`npm i botmux\` 用户被降级（v2.9.x 事故的根因）。
+
+如果你确认这是新版本号，先把 vX.Y.Z 三位中的某一位调大；
+如果是不该发 latest 的 hotfix，改名成 v${version}-rc.0 或 v${version}-next.0 走旁路；
+紧急绕过用 \`git push --no-verify\`（仅当你确实想覆盖 latest 时）。
+EOF
+    exit 1
+  fi
+done
+
+exit 0

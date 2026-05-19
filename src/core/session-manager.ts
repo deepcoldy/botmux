@@ -13,6 +13,7 @@ import { downloadMessageResource, listChatBotMembers } from '../im/lark/client.j
 import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -22,6 +23,7 @@ import type { MessageResource } from '../im/lark/message-parser.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
+import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -157,7 +159,7 @@ function xmlEscape(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
-export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
+export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {
   if (!attachments || attachments.length === 0) return '';
   let imgN = 0, fileN = 0;
   const items = attachments.map(a => {
@@ -165,7 +167,7 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
     const n = a.type === 'image' ? ++imgN : ++fileN;
     return `  <${tag} n="${n}" path="${xmlEscape(a.path)}" />`;
   });
-  return `<attachments hint="使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应">\n${items.join('\n')}\n</attachments>`;
+  return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
 }
 
 export function buildNewTopicPrompt(
@@ -178,21 +180,27 @@ export function buildNewTopicPrompt(
   availableBots?: Array<{ name: string; displayName: string; openId: string }>,
   followUps?: string[],
   botIdentity?: { name?: string; openId?: string },
+  locale?: Locale,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
-  const hints = adapter.systemHints;
+  // Non-Claude CLIs receive the botmux routing hints inline via the prompt
+  // (Claude Code builds its own via --append-system-prompt). Source hints
+  // freshly from i18n so they respect the resolved locale instead of the
+  // static `adapter.systemHints` array that was baked at module load.
+  const hints = adapter.injectsSessionContext ? [] : buildBotmuxShellHints(locale);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
     : '';
 
+  const unknown = t('ai.identity.unknown', undefined, locale);
   let identityBlock = '';
   if (botIdentity && (botIdentity.name || botIdentity.openId)) {
     identityBlock = [
       '<identity>',
-      `  <name>${xmlEscape(botIdentity.name ?? '(未知)')}</name>`,
-      `  <open_id>${xmlEscape(botIdentity.openId ?? '(未知)')}</open_id>`,
-      '  <routing_rules>提醒：让别的 bot 接力干活必须 `botmux send --mention <对方 open_id>`，否则对方 bot 不会被触发。</routing_rules>',
+      `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
+      `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
+      `  <routing_rules>${t('ai.identity.short_routing', undefined, locale)}</routing_rules>`,
       '</identity>',
     ].join('\n');
   }
@@ -214,7 +222,7 @@ export function buildNewTopicPrompt(
       const items = unmentionedBots.map(
         b => `  <bot name="${xmlEscape(b.displayName)}" open_id="${xmlEscape(b.openId)}" />`,
       );
-      botBlock = `<available_bots hint="让这里的某个 bot 接力干活必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息">\n${items.join('\n')}\n</available_bots>`;
+      botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint', undefined, locale))}">\n${items.join('\n')}\n</available_bots>`;
     }
   }
 
@@ -227,7 +235,7 @@ export function buildNewTopicPrompt(
     }
   }
 
-  const attachHint = formatAttachmentsHint(attachments);
+  const attachHint = formatAttachmentsHint(attachments, locale);
   if (attachHint) parts.push(attachHint);
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
@@ -251,17 +259,16 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale },
 ): string {
   const parts: string[] = [`<user_message>\n${content}\n</user_message>`];
 
   const attachHint = opts?.attachments && opts.attachments.length > 0
-    ? formatAttachmentsHint(opts.attachments)
+    ? formatAttachmentsHint(opts.attachments, opts.locale)
     : '';
   if (attachHint) parts.push(attachHint);
 
   if (!opts?.isAdoptMode) {
-    // CLIs with injectsSessionContext get session ID via system prompt + ancestor-pid auto-detection
     const skipSessionId = opts?.cliId
       ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
       : false;
@@ -278,10 +285,7 @@ export function buildFollowUpContent(
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
 
-  // Per-message routing hint — system prompt routing block can fade in long
-  // sessions, so re-state the core "use botmux send" rule at the tail of every
-  // follow-up regardless of CLI.
-  parts.push('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
+  parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
 
   return parts.join('\n\n');
 }
@@ -305,6 +309,7 @@ export function buildBridgeInputContent(
     attachments?: LarkAttachment[];
     mentions?: LarkMention[];
     selfMention?: { name?: string | null; openId?: string | null };
+    locale?: Locale;
   },
 ): string {
   const selfMention = opts?.selfMention;
@@ -354,13 +359,13 @@ export function buildBridgeInputContent(
 
   if (opts?.attachments && opts.attachments.length > 0) {
     const lines = opts.attachments.map(a => `- ${a.name} (${a.path})`);
-    parts.push(`\n[附件]\n${lines.join('\n')}`);
+    parts.push(`\n${t('ai.bridge.attachments_label', undefined, opts.locale)}\n${lines.join('\n')}`);
   }
 
   const mentions = opts?.mentions?.filter(m => !isSelfMention(m)) ?? [];
   if (mentions.length > 0) {
     const lines = mentions.map(m => `- @${m.name}`);
-    parts.push(`\n[@提及]\n${lines.join('\n')}`);
+    parts.push(`\n${t('ai.bridge.mentions_label', undefined, opts?.locale)}\n${lines.join('\n')}`);
   }
 
   return parts.join('\n');
@@ -395,13 +400,16 @@ export function buildReforkPrompt(
     cliId?: CliId;
     cliPathOverride?: string;
     selfMention?: { name?: string | null; openId?: string | null };
+    locale?: Locale;
   },
 ): string {
+  const locale = opts?.locale ?? localeForBot(ds.larkAppId);
   if (ds.adoptedFrom) {
     return buildBridgeInputContent(content, {
       attachments: opts?.attachments,
       mentions: opts?.mentions,
       selfMention: opts?.selfMention,
+      locale,
     });
   }
   return buildFollowUpContent(content, ds.session.sessionId, {
@@ -410,6 +418,7 @@ export function buildReforkPrompt(
     isAdoptMode: false,
     cliId: opts?.cliId,
     cliPathOverride: opts?.cliPathOverride,
+    locale,
   });
 }
 
@@ -544,10 +553,28 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   if (config.daemon.backendType === 'tmux') {
     for (const [, ds] of activeSessions) {
       const tmuxName = TmuxBackend.sessionName(ds.session.sessionId);
-      if (TmuxBackend.hasSession(tmuxName)) {
-        logger.info(`[${ds.session.sessionId.substring(0, 8)}] Tmux session alive, auto-forking worker to re-attach`);
-        forkWorker(ds, '', true);
+      if (!TmuxBackend.hasSession(tmuxName)) continue;
+
+      // Guard against re-attaching to a tmux session that was started with a
+      // different CLI than the bot is currently configured for. tmux's
+      // attach-session ignores the bin/args we hand to backend.spawn(), so
+      // without this check, changing a bot's cliId in bots.json would silently
+      // resurrect the OLD CLI on restart. Compare persisted session.cliId
+      // (stamped at fork time in worker-pool.forkWorker) against the bot's
+      // current config; mismatch ⇒ kill the stale tmux, let the next message
+      // trigger a fresh spawn.
+      const tag = ds.session.sessionId.substring(0, 8);
+      const sessionCliId = ds.session.cliId;
+      let botCliId: CliId | undefined;
+      try { botCliId = getBot(ds.larkAppId).config.cliId; } catch { /* bot deregistered */ }
+      if (sessionCliId && botCliId && sessionCliId !== botCliId) {
+        logger.warn(`[${tag}] CLI mismatch (session=${sessionCliId}, bot=${botCliId}), killing stale tmux ${tmuxName}`);
+        TmuxBackend.killSession(tmuxName);
+        continue;
       }
+
+      logger.info(`[${tag}] Tmux session alive, auto-forking worker to re-attach`);
+      forkWorker(ds, '', true);
     }
   }
 
@@ -798,7 +825,7 @@ export async function executeScheduledTask(
   // formerly chat-scope task was redirected into a converted topic chat, promote
   // the runtime session to thread-scope so follow-up replies stay in-thread.
   const runtimeScope: 'thread' | 'chat' = scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
-  const session = sessionStore.createSession(task.chatId, anchor, `[定时] ${task.name}`);
+  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`);
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.scope = runtimeScope;
@@ -806,7 +833,7 @@ export async function executeScheduledTask(
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
 
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId });
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId));
 
   const ds: DaemonSession = {
     session,

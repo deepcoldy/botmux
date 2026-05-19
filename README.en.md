@@ -39,7 +39,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Gemini, OpenCode) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -51,7 +51,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
-| Multi-CLI Support | 4 CLIs, switch with one config (Claude Code / Codex / Gemini / OpenCode) | Tied to a single SDK, cannot switch CLIs |
+| Multi-CLI Support | 5 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
@@ -62,7 +62,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 20
-- **AI coding CLI** installed and authenticated (`claude`, `codex`, `gemini`, or `opencode` in PATH)
+- **AI coding CLI** installed and authenticated (`claude`, `codex`, `cursor-agent`, `gemini`, or `opencode` in PATH)
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
   - macOS: ships with PingFang / Hiragino, no action needed
@@ -266,8 +266,8 @@ descriptions, so the agent picks them up automatically. Compared to
 Anthropic's official Telegram channel — which exposes each action as an
 MCP tool — the Skill + CLI combo skips the MCP handshake on every CLI
 launch, doesn't burn tool-list tokens, and works across every CLI that
-can read a system prompt and shell out (Claude Code / Codex / Gemini /
-OpenCode), with no MCP protocol support required.
+can read a system prompt and shell out (Claude Code / Codex / Cursor /
+Gemini / OpenCode), with no MCP protocol support required.
 
 ### Dashboard
 
@@ -378,7 +378,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `larkAppId` | Yes | Lark app ID |
 | `larkAppSecret` | Yes | Lark app secret |
 | `name` | No | PM2 name suffix shown by `botmux status`; e.g. `claude-main` appears as `botmux-claude-main`, defaults to `botmux-<index>` |
-| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `gemini`, `opencode`) |
+| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `cursor`, `gemini`, `opencode`) |
 | `cliPathOverride` | No | CLI binary path override |
 | `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
 | `workingDir` | No | Default working directory, supports comma-separated |

@@ -7,6 +7,7 @@ const PAGE_HTML = `
   <select name="cli" multiple size="4">
     <option value="claude-code">claude-code</option>
     <option value="codex">codex</option>
+    <option value="cursor">cursor</option>
     <option value="gemini">gemini</option>
     <option value="opencode">opencode</option>
     <option value="aiden">aiden</option>

@@ -19,6 +19,7 @@ import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js'
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
+import { t, localeForBot } from '../../i18n/index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -116,25 +117,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // which violates the bridge invariant. Defense in depth — buildSessionCard
       // already omits the restart button when adoptMode=true, but a stale
       // pre-fix card or a malformed action payload could still arrive.
+      const locDs = localeForBot(ds.larkAppId);
       if (ds.adoptedFrom) {
         logger.warn(`[${tag(ds)}] Rejected restart on adopt session — would kill user's pane`);
-        await sessionReply(rootId, '⚠️ adopt 模式不支持重启（不会触动你自己的 tmux pane / CLI 进程）');
+        await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
       const botCfg = getBot(ds.larkAppId).config;
       if (ds.worker) {
-        // Worker alive — tell it to restart CLI
         logger.info(`[${tag(ds)}] Restart via card button`);
         ds.worker.send({ type: 'restart' } as DaemonToWorker);
         const cliName = getCliDisplayName(botCfg.cliId);
-        await sessionReply(rootId, `🔄 已重启 ${cliName}`);
+        await sessionReply(rootId, t('card.action.restarted', { cliName }, locDs));
       } else {
-        // Worker gone (e.g. after daemon restart) — re-fork
         logger.info(`[${tag(ds)}] Re-forking worker via card button`);
         forkWorker(ds, '', ds.hasHistory);
         const cliName = getCliDisplayName(botCfg.cliId);
-        await sessionReply(rootId, `🔄 已重新启动 ${cliName}`);
-        // DM card will be sent by the ready handler when worker starts
+        await sessionReply(rootId, t('card.action.restarted_fresh', { cliName }, locDs));
       }
     }
 
@@ -164,6 +163,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         closedCliId,
         closedWorkingDir,
         cliResumeCommand,
+        localeForBot(ds.larkAppId),
       );
       await sessionReply(rootId, card, 'interactive');
       logger.info(`[${tag(ds)}] Closed via card button`);
@@ -171,23 +171,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (actionType === 'resume') {
       const targetSessionId = value?.session_id;
+      const locDsResume = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!targetSessionId) {
-        await sessionReply(rootId, '⚠️ 缺少 session_id，无法恢复。');
+        await sessionReply(rootId, t('card.action.resume_missing_session_id', undefined, locDsResume));
       } else {
         const result = resumeSession(targetSessionId, activeSessions);
         if (result.ok) {
           const cliName = getCliDisplayName(result.ds.session.cliId ?? getBot(result.ds.larkAppId).config.cliId);
-          await sessionReply(rootId, `✅ 会话已恢复，发条消息继续与 ${cliName} 对话。`);
+          await sessionReply(rootId, t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId)));
           logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button`);
         } else if (result.error === 'not_found') {
-          await sessionReply(rootId, `⚠️ 找不到会话 ${targetSessionId.substring(0, 8)}，可能已被清理。`);
+          await sessionReply(rootId, t('card.action.resume_not_found', { short: targetSessionId.substring(0, 8) }, locDsResume));
         } else if (result.error === 'not_closed') {
-          await sessionReply(rootId, '会话已是活跃状态，无需恢复。');
+          await sessionReply(rootId, t('card.action.resume_not_closed', undefined, locDsResume));
         } else if (result.error === 'anchor_occupied') {
-          const occ = result.activeSessionId ? `（占用者：${result.activeSessionId.substring(0, 8)}）` : '';
-          await sessionReply(rootId, `⚠️ 当前话题已有新会话${occ}，无法恢复旧会话。`);
+          const detail = result.activeSessionId
+            ? t('card.action.resume_anchor_holder', { short: result.activeSessionId.substring(0, 8) }, locDsResume)
+            : '';
+          await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, locDsResume));
         } else if (result.error === 'adopt_unsupported') {
-          await sessionReply(rootId, '⚠️ adopt 接管会话不支持 resume。');
+          await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, locDsResume));
         }
       }
     }
@@ -196,23 +199,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
       activeSessions.delete(sKey);
-      await sessionReply(rootId, '⏏ 已断开，原 CLI 会话不受影响');
+      await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);
     }
 
     if (actionType === 'takeover' && ds && ds.adoptedFrom) {
-      // The legacy takeover button was retired in the v3 adopt-bridge
-      // refactor: bridge mode forwards Claude's final answers from the
-      // transcript watcher without taking over the pane, so the old
-      // SIGKILL-original-PID path is incompatible. New cards no longer
-      // render this button (worker-pool.ts:setupWorkerHandlers sets
-      // showTakeover=false), but historical PATCH'd cards may still expose
-      // it — short-circuit here so a stray click can never kill the user's
-      // CLI again.
-      await sessionReply(
-        rootId,
-        '⚠️ 旧版"接管"按钮已停用。bridge 模式下原 CLI 由 botmux 桥接，无需接管即可在飞书中收到回答。如需 /resume 完整接管能力，请等待 /adopt --takeover 命令上线。',
-      );
+      await sessionReply(rootId, t('card.action.takeover_retired', undefined, localeForBot(ds.larkAppId)));
       logger.info(`[${tag(ds)}] Legacy takeover action ignored (bridge era; historical card)`);
     }
 
@@ -234,13 +226,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] TUI toggle (card only): option ${selectedIndex}, toggled: [${ds.tuiToggledIndices}]`);
         // PATCH card to update ☐/☑ state
         if (cardMessageId && ds.tuiPromptOptions) {
+          const locDs = localeForBot(ds.larkAppId);
           const updatedCard = buildTuiPromptCard(
             sessionAnchorId(ds),
             ds.session.sessionId,
-            ds.currentTurnTitle || 'Select options',
+            ds.currentTurnTitle || t('card.action.tui_select_title', undefined, locDs),
             ds.tuiPromptOptions,
             true,
             ds.tuiToggledIndices,
+            locDs,
           );
           updateMessage(ds.larkAppId, cardMessageId, updatedCard).catch(err =>
             logger.debug(`[${tag(ds)}] Failed to update TUI toggle card: ${err}`),
@@ -275,9 +269,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
           const finalText = resolveText || selectedText;
+          const locDs = localeForBot(ds.larkAppId);
           if (cardMessageId) {
             setTimeout(() => {
-              const resolvedCard = buildTuiPromptResolvedCard(finalText);
+              const resolvedCard = buildTuiPromptResolvedCard(finalText, locDs);
               updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
                 logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
               );
@@ -287,7 +282,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.tuiPromptOptions = undefined;
           ds.tuiPromptMultiSelect = undefined;
           ds.tuiToggledIndices = undefined;
-          try { return JSON.parse(buildTuiPromptProcessingCard(finalText)); } catch { /* fall through */ }
+          try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }
       }
     }
@@ -296,12 +291,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const inputText = action?.form_value?.tui_custom_input ?? '';
       let inputKeys: string[] = [];
       try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
+      const locDs = localeForBot(ds.larkAppId);
       if (ds.worker && inputText && inputKeys.length > 0) {
         // Atomic IPC — worker handles keys + text in one flow to avoid race
         ds.worker.send({ type: 'tui_text_input', keys: inputKeys, text: inputText } as DaemonToWorker);
         logger.info(`[${tag(ds)}] TUI text input: "${inputText}" (keys: ${JSON.stringify(inputKeys)})`);
         if (cardMessageId) {
-          const resolvedCard = buildTuiPromptResolvedCard(inputText);
+          const resolvedCard = buildTuiPromptResolvedCard(inputText, locDs);
           updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
             logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
           );
@@ -310,12 +306,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.tuiPromptOptions = undefined;
       }
       try {
-        return JSON.parse(buildTuiPromptResolvedCard(inputText || 'Custom input'));
+        return JSON.parse(buildTuiPromptResolvedCard(inputText || t('card.action.tui_custom_input', undefined, locDs), locDs));
       } catch { /* fall through */ }
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
       const botCfg = getBot(ds.larkAppId).config;
+      const locDs = localeForBot(ds.larkAppId);
       if (ds.workerPort && ds.workerToken) {
         const writeUrl = `http://${config.web.externalHost}:${ds.workerPort}?token=${ds.workerToken}`;
         const dmCardJson = buildSessionCard(
@@ -324,15 +321,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           writeUrl,
           ds.session.title || getCliDisplayName(botCfg.cliId),
           botCfg.cliId,
-          true, // showManageButtons — DM card includes restart & close
-          !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+          true,
+          !!ds.adoptedFrom,
+          locDs,
         );
         sendUserMessage(ds.larkAppId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
           logger.warn(`[${tag(ds)}] Failed to DM write link: ${err}`),
         );
         logger.info(`[${tag(ds)}] Sent write link via DM to ${operatorOpenId}`);
       } else {
-        await sessionReply(rootId, '⚠️ 终端尚未就绪，请稍后再试。');
+        await sessionReply(rootId, t('card.action.terminal_not_ready', undefined, locDs));
       }
     }
 
@@ -372,6 +370,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           frozen.imageKey,
           !!ds.adoptedFrom,
           false,
+          localeForBot(ds.larkAppId),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to toggle frozen card: ${err}`),
@@ -407,6 +406,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.currentImageKey,
           !!ds.adoptedFrom,
           false,
+          localeForBot(ds.larkAppId),
         );
         scheduleCardPatch(ds, cardJson);
         logger.info(`[${tag(ds)}] Display mode → ${next}`);
@@ -429,7 +429,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       } else {
         content = ds.lastScreenContent ?? '';
       }
-      const body = content.trim() ? truncateContent(content) : '(当前无输出内容)';
+      const locDs = localeForBot(ds.larkAppId);
+      const body = content.trim() ? truncateContent(content, locDs) : t('card.action.no_output', undefined, locDs);
       await sessionReply(sessionAnchorId(ds), body);
       logger.info(`[${tag(ds)}] Exported terminal text (${body.length} chars)`);
       return;
@@ -461,6 +462,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.currentImageKey,
           !!ds.adoptedFrom,
           false,
+          localeForBot(ds.larkAppId),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -475,11 +477,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.worker.send({ type: 'term_action', key } as DaemonToWorker);
         logger.info(`[${tag(ds)}] term_action: ${key}`);
       }
-      // Return the current card JSON so Feishu doesn't revert the displayed
-      // image to the originally-POSTed initial frame while waiting for the
-      // post-action screenshot PATCH (~1s). Keep status unchanged — Feishu's
-      // built-in button spinner already shows that the click registered, and
-      // overriding to 'analyzing' was confusing (AI analysis uses that color).
       if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
         const botCfg = getBot(ds.larkAppId).config;
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
@@ -497,6 +494,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.currentImageKey,
           !!ds.adoptedFrom,
           false,
+          localeForBot(ds.larkAppId),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -504,10 +502,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'skip_repo' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
       if (ds.pendingRepo) {
         const selfBot = getBot(ds.larkAppId);
         const botCfg = selfBot.config;
-        // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
         const prompt = buildNewTopicPrompt(
           ds.pendingPrompt ?? '',
@@ -519,6 +517,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await getAvailableBots(ds.larkAppId, ds.chatId),
           ds.pendingFollowUps,
           { name: selfBot.botName, openId: selfBot.botOpenId },
+          locDs,
         );
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
@@ -526,11 +525,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.pendingFollowUps = undefined;
         forkWorker(ds, prompt);
         const cwd = getSessionWorkingDir(ds);
-        await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
+        await sessionReply(rootId, t('cmd.skip.opened', { cwd }, locDs));
         logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
       } else {
-        // Mid-session: user cancelled repo switch
-        await sessionReply(rootId, `继续使用当前仓库：${getSessionWorkingDir(ds)}`);
+        await sessionReply(rootId, t('card.action.continue_using_current_repo', { cwd: getSessionWorkingDir(ds) }, locDs));
       }
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
       ds.repoCardMessageId = undefined;
@@ -563,7 +561,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sessions = discoverAdoptableSessions();
     const target = sessions.find(s => s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
     if (!target) {
-      await sessionReply(rootId, '⚠️ 目标 CLI 会话已退出');
+      await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
       return;
     }
@@ -600,6 +598,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   targetDs.session.workingDir = selectedPath;
   sessionStore.updateSession(targetDs.session);
 
+  const locTarget = localeForBot(targetDs.larkAppId);
   if (targetDs.pendingRepo) {
     const selfBot = getBot(targetDs.larkAppId);
     const botCfg = selfBot.config;
@@ -615,13 +614,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
       targetDs.pendingFollowUps,
       { name: selfBot.botName, openId: selfBot.botOpenId },
+      locTarget,
     );
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
     targetDs.pendingMentions = undefined;
     targetDs.pendingFollowUps = undefined;
     forkWorker(targetDs, prompt);
-    await sessionReply(rootId, `✅ 已选择 ${displayName}`);
+    await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, locTarget));
     logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);
   } else {
     // Mid-session repo switch — close old session, start fresh.
@@ -660,7 +660,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     targetDs.lastScreenContent = undefined;
     targetDs.lastScreenStatus = undefined;
     forkWorker(targetDs, '', false);
-    await sessionReply(rootId, `🔄 已切换到 ${displayName}`);
+    await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, locTarget));
     logger.info(`[${tag(targetDs)}] Repo switched to ${selectedPath}, new session created`);
   }
 
