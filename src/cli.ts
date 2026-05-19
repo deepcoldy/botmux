@@ -617,13 +617,32 @@ async function cmdSetup(): Promise<void> {
         return;
       }
 
+      const original = bots[index];
       let edited: Record<string, any>;
       try {
-        edited = await promptEditBotConfig(rl, bots[index]);
+        edited = await promptEditBotConfig(rl, original);
       } catch (err: any) {
         rl.close();
         console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
         return;
+      }
+
+      // 凭证字段有变化时, 像 promptBotConfig 一样跑一次 tenant_access_token
+      // 校验. 失败不写盘——避免编辑后 typo 一个字符, daemon 重启时才发现.
+      // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
+      const appIdChanged = edited.larkAppId !== original.larkAppId;
+      const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
+      if (appIdChanged || appSecretChanged) {
+        console.log('\n校验新凭证（取 tenant_access_token）…');
+        const { validateCredentials } = await import('./setup/verify-permissions.js');
+        const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
+        if (!v.ok) {
+          rl.close();
+          console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
+          console.log('   配置未修改。请重新运行 botmux setup → 编辑现有机器人。');
+          return;
+        }
+        console.log('✅ 凭证有效\n');
       }
       rl.close();
 
@@ -633,6 +652,11 @@ async function cmdSetup(): Promise<void> {
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
       writeBotsJsonAtomic(nextBots);
       console.log(`✅ 已更新机器人 ${botProcessName(edited, index, PM2_NAME)} (${edited.larkAppId})`);
+      // appId 切换 = 换了一个飞书应用, 新 appId 大概率需要重新申请权限 + 配重定向 URL.
+      // 把 printRemainingSteps 的深链端给用户, 比 README 警告里那句"历史数据不迁移"更可操作.
+      if (appIdChanged) {
+        printRemainingSteps(edited.larkAppId, botBrand(edited));
+      }
       console.log(`下一步: botmux restart\n`);
       return;
     }
