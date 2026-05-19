@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
+import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -32,15 +33,18 @@ export interface BotDefaultOncall {
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
+  /** Optional process-name suffix; the daemon's process name is rendered as `botmux-<name>` (defaults to `botmux-<index>`). */
+  name?: string;
   cliId: CliId;
   cliPathOverride?: string;
   backendType?: 'pty' | 'tmux';
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
-  projectScanDir?: string;
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
+  /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
+  lang?: Locale;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
@@ -62,6 +66,10 @@ export interface BotState {
 }
 
 const bots = new Map<string, BotState>();
+
+// Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
+// a hard import cycle between `i18n` and `bot-registry`.
+setBotLookup((id) => bots.get(id));
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
 let loadedConfigPath: string | undefined;
@@ -270,16 +278,17 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
+      name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
       backendType: entry.backendType,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
-      projectScanDir: entry.projectScanDir,
       oncallChats,
       defaultOncall,
       defaultOncallAutoboundChats,
+      lang: isLocale(entry.lang) ? entry.lang : undefined,
     });
   }
 

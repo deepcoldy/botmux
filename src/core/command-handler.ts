@@ -22,6 +22,7 @@ import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-st
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
+import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -51,17 +52,17 @@ const MULTILINE_COMMANDS = new Set(['/schedule']);
  * with full filesystem access, so an allowlist would be theater. We only do
  * the typo guards: exists and is a directory.
  */
-export function validateWorkingDir(input: string): { ok: true; resolvedPath: string } | { ok: false; error: string } {
+export function validateWorkingDir(input: string, locale?: Locale): { ok: true; resolvedPath: string } | { ok: false; error: string } {
   const resolvedPath = resolve(expandHome(input));
   if (!existsSync(resolvedPath)) {
-    return { ok: false, error: `目录不存在：${resolvedPath}` };
+    return { ok: false, error: t('cmd.cd.dir_not_exist', { path: resolvedPath }, locale) };
   }
   let isDir = false;
   try { isDir = statSync(resolvedPath).isDirectory(); } catch (e: any) {
-    return { ok: false, error: `无法读取路径：${resolvedPath}（${e?.message ?? e}）` };
+    return { ok: false, error: t('cmd.cd.cannot_read', { path: resolvedPath, msg: e?.message ?? String(e) }, locale) };
   }
   if (!isDir) {
-    return { ok: false, error: `路径不是目录：${resolvedPath}` };
+    return { ok: false, error: t('cmd.cd.not_a_directory', { path: resolvedPath }, locale) };
   }
   return { ok: true, resolvedPath };
 }
@@ -153,23 +154,29 @@ async function handleScheduleCommand(
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const trimmed = args.trim();
+  const loc = localeForBot(larkAppId);
+  // Format dates using a locale that matches the user's UI choice. Both
+  // forms include the wall-clock components the user cares about; the
+  // difference is just punctuation and digit order.
+  const timeLocale = loc === 'en' ? 'en-US' : 'zh-CN';
+  const timeZone = 'Asia/Shanghai';
 
   // /schedule list | /schedule 列表
   if (!trimmed || trimmed === 'list' || trimmed === '列表') {
     const tasks = scheduleStore.listTasks();
     if (tasks.length === 0) {
-      await sessionReply(rootId, '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报');
+      await sessionReply(rootId, t('schedule.empty_with_examples', undefined, loc));
       return;
     }
-    const lines = tasks.map(t => {
-      const status = t.enabled ? '✅' : '⏸️';
-      const next = t.enabled ? scheduler.getNextRun(t.id) : null;
-      const nextStr = next ? ` → 下次: ${next.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : '';
-      const lastStr = t.lastRunAt ? ` | 上次: ${new Date(t.lastRunAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : '';
-      const display = t.parsed?.display ?? t.schedule;
-      return `${status} [${t.id}] ${display} | ${t.name}\n   prompt: ${t.prompt.substring(0, 50)}${t.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
+    const lines = tasks.map(task => {
+      const status = task.enabled ? '✅' : '⏸️';
+      const next = task.enabled ? scheduler.getNextRun(task.id) : null;
+      const nextStr = next ? t('schedule.next_label', { time: next.toLocaleString(timeLocale, { timeZone }) }, loc) : '';
+      const lastStr = task.lastRunAt ? t('schedule.last_label', { time: new Date(task.lastRunAt).toLocaleString(timeLocale, { timeZone }) }, loc) : '';
+      const display = task.parsed?.display ?? task.schedule;
+      return `${status} [${task.id}] ${display} | ${task.name}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
     });
-    await sessionReply(rootId, `定时任务列表 (${tasks.length})：\n\n${lines.join('\n\n')}`);
+    await sessionReply(rootId, `${t('schedule.list_header', { count: tasks.length }, loc)}\n\n${lines.join('\n\n')}`);
     return;
   }
 
@@ -178,9 +185,9 @@ async function handleScheduleCommand(
   if (removeMatch) {
     const id = removeMatch[1];
     if (scheduler.removeTask(id)) {
-      await sessionReply(rootId, `已删除定时任务 ${id}`);
+      await sessionReply(rootId, t('schedule.removed', { id }, loc));
     } else {
-      await sessionReply(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, t('schedule.not_found', { id }, loc));
     }
     return;
   }
@@ -190,9 +197,9 @@ async function handleScheduleCommand(
   if (enableMatch) {
     const id = enableMatch[1];
     if (scheduler.enableTask(id)) {
-      await sessionReply(rootId, `已启用定时任务 ${id}`);
+      await sessionReply(rootId, t('schedule.enabled', { id }, loc));
     } else {
-      await sessionReply(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, t('schedule.not_found', { id }, loc));
     }
     return;
   }
@@ -202,9 +209,9 @@ async function handleScheduleCommand(
   if (disableMatch) {
     const id = disableMatch[1];
     if (scheduler.disableTask(id)) {
-      await sessionReply(rootId, `已禁用定时任务 ${id}`);
+      await sessionReply(rootId, t('schedule.disabled', { id }, loc));
     } else {
-      await sessionReply(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, t('schedule.not_found', { id }, loc));
     }
     return;
   }
@@ -214,9 +221,9 @@ async function handleScheduleCommand(
   if (runMatch) {
     const id = runMatch[1];
     if (scheduler.runTaskNow(id)) {
-      await sessionReply(rootId, `已触发定时任务 ${id} 立即执行`);
+      await sessionReply(rootId, t('schedule.triggered_now', { id }, loc));
     } else {
-      await sessionReply(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, t('schedule.not_found', { id }, loc));
     }
     return;
   }
@@ -226,14 +233,10 @@ async function handleScheduleCommand(
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
-    // For chat-scope sessions, `rootId` here is actually the chatId (the
-    // session's anchor). The scheduler keys cross-target routing on
-    // rootMessageId — for chat-scope tasks we set rootMessageId=undefined and
-    // rely on chatId + scope='chat' to do plain chat sends at fire time.
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     const task = scheduler.addTask({
       name: parsed.name,
-      schedule: trimmed, // raw user input (schedule + prompt blob, kept only for display)
+      schedule: trimmed,
       parsed: parsed.parsed,
       prompt: parsed.prompt,
       workingDir,
@@ -244,13 +247,20 @@ async function handleScheduleCommand(
       larkAppId,
     });
     const next = scheduler.getNextRun(task.id);
-    const nextStr = next ? next.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : 'N/A';
-    await sessionReply(rootId, `✅ 定时任务已创建！\n\nID: ${task.id}\n名称: ${task.name}\n规则: ${parsed.parsed.display}\nPrompt: ${task.prompt}\n工作目录: ${expandHome(workingDir)}\n下次执行: ${nextStr}`);
+    const nextStr = next ? next.toLocaleString(timeLocale, { timeZone }) : 'N/A';
+    await sessionReply(rootId, t('schedule.created', {
+      id: task.id,
+      name: task.name,
+      rule: parsed.parsed.display,
+      prompt: task.prompt,
+      dir: expandHome(workingDir),
+      next: nextStr,
+    }, loc));
     return;
   }
 
   // Unrecognized format
-  await sessionReply(rootId, `无法解析定时任务，请使用自然语言格式：\n\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报\n/schedule 每小时 检查服务健康状态\n/schedule 每30分钟 ping一下服务\n/schedule 每月1号9:00 生成月报\n\n管理命令：\n/schedule list — 查看所有任务\n/schedule remove <id> — 删除任务\n/schedule enable <id> — 启用任务\n/schedule disable <id> — 禁用任务\n/schedule run <id> — 立即执行一次`);
+  await sessionReply(rootId, t('schedule.parse_failed', undefined, loc));
 }
 
 // ─── Main command handler ────────────────────────────────────────────────────
@@ -266,9 +276,10 @@ export async function handleCommand(
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
-  const t = ds ? tag(ds) : rootId.substring(0, 12);
+  const logTag = ds ? tag(ds) : rootId.substring(0, 12);
+  const loc: Locale = localeForBot(ds?.larkAppId ?? larkAppId);
 
-  logger.info(`[${t}] Command: ${cmd}`);
+  logger.info(`[${logTag}] Command: ${cmd}`);
   logger.debug(`repo command`, message);
 
   try {
@@ -281,10 +292,6 @@ export async function handleCommand(
           const closedCliId = ds.session.cliId ?? botCfg.cliId;
           const closedAnchor = sessionAnchorId(ds);
           const closedWorkingDir = ds.session.workingDir;
-          // Resolve the CLI-native resume command BEFORE killing the worker
-          // — for codex this consults `~/.codex/history.jsonl` which is
-          // populated by the live worker; reading it post-kill still works
-          // (the file lives on disk) but capturing here keeps intent clear.
           const cliResumeCommand = (() => {
             try {
               const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
@@ -304,11 +311,12 @@ export async function handleCommand(
             closedCliId,
             closedWorkingDir,
             cliResumeCommand,
+            loc,
           );
           await sessionReply(rootId, card, 'interactive');
-          logger.info(`[${t}] Session closed by /close command`);
+          logger.info(`[${logTag}] Session closed by /close command`);
         } else {
-          await sessionReply(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
         break;
       }
@@ -318,15 +326,15 @@ export async function handleCommand(
           if (ds.worker && !ds.worker.killed) {
             ds.worker.send({ type: 'restart' } as DaemonToWorker);
             const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
-            await sessionReply(rootId, `🔄 正在重启 ${cliName}...`);
+            await sessionReply(rootId, t('cmd.restart.in_progress', { cliName }, loc));
           } else {
             killWorker(ds);
             const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
-            await sessionReply(rootId, `${cliName} 进程已终止，下次发消息时将自动恢复。`);
+            await sessionReply(rootId, t('cmd.restart.terminated', { cliName }, loc));
           }
-          logger.info(`[${t}] Restart by /restart command`);
+          logger.info(`[${logTag}] Restart by /restart command`);
         } else {
-          await sessionReply(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
         break;
       }
@@ -334,14 +342,14 @@ export async function handleCommand(
       case '/cd': {
         const targetPath = message.content.replace(/^\/cd\s*/, '').trim();
         if (!targetPath) {
-          await sessionReply(rootId, '用法：/cd <path>\n例如：/cd ~/projects/my-app');
+          await sessionReply(rootId, t('cmd.cd.usage', undefined, loc));
           break;
         }
         if (!ds) {
-          await sessionReply(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
         }
-        const validation = validateWorkingDir(targetPath);
+        const validation = validateWorkingDir(targetPath, loc);
         if (!validation.ok) {
           await sessionReply(rootId, validation.error);
           break;
@@ -351,8 +359,8 @@ export async function handleCommand(
         ds.workingDir = targetPath;
         ds.session.workingDir = targetPath;
         sessionStore.updateSession(ds.session);
-        await sessionReply(rootId, `工作目录已切换到 ${resolvedPath}，下次发消息时将在新目录下恢复。`);
-        logger.info(`[${t}] Working directory changed to ${resolvedPath} by /cd command`);
+        await sessionReply(rootId, t('cmd.cd.switched', { path: resolvedPath }, loc));
+        logger.info(`[${logTag}] Working directory changed to ${resolvedPath} by /cd command`);
         break;
       }
 
@@ -360,15 +368,14 @@ export async function handleCommand(
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
         const repoIndex = repoArg ? parseInt(repoArg, 10) : NaN;
 
-        // /repo <N> — quick select from last scan
         if (!isNaN(repoIndex) && ds) {
           const cached = lastRepoScan.get(ds.chatId);
           if (!cached || cached.length === 0) {
-            await sessionReply(rootId, '请先执行 /repo 查看项目列表。');
+            await sessionReply(rootId, t('cmd.repo.no_prior_scan', undefined, loc));
             break;
           }
           if (repoIndex < 1 || repoIndex > cached.length) {
-            await sessionReply(rootId, `序号超出范围，有效范围：1-${cached.length}`);
+            await sessionReply(rootId, t('cmd.repo.index_out_of_range', { max: cached.length }, loc));
             break;
           }
           const project = cached[repoIndex - 1];
@@ -393,60 +400,55 @@ export async function handleCommand(
               await getAvailableBots(ds.larkAppId, ds.chatId),
               ds.pendingFollowUps,
               { name: selfBot.botName, openId: selfBot.botOpenId },
+              loc,
             );
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
             ds.pendingFollowUps = undefined;
             forkWorker(ds, prompt);
-            await sessionReply(rootId, `✅ 已选择 ${displayName}`);
+            await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
             killWorker(ds);
             sessionStore.closeSession(ds.session.sessionId);
             const session = sessionStore.createSession(ds.chatId, rootId, displayName, ds.chatType);
             ds.session = session;
-            // Pin workingDir + larkAppId onto the freshly-created record before
-            // forkWorker — otherwise a daemon restart restores the session with
-            // an empty workingDir and falls back to the bot's default cwd,
-            // making `claude --resume` look in the wrong .claude/projects/ dir.
             ds.session.workingDir = selectedPath;
             ds.session.larkAppId = ds.larkAppId;
             sessionStore.updateSession(ds.session);
             ds.hasHistory = false;
             forkWorker(ds, '', false);
-            await sessionReply(rootId, `🔄 已切换到 ${displayName}`);
+            await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
           }
-          // Withdraw repo selection card
           if (ds.repoCardMessageId) {
             deleteMessage(ds.larkAppId, ds.repoCardMessageId);
             ds.repoCardMessageId = undefined;
           }
-          logger.info(`[${t}] Repo selected via /repo ${repoIndex}: ${selectedPath}`);
+          logger.info(`[${logTag}] Repo selected via /repo ${repoIndex}: ${selectedPath}`);
           break;
         }
 
-        // /repo — show project list card
         if (ds?.worker && !ds.worker.killed) {
-          await sessionReply(rootId, '⚠️ 当前会话已在运行中，切换仓库将关闭当前会话并创建新会话。\n如需切换，请在下方卡片中选择新仓库。');
+          await sessionReply(rootId, t('cmd.repo.warning_running', undefined, loc));
         }
 
         const scanDirs = getProjectScanDirs(ds);
         const validDirs = scanDirs.filter(d => existsSync(d));
         if (validDirs.length === 0) {
-          await sessionReply(rootId, `扫描目录不存在：${scanDirs.join(', ')}\n请设置 PROJECT_SCAN_DIR 或 WORKING_DIR 环境变量。`);
+          await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
           break;
         }
         const projects = scanMultipleProjects(validDirs);
         if (projects.length === 0) {
-          await sessionReply(rootId, `在 ${validDirs.join(', ')} 下未找到 git 仓库。`);
+          await sessionReply(rootId, t('cmd.repo.no_git_repos', { dirs: validDirs.join(', ') }, loc));
           break;
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
-        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
+        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId, loc);
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) ds.repoCardMessageId = repoCardMsgId;
-        logger.info(`[${t}] Sent repo card with ${projects.length} project(s)`);
+        logger.info(`[${logTag}] Sent repo card with ${projects.length} project(s)`);
         break;
       }
 
@@ -466,6 +468,7 @@ export async function handleCommand(
             await getAvailableBots(ds.larkAppId, ds.chatId),
             ds.pendingFollowUps,
             { name: selfBot.botName, openId: selfBot.botOpenId },
+            loc,
           );
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
@@ -473,14 +476,14 @@ export async function handleCommand(
           ds.pendingFollowUps = undefined;
           forkWorker(ds, prompt);
           const cwd = getSessionWorkingDir(ds);
-          await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
+          await sessionReply(rootId, t('cmd.skip.opened', { cwd }, loc));
           if (ds.repoCardMessageId) {
             deleteMessage(ds.larkAppId, ds.repoCardMessageId);
             ds.repoCardMessageId = undefined;
           }
-          logger.info(`[${t}] Skip repo via /skip, spawning CLI in ${cwd}`);
+          logger.info(`[${logTag}] Skip repo via /skip, spawning CLI in ${cwd}`);
         } else {
-          await sessionReply(rootId, '当前没有待选择的仓库。');
+          await sessionReply(rootId, t('cmd.skip.no_pending', undefined, loc));
         }
         break;
       }
@@ -492,7 +495,7 @@ export async function handleCommand(
           const termUrl = ds.workerPort ? `http://${config.web.externalHost}:${ds.workerPort}` : '-';
           const lines = [
             `Session: ${ds.session.sessionId}`,
-            `Status: ${alive ? '运行中' : '等待中'}`,
+            `Status: ${alive ? t('cmd.status.running', undefined, loc) : t('cmd.status.waiting', undefined, loc)}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
             `${getCliDisplayName(getBot(ds.larkAppId).config.cliId)}: v${ds.cliVersion}${ds.cliVersion !== getCurrentCliVersion() ? ` (latest: v${getCurrentCliVersion()})` : ''}`,
@@ -503,7 +506,11 @@ export async function handleCommand(
           await sessionReply(rootId, lines.join('\n'));
         } else {
           const fallbackCliName = larkAppId ? getCliDisplayName(getBot(larkAppId).config.cliId) : 'CLI';
-          await sessionReply(rootId, `当前话题没有活跃的会话。\nDaemon active sessions: ${getActiveCount()}\n${fallbackCliName}: v${getCurrentCliVersion()}`);
+          await sessionReply(rootId, t('cmd.status.fallback_no_session', {
+            count: getActiveCount(),
+            cliName: fallbackCliName,
+            version: getCurrentCliVersion(),
+          }, loc));
         }
         break;
       }
@@ -512,7 +519,7 @@ export async function handleCommand(
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
         await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId);
-        logger.info(`[${t}] Schedule command handled`);
+        logger.info(`[${logTag}] Schedule command handled`);
         break;
       }
 
@@ -522,52 +529,42 @@ export async function handleCommand(
           await sessionReply(rootId, getTokenStatus());
           break;
         }
-        // Generate OAuth URL
         const botCfg2 = ds ? getBot(ds.larkAppId).config : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
         if (!botCfg2?.larkAppId || !botCfg2?.larkAppSecret) {
-          await sessionReply(rootId, '❌ 无法获取应用凭证');
+          await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
           break;
         }
         const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret);
         await sessionReply(rootId, [
-          '🔐 飞书用户授权',
+          t('cmd.login.title', undefined, loc),
           '',
-          '1. 点击下方链接完成授权：',
+          t('cmd.login.step1', undefined, loc),
           authUrl,
           '',
-          '2. 授权后浏览器会跳转到一个打不开的页面（正常）',
-          '3. 复制浏览器地址栏的完整 URL，发送到本话题',
+          t('cmd.login.step2', undefined, loc),
+          t('cmd.login.step3', undefined, loc),
           '',
-          '授权后可下载第三方卡片中的图片等资源。',
-          '查看状态：/login status',
+          t('cmd.login.footer', undefined, loc),
+          t('cmd.login.status_hint', undefined, loc),
         ].join('\n'));
         break;
       }
 
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
-        // Refuse re-adopt when the thread is already bridged. Otherwise the
-        // user sees the misleading "未发现可接入 CLI 会话" branch whenever the
-        // discovery scan happens to return zero (e.g. the original CLI exited
-        // mid-bridge, or pane filters mismatch) — they have no idea why their
-        // working session was "lost". Force the explicit 断开 → /adopt swap.
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
           const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
           const project = adopted.cwd ? (adopted.cwd.split('/').pop() || adopted.cwd) : '';
           const label = project ? `${cliName} · ${project}` : cliName;
-          await sessionReply(rootId,
-            `本话题已接入 ${label} (${adopted.tmuxTarget})。\n` +
-            '请先点击卡片上的「断开」按钮，再 /adopt 切换 CLI 会话（原 CLI 不受影响）。',
-          );
+          await sessionReply(rootId, t('cmd.adopt.already_adopted', { label, pane: adopted.tmuxTarget }, loc));
           break;
         }
-        // Only show sessions matching this bot's CLI type
         const botCliId = ds ? getBot(ds.larkAppId).config.cliId : undefined;
         const sessions = discoverAdoptableSessions(botCliId);
 
         if (sessions.length === 0) {
-          await sessionReply(rootId, '未发现可接入的 CLI 会话');
+          await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
           break;
         }
 
@@ -575,15 +572,14 @@ export async function handleCommand(
         if (directTarget) {
           const target = sessions.find(s => s.tmuxTarget === directTarget);
           if (!target) {
-            await sessionReply(rootId, `未找到 tmux pane ${directTarget}`);
+            await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
             break;
           }
           if (ds) await startAdoptSession(target, ds, deps, larkAppId);
           break;
         }
 
-        // Show selection card
-        const cardJson = buildAdoptSelectCard(sessions, rootId);
+        const cardJson = buildAdoptSelectCard(sessions, rootId, loc);
         await sessionReply(rootId, cardJson, 'interactive');
         break;
       }
@@ -595,30 +591,16 @@ export async function handleCommand(
         const chatId = ds?.chatId;
 
         if (!appId || !chatId) {
-          await sessionReply(rootId, '/oncall 需要在群聊中、以新话题方式使用。');
+          await sessionReply(rootId, t('cmd.oncall.need_group', undefined, loc));
           break;
         }
 
         if (!sub || sub === 'status' || sub === '状态') {
           const entry = getOncallStatus(appId, chatId);
           if (!entry) {
-            await sessionReply(rootId, [
-              '当前群尚未绑定 oncall 项目。',
-              '',
-              '用法：',
-              '/oncall bind <path>     — 绑定当前群到某个项目目录，跳过仓库选择卡片',
-              '/oncall unbind          — 解除当前群的 oncall 绑定',
-              '/oncall status          — 查看当前绑定状态',
-              '',
-              '绑定后：群内任何成员都可以 @ 机器人提问；仅 allowedUsers 能点卡片按钮、执行 /cd /restart /close 等命令。',
-            ].join('\n'));
+            await sessionReply(rootId, t('cmd.oncall.not_bound', undefined, loc));
           } else {
-            await sessionReply(rootId, [
-              '🟢 已绑定 oncall',
-              `工作目录：${entry.workingDir}`,
-              '',
-              '/oncall unbind 可解除绑定；/cd <path> 切换工作目录（仍保留 oncall 模式）。',
-            ].join('\n'));
+            await sessionReply(rootId, t('cmd.oncall.bound', { dir: entry.workingDir }, loc));
           }
           break;
         }
@@ -626,10 +608,10 @@ export async function handleCommand(
         if (sub === 'bind' || sub === '绑定') {
           const target = rest.join(' ').trim();
           if (!target) {
-            await sessionReply(rootId, '用法：/oncall bind <path>\n例如：/oncall bind ~/projects/payments-service');
+            await sessionReply(rootId, t('cmd.oncall.bind_usage', undefined, loc));
             break;
           }
-          const validation = validateWorkingDir(target);
+          const validation = validateWorkingDir(target, loc);
           if (!validation.ok) {
             await sessionReply(rootId, validation.error);
             break;
@@ -638,42 +620,41 @@ export async function handleCommand(
           const result = await bindOncall(appId, chatId, target);
           if (!result.ok) {
             if (result.reason === 'bot_not_in_config') {
-              await sessionReply(rootId, '⚠️ 无法在配置文件中找到当前机器人条目，绑定失败。');
+              await sessionReply(rootId, t('cmd.oncall.bind_failed_no_bot', undefined, loc));
             } else {
-              await sessionReply(rootId, `⚠️ 绑定失败：${result.reason}`);
+              await sessionReply(rootId, t('cmd.oncall.bind_failed', { reason: result.reason }, loc));
             }
             break;
           }
-          const verb = result.created ? '已绑定' : '已更新';
-          await sessionReply(rootId, [
-            `✅ ${verb} oncall`,
-            `群：${chatId}`,
-            `工作目录：${target} → ${resolvedPath}`,
-            '',
-            '下次在本群开新话题时会直接用此目录启动 CLI，不再弹仓库选择卡片。',
-          ].join('\n'));
-          logger.info(`[${t}] /oncall bind chat=${chatId} dir=${target}`);
+          const verb = result.created
+            ? t('cmd.oncall.verb_bound', undefined, loc)
+            : t('cmd.oncall.verb_updated', undefined, loc);
+          await sessionReply(rootId, t('cmd.oncall.bind_success', {
+            verb,
+            chatId,
+            target,
+            resolved: resolvedPath,
+          }, loc));
+          logger.info(`[${logTag}] /oncall bind chat=${chatId} dir=${target}`);
           break;
         }
 
         if (sub === 'unbind' || sub === '解绑') {
           const result = await unbindOncall(appId, chatId);
           if (!result.ok) {
-            await sessionReply(rootId, `⚠️ 解绑失败：${result.reason}`);
+            await sessionReply(rootId, t('cmd.oncall.unbind_failed', { reason: result.reason }, loc));
             break;
           }
           if (!result.wasBound) {
-            // Tombstone was still written — surface that softly so users
-            // understand subsequent default-oncall won't re-bind this chat.
-            await sessionReply(rootId, '当前群未绑定 oncall。（已记录解绑意图，default-oncall 不会再自动绑此群）');
+            await sessionReply(rootId, t('cmd.oncall.unbind_not_bound', undefined, loc));
           } else {
-            await sessionReply(rootId, '✅ 已解除 oncall 绑定。下次开新话题将恢复默认仓库选择卡片流程。');
+            await sessionReply(rootId, t('cmd.oncall.unbind_success', undefined, loc));
           }
-          logger.info(`[${t}] /oncall unbind chat=${chatId} wasBound=${result.wasBound}`);
+          logger.info(`[${logTag}] /oncall unbind chat=${chatId} wasBound=${result.wasBound}`);
           break;
         }
 
-        await sessionReply(rootId, `未知子命令：${sub}\n支持：/oncall bind <path> | /oncall unbind | /oncall status`);
+        await sessionReply(rootId, t('cmd.oncall.unknown_sub', { sub }, loc));
         break;
       }
 
@@ -681,47 +662,47 @@ export async function handleCommand(
         const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const help = [
-          '📌 会话管理：',
-          `/close      - 关闭当前会话，终止 ${cliName} 进程`,
-          `/restart    - 重启 ${cliName} 进程（保留 session）`,
-          `/cd <path>  - 切换工作目录并重启 ${cliName} 进程`,
-          '/repo       - 查看项目列表（交互式下拉 + 文本列表）',
-          '/repo <N>   - 切换到第 N 个项目',
-          '/status     - 查看当前会话状态（含终端链接）',
+          t('help.heading_session', undefined, loc),
+          t('help.close', { cliName }, loc),
+          t('help.restart', { cliName }, loc),
+          t('help.cd', { cliName }, loc),
+          t('help.repo_list', undefined, loc),
+          t('help.repo_n', undefined, loc),
+          t('help.status', undefined, loc),
           '',
-          `🔀 透传给 ${cliName}（字面送达，供其内置 slash 命令处理）：`,
+          t('help.heading_passthrough', { cliName }, loc),
           '/compact /model /clear /plugin /usage',
           '',
-          '⏰ 定时任务：',
-          '/schedule 每日17:50 帮我看AI新闻   - 创建定时任务（自然语言）',
-          '/schedule list                     - 查看所有定时任务',
-          '/schedule remove <id>              - 删除任务',
-          '/schedule enable/disable <id>      - 启用/禁用任务',
-          '/schedule run <id>                 - 立即执行一次',
+          t('help.heading_schedule', undefined, loc),
+          t('help.schedule_create', undefined, loc),
+          t('help.schedule_list', undefined, loc),
+          t('help.schedule_remove', undefined, loc),
+          t('help.schedule_toggle', undefined, loc),
+          t('help.schedule_run', undefined, loc),
           '',
-          '支持的时间格式：每日/每天、每周X、每月X号、工作日每天、每N小时、每N分钟',
+          t('help.schedule_formats', undefined, loc),
           '',
-          '📡 会话接入：',
-          '/adopt              - 接入本机正在运行的 CLI 会话',
-          '/adopt <tmux_pane>  - 直接接入指定 tmux pane',
+          t('help.heading_adopt', undefined, loc),
+          t('help.adopt', undefined, loc),
+          t('help.adopt_pane', undefined, loc),
           '',
-          '🔐 用户授权：',
-          '/login              - 飞书用户授权（可下载第三方卡片图片等）',
-          '/login status       - 查看授权状态',
+          t('help.heading_login', undefined, loc),
+          t('help.login', undefined, loc),
+          t('help.login_status', undefined, loc),
           '',
-          '🛎️ Oncall 模式（群聊）：',
-          '/oncall bind <path>  - 把当前群绑到某个项目，跳过仓库选择卡片',
-          '/oncall unbind       - 解绑当前群',
-          '/oncall status       - 查看当前群的 oncall 绑定',
+          t('help.heading_oncall', undefined, loc),
+          t('help.oncall_bind', undefined, loc),
+          t('help.oncall_unbind', undefined, loc),
+          t('help.oncall_status', undefined, loc),
           '',
-          '/help       - 显示此帮助',
+          t('help.help', undefined, loc),
         ];
         await sessionReply(rootId, help.join('\n'));
         break;
       }
     }
   } catch (err: any) {
-    logger.error(`[${t}] Command ${cmd} error: ${err.message}`);
+    logger.error(`[${logTag}] Command ${cmd} error: ${err.message}`);
   }
 }
 
@@ -735,16 +716,15 @@ export async function startAdoptSession(
 ): Promise<void> {
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
+  const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
 
-  // Validate target is still alive
   if (!validateAdoptTarget(target.tmuxTarget, target.cliPid)) {
-    await sessionReply(sessionAnchorId(ds), '⚠️ 目标 CLI 会话已退出');
+    await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
     return;
   }
 
   const project = target.cwd.split('/').pop() || target.cwd;
 
-  // Update the existing DaemonSession with adopt info
   ds.workingDir = target.cwd;
   ds.session.workingDir = target.cwd;
   ds.session.title = `Adopt: ${project}`;
@@ -757,12 +737,11 @@ export async function startAdoptSession(
     paneCols: target.paneCols,
     paneRows: target.paneRows,
   };
-  // Persist adopt metadata so the session can be restored after daemon restart
   ds.session.adoptedFrom = { ...ds.adoptedFrom };
   sessionStore.updateSession(ds.session);
 
   forkAdoptWorker(ds);
 
   const cliName = getCliDisplayName(target.cliId);
-  await sessionReply(sessionAnchorId(ds), `📡 已接入 ${cliName} · ${project} (${target.tmuxTarget})`);
+  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane: target.tmuxTarget }, loc));
 }

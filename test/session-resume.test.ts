@@ -21,7 +21,7 @@ vi.mock('../src/config.js', () => ({
     session: {
       get dataDir() { return tempDir; },
     },
-    daemon: { backendType: 'pty', workingDir: '~', projectScanDir: undefined, workingDirs: ['~'] },
+    daemon: { backendType: 'pty', workingDir: '~', workingDirs: ['~'] },
   },
 }));
 

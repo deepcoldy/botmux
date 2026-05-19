@@ -155,12 +155,13 @@ export function createImgNumberer(): ImgNumberer {
 }
 
 export function extractResources(msgType: string, rawContent: string, numberer?: ImgNumberer): MessageResource[] {
+  const content = normalizeApiMessageContent(msgType, rawContent);
   const nb = numberer ?? createImgNumberer();
   const pushIfNew = (resources: MessageResource[], r: MessageResource) => {
     if (nb.assign(`${r.type}:${r.key}`).isNew) resources.push(r);
   };
   try {
-    const parsed = JSON.parse(rawContent);
+    const parsed = JSON.parse(content);
 
     if (msgType === 'image') {
       const resources: MessageResource[] = [];
@@ -269,15 +270,22 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
 }
 
 export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
+  const msgType = msg.msg_type ?? 'text';
+  const rawContent = msg.body?.content ?? '';
   return {
     messageId: msg.message_id ?? '',
     rootId: msg.root_id ?? msg.thread_id ?? '',
     senderId: msg.sender?.id ?? '',
     senderType: msg.sender?.sender_type ?? 'unknown',
-    msgType: msg.msg_type ?? 'text',
-    content: extractTextContent(msg.msg_type ?? 'text', msg.body?.content ?? '', undefined, numberer),
+    msgType,
+    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
     createTime: msg.create_time ?? '',
   };
+}
+
+function normalizeApiMessageContent(msgType: string, rawContent: string): string {
+  if (msgType !== 'interactive') return rawContent;
+  return unwrapUserDslContent(rawContent) ?? rawContent;
 }
 
 /** Resolve post body from either wrapped {"zh_cn":{title,content}} or unwrapped {title,content} format */

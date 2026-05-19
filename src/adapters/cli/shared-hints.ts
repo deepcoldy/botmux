@@ -7,17 +7,20 @@
  *
  * Each array element becomes one line inside the `<botmux_routing>` XML block
  * rendered by `buildNewTopicPrompt` in `session-manager.ts`.
- *
- * The phrasing emphasises that `botmux send` is a shell command (not an MCP
- * tool) to stop models — particularly CoCo — from searching the tool list,
- * failing to find it, and silently giving up.
  */
-export const BOTMUX_SHELL_HINTS: string[] = [
-  '你运行在飞书（Lark）话题群中。用户在飞书阅读回复，看不到你的终端输出。',
-  '重要：botmux send / botmux history / botmux quoted / botmux bots 都是 shell 命令（CLI 程序，已安装在 $PATH），不是 MCP 工具。必须通过 Bash 工具执行，不要到 MCP 工具列表里找。',
-  '把消息发给用户（唯一方式）：用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`。',
-  '多行消息必须用 heredoc，禁止写成 `botmux send "第一行\\n第二行"`；否则 `\\n` 可能按字面量显示在飞书里。',
-  "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
-  '辅助命令：`botmux history`（读此会话历史，话题群拉话题内、普通群拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
-  '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。',
-];
+import { t, type Locale } from '../../i18n/index.js';
+
+export function buildBotmuxShellHints(locale?: Locale): string[] {
+  return [
+    t('ai.shell.intro', undefined, locale),
+    t('ai.shell.commands_are_shell', undefined, locale),
+    t('ai.shell.how_to_send', undefined, locale),
+    t('ai.shell.multiline_heredoc', undefined, locale),
+    t('ai.shell.heredoc_example', undefined, locale),
+    t('ai.shell.helpers', undefined, locale),
+    t('ai.shell.when_to_send', undefined, locale),
+  ];
+}
+
+/** @deprecated Use `buildBotmuxShellHints(locale)` instead. Kept for any external callers. */
+export const BOTMUX_SHELL_HINTS: string[] = buildBotmuxShellHints();

@@ -2,12 +2,14 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import type { AdoptableSession } from '../../core/session-discovery.js';
 import type { DisplayMode } from '../../types.js';
+import { t, type Locale } from '../../i18n/index.js';
 
 const cliDisplayNames: Record<CliId, string> = {
   'claude-code': 'Claude',
   'aiden': 'Aiden',
   'coco': 'CoCo',
   'codex': 'Codex',
+  'cursor': 'Cursor',
   'gemini': 'Gemini',
   'opencode': 'OpenCode',
 };
@@ -34,13 +36,14 @@ export function buildSessionCard(
   cliId?: CliId,
   showManageButtons?: boolean,
   adoptMode?: boolean,
+  locale?: Locale,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const actions: any[] = [
     {
       tag: 'button',
-      text: { tag: 'plain_text', content: showManageButtons ? '🖥️ 打开可操作终端' : '🖥️ 打开终端' },
+      text: { tag: 'plain_text', content: t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale) },
       type: 'primary',
       multi_url: {
         url: terminalUrl,
@@ -51,22 +54,17 @@ export function buildSessionCard(
     },
   ];
   if (!showManageButtons) {
-    // Group card: show "get write link" button (DM card already has the write token)
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '🔑 获取操作链接' },
+      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
       type: 'default',
       value: { action: 'get_write_link', ...actionBase },
     });
   }
   if (showManageButtons && !adoptMode) {
-    // DM card: include restart button. Adopt sessions skip this — restarting
-    // would mean killing the user's Claude process which the daemon never
-    // owned in the first place. The handler also hard-rejects restart on
-    // adopt sessions as a defense-in-depth (see card-handler.ts).
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
+      text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },
       type: 'default',
       value: { action: 'restart', ...actionBase },
     });
@@ -74,14 +72,14 @@ export function buildSessionCard(
   if (adoptMode) {
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '⏏ 断开' },
+      text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
       type: 'danger',
       value: { action: 'disconnect', ...actionBase },
     });
   } else {
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '❌ 关闭会话' },
+      text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
       type: 'danger',
       value: { action: 'close', ...actionBase },
     });
@@ -121,21 +119,22 @@ export function buildSessionClosedCard(
   cliId?: CliId,
   workingDir?: string,
   cliResumeCommand?: string | null,
+  locale?: Locale,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
-  const dirLine = workingDir ? `\n📁 工作目录：\`${escapeMd(workingDir)}\`` : '';
+  const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
   const cmdBlock = cliResumeCommand
-    ? `点击「恢复会话」继续，或在终端执行：\n\`\`\`\n${cliResumeCommand}\n\`\`\``
-    : `点击「恢复会话」继续。\n_${cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。_`;
+    ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
+    : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName }, locale)}`;
   const body =
     `**${escapeMd(title || cliName)}**\n` +
-    `${cliName} 进程已终止。${cmdBlock}` +
+    `${t('card.body.cli_terminated', { cliName }, locale)}${cmdBlock}` +
     dirLine;
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: '🛑 会话已关闭' },
+      title: { tag: 'plain_text', content: t('card.status.session_closed', undefined, locale) },
       template: 'grey',
     },
     elements: [
@@ -145,7 +144,7 @@ export function buildSessionClosedCard(
         actions: [
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: '▶️ 恢复会话' },
+            text: { tag: 'plain_text', content: t('card.btn.resume_session', undefined, locale) },
             type: 'primary',
             value: { action: 'resume', ...actionBase },
           },
@@ -163,7 +162,7 @@ export function buildSessionClosedCard(
 const MAX_CONTENT_BYTES = 100_000;
 
 /** Truncate content to fit within MAX_CONTENT_BYTES, keeping the tail (most recent output). */
-export function truncateContent(content: string): string {
+export function truncateContent(content: string, locale?: Locale): string {
   if (Buffer.byteLength(content, 'utf-8') <= MAX_CONTENT_BYTES) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
@@ -178,7 +177,7 @@ export function truncateContent(content: string): string {
       lo = mid + 1;
     }
   }
-  return `… (已截断)\n${lines.slice(lo).join('\n')}`;
+  return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
 }
 
 /**
@@ -205,12 +204,20 @@ export function buildStreamingCard(
   imageKey?: string,
   adoptMode?: boolean,
   showTakeover?: boolean,
+  locale?: Locale,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
   const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple' } as const;
-  const statusMap = { starting: '启动中…', working: '工作中', idle: '等待输入', analyzing: '正在分析…' } as const;
+  const statusLabel = (s: typeof status): string => {
+    switch (s) {
+      case 'starting': return t('card.status.starting', undefined, locale);
+      case 'working': return t('card.status.working', undefined, locale);
+      case 'idle': return t('card.status.idle', undefined, locale);
+      case 'analyzing': return t('card.status.analyzing', undefined, locale);
+    }
+  };
 
   const elements: any[] = [];
 
@@ -225,7 +232,7 @@ export function buildStreamingCard(
         preview: true,
       });
     } else {
-      elements.push({ tag: 'markdown', content: '_(等待第一张截图…)_' });
+      elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
     }
     elements.push({ tag: 'hr' });
   }
@@ -235,14 +242,14 @@ export function buildStreamingCard(
 
   headerActions.push({
     tag: 'button',
-    text: { tag: 'plain_text', content: displayMode === 'hidden' ? '📖 显示输出' : '📕 隐藏输出' },
+    text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
     type: 'default' as const,
     value: { action: 'toggle_display', ...actionBase },
   });
   if (displayMode !== 'hidden') {
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '📝 导出文字' },
+      text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
       type: 'default' as const,
       value: { action: 'export_text', ...actionBase },
     });
@@ -250,20 +257,20 @@ export function buildStreamingCard(
   if (displayMode === 'screenshot') {
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '🔃 刷新' },
+      text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
       type: 'default' as const,
       value: { action: 'refresh_screenshot', ...actionBase },
     });
   }
   headerActions.push({
     tag: 'button',
-    text: { tag: 'plain_text', content: '🖥️ 打开终端' },
+    text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
     type: 'primary',
     multi_url: { url: terminalUrl, pc_url: terminalUrl, android_url: terminalUrl, ios_url: terminalUrl },
   });
   headerActions.push({
     tag: 'button',
-    text: { tag: 'plain_text', content: '🔑 获取操作链接' },
+    text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
     type: 'default',
     value: { action: 'get_write_link', ...actionBase },
   });
@@ -271,21 +278,21 @@ export function buildStreamingCard(
     if (showTakeover) {
       headerActions.push({
         tag: 'button',
-        text: { tag: 'plain_text', content: '🔄 接管' },
+        text: { tag: 'plain_text', content: t('card.btn.takeover', undefined, locale) },
         type: 'default' as const,
         value: { action: 'takeover', ...actionBase },
       });
     }
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '⏏ 断开' },
+      text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
       type: 'danger' as const,
       value: { action: 'disconnect', ...actionBase },
     });
   } else {
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: '❌ 关闭会话' },
+      text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
       type: 'danger' as const,
       value: { action: 'close', ...actionBase },
     });
@@ -318,8 +325,8 @@ export function buildStreamingCard(
         mkKey('↑', 'up'),
         mkKey('↓', 'down'),
         mkKey('→', 'right'),
-        mkKey('⇞ 上半屏', 'half_page_up'),
-        mkKey('⇟ 下半屏', 'half_page_down'),
+        mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
+        mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
       ],
     });
   }
@@ -327,7 +334,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${statusMap[status]}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${statusLabel(status)}` },
       template: templateMap[status],
     },
     elements,
@@ -339,9 +346,10 @@ export function buildStreamingCard(
  * Build a Feishu interactive card with a dropdown selector for projects.
  * Returns a JSON string suitable for msg_type: 'interactive'.
  */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string): string {
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale): string {
+  const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
-    const currentTag = p.path === currentPath ? ' ← 当前' : '';
+    const currentTag = p.path === currentPath ? currentMarker : '';
     const typeTag = p.type === 'worktree' ? ' [worktree]' : '';
     return {
       text: { tag: 'plain_text' as const, content: `${i + 1}. ${p.name} (${p.branch})${typeTag}${currentTag}` },
@@ -353,14 +361,14 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
     config: { wide_screen_mode: true },
     header: {
       template: 'blue',
-      title: { tag: 'plain_text', content: '📁 项目仓库管理' },
+      title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
     },
     elements: [
       {
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `当前活跃项目：**${escapeMd(currentPath ?? 'N/A')}**`,
+          content: `${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`,
         },
       },
       {
@@ -371,13 +379,13 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
         actions: [
           {
             tag: 'select_static',
-            placeholder: { tag: 'plain_text', content: '选择仓库并切换' },
+            placeholder: { tag: 'plain_text', content: t('card.repo.placeholder_switch', undefined, locale) },
             options,
             value: { key: 'repo_switch', root_id: rootMessageId ?? '' },
           },
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: '▶️ 直接开启会话' },
+            text: { tag: 'plain_text', content: t('card.btn.skip_repo', undefined, locale) },
             type: 'primary',
             value: { action: 'skip_repo', root_id: rootMessageId ?? '' },
           },
@@ -388,7 +396,7 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
         elements: [
           {
             tag: 'lark_md',
-            content: '也可以回复 `/repo <编号>` 切换，例如：`/repo 1`',
+            content: t('card.repo.note', undefined, locale),
           },
         ],
       },
@@ -411,6 +419,7 @@ export function buildTuiPromptCard(
   options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>,
   multiSelect?: boolean,
   toggledIndices?: number[],
+  locale?: Locale,
 ): string {
   const hasInputOption = options.some(o => o.type === 'input');
   const toggled = new Set(toggledIndices ?? []);
@@ -478,11 +487,11 @@ export function buildTuiPromptCard(
         {
           tag: 'input',
           name: 'tui_custom_input',
-          placeholder: { tag: 'plain_text', content: '输入自定义回复…' },
+          placeholder: { tag: 'plain_text', content: t('card.tui.input_placeholder', undefined, locale) },
         },
         {
           tag: 'button',
-          text: { tag: 'plain_text', content: '📝 发送自定义回复' },
+          text: { tag: 'plain_text', content: t('card.btn.send_custom', undefined, locale) },
           type: 'primary',
           name: 'tui_input_submit',
           action_type: 'form_submit',
@@ -511,17 +520,17 @@ export function buildTuiPromptCard(
 /**
  * Build a "processing" TUI prompt card — shown immediately when user clicks a button.
  */
-export function buildTuiPromptProcessingCard(selectedText: string): string {
+export function buildTuiPromptProcessingCard(selectedText: string, locale?: Locale): string {
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: '正在执行…' },
+      title: { tag: 'plain_text', content: t('card.status.executing', undefined, locale) },
       template: 'blue',
     },
     elements: [
       {
         tag: 'div',
-        text: { tag: 'lark_md', content: `选择: **${escapeMd(selectedText)}**` },
+        text: { tag: 'lark_md', content: `${t('card.body.choose_label', undefined, locale)} **${escapeMd(selectedText)}**` },
       },
     ],
   };
@@ -531,11 +540,11 @@ export function buildTuiPromptProcessingCard(selectedText: string): string {
 /**
  * Build a resolved TUI prompt card — shows which option was selected.
  */
-export function buildTuiPromptResolvedCard(selectedText: string): string {
+export function buildTuiPromptResolvedCard(selectedText: string, locale?: Locale): string {
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `已选择` },
+      title: { tag: 'plain_text', content: t('card.status.selected', undefined, locale) },
       template: 'green',
     },
     elements: [
@@ -561,11 +570,12 @@ function formatDuration(ms: number): string {
   return `${d}d${h % 24}h`;
 }
 
-export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId?: string): string {
+export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId?: string, locale?: Locale): string {
+  const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
   const options = sessions.map((s) => {
     const project = s.cwd.split('/').pop() || s.cwd;
     const cliName = getCliDisplayName(s.cliId);
-    const uptime = s.startedAt ? formatDuration(Date.now() - s.startedAt) : '未知';
+    const uptime = s.startedAt ? formatDuration(Date.now() - s.startedAt) : unknownUptime;
     return {
       text: { tag: 'plain_text' as const, content: `${cliName} · ${project} · ${s.tmuxTarget} · ${uptime}` },
       value: JSON.stringify({ tmuxTarget: s.tmuxTarget, cliPid: s.cliPid }),
@@ -576,7 +586,7 @@ export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId
     config: { wide_screen_mode: true },
     header: {
       template: 'blue',
-      title: { tag: 'plain_text', content: '📡 选择要接入的 CLI 会话' },
+      title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },
     },
     elements: [
       {
@@ -584,7 +594,7 @@ export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId
         actions: [
           {
             tag: 'select_static',
-            placeholder: { tag: 'plain_text', content: '选择 CLI 会话' },
+            placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_select', undefined, locale) },
             options,
             value: { key: 'adopt_select', root_id: rootMessageId ?? '' },
           },

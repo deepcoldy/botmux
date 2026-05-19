@@ -50,7 +50,7 @@
     "@midscene/web": "^1.7.6",
     "@playwright/test": "^1.58.2",
     "@types/markdown-it": "^14.1.2",
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.0",
@@ -66,7 +66,8 @@
     ]
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
+  "packageManager": "pnpm@9.5.0",
   "license": "MIT"
 }

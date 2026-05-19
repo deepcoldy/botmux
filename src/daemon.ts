@@ -28,6 +28,7 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { t as tr, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
@@ -296,7 +297,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
       ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId,
       prevMode, ds.streamCardNonce, ds.currentImageKey,
-      !!ds.adoptedFrom, false,
+      !!ds.adoptedFrom, false, localeForBot(ds.larkAppId),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -441,7 +442,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
-      await sessionReply(anchor, `${cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。`, 'text', larkAppId);
+      await sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
@@ -451,7 +452,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // deployments inherit the same gate so /cd /restart /close don't slip
       // past allowedUsers just because this bot wasn't the one that bound.
       if (isChatOncallBoundForAnyBot(chatId) && !canOperate(larkAppId, chatId, senderOpenId)) {
-        await sessionReply(anchor, `⚠️ ${cmd} 仅 allowedUsers 可执行。`, 'text', larkAppId);
+        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       // Same rootMessageId reasoning as below in the main spawn path:
@@ -494,7 +495,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     parsed.attachments = attachments;
   }
   if (needLogin) {
-    sessionReply(anchor, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', larkAppId);
+    sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(larkAppId)), 'text', larkAppId);
   }
 
   // First-turn quote-reply: when the user @s the bot via Lark's "quote" UI as
@@ -579,7 +580,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId));
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -597,14 +598,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   if (projects.length > 0) {
     lastRepoScan.set(chatId, projects);
     const currentCwd = getSessionWorkingDir(ds);
-    const cardJson = buildRepoSelectCard(projects, currentCwd, anchor);
+    const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId));
     ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId));
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -675,7 +676,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     (isBotSenderType ||
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
   const botSenderPrefix = isForeignBot
-    ? `[来自 ${lookupForeignBotName(senderOpenIdForPrefix!, larkAppId)} 的 @mention]\n`
+    ? `${tr('daemon.foreign_bot_mention_prefix', { botName: lookupForeignBotName(senderOpenIdForPrefix!, larkAppId) }, localeForBot(larkAppId))}\n`
     : '';
 
   const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + parsed.content;
@@ -717,7 +718,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         markSessionActivity(ds);
         logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
       } else {
-        sessionReply(anchor, `${cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。`, 'text', larkAppId);
+        sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       }
       return;
     }
@@ -727,7 +728,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const threadChatId = existingDs?.chatId ?? ctxChatId ?? data?.message?.chat_id;
       const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       if (threadChatId && isChatOncallBoundForAnyBot(threadChatId) && !canOperate(larkAppId, threadChatId, threadSenderOpenId)) {
-        sessionReply(anchor, `⚠️ ${cmd} 仅 allowedUsers 可执行。`, 'text', larkAppId);
+        sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       // Pass mention-stripped content so /command argument parsing works.
@@ -764,7 +765,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     parsed.attachments = attachments;
   }
   if (needLogin) {
-    sessionReply(anchor, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', effectiveAppId);
+    sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(effectiveAppId)), 'text', effectiveAppId);
   }
 
   // Update last message time + last caller (used by `botmux send` to address
@@ -790,11 +791,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
         return `- @${m.name}${idPart}`;
       });
-      enriched += `\n\n消息中的 @mention：\n${mentionLines.join('\n')}`;
+      enriched += `\n\n${tr('daemon.enriched_mentions_label', undefined, localeForBot(larkAppId))}\n${mentionLines.join('\n')}`;
     }
     if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
     ds.pendingFollowUps.push(enriched);
-    await sessionReply(anchor, '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。', 'text', larkAppId);
+    await sessionReply(anchor, tr('daemon.choose_repo_first', undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
 
@@ -884,7 +885,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId));
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -902,14 +903,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     if (projects.length > 0) {
       lastRepoScan.set(autoCreateChatId, projects);
       const currentCwd = getSessionWorkingDir(newDs);
-      const cardJson = buildRepoSelectCard(projects, currentCwd, anchor);
+      const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId));
       newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId));
       forkWorker(newDs, prompt);
     }
 

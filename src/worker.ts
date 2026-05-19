@@ -84,7 +84,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', gemini: 'Gemini', opencode: 'OpenCode' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -2443,6 +2443,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     initialPrompt: cfg.prompt || undefined,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
+    locale: cfg.locale,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -2460,7 +2461,17 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log('Detected root user — injecting IS_SANDBOX=1 for Claude Code');
   }
 
-  log(`Spawning: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
+  // Predict reattach vs fresh so the log line tells the truth. When a bmx-*
+  // tmux session is still alive, TmuxBackend.spawn ignores the bin/args and
+  // just `tmux attach-session`s — logging `Spawning: <new bin>` in that case
+  // is misleading and has cost real debugging time. (CliId-mismatch reattach
+  // is now blocked upstream in restoreActiveSessions / killStalePids.)
+  const willReattachTmux = isTmuxMode && TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
+  if (willReattachTmux) {
+    log(`Re-attaching to existing tmux session: ${TmuxBackend.sessionName(cfg.sessionId)} (requested CLI: ${cliAdapter.resolvedBin})`);
+  } else {
+    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
+  }
 
   backend.spawn(cliAdapter.resolvedBin, args, {
     cwd: cfg.workingDir,
@@ -2998,6 +3009,13 @@ process.on('message', async (raw: unknown) => {
       lastInitConfig = msg;
       sessionId = msg.sessionId;
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
+      // Pin this worker's i18n locale early so every t() call below resolves
+      // against the bot's chosen language without each callsite needing to
+      // re-thread it.
+      if (msg.locale === 'zh' || msg.locale === 'en') {
+        const { setDefaultLocale } = await import('./i18n/index.js');
+        setDefaultLocale(msg.locale);
+      }
       // Scope session store to this bot's per-bot file
       if (msg.larkAppId) sessionStore.init(msg.larkAppId);
       // Capture credentials for direct image upload from worker

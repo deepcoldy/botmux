@@ -65,6 +65,28 @@ describe('renderQuotedMessage: post', () => {
   });
 });
 
+describe('renderQuotedMessage: interactive', () => {
+  it('parses user_dsl card content and keeps image placeholders aligned with resources', async () => {
+    const out = await renderQuotedMessage('app_x', rawMessage('interactive', {
+      user_dsl: JSON.stringify({
+        header: { title: { tag: 'plain_text', content: 'Quoted Card' } },
+        body: {
+          elements: [
+            { tag: 'markdown', content: 'card body' },
+            { tag: 'img', img_key: 'img_card' },
+          ],
+        },
+      }),
+    }), noExpand);
+
+    expect(out.msgType).toBe('interactive');
+    expect(out.content).toContain('[卡片: Quoted Card]');
+    expect(out.content).toContain('card body');
+    expect(out.content).toContain('[图片 1]');
+    expect(out.resources).toEqual([{ type: 'image', key: 'img_card', name: 'img_card.jpg' }]);
+  });
+});
+
 describe('renderQuotedMessage: merge_forward', () => {
   it('appends sub-message extraResources after top-level resources and stamps msgType to merge_forward_expanded', async () => {
     // Stub expandMergeForward to mimic a forwarded subtree with one image

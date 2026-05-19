@@ -348,23 +348,23 @@ describe('loadBotConfigs', () => {
     fsMock.readFileSync.mockReturnValue(JSON.stringify([{
       larkAppId: 'app_full',
       larkAppSecret: 'secret_full',
+      name: 'codex-main',
       cliId: 'gemini',
       cliPathOverride: '/usr/local/bin/gemini',
       backendType: 'tmux',
       workingDir: '/home/user/project',
       allowedUsers: ['alice', 'bob'],
-      projectScanDir: '/home/user/repos',
     }]));
 
     const configs = mod.loadBotConfigs();
     expect(configs).toHaveLength(1);
     const c = configs[0];
+    expect(c.name).toBe('codex-main');
     expect(c.cliId).toBe('gemini');
     expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
     expect(c.backendType).toBe('tmux');
     expect(c.workingDir).toBe('/home/user/project');
     expect(c.allowedUsers).toEqual(['alice', 'bob']);
-    expect(c.projectScanDir).toBe('/home/user/repos');
   });
 
   it('should split comma-separated workingDir into workingDirs', () => {

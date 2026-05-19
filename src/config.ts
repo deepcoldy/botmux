@@ -38,7 +38,6 @@ export const config = {
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
-    projectScanDir: process.env.PROJECT_SCAN_DIR ?? '',
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',

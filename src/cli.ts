@@ -27,8 +27,31 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
+import {
+  applyBotConfigEdits,
+  assertUniqueBotProcessNames,
+  botProcessName,
+  normalizeBotConfig,
+  parseBotConfigsJson,
+  parseBotSelection,
+  removeBotConfig,
+  resolveCliId,
+  type BotConfigEditInput,
+} from './setup/bot-config-editor.js';
+import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { firstPositional } from './cli/arg-utils.js';
+import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
+import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+
+// Resolve the CLI's UI locale once from the global config file, so subsequent
+// CLI output (and any t() callers that don't pass an explicit locale) honour
+// the user's chosen language. Daemon entrypoint sets this separately for the
+// daemon process.
+{
+  const cfg = readGlobalConfig();
+  if (cfg.lang) setDefaultLocale(cfg.lang);
+}
 
 // CLI subcommands (send/thread/bots/list/etc) print JSON to stdout for
 // callers to parse. Transitive logger.info calls from shared modules would
@@ -146,14 +169,30 @@ function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
 
 function loadBotsJson(): any[] {
   if (existsSync(BOTS_JSON_FILE)) {
-    try { return JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')); } catch { return []; }
+    try {
+      return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE);
+    } catch (err: any) {
+      console.error(`❌ ${err?.message ?? String(err)}`);
+      process.exit(1);
+    }
   }
   return [];
+}
+
+function ensureUniqueBotProcessNames(bots: any[]): void {
+  try {
+    assertUniqueBotProcessNames(bots, PM2_NAME);
+  } catch (err: any) {
+    console.error(`❌ ${err?.message ?? String(err)}`);
+    console.error('   请修改 bots.json 中的 name，确保进程名唯一。');
+    process.exit(1);
+  }
 }
 
 function ecosystemConfig(): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
+  ensureUniqueBotProcessNames(bots);
 
   const baseApp = {
     script: daemonScript,
@@ -167,7 +206,7 @@ function ecosystemConfig(): string {
 
   const apps: any[] = bots.map((_bot: any, i: number) => ({
     ...baseApp,
-    name: `${PM2_NAME}-${i}`,
+    name: botProcessName(_bot, i, PM2_NAME),
     error_file: join(LOG_DIR, `daemon-${i}-error.log`),
     out_file: join(LOG_DIR, `daemon-${i}-out.log`),
     env: { SESSION_DATA_DIR: DATA_DIR, BOTMUX_BOT_INDEX: String(i) },
@@ -205,10 +244,19 @@ function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<
 
 // ─── Setup helpers ──────────────────────────────────────────────────────────
 
+function printInputHelp(title: string, lines: string[]): void {
+  console.log(`\n${title}`);
+  for (const line of lines) {
+    console.log(`  ${line}`);
+  }
+}
+
 // Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
 // the same name without passing BOTS_JSON_FILE explicitly each time.
 function writeBotsJsonAtomic(bots: any[]): void {
-  writeBotsAtomic(BOTS_JSON_FILE, bots);
+  const normalized = bots.map(bot => normalizeBotConfig(bot));
+  ensureUniqueBotProcessNames(normalized);
+  writeBotsAtomic(BOTS_JSON_FILE, normalized);
 }
 
 /**
@@ -399,10 +447,16 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
-  const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex', '5': 'gemini', '6': 'opencode' };
-  const cliId = cliIdMap[cliChoice] ?? (cliChoice || 'claude-code');
+  let cliId: CliId;
+  try {
+    cliId = resolveCliId(cliChoice) ?? 'claude-code';
+  } catch (err: any) {
+    console.log(`\n❌ ${err?.message ?? String(err)}`);
+    console.log('   不写 bots.json。请重新运行 botmux setup。');
+    return null;
+  }
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
 
   // 不再持久化 brand 字段: setup 阶段 brand=lark 直接被 obtainCredentials 中止,
@@ -422,7 +476,105 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   // 字段即可. 手动 fallback 场景没 open_id, 字段直接不写 (== 不限制).
   if (creds.userOpenId) bot.allowedUsers = [creds.userOpenId];
 
-  return bot;
+  return normalizeBotConfig(bot);
+}
+
+function formatOptionalValue(v: unknown): string {
+  if (Array.isArray(v)) return v.join(',');
+  if (typeof v === 'string' && v) return v;
+  return '未设置';
+}
+
+/**
+ * 把 bots.json 渲染成对齐的小表格. 不带行号——进程名 (botmux-N) 已经
+ * 是唯一可寻址的标识, 行号 + 进程名后缀 1-based / 0-based 并列容易引
+ * 起 off-by-one 误解 (用户曾踩过 "1. botmux-0" 这种排版).
+ *
+ * 选择机器人时直接输完整进程名 (botmux-N / botmux-custom) 或 AppID,
+ * parseBotSelection 不再接受裸数字, 避免又冒出 "序号到底是几" 的歧义.
+ */
+function formatBotConfigTable(bots: any[]): string {
+  if (bots.length === 0) return '';
+  const headers = ['进程名', 'App ID', 'CLI'];
+  const rows = bots.map((b, i) => [
+    botProcessName(b, i, PM2_NAME),
+    String(b?.larkAppId ?? ''),
+    String(b?.cliId ?? 'claude-code'),
+  ]);
+  const widths = headers.map((h, c) =>
+    Math.max(displayWidth(h), ...rows.map(r => displayWidth(r[c]))),
+  );
+  const render = (cells: string[]) =>
+    '  ' + cells.map((cell, i) => padEndDisplay(cell, widths[i])).join('  ');
+  return [render(headers), ...rows.map(render)].join('\n');
+}
+
+async function promptEditBotConfig(
+  rl: ReturnType<typeof createInterface>,
+  bot: Record<string, any>,
+): Promise<Record<string, any>> {
+  console.log('\n字段留空表示保留当前值；可选字段输入 - 表示清空。\n');
+  const input: BotConfigEditInput = {};
+
+  printInputHelp('botmux status 显示名称', [
+    '可选。用于本机进程名，方便在 botmux status / logs 中识别机器人。',
+    '留空保留当前值；输入 - 清空自定义名称并恢复 botmux-<序号>。',
+  ]);
+  input.name = await ask(rl, `botmux status 显示名称 [${formatOptionalValue(bot.name)}]: `);
+
+  printInputHelp('LARK_APP_ID', [
+    '飞书开放平台应用的 App ID。修改后，这个配置项会切到另一个飞书应用。',
+    '留空保留当前值；修改会二次确认，因为历史会话和群聊状态不会自动迁移。',
+  ]);
+  input.larkAppId = await ask(rl, `LARK_APP_ID [${bot.larkAppId}]: `);
+
+  printInputHelp('LARK_APP_SECRET', [
+    '当前 App ID 对应的 App Secret。只更新密钥时填写这一项即可。',
+    '留空保留当前值。',
+  ]);
+  input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
+
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
+  printInputHelp('CLI 适配器', [
+    '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
+    '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
+  ]);
+  input.cliChoice = await ask(rl, `CLI 适配器 [${bot.cliId ?? 'claude-code'}]: `);
+
+  printInputHelp('CLI 可执行文件路径覆盖', [
+    '可选。CLI 入口的绝对路径，用于在原 CLI 外面套一层 wrapper / router。',
+    '典型场景：ccr (Claude Code Router) / claude-w / aiden-x-claude 等自定义入口。',
+    '留空保留当前值；输入 - 清空覆盖，回到 PATH 查 cliId 对应的默认二进制。',
+  ]);
+  input.cliPathOverride = await ask(rl, `CLI 可执行文件路径覆盖 [${formatOptionalValue(bot.cliPathOverride)}]: `);
+
+  printInputHelp('会话后端 backendType', [
+    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着。',
+    '留空保留当前值；输入 - 回到自动检测；只接受 pty 或 tmux。',
+  ]);
+  input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
+
+  printInputHelp('默认工作目录', [
+    '可选。新会话默认进入的目录，支持逗号分隔多个候选目录。',
+    '留空保留当前值；输入 - 清空并回到默认 ~。',
+  ]);
+  input.workingDir = await ask(rl, `默认工作目录 [${formatOptionalValue(bot.workingDir)}]: `);
+
+  printInputHelp('允许的用户', [
+    '可选。限制哪些飞书用户可以操作机器人，支持邮箱前缀或 open_id，多个值用逗号分隔。',
+    '留空保留当前值；输入 - 清空限制。',
+  ]);
+  input.allowedUsers = await ask(rl, `允许的用户 [${formatOptionalValue(bot.allowedUsers)}]: `);
+
+  const edited = applyBotConfigEdits(bot, input);
+  if (edited.larkAppId !== bot.larkAppId) {
+    console.log('\n⚠️  LARK_APP_ID 变更后，旧 appId 下的历史会话/群聊状态数据不会自动迁移。');
+    const confirm = (await ask(rl, `确认将 LARK_APP_ID 从 ${bot.larkAppId} 改为 ${edited.larkAppId}? (y/N): `)).trim().toLowerCase();
+    if (confirm !== 'y' && confirm !== 'yes') {
+      edited.larkAppId = bot.larkAppId;
+    }
+  }
+  return edited;
 }
 
 /** Parse .env file to extract bot config for migration to bots.json */
@@ -442,11 +594,10 @@ function parseDotEnvToBotConfig(): Record<string, any> {
     larkAppSecret: vars.LARK_APP_SECRET || '',
   };
   if (vars.CLI_ID) bot.cliId = vars.CLI_ID;
-  if (vars.CLI_PATH) bot.cliPathOverride = vars.CLI_PATH;
+  if (vars.CLI_PATH?.trim()) bot.cliPathOverride = vars.CLI_PATH.trim();
   if (vars.BACKEND_TYPE) bot.backendType = vars.BACKEND_TYPE;
   if (vars.WORKING_DIR) bot.workingDir = vars.WORKING_DIR;
   if (vars.ALLOWED_USERS) bot.allowedUsers = vars.ALLOWED_USERS.split(',').map((s: string) => s.trim()).filter(Boolean);
-  if (vars.PROJECT_SCAN_DIR) bot.projectScanDir = vars.PROJECT_SCAN_DIR;
 
   return bot;
 }
@@ -487,15 +638,13 @@ async function cmdSetup(): Promise<void> {
 
   if (hasBots) {
     // --- Multi-bot mode (bots.json exists) ---
-    const bots = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')) as any[];
-    console.log(`已配置 ${bots.length} 个机器人：`);
-    for (let i = 0; i < bots.length; i++) {
-      console.log(`  ${i + 1}. ${bots[i].larkAppId} (${bots[i].cliId ?? 'claude-code'})`);
-    }
+    const bots = loadBotsJson();
+    console.log(`已配置 ${bots.length} 个机器人：\n`);
+    console.log(formatBotConfigTable(bots));
     console.log('');
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  (1/2) [1]: ');
+    const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  3) 编辑现有机器人  4) 删除机器人  (1/2/3/4) [1]: ');
 
     if (action === '2') {
       console.log('\n── 重新配置 ──\n');
@@ -513,6 +662,87 @@ async function cmdSetup(): Promise<void> {
       writeBotsJsonAtomic([newBot]);
       console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
       printRemainingSteps(newBot.larkAppId, botBrand(newBot));
+      console.log(`下一步: botmux restart\n`);
+      return;
+    }
+
+    if (action === '3') {
+      console.log('\n── 编辑现有机器人 ──\n');
+      const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
+      const index = parseBotSelection(selected, bots);
+      if (index === undefined) {
+        rl.close();
+        console.log('\n❌ 找不到指定机器人，配置未修改。');
+        return;
+      }
+
+      const original = bots[index];
+      let edited: Record<string, any>;
+      try {
+        edited = await promptEditBotConfig(rl, original);
+      } catch (err: any) {
+        rl.close();
+        console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
+        return;
+      }
+
+      // 凭证字段有变化时, 像 promptBotConfig 一样跑一次 tenant_access_token
+      // 校验. 失败不写盘——避免编辑后 typo 一个字符, daemon 重启时才发现.
+      // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
+      const appIdChanged = edited.larkAppId !== original.larkAppId;
+      const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
+      if (appIdChanged || appSecretChanged) {
+        console.log('\n校验新凭证（取 tenant_access_token）…');
+        const { validateCredentials } = await import('./setup/verify-permissions.js');
+        const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
+        if (!v.ok) {
+          rl.close();
+          console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
+          console.log('   配置未修改。请重新运行 botmux setup → 编辑现有机器人。');
+          return;
+        }
+        console.log('✅ 凭证有效\n');
+      }
+      rl.close();
+
+      const nextBots = bots.slice();
+      nextBots[index] = edited;
+      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+      writeBotsJsonAtomic(nextBots);
+      console.log(`✅ 已更新机器人 ${botProcessName(edited, index, PM2_NAME)} (${edited.larkAppId})`);
+      // appId 切换 = 换了一个飞书应用, 新 appId 大概率需要重新申请权限 + 配重定向 URL.
+      // 把 printRemainingSteps 的深链端给用户, 比 README 警告里那句"历史数据不迁移"更可操作.
+      if (appIdChanged) {
+        printRemainingSteps(edited.larkAppId, botBrand(edited));
+      }
+      console.log(`下一步: botmux restart\n`);
+      return;
+    }
+
+    if (action === '4') {
+      console.log('\n── 删除机器人 ──\n');
+      const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
+      const result = removeBotConfig(bots, selected);
+      if (!result) {
+        rl.close();
+        console.log('\n❌ 找不到指定机器人，配置未修改。');
+        return;
+      }
+      const confirm = (await ask(
+        rl,
+        `确认删除 ${botProcessName(result.removed, result.index, PM2_NAME)} (${result.removed.larkAppId})? (y/N): `,
+      )).trim().toLowerCase();
+      rl.close();
+      if (confirm !== 'y' && confirm !== 'yes') {
+        console.log('\n已取消，配置未修改。');
+        return;
+      }
+
+      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+      writeBotsJsonAtomic(result.bots);
+      console.log(`✅ 已删除机器人 ${botProcessName(result.removed, result.index, PM2_NAME)} (${result.removed.larkAppId})`);
       console.log(`下一步: botmux restart\n`);
       return;
     }
@@ -802,12 +1032,12 @@ async function cmdRestart(): Promise<void> {
   killDuplicatePm2GodDaemons();
   preflightNodeSanity();
   await ensureSystemDependencies();
+  const cfg = ecosystemConfig();
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
-  const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
@@ -865,14 +1095,24 @@ function cmdLogs(): void {
     : '50';
 
   const bots = loadBotsJson();
-  // Support --bot <index> to filter specific bot logs
+  // Support --bot <0-based-index|pm2-name|appId> to filter specific bot logs.
   const botIdx = process.argv.includes('--bot')
     ? process.argv[process.argv.indexOf('--bot') + 1]
     : undefined;
 
   let target: string;
   if (botIdx !== undefined) {
-    target = `${PM2_NAME}-${botIdx}`;
+    const numericIdx = /^\d+$/.test(botIdx) ? Number(botIdx) : undefined;
+    const selectedIdx = numericIdx === undefined
+      ? parseBotSelection(botIdx, bots)
+      : numericIdx >= 0 && numericIdx < bots.length
+        ? numericIdx
+        : undefined;
+    target = selectedIdx !== undefined
+      ? botProcessName(bots[selectedIdx], selectedIdx, PM2_NAME)
+      : numericIdx !== undefined
+        ? `${PM2_NAME}-${botIdx}`
+        : botIdx;
   } else {
     // Show all botmux logs via pm2 regex match
     target = `/^${PM2_NAME}/`;
@@ -1752,7 +1992,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   start       启动 daemon
   stop        停止 daemon
   restart     重启 daemon（自动恢复活跃会话）
-  logs        查看 daemon 日志（--lines N, --bot <index>）
+  logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
   dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
@@ -1766,6 +2006,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
+  lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
+       --bot N         仅改 bots.json 中第 N 个 bot 的 lang
+       --unset         清除（global 或 --bot N 配合）
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -2690,15 +2933,11 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   let botEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
-  const botByCli = new Map<string, BotInfoEntry>();
-  for (const b of botEntries) botByCli.set(b.cliId, b);
-
   try {
     const { listChatBotMembers } = await import('./im/lark/client.js');
     const chatBots = await listChatBotMembers(appId, s.chatId);
     const result = chatBots.map(cb => {
-      const info = botByCli.get(cb.name);
-      return { name: cb.displayName, openId: cb.openId, isSelf: info?.larkAppId === appId };
+      return { name: cb.displayName, openId: cb.openId, isSelf: cb.larkAppId === appId };
     });
     console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
   } catch (err: any) {
@@ -2708,6 +2947,96 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     }));
     console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, note: `chat query failed: ${err.message}` }, null, 2));
   }
+}
+
+// ─── botmux lang ─────────────────────────────────────────────────────────────
+
+/**
+ * `botmux lang [zh|en] [--bot N] [--unset]`
+ *
+ * No arg → print effective locale + per-bot overrides.
+ * `zh|en` → write global `~/.botmux/config.json` (or, with `--bot N`, write
+ *   the per-bot `lang` field in `bots.json`).
+ * `--unset` → clear the global config's `lang` (or, with `--bot N`, drop
+ *   the per-bot override).
+ *
+ * On any write, hint the user to `botmux restart` so live daemons pick it up.
+ */
+function cmdLang(args: string[]): void {
+  ensureConfigDir();
+  const cfg = readGlobalConfig();
+  const globalLang: Locale | undefined = cfg.lang;
+
+  const botFlagIdx = args.indexOf('--bot');
+  const botFlag = botFlagIdx >= 0 ? parseInt(args[botFlagIdx + 1] ?? '', 10) : NaN;
+  const unset = args.includes('--unset');
+  const positional = args.filter((a, i) => {
+    if (a === '--bot') return false;
+    if (i > 0 && args[i - 1] === '--bot') return false;
+    if (a === '--unset') return false;
+    return true;
+  });
+  const target = positional[0]?.toLowerCase();
+
+  // No-arg → status
+  if (!target && !unset) {
+    const bots = loadBotsJson();
+    const effective = globalLang ?? 'zh';
+    console.log(`Global lang: ${globalLang ?? '(unset, defaults to zh)'}`);
+    console.log(`Effective for CLI:    ${effective}`);
+    console.log(`Config file:          ${globalConfigPath()}`);
+    if (bots.length > 0) {
+      console.log('\nPer-bot:');
+      bots.forEach((b: any, i: number) => {
+        const explicit: string | undefined = isLocale(b.lang) ? b.lang : undefined;
+        const eff = explicit ?? effective;
+        const tag = explicit ? `${explicit} (explicit override)` : `${eff} (inherits global)`;
+        console.log(`  ${i}. ${b.larkAppId} → ${tag}`);
+      });
+    }
+    return;
+  }
+
+  // Per-bot operations require an existing bots.json index.
+  if (!isNaN(botFlag)) {
+    const bots = loadBotsJson();
+    if (botFlag < 0 || botFlag >= bots.length) {
+      console.error(`--bot index out of range; bots.json has ${bots.length} entry(ies). Use \`botmux lang\` to see indices.`);
+      process.exit(1);
+    }
+    if (unset) {
+      delete bots[botFlag].lang;
+      writeBotsJsonAtomic(bots);
+      console.log(`✅ Cleared per-bot lang for bot ${botFlag} (${bots[botFlag].larkAppId}).`);
+    } else {
+      if (!isLocale(target)) {
+        console.error(`Unknown locale "${target}". Supported: ${SUPPORTED_LOCALES.join(', ')}.`);
+        process.exit(1);
+      }
+      bots[botFlag].lang = target;
+      writeBotsJsonAtomic(bots);
+      console.log(`✅ Set bot ${botFlag} (${bots[botFlag].larkAppId}) lang → ${target}.`);
+    }
+    console.log(`Run \`botmux restart\` for changes to take effect.`);
+    return;
+  }
+
+  // Global operations
+  if (unset) {
+    setGlobalLocale(null);
+    console.log(`✅ Cleared global lang (will default to zh).`);
+    console.log(`Run \`botmux restart\` for changes to take effect.`);
+    return;
+  }
+
+  if (!isLocale(target)) {
+    console.error(`Unknown locale "${target}". Supported: ${SUPPORTED_LOCALES.join(', ')}.`);
+    console.error(`Usage: botmux lang [zh|en] [--bot N] [--unset]`);
+    process.exit(1);
+  }
+  setGlobalLocale(target);
+  console.log(`✅ Set global lang → ${target}.`);
+  console.log(`Run \`botmux restart\` for changes to take effect.`);
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -2747,6 +3076,7 @@ switch (command) {
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
+  case 'lang':     cmdLang(process.argv.slice(3)); break;
   case 'thread':   {
     // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
     // pre-rename scripts/skills surface the rename instead of "unknown command".
