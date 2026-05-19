@@ -50,10 +50,10 @@ export function getSessionWorkingDir(ds?: DaemonSession): string {
 }
 
 export function getProjectScanDir(ds?: DaemonSession): string {
-  // Priority: PROJECT_SCAN_DIR env > parent of current working dir
-  if (config.daemon.projectScanDir) {
-    return expandHome(config.daemon.projectScanDir);
-  }
+  // 总是落到 workingDir 的父目录. 之前 PROJECT_SCAN_DIR / projectScanDir
+  // 字段允许显式覆盖, 但在交互配置里从未暴露过, 也基本没人用; workingDir
+  // 逗号语法 (workingDirs) 已经覆盖 "扫多棵树" 的需求, 故整个字段在
+  // PR feature/setup-bot-management 收尾时一并下线.
   const cwd = getSessionWorkingDir(ds);
   return resolve(cwd, '..');
 }
@@ -62,9 +62,6 @@ export function getProjectScanDir(ds?: DaemonSession): string {
 export function getProjectScanDirs(ds?: DaemonSession): string[] {
   if (ds?.larkAppId) {
     const bot = getBot(ds.larkAppId);
-    if (bot.config.projectScanDir) {
-      return [expandHome(bot.config.projectScanDir)];
-    }
     const dirs = new Set<string>();
     for (const wd of bot.config.workingDirs ?? [bot.config.workingDir ?? '~']) {
       dirs.add(resolve(expandHome(wd), '..'));
@@ -75,9 +72,6 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
     return [...dirs];
   }
   // Fallback to global config
-  if (config.daemon.projectScanDir) {
-    return [expandHome(config.daemon.projectScanDir)];
-  }
   const dirs = new Set<string>();
   for (const wd of config.daemon.workingDirs) {
     dirs.add(resolve(expandHome(wd), '..'));

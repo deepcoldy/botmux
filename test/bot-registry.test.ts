@@ -354,7 +354,6 @@ describe('loadBotConfigs', () => {
       backendType: 'tmux',
       workingDir: '/home/user/project',
       allowedUsers: ['alice', 'bob'],
-      projectScanDir: '/home/user/repos',
     }]));
 
     const configs = mod.loadBotConfigs();
@@ -366,7 +365,6 @@ describe('loadBotConfigs', () => {
     expect(c.backendType).toBe('tmux');
     expect(c.workingDir).toBe('/home/user/project');
     expect(c.allowedUsers).toEqual(['alice', 'bob']);
-    expect(c.projectScanDir).toBe('/home/user/repos');
   });
 
   it('should split comma-separated workingDir into workingDirs', () => {

@@ -66,7 +66,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.selected_in_pending': '✅ Selected {name}',
   'cmd.repo.switched_to': '🔄 Switched to {name}',
   'cmd.repo.warning_running': '⚠️ A session is already running. Switching repos will close it and start a new one.\nIf that\'s what you want, pick the new repo from the card below.',
-  'cmd.repo.scan_dir_not_exist': 'Scan dirs do not exist: {dirs}\nSet PROJECT_SCAN_DIR or WORKING_DIR.',
+  'cmd.repo.scan_dir_not_exist': 'Scan dirs do not exist: {dirs}\nCheck that workingDir in bots.json points to a valid directory.',
   'cmd.repo.no_git_repos': 'No git repositories found under {dirs}.',
   'cmd.skip.opened': '▶️ Session started (working dir: {cwd})',
   'cmd.skip.no_pending': 'No pending repo selection.',

@@ -16,29 +16,31 @@ describe('parseBotSelection', () => {
     { larkAppId: 'app_b' },
   ];
 
-  it('selects by one-based setup index', () => {
-    expect(parseBotSelection('2', bots)).toBe(1);
+  it('rejects bare-digit input now that the list shows no row numbers', () => {
+    expect(parseBotSelection('0', bots)).toBeUndefined();
+    expect(parseBotSelection('1', bots)).toBeUndefined();
+    expect(parseBotSelection('2', bots)).toBeUndefined();
   });
 
-  it('selects by pm2 status name', () => {
+  it('selects by process name', () => {
     expect(parseBotSelection('botmux-1', bots)).toBe(1);
   });
 
-  it('does not select botmux-N when that bot has a custom pm2 status name', () => {
+  it('does not select botmux-N when that bot has a custom process name', () => {
     expect(parseBotSelection('botmux-1', [
       { larkAppId: 'app_a', name: 'claude-main' },
       { larkAppId: 'app_b', name: 'codex-main' },
     ])).toBeUndefined();
   });
 
-  it('selects a custom numeric pm2 status name even when it belongs to a different index', () => {
+  it('selects a custom numeric process name even when it belongs to a different index', () => {
     expect(parseBotSelection('botmux-1', [
       { larkAppId: 'app_a', name: '1' },
       { larkAppId: 'app_b', name: 'codex-main' },
     ])).toBe(0);
   });
 
-  it('selects by custom pm2 status name', () => {
+  it('selects by custom process name', () => {
     expect(parseBotSelection('botmux-claude-main', bots)).toBe(0);
   });
 
@@ -98,7 +100,6 @@ describe('applyBotConfigEdits', () => {
       cliPathOverride: '/opt/legacy/claude',
       backendType: 'tmux',
       allowedUsers: ['alice'],
-      projectScanDir: '~/repos',
     }, {
       larkAppId: '',
       larkAppSecret: '',
@@ -107,7 +108,6 @@ describe('applyBotConfigEdits', () => {
       cliPathOverride: '-',
       backendType: '-',
       allowedUsers: '-',
-      projectScanDir: '-',
     });
 
     expect(updated).toEqual({
@@ -221,23 +221,23 @@ describe('assertUniqueBotProcessNames', () => {
     expect(() => assertUniqueBotProcessNames([
       { larkAppId: 'app_a', name: 'Codex Main' },
       { larkAppId: 'app_b', name: 'Codex-Main' },
-    ])).toThrow(/botmux-Codex-Main.*entries 1 and 2/);
+    ])).toThrow(/botmux-Codex-Main.*第 1 条和第 2 条重复/);
   });
 
   it('rejects collisions between custom numeric names and unnamed index names', () => {
     expect(() => assertUniqueBotProcessNames([
       { larkAppId: 'app_a', name: '1' },
       { larkAppId: 'app_b' },
-    ])).toThrow(/botmux-1.*entries 1 and 2/);
+    ])).toThrow(/botmux-1.*第 1 条和第 2 条重复/);
   });
 
-  it('rejects the reserved dashboard pm2 process name', () => {
+  it('rejects the reserved dashboard process name', () => {
     expect(() => assertUniqueBotProcessNames([
       { larkAppId: 'app_a', name: 'dashboard' },
-    ])).toThrow(/botmux-dashboard.*reserved/);
+    ])).toThrow(/botmux-dashboard.*保留名/);
   });
 
-  it('allows unique pm2 process names', () => {
+  it('allows unique process names', () => {
     expect(() => assertUniqueBotProcessNames([
       { larkAppId: 'app_a', name: 'claude-main' },
       { larkAppId: 'app_b' },
@@ -270,8 +270,8 @@ describe('removeBotConfig', () => {
     expect(removeBotConfig([{ larkAppId: 'app_a' }], 'missing')).toBeUndefined();
   });
 
-  it('allows removing the final bot config', () => {
-    const result = removeBotConfig([{ larkAppId: 'app_a' }], '1');
+  it('allows removing the final bot config by process name', () => {
+    const result = removeBotConfig([{ larkAppId: 'app_a' }], 'botmux-0');
 
     expect(result).toEqual({
       index: 0,

@@ -69,7 +69,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.selected_in_pending': '✅ 已选择 {name}',
   'cmd.repo.switched_to': '🔄 已切换到 {name}',
   'cmd.repo.warning_running': '⚠️ 当前会话已在运行中，切换仓库将关闭当前会话并创建新会话。\n如需切换，请在下方卡片中选择新仓库。',
-  'cmd.repo.scan_dir_not_exist': '扫描目录不存在：{dirs}\n请设置 PROJECT_SCAN_DIR 或 WORKING_DIR 环境变量。',
+  'cmd.repo.scan_dir_not_exist': '扫描目录不存在：{dirs}\n请检查 bots.json 中的 workingDir 是否指向有效目录。',
   'cmd.repo.no_git_repos': '在 {dirs} 下未找到 git 仓库。',
   'cmd.skip.opened': '▶️ 已直接开启会话（工作目录：{cwd}）',
   'cmd.skip.no_pending': '当前没有待选择的仓库。',

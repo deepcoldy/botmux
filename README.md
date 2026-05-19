@@ -421,7 +421,7 @@ dashboard 走单独 pm2 进程 `botmux-dashboard`，跟着 `pnpm daemon:restart`
 botmux setup
 ```
 
-已有 `~/.botmux/bots.json` 时，`botmux setup` 支持添加新机器人、重新配置、编辑现有机器人，以及删除机器人配置。编辑或删除时可用序号、`larkAppId` 或 `botmux status` 里的 PM2 名称（如 `botmux-1` 或自定义的 `botmux-claude-main`）选择目标；字段留空表示保留当前值，`name`、`cliPathOverride`、`backendType`、`workingDir`、`allowedUsers`、`projectScanDir` 等可选字段输入 `-` 表示清空。修改 `larkAppId` 会提示确认，因为旧 appId 下的历史会话和群聊状态数据不会自动迁移。删除机器人只移除本机 `bots.json` 中的一项，不删除飞书开放平台应用、历史消息或本地会话数据；修改完成后运行 `botmux restart` 生效。
+已有 `~/.botmux/bots.json` 时，`botmux setup` 支持添加新机器人、重新配置、编辑现有机器人，以及删除机器人配置。编辑或删除时用 `botmux status` 里的进程名（如 `botmux-1` 或自定义的 `botmux-claude-main`）或 `larkAppId` 选择目标；字段留空表示保留当前值，`name`、`cliPathOverride`、`backendType`、`workingDir`、`allowedUsers` 等可选字段输入 `-` 表示清空。修改 `larkAppId` 会提示确认，因为旧 appId 下的历史会话和群聊状态数据不会自动迁移。删除机器人只移除本机 `bots.json` 中的一项，不删除飞书开放平台应用、历史消息或本地会话数据；修改完成后运行 `botmux restart` 生效。
 
 **bots.json 格式：**
 
@@ -448,13 +448,12 @@ botmux setup
 |------|------|------|
 | `larkAppId` | 是 | 飞书应用 App ID |
 | `larkAppSecret` | 是 | 飞书应用 App Secret |
-| `name` | 否 | `botmux status` 中的 PM2 名称后缀；例如 `claude-main` 会显示为 `botmux-claude-main`，留空默认 `botmux-<序号>` |
+| `name` | 否 | `botmux status` 中的进程名后缀；例如 `claude-main` 会显示为 `botmux-claude-main`，留空默认 `botmux-<序号>` |
 | `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`cursor`、`gemini`、`opencode`） |
 | `cliPathOverride` | 否 | CLI 可执行文件路径覆盖 |
 | `backendType` | 否 | 会话后端：`pty` 或 `tmux`（默认自动检测） |
 | `workingDir` | 否 | 默认工作目录，支持逗号分隔多个目录 |
 | `allowedUsers` | 否 | 允许的用户列表（邮箱前缀或 open_id） |
-| `projectScanDir` | 否 | 扫描 Git 仓库的目录 |
 | `oncallChats` | 否 | oncall 绑定（`/oncall bind` 写入），形如 `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`，群内任何成员可 @ 提问 |
 
 **配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`

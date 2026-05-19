@@ -133,7 +133,7 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
     assertUniqueBotProcessNames(bots, PM2_NAME);
   } catch (err: any) {
     console.error(`❌ ${err?.message ?? String(err)}`);
-    console.error('   请修改 bots.json 中的 name，确保 botmux status/PM2 进程名唯一。');
+    console.error('   请修改 bots.json 中的 name，确保进程名唯一。');
     process.exit(1);
   }
 }
@@ -434,9 +434,28 @@ function formatOptionalValue(v: unknown): string {
   return '未设置';
 }
 
-function formatBotConfigLine(bot: Record<string, any>, index: number): string {
-  const cliId = bot.cliId ?? 'claude-code';
-  return `${index + 1}. ${botProcessName(bot, index, PM2_NAME)}  ${bot.larkAppId} (${cliId})`;
+/**
+ * 把 bots.json 渲染成对齐的小表格. 不带行号——进程名 (botmux-N) 已经
+ * 是唯一可寻址的标识, 行号 + 进程名后缀 1-based / 0-based 并列容易引
+ * 起 off-by-one 误解 (用户曾踩过 "1. botmux-0" 这种排版).
+ *
+ * 选择机器人时直接输完整进程名 (botmux-N / botmux-custom) 或 AppID,
+ * parseBotSelection 不再接受裸数字, 避免又冒出 "序号到底是几" 的歧义.
+ */
+function formatBotConfigTable(bots: any[]): string {
+  if (bots.length === 0) return '';
+  const headers = ['进程名', 'App ID', 'CLI'];
+  const rows = bots.map((b, i) => [
+    botProcessName(b, i, PM2_NAME),
+    String(b?.larkAppId ?? ''),
+    String(b?.cliId ?? 'claude-code'),
+  ]);
+  const widths = headers.map((h, c) =>
+    Math.max(displayWidth(h), ...rows.map(r => displayWidth(r[c]))),
+  );
+  const render = (cells: string[]) =>
+    '  ' + cells.map((cell, i) => padEndDisplay(cell, widths[i])).join('  ');
+  return [render(headers), ...rows.map(render)].join('\n');
 }
 
 async function promptEditBotConfig(
@@ -447,7 +466,7 @@ async function promptEditBotConfig(
   const input: BotConfigEditInput = {};
 
   printInputHelp('botmux status 显示名称', [
-    '可选。用于本机 PM2 进程名，方便在 botmux status / logs 中识别机器人。',
+    '可选。用于本机进程名，方便在 botmux status / logs 中识别机器人。',
     '留空保留当前值；输入 - 清空自定义名称并恢复 botmux-<序号>。',
   ]);
   input.name = await ask(rl, `botmux status 显示名称 [${formatOptionalValue(bot.name)}]: `);
@@ -495,12 +514,6 @@ async function promptEditBotConfig(
   ]);
   input.allowedUsers = await ask(rl, `允许的用户 [${formatOptionalValue(bot.allowedUsers)}]: `);
 
-  printInputHelp('Git 仓库扫描目录', [
-    '可选。用于项目选择/扫描时从指定目录发现 Git 仓库。',
-    '留空保留当前值；输入 - 清空扫描目录。',
-  ]);
-  input.projectScanDir = await ask(rl, `Git 仓库扫描目录 [${formatOptionalValue(bot.projectScanDir)}]: `);
-
   const edited = applyBotConfigEdits(bot, input);
   if (edited.larkAppId !== bot.larkAppId) {
     console.log('\n⚠️  LARK_APP_ID 变更后，旧 appId 下的历史会话/群聊状态数据不会自动迁移。');
@@ -533,7 +546,6 @@ function parseDotEnvToBotConfig(): Record<string, any> {
   if (vars.BACKEND_TYPE) bot.backendType = vars.BACKEND_TYPE;
   if (vars.WORKING_DIR) bot.workingDir = vars.WORKING_DIR;
   if (vars.ALLOWED_USERS) bot.allowedUsers = vars.ALLOWED_USERS.split(',').map((s: string) => s.trim()).filter(Boolean);
-  if (vars.PROJECT_SCAN_DIR) bot.projectScanDir = vars.PROJECT_SCAN_DIR;
 
   return bot;
 }
@@ -575,10 +587,8 @@ async function cmdSetup(): Promise<void> {
   if (hasBots) {
     // --- Multi-bot mode (bots.json exists) ---
     const bots = loadBotsJson();
-    console.log(`已配置 ${bots.length} 个机器人：`);
-    for (let i = 0; i < bots.length; i++) {
-      console.log(`  ${formatBotConfigLine(bots[i], i)}`);
-    }
+    console.log(`已配置 ${bots.length} 个机器人：\n`);
+    console.log(formatBotConfigTable(bots));
     console.log('');
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -606,7 +616,7 @@ async function cmdSetup(): Promise<void> {
 
     if (action === '3') {
       console.log('\n── 编辑现有机器人 ──\n');
-      const selected = await ask(rl, '选择机器人（序号 / PM2 名 / AppID）: ');
+      const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
       const index = parseBotSelection(selected, bots);
       if (index === undefined) {
         rl.close();
@@ -660,7 +670,7 @@ async function cmdSetup(): Promise<void> {
 
     if (action === '4') {
       console.log('\n── 删除机器人 ──\n');
-      const selected = await ask(rl, '选择机器人（序号 / PM2 名 / AppID）: ');
+      const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
       const result = removeBotConfig(bots, selected);
       if (!result) {
         rl.close();

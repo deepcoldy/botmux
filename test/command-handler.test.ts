@@ -28,7 +28,7 @@ vi.mock('node:os', async (importOriginal) => {
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
-    daemon: { workingDir: '~', projectScanDir: '' },
+    daemon: { workingDir: '~' },
   },
 }));
 

@@ -39,7 +39,6 @@ export interface BotConfigEditInput {
   backendType?: string;
   workingDir?: string;
   allowedUsers?: string;
-  projectScanDir?: string;
 }
 
 export interface RemoveBotConfigResult<T> {
@@ -110,13 +109,13 @@ export function assertUniqueBotProcessNames(
   for (let i = 0; i < bots.length; i++) {
     const name = botProcessName(bots[i], i, prefix);
     if (reserved.has(name)) {
-      throw new Error(`Bot PM2 process name "${name}" is reserved. Set a different "name" value.`);
+      throw new Error(`进程名 "${name}" 是保留名, 请改用其他 "name" 值.`);
     }
     const firstIndex = seen.get(name);
     if (firstIndex !== undefined) {
       throw new Error(
-        `Duplicate bot PM2 process name "${name}" in bots.json entries ${firstIndex + 1} and ${i + 1}. ` +
-        'Set unique "name" values or clear one before restarting.',
+        `进程名 "${name}" 在 bots.json 第 ${firstIndex + 1} 条和第 ${i + 1} 条重复. ` +
+        '请改 "name" 让进程名唯一, 或清空其中一个后再重启.',
       );
     }
     seen.set(name, i);
@@ -151,11 +150,6 @@ export function parseBotSelection(
     if (Number.isInteger(idx) && idx >= 0 && idx < bots.length && botProcessName(bots[idx], idx) === raw) {
       return idx;
     }
-  }
-
-  if (/^\d+$/.test(raw)) {
-    const idx = Number(raw) - 1;
-    return idx >= 0 && idx < bots.length ? idx : undefined;
   }
 
   const byAppId = bots.findIndex(b => b.larkAppId === raw);
@@ -213,7 +207,6 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   }
 
   applyOptionalString(out, 'workingDir', input.workingDir);
-  applyOptionalString(out, 'projectScanDir', input.projectScanDir);
 
   if (input.allowedUsers !== undefined) {
     const allowedUsers = input.allowedUsers.trim();
