@@ -314,6 +314,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   }
   ds.streamCardPending = true;
   ds.currentTurnTitle = title.substring(0, 50);
+  ds.currentImageKey = undefined;
   persistStreamCardState(ds);
 }
 
@@ -957,6 +958,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     parkStreamCard(ds);
     ds.streamCardId = undefined;
     ds.streamCardNonce = undefined;
+    // This is a new turn even though the worker is currently down. Force the
+    // first screen_update from the re-forked worker to POST a fresh card and
+    // drop any persisted screenshot from the previous turn. Otherwise a stale
+    // image_key (for example an old Claude Code frame) can be reused on the
+    // new Worker card until the next screenshot upload, which makes a fresh
+    // @mention appear to resurrect the wrong CLI UI.
+    ds.streamCardPending = true;
+    ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
     // `<botmux_reminder>` envelope as live-worker turns. Without this, the

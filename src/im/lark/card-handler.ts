@@ -45,6 +45,66 @@ function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
 }
 
+const LEGACY_SELF_HEAL_ACTIONS = new Set(['toggle_display', 'toggle_stream', 'refresh_screenshot']);
+
+function isLegacySelfHealAction(actionType?: string): boolean {
+  return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
+}
+
+function getSessionByActionValue(
+  activeSessions: Map<string, DaemonSession>,
+  rootId: string | undefined,
+  larkAppId: string | undefined,
+  sessionId: string | undefined,
+  actionType: string | undefined,
+): DaemonSession | undefined {
+  const primary = rootId && larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
+  if (primary && (!sessionId || primary.session.sessionId === sessionId)) return primary;
+
+  if (sessionId) {
+    for (const ds of activeSessions.values()) {
+      if (ds.larkAppId === larkAppId && ds.session.sessionId === sessionId) return ds;
+    }
+  }
+
+  // Legacy visible cards may carry a stale/closed session_id.  Only redirect
+  // self-healing display actions to the current root session; sensitive actions
+  // (close/restart/disconnect/get_write_link/term_action/...) must not operate
+  // on a different current session just because an old card shared the root.
+  if (primary && isLegacySelfHealAction(actionType)) return primary;
+  return undefined;
+}
+
+function sessionCliId(ds: DaemonSession) {
+  return ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+}
+
+function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string>): boolean {
+  const expected = value?.cli_id;
+  if (!expected) return true;
+  const actual = sessionCliId(ds);
+  if (actual === expected) return true;
+
+  // Backward-compat migration path: some already-visible Worker(CoCo) cards
+  // were rendered with cli_id=claude-code before the binding fix.  Let only
+  // display self-healing actions through so the handler can PATCH the clicked
+  // card into the current session/CLI.  Never allow stale mismatched cards to
+  // trigger sensitive/session-mutating actions.
+  if (expected === 'claude-code' && actual !== 'claude-code' && isLegacySelfHealAction(value?.action)) {
+    logger.warn(
+      `[${tag(ds)}] Accepting legacy mismatched CLI card for self-heal: ` +
+      `action=${value?.action ?? '?'} expected=${expected} actual=${actual}`,
+    );
+    return true;
+  }
+
+  logger.warn(
+    `[${tag(ds)}] Ignoring card action from mismatched CLI card: ` +
+    `action=${value?.action ?? '?'} expected=${expected} actual=${actual}`,
+  );
+  return false;
+}
+
 // ─── Main handler ─────────────────────────────────────────────────────────
 
 export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
@@ -77,7 +137,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // hits, and keep the bare-rootId fallback for legacy single-bot cards.
     const ds = rootId
       ? (larkAppId
-          ? activeSessions.get(sessionKey(rootId, larkAppId)) ?? activeSessions.get(rootId)
+          ? getSessionByActionValue(activeSessions, rootId, larkAppId, value?.session_id, value?.action)
           : activeSessions.get(rootId))
       : undefined;
     // Resume targets a closed session — fall back to the persistent store so
@@ -108,7 +168,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (value?.action) {
     const { action: actionType, root_id: rootId } = value;
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
-    const ds = activeSessions.get(sKey);
+    const ds = larkAppId
+      ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
+      : activeSessions.get(rootId);
+
+    if (ds && !validateCardCliBinding(ds, value)) return;
 
     if (actionType === 'restart' && ds) {
       // Adopt sessions: hard-reject. botmux never owned the user's CLI;
@@ -122,17 +186,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return;
       }
       const botCfg = getBot(ds.larkAppId).config;
+      const effectiveCliId = sessionCliId(ds);
       if (ds.worker) {
         // Worker alive — tell it to restart CLI
         logger.info(`[${tag(ds)}] Restart via card button`);
         ds.worker.send({ type: 'restart' } as DaemonToWorker);
-        const cliName = getCliDisplayName(botCfg.cliId);
+        const cliName = getCliDisplayName(effectiveCliId);
         await sessionReply(rootId, `🔄 已重启 ${cliName}`);
       } else {
         // Worker gone (e.g. after daemon restart) — re-fork
         logger.info(`[${tag(ds)}] Re-forking worker via card button`);
         forkWorker(ds, '', ds.hasHistory);
-        const cliName = getCliDisplayName(botCfg.cliId);
+        const cliName = getCliDisplayName(effectiveCliId);
         await sessionReply(rootId, `🔄 已重新启动 ${cliName}`);
         // DM card will be sent by the ready handler when worker starts
       }
@@ -316,14 +381,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
       const botCfg = getBot(ds.larkAppId).config;
+      const effectiveCliId = sessionCliId(ds);
       if (ds.workerPort && ds.workerToken) {
         const writeUrl = `http://${config.web.externalHost}:${ds.workerPort}?token=${ds.workerToken}`;
         const dmCardJson = buildSessionCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
           writeUrl,
-          ds.session.title || getCliDisplayName(botCfg.cliId),
-          botCfg.cliId,
+          ds.session.title || getCliDisplayName(effectiveCliId),
+          effectiveCliId,
           true, // showManageButtons — DM card includes restart & close
           !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
         );
@@ -350,40 +416,87 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
         const frozen = ds.frozenCards.get(clickedNonce!);
         if (!frozen) {
-          logger.debug(`[${tag(ds)}] Toggle on unknown frozen card: nonce=${clickedNonce}`);
+          // The clicked card can predate the frozen-card cache for the current
+          // active session (e.g. a stale Worker card whose session_id/card_nonce
+          // came from a now-closed session). Migrate the visible card to the
+          // current root session/CLI instead of leaving stale terminal URL/chrome.
+          const effectiveCliId = sessionCliId(ds);
+          const cur: DisplayMode = ds.displayMode ?? 'hidden';
+          const next = nextMode(cur);
+          ds.displayMode = next;
+          persistStreamCardState(ds);
+          if (ds.worker) {
+            ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+          }
+          if (cardMessageId && ds.workerPort) {
+            const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+            const cardJson = buildStreamingCard(
+              ds.session.sessionId,
+              sessionAnchorId(ds),
+              readUrl,
+              turnTitle,
+              ds.lastScreenContent || '',
+              ds.lastScreenStatus || 'working',
+              effectiveCliId,
+              next,
+              ds.streamCardNonce,
+              ds.currentImageKey,
+              !!ds.adoptedFrom,
+              false,
+            );
+            updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
+              logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
+            );
+            logger.info(`[${tag(ds)}] Migrated unknown frozen card to ${next} (legacy nonce=${clickedNonce})`);
+            try { return JSON.parse(cardJson); } catch { /* fall through */ }
+          }
+          logger.debug(`[${tag(ds)}] Toggle on unknown frozen card could not migrate: nonce=${clickedNonce}`);
           return;
         }
-        const cur = frozenDisplayMode(frozen);
+        // Self-heal known historical cards by migrating the clicked card to the
+        // current live session/CLI instead of rebuilding from cached frozen
+        // title/content/imageKey. The cache may have been persisted while this
+        // thread was bound to a different CLI (or before cli_id existed), and
+        // reusing its imageKey is exactly what makes a second click snap back to
+        // an old Claude Code screenshot.
+        const cur: DisplayMode = ds.displayMode ?? frozenDisplayMode(frozen);
         const next = nextMode(cur);
-        frozen.displayMode = next;
-        frozen.expanded = next !== 'hidden';
-        const botCfg = getBot(ds.larkAppId).config;
+        ds.displayMode = next;
+        persistStreamCardState(ds);
+        if (ds.worker) {
+          ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+        }
+        const effectiveCliId = sessionCliId(ds);
         const readUrl = ds.workerPort ? `http://${config.web.externalHost}:${ds.workerPort}` : '';
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
           readUrl,
-          frozen.title,
-          frozen.content,
-          'idle',
-          botCfg.cliId,
+          turnTitle,
+          ds.lastScreenContent || '',
+          ds.lastScreenStatus || 'working',
+          effectiveCliId,
           next,
-          clickedNonce,
-          frozen.imageKey,
+          ds.streamCardNonce,
+          ds.currentImageKey,
           !!ds.adoptedFrom,
           false,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
-          logger.debug(`[${tag(ds)}] Failed to toggle frozen card: ${err}`),
+          logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
         );
+        ds.frozenCards.delete(clickedNonce!);
         saveFrozenCards(ds.session.sessionId, ds.frozenCards);
-        logger.info(`[${tag(ds)}] Frozen card toggled to ${next} (nonce=${clickedNonce})`);
+        logger.info(`[${tag(ds)}] Migrated frozen card to current ${next} (legacy nonce=${clickedNonce})`);
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
         return;
       }
 
       // Current (latest) card — change displayMode + tell worker
       const botCfg = getBot(ds.larkAppId).config;
+      const effectiveCliId = sessionCliId(ds);
       const cur: DisplayMode = ds.displayMode ?? 'hidden';
       const next = nextMode(cur);
       ds.displayMode = next;
@@ -393,7 +506,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       if (ds.streamCardId && ds.workerPort) {
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -401,14 +514,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           turnTitle,
           ds.lastScreenContent || '',
           ds.lastScreenStatus || 'working',
-          botCfg.cliId,
+          effectiveCliId,
           next,
           ds.streamCardNonce,
           ds.currentImageKey,
           !!ds.adoptedFrom,
           false,
         );
-        scheduleCardPatch(ds, cardJson);
+        if (cardMessageId && cardMessageId !== ds.streamCardId) {
+          updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
+            logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
+          );
+        } else {
+          scheduleCardPatch(ds, cardJson);
+        }
         logger.info(`[${tag(ds)}] Display mode → ${next}`);
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -446,8 +565,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // fresh screenshot PATCH (~1s).
       if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
         const botCfg = getBot(ds.larkAppId).config;
+        const effectiveCliId = sessionCliId(ds);
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -455,13 +575,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           turnTitle,
           ds.lastScreenContent || '',
           ds.lastScreenStatus || 'working',
-          botCfg.cliId,
+          effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
           !!ds.adoptedFrom,
           false,
         );
+        if (cardMessageId && cardMessageId !== ds.streamCardId) {
+          updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
+            logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
+          );
+        }
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
       return;
@@ -482,8 +607,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // overriding to 'analyzing' was confusing (AI analysis uses that color).
       if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
         const botCfg = getBot(ds.larkAppId).config;
+        const effectiveCliId = sessionCliId(ds);
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -491,7 +617,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           turnTitle,
           ds.lastScreenContent || '',
           ds.lastScreenStatus || 'working',
-          botCfg.cliId,
+          effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
@@ -507,12 +633,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (ds.pendingRepo) {
         const selfBot = getBot(ds.larkAppId);
         const botCfg = selfBot.config;
+        const effectiveCliId = sessionCliId(ds);
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
         const prompt = buildNewTopicPrompt(
           ds.pendingPrompt ?? '',
           ds.session.sessionId,
-          botCfg.cliId,
+          effectiveCliId,
           botCfg.cliPathOverride,
           ds.pendingAttachments,
           ds.pendingMentions,
@@ -603,12 +730,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (targetDs.pendingRepo) {
     const selfBot = getBot(targetDs.larkAppId);
     const botCfg = selfBot.config;
+    const effectiveCliId = sessionCliId(targetDs);
     // First-time repo selection — now spawn CLI with the original prompt
     targetDs.pendingRepo = false;
     const prompt = buildNewTopicPrompt(
       targetDs.pendingPrompt ?? '',
       targetDs.session.sessionId,
-      botCfg.cliId,
+      effectiveCliId,
       botCfg.cliPathOverride,
       targetDs.pendingAttachments,
       targetDs.pendingMentions,

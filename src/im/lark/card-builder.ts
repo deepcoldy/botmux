@@ -36,6 +36,7 @@ export function buildSessionCard(
   adoptMode?: boolean,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const actions: any[] = [
     {
       tag: 'button',
@@ -55,7 +56,7 @@ export function buildSessionCard(
       tag: 'button',
       text: { tag: 'plain_text', content: '🔑 获取操作链接' },
       type: 'default',
-      value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
+      value: { action: 'get_write_link', ...actionBase },
     });
   }
   if (showManageButtons && !adoptMode) {
@@ -67,7 +68,7 @@ export function buildSessionCard(
       tag: 'button',
       text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
       type: 'default',
-      value: { action: 'restart', root_id: rootId, session_id: sessionId },
+      value: { action: 'restart', ...actionBase },
     });
   }
   if (adoptMode) {
@@ -75,20 +76,20 @@ export function buildSessionCard(
       tag: 'button',
       text: { tag: 'plain_text', content: '⏏ 断开' },
       type: 'danger',
-      value: { action: 'disconnect', root_id: rootId, session_id: sessionId },
+      value: { action: 'disconnect', ...actionBase },
     });
   } else {
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: '❌ 关闭会话' },
       type: 'danger',
-      value: { action: 'close', root_id: rootId, session_id: sessionId },
+      value: { action: 'close', ...actionBase },
     });
   }
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${escapeMd(title)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)}` },
       template: 'blue',
     },
     elements: [
@@ -122,6 +123,7 @@ export function buildSessionClosedCard(
   cliResumeCommand?: string | null,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n📁 工作目录：\`${escapeMd(workingDir)}\`` : '';
   const cmdBlock = cliResumeCommand
     ? `点击「恢复会话」继续，或在终端执行：\n\`\`\`\n${cliResumeCommand}\n\`\`\``
@@ -145,7 +147,7 @@ export function buildSessionClosedCard(
             tag: 'button',
             text: { tag: 'plain_text', content: '▶️ 恢复会话' },
             type: 'primary',
-            value: { action: 'resume', root_id: rootId, session_id: sessionId },
+            value: { action: 'resume', ...actionBase },
           },
         ],
       },
@@ -204,7 +206,9 @@ export function buildStreamingCard(
   adoptMode?: boolean,
   showTakeover?: boolean,
 ): string {
-  void cliId;
+  const effectiveCliId = cliId ?? 'claude-code';
+  const cliName = getCliDisplayName(effectiveCliId);
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
   const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple' } as const;
   const statusMap = { starting: '启动中…', working: '工作中', idle: '等待输入', analyzing: '正在分析…' } as const;
 
@@ -233,14 +237,14 @@ export function buildStreamingCard(
     tag: 'button',
     text: { tag: 'plain_text', content: displayMode === 'hidden' ? '📖 显示输出' : '📕 隐藏输出' },
     type: 'default' as const,
-    value: { action: 'toggle_display', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
+    value: { action: 'toggle_display', ...actionBase },
   });
   if (displayMode !== 'hidden') {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: '📝 导出文字' },
       type: 'default' as const,
-      value: { action: 'export_text', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
+      value: { action: 'export_text', ...actionBase },
     });
   }
   if (displayMode === 'screenshot') {
@@ -248,7 +252,7 @@ export function buildStreamingCard(
       tag: 'button',
       text: { tag: 'plain_text', content: '🔃 刷新' },
       type: 'default' as const,
-      value: { action: 'refresh_screenshot', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
+      value: { action: 'refresh_screenshot', ...actionBase },
     });
   }
   headerActions.push({
@@ -261,7 +265,7 @@ export function buildStreamingCard(
     tag: 'button',
     text: { tag: 'plain_text', content: '🔑 获取操作链接' },
     type: 'default',
-    value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
+    value: { action: 'get_write_link', ...actionBase },
   });
   if (adoptMode) {
     if (showTakeover) {
@@ -269,21 +273,21 @@ export function buildStreamingCard(
         tag: 'button',
         text: { tag: 'plain_text', content: '🔄 接管' },
         type: 'default' as const,
-        value: { action: 'takeover', root_id: rootId, session_id: sessionId },
+        value: { action: 'takeover', ...actionBase },
       });
     }
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: '⏏ 断开' },
       type: 'danger' as const,
-      value: { action: 'disconnect', root_id: rootId, session_id: sessionId },
+      value: { action: 'disconnect', ...actionBase },
     });
   } else {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: '❌ 关闭会话' },
       type: 'danger' as const,
-      value: { action: 'close', root_id: rootId, session_id: sessionId },
+      value: { action: 'close', ...actionBase },
     });
   }
   elements.push({ tag: 'action', actions: headerActions });
@@ -295,7 +299,7 @@ export function buildStreamingCard(
       tag: 'button',
       text: { tag: 'plain_text', content: label },
       type: 'default' as const,
-      value: { action: 'term_action', root_id: rootId, session_id: sessionId, key },
+      value: { action: 'term_action', ...actionBase, key },
     });
     elements.push({
       tag: 'action',
@@ -323,7 +327,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${escapeMd(title)} — ${statusMap[status]}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${statusMap[status]}` },
       template: templateMap[status],
     },
     elements,

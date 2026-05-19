@@ -86,6 +86,57 @@ function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
   return { ...process.env, PM2_HOME: home };
 }
 
+function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
+  if (process.platform !== 'linux') return [];
+  const marker = `God Daemon (${home})`;
+  const pids: number[] = [];
+  try {
+    for (const ent of readdirSync('/proc')) {
+      if (!/^\d+$/.test(ent)) continue;
+      const pid = parseInt(ent, 10);
+      if (!pid) continue;
+      try {
+        const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\u0000/g, ' ').trim();
+        if (cmd.includes('PM2 v') && cmd.includes(marker)) pids.push(pid);
+      } catch { /* ignore unreadable proc entries */ }
+    }
+  } catch { /* ignore proc scan failure */ }
+  return pids.sort((a, b) => a - b);
+}
+
+function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
+  const pids = listPm2GodDaemonPids(home);
+  if (pids.length <= 1) return false;
+
+  const pidFile = join(home, 'pm2.pid');
+  let keepPid = 0;
+  if (existsSync(pidFile)) {
+    try {
+      const parsed = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+      if (pids.includes(parsed)) keepPid = parsed;
+    } catch { /* ignore malformed pid file */ }
+  }
+  if (!keepPid) keepPid = pids[pids.length - 1];
+
+  const dupes = pids.filter(pid => pid !== keepPid);
+  if (dupes.length === 0) return false;
+
+  for (const pid of dupes) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
+    try {
+      process.kill(pid, 0);
+      process.kill(pid, 'SIGKILL');
+    } catch { /* ignore */ }
+  }
+
+  try {
+    writeFileSync(pidFile, `${keepPid}\n`, 'utf-8');
+  } catch { /* ignore */ }
+
+  console.warn(`⚠️  检测到同一 PM2_HOME (${home}) 下存在多个 PM2 God Daemon，已清理重复实例；保留 pid ${keepPid}，移除: ${dupes.join(', ')}`);
+  return true;
+}
+
 function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
   execSync(`${pm2Bin()} ${args.join(' ')}`, {
     stdio: inherit ? 'inherit' : 'pipe',
@@ -600,6 +651,7 @@ async function cmdStart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
+  killDuplicatePm2GodDaemons();
   preflightNodeSanity();
   await ensureSystemDependencies();
 
@@ -718,6 +770,7 @@ function cleanupLegacyPm2(): boolean {
 }
 
 function cmdStop(): void {
+  killDuplicatePm2GodDaemons();
   cleanupLegacyPm2();
   let stopped = false;
   try {
@@ -746,6 +799,7 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
+  killDuplicatePm2GodDaemons();
   preflightNodeSanity();
   await ensureSystemDependencies();
   cleanupLegacyPm2();
@@ -804,6 +858,7 @@ function warnIfLegacyBotmuxAlive(): void {
 }
 
 function cmdLogs(): void {
+  killDuplicatePm2GodDaemons();
   warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
@@ -832,6 +887,7 @@ function cmdLogs(): void {
 }
 
 function cmdStatus(): void {
+  killDuplicatePm2GodDaemons();
   warnIfLegacyBotmuxAlive();
   runPm2(['status']);
 }
