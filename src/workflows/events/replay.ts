@@ -193,6 +193,22 @@ export type RunState = {
   failedNodeId?: string;
   rootCauseEventId?: string;
   cancelOriginEventId?: string;
+  /**
+   * Immutable bot identity snapshot captured at runCreated time
+   * (UI doc §3.4).  Read by the runtime when spawning workers so that
+   * subsequent bot-registry rename / re-wire doesn't drift execution
+   * away from what was authored.  Absent on legacy runs created before
+   * v0.1.3 introduced the field.
+   */
+  botSnapshots?: Record<
+    string,
+    {
+      larkAppId?: string;
+      cliId?: string;
+      displayName?: string;
+      workingDir?: string;
+    }
+  >;
 };
 
 export type Snapshot = {
@@ -359,6 +375,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
           run.revisionId = p.revisionId;
           run.initiator = p.initiator;
           run.input = p.inputRef;
+          if (p.botSnapshots) run.botSnapshots = p.botSnapshots;
         }
         break;
       }

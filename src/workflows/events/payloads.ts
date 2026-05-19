@@ -85,11 +85,28 @@ export const BackoffPolicySchema = z.object({
 
 // ─── Group 1 — Lifecycle (14) ───────────────────────────────────────────────
 
+/**
+ * Immutable identity snapshot of a workflow bot at run-creation time.
+ * Frozen here so subsequent rename / re-wire in bots.json doesn't drift
+ * the historical run view (UI doc §3.4).  All fields optional so a bot
+ * with partial registry data still serializes cleanly.
+ */
+export const BotSnapshotSchema = z.object({
+  larkAppId: z.string().optional(),
+  cliId: z.string().optional(),
+  displayName: z.string().optional(),
+  workingDir: z.string().optional(),
+});
+export type BotSnapshot = z.infer<typeof BotSnapshotSchema>;
+
 export const RunCreatedPayload = z.object({
   workflowId: z.string(),
   revisionId: z.string(),
   inputRef: OutputRefSchema,
   initiator: z.string(),
+  // Non-breaking extension (UI doc §11): bot name → identity snapshot
+  // for every subagent bot referenced in the workflow definition.
+  botSnapshots: z.record(BotSnapshotSchema).optional(),
 });
 
 export const RunStartedPayload = z.object({}).strict();

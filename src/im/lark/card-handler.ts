@@ -9,6 +9,7 @@ import { getBot, getAllBots } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
 import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, getCliDisplayName, truncateContent } from './card-builder.js';
+import { handleWorkflowApprovalAction, isWorkflowApprovalAction } from './workflow-card-handler.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
@@ -127,7 +128,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -163,6 +164,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
       }
     }
+  }
+
+  if (isWorkflowApprovalAction(value?.action)) {
+    return handleWorkflowApprovalAction(data);
   }
 
   // Handle session card button actions (restart/close)
