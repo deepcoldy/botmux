@@ -357,10 +357,20 @@ describe('Card integration: full event flow', () => {
     });
   });
 
-  // ── Scenario 3: multi-turn card lifecycle (nonce-based isolation) ──────
+  // ── Scenario 3: multi-turn card lifecycle (stale-nonce self-heal) ─────
+  //
+  // Before this PR, a click on a stale-nonce card was *ignored* (no state
+  // change, no PATCH). That left users stranded on legacy cards — clicking
+  // them produced no feedback, and the stale `cli_id` / image_key on the
+  // card couldn't be corrected once a session rebooted under a different
+  // CLI. The PR replaces that with a self-heal: a stale-nonce click migrates
+  // the live session's displayMode to the next value, informs the worker
+  // over IPC, and (when the event carries the clicked message id) PATCHes
+  // the *clicked* card so its `cli_id` / chrome are re-bound to the current
+  // session. The two tests below pin both halves of that contract.
 
   describe('Scenario 3: multi-turn card lifecycle', () => {
-    it('toggle on old card (stale nonce) should be ignored, toggle on current card works', async () => {
+    it('stale-nonce toggle self-heals live state + worker IPC; current-nonce click still toggles back via scheduleCardPatch', async () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_new_card',
         streamCardNonce: NONCE_CURRENT,
@@ -369,26 +379,33 @@ describe('Card integration: full event flow', () => {
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
+      const workerSend = (ds.worker as any).send as Mock;
 
-      // User clicks toggle on OLD (frozen) card — carries stale nonce
+      // Click on OLD (frozen) card carrying stale nonce — and NO clicked
+      // message id (e.g. some legacy webhook payloads omit context). State
+      // self-heals, worker is notified, but no card can be PATCHed because
+      // the handler doesn't know which message to target.
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_OLD), deps, APP_ID);
       await flush();
 
-      // Should NOT have toggled or sent any PATCH
-      expect(ds.displayMode).toBe('hidden');
+      expect(ds.displayMode).toBe('screenshot');
+      expect(workerSend).toHaveBeenCalledWith({ type: 'set_display_mode', mode: 'screenshot' });
       expect(fakeLark.patches).toHaveLength(0);
 
-      // User clicks toggle on current card — carries current nonce
+      // Click on current card flips displayMode back and PATCHes the
+      // live streaming card via the normal scheduleCardPatch path.
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
-      expect(ds.displayMode).toBe('screenshot');
+      expect(ds.displayMode).toBe('hidden');
       expect(fakeLark.patches).toHaveLength(1);
+      expect(fakeLark.patches[0].args[1]).toBe('om_new_card');
     });
 
-    it('new turn: old nonce is stale, new nonce distinguishes cards', async () => {
+    it('stale-nonce toggle with clicked message id migrates the legacy card via updateMessage', async () => {
       const NONCE_TURN1 = 'nonce_turn1';
       const NONCE_TURN2 = 'nonce_turn2';
+      const LEGACY_MSG_ID = 'om_card_turn1';
 
       const ds = makeDaemonSession({
         streamCardId: 'om_card_turn2',
@@ -399,17 +416,28 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      // Toggle with turn1 nonce → ignored
-      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_TURN1), deps, APP_ID);
+      // Click on the older turn's card (turn1 nonce + its message id).
+      // Self-heal should PATCH that *clicked* card, not the live one, so the
+      // visible chrome on the legacy card gets re-bound to the current
+      // session and CLI.
+      await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_TURN1, 'ou_user', LEGACY_MSG_ID),
+        deps,
+        APP_ID,
+      );
       await flush();
-      expect(ds.displayMode).toBe('hidden');
-      expect(fakeLark.patches).toHaveLength(0);
 
-      // Toggle with turn2 nonce → works
-      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_TURN2), deps, APP_ID);
-      await flush();
       expect(ds.displayMode).toBe('screenshot');
       expect(fakeLark.patches).toHaveLength(1);
+      expect(fakeLark.patches[0].args[1]).toBe(LEGACY_MSG_ID);
+
+      // Current-nonce click still works after a stale-nonce migration.
+      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_TURN2), deps, APP_ID);
+      await flush();
+
+      expect(ds.displayMode).toBe('hidden');
+      expect(fakeLark.patches).toHaveLength(2);
+      expect(fakeLark.patches[1].args[1]).toBe('om_card_turn2');
     });
   });
 
