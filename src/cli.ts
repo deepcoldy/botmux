@@ -396,8 +396,6 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  const name = (await ask(rl, 'botmux status 显示名称（可选，如 codex-main；实际显示 botmux-codex-main）: ')).trim();
-
   console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   let cliId: CliId;
@@ -422,7 +420,6 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     // 在哪儿, 不用去 README 查字段名.
     workingDir: workingDir.trim() || '~',
   };
-  if (name) bot.name = name;
   // 不再问 allowedUsers — 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id);
   // 想改成多人共用 / 不限制, 用户后续手动编辑 ~/.botmux/bots.json 的 allowedUsers
   // 字段即可. 手动 fallback 场景没 open_id, 字段直接不写 (== 不限制).
