@@ -8,7 +8,6 @@ import {
   parseApiMessage,
   extractResources,
   createImgNumberer,
-  normalizeApiMessageContent,
   type MessageResource,
 } from '../im/lark/message-parser.js';
 
@@ -49,9 +48,7 @@ export async function renderQuotedMessage(
   // the other order leaves resources unnumbered when extractTextContent runs
   // first (it only consults the cache, doesn't create entries for resources
   // that haven't been declared yet via extractResources).
-  const msgType = rawMessage.msg_type ?? '';
-  const content = normalizeApiMessageContent(msgType, rawMessage.body?.content ?? '');
-  const resources = extractResources(msgType, content, numberer);
+  const resources = extractResources(rawMessage.msg_type ?? '', rawMessage.body?.content ?? '', numberer);
   const parsed = parseApiMessage(rawMessage, numberer);
   if (parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer);

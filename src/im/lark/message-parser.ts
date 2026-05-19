@@ -155,13 +155,13 @@ export function createImgNumberer(): ImgNumberer {
 }
 
 export function extractResources(msgType: string, rawContent: string, numberer?: ImgNumberer): MessageResource[] {
-  rawContent = normalizeApiMessageContent(msgType, rawContent);
+  const content = normalizeApiMessageContent(msgType, rawContent);
   const nb = numberer ?? createImgNumberer();
   const pushIfNew = (resources: MessageResource[], r: MessageResource) => {
     if (nb.assign(`${r.type}:${r.key}`).isNew) resources.push(r);
   };
   try {
-    const parsed = JSON.parse(rawContent);
+    const parsed = JSON.parse(content);
 
     if (msgType === 'image') {
       const resources: MessageResource[] = [];
@@ -283,7 +283,7 @@ export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
   };
 }
 
-export function normalizeApiMessageContent(msgType: string, rawContent: string): string {
+function normalizeApiMessageContent(msgType: string, rawContent: string): string {
   if (msgType !== 'interactive') return rawContent;
   return unwrapUserDslContent(rawContent) ?? rawContent;
 }
