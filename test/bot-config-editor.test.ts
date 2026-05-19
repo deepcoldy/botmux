@@ -7,6 +7,7 @@ import {
   parseBotConfigsJson,
   parseBotSelection,
   removeBotConfig,
+  resolveCliId,
 } from '../src/setup/bot-config-editor.js';
 
 describe('parseBotSelection', () => {
@@ -132,6 +133,47 @@ describe('applyBotConfigEdits', () => {
       name: 'Codex-Main',
       workingDir: '~/new',
     });
+  });
+
+  it('accepts cliChoice as a literal cliId', () => {
+    const updated = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+    }, { cliChoice: 'codex' });
+
+    expect(updated.cliId).toBe('codex');
+  });
+
+  it('rejects unknown cliChoice instead of silently storing typos', () => {
+    expect(() => applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+    }, { cliChoice: 'claud-code' })).toThrow(/Unknown CLI 适配器 "claud-code"/);
+  });
+});
+
+describe('resolveCliId', () => {
+  it('returns undefined for empty input so callers can preserve current cliId', () => {
+    expect(resolveCliId('')).toBeUndefined();
+    expect(resolveCliId('   ')).toBeUndefined();
+    expect(resolveCliId(undefined)).toBeUndefined();
+  });
+
+  it('maps setup menu indices to cliIds', () => {
+    expect(resolveCliId('1')).toBe('claude-code');
+    expect(resolveCliId('4')).toBe('codex');
+  });
+
+  it('passes through literal cliIds unchanged', () => {
+    expect(resolveCliId('codex')).toBe('codex');
+    expect(resolveCliId('opencode')).toBe('opencode');
+  });
+
+  it('throws on typos so they do not leak into bots.json', () => {
+    expect(() => resolveCliId('claud-code')).toThrow(/Unknown CLI 适配器 "claud-code"/);
+    expect(() => resolveCliId('7')).toThrow(/Unknown CLI 适配器 "7"/);
   });
 });
 

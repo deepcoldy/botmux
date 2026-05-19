@@ -31,13 +31,14 @@ import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
   botProcessName,
-  CLI_ID_CHOICES,
   normalizeBotConfig,
   parseBotConfigsJson,
   parseBotSelection,
   removeBotConfig,
+  resolveCliId,
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
+import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
@@ -395,15 +396,18 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  printInputHelp('botmux status 显示名称', [
-    '可选。用于本机 PM2 进程名，方便在 botmux status / logs 中识别机器人。',
-    '最终显示为 botmux-<名称>；留空时默认使用 botmux-<序号>。',
-  ]);
   const name = (await ask(rl, 'botmux status 显示名称（可选，如 codex-main；实际显示 botmux-codex-main）: ')).trim();
 
   console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
-  const cliId = CLI_ID_CHOICES[cliChoice] ?? (cliChoice || 'claude-code');
+  let cliId: CliId;
+  try {
+    cliId = resolveCliId(cliChoice) ?? 'claude-code';
+  } catch (err: any) {
+    console.log(`\n❌ ${err?.message ?? String(err)}`);
+    console.log('   不写 bots.json。请重新运行 botmux setup。');
+    return null;
+  }
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
 
   // 不再持久化 brand 字段: setup 阶段 brand=lark 直接被 obtainCredentials 中止,

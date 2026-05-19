@@ -10,6 +10,26 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '7': 'opencode',
 };
 
+const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
+
+/**
+ * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
+ *   - 空 → undefined (调用方决定 "preserve current" 还是套默认 'claude-code')
+ *   - "1".."6" → CLI_ID_CHOICES 映射
+ *   - 已是合法 cliId 字面值 → 原样返回
+ *   - 其它 → throw (typo 不该静默落盘成 cliId)
+ */
+export function resolveCliId(input: string | undefined): CliId | undefined {
+  const raw = trimmed(input);
+  if (!raw) return undefined;
+  const mapped = CLI_ID_CHOICES[raw];
+  if (mapped) return mapped;
+  if (VALID_CLI_IDS.has(raw)) return raw as CliId;
+  throw new Error(
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-6 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+  );
+}
+
 export interface BotConfigEditInput {
   name?: string;
   larkAppId?: string;
@@ -175,10 +195,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   const appSecret = trimmed(input.larkAppSecret);
   if (appSecret) out.larkAppSecret = appSecret;
 
-  const cliChoice = trimmed(input.cliChoice);
-  if (cliChoice) {
-    out.cliId = CLI_ID_CHOICES[cliChoice] ?? cliChoice;
-  }
+  const cliId = resolveCliId(input.cliChoice);
+  if (cliId) out.cliId = cliId;
 
   applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
 
