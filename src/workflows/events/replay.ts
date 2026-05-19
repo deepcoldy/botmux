@@ -80,6 +80,11 @@ export type AttemptState = {
     idempotencyTtlMs: number;
     provider: string;
     attemptedAtEventId: string;
+    /** Wall-clock timestamp the effectAttempted envelope landed (ms epoch).
+     *  Resume uses this to evaluate the TTL boundary against `now()` —
+     *  cheaper and more deterministic than re-deriving the time from
+     *  `eventId` parsing. */
+    attemptedAtMs: number;
   };
   // terminal
   output?: OutputRef;
@@ -409,6 +414,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
               idempotencyTtlMs: p.idempotencyTtlMs,
               provider: p.provider,
               attemptedAtEventId: e.eventId,
+              attemptedAtMs: e.timestamp,
             };
             at.status = 'effectAttempting';
             a.status = 'effectAttempting';

@@ -374,8 +374,14 @@ describe('event schema — reconcileResult decision matrix', () => {
 
   it.each([
     ['replayed', 'none'],
+    // completedByIdempotentSubmit covers both ROL-found (schedule) and
+    // IS re-submit (Feishu); both are legal per events doc v0.1.2 §4.3.1.
     ['completedByIdempotentSubmit', 'idempotentSubmit'],
+    ['completedByIdempotentSubmit', 'readOnlyLookup'],
+    // manual is the catch-all; capability records what was tried.
     ['manual', 'none'],
+    ['manual', 'idempotentSubmit'],
+    ['manual', 'readOnlyLookup'],
     ['freshRetry', 'readOnlyLookup'],
   ] as const)('accepts decision=%s capability=%s (legal combo)', (decision, capability) => {
     const e = {
@@ -392,15 +398,20 @@ describe('event schema — reconcileResult decision matrix', () => {
   });
 
   it.each([
-    // Each row is an illegal capability×decision pairing (codex round 4).
+    // Each row is an illegal capability×decision pairing per the relaxed
+    // invariant (events doc v0.1.2 §4.3.1).
+    //   - `replayed` is "log already had terminal" — by definition no
+    //     provider call ran, so capability MUST be none.
+    //   - `completedByIdempotentSubmit` requires *some* provider work;
+    //     capability=none would mean "completed without doing anything",
+    //     which is incoherent.
+    //   - `freshRetry` means ROL confirmed not-yet; cannot come from
+    //     none or idempotentSubmit (IS lands or fails, no "definitely-not-yet").
     ['replayed', 'idempotentSubmit'],
     ['replayed', 'readOnlyLookup'],
     ['completedByIdempotentSubmit', 'none'],
-    ['completedByIdempotentSubmit', 'readOnlyLookup'],
     ['freshRetry', 'none'],
     ['freshRetry', 'idempotentSubmit'],
-    ['manual', 'idempotentSubmit'],
-    ['manual', 'readOnlyLookup'],
   ] as const)('rejects decision=%s capability=%s (illegal combo)', (decision, capability) => {
     const e = {
       ...base,

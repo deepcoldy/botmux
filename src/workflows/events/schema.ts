@@ -213,27 +213,33 @@ export function checkPayloadHashInvariant(event: WorkflowEvent): string | null {
 }
 
 /**
- * `reconcileResult.capability` × `decision` legal combinations (codex
- * round 4 + events doc §4.3.1):
+ * `reconcileResult.capability` × `decision` legal combinations (events
+ * doc v0.1.2 §4.3.1 — table updated per spec freeze; the codex round 4
+ * variant of this invariant pinned `completedByIdempotentSubmit` to
+ * `idempotentSubmit` only, but the spec explicitly allows the
+ * `readOnlyLookup → found → completedByIdempotentSubmit` path for
+ * schedule, so we widen accordingly):
  *
- *   | decision                       | required capability    |
- *   |--------------------------------|------------------------|
- *   | replayed                       | none (no provider work)|
- *   | completedByIdempotentSubmit    | idempotentSubmit       |
- *   | freshRetry                     | readOnlyLookup         |
- *   | manual                         | none                   |
+ *   | decision                       | allowed capability        |
+ *   |--------------------------------|---------------------------|
+ *   | replayed                       | none                      |
+ *   | completedByIdempotentSubmit    | readOnlyLookup OR         |
+ *   |                                |   idempotentSubmit        |
+ *   | freshRetry                     | readOnlyLookup            |
+ *   | manual                         | any                       |
  *
  * Rationale:
  *   - `replayed` means the event log already had a terminal — resume
  *     scans the log, no provider call, capability is `none`.
- *   - `completedByIdempotentSubmit` is the outcome of calling provider
- *     with idempotent submit; capability MUST be `idempotentSubmit`.
- *   - `freshRetry` means provider was checked via `readOnlyLookup` and
- *     confirmed not to have the effect; capability MUST be
- *     `readOnlyLookup`.
- *   - `manual` means all available capabilities failed or none were
- *     applicable; capability records what was tried — `none` is the
- *     canonical zero value for "we didn't try anything that succeeded".
+ *   - `completedByIdempotentSubmit` covers BOTH "ROL found the effect"
+ *     (schedule case) and "IS re-submit returned the original ref"
+ *     (Feishu case).  The `capability` field disambiguates which path
+ *     was taken; the decision name reflects the outcome.
+ *   - `freshRetry` requires `readOnlyLookup`: the only way to confirm
+ *     "provider definitely doesn't have it, safe to retry" is a
+ *     side-effect-free read.  IS by itself cannot produce freshRetry —
+ *     a re-submit either lands or fails, no "definitely-not-yet" state.
+ *   - `manual` is the catch-all; capability records what was tried.
  *
  * Returns `null` if legal, otherwise a reason string.
  */
@@ -244,14 +250,14 @@ export function checkReconcileResultInvariant(event: WorkflowEvent): string | nu
     capability: 'readOnlyLookup' | 'idempotentSubmit' | 'none';
     decision: 'replayed' | 'completedByIdempotentSubmit' | 'manual' | 'freshRetry';
   };
-  const expected: Record<typeof decision, typeof capability> = {
-    replayed: 'none',
-    completedByIdempotentSubmit: 'idempotentSubmit',
-    freshRetry: 'readOnlyLookup',
-    manual: 'none',
+  const allowed: Record<typeof decision, ReadonlyArray<typeof capability>> = {
+    replayed: ['none'],
+    completedByIdempotentSubmit: ['readOnlyLookup', 'idempotentSubmit'],
+    freshRetry: ['readOnlyLookup'],
+    manual: ['none', 'readOnlyLookup', 'idempotentSubmit'],
   };
-  if (expected[decision] !== capability) {
-    return `reconcileResult: decision='${decision}' requires capability='${expected[decision]}', got '${capability}'`;
+  if (!allowed[decision].includes(capability)) {
+    return `reconcileResult: decision='${decision}' requires capability ∈ {${allowed[decision].join(', ')}}, got '${capability}'`;
   }
   return null;
 }

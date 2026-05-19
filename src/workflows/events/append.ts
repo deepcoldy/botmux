@@ -61,7 +61,7 @@ function getRunMutex(runId: string): Mutex {
  * The discriminated union over WorkflowEvent distributes through Omit, so
  * each event type's payload shape is preserved at the call site.
  */
-export type EventDraft = Omit<WorkflowEvent, 'eventId' | 'schemaVersion'> & {
+export type EventDraft = Omit<WorkflowEvent, 'eventId' | 'schemaVersion' | 'timestamp'> & {
   timestamp?: number;
 };
 
