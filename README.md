@@ -450,7 +450,7 @@ botmux setup
 | `larkAppSecret` | 是 | 飞书应用 App Secret |
 | `name` | 否 | `botmux status` 中的进程名后缀；例如 `claude-main` 会显示为 `botmux-claude-main`，留空默认 `botmux-<序号>` |
 | `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`cursor`、`gemini`、`opencode`） |
-| `cliPathOverride` | 否 | CLI 可执行文件路径覆盖 |
+| `cliPathOverride` | 否 | CLI 入口的绝对路径，用于套 wrapper / router；典型场景：ccr、claude-w、aiden-x-claude 等自定义入口 |
 | `backendType` | 否 | 会话后端：`pty` 或 `tmux`（默认自动检测） |
 | `workingDir` | 否 | 默认工作目录，支持逗号分隔多个目录 |
 | `allowedUsers` | 否 | 允许的用户列表（邮箱前缀或 open_id） |

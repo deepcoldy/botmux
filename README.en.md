@@ -379,7 +379,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `larkAppSecret` | Yes | Lark app secret |
 | `name` | No | Process name suffix shown by `botmux status`; e.g. `claude-main` appears as `botmux-claude-main`, defaults to `botmux-<index>` |
 | `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `cursor`, `gemini`, `opencode`) |
-| `cliPathOverride` | No | CLI binary path override |
+| `cliPathOverride` | No | Absolute path to the CLI entry, for wrappers / routers; typical use: `ccr`, `claude-w`, `aiden-x-claude`, etc. |
 | `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
 | `workingDir` | No | Default working directory, supports comma-separated |
 | `allowedUsers` | No | Allowed users (email prefixes or open_ids) |

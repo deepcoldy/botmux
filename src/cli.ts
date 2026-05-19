@@ -491,8 +491,9 @@ async function promptEditBotConfig(
   input.cliChoice = await ask(rl, `CLI 适配器 [${bot.cliId ?? 'claude-code'}]: `);
 
   printInputHelp('CLI 可执行文件路径覆盖', [
-    '可选。CLI 不在 PATH 或重装后路径变化时填写绝对路径。',
-    '留空保留当前值；输入 - 清空覆盖并回到 PATH 查找。',
+    '可选。CLI 入口的绝对路径，用于在原 CLI 外面套一层 wrapper / router。',
+    '典型场景：ccr (Claude Code Router) / claude-w / aiden-x-claude 等自定义入口。',
+    '留空保留当前值；输入 - 清空覆盖，回到 PATH 查 cliId 对应的默认二进制。',
   ]);
   input.cliPathOverride = await ask(rl, `CLI 可执行文件路径覆盖 [${formatOptionalValue(bot.cliPathOverride)}]: `);
 
