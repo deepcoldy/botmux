@@ -119,6 +119,27 @@ describe('Interactive card parsing: Format A (API simplified)', () => {
 // ─── Interactive card: Format B (original card JSON) ──────────────────────
 
 describe('Interactive card parsing: Format B (original card JSON)', () => {
+  it('unwraps user_dsl before parsing API interactive messages', () => {
+    const card = {
+      user_dsl: JSON.stringify({
+        header: { title: { tag: 'plain_text', content: '引用卡片' } },
+        body: {
+          elements: [
+            { tag: 'markdown', content: '卡片正文' },
+            { tag: 'img', img_key: 'img_card' },
+          ],
+        },
+      }),
+    };
+    const numberer = createImgNumberer();
+    const resources = extractResources('interactive', JSON.stringify(card), numberer);
+    const result = parseApiMessage(makeMsg('interactive', card), numberer);
+    expect(result.content).toContain('[卡片: 引用卡片]');
+    expect(result.content).toContain('卡片正文');
+    expect(result.content).toContain('[图片 1]');
+    expect(resources).toEqual([{ type: 'image', key: 'img_card', name: 'img_card.jpg' }]);
+  });
+
   it('should extract header title and div text', () => {
     const card = {
       config: { wide_screen_mode: true },
