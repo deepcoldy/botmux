@@ -1,7 +1,7 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ dataDir: '' }));
 
@@ -22,9 +22,6 @@ vi.mock('../src/utils/user-token.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
-  getBotClient: vi.fn(),
-  getBot: vi.fn(),
-  getAllBots: vi.fn(() => []),
   loadBotConfigs: vi.fn(() => [
     { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
     { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
@@ -51,6 +48,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 describe('listChatBotMembers', () => {
+  afterEach(() => {
+    if (state.dataDir) {
+      rmSync(state.dataDir, { recursive: true, force: true });
+      state.dataDir = '';
+    }
+  });
+
   it('returns larkAppId so callers can identify self when cliId is duplicated', async () => {
     state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
     writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
