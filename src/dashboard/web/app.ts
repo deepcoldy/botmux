@@ -5,6 +5,7 @@ import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
 import { renderWorkflowsPage } from './workflows.js';
+import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { getLang, onLangChange, setLang, t, translateDom, type Lang } from './i18n.js';
 
 const root = document.getElementById('root')!;
@@ -17,7 +18,8 @@ let pageDispose: (() => void) | null = null;
 function route() {
   if (pageDispose) { pageDispose(); pageDispose = null; }
   const hash = location.hash || '#/';
-  if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  if (hash.startsWith('#/workflows-catalog')) pageDispose = renderWorkflowCatalogPage(root);
+  else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);

@@ -149,6 +149,20 @@ input.row-select { cursor: pointer; }
 .wf-error-msg { display: block; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 td code, .wf-summary-item code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 
+/* Workflow catalog */
+.catalog-head, .catalog-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.8rem; margin-bottom: 0.8rem; }
+.catalog-head h2, .catalog-detail-head h2 { margin: 0 0 0.15rem; font-size: 18px; line-height: 1.25; }
+.catalog-run-form { display: grid; gap: 0.65rem; max-width: 900px; }
+.catalog-run-form label span, .catalog-param header { display: block; margin-bottom: 0.25rem; color: var(--muted); font-size: 12px; }
+.catalog-run-form textarea, .catalog-run-form input[type=text] { width: 100%; padding: 0.4rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--fg); background: white; }
+.catalog-run-form textarea { resize: vertical; min-height: 150px; }
+.catalog-chat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
+.catalog-param-errors { background: #fff8c5; border-left: 3px solid #bf8700; padding: 0.45rem 0.65rem; border-radius: 3px; }
+.catalog-param-errors ul { margin: 0.35rem 0 0; padding-left: 1.2rem; }
+.catalog-param-list { display: grid; gap: 0.55rem; }
+.catalog-param { border: 1px solid var(--border); border-radius: 4px; padding: 0.55rem; background: #f6f8fa; }
+.catalog-param header { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; margin-bottom: 0.35rem; }
+
 @media (max-width: 720px) {
   .topbar { align-items: flex-start; flex-direction: column; gap: 0.45rem; }
   .topbar nav { display: flex; gap: 0.35rem; flex-wrap: wrap; }
@@ -168,6 +182,8 @@ td code, .wf-summary-item code { font-family: ui-monospace, SFMono-Regular, Menl
   .wf-io-grid { grid-template-columns: 1fr; }
   .wf-approval-actions button { flex: 1 1 120px; }
   .wf-timeline-scroll { max-height: 420px; }
+  .catalog-head, .catalog-detail-head { flex-direction: column; }
+  .catalog-chat-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 460px) {
