@@ -310,8 +310,8 @@ Gemini / OpenCode), with no MCP protocol support required.
 | `/adopt` | Adopt a running CLI session (tmux) |
 | `/schedule` | Manage scheduled tasks |
 | `/login` / `/login status` | Lark user OAuth (e.g. to download images from third-party cards) / show OAuth status |
-| `/grant @someone` | (owner) Pop an authorization card to add the user to the "this chat" or "global" allowlist; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
-| `/revoke @someone` | (owner) Revoke the user's this-chat + global access |
+| `@bot /grant @someone` | (owner) Pop an authorization card to add the user to the "this chat" or "global" allowlist; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
+| `@bot /revoke @someone` | (owner) Revoke the user's this-chat + global access |
 | `/help` | Show available commands |
 | `/compact` `/model` `/clear` `/plugin` `/usage` | Forwarded verbatim to the underlying CLI (e.g. Claude Code's built-in slash commands) |
 

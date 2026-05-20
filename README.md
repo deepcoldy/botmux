@@ -304,8 +304,8 @@ botmux autostart enable
 | `/adopt` | 接入已运行的 CLI 会话（tmux） |
 | `/schedule` | 管理定时任务 |
 | `/login` / `/login status` | 飞书用户授权（用于下载第三方卡片图片等）/ 查看授权状态 |
-| `/grant @某人` | （owner）弹授权卡片，把对方加进「本群使用」或「全局」白名单；无权限者 @ 机器人时也会自动弹这张卡并 @owner |
-| `/revoke @某人` | （owner）撤销对方的本群 + 全局授权 |
+| `@机器人 /grant @某人` | （owner）弹授权卡片，把对方加进「本群使用」或「全局」白名单；无权限者 @ 机器人时也会自动弹这张卡并 @owner |
+| `@机器人 /revoke @某人` | （owner）撤销对方的本群 + 全局授权 |
 | `/help` | 显示可用命令 |
 | `/compact` `/model` `/clear` `/plugin` `/usage` | 字面透传给底层 CLI（例如 Claude Code 的内置 slash 命令） |
 
