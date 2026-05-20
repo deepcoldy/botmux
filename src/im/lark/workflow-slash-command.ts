@@ -11,7 +11,11 @@ import {
   createDefaultProviderReconcilers,
 } from '../../workflows/hostExecutors/registry.js';
 import { loadEffectInputSidecar } from '../../workflows/effect-input.js';
-import type { WorkflowDefinition, ParamDef } from '../../workflows/definition.js';
+import type { WorkflowDefinition } from '../../workflows/definition.js';
+import { coerceWorkflowParamsFromStrings as coerceWorkflowParams } from '../../workflows/params.js';
+// Re-export from the shared params module so existing IM tests + callers keep
+// the same import path. New code should pull from `src/workflows/params.ts`.
+export { coerceWorkflowParams };
 import type { BotSnapshot } from '../../workflows/events/payloads.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from '../../workflows/runtime.js';
 
@@ -133,32 +137,6 @@ export function parseWorkflowCommand(content: string): WorkflowCommand | null {
   return { kind: 'run', workflowId, rawParams };
 }
 
-export function coerceWorkflowParams(
-  def: WorkflowDefinition,
-  rawParams: Record<string, string>,
-): Record<string, unknown> {
-  const paramDefs = def.params ?? {};
-  for (const key of Object.keys(rawParams)) {
-    if (!Object.prototype.hasOwnProperty.call(paramDefs, key)) {
-      throw new Error(`未知参数：${key}`);
-    }
-  }
-
-  const out: Record<string, unknown> = {};
-  for (const [name, param] of Object.entries(paramDefs)) {
-    const hasRaw = Object.prototype.hasOwnProperty.call(rawParams, name);
-    if (!hasRaw) {
-      if (param.default !== undefined) {
-        out[name] = param.default;
-        continue;
-      }
-      if (param.required) throw new Error(`缺少必填参数：${name}`);
-      continue;
-    }
-    out[name] = coerceParam(name, param, rawParams[name]!);
-  }
-  return out;
-}
 
 export async function executeWorkflowCommand(
   input: ExecuteWorkflowCommandInput,
@@ -277,30 +255,6 @@ function invalid(error: string): WorkflowCommand {
 function formatCancelError(error: string): string {
   if (error === 'wrong_chat') return 'this run belongs to a different chat';
   return error;
-}
-
-function coerceParam(name: string, param: ParamDef, raw: string): unknown {
-  switch (param.type) {
-    case 'string':
-      return raw;
-    case 'number': {
-      const n = Number(raw);
-      if (!Number.isFinite(n)) throw new Error(`参数 ${name} 必须是 number`);
-      return n;
-    }
-    case 'boolean':
-      return coerceBoolean(name, raw);
-    case 'object':
-    case 'array':
-      throw new Error(`参数 ${name} 的 ${param.type} 类型暂不支持 IM key=value 输入`);
-  }
-}
-
-function coerceBoolean(name: string, raw: string): boolean {
-  const normalized = raw.trim().toLowerCase();
-  if (['true', '1', 'yes', 'y'].includes(normalized)) return true;
-  if (['false', '0', 'no', 'n'].includes(normalized)) return false;
-  throw new Error(`参数 ${name} 必须是 boolean`);
 }
 
 function botMatches(value: string | undefined, botName: string): boolean {

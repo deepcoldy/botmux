@@ -89,7 +89,77 @@ describe('botmux workflow CLI', () => {
   it('run <id> with missing required param exits non-zero', () => {
     const out = runCli(['workflow', 'run', 'cli-hello']);
     expect(out.status).not.toBe(0);
-    expect(out.stdout).toMatch(/缺少必填 param/);
+    expect(out.stdout).toMatch(/缺少必填参数：name/);
+  });
+
+  it('run <id> rejects unknown param keys (typo guard)', () => {
+    const out = runCli([
+      'workflow', 'run', 'cli-hello',
+      '--param', 'name=Tester',
+      '--param', 'misspelled=oops',
+    ]);
+    expect(out.status).not.toBe(0);
+    expect(out.stdout).toMatch(/未知参数：misspelled/);
+  });
+
+  it('run <id> rejects non-numeric value for type=number param', () => {
+    // Augment workflow with a number-typed param so we exercise the strict
+    // coerce path through the shared module.  The IM path already had this
+    // strictness; v0.1.3 brings CLI to parity.
+    writeFileSync(
+      join(tempDir, 'workflows', 'cli-numeric.workflow.json'),
+      JSON.stringify({
+        workflowId: 'cli-numeric',
+        version: 1,
+        params: {
+          retries: { type: 'number', required: true },
+        },
+        nodes: { n: { type: 'subagent', bot: 'b', prompt: 'p' } },
+      }),
+      'utf-8',
+    );
+    const out = runCli([
+      'workflow', 'run', 'cli-numeric',
+      '--param', 'retries=not-a-number',
+    ]);
+    expect(out.status).not.toBe(0);
+    expect(out.stdout).toMatch(/参数 retries 必须是 number/);
+  });
+
+  it('run <id> --param-json key=<json> threads object/array values', () => {
+    writeFileSync(
+      join(tempDir, 'workflows', 'cli-json.workflow.json'),
+      JSON.stringify({
+        workflowId: 'cli-json',
+        version: 1,
+        params: {
+          tags: { type: 'array', required: true },
+        },
+        nodes: { n: { type: 'subagent', bot: 'b', prompt: 'p' } },
+      }),
+      'utf-8',
+    );
+    const out = runCli([
+      'workflow', 'run', 'cli-json',
+      '--param-json', 'tags=["x","y","z"]',
+    ]);
+    expect(out.status).toBe(0);
+    const runId = out.stdout.match(/runId=(\S+)/)?.[1];
+    expect(runId).toBeDefined();
+    // run-init wrote the params blob with our resolved values; replay reads
+    // it back as part of `runCreated.inputRef`.
+    const showOut = runCli(['workflow', 'show', runId!]);
+    expect(showOut.stdout).toContain('cli-json');
+  });
+
+  it('run <id> --param-json rejects malformed JSON', () => {
+    const out = runCli([
+      'workflow', 'run', 'cli-hello',
+      '--param', 'name=t',
+      '--param-json', 'extra={not valid json',
+    ]);
+    expect(out.status).not.toBe(0);
+    expect(out.stdout).toMatch(/--param-json/);
   });
 
   it('run <unknown-id> exits non-zero with search-path hint', () => {

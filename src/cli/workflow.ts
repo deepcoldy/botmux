@@ -18,6 +18,11 @@ import { EventLog } from '../workflows/events/append.js';
 import { replay } from '../workflows/events/replay.js';
 import { parseWorkflowDefinition } from '../workflows/definition.js';
 import { loadWorkflowDefinition } from '../workflows/loader.js';
+import {
+  coerceWorkflowParams,
+  ParamCoerceFailure,
+  type RawParamInput,
+} from '../workflows/params.js';
 import { runLoop } from '../workflows/loop.js';
 import { mintWorkflowRunId } from '../workflows/run-id.js';
 import { createRun, type BotResolver } from '../workflows/run-init.js';
@@ -110,9 +115,12 @@ function printHelp(): void {
   console.log(`用法: botmux workflow <run|resume|cancel|ls|tail|validate|show> [...]
 
 子命令:
-  run <id> [--param key=value ...] [--run-id <id>] [--bot-resolver echo]
+  run <id> [--param key=value ...] [--param-json key=<json> ...] [--run-id <id>] [--bot-resolver echo]
       离线驱动 workflow（stub spawn）。事件 / 状态打到 stdout。
       humanGate 节点跑到 'awaiting-wait' 即退出（CLI 离线场景下没有审批入口）。
+      --param 适合标量（string/number/boolean）；--param-json 适合 object/array
+      或希望严格保留 JSON 类型的值，例如 --param-json users='["a","b"]'。
+      未声明的 param 名会被拒；type 不匹配 / 缺 required 会清晰报错。
 
   resume <runId>
       从磁盘 runDir 冷恢复一个已有 run。R0 recovery 先收 dangling effect，
@@ -151,11 +159,11 @@ function printHelp(): void {
 async function cmdWorkflowRun(rest: string[]): Promise<void> {
   const id = positionals(rest)[0];
   if (!id) {
-    console.error('用法: botmux workflow run <id> [--param key=value ...]');
+    console.error('用法: botmux workflow run <id> [--param key=value ...] [--param-json key=<json> ...]');
     process.exit(1);
   }
   const runId = argValue(rest, '--run-id') ?? mintWorkflowRunId(id);
-  const params = collectParams(rest);
+  const rawParams = collectRawParams(rest);
 
   const def = await loadWorkflowDefinition(id).catch((err: Error) => {
     console.error(err.message);
@@ -163,7 +171,20 @@ async function cmdWorkflowRun(rest: string[]): Promise<void> {
   });
   // unreachable after process.exit, but TS doesn't know
   if (!def) return;
-  validateParams(def, params);
+  let params: Record<string, unknown>;
+  try {
+    params = coerceWorkflowParams(def, rawParams);
+  } catch (err) {
+    if (err instanceof ParamCoerceFailure) {
+      console.error('参数校验失败：');
+      for (const issue of err.issues) {
+        console.error(`- ${issue.message}`);
+      }
+    } else {
+      console.error(`参数校验失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+    process.exit(1);
+  }
 
   // Bootstrap the in-memory bot registry so hostExecutors like
   // feishu-send can resolve `larkAppId` → Lark client.  IM path inherits
@@ -497,53 +518,58 @@ async function readExistingRunEvents(
   return events;
 }
 
-function collectParams(rest: string[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+/**
+ * Parse CLI args into raw param inputs.  Each `--param key=value` carries a
+ * plain string (type coercion happens in `coerceWorkflowParams` against the
+ * workflow's `params` schema); each `--param-json key=<json>` carries a
+ * parsed JSON value, which is the only way to thread `object` / `array`
+ * params (or numbers / booleans you'd rather not stringify) into a run.
+ *
+ * Both flags accept the `--flag value` and `--flag=value` forms.
+ */
+function collectRawParams(rest: string[]): Record<string, RawParamInput> {
+  const out: Record<string, RawParamInput> = {};
+  const ingestStringKV = (kv: string): void => {
+    const eq = kv.indexOf('=');
+    if (eq <= 0) {
+      console.error(`--param 期望 key=value，收到 "${kv}"`);
+      process.exit(1);
+    }
+    out[kv.slice(0, eq)] = { kind: 'string', value: kv.slice(eq + 1) };
+  };
+  const ingestJsonKV = (kv: string): void => {
+    const eq = kv.indexOf('=');
+    if (eq <= 0) {
+      console.error(`--param-json 期望 key=<json>，收到 "${kv}"`);
+      process.exit(1);
+    }
+    const key = kv.slice(0, eq);
+    const jsonText = kv.slice(eq + 1);
+    try {
+      out[key] = { kind: 'json', value: JSON.parse(jsonText) };
+    } catch (err) {
+      console.error(
+        `--param-json ${key} 的 JSON 解析失败：` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+      process.exit(1);
+    }
+  };
+
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--param' && i + 1 < rest.length) {
-      const kv = rest[i + 1]!;
-      const eq = kv.indexOf('=');
-      if (eq <= 0) {
-        console.error(`--param 期望 key=value，收到 "${kv}"`);
-        process.exit(1);
-      }
-      const key = kv.slice(0, eq);
-      const raw = kv.slice(eq + 1);
-      out[key] = coerce(raw);
+      ingestStringKV(rest[i + 1]!);
       i++;
     } else if (rest[i]?.startsWith('--param=')) {
-      const kv = rest[i]!.slice('--param='.length);
-      const eq = kv.indexOf('=');
-      if (eq <= 0) {
-        console.error(`--param 期望 key=value，收到 "${kv}"`);
-        process.exit(1);
-      }
-      out[kv.slice(0, eq)] = coerce(kv.slice(eq + 1));
+      ingestStringKV(rest[i]!.slice('--param='.length));
+    } else if (rest[i] === '--param-json' && i + 1 < rest.length) {
+      ingestJsonKV(rest[i + 1]!);
+      i++;
+    } else if (rest[i]?.startsWith('--param-json=')) {
+      ingestJsonKV(rest[i]!.slice('--param-json='.length));
     }
   }
   return out;
-}
-
-function coerce(raw: string): unknown {
-  if (raw === 'true') return true;
-  if (raw === 'false') return false;
-  if (raw === 'null') return null;
-  if (/^-?\d+$/.test(raw)) return Number(raw);
-  if (/^-?\d*\.\d+$/.test(raw)) return Number(raw);
-  return raw;
-}
-
-function validateParams(
-  def: Awaited<ReturnType<typeof loadWorkflowDefinition>>,
-  params: Record<string, unknown>,
-): void {
-  if (!def.params) return;
-  for (const [name, spec] of Object.entries(def.params)) {
-    if (spec.required && !(name in params)) {
-      console.error(`缺少必填 param: ${name} (type=${spec.type})`);
-      process.exit(1);
-    }
-  }
 }
 
 // ─── validate ─────────────────────────────────────────────────────────────
