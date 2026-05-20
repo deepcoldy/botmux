@@ -99,6 +99,18 @@ describe('dashboard workflow API routes', () => {
     expect(events.events.map((e) => e.type)).toContain('waitCreated');
   });
 
+  it('filters list by comma-separated statuses', async () => {
+    await seedWaitingRun('api-running-01', WAIT_DEF);
+    await seedSucceededRun('api-succeeded-01', DONE_DEF);
+
+    const res = await fetch(`${baseUrl}/api/workflows/runs?status=running,failed`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { runs: Array<{ runId: string; status: string }> };
+    expect(body.runs).toEqual([
+      expect.objectContaining({ runId: 'api-running-01', status: 'running' }),
+    ]);
+  });
+
   it('short-circuits cancel for terminal runs without proxying to daemon', async () => {
     await seedSucceededRun('api-done-01', DONE_DEF);
 
@@ -121,6 +133,28 @@ describe('dashboard workflow API routes', () => {
     });
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ ok: false, error: 'bad_run_id' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('returns unknown_run for missing runDir on cancel', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/runs/missing-run/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'stop' }),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ ok: false, error: 'unknown_run' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed cancel JSON before reading run state', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/runs/api-wait-01/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{bad json',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_json' });
     expect(proxyToDaemon).not.toHaveBeenCalled();
   });
 
