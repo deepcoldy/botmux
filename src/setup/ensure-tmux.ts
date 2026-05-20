@@ -34,6 +34,45 @@ export interface TmuxResult {
   reason?: string;
   /** When installed=false: the manual command we'd have run, for the warning. */
   manualCommand?: string;
+  /** Non-fatal compatibility warnings for installed tmux. */
+  warnings?: string[];
+}
+
+export const TMUX_PASTE_BUFFER_P_MIN_VERSION = { major: 3, minor: 2 } as const;
+
+export interface ParsedTmuxVersion {
+  major: number;
+  minor: number;
+}
+
+export function parseTmuxVersion(version: string): ParsedTmuxVersion | undefined {
+  const m = version.match(/(\d+)\.(\d+)/);
+  if (!m) return undefined;
+  return { major: Number(m[1]), minor: Number(m[2]) };
+}
+
+export function tmuxVersionSupportsPasteBufferP(version: string): boolean | undefined {
+  const parsed = parseTmuxVersion(version);
+  if (!parsed) return undefined;
+  if (parsed.major !== TMUX_PASTE_BUFFER_P_MIN_VERSION.major) {
+    return parsed.major > TMUX_PASTE_BUFFER_P_MIN_VERSION.major;
+  }
+  return parsed.minor >= TMUX_PASTE_BUFFER_P_MIN_VERSION.minor;
+}
+
+export function tmuxPasteBufferPCompatibilityWarning(version: string): string | undefined {
+  const supported = tmuxVersionSupportsPasteBufferP(version);
+  if (supported === true) return undefined;
+  if (supported === false) {
+    return `${version} 低于 tmux ${TMUX_PASTE_BUFFER_P_MIN_VERSION.major}.${TMUX_PASTE_BUFFER_P_MIN_VERSION.minor}：` +
+      'CoCo tmux 提交依赖 `paste-buffer -p` 产生 bracketed-paste 标记，低版本会 unknown flag，导致提交确认失败。请升级 tmux。';
+  }
+  return `无法解析 tmux 版本：${version}；请确认支持 \`paste-buffer -p\`（tmux >= ${TMUX_PASTE_BUFFER_P_MIN_VERSION.major}.${TMUX_PASTE_BUFFER_P_MIN_VERSION.minor}）。`;
+}
+
+function tmuxCompatibilityWarnings(version: string): string[] | undefined {
+  const warning = tmuxPasteBufferPCompatibilityWarning(version);
+  return warning ? [warning] : undefined;
 }
 
 function probeTmuxVersion(): string | undefined {
@@ -188,7 +227,12 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   // that pass -V but fail every actual tmux command.
   const initialProbe = probeTmuxFunctional();
   if (initialProbe.ok) {
-    return { installed: true, version: initialProbe.version, freshInstall: false };
+    return {
+      installed: true,
+      version: initialProbe.version,
+      freshInstall: false,
+      warnings: tmuxCompatibilityWarnings(initialProbe.version),
+    };
   }
 
   // If the binary exists but the server can't start, no amount of
@@ -221,7 +265,13 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
       const postInstall = probeTmuxFunctional();
       if (postInstall.ok) {
         console.log(`✅ tmux ${postInstall.version} 安装完成 (via ${pm})`);
-        return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm };
+        return {
+          installed: true,
+          version: postInstall.version,
+          freshInstall: true,
+          strategy: pm,
+          warnings: tmuxCompatibilityWarnings(postInstall.version),
+        };
       }
       tried.push(`${pm}（装上了但 server 起不来：${postInstall.reason}）`);
     } else {

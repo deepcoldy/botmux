@@ -25,6 +25,9 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
   const tmux = await ensureTmux(platform);
   if (tmux.installed) {
     if (!tmux.freshInstall) console.log(`✓ tmux ${tmux.version} (existing)`);
+    for (const warning of tmux.warnings ?? []) {
+      console.warn(`⚠️  tmux 兼容性提醒：${warning}`);
+    }
   } else {
     console.warn('');
     console.warn('⚠️  tmux 不可用，已退回到 PTY backend');

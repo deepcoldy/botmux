@@ -18,7 +18,13 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { tmuxEnv, probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
+import {
+  parseTmuxVersion,
+  probeTmuxFunctional,
+  tmuxEnv,
+  tmuxPasteBufferPCompatibilityWarning,
+  tmuxVersionSupportsPasteBufferP,
+} from '../src/setup/ensure-tmux.js';
 
 describe('tmuxEnv()', () => {
   it('strips TMUX and TMUX_PANE from the env', () => {
@@ -54,6 +60,29 @@ describe('tmuxEnv()', () => {
     const input: NodeJS.ProcessEnv = { TMUX: '/dead/socket,1,1', PATH: '/usr/bin' };
     tmuxEnv(input);
     expect(input.TMUX).toBe('/dead/socket,1,1');
+  });
+});
+
+describe('tmux paste-buffer -p compatibility', () => {
+  it('parses common tmux -V output variants', () => {
+    expect(parseTmuxVersion('tmux 3.3a')).toEqual({ major: 3, minor: 3 });
+    expect(parseTmuxVersion('tmux 3.2')).toEqual({ major: 3, minor: 2 });
+    expect(parseTmuxVersion('tmux next-3.4')).toEqual({ major: 3, minor: 4 });
+    expect(parseTmuxVersion('not tmux')).toBeUndefined();
+  });
+
+  it('requires tmux >= 3.2 for paste-buffer -p', () => {
+    expect(tmuxVersionSupportsPasteBufferP('tmux 2.9')).toBe(false);
+    expect(tmuxVersionSupportsPasteBufferP('tmux 3.1c')).toBe(false);
+    expect(tmuxVersionSupportsPasteBufferP('tmux 3.2')).toBe(true);
+    expect(tmuxVersionSupportsPasteBufferP('tmux 3.3a')).toBe(true);
+    expect(tmuxVersionSupportsPasteBufferP('tmux 4.0')).toBe(true);
+  });
+
+  it('warns on low or unparseable versions, but not supported ones', () => {
+    expect(tmuxPasteBufferPCompatibilityWarning('tmux 3.3a')).toBeUndefined();
+    expect(tmuxPasteBufferPCompatibilityWarning('tmux 3.1c')).toContain('低于 tmux 3.2');
+    expect(tmuxPasteBufferPCompatibilityWarning('tmux unknown')).toContain('无法解析 tmux 版本');
   });
 });
 
