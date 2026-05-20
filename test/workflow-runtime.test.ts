@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { EventLog } from '../src/workflows/events/append.js';
+import { INLINE_PAYLOAD_MAX_BYTES } from '../src/workflows/events/schema.js';
 import { replay } from '../src/workflows/events/replay.js';
 import {
   parseWorkflowDefinition,
@@ -196,6 +197,47 @@ describe('dispatchGate', () => {
     expect(waitP.deadlineAt).toBe(1_700_000_000_000 + 60_000);
   });
 
+  it('fails humanGate with clear userFault when resolved prompt would exceed inline event cap', async () => {
+    const longPrompt = 'x'.repeat(INLINE_PAYLOAD_MAX_BYTES + 200);
+    const def = parseWorkflowDefinition({
+      workflowId: 'gated-large-prompt',
+      version: 1,
+      nodes: {
+        gated: {
+          type: 'subagent',
+          bot: 'b2',
+          prompt: 'do gated thing',
+          humanGate: {
+            stage: 'before',
+            prompt: longPrompt,
+          },
+        },
+      },
+    });
+    const { log, ctx } = await bootstrap(def, successSpawn);
+    const actions = decideNextActions(replay(await log.readAll()), def);
+    const gateAction = actions.find((a) => a.kind === 'dispatchGate');
+    if (!gateAction || gateAction.kind !== 'dispatchGate') throw new Error('no gate action');
+
+    const result = await dispatchGate(ctx, gateAction);
+
+    expect(result.kind).toBe('failed');
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'runStarted',
+      'attemptCreated',
+      'activityFailed',
+    ]);
+    const failed = events.at(-1)!;
+    expect(failed.type).toBe('activityFailed');
+    const p = failed.payload as { error: { errorCode: string; errorClass: string; errorMessage: string } };
+    expect(p.error.errorCode).toBe('InputBindingFailed');
+    expect(p.error.errorClass).toBe('userFault');
+    expect(p.error.errorMessage).toContain('humanGate.prompt is too large');
+    expect(p.error.errorMessage).toContain('summary/preview');
+  });
+
   it('orchestrator decides dispatchGate is no longer needed after gate raised', async () => {
     const def = gatedDef();
     const { log, ctx } = await bootstrap(def, successSpawn);
@@ -262,6 +304,13 @@ describe('dispatchWork — subagent', () => {
     const session = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
     expect(session.botName).toBe('b1');
     expect(session.webPort).toBe(7878);
+    expect(session.logPath).toBe(join(
+      log.runDir,
+      'attempts',
+      workActivityId(RUN_ID, 'a'),
+      result.attemptId,
+      'terminal.log',
+    ));
   });
 
   it('crash path writes activityFailed', async () => {
@@ -326,6 +375,52 @@ describe('dispatchWork — subagent', () => {
     });
 
     expect(prompts).toEqual(['Alice']);
+  });
+
+  it('interpolates params refs inside subagent prompt before spawning', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-param-subagent-template',
+      version: 1,
+      params: {
+        city: { type: 'string', required: true },
+      },
+      nodes: {
+        weather: {
+          type: 'subagent',
+          bot: 'b1',
+          prompt: '查询 ${params.city} 天气',
+        },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, {
+      def,
+      params: { city: '上海' },
+      initiator: 'tester',
+      botResolver: noopResolver,
+    });
+    const prompts: string[] = [];
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def,
+      spawnSubagent: async (input) => {
+        prompts.push(input.prompt);
+        return {
+          kind: 'success',
+          output: { ok: true },
+          session: { sessionId: 's', botName: input.botName, startedAt: 0 },
+        };
+      },
+    };
+
+    await dispatchWork(ctx, {
+      kind: 'dispatchWork',
+      nodeId: 'weather',
+      activityId: workActivityId(RUN_ID, 'weather'),
+      node: def.nodes.weather!,
+    });
+
+    expect(prompts).toEqual(['查询 上海 天气']);
   });
 
   it('unknown hostExecutor writes attemptCreated + activityFailed{manual} terminal', async () => {

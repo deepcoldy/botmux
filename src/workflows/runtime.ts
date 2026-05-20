@@ -41,6 +41,7 @@ import type {
   RunSucceededEvent,
   WaitCreatedEvent,
 } from './events/types.js';
+import { INLINE_PAYLOAD_MAX_BYTES } from './events/schema.js';
 import type {
   CompleteNodeFailedAction,
   CompleteNodeSucceededAction,
@@ -70,6 +71,8 @@ export type WorkerSpawnInput = {
   attemptId: string;
   nodeId: string;
   runId: string;
+  /** Conventional per-attempt execution log path, used by daemon-backed workers. */
+  attemptLogPath?: string;
 };
 
 export type WorkerSessionInfo = {
@@ -190,6 +193,13 @@ async function writeSessionSidecar(
   const dir = await attemptSidecarDir(log, activityId, attemptId);
   const file = join(dir, 'session.json');
   await fs.writeFile(file, JSON.stringify(session, null, 2), 'utf-8');
+}
+
+function withAttemptLogPath(
+  session: WorkerSessionInfo,
+  attemptLogPath: string,
+): WorkerSessionInfo {
+  return session.logPath ? session : { ...session, logPath: attemptLogPath };
 }
 
 async function resolveWorkflowIdentity(
@@ -343,6 +353,25 @@ export async function dispatchGate(
     ? nowMs(ctx) + action.humanGate.deadlineMs
     : undefined;
 
+  const oversizedPrompt = checkWaitCreatedPayloadSize({
+    activityId: action.activityId,
+    nodeId: action.nodeId,
+    waitKind: 'human-gate',
+    deadlineAt,
+    prompt: resolvedPrompt,
+    approvers: action.humanGate.approvers,
+    onTimeout: action.humanGate.onTimeout,
+  });
+  if (oversizedPrompt) {
+    const activityFailed = await writeBindingFailure(
+      ctx,
+      action.activityId,
+      attemptId,
+      oversizedPrompt,
+    );
+    return { kind: 'failed', attemptId, attemptCreated, activityFailed };
+  }
+
   const waitCreated = await createWait(ctx.log, {
     activityId: action.activityId,
     attemptId,
@@ -355,6 +384,26 @@ export async function dispatchGate(
   });
 
   return { kind: 'wait', attemptId, attemptCreated, waitCreated };
+}
+
+function checkWaitCreatedPayloadSize(payload: {
+  activityId: string;
+  nodeId: string;
+  waitKind: 'human-gate';
+  deadlineAt?: number;
+  prompt?: string;
+  approvers?: string[];
+  onTimeout?: string;
+}): string | undefined {
+  const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf-8');
+  if (bytes <= INLINE_PAYLOAD_MAX_BYTES) return undefined;
+  return (
+    `humanGate.prompt is too large after binding (${bytes} bytes; max ` +
+    `${INLINE_PAYLOAD_MAX_BYTES}). Use a short summary/preview field for ` +
+    `humanGate.prompt and keep the full content in the node output for ` +
+    `downstream delivery. Future promptRef support may allow large approval ` +
+    `payloads.`
+  );
 }
 
 async function writeBindingFailure(
@@ -568,6 +617,8 @@ export async function dispatchWork(
   // (Slice D / runtime-loop slice).
 
   const botSnapshot = await resolveBotSnapshot(ctx, node.bot, options.snapshot);
+  const sidecarDir = await attemptSidecarDir(ctx.log, action.activityId, attemptId);
+  const attemptLogPath = join(sidecarDir, 'terminal.log');
   const spawnResult = await ctx.spawnSubagent({
     botName: node.bot,
     botSnapshot,
@@ -583,9 +634,11 @@ export async function dispatchWork(
     attemptId,
     nodeId: action.nodeId,
     runId: ctx.log.runId,
+    attemptLogPath,
   });
 
   if (spawnResult.session) {
+    spawnResult.session = withAttemptLogPath(spawnResult.session, attemptLogPath);
     await writeSessionSidecar(ctx.log, action.activityId, attemptId, spawnResult.session);
   }
 

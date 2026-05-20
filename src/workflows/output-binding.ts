@@ -15,9 +15,11 @@
  *     `outputRef` blob is the contract.  Missing blob file ⇒ binding fails
  *     loudly so the operator notices a write-side bug rather than getting
  *     a half-resolved input.
- *   - No template language — `$ref` is the only binding primitive.  An
- *     entire field value is replaced (whole-string substitution), not
- *     string-interpolated.
+ *   - `{ "$ref": "..." }` is the typed binding primitive: an entire field
+ *     value is replaced and objects/arrays/numbers are preserved.
+ *   - String interpolation is intentionally narrow: `${...}` may embed the
+ *     same ref grammar inside a string, and only scalar values are allowed.
+ *     Objects/arrays must use whole-field `$ref`.
  *
  * Reference syntax:
  *   `<nodeId>.output.<segment>(.<segment>)*`
@@ -255,6 +257,9 @@ export async function resolveBindings(
   if (isOutputRefSpec(value)) {
     return resolveOutputRef(value.$ref, ctx);
   }
+  if (typeof value === 'string') {
+    return interpolateStringRefs(value, ctx);
+  }
   if (Array.isArray(value)) {
     const out: unknown[] = [];
     for (const v of value) {
@@ -270,6 +275,43 @@ export async function resolveBindings(
     return out;
   }
   return value;
+}
+
+async function interpolateStringRefs(value: string, ctx: BindingContext): Promise<string> {
+  if (!value.includes('${')) return value;
+  let out = '';
+  let cursor = 0;
+  while (cursor < value.length) {
+    const start = value.indexOf('${', cursor);
+    if (start < 0) {
+      out += value.slice(cursor);
+      break;
+    }
+    out += value.slice(cursor, start);
+    const end = value.indexOf('}', start + 2);
+    if (end < 0) {
+      throw new BindingError(`unterminated string ref interpolation in '${value}'`);
+    }
+    const ref = value.slice(start + 2, end);
+    if (!ref) {
+      throw new BindingError(`empty string ref interpolation in '${value}'`);
+    }
+    const resolved = await resolveOutputRef(ref, ctx);
+    out += stringifyInterpolatedValue(ref, resolved);
+    cursor = end + 1;
+  }
+  return out;
+}
+
+function stringifyInterpolatedValue(ref: string, value: unknown): string {
+  if (value === null) return 'null';
+  const t = typeof value;
+  if (t === 'string') return value as string;
+  if (t === 'number' || t === 'boolean') return String(value);
+  throw new BindingError(
+    `string interpolation '\${${ref}}' resolved to ${Array.isArray(value) ? 'array' : t} ` +
+    `(expected string/number/boolean/null; use whole-field $ref for structured values)`,
+  );
 }
 
 /**

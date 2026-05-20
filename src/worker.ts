@@ -29,6 +29,7 @@ import {
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
+import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -346,6 +347,13 @@ function bridgeProbeOpenSessionIds(): void {
 
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
+  if (!lastInitConfig?.adoptMode) {
+    const cursor = baselineJsonlCursor(bridgeJsonlPath);
+    bridgeOffset = cursor.newOffset;
+    bridgePendingTail = cursor.pendingTail;
+    bridgeBaselineDone = true;
+    return;
+  }
   const result = drainTranscript(bridgeJsonlPath, 0);
   bridgeOffset = result.newOffset;
   bridgePendingTail = result.pendingTail;
@@ -1350,10 +1358,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     codexBridgeBaselineDone = true;
     log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
   } else if (existsSync(rolloutPath)) {
-    const result = structuredBridgeIngestPath(rolloutPath, 0);
-    codexBridgeOffset = result.newOffset;
-    codexBridgePendingTail = result.pendingTail;
-    codexBridgeQueue.absorb(result.events);
+    const cursor = baselineJsonlCursor(rolloutPath);
+    codexBridgeOffset = cursor.newOffset;
+    codexBridgePendingTail = cursor.pendingTail;
     codexBridgeBaselineDone = true;
     log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
   } else {
@@ -1577,6 +1584,10 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
 const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
+const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
+const WORKFLOW_OUTPUT_END_MARKER = '</WORKFLOW_OUTPUT>';
+let workflowTranscript = '';
+let workflowFinalOutputSent = false;
 /** Tracks whether the CLI is currently in the alt screen buffer. Updated by
  *  scanning PTY output for DECSET 1049/47/1047 toggles. Used when trimming
  *  scrollback at cap so replay always starts with the correct buffer mode —
@@ -1592,6 +1603,30 @@ const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
 let screenAnalyzer: ScreenAnalyzer | null = null;
 /** When true, user messages are queued because a TUI prompt is active */
 let tuiPromptBlocking = false;
+
+function isWorkflowWorker(): boolean {
+  return process.env.BOTMUX_WORKFLOW === '1';
+}
+
+function captureWorkflowTranscript(data: string): void {
+  if (!isWorkflowWorker() || workflowFinalOutputSent) return;
+  workflowTranscript += data;
+  if (workflowTranscript.length > WORKFLOW_TRANSCRIPT_MAX) {
+    workflowTranscript = workflowTranscript.slice(-WORKFLOW_TRANSCRIPT_MAX);
+  }
+}
+
+function maybeEmitWorkflowTranscriptOutput(): void {
+  if (!isWorkflowWorker() || workflowFinalOutputSent) return;
+  if (!workflowTranscript.includes(WORKFLOW_OUTPUT_END_MARKER)) return;
+  send({
+    type: 'final_output',
+    content: workflowTranscript,
+    lastUuid: `workflow-pty-${Date.now()}`,
+    turnId: `workflow-pty-${sessionId || 'unknown'}`,
+  });
+  log('Workflow PTY transcript final_output emitted');
+}
 
 function startScreenAnalyzer(): void {
   const sa = config.screenAnalyzer;
@@ -1939,6 +1974,7 @@ let trustHandled = false;
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
 function onPtyData(data: string): void {
+  captureWorkflowTranscript(data);
   renderer?.write(data);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
@@ -1998,6 +2034,7 @@ function onPtyData(data: string): void {
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
   isPromptReady = true;
+  maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();  // exclude history replay from streaming card
@@ -2990,6 +3027,9 @@ if(isTouch&&typeof Hammer!=='undefined'){
 // ─── IPC Communication ───────────────────────────────────────────────────────
 
 function send(msg: WorkerToDaemon): void {
+  if (isWorkflowWorker() && msg.type === 'final_output') {
+    workflowFinalOutputSent = true;
+  }
   process.send?.(msg);
 }
 
@@ -3038,9 +3078,14 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
-        const port = await startWebServer('0.0.0.0', msg.webPort);
-        startScreenUpdates();
-        startScreenAnalyzer();
+        let port = 0;
+        if (!isWorkflowWorker()) {
+          port = await startWebServer('0.0.0.0', msg.webPort);
+          startScreenUpdates();
+          startScreenAnalyzer();
+        } else {
+          log('Workflow worker mode: skipping web terminal, screen updates, and screen analyzer');
+        }
         spawnCli(msg);
 
         // Queue the initial prompt — flushed when CLI shows idle.

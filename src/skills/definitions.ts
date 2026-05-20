@@ -404,10 +404,16 @@ description: 根据用户自然语言描述生成 botmux workflow JSON 定义文
 3. 写到 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`（**绝对路径**，daemon 的全局位置）。不要写到当前 cwd 的 \`./workflows/\`——CLI agent 和 daemon 进程的 cwd 不一定一致。\`workflowId\` 推荐 kebab-case。
 4. 写完必须跑 \`botmux workflow validate $HOME/.botmux/workflows/<workflowId>.workflow.json\`，失败就按错误修到通过。
 5. 高风险节点主动建议 \`humanGate\`：发消息、写文件、外部 API、git push、删除/覆盖。纯读、草稿、纯计算通常不加 gate。
-6. 当前没有字符串模板语言：不要写 \`{{params.name}}\` 或 \`{{draft.output}}\` 期望 runtime 展开。
-7. \`$ref\` 只支持整值替换，**不能拼接字符串**。两种合法形式：
-   - \`{ "$ref": "<nodeId>.output.<path>" }\` 引上游节点输出
-   - \`{ "$ref": "params.<path>" }\` 引启动时的入参（嵌套字段也支持，例如 \`params.user.email\`）
+6. 数据流有两套语法：**整字段 \`$ref\` 替换** 和 **字符串内 \`\${...}\` 内嵌引用**。**不要**写 \`{{...}}\` 期望 runtime 展开——支持的是 \`\${...}\`，不是双花括号。
+7. 两套语法的边界：
+   - **整字段 \`$ref\`**（值可以是任意类型，含对象/数组）：
+     - \`{ "$ref": "<nodeId>.output.<path>" }\` 引上游节点输出
+     - \`{ "$ref": "params.<path>" }\` 引启动时的入参（嵌套用点号：\`params.user.email\`）
+     - \`$ref\` 对象必须独占，不能有兄弟 key
+   - **字符串内 \`\${...}\` 内嵌**（仅用在 string 字段里，例如 prompt / humanGate.prompt / hostExecutor.input 的 string 值）：
+     - \`"prompt": "查询 \${params.city} 未来 \${params.days} 天天气"\`
+     - \`"prompt": "基于天气数据 \${fetchWeather.output.summary} 出行规划"\`
+     - 引用值只能是 string / number / boolean / null；object / array 会运行时报 BindingError，要用整字段 \`$ref\` 而非内嵌
 
 ## 工作流程
 
@@ -481,7 +487,7 @@ botmux workflow run <workflowId>
 }
 \`\`\`
 
-\`params\` 是启动 run 时通过 \`--param key=value\` 传入的入参，会被 type/required 校验。在节点里通过 \`{ "$ref": "params.<path>" }\` 注入到 \`prompt\` / \`humanGate.prompt\` / \`hostExecutor.input\` 任意字段。嵌套对象用点号路径：\`params.user.email\`。
+\`params\` 是启动 run 时通过 \`--param key=value\` 传入的入参，会被 type/required 校验。在节点里既可以用 \`{ "$ref": "params.<path>" }\` 整字段替换，也可以在字符串里 \`"\${params.<path>}"\` 内嵌（仅限值是标量时）。嵌套对象用点号路径：\`params.user.email\`。
 
 subagent node：
 
@@ -539,19 +545,35 @@ humanGate：
 
 ## 数据流规则
 
-只支持 \`$ref\`：
+两种引用语法：
 
+**整字段 \`$ref\`**（任何类型，独占对象）：
 \`\`\`json
 { "$ref": "draft.output.text" }
+{ "$ref": "params.user" }
 \`\`\`
 
-约束：
-- 语法支持两种形式：\`<nodeId>.output.<path>\` 引上游 output，\`params.<path>\` 引 run 启动入参。
-- \`$ref\` 对象必须独占，不能有额外 key。
-- \`$ref\` 是整值替换，不能拼字符串。
+**字符串内 \`\${...}\` 内嵌**（只用在 string 字段，引用值必须是标量）：
+\`\`\`json
+"prompt": "查询 \${params.city} 未来 \${params.days} 天天气"
+"prompt": "基于天气 \${fetchWeather.output.summary} 出行建议"
+\`\`\`
+
+共同约束：
+- 引用路径形式：\`<nodeId>.output.<path>\` 或 \`params.<path>\`，路径用点号嵌套。
 - 引用某个 node 的 output 时，当前 node 必须在 \`depends\` 里声明该 node。
 - 引用 \`params.<path>\` 时，不需要写 \`depends\`。
 - validate 不会证明 output 字段存在；用 \`outputSchema\` 和 few-shot prompt 约束 subagent 返回 JSON。
+
+两种语法怎么选：
+- 上游产物本身是字符串、整段灌给下游 → 整字段 \`$ref\`（更便宜，不需要 string concat）
+- 模板需要把多个引用 / 标量参数拼进同一句话 → 字符串内 \`\${...}\`
+- 引用值是对象/数组 → 必须整字段 \`$ref\`，**不能**塞进 \`\${...}\` 拼字符串
+
+\`\${...}\` 内嵌的限制：
+- 只在字符串字段里识别（prompt / humanGate.prompt / hostExecutor.input 的 string 值）；对象 / 数组字段里的 string 也支持。
+- 引用值是 object / array 时报 \`BindingError\`——错误消息会建议改用整字段 \`$ref\`。
+- 整字段 \`$ref\` 对象必须独占，不能有兄弟 key（schema 强制）。
 
 ## humanGate 启发式
 
@@ -667,13 +689,64 @@ humanGate：
 }
 \`\`\`
 
-**Params 注入最适合的场景**：路由信息（chat id / app id / recipient）、模式开关（mode='draft'|'send'）、配置（threshold、超时）。**不适合**：放完整 prompt 指令——因为 \`$ref\` 不能拼接字符串，prompt 应该是节点设计时确定的固定指令，让 bot 拿 params 当上下文 input 不如直接固定 prompt 简单。
+**Params 注入最适合的场景**：路由信息（chat id / app id / recipient）、模式开关（mode='draft'|'send'）、配置（threshold、超时）。也适合在 prompt 模板里用 \`\${params.city}\` 这种标量插值（"查询 \${params.city} 天气"）。**仍不适合**：完整 prompt 指令通过 params 整段传——节点的"任务定义"应该写死在 workflow.json 里，让 caller 传业务变量而非整条指令，否则 workflow 就退化成消息转发器。
+
+## 范例 C — string template 演示
+
+启动：\`botmux workflow run weather-city --param city=上海 --param days=3\`
+
+\`\`\`json
+{
+  "workflowId": "weather-city",
+  "version": 1,
+  "params": {
+    "city": { "type": "string", "required": true, "description": "城市名" },
+    "days": { "type": "number", "required": false, "default": 3, "description": "查几天" }
+  },
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 180000,
+    "maxOutputBytes": 8192
+  },
+  "nodes": {
+    "fetchWeather": {
+      "type": "subagent",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
+      "prompt": "查询 \${params.city} 未来 \${params.days} 天天气，返回 JSON: {\\"summary\\": string, \\"forecast\\": [...]}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["summary", "forecast"],
+        "properties": {
+          "summary": { "type": "string" },
+          "forecast": { "type": "array" }
+        }
+      },
+      "description": "params.city / params.days 通过字符串模板内嵌到 prompt 里；上游不需要再合成 prompt 字段。"
+    },
+    "planTrip": {
+      "type": "subagent",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
+      "depends": ["fetchWeather"],
+      "prompt": "基于 \${params.city} \${params.days} 日天气概要「\${fetchWeather.output.summary}」生成出行建议，返回 JSON: {\\"plan\\": string}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["plan"],
+        "properties": { "plan": { "type": "string" } }
+      },
+      "description": "把 params 和上游 output 混在同一句 prompt 里——string template 比整字段 \$ref 更适合这种 fan-in 场景。"
+    }
+  }
+}
+\`\`\`
+
+注意 \`forecast\` 是数组，**不能**嵌到 \`\${fetchWeather.output.forecast}\` 字符串里（runtime 会报 BindingError）。如果下游真的需要整个 forecast 数组，把 prompt 拆开：用 \`\${fetchWeather.output.summary}\` 做导读，再用整字段 \`{ "$ref": "fetchWeather.output.forecast" }\` 传给 hostExecutor.input 之类支持对象的字段。
 
 ## 常见错误
 
 - **\`subagent.bot\` 填了 displayName（如 \`claude-loopy\` 或 \`aiden-oncall(d2)\`）而不是 larkAppId**：跨 daemon 必 fail，runtime 报 "Bot 'X' not found in registry"。一定填 \`cli_xxxxxxxxxxxxxxxx\`。
 - **workflow 文件写到当前 cwd 的 \`./workflows/\` 而不是 \`$HOME/.botmux/workflows/\`**：CLI agent cwd 和 daemon cwd 不一致时 daemon 找不到文件。一定用绝对路径 \`$HOME/.botmux/workflows/<id>.workflow.json\`。
-- 写 \`{{...}}\` 模板：当前 runtime 不展开，改成整字段 \`$ref\` 或让上游输出完整字符串。
+- 写 \`{{...}}\` 模板：runtime 只识别 \`\${...}\`，不识别双花括号；改成 \`\${...}\` 或整字段 \`$ref\`。
+- 把对象 / 数组塞进 \`\${...}\` 字符串模板里：会报 \`BindingError\`。对象 / 数组必须用整字段 \`$ref\` 替换。
 - \`$ref\` 字符串里没有 \`.output.\` 也不是 \`params.*\` 开头：parse 会报错。
 - \`$ref\` 引用的 node 没写进 \`depends\`：validate 可能过，运行时顺序不可靠。
 - \`humanGate.stage: "after"\`：不支持。

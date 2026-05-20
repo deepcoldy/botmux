@@ -51,10 +51,17 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).toContain('feishu-send');
     expect(skill!.content).toContain('feishu-reply');
     expect(skill!.content).toContain('botmux-schedule');
-    expect(skill!.content).toContain('当前没有字符串模板语言');
     expect(skill!.content).toContain('"$ref": "params.<path>"');
-    expect(skill!.content).toContain('语法支持两种形式');
-    expect(skill!.content).not.toContain('语法只能是 `<nodeId>.output.<path>`');
+    // String template interpolation `${...}` is now supported alongside whole-field $ref —
+    // SKILL.md must teach the new syntax so workflow-create LLM uses it instead of writing
+    // upstream "planRequest"-style workaround fields.
+    expect(skill!.content).toContain('${params.city}');
+    expect(skill!.content).toContain('${fetchWeather.output.summary}');
+    expect(skill!.content).toContain('整字段');
+    expect(skill!.content).toContain('内嵌');
+    // The old "no template language" line must be gone so the LLM doesn't keep
+    // building "planRequest"-style upstream wrappers.
+    expect(skill!.content).not.toContain('当前没有字符串模板语言');
     // workflow.subagent.bot must be larkAppId (cross-daemon stable identifier), not displayName
     expect(skill!.content).toContain('larkAppId');
     expect(skill!.content).toContain('cli_xxxxxxxxxxxxxxxx');

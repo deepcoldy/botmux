@@ -422,6 +422,242 @@ describe('resolveBindings', () => {
       nested: { inner: ['Hello', 'literal'] },
     });
   });
+
+  it('interpolates scalar refs inside strings', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: {
+        a: { type: 'subagent', bot: 'b', prompt: 'go' },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, {
+      def,
+      params: { city: '上海' },
+      initiator: 't',
+      botResolver: () => ({}),
+    });
+    const blobBuf = JSON.stringify({ tempC: 23, raining: false, note: null });
+    const blobPath = join(baseDir, RUN_ID, 'blobs', 'weather.json');
+    const { promises: fsp } = await import('node:fs');
+    await fsp.mkdir(join(baseDir, RUN_ID, 'blobs'), { recursive: true });
+    writeFileSync(blobPath, blobBuf);
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'a',
+        activityId: workActivityId(RUN_ID, 'a'),
+        attemptId: 'att-1',
+        attemptNumber: 1,
+        inputRef: {
+          outputHash: 'sha256:' + 'b'.repeat(64),
+          outputBytes: blobBuf.length,
+          outputSchemaVersion: 1,
+        },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'activitySucceeded',
+      actor: 'worker',
+      payload: {
+        activityId: workActivityId(RUN_ID, 'a'),
+        attemptId: 'att-1',
+        outputRef: {
+          outputHash: 'sha256:' + 'b'.repeat(64),
+          outputPath: blobPath,
+          outputBytes: blobBuf.length,
+          outputSchemaVersion: 1,
+          contentType: 'application/json',
+        },
+      },
+    });
+
+    const snap = replay(await log.readAll());
+    const resolved = await resolveBindings(
+      '查 ${params.city} 天气：${a.output.tempC}C raining=${a.output.raining} note=${a.output.note}',
+      { snapshot: snap, def, log },
+    );
+
+    expect(resolved).toBe('查 上海 天气：23C raining=false note=null');
+  });
+
+  it('rejects object/array refs inside string interpolation', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: {
+        upstream: { type: 'subagent', bot: 'b', prompt: 'go' },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: {}, initiator: 't', botResolver: () => ({}) });
+    const blobBuf = JSON.stringify({ payload: { nested: true } });
+    const blobPath = join(baseDir, RUN_ID, 'blobs', 'payload.json');
+    const { promises: fsp } = await import('node:fs');
+    await fsp.mkdir(join(baseDir, RUN_ID, 'blobs'), { recursive: true });
+    writeFileSync(blobPath, blobBuf);
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'upstream',
+        activityId: workActivityId(RUN_ID, 'upstream'),
+        attemptId: 'att-1',
+        attemptNumber: 1,
+        inputRef: {
+          outputHash: 'sha256:' + 'c'.repeat(64),
+          outputBytes: blobBuf.length,
+          outputSchemaVersion: 1,
+        },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'activitySucceeded',
+      actor: 'worker',
+      payload: {
+        activityId: workActivityId(RUN_ID, 'upstream'),
+        attemptId: 'att-1',
+        outputRef: {
+          outputHash: 'sha256:' + 'c'.repeat(64),
+          outputPath: blobPath,
+          outputBytes: blobBuf.length,
+          outputSchemaVersion: 1,
+          contentType: 'application/json',
+        },
+      },
+    });
+    const snap = replay(await log.readAll());
+
+    await expect(
+      resolveBindings('payload=${upstream.output.payload}', { snapshot: snap, def, log }),
+    ).rejects.toThrow(/use whole-field \$ref/);
+  });
+
+  it('rejects malformed string interpolation', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: {
+        a: { type: 'subagent', bot: 'b', prompt: 'go' },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: { city: 'x' }, initiator: 't', botResolver: () => ({}) });
+    const snap = replay(await log.readAll());
+
+    await expect(
+      resolveBindings('查 ${params.city 天气', { snapshot: snap, def, log }),
+    ).rejects.toThrow(/unterminated/);
+  });
+
+  it('passes through strings without ${...} markers unchanged', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: { a: { type: 'subagent', bot: 'b', prompt: 'go' } },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: {}, initiator: 't', botResolver: () => ({}) });
+    const snap = replay(await log.readAll());
+
+    // No `${` substring means the resolver should short-circuit without
+    // touching the snapshot — guards against regressions where a refactor
+    // forces every string through the interpolation walker.
+    expect(
+      await resolveBindings('plain string with $ and { but no template', {
+        snapshot: snap,
+        def,
+        log,
+      }),
+    ).toBe('plain string with $ and { but no template');
+  });
+
+  it('rejects empty ${} ref', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: { a: { type: 'subagent', bot: 'b', prompt: 'go' } },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: {}, initiator: 't', botResolver: () => ({}) });
+    const snap = replay(await log.readAll());
+
+    // `${}` is almost certainly a typo (forgotten ref body). The runtime
+    // surfaces it as BindingError so the workflow author notices instead of
+    // silently emitting the literal `${}` downstream.
+    await expect(
+      resolveBindings('hi ${}', { snapshot: snap, def, log }),
+    ).rejects.toThrow(/empty/);
+  });
+
+  it('does not interpolate strings nested inside upstream subagent output blobs', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: {
+        upstream: { type: 'subagent', bot: 'b', prompt: 'go' },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: { city: '上海' }, initiator: 't', botResolver: () => ({}) });
+    // Upstream output contains a literal `${params.city}` string. Refs are
+    // author-only: dynamic content carried through outputs must NOT be
+    // re-interpreted as a template, otherwise a bot's tainted output could
+    // dereference any param it knows the name of.
+    const blobBuf = JSON.stringify({ note: 'literal ${params.city} stays literal' });
+    const blobPath = join(baseDir, RUN_ID, 'blobs', 'upstream.json');
+    const { promises: fsp } = await import('node:fs');
+    await fsp.mkdir(join(baseDir, RUN_ID, 'blobs'), { recursive: true });
+    writeFileSync(blobPath, blobBuf);
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'upstream',
+        activityId: workActivityId(RUN_ID, 'upstream'),
+        attemptId: 'att-1',
+        attemptNumber: 1,
+        inputRef: {
+          outputHash: 'sha256:' + 'd'.repeat(64),
+          outputBytes: blobBuf.length,
+          outputSchemaVersion: 1,
+        },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'activitySucceeded',
+      actor: 'worker',
+      payload: {
+        activityId: workActivityId(RUN_ID, 'upstream'),
+        attemptId: 'att-1',
+        outputRef: {
+          outputHash: 'sha256:' + 'd'.repeat(64),
+          outputPath: blobPath,
+          outputBytes: blobBuf.length,
+          outputSchemaVersion: 1,
+          contentType: 'application/json',
+        },
+      },
+    });
+
+    const snap = replay(await log.readAll());
+    // Author-side interpolation referencing upstream.output.note pulls in
+    // the literal `${params.city}` text as-is — NOT '上海'.
+    const resolved = await resolveBindings('note=${upstream.output.note}', {
+      snapshot: snap,
+      def,
+      log,
+    });
+    expect(resolved).toBe('note=literal ${params.city} stays literal');
+  });
 });
 
 // ─── End-to-end: dispatchWork hostExecutor with $ref input ───────────────
