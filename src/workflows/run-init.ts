@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
+import { loadBotConfigs } from '../bot-registry.js';
 import { canonicalJsonStringify, computeRevisionId } from './definition.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
@@ -128,10 +129,35 @@ function collectBotSnapshots(
     const snap = resolver(node.bot);
     if (!snap) {
       throw new Error(
-        `Bot '${node.bot}' referenced in workflow '${def.workflowId}' not found in registry`,
+        missingBotMessage(node.bot, def.workflowId, out),
       );
     }
     out[node.bot] = snap;
   }
   return out;
+}
+
+function missingBotMessage(
+  botRef: string,
+  workflowId: string,
+  resolvedSnapshots: Record<string, BotSnapshot>,
+): string {
+  const availableIds = new Set<string>();
+  for (const snap of Object.values(resolvedSnapshots)) {
+    if (snap.larkAppId) availableIds.add(snap.larkAppId);
+  }
+  try {
+    for (const cfg of loadBotConfigs()) availableIds.add(cfg.larkAppId);
+  } catch {
+    // Missing/invalid bots.json should not hide the original workflow error.
+  }
+
+  const idHint = availableIds.size > 0
+    ? ` Available bot larkAppIds: ${Array.from(availableIds).join(', ')}.`
+    : '';
+  return (
+    `Bot '${botRef}' referenced in workflow '${workflowId}' not found in registry. ` +
+    `Use 'botmux bots list' and set subagent.bot to the bot's larkAppId, not its display name.` +
+    idHint
+  );
 }

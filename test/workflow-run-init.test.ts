@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -141,6 +141,40 @@ describe('createRun', () => {
     expect(Object.keys(p.botSnapshots ?? {})).toEqual(['claude-loopy']);
   });
 
+  it('allows workflow subagent.bot to be the stable larkAppId', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-lark-app-id',
+      version: 1,
+      nodes: {
+        sub: { type: 'subagent', bot: 'cli_claude', prompt: 'x' },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+
+    const { runCreatedEvent } = await createRun(log, {
+      def,
+      params: {},
+      initiator: 'tester',
+      botResolver: fakeResolver({
+        cli_claude: {
+          larkAppId: 'cli_claude',
+          cliId: 'claude-code',
+          displayName: 'Claude',
+        },
+      }),
+    });
+
+    const p = runCreatedEvent.payload;
+    if ('ref' in p) throw new Error('expected inline payload');
+    expect(p.botSnapshots).toEqual({
+      cli_claude: {
+        larkAppId: 'cli_claude',
+        cliId: 'claude-code',
+        displayName: 'Claude',
+      },
+    });
+  });
+
   it('throws when a subagent bot is not registered', async () => {
     const def = smallDef();
     const log = new EventLog(RUN_ID, baseDir);
@@ -156,6 +190,48 @@ describe('createRun', () => {
         botResolver: resolver,
       }),
     ).rejects.toThrow(/codex-loopy.*not found/);
+  });
+
+  it('unknown bot errors include available larkAppId hints', async () => {
+    const oldBotsConfig = process.env.BOTS_CONFIG;
+    const botsConfigPath = join(baseDir, 'bots.json');
+    writeFileSync(
+      botsConfigPath,
+      JSON.stringify([
+        {
+          larkAppId: 'cli_codex_from_config',
+          larkAppSecret: 'secret',
+          cliId: 'codex',
+        },
+      ]),
+      'utf-8',
+    );
+    process.env.BOTS_CONFIG = botsConfigPath;
+    try {
+      const def = smallDef();
+      const log = new EventLog(RUN_ID, baseDir);
+      await expect(
+        createRun(log, {
+          def,
+          params: {},
+          initiator: 'tester',
+          botResolver: fakeResolver({
+            'claude-loopy': {
+              larkAppId: 'cli_claude_resolved',
+              displayName: 'Claude',
+            },
+          }),
+        }),
+      ).rejects.toThrow(
+        /Use 'botmux bots list'.*larkAppId.*cli_claude_resolved.*cli_codex_from_config/s,
+      );
+    } finally {
+      if (oldBotsConfig === undefined) {
+        delete process.env.BOTS_CONFIG;
+      } else {
+        process.env.BOTS_CONFIG = oldBotsConfig;
+      }
+    }
   });
 
   it('replay sees both events with proper run.input', async () => {

@@ -41,6 +41,10 @@ import {
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { firstPositional } from './cli/arg-utils.js';
+import {
+  formatBotInfoEntriesForCli,
+  formatChatBotsForCli,
+} from './cli/bots-list-output.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 
@@ -2955,21 +2959,11 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     // botmux daemon on this host). 'introduce' = discovered via /introduce
     // collaboration command (external bot, possibly other-tenant). isSelf is
     // retained (not filtered) so the model can still identify itself when needed.
-    const result = chatBots.map(cb => ({
-      name: cb.displayName,
-      openId: cb.openId,
-      isSelf: cb.larkAppId === appId,
-      source: cb.source,
-    }));
+    const result = formatChatBotsForCli(chatBots, appId);
     console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
   } catch (err: any) {
     // Fallback to bots-info.json
-    const result = botEntries.filter(b => b.botOpenId).map(b => ({
-      name: b.botName ?? b.cliId,
-      openId: b.botOpenId!,
-      isSelf: b.larkAppId === appId,
-      source: 'configured' as const,
-    }));
+    const result = formatBotInfoEntriesForCli(botEntries, appId);
     console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, note: `chat query failed: ${err.message}` }, null, 2));
   }
 }
