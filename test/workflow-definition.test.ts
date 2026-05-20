@@ -170,6 +170,31 @@ describe('parseWorkflowDefinition', () => {
     expect(() => parseWorkflowDefinition(raw)).not.toThrow();
   });
 
+  it('preserves optional node descriptions for authoring tools', () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-x',
+      version: 1,
+      nodes: {
+        draft: {
+          type: 'subagent',
+          bot: 'b1',
+          prompt: 'x',
+          description: 'Use b1 because it has domain context.',
+        },
+        send: {
+          type: 'hostExecutor',
+          executor: 'feishu-send',
+          depends: ['draft'],
+          input: { content: { $ref: 'draft.output.text' } },
+          description: 'Send the approved draft to Feishu.',
+        },
+      },
+    });
+
+    expect(def.nodes.draft!.description).toBe('Use b1 because it has domain context.');
+    expect(def.nodes.send!.description).toBe('Send the approved draft to Feishu.');
+  });
+
   it('rejects empty nodes map', () => {
     const raw = { workflowId: 'wf-x', version: 1, nodes: {} };
     expect(() => parseWorkflowDefinition(raw)).toThrow();

@@ -94,6 +94,7 @@ export type HumanGate = z.infer<typeof HumanGateSchema>;
 export const OutputSchemaSchema = z.record(z.unknown());
 
 const NodeBaseShape = {
+  description: z.string().optional(),
   depends: z.array(z.string()).optional(),
   humanGate: HumanGateSchema.optional(),
   retryPolicy: RetryPolicySchema.optional(),

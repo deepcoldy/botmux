@@ -137,4 +137,31 @@ describe('botmux workflow CLI', () => {
     expect(cancelAgain.stdout).toContain('terminal');
     expect(readFileSync(join(runsDir, runId!, 'events.ndjson'), 'utf-8')).toBe(raw);
   });
+
+  it('validate <path> accepts workflow json files', () => {
+    const out = runCli(['workflow', 'validate', join(tempDir, 'workflows', 'cli-hello.workflow.json')]);
+    expect(out.status).toBe(0);
+    expect(out.stdout).toContain('workflow valid: cli-hello');
+    expect(out.stdout).toContain('nodes=2');
+  });
+
+  it('validate <path> reports zod issue paths', () => {
+    const invalidPath = join(tempDir, 'workflows', 'invalid.workflow.json');
+    writeFileSync(
+      invalidPath,
+      JSON.stringify({
+        workflowId: 'invalid',
+        version: 1,
+        nodes: {
+          only: { type: 'subagent', prompt: 'missing bot' },
+        },
+      }),
+      'utf-8',
+    );
+
+    const out = runCli(['workflow', 'validate', invalidPath]);
+    expect(out.status).not.toBe(0);
+    expect(out.stdout).toContain('workflow invalid');
+    expect(out.stdout).toContain('nodes.only.bot');
+  });
 });

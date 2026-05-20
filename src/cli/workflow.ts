@@ -12,6 +12,7 @@
 
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
+import { ZodError } from 'zod';
 
 import { EventLog } from '../workflows/events/append.js';
 import { replay } from '../workflows/events/replay.js';
@@ -87,6 +88,9 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
     case 'tail':
       await cmdWorkflowTail(rest);
       return;
+    case 'validate':
+      await cmdWorkflowValidate(rest);
+      return;
     case 'show':
       await cmdWorkflowShow(rest);
       return;
@@ -103,7 +107,7 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
 }
 
 function printHelp(): void {
-  console.log(`用法: botmux workflow <run|resume|cancel|ls|tail|show> [...]
+  console.log(`用法: botmux workflow <run|resume|cancel|ls|tail|validate|show> [...]
 
 子命令:
   run <id> [--param key=value ...] [--run-id <id>] [--bot-resolver echo]
@@ -129,6 +133,10 @@ function printHelp(): void {
   tail <runId> [--from <seq>] [--follow] [--json]
       打印 run 的事件简表（seq / type / node / activity / errorCode）。
       默认 history-only；--follow 才轮询 events.ndjson 增量。--from 默认 1。
+
+  validate <path>
+      校验 workflow.json 文件。成功打印 workflowId / node 数；失败打印
+      JSON parse、Zod issue path + message，或 graph invariant 错误。
 
   show <runId>
       replay 当前 run 的事件，打印 Snapshot 摘要 JSON（含 nodes/dangling 等）。
@@ -535,6 +543,51 @@ function validateParams(
       console.error(`缺少必填 param: ${name} (type=${spec.type})`);
       process.exit(1);
     }
+  }
+}
+
+// ─── validate ─────────────────────────────────────────────────────────────
+
+async function cmdWorkflowValidate(rest: string[]): Promise<void> {
+  const path = positionals(rest)[0];
+  if (!path) {
+    console.error('用法: botmux workflow validate <path>');
+    process.exit(1);
+  }
+
+  let rawText: string;
+  try {
+    rawText = await fs.readFile(path, 'utf-8');
+  } catch (err) {
+    console.error(`读取 ${path} 失败：${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(rawText!);
+  } catch (err) {
+    console.error(`解析 JSON 失败：${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  try {
+    const def = parseWorkflowDefinition(raw);
+    console.log(
+      `workflow valid: ${def.workflowId} ` +
+        `(version=${def.version}, nodes=${Object.keys(def.nodes).length})`,
+    );
+  } catch (err) {
+    console.error(`workflow invalid: ${path}`);
+    if (err instanceof ZodError) {
+      for (const issue of err.issues) {
+        const p = issue.path.length ? issue.path.join('.') : '<root>';
+        console.error(`- ${p}: ${issue.message}`);
+      }
+    } else {
+      console.error(`- ${err instanceof Error ? err.message : String(err)}`);
+    }
+    process.exit(1);
   }
 }
 
