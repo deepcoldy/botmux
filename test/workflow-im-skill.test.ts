@@ -15,8 +15,12 @@ import {
   workflowApprovalCardNonce,
 } from '../src/im/lark/workflow-cards.js';
 import { EventLog } from '../src/workflows/events/append.js';
+import { replay } from '../src/workflows/events/replay.js';
 import type { WorkflowDefinition } from '../src/workflows/definition.js';
+import { createRun } from '../src/workflows/run-init.js';
 import type { WorkflowRuntimeContext } from '../src/workflows/runtime.js';
+import { requestCancel } from '../src/workflows/cancel.js';
+import { guardWorkflowRunCancelChatScope } from '../src/workflows/cancel-run.js';
 
 const def: WorkflowDefinition = {
   workflowId: 'hello',
@@ -181,6 +185,7 @@ describe('executeWorkflowCommand', () => {
     expect(cancelWorkflowRunFn).toHaveBeenCalledWith(
       'hello-20260520-abcd1234',
       'cancelled via /workflow cancel',
+      { expectedChatId: 'oc_chat', by: 'ou_user' },
     );
     expect(result).toEqual({
       handled: true,
@@ -217,6 +222,85 @@ describe('executeWorkflowCommand', () => {
       ok: false,
       error: 'workflow_not_attached',
     });
+  });
+
+  it('returns a cross-chat error when cancel runtime hook rejects chat ownership', async () => {
+    const result = await executeWorkflowCommand(
+      {
+        content: '/workflow cancel other-chat-run',
+        chatId: 'oc_chat_a',
+        larkAppId: 'cli_codex',
+        initiator: 'ou_user',
+      },
+      {
+        cancelWorkflowRunFn: async (_runId, _reason, opts) => {
+          expect(opts).toEqual({ expectedChatId: 'oc_chat_a', by: 'ou_user' });
+          return {
+            ok: false,
+            error: 'wrong_chat',
+            status: 'running',
+          };
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      handled: true,
+      ok: false,
+      error: 'this run belongs to a different chat',
+    });
+  });
+
+  it('does not write cancel intent when IM cancel comes from a different chat', async () => {
+    const runId = 'cross-chat-run';
+    const log = new EventLog(runId, baseDir);
+    await createRun(log, {
+      def,
+      params: { name: 'alice' },
+      initiator: 'ou_owner',
+      botResolver: () => ({}),
+      chatBinding: { chatId: 'oc_chat_a', larkAppId: 'cli_codex' },
+    });
+
+    const result = await executeWorkflowCommand(
+      {
+        content: `/workflow cancel ${runId}`,
+        chatId: 'oc_chat_b',
+        larkAppId: 'cli_codex',
+        initiator: 'ou_user',
+      },
+      {
+        cancelWorkflowRunFn: async (rid, reason, opts) => {
+          const scope = await guardWorkflowRunCancelChatScope(baseDir, rid, opts?.expectedChatId ?? '');
+          if (!scope.ok) return scope;
+          const cancel = await requestCancel(
+            log,
+            {
+              target: { kind: 'run', runId: rid },
+              reason,
+              by: opts?.by ?? 'unknown',
+            },
+            'human',
+          );
+          const snap = replay(await log.readAll());
+          return {
+            ok: true,
+            runId: rid,
+            status: snap.run.status,
+            alreadyTerminal: false,
+            cancelEventId: cancel.eventId,
+            lastSeq: snap.lastSeq,
+          };
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      handled: true,
+      ok: false,
+      error: 'this run belongs to a different chat',
+    });
+    expect(replay(await log.readAll()).cancelledRunIntent).toBeUndefined();
   });
 });
 

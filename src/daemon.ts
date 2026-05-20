@@ -91,6 +91,7 @@ import {
 } from './workflows/hostExecutors/registry.js';
 import {
   cancelWorkflowRun,
+  guardWorkflowRunCancelChatScope,
   isTerminalRunStatus,
 } from './workflows/cancel-run.js';
 import { requestCancel } from './workflows/cancel.js';
@@ -368,6 +369,7 @@ function cleanupWorkflowRun(runId: string): void {
 async function cancelWorkflowRunOnDaemon(
   runId: string,
   reason: string,
+  opts: { expectedChatId?: string; by?: string } = {},
 ): Promise<{
   ok: true;
   runId: string;
@@ -383,6 +385,11 @@ async function cancelWorkflowRunOnDaemon(
   status?: string;
 }> {
   if (!isValidRunId(runId)) return { ok: false, error: 'bad_run_id' };
+
+  if (opts.expectedChatId) {
+    const scope = await guardWorkflowRunCancelChatScope(getRunsDir(), runId, opts.expectedChatId);
+    if (!scope.ok) return scope;
+  }
 
   const entry = workflowRuns.get(runId);
   if (entry?.running) {
@@ -403,7 +410,7 @@ async function cancelWorkflowRunOnDaemon(
         {
           target: { kind: 'run', runId },
           reason,
-          by: 'dashboard',
+          by: opts.by ?? 'dashboard',
         },
         'human',
       );
@@ -441,7 +448,7 @@ async function cancelWorkflowRunOnDaemon(
   const result = await cancelWorkflowRun({
     ctx: current.ctx,
     reason,
-    by: 'dashboard',
+    by: opts.by ?? 'dashboard',
     actor: 'human',
     maxTicks: 200,
   });
@@ -546,7 +553,7 @@ async function handleWorkflowCommandIfAny(
       attachWorkflowEventWatcher,
       spawnSubagent: workflowSpawnFn(),
       runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId),
-      cancelWorkflowRunFn: (runId, reason) => cancelWorkflowRunOnDaemon(runId, reason),
+      cancelWorkflowRunFn: (runId, reason, opts) => cancelWorkflowRunOnDaemon(runId, reason, opts),
       onRunCreated: async (info) => {
         try {
           await sessionReply(
@@ -683,7 +690,8 @@ ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) =
       result.error === 'bad_run_id' ? 400 :
         result.error === 'unknown_run' ? 404 :
           result.error === 'workflow_not_attached' ? 409 :
-            500;
+            result.error === 'wrong_chat' ? 403 :
+              500;
     return jsonRes(res, status, result);
   }
   return jsonRes(res, 200, result);

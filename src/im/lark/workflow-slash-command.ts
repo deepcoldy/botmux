@@ -63,7 +63,10 @@ export type WorkflowCommandDeps = {
   spawnSubagent?: WorkerSpawnFn;
   attachWorkflowEventWatcher?: (runId: string, ctx: WorkflowRuntimeContext) => { ready?: Promise<unknown> };
   runLoopFn?: (ctx: WorkflowRuntimeContext) => Promise<RunLoopResult>;
-  cancelWorkflowRunFn?: (runId: string, reason: string) => Promise<{
+  cancelWorkflowRunFn?: (runId: string, reason: string, opts?: {
+    expectedChatId?: string;
+    by?: string;
+  }) => Promise<{
     ok: true;
     runId: string;
     status: string;
@@ -178,9 +181,10 @@ export async function executeWorkflowCommand(
     const result = await deps.cancelWorkflowRunFn(
       command.runId,
       'cancelled via /workflow cancel',
+      { expectedChatId: input.chatId, by: input.initiator },
     );
     if (!result.ok) {
-      return { handled: true, ok: false, error: result.error, usage: USAGE };
+      return { handled: true, ok: false, error: formatCancelError(result.error), usage: USAGE };
     }
     return {
       handled: true,
@@ -268,6 +272,11 @@ export function resolveBotSnapshot(botName: string): BotSnapshot | undefined {
 
 function invalid(error: string): WorkflowCommand {
   return { kind: 'invalid', error, usage: USAGE };
+}
+
+function formatCancelError(error: string): string {
+  if (error === 'wrong_chat') return 'this run belongs to a different chat';
+  return error;
 }
 
 function coerceParam(name: string, param: ParamDef, raw: string): unknown {

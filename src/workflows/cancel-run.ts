@@ -9,6 +9,7 @@ import {
   requestCancel,
   type RequestCancelActor,
 } from './cancel.js';
+import { isValidRunId, readRunSnapshot } from './ops-projection.js';
 
 export type CancelWorkflowRunInput = {
   ctx: WorkflowRuntimeContext;
@@ -25,6 +26,28 @@ export type CancelWorkflowRunResult = {
   cancelAlreadyRequested: boolean;
   alreadyTerminal: boolean;
 };
+
+export type CancelWorkflowRunChatScopeResult =
+  | { ok: true }
+  | { ok: false; error: 'bad_run_id' | 'unknown_run' | 'wrong_chat'; status?: string };
+
+/**
+ * IM cancel is scoped to the chat that created the run.  This is a pure
+ * guard: callers must run it before writing cancelRequested.
+ */
+export async function guardWorkflowRunCancelChatScope(
+  runsDir: string,
+  runId: string,
+  expectedChatId: string,
+): Promise<CancelWorkflowRunChatScopeResult> {
+  if (!isValidRunId(runId)) return { ok: false, error: 'bad_run_id' };
+  const snapshot = await readRunSnapshot(runsDir, runId);
+  if (!snapshot) return { ok: false, error: 'unknown_run' };
+  if (snapshot.chatBinding?.chatId !== expectedChatId) {
+    return { ok: false, error: 'wrong_chat', status: snapshot.run.status };
+  }
+  return { ok: true };
+}
 
 /**
  * Shared run-level cancel operation used by CLI and dashboard/daemon IPC.
