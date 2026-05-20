@@ -406,6 +406,55 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
   return JSON.stringify(card);
 }
 
+// ─── 群内授权卡片 ─────────────────────────────────────────────────────────────
+
+export interface GrantCardOpts {
+  ownerOpenId: string;
+  requesterOpenId: string;
+  requesterName: string;
+  chatId: string;
+  nonce: string;
+  /** 'request' = 无权限者自助申请；'owner' = owner 主动 /grant。仅文案不同。 */
+  mode: 'request' | 'owner';
+}
+
+/** 授权卡片：正文 @owner，三枚按钮各带 action + 上下文 + nonce。 */
+export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
+  const body = o.mode === 'request'
+    ? t('card.grant.body_request', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale)
+    : t('card.grant.body_owner', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale);
+  const v = { target_open_id: o.requesterOpenId, chat_id: o.chatId, nonce: o.nonce };
+  const card = {
+    config: { wide_screen_mode: true },
+    header: { template: 'orange', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: body } },
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.grant.btn_chat', undefined, locale) }, value: { action: 'grant_chat', ...v } },
+          { tag: 'button', type: 'default', text: { tag: 'plain_text', content: t('card.grant.btn_global', undefined, locale) }, value: { action: 'grant_global', ...v } },
+          { tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.grant.btn_deny', undefined, locale) }, value: { action: 'grant_deny', ...v } },
+        ],
+      },
+      { tag: 'note', elements: [{ tag: 'lark_md', content: t('card.grant.note', undefined, locale) }] },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
+/** 授权处置后的终态卡（无按钮，防重复点击）。 */
+export function buildGrantResultCard(kind: 'chat' | 'global' | 'deny', locale?: Locale): string {
+  const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
+  const card = {
+    config: { wide_screen_mode: true },
+    header: { template: kind === 'deny' ? 'grey' : 'green', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content: t(key, undefined, locale) } }],
+  };
+  return JSON.stringify(card);
+}
+
 // ─── TUI Prompt cards ───────────────────────────────────────────────────────
 
 /**

@@ -47,6 +47,21 @@ export const messages: Record<string, string> = {
   'card.repo.current_marker': ' ← 当前',
   'card.repo.note': '也可以回复 `/repo <编号>` 切换，例如：`/repo 1`',
 
+  // 群内授权卡片
+  'card.grant.title': '🔑 使用授权',
+  'card.grant.body_request': '用户 **{name}** 申请在本群使用我。<at id={owner}></at> 请选择授权范围：',
+  'card.grant.body_owner': '请选择对 **{name}** 的授权范围（<at id={owner}></at>）：',
+  'card.grant.btn_chat': '授权本群',
+  'card.grant.btn_global': '全局授权',
+  'card.grant.btn_deny': '拒绝',
+  'card.grant.note': '「授权本群」仅允许其在本群与我对话；管理命令（/cd、/oncall 等）仍仅限 owner。',
+  'card.grant.toast_owner_only': '仅 owner 可操作',
+  'card.grant.toast_expired': '该授权请求已失效',
+  'card.grant.toast_no_repo_perm': '无权限切换仓库',
+  'card.grant.result_chat': '✅ 已授权本群使用',
+  'card.grant.result_global': '✅ 已全局授权',
+  'card.grant.result_deny': '🚫 已拒绝该申请',
+
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 选择要接入的 CLI 会话',
   'card.adopt.placeholder_select': '选择 CLI 会话',

@@ -44,6 +44,21 @@ export const messages: Record<string, string> = {
   'card.repo.current_marker': ' ← current',
   'card.repo.note': 'You can also reply `/repo <N>` to switch — e.g. `/repo 1`.',
 
+  // In-group authorization card
+  'card.grant.title': '🔑 Access Request',
+  'card.grant.body_request': 'User **{name}** is requesting to use me in this chat. <at id={owner}></at> please choose the grant scope:',
+  'card.grant.body_owner': 'Choose the grant scope for **{name}** (<at id={owner}></at>):',
+  'card.grant.btn_chat': 'Grant this chat',
+  'card.grant.btn_global': 'Grant globally',
+  'card.grant.btn_deny': 'Deny',
+  'card.grant.note': '"Grant this chat" only lets them talk to me here; management commands (/cd, /oncall, …) remain owner-only.',
+  'card.grant.toast_owner_only': 'Only the owner can do this',
+  'card.grant.toast_expired': 'This request has expired',
+  'card.grant.toast_no_repo_perm': 'No permission to switch repo',
+  'card.grant.result_chat': '✅ Granted for this chat',
+  'card.grant.result_global': '✅ Granted globally',
+  'card.grant.result_deny': '🚫 Request denied',
+
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 Choose a CLI session to adopt',
   'card.adopt.placeholder_select': 'Pick a CLI session',
