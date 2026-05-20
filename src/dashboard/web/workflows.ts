@@ -321,6 +321,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
       <span id="wf-detail-refresh" class="muted"></span>
     </div>
     <section id="wf-detail-error" class="hint-warn" hidden></section>
+    <section id="wf-cancel-status" class="hint-ok" hidden></section>
     <section id="wf-summary" class="wf-summary-grid"></section>
     <section id="wf-dangling-panel"></section>
     <section class="wf-panel">
@@ -357,6 +358,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   const subtitle = root.querySelector<HTMLElement>('#wf-detail-subtitle')!;
   const refresh = root.querySelector<HTMLElement>('#wf-detail-refresh')!;
   const errorEl = root.querySelector<HTMLElement>('#wf-detail-error')!;
+  const cancelStatusEl = root.querySelector<HTMLElement>('#wf-cancel-status')!;
   const summaryEl = root.querySelector<HTMLElement>('#wf-summary')!;
   const danglingEl = root.querySelector<HTMLElement>('#wf-dangling-panel')!;
   const nodeTbody = root.querySelector<HTMLElement>('#wf-node-tbody')!;
@@ -385,6 +387,16 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     }
     errorEl.hidden = false;
     errorEl.textContent = message;
+  }
+
+  function setCancelStatus(message: string | null): void {
+    if (!message) {
+      cancelStatusEl.hidden = true;
+      cancelStatusEl.textContent = '';
+      return;
+    }
+    cancelStatusEl.hidden = false;
+    cancelStatusEl.textContent = message;
   }
 
   async function fetchSnapshot(): Promise<void> {
@@ -496,7 +508,8 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
       if (!res.ok || !body.ok) {
         throw new Error(body.hint ?? body.error ?? `cancel HTTP ${res.status}`);
       }
-      setError(body.pending ? 'cancel pending; waiting for running activity to drain' : null);
+      setCancelStatus(body.pending ? 'cancel pending; waiting for running activity to drain' : null);
+      setError(null);
       await poll();
     } catch (err: any) {
       setError(err?.message ?? String(err));
@@ -510,6 +523,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   function rerender(): void {
     if (!snapshot) return;
     const run = snapshot.run;
+    if (TERMINAL.has(run.status)) setCancelStatus(null);
     subtitle.innerHTML = `${escapeHtml(run.workflowId ?? '?')} · ${statusBadge(run.status)} · lastSeq ${snapshot.lastSeq}`;
     refresh.textContent = `refreshed ${new Date().toLocaleTimeString()}`;
     cancelBtn.hidden = TERMINAL.has(run.status);
