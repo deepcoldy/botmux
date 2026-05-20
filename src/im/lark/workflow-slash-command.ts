@@ -15,11 +15,12 @@ import type { WorkflowDefinition, ParamDef } from '../../workflows/definition.js
 import type { BotSnapshot } from '../../workflows/events/payloads.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from '../../workflows/runtime.js';
 
-const USAGE = '用法：/workflow run <id> [key=value ...]';
+const USAGE = '用法：/workflow run <id> [key=value ...]\n或：/workflow cancel <runId>';
 const WORKFLOW_ID_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
 export type WorkflowCommand =
   | { kind: 'run'; workflowId: string; rawParams: Record<string, string> }
+  | { kind: 'cancel'; runId: string }
   | { kind: 'invalid'; error: string; usage: string };
 
 export type WorkflowRunCreatedInfo = {
@@ -35,10 +36,22 @@ export type WorkflowCommandResult =
   | {
       handled: true;
       ok: true;
+      command: 'run';
       runId: string;
       workflowId: string;
       params: Record<string, unknown>;
       loopResult: RunLoopResult;
+    }
+  | {
+      handled: true;
+      ok: true;
+      command: 'cancel';
+      runId: string;
+      status: string;
+      alreadyTerminal: boolean;
+      pending?: boolean;
+      cancelEventId?: string;
+      lastSeq: number;
     };
 
 export type WorkflowCommandDeps = {
@@ -50,6 +63,19 @@ export type WorkflowCommandDeps = {
   spawnSubagent?: WorkerSpawnFn;
   attachWorkflowEventWatcher?: (runId: string, ctx: WorkflowRuntimeContext) => { ready?: Promise<unknown> };
   runLoopFn?: (ctx: WorkflowRuntimeContext) => Promise<RunLoopResult>;
+  cancelWorkflowRunFn?: (runId: string, reason: string) => Promise<{
+    ok: true;
+    runId: string;
+    status: string;
+    alreadyTerminal: boolean;
+    pending?: boolean;
+    cancelEventId?: string;
+    lastSeq: number;
+  } | {
+    ok: false;
+    error: string;
+    status?: string;
+  }>;
   onRunCreated?: (info: WorkflowRunCreatedInfo) => Promise<void> | void;
 };
 
@@ -66,8 +92,18 @@ export function parseWorkflowCommand(content: string): WorkflowCommand | null {
 
   const parts = trimmed.split(/\s+/);
   if (parts[0] !== '/workflow') return null;
-  if (parts[1] !== 'run') {
-    return invalid('只支持 /workflow run 子命令');
+  const sub = parts[1];
+  if (sub === 'cancel') {
+    const runId = parts[2];
+    if (!runId) return invalid('缺少 runId');
+    if (parts.length > 3) return invalid('/workflow cancel 只接受 runId');
+    if (!WORKFLOW_ID_PATTERN.test(runId)) {
+      return invalid('runId 只能包含字母、数字、下划线、点和短横线');
+    }
+    return { kind: 'cancel', runId };
+  }
+  if (sub !== 'run') {
+    return invalid('只支持 /workflow run / cancel 子命令');
   }
 
   const workflowId = parts[2];
@@ -130,6 +166,34 @@ export async function executeWorkflowCommand(
   if (command.kind === 'invalid') {
     return { handled: true, ok: false, error: command.error, usage: command.usage };
   }
+  if (command.kind === 'cancel') {
+    if (!deps.cancelWorkflowRunFn) {
+      return {
+        handled: true,
+        ok: false,
+        error: '/workflow cancel requires daemon runtime context',
+        usage: USAGE,
+      };
+    }
+    const result = await deps.cancelWorkflowRunFn(
+      command.runId,
+      'cancelled via /workflow cancel',
+    );
+    if (!result.ok) {
+      return { handled: true, ok: false, error: result.error, usage: USAGE };
+    }
+    return {
+      handled: true,
+      ok: true,
+      command: 'cancel',
+      runId: result.runId,
+      status: result.status,
+      alreadyTerminal: result.alreadyTerminal,
+      pending: result.pending,
+      cancelEventId: result.cancelEventId,
+      lastSeq: result.lastSeq,
+    };
+  }
 
   try {
     const loadDefinition = deps.loadWorkflowDefinitionFn ?? loadWorkflowDefinition;
@@ -166,6 +230,7 @@ export async function executeWorkflowCommand(
     return {
       handled: true,
       ok: true,
+      command: 'run',
       runId,
       workflowId: def.workflowId,
       params,

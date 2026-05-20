@@ -365,7 +365,7 @@ function cleanupWorkflowRun(runId: string): void {
   }
 }
 
-async function cancelWorkflowRunFromDashboard(
+async function cancelWorkflowRunOnDaemon(
   runId: string,
   reason: string,
 ): Promise<{
@@ -546,6 +546,7 @@ async function handleWorkflowCommandIfAny(
       attachWorkflowEventWatcher,
       spawnSubagent: workflowSpawnFn(),
       runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId),
+      cancelWorkflowRunFn: (runId, reason) => cancelWorkflowRunOnDaemon(runId, reason),
       onRunCreated: async (info) => {
         try {
           await sessionReply(
@@ -565,7 +566,7 @@ async function handleWorkflowCommandIfAny(
   if (!result.ok) {
     await sessionReply(
       anchor,
-      `Workflow 启动失败：${result.error}${result.usage ? `\n${result.usage}` : ''}`,
+      `Workflow 命令失败：${result.error}${result.usage ? `\n${result.usage}` : ''}`,
       'text',
       larkAppId,
     );
@@ -577,6 +578,15 @@ async function handleWorkflowCommandIfAny(
 }
 
 function formatWorkflowCommandResult(result: Extract<WorkflowCommandResult, { ok: true }>): string {
+  if (result.command === 'cancel') {
+    if (result.alreadyTerminal) {
+      return `Workflow already terminal: ${result.status}\nrunId: ${result.runId}`;
+    }
+    if (result.pending) {
+      return `Workflow cancel requested; waiting for running activity to drain.\nrunId: ${result.runId}\nstatus: ${result.status}`;
+    }
+    return `Workflow cancel processed.\nrunId: ${result.runId}\nstatus: ${result.status}`;
+  }
   const status =
     result.loopResult.reason === 'awaiting-wait'
       ? '等待审批'
@@ -667,7 +677,7 @@ ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) =
     typeof body.reason === 'string' && body.reason.trim()
       ? body.reason.trim()
       : 'cancelled via dashboard';
-  const result = await cancelWorkflowRunFromDashboard(params.runId, reason);
+  const result = await cancelWorkflowRunOnDaemon(params.runId, reason);
   if (!result.ok) {
     const status =
       result.error === 'bad_run_id' ? 400 :

@@ -54,10 +54,32 @@ describe('/workflow command parsing', () => {
     });
   });
 
+  it('parses /workflow cancel with run id', () => {
+    expect(parseWorkflowCommand('/workflow cancel hello-20260520-abcd1234')).toEqual({
+      kind: 'cancel',
+      runId: 'hello-20260520-abcd1234',
+    });
+  });
+
   it('rejects non key=value params', () => {
     expect(parseWorkflowCommand('/workflow run hello name')).toMatchObject({
       kind: 'invalid',
       error: expect.stringContaining('key=value'),
+    });
+  });
+
+  it('rejects malformed cancel commands', () => {
+    expect(parseWorkflowCommand('/workflow cancel')).toMatchObject({
+      kind: 'invalid',
+      error: expect.stringContaining('runId'),
+    });
+    expect(parseWorkflowCommand('/workflow cancel hello extra')).toMatchObject({
+      kind: 'invalid',
+      error: expect.stringContaining('只接受 runId'),
+    });
+    expect(parseWorkflowCommand('/workflow cancel ../escape')).toMatchObject({
+      kind: 'invalid',
+      error: expect.stringContaining('runId 只能包含'),
     });
   });
 
@@ -105,6 +127,7 @@ describe('executeWorkflowCommand', () => {
     expect(result).toMatchObject({
       handled: true,
       ok: true,
+      command: 'run',
       runId: 'workflow-hello-test',
     });
     expect(attachWorkflowEventWatcher).toHaveBeenCalledTimes(1);
@@ -131,6 +154,68 @@ describe('executeWorkflowCommand', () => {
       handled: true,
       ok: false,
       error: expect.stringContaining("Workflow 'missing' not found"),
+    });
+  });
+
+  it('cancels a run through the daemon runtime hook', async () => {
+    const cancelWorkflowRunFn = vi.fn(async () => ({
+      ok: true as const,
+      runId: 'hello-20260520-abcd1234',
+      status: 'running',
+      alreadyTerminal: false,
+      pending: true,
+      cancelEventId: 'hello-20260520-abcd1234-7',
+      lastSeq: 7,
+    }));
+
+    const result = await executeWorkflowCommand(
+      {
+        content: '/workflow cancel hello-20260520-abcd1234',
+        chatId: 'oc_chat',
+        larkAppId: 'cli_codex',
+        initiator: 'ou_user',
+      },
+      { cancelWorkflowRunFn },
+    );
+
+    expect(cancelWorkflowRunFn).toHaveBeenCalledWith(
+      'hello-20260520-abcd1234',
+      'cancelled via /workflow cancel',
+    );
+    expect(result).toEqual({
+      handled: true,
+      ok: true,
+      command: 'cancel',
+      runId: 'hello-20260520-abcd1234',
+      status: 'running',
+      alreadyTerminal: false,
+      pending: true,
+      cancelEventId: 'hello-20260520-abcd1234-7',
+      lastSeq: 7,
+    });
+  });
+
+  it('returns a user-facing error when cancel runtime hook rejects the run', async () => {
+    const result = await executeWorkflowCommand(
+      {
+        content: '/workflow cancel missing-run',
+        chatId: 'oc_chat',
+        larkAppId: 'cli_codex',
+        initiator: 'ou_user',
+      },
+      {
+        cancelWorkflowRunFn: async () => ({
+          ok: false,
+          error: 'workflow_not_attached',
+          status: 'running',
+        }),
+      },
+    );
+
+    expect(result).toMatchObject({
+      handled: true,
+      ok: false,
+      error: 'workflow_not_attached',
     });
   });
 });
