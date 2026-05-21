@@ -246,18 +246,22 @@ describe('cancel responsiveness — orchestrator + runtime', () => {
     expect(events.find((e) => e.type === 'activityCanceled')).toBeDefined();
   });
 
-  it('case 6: no double terminal when spawn writes success then cancel later arrives', async () => {
-    // Two activities run in parallel.  B succeeds quickly; then cancel
-    // arrives.  The cancel-run.ts fanout should skip B (already terminal)
-    // and only mark C if C is still dangling.
+  it('case 6: cancel observer does not synthesize spurious cancels on a clean run', async () => {
+    // Sanity invariant: in the absence of any `cancelRequested`, the
+    // 200ms polling observer must NOT fire abort and must NOT synthesize
+    // `activityCanceled` events.  A clean parallel fanout run still
+    // satisfies the per-activity terminal-event uniqueness invariant.
+    //
+    // This is NOT a late-cancel regression — case 10 in
+    // workflow-cancel-finalize-e2e.test.ts is where the full late-cancel
+    // chain gets exercised against the daemon finalize closure.
     const def = fanoutDef();
     const { log, ctx } = await bootstrap(def, okSpawn, 'no-double-term');
     await runLoop(ctx);
-    // After the loop, B/C/D all succeeded — no cancel happened, so this
-    // is just a sanity check that the cancel observer doesn't synthesize
-    // spurious cancels.
     const events = await log.readAll();
-    // Per-activity uniqueness invariant.
+    // No cancel signals fired → no activityCanceled events at all.
+    expect(events.find((e) => e.type === 'activityCanceled')).toBeUndefined();
+    // Per-activity terminal-event uniqueness invariant.
     const terminalByActivity = new Map<string, number>();
     for (const e of events) {
       if (

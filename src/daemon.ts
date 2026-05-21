@@ -117,11 +117,21 @@ const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
  * still finalizing the first, it awaits the in-flight finalize instead
  * of re-firing.
  */
+type CancelOnDaemonOk = {
+  ok: true;
+  runId: string;
+  status: string;
+  alreadyTerminal: boolean;
+  cancelEventId?: string;
+  loopReason?: string;
+  pending?: boolean;
+  lastSeq: number;
+};
 const workflowRuns = new Map<string, {
   ctx: WorkflowRuntimeContext;
   running?: Promise<RunLoopResult>;
   aborters?: Map<string, AbortController>;
-  cancelling?: Promise<unknown>;
+  cancelling?: Promise<CancelOnDaemonOk>;
 }>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
@@ -493,91 +503,27 @@ async function cancelWorkflowRunOnDaemon(
         lastSeq: snapshot.lastSeq,
       };
     }
-    // Dedup concurrent cancel calls — second caller awaits the in-flight
-    // finalize instead of re-firing abort/cancelRequested.
+    // Dedup concurrent cancel calls (codex round 3 M1).  The first caller
+    // synchronously assigns `entry.cancelling` BEFORE any await so a
+    // second caller arriving mid-flight sees the in-flight promise and
+    // returns the same result instead of re-writing `cancelRequested` or
+    // re-firing aborters.
     if (entry.cancelling) {
-      await entry.cancelling.catch(() => {});
-      const finalSnap = replay(await entry.ctx.log.readAll());
-      return {
-        ok: true,
-        runId,
-        status: finalSnap.run.status,
-        alreadyTerminal: isTerminalRunStatus(finalSnap.run.status),
-        cancelEventId: finalSnap.cancelledRunIntent?.cancelOriginEventId,
-        loopReason: 'already-cancelling',
-        pending: !isTerminalRunStatus(finalSnap.run.status),
-        lastSeq: finalSnap.lastSeq,
-      };
+      return await entry.cancelling;
     }
-    // 1) Write cancelRequested if not already present.
-    let cancelEventId = snapshot.cancelledRunIntent?.cancelOriginEventId;
-    if (!cancelEventId) {
-      const cancel = await requestCancel(
-        entry.ctx.log,
-        {
-          target: { kind: 'run', runId },
-          reason,
-          by: opts.by ?? 'dashboard',
-        },
-        'human',
-      );
-      cancelEventId = cancel.eventId;
-    }
-    // 2) Fire all in-flight dispatch aborters so workers can shut down
-    //    promptly instead of waiting for the EventLog polling fallback
-    //    (~200ms latency) to notice the new cancelRequested.
-    if (entry.aborters && entry.aborters.size > 0) {
-      const reason: AbortCancelReason = { cancelOriginEventId: cancelEventId };
-      for (const ac of entry.aborters.values()) {
-        if (!ac.signal.aborted) ac.abort(reason);
-      }
-    }
-    // 3) Await the running loop draining, then 4) drive finalize so
-    //    cancel-fanout + nodeCanceled + runCanceled actually get written.
-    //    Without this, the orchestrator's `cancelledRunIntent` short-
-    //    circuit would leave the loop returning no-progress and the
-    //    run would stay non-terminal forever.
-    const finalize = (async () => {
-      try {
-        await entry.running?.catch(() => {});
-      } finally {
-        const current = workflowRuns.get(runId);
-        if (current) {
-          const result = await cancelWorkflowRun({
-            ctx: current.ctx,
-            reason,
-            by: opts.by ?? 'dashboard',
-            actor: 'human',
-            maxTicks: 200,
-          });
-          if (isTerminalRunStatus(result.snapshot.run.status)) {
-            cleanupWorkflowRun(runId);
-          }
-        }
-      }
-    })();
-    entry.cancelling = finalize;
-    finalize.catch((err) => {
+    const cancelling = startRunningCancel(entry, runId, reason, opts.by ?? 'dashboard');
+    entry.cancelling = cancelling;
+    cancelling.catch((err) => {
       logger.warn(
-        `[workflow:${runId}] cancel finalize failed: ${
+        `[workflow:${runId}] cancel foreground failed: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }).finally(() => {
       const e = workflowRuns.get(runId);
-      if (e && e.cancelling === finalize) delete e.cancelling;
+      if (e && e.cancelling === cancelling) delete e.cancelling;
     });
-    const after = replay(await entry.ctx.log.readAll());
-    return {
-      ok: true,
-      runId,
-      status: after.run.status,
-      alreadyTerminal: false,
-      cancelEventId,
-      loopReason: 'already-running',
-      pending: true,
-      lastSeq: after.lastSeq,
-    };
+    return await cancelling;
   }
 
   const current = workflowRuns.get(runId);
@@ -614,6 +560,104 @@ async function cancelWorkflowRunOnDaemon(
     cancelEventId: result.cancelEventId,
     loopReason: result.loopResult?.reason,
     lastSeq: result.snapshot.lastSeq,
+  };
+}
+
+/**
+ * Foreground portion of the running-cancel chain (v0.1.4-a, codex round 3 M1).
+ *
+ * Returns the API response object the caller surfaces to the dashboard /
+ * IM caller.  Synchronously starts a background task that awaits the
+ * running loop draining and then drives `cancelWorkflowRun` to finalize
+ * the cancel chain (cancelDelivered → activityCanceled → nodeCanceled →
+ * runCanceled).
+ *
+ * The function is wrapped in an IIFE'd async closure by the caller and
+ * assigned to `entry.cancelling` BEFORE awaiting it, so that a
+ * concurrent second cancel call sees the in-flight promise and dedupes
+ * onto it instead of re-writing `cancelRequested` or re-firing
+ * aborters.
+ */
+async function startRunningCancel(
+  entry: { ctx: WorkflowRuntimeContext; running?: Promise<RunLoopResult>; aborters?: Map<string, AbortController> },
+  runId: string,
+  reason: string,
+  by: string,
+): Promise<CancelOnDaemonOk> {
+  const snapshot = replay(await entry.ctx.log.readAll());
+  if (isTerminalRunStatus(snapshot.run.status)) {
+    return {
+      ok: true,
+      runId,
+      status: snapshot.run.status,
+      alreadyTerminal: true,
+      cancelEventId: snapshot.cancelledRunIntent?.cancelOriginEventId,
+      lastSeq: snapshot.lastSeq,
+    };
+  }
+
+  // 1) Write `cancelRequested` if not already present.
+  let cancelEventId = snapshot.cancelledRunIntent?.cancelOriginEventId;
+  if (!cancelEventId) {
+    const cancel = await requestCancel(
+      entry.ctx.log,
+      { target: { kind: 'run', runId }, reason, by },
+      'human',
+    );
+    cancelEventId = cancel.eventId;
+  }
+
+  // 2) Fire all in-flight dispatch aborters so workers stop ASAP instead
+  //    of waiting for the EventLog 200ms polling fallback.
+  if (entry.aborters && entry.aborters.size > 0) {
+    const abortReason: AbortCancelReason = { cancelOriginEventId: cancelEventId };
+    for (const ac of entry.aborters.values()) {
+      if (!ac.signal.aborted) ac.abort(abortReason);
+    }
+  }
+
+  // 3) Fire-and-forget background finalize: await the running loop, then
+  //    drive `cancelWorkflowRun` to terminate the run.  Idempotent so a
+  //    redundant invocation (e.g. via a separate cold-attach path) is
+  //    safe — replay short-circuits on already-terminal.
+  void (async () => {
+    try {
+      await entry.running?.catch(() => {});
+    } finally {
+      const current = workflowRuns.get(runId);
+      if (current) {
+        try {
+          const result = await cancelWorkflowRun({
+            ctx: current.ctx,
+            reason,
+            by,
+            actor: 'human',
+            maxTicks: 200,
+          });
+          if (isTerminalRunStatus(result.snapshot.run.status)) {
+            cleanupWorkflowRun(runId);
+          }
+        } catch (err) {
+          logger.warn(
+            `[workflow:${runId}] cancel finalize failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+    }
+  })();
+
+  const after = replay(await entry.ctx.log.readAll());
+  return {
+    ok: true,
+    runId,
+    status: after.run.status,
+    alreadyTerminal: false,
+    cancelEventId,
+    loopReason: 'already-running',
+    pending: true,
+    lastSeq: after.lastSeq,
   };
 }
 
