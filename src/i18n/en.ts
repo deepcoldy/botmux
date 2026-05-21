@@ -59,6 +59,8 @@ export const messages: Record<string, string> = {
   'card.grant.result_chat': '✅ Granted for this chat',
   'card.grant.result_global': '✅ Granted globally',
   'card.grant.result_deny': '🚫 Request denied',
+  'card.grant.notify_chat': '✅ {at} can now use me in this chat — just @-mention me.',
+  'card.grant.notify_global': '✅ {at} now has global access — @-mention me in any chat.',
 
   // /grant, /revoke command replies
   'cmd.grant.owner_only': 'Only the owner can use /grant.',

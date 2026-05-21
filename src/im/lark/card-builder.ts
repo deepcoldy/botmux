@@ -444,6 +444,17 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   return JSON.stringify(card);
 }
 
+/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。 */
+export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string, locale?: Locale): string {
+  const at = `<at id=${targetOpenId}></at>`;
+  const content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+  const card = {
+    config: { wide_screen_mode: true },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
+  };
+  return JSON.stringify(card);
+}
+
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
 export function buildGrantResultCard(kind: 'chat' | 'global' | 'deny', locale?: Locale): string {
   const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';

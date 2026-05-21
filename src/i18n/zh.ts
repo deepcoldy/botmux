@@ -62,6 +62,8 @@ export const messages: Record<string, string> = {
   'card.grant.result_chat': '✅ 已授权本群使用',
   'card.grant.result_global': '✅ 已全局授权',
   'card.grant.result_deny': '🚫 已拒绝该申请',
+  'card.grant.notify_chat': '✅ {at} 已获授权在本群使用我，发消息 @ 我即可。',
+  'card.grant.notify_global': '✅ {at} 已获全局授权，在任意群发消息 @ 我即可。',
 
   // /grant、/revoke 命令回执
   'cmd.grant.owner_only': '仅 owner 可使用 /grant。',

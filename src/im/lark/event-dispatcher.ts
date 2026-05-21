@@ -731,10 +731,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     'card.action.trigger': async (data: any) => {
       try {
-        const cardBody = await handlers.handleCardAction(data, larkAppId);
-        // If the handler returns a card body (e.g. toggle_stream), return it
-        // so Lark renders the update immediately without waiting for an API PATCH.
-        if (cardBody) return { card: { type: 'raw', data: cardBody } };
+        const result = await handlers.handleCardAction(data, larkAppId);
+        // The handler may return:
+        //   - an already-shaped Lark response ({toast} and/or {card}) → pass through
+        //     so toasts (e.g. "仅 owner 可操作") and explicit card payloads render;
+        //   - a raw card body (e.g. toggle_stream) → wrap as an in-place card patch
+        //     so Lark updates the clicked card without waiting for an API PATCH.
+        if (result && (result.toast || result.card)) return result;
+        if (result) return { card: { type: 'raw', data: result } };
       } catch (err) {
         logger.error(`Error handling card action: ${err}`);
       }

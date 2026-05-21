@@ -7,8 +7,8 @@ import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
-import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, getCliDisplayName, truncateContent } from './card-builder.js';
+import { sendUserMessage, updateMessage, deleteMessage, replyMessage } from './client.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied } from './grant-pending.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
@@ -146,24 +146,36 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!target || !grantChatId || !nonce || !checkNonce(larkAppId, grantChatId, target, nonce)) {
       return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
     }
+    // 拒绝：只把卡更新成「已拒绝」+ 进 deny 冷却，绝不触碰 grant-store。
+    // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
       markDenied(larkAppId, grantChatId, target);
-      if (cardMessageId) await updateMessage(larkAppId, cardMessageId, buildGrantResultCard('deny', loc));
-      return;
+      return JSON.parse(buildGrantResultCard('deny', loc));
     }
+    // 授权：先落库。落库失败不撤卡、保留 pending（owner 可重试），给 toast。
     const res = value.action === 'grant_chat'
       ? await addChatGrant(larkAppId, grantChatId, target)
       : await addGlobalGrant(larkAppId, target);
     if (!res.ok) {
-      // 写失败：保留 pending（owner 可重试），卡片不渲染成成功，给 toast。
       logger.warn(`Grant action "${value.action}" store failed: ${res.reason}`);
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: res.reason }, loc) } };
     }
     clearPending(larkAppId, grantChatId, target);
+    const kind = value.action === 'grant_chat' ? 'chat' : 'global';
+    // 授权成功后：在原线程 @ 被授权人发通知 + 撤回授权卡（用户要求）。
+    // 这两步失败不回滚授权（已落库），仅记日志，并兜底用 in-place patch 让 owner 看到结果。
     if (cardMessageId) {
-      await updateMessage(larkAppId, cardMessageId, buildGrantResultCard(value.action === 'grant_chat' ? 'chat' : 'global', loc));
+      try {
+        await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, target, loc), 'interactive', true);
+        await deleteMessage(larkAppId, cardMessageId);
+        return; // 卡已撤回，无需返回 patch
+      } catch (err) {
+        logger.warn(`grant notify/withdraw failed (grant still applied): ${err}`);
+        // 落到下面的 in-place patch 兜底
+      }
     }
-    return;
+    // 兜底（无 card message_id，或撤回/通知失败）：靠 callback 返回 patch 原地更新卡。
+    return JSON.parse(buildGrantResultCard(kind, loc));
   }
 
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
