@@ -12,6 +12,7 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { getChatMode, replyMessage, sendMessage } from '../im/lark/client.js';
 import { resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
+import { getBotAvatarUrl } from '../bot-registry.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -395,6 +396,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
+    botAvatarUrl: getBotAvatarUrl(cachedLarkAppId),
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     autoboundChatCount: autoboundChats.length,
   });

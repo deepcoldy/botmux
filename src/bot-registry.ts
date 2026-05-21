@@ -64,6 +64,7 @@ export interface BotState {
   client: Lark.Client;
   botOpenId?: string;
   botName?: string;       // Lark app display name (from /bot/v3/info)
+  botAvatarUrl?: string;  // Lark app avatar URL (from /bot/v3/info)
   resolvedAllowedUsers: string[];
   /** raw allowedUsers 条目 → 解析后的 open_id。供 /revoke 反查并删除 email 形式的 raw 条目。 */
   rawAllowedUserResolution: Map<string, string>;
@@ -139,6 +140,11 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
 export function getBotOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.botOpenId;
+}
+
+/** Bot 自身的头像 URL（从 /bot/v3/info 取得，开放 CDN，可直接给 <img>）。 */
+export function getBotAvatarUrl(larkAppId: string): string | undefined {
+  return bots.get(larkAppId)?.botAvatarUrl;
 }
 
 export function getAllBots(): BotState[] {

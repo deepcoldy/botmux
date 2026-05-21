@@ -89,10 +89,12 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
 
   const openId = botData.bot?.open_id;
   const appName = botData.bot?.app_name;
+  const avatarUrl = botData.bot?.avatar_url;
   if (openId) {
     bot.botOpenId = openId;
     if (appName) bot.botName = appName;
-    logger.info(`Bot open_id: ${bot.botOpenId}`);
+    if (typeof avatarUrl === 'string' && avatarUrl) bot.botAvatarUrl = avatarUrl;
+    logger.info(`Bot open_id: ${bot.botOpenId} | avatar_url: ${avatarUrl ?? '(missing)'}`);
   } else {
     throw new Error('No open_id in bot info response');
   }

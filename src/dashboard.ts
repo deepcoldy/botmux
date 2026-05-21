@@ -508,6 +508,7 @@ const server = createServer(async (req, res) => {
           return {
             larkAppId: d.larkAppId,
             botName: d.botName ?? j.botName,
+            botAvatarUrl: j.botAvatarUrl,
             online: true,
             defaultOncall: j.defaultOncall,
             autoboundChatCount: j.autoboundChatCount ?? 0,
@@ -517,6 +518,37 @@ const server = createServer(async (req, res) => {
         }
       }));
       return jsonRes(res, 200, { bots: out });
+    }
+
+    // GET /api/bots/:appId/avatar — fetch the bot's avatar from upstream Lark
+    // CDN and pipe to the browser. Avoids exposing the bot's CDN URL (which
+    // may not be reachable from arbitrary user networks / has referer rules)
+    // and keeps the browser talking only to the dashboard host.
+    let mAvatar: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mAvatar = url.pathname.match(/^\/api\/bots\/([^/]+)\/avatar$/))) {
+      const appId = decodeURIComponent(mAvatar[1]);
+      const d = registry.getByAppId(appId);
+      if (!d) return jsonRes(res, 404, { error: 'bot_offline' });
+      try {
+        const meta = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
+        if (!meta.ok) return jsonRes(res, 502, { error: 'meta_failed' });
+        const j = await meta.json() as { botAvatarUrl?: string };
+        if (!j.botAvatarUrl) return jsonRes(res, 404, { error: 'no_avatar' });
+        const upstream = await fetch(j.botAvatarUrl);
+        if (!upstream.ok || !upstream.body) {
+          return jsonRes(res, 502, { error: `upstream_${upstream.status}` });
+        }
+        res.writeHead(200, {
+          'content-type': upstream.headers.get('content-type') ?? 'image/jpeg',
+          'cache-control': 'public, max-age=86400',
+        });
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        res.end(buf);
+      } catch (e: any) {
+        logger.warn(`[dashboard] avatar proxy ${appId}: ${e?.message ?? e}`);
+        jsonRes(res, 502, { error: 'proxy_failed' });
+      }
+      return;
     }
 
     let mBotDef: RegExpMatchArray | null;
