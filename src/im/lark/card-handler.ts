@@ -165,16 +165,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 授权成功后：在原线程 @ 被授权人发通知 + 撤回授权卡（用户要求）。
     // 这两步失败不回滚授权（已落库），仅记日志，并兜底用 in-place patch 让 owner 看到结果。
     if (cardMessageId) {
+      // 通知是 best-effort（@被授权人）；失败不影响主流程，只记日志。
       try {
         await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, target, loc), 'interactive', true);
-        await deleteMessage(larkAppId, cardMessageId);
-        return; // 卡已撤回，无需返回 patch
       } catch (err) {
-        logger.warn(`grant notify/withdraw failed (grant still applied): ${err}`);
-        // 落到下面的 in-place patch 兜底
+        logger.warn(`grant notify failed (grant still applied): ${err}`);
       }
+      // 撤回授权卡。deleteMessage 返回 boolean——只有确认撤回成功才不返回 patch；
+      // 否则（SDK 吞错/非 0 code）落到 in-place patch，避免卡片留在原地无终态。
+      const withdrawn = await deleteMessage(larkAppId, cardMessageId);
+      if (withdrawn) return;
+      logger.warn(`grant card withdraw failed (grant still applied); falling back to in-place patch`);
     }
-    // 兜底（无 card message_id，或撤回/通知失败）：靠 callback 返回 patch 原地更新卡。
+    // 兜底（无 card message_id，或撤回失败）：靠 callback 返回 patch 原地更新卡。
     return JSON.parse(buildGrantResultCard(kind, loc));
   }
 

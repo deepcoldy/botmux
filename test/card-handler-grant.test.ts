@@ -13,7 +13,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 });
 
 const replyMock = vi.fn(async () => 'om_notify');
-const deleteMock = vi.fn(async () => {});
+const deleteMock = vi.fn(async () => true);  // deleteMessage now returns boolean (success)
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return { ...actual, replyMessage: (...a: any[]) => replyMock(...a), deleteMessage: (...a: any[]) => deleteMock(...a) };
@@ -38,7 +38,7 @@ function action(a: string, extra: Record<string, any> = {}, openMsgId?: string) 
 }
 
 beforeEach(() => {
-  replyMock.mockClear(); deleteMock.mockClear(); deleteMock.mockImplementation(async () => {});
+  replyMock.mockClear(); deleteMock.mockClear(); deleteMock.mockImplementation(async () => true);
   const dir = mkdtempSync(join(tmpdir(), 'botmux-cardgrant-'));
   configPath = join(dir, 'bots.json');
   writeFileSync(configPath, JSON.stringify([{ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] }], null, 2));
@@ -89,9 +89,9 @@ describe('card-handler grant actions', () => {
     expect(registry.getBot('h1').resolvedAllowedUsers).toContain('ou_g');
   });
 
-  it('withdraw fails but grant still applied → fallback patch, still persisted', async () => {
+  it('withdraw returns false (swallowed SDK error) → fallback patch, still persisted', async () => {
     const { registry, pending, handler } = await fresh();
-    deleteMock.mockRejectedValueOnce(new Error('recall window passed'));
+    deleteMock.mockResolvedValueOnce(false);   // production deleteMessage swallows errors → returns false
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
     expect(res?.elements).toBeTruthy();           // fell through to in-place patch

@@ -240,12 +240,24 @@ export async function getChatMode(
   return mode;
 }
 
-export async function deleteMessage(larkAppId: string, messageId: string): Promise<void> {
+/**
+ * Recall (delete) a message. Returns `true` only when Lark confirms success,
+ * `false` on SDK throw or a non-zero response code — so callers that need to
+ * know whether the withdraw actually happened (e.g. grant-card withdraw) can
+ * fall back instead of assuming success. Fire-and-forget callers can ignore it.
+ */
+export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
   const c = getBotClient(larkAppId);
   try {
-    await c.im.v1.message.delete({ path: { message_id: messageId } });
+    const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
+    if (res && typeof res.code === 'number' && res.code !== 0) {
+      logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+      return false;
+    }
+    return true;
   } catch (err) {
     logger.debug(`Failed to delete message ${messageId}: ${err}`);
+    return false;
   }
 }
 
