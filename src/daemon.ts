@@ -64,6 +64,7 @@ import {
   restoreActiveSessions,
   executeScheduledTask,
   persistStreamCardState,
+  rememberLastCliInput,
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
@@ -291,6 +292,8 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string): void {
+  const previousUsageLimit = ds.usageLimit;
+  const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
   if (ds.streamCardId && ds.workerPort) {
     const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
     const dsBotCfg = getBot(ds.larkAppId).config;
@@ -298,9 +301,9 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
     const prevMode = ds.displayMode ?? 'hidden';
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
-      ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId,
+      ds.lastScreenContent ?? '', previousStatus, dsBotCfg.cliId,
       prevMode, ds.streamCardNonce, ds.currentImageKey,
-      !!ds.adoptedFrom, false, localeForBot(ds.larkAppId),
+      !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -316,6 +319,11 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }
   }
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  ds.usageLimit = undefined;
   ds.streamCardPending = true;
   ds.currentTurnTitle = title.substring(0, 50);
   ds.currentImageKey = undefined;
@@ -619,6 +627,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender);
+    rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -645,6 +654,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender);
+    rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -968,6 +978,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender);
+      rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -994,6 +1005,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender);
+      rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
     }
 
@@ -1028,12 +1040,18 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           sender: await getThreadSender(),
         });
     beginNewTurn(ds, parsed.content);
+    rememberLastCliInput(ds, promptContent, msgContent);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
     // card instead of PATCHing the previous turn's card in place.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
+    if (ds.usageLimitRetryTimer) {
+      clearTimeout(ds.usageLimitRetryTimer);
+      ds.usageLimitRetryTimer = undefined;
+    }
+    ds.usageLimit = undefined;
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     // The cosmetic freeze step (above) is gated on a live worker. With no
     // worker we just park the current card in frozenCards — the upcoming
@@ -1069,6 +1087,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
       sender: await getThreadSender(),
     });
+    rememberLastCliInput(ds, promptContent, wrappedPrompt);
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }
 }

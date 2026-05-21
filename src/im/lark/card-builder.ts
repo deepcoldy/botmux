@@ -2,6 +2,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import type { AdoptableSession } from '../../core/session-discovery.js';
 import type { DisplayMode } from '../../types.js';
+import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
 
 const cliDisplayNames: Record<CliId, string> = {
@@ -198,7 +199,7 @@ export function buildStreamingCard(
   terminalUrl: string,
   title: string,
   screenContent: string,
-  status: 'starting' | 'working' | 'idle' | 'analyzing',
+  status: 'starting' | 'working' | 'idle' | 'analyzing' | 'limited',
   cliId?: CliId,
   displayMode: DisplayMode = 'hidden',
   cardNonce?: string,
@@ -206,23 +207,38 @@ export function buildStreamingCard(
   adoptMode?: boolean,
   showTakeover?: boolean,
   locale?: Locale,
+  usageLimit?: CliUsageLimitState,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
-  const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple' } as const;
+  const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+  const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green' } as const;
   const statusLabel = (s: typeof status): string => {
     switch (s) {
       case 'starting': return t('card.status.starting', undefined, locale);
       case 'working': return t('card.status.working', undefined, locale);
       case 'idle': return t('card.status.idle', undefined, locale);
       case 'analyzing': return t('card.status.analyzing', undefined, locale);
+      case 'limited': return usageLimit?.retryReady
+        ? t('card.status.retry_ready', undefined, locale)
+        : t('card.status.limited', undefined, locale);
     }
   };
 
   const elements: any[] = [];
 
   // ── Output body ─────────────────────────────────────────────────────────
+  if (status === 'limited' && usageLimit) {
+    elements.push({
+      tag: 'markdown',
+      content: usageLimit.retryReady
+        ? t('card.usage_limit.retry_ready', { cliName }, locale)
+        : t('card.usage_limit.retry_at', { cliName, retryLabel: usageLimit.retryLabel }, locale),
+    });
+    elements.push({ tag: 'hr' });
+  }
+
   if (displayMode === 'screenshot') {
     if (imageKey) {
       elements.push({
@@ -269,6 +285,14 @@ export function buildStreamingCard(
     type: 'primary',
     multi_url: { url: terminalUrl, pc_url: terminalUrl, android_url: terminalUrl, ios_url: terminalUrl },
   });
+  if (status === 'limited' && usageLimit?.retryReady) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.retry_last_task', undefined, locale) },
+      type: 'primary' as const,
+      value: { action: 'retry_last_task', ...actionBase },
+    });
+  }
   headerActions.push({
     tag: 'button',
     text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
@@ -336,7 +360,7 @@ export function buildStreamingCard(
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${statusLabel(status)}` },
-      template: templateMap[status],
+      template: templateMap[displayStatus],
     },
     elements,
   };

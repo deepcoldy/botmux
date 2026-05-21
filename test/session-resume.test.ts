@@ -199,6 +199,10 @@ describe('resumeSession', () => {
   describe('success path', () => {
     it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', () => {
       const closed = makeClosedSession({ rootMessageId: 'om_threadA' });
+      (closed as any).lastUserPrompt = '继续修复限额后的任务';
+      (closed as any).lastCliInput = '<user_message>继续修复限额后的任务</user_message>';
+      sessionStore.updateSession(closed);
+      sessionStore.closeSession(closed.sessionId);
       const map = new Map<string, DaemonSession>();
 
       const r = resumeSession(closed.sessionId, map);
@@ -218,6 +222,8 @@ describe('resumeSession', () => {
       expect(ds.workingDir).toBe('/tmp/proj');
       expect(ds.worker).toBeNull();
       expect(ds.larkAppId).toBe('app_test');
+      expect(ds.lastUserPrompt).toBe('继续修复限额后的任务');
+      expect(ds.lastCliInput).toBe('<user_message>继续修复限额后的任务</user_message>');
     });
 
     it('uses chatId as the routing anchor for chat-scope sessions', () => {

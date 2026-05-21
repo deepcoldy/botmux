@@ -1,5 +1,6 @@
 import type { ChildProcess } from 'node:child_process';
 import type { Session, DaemonToWorker, LarkAttachment, LarkMention, DisplayMode } from '../types.js';
+import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -66,7 +67,11 @@ export interface DaemonSession {
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
-  lastScreenStatus?: 'starting' | 'working' | 'idle' | 'analyzing';  // last screen_update status
+  lastScreenStatus?: 'starting' | 'working' | 'idle' | 'analyzing' | 'limited';  // last screen_update status
+  usageLimit?: CliUsageLimitState;
+  usageLimitRetryTimer?: NodeJS.Timeout;
+  lastUserPrompt?: string;
+  lastCliInput?: string;
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)

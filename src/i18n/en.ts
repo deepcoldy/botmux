@@ -17,12 +17,15 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_up': '⇞ Page ½ Up',
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
+  'card.btn.retry_last_task': '🔁 Retry Last Task',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
   'card.status.analyzing': 'Analyzing…',
+  'card.status.limited': 'Limit reached',
+  'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
   'card.status.session_closed': '🛑 Session Closed',
   'card.status.selected': 'Selected',
@@ -36,6 +39,8 @@ export const messages: Record<string, string> = {
   'card.body.cli_no_cli_resume': '_{cliName} cannot resume a specific session from the CLI; you can resume here in Lark._',
   'card.body.working_dir': '📁 Working dir:',
   'card.body.choose_label': 'Choice:',
+  'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
+  'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -237,6 +242,9 @@ export const messages: Record<string, string> = {
   'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
   'card.action.continue_using_current_repo': 'Keeping current repo: {cwd}',
+  'card.action.retry_last_task_missing': '⚠️ Cannot find the last task to retry. Send a new message instead.',
+  'card.action.retry_last_task_unavailable': '⚠️ This retry state is no longer active. Send a new message instead.',
+  'card.action.retry_last_task_not_ready': '⚠️ The limit is still active. Try again after {retryLabel}.',
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',

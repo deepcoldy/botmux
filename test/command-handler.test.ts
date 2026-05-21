@@ -128,6 +128,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/home/testuser/projects'),
   getProjectScanDir: vi.fn(() => '/home/testuser'),
   getProjectScanDirs: vi.fn(() => ['/home/testuser']),
+  rememberLastCliInput: vi.fn((ds: any, userPrompt: string, cliInput: string) => {
+    ds.lastUserPrompt = userPrompt;
+    ds.lastCliInput = cliInput;
+  }),
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({

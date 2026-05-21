@@ -79,6 +79,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   getProjectScanDir: vi.fn(() => '/tmp'),
   getProjectScanDirs: vi.fn(() => ['/tmp']),
   getAvailableBots: vi.fn(async () => []),
+  rememberLastCliInput: vi.fn((ds: any, userPrompt: string, cliInput: string) => {
+    ds.lastUserPrompt = userPrompt;
+    ds.lastCliInput = cliInput;
+  }),
 }));
 
 vi.mock('../src/services/frozen-card-store.js', () => ({

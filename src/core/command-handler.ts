@@ -14,7 +14,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
-import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
+import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
@@ -389,8 +389,9 @@ export async function handleCommand(
             const botCfg = selfBot.config;
             ds.pendingRepo = false;
             const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+            const pendingPrompt = ds.pendingPrompt ?? '';
             const prompt = buildNewTopicPrompt(
-              ds.pendingPrompt ?? '',
+              pendingPrompt,
               ds.session.sessionId,
               botCfg.cliId,
               botCfg.cliPathOverride,
@@ -402,6 +403,7 @@ export async function handleCommand(
               loc,
               ds.pendingSender,
             );
+            rememberLastCliInput(ds, pendingPrompt, prompt);
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
@@ -414,6 +416,8 @@ export async function handleCommand(
             sessionStore.closeSession(ds.session.sessionId);
             const session = sessionStore.createSession(ds.chatId, rootId, displayName, ds.chatType);
             ds.session = session;
+            ds.lastUserPrompt = undefined;
+            ds.lastCliInput = undefined;
             ds.session.workingDir = selectedPath;
             ds.session.larkAppId = ds.larkAppId;
             sessionStore.updateSession(ds.session);
@@ -464,8 +468,9 @@ export async function handleCommand(
           const botCfg = selfBot.config;
           ds.pendingRepo = false;
           const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+          const pendingPrompt = ds.pendingPrompt ?? '';
           const prompt = buildNewTopicPrompt(
-            ds.pendingPrompt ?? '',
+            pendingPrompt,
             ds.session.sessionId,
             botCfg.cliId,
             botCfg.cliPathOverride,
@@ -477,6 +482,7 @@ export async function handleCommand(
             loc,
             ds.pendingSender,
           );
+          rememberLastCliInput(ds, pendingPrompt, prompt);
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;

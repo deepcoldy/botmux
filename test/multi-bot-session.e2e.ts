@@ -23,6 +23,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   getAvailableBots: vi.fn(async () => []),
+  rememberLastCliInput: vi.fn((ds: any, userPrompt: string, cliInput: string) => {
+    ds.lastUserPrompt = userPrompt;
+    ds.lastCliInput = cliInput;
+  }),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({

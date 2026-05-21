@@ -20,12 +20,15 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_up': '⇞ 上半屏',
   'card.btn.half_page_down': '⇟ 下半屏',
   'card.btn.send_custom': '📝 发送自定义回复',
+  'card.btn.retry_last_task': '🔁 重发上一条任务',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
   'card.status.analyzing': '正在分析…',
+  'card.status.limited': '限额已达',
+  'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
   'card.status.session_closed': '🛑 会话已关闭',
   'card.status.selected': '已选择',
@@ -39,6 +42,8 @@ export const messages: Record<string, string> = {
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',
   'card.body.working_dir': '📁 工作目录：',
   'card.body.choose_label': '选择:',
+  'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
+  'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -240,6 +245,9 @@ export const messages: Record<string, string> = {
   'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
   'card.action.continue_using_current_repo': '继续使用当前仓库：{cwd}',
+  'card.action.retry_last_task_missing': '⚠️ 找不到上一条任务，无法重发。请直接发送新的消息。',
+  'card.action.retry_last_task_unavailable': '⚠️ 当前重试状态已失效。请直接发送新的消息。',
+  'card.action.retry_last_task_not_ready': '⚠️ 当前仍在限额中，请在 {retryLabel} 后再试。',
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ 已采纳的 CLI 会话已退出',

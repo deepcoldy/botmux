@@ -96,6 +96,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   // displayMode — without a stub here the test crashes with "No export …"
   // before exercising the PATCH serialization we're actually testing.
   persistStreamCardState: vi.fn(),
+  rememberLastCliInput: vi.fn((ds: any, userPrompt: string, cliInput: string) => {
+    ds.lastUserPrompt = userPrompt;
+    ds.lastCliInput = cliInput;
+  }),
   resumeSession: vi.fn(),
 }));
 

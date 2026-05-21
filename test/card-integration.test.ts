@@ -26,6 +26,7 @@ import {
   makeCloseEvent,
   makeResumeEvent,
   makeGetWriteLinkEvent,
+  makeRetryLastTaskEvent,
 } from './fixtures/card-action-events.js';
 
 // ─── Shared state ─────────────────────────────────────────────────────────
@@ -138,6 +139,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   persistStreamCardState: vi.fn(),
   buildBridgeInputContent: vi.fn((s: string) => s),
   buildFollowUpContent: vi.fn((s: string) => s),
+  rememberLastCliInput: vi.fn((ds: any, userPrompt: string, cliInput: string) => {
+    ds.lastUserPrompt = userPrompt;
+    ds.lastCliInput = cliInput;
+  }),
   // Resume action delegates to session-manager — tests stub per-scenario.
   resumeSession: vi.fn(),
 }));
@@ -832,6 +837,58 @@ describe('Card integration: full event flow', () => {
       expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'restart' });
       expect(forkWorker).not.toHaveBeenCalled();
       // sessionReply was used to surface the rejection message.
+      expect(deps.sessionReply).toHaveBeenCalled();
+    });
+  });
+
+  describe('Scenario 8: usage-limit retry action', () => {
+    it('resends the stored CLI input and clears the limit state when retry is ready', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_stream_card_retry',
+        lastScreenStatus: 'limited',
+        usageLimit: {
+          limited: true,
+          kind: 'usage',
+          retryAtMs: Date.now() - 1000,
+          retryLabel: '10:36 PM',
+          retryReady: true,
+        },
+        lastUserPrompt: '继续',
+        lastCliInput: '<user_message>继续</user_message>',
+        currentImageKey: 'img_old',
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeRetryLastTaskEvent(ROOT_ID), deps, APP_ID);
+
+      expect((ds.worker as any).send).toHaveBeenCalledWith({
+        type: 'message',
+        content: '<user_message>继续</user_message>',
+      });
+      expect(ds.usageLimit).toBeUndefined();
+      expect(ds.usageLimitRetryTimer).toBeUndefined();
+      expect(ds.lastScreenStatus).toBe('working');
+      expect(ds.streamCardPending).toBe(true);
+      expect(ds.currentImageKey).toBeUndefined();
+      expect(ds.currentTurnTitle).toBe('继续');
+    });
+
+    it('does not resend from a stale retry button after the limit state is cleared', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_stream_card_stale_retry',
+        lastScreenStatus: 'working',
+        lastUserPrompt: '继续',
+        lastCliInput: '<user_message>继续</user_message>',
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeRetryLastTaskEvent(ROOT_ID), deps, APP_ID);
+
+      expect((ds.worker as any).send).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalled();
     });
   });

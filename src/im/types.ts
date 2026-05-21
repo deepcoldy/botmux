@@ -51,7 +51,7 @@ export interface ImCardBuilder {
     terminalUrl: string;
     title: string;
     content: string;
-    status: 'starting' | 'working' | 'idle';
+    status: 'starting' | 'working' | 'idle' | 'limited';
   }): ImCard;
 
   buildRepoSelectCard(opts: {

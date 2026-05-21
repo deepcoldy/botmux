@@ -294,6 +294,72 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('Fix \\*bug\\*');
       expect(card.header.title.content).toContain('等待输入');
     });
+
+    it('should show red usage-limit status with retry time', () => {
+      const card = parse(buildStreamingCard(
+        SID,
+        ROOT,
+        URL,
+        TITLE,
+        '',
+        'limited',
+        'codex',
+        'hidden',
+        undefined,
+        undefined,
+        false,
+        false,
+        undefined,
+        {
+          limited: true,
+          kind: 'usage',
+          retryAtMs: new Date(2026, 4, 19, 22, 36).getTime(),
+          retryLabel: '10:36 PM',
+          retryReady: false,
+        },
+      ));
+
+      expect(card.header.template).toBe('red');
+      expect(card.header.title.content).toContain('限额已达');
+      expect(JSON.stringify(card)).toContain('10:36 PM');
+      const actions = findActions(card);
+      expect(actions.find((a: any) => a.value?.action === 'retry_last_task')).toBeUndefined();
+    });
+
+    it('should show retry-ready status and retry button after reset time', () => {
+      const card = parse(buildStreamingCard(
+        SID,
+        ROOT,
+        URL,
+        TITLE,
+        '',
+        'limited',
+        'codex',
+        'hidden',
+        'nonce_123',
+        undefined,
+        false,
+        false,
+        undefined,
+        {
+          limited: true,
+          kind: 'usage',
+          retryAtMs: new Date(2026, 4, 19, 22, 36).getTime(),
+          retryLabel: '10:36 PM',
+          retryReady: true,
+        },
+      ));
+
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('可重试');
+      const actions = findActions(card);
+      const retryBtn = actions.find((a: any) => a.value?.action === 'retry_last_task');
+      expect(retryBtn).toBeDefined();
+      expect(retryBtn.text.content).toContain('重发上一条任务');
+      expect(retryBtn.value.root_id).toBe(ROOT);
+      expect(retryBtn.value.session_id).toBe(SID);
+      expect(retryBtn.value.card_nonce).toBe('nonce_123');
+    });
   });
 
   // ── Hidden display mode ────────────────────────────────────────────────

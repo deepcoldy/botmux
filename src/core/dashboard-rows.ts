@@ -14,7 +14,7 @@ export interface SessionRow {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
-  status: 'starting' | 'working' | 'idle' | 'analyzing' | 'closed';
+  status: 'starting' | 'working' | 'idle' | 'analyzing' | 'limited' | 'closed';
   adopt: boolean;
   spawnedAt: number;
   lastMessageAt: number;
