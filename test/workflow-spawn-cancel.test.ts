@@ -134,6 +134,78 @@ describe('daemon-spawn cancel responsiveness', () => {
     }
   });
 
+  it('case 10: cancel wins over a pending quiesce (final_output landed, abort fires before quiesce expires)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeWorker({ exitOn: ['SIGINT'] });
+      const deps = createWorkflowDaemonSpawn({
+        resolveLarkCredentials: () => ({ larkAppId: 'cli_x', larkAppSecret: 'sec' }),
+        factory: makeFactory(fake.worker),
+        cancelGraceMs: 5000,
+        defaultTimeoutMs: 60_000,
+        quiesceMs: 800,
+      });
+      const ac = new AbortController();
+      const reason: AbortCancelReason = { cancelOriginEventId: 'evt-quiesce-race' };
+      const promise = deps.runOneShot({ ...baseInput(), cancelSignal: ac.signal });
+      const settled = promise.catch((err) => err);
+      // Worker reports final_output → quiesce timer armed at t+800.
+      await vi.advanceTimersByTimeAsync(0);
+      fake.emitter.emit('message', {
+        type: 'final_output',
+        turnId: 't1',
+        content: '<<WF-OUT>>{"ok":true}<<WF-END>>',
+      });
+      // Inside the quiesce window — abort fires.
+      await vi.advanceTimersByTimeAsync(400);
+      ac.abort(reason);
+      // Advance past where quiesce WOULD fire if we hadn't disarmed it.
+      await vi.advanceTimersByTimeAsync(1000);
+      // Worker is cooperative — exits on SIGINT.  Promise must settle as
+      // CANCELLED, not as success from the late quiesce.
+      expect(fake.kills).toContain('SIGINT');
+      expect(fake.kills).not.toContain('SIGTERM');
+      const result = await settled;
+      expect(result).toBeInstanceOf(WorkflowSpawnCancelledError);
+      expect((result as WorkflowSpawnCancelledError).cancelOriginEventId).toBe('evt-quiesce-race');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('case 11: cancel wins over a post-abort hardDeadline / worker error', async () => {
+    vi.useFakeTimers();
+    try {
+      // Worker stays alive until SIGKILL — gives us a long enough window
+      // for the (disarmed) hardDeadline to be irrelevant; the exit
+      // handler must settle as cancelled, not as timeout failure.
+      const fake = makeFakeWorker({ exitOn: ['SIGKILL'] });
+      const deps = createWorkflowDaemonSpawn({
+        resolveLarkCredentials: () => ({ larkAppId: 'cli_x', larkAppSecret: 'sec' }),
+        factory: makeFactory(fake.worker),
+        cancelGraceMs: 5000,
+        defaultTimeoutMs: 10_000,
+        quiesceMs: 100,
+      });
+      const ac = new AbortController();
+      const reason: AbortCancelReason = { cancelOriginEventId: 'evt-timeout-race' };
+      const promise = deps.runOneShot({ ...baseInput(), cancelSignal: ac.signal });
+      const settled = promise.catch((err) => err);
+      await vi.advanceTimersByTimeAsync(0);
+      ac.abort(reason);
+      // Even if we advance well past the original hardDeadline window,
+      // it must have been disarmed by onCancelAbort.  Worker stays alive
+      // until SIGKILL at t≥5000.
+      await vi.advanceTimersByTimeAsync(15_000);
+      const result = await settled;
+      expect(result).toBeInstanceOf(WorkflowSpawnCancelledError);
+      expect((result as WorkflowSpawnCancelledError).cancelOriginEventId).toBe('evt-timeout-race');
+      expect(fake.kills).toContain('SIGKILL');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('case 9: worker exits voluntarily after SIGINT — promise settles AFTER exit, no SIGKILL', async () => {
     vi.useFakeTimers();
     try {

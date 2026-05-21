@@ -301,6 +301,16 @@ async function runOneShotImpl(
         'system',
         `cancel signal received origin=${cancelOriginEventId || '<missing>'}, sending close+SIGINT (grace ${deps.cancelGraceMs}ms)`,
       );
+      // Cancel-wins (codex round 5 M1): once aborted, no other path may
+      // settle the promise before the worker exits — neither quiesce →
+      // success nor hardDeadline / error → failure.  Disarm those timers
+      // here so they can't fire after the abort; `finish` and `fail` also
+      // short-circuit on `cancelRequested` defensively.
+      clearTimeout(hardDeadline);
+      if (quiesceTimer) {
+        clearTimeout(quiesceTimer);
+        quiesceTimer = undefined;
+      }
       try { worker.send({ type: 'close' }); } catch { /* already gone */ }
       try { worker.kill('SIGINT'); } catch { /* already gone */ }
       sigkillTimer = setTimeout(() => {
@@ -338,6 +348,19 @@ async function runOneShotImpl(
 
     const fail = (err: Error): void => {
       if (settled) return;
+      // Cancel-wins (codex round 5 M1): once an abort has fired, all
+      // failure paths defer to the worker.on('exit') handler which
+      // rejects with WorkflowSpawnCancelledError.  Otherwise a racing
+      // hardDeadline / worker error would surface as a generic failure
+      // and lose the cancel origin id.
+      if (cancelRequested) {
+        appendAttemptLog(
+          input,
+          'system',
+          `ignoring fail(${err.message}) while cancel in flight; deferring to exit handler`,
+        );
+        return;
+      }
       settled = true;
       cleanup();
       reject(err);
@@ -345,6 +368,17 @@ async function runOneShotImpl(
 
     const finish = (): void => {
       if (settled) return;
+      // Cancel-wins guard symmetric with `fail`: quiesce timer might be
+      // disarmed in onCancelAbort, but defend against any path that
+      // calls finish() directly after abort.
+      if (cancelRequested) {
+        appendAttemptLog(
+          input,
+          'system',
+          'ignoring finish() while cancel in flight; deferring to exit handler',
+        );
+        return;
+      }
       cleanup();
       const last = collectedOutputs[collectedOutputs.length - 1];
       if (!last) {
