@@ -380,6 +380,13 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     <section id="wf-dangling-panel"></section>
     <section class="wf-panel">
       <div class="wf-panel-title">
+        <h3>${escapeHtml(t('workflow.detail.parallel'))}</h3>
+        <span id="wf-parallel-meta" class="muted"></span>
+      </div>
+      <div id="wf-parallel-view"></div>
+    </section>
+    <section class="wf-panel">
+      <div class="wf-panel-title">
         <h3>${escapeHtml(t('workflow.detail.nodes'))}</h3>
       </div>
       <div class="wf-table-scroll">
@@ -421,6 +428,8 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   const cancelStatusEl = root.querySelector<HTMLElement>('#wf-cancel-status')!;
   const summaryEl = root.querySelector<HTMLElement>('#wf-summary')!;
   const danglingEl = root.querySelector<HTMLElement>('#wf-dangling-panel')!;
+  const parallelEl = root.querySelector<HTMLElement>('#wf-parallel-view')!;
+  const parallelMeta = root.querySelector<HTMLElement>('#wf-parallel-meta')!;
   const nodeTbody = root.querySelector<HTMLElement>('#wf-node-tbody')!;
   const ioList = root.querySelector<HTMLElement>('#wf-io-list')!;
   const timelineScroll = root.querySelector<HTMLElement>('.wf-timeline-scroll')!;
@@ -651,6 +660,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
       : t('workflow.detail.cliCancelTitle', { runId });
     renderSummary(summaryEl, snapshot);
     renderDangling(danglingEl, snapshot);
+    renderParallelTimeline(parallelEl, parallelMeta, snapshot, events);
     renderNodeActivityRows(nodeTbody, snapshot);
     renderNodeIO(ioList, snapshot, openIOBlocks, ioScrollTops, {
       comments: approvalComments,
@@ -781,6 +791,163 @@ function renderDangling(el: HTMLElement, snap: RunSnapshot): void {
         )
         .join('')}
     </div>`;
+}
+
+type AttemptTimelineItem = {
+  nodeId?: string;
+  activityId: string;
+  attemptId: string;
+  attemptNumber?: number;
+  status: string;
+  startedAt: number;
+  runningAt?: number;
+  endedAt?: number;
+  endType?: string;
+};
+
+function renderParallelTimeline(
+  el: HTMLElement,
+  metaEl: HTMLElement,
+  snap: RunSnapshot,
+  events: WorkflowEvent[],
+): void {
+  const items = buildAttemptTimeline(events, snap);
+  if (items.length === 0) {
+    metaEl.textContent = '';
+    el.innerHTML = `<div class="empty">${escapeHtml(t('workflow.detail.noParallelData'))}</div>`;
+    return;
+  }
+
+  const now = Date.now();
+  const start = Math.min(...items.map((item) => item.startedAt));
+  const end = Math.max(...items.map((item) => item.endedAt ?? now), start + 1000);
+  const duration = Math.max(1, end - start);
+  const maxParallel = maxConcurrency(items, now);
+  const running = items.filter((item) => !item.endedAt && (item.status === 'running' || item.status === 'effectAttempting')).length;
+  metaEl.textContent = t('workflow.detail.parallelMeta', {
+    count: items.length,
+    max: maxParallel,
+    running,
+  });
+
+  const rows = items
+    .sort((a, b) => a.startedAt - b.startedAt || a.activityId.localeCompare(b.activityId))
+    .map((item) => renderParallelRow(item, start, duration, now))
+    .join('');
+
+  el.innerHTML = `<div class="wf-parallel-axis">
+      <span title="${escapeHtml(new Date(start).toISOString())}">${escapeHtml(formatClock(start))}</span>
+      <span title="${escapeHtml(new Date(end).toISOString())}">${escapeHtml(formatClock(end))}</span>
+    </div>
+    <div class="wf-parallel-list">${rows}</div>`;
+}
+
+function buildAttemptTimeline(events: WorkflowEvent[], snap: RunSnapshot): AttemptTimelineItem[] {
+  const byAttempt = new Map<string, AttemptTimelineItem>();
+  const activityOwner = new Map(snap.activities.map((activity) => [activity.activityId, activity.ownerNodeId]));
+
+  for (const event of [...events].sort((a, b) => eventSeqFromId(a.eventId) - eventSeqFromId(b.eventId))) {
+    const payload = payloadRecord(event);
+    if (!payload) continue;
+    const activityId = typeof payload.activityId === 'string' ? payload.activityId : undefined;
+    const attemptId = typeof payload.attemptId === 'string' ? payload.attemptId : undefined;
+    if (!activityId || !attemptId) continue;
+
+    let item = byAttempt.get(attemptId);
+    if (event.type === 'attemptCreated') {
+      const attemptNumber = typeof payload.attemptNumber === 'number' ? payload.attemptNumber : undefined;
+      const nodeId = typeof payload.nodeId === 'string' ? payload.nodeId : activityOwner.get(activityId);
+      item = {
+        nodeId,
+        activityId,
+        attemptId,
+        attemptNumber,
+        status: 'pending',
+        startedAt: event.timestamp,
+      };
+      byAttempt.set(attemptId, item);
+      continue;
+    }
+    if (!item) {
+      item = {
+        nodeId: activityOwner.get(activityId),
+        activityId,
+        attemptId,
+        status: 'pending',
+        startedAt: event.timestamp,
+      };
+      byAttempt.set(attemptId, item);
+    }
+
+    if (event.type === 'activityRunning') {
+      item.status = 'running';
+      item.runningAt = event.timestamp;
+    } else if (event.type === 'effectAttempted') {
+      item.status = 'effectAttempting';
+    } else if (event.type === 'activityWaiting' || event.type === 'waitCreated') {
+      item.status = 'waiting';
+    } else if (isTerminalActivityEvent(event.type)) {
+      item.status = terminalStatusForEvent(event.type);
+      item.endedAt = event.timestamp;
+      item.endType = event.type;
+    }
+  }
+
+  return [...byAttempt.values()];
+}
+
+function renderParallelRow(item: AttemptTimelineItem, start: number, duration: number, now: number): string {
+  const end = item.endedAt ?? now;
+  const left = clamp(((item.startedAt - start) / duration) * 100, 0, 100);
+  const width = clamp(((Math.max(end, item.startedAt + 1) - item.startedAt) / duration) * 100, 0.7, 100 - left);
+  const label = item.nodeId ?? item.activityId;
+  const attempt = item.attemptNumber !== undefined ? `#${item.attemptNumber}` : short(item.attemptId);
+  const title = [
+    `${label} ${item.status}`,
+    `${new Date(item.startedAt).toISOString()} → ${item.endedAt ? new Date(item.endedAt).toISOString() : t('workflow.detail.parallelNow')}`,
+    item.endType ? `end: ${item.endType}` : undefined,
+  ].filter(Boolean).join('\n');
+  return `<div class="wf-parallel-row">
+    <div class="wf-parallel-label">
+      <code>${escapeHtml(label)}</code>
+      <span class="muted">${escapeHtml(item.activityId)} · ${escapeHtml(attempt)}</span>
+    </div>
+    <div class="wf-parallel-track">
+      <div class="wf-parallel-bar wf-parallel-${escapeHtml(item.status)}" style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%;" title="${escapeHtml(title)}">
+        <span>${escapeHtml(statusLabel(item.status))}</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function maxConcurrency(items: AttemptTimelineItem[], now: number): number {
+  const points: Array<{ time: number; delta: number }> = [];
+  for (const item of items) {
+    points.push({ time: item.startedAt, delta: 1 });
+    points.push({ time: item.endedAt ?? now, delta: -1 });
+  }
+  points.sort((a, b) => a.time - b.time || b.delta - a.delta);
+  let current = 0;
+  let max = 0;
+  for (const point of points) {
+    current += point.delta;
+    max = Math.max(max, current);
+  }
+  return max;
+}
+
+function isTerminalActivityEvent(type: string): boolean {
+  return type === 'activitySucceeded' ||
+    type === 'activityFailed' ||
+    type === 'activityTimedOut' ||
+    type === 'activityCanceled';
+}
+
+function terminalStatusForEvent(type: string): string {
+  if (type === 'activitySucceeded') return 'succeeded';
+  if (type === 'activityCanceled') return 'cancelled';
+  if (type === 'activityTimedOut') return 'timedOut';
+  return 'failed';
 }
 
 function renderNodeActivityRows(tbody: HTMLElement, snap: RunSnapshot): void {
@@ -1121,6 +1288,15 @@ function extractEventContext(
     out.errorCode = String((err as { errorCode: unknown }).errorCode);
   }
   return out;
+}
+
+function payloadRecord(ev: WorkflowEvent): Record<string, unknown> | null {
+  if (!ev.payload || typeof ev.payload !== 'object' || 'ref' in (ev.payload as object)) return null;
+  return ev.payload as Record<string, unknown>;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function short(value?: string): string {

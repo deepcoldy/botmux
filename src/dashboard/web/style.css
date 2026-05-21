@@ -128,6 +128,20 @@ input.row-select { cursor: pointer; }
 .wf-table-scroll { overflow-x: auto; }
 .wf-timeline-scroll { max-height: 520px; overflow: auto; border: 1px solid var(--border); border-radius: 4px; }
 .wf-timeline-scroll table th { position: sticky; top: 0; z-index: 1; }
+.wf-parallel-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin: 0 0 0.35rem 170px; }
+.wf-parallel-list { display: grid; gap: 0.45rem; }
+.wf-parallel-row { display: grid; grid-template-columns: 160px minmax(220px, 1fr); gap: 0.6rem; align-items: center; }
+.wf-parallel-label { min-width: 0; }
+.wf-parallel-label code { display: block; overflow-wrap: anywhere; }
+.wf-parallel-label .muted { display: block; margin-top: 0.1rem; font-size: 11px; overflow-wrap: anywhere; }
+.wf-parallel-track { position: relative; height: 28px; border: 1px solid var(--border); border-radius: 4px; background: linear-gradient(90deg, #f6f8fa, #fff); overflow: hidden; }
+.wf-parallel-bar { position: absolute; top: 4px; bottom: 4px; min-width: 3px; border-radius: 3px; display: flex; align-items: center; padding: 0 0.35rem; color: #fff; font-size: 11px; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wf-parallel-running, .wf-parallel-effectAttempting { background: #0969da; }
+.wf-parallel-waiting { background: #bf8700; }
+.wf-parallel-pending { background: #8250df; }
+.wf-parallel-succeeded { background: #1a7f37; }
+.wf-parallel-failed, .wf-parallel-timedOut { background: #cf222e; }
+.wf-parallel-cancelled { background: #6e7781; }
 .wf-io-list { display: grid; gap: 0.7rem; }
 .wf-io-card { border: 1px solid var(--border); border-radius: 6px; padding: 0.65rem; background: #fff; }
 .wf-io-card header { display: flex; justify-content: space-between; gap: 0.8rem; align-items: flex-start; }
@@ -178,6 +192,8 @@ td code, .wf-summary-item code { font-family: ui-monospace, SFMono-Regular, Menl
   .wf-detail-head #wf-cancel-run { margin-left: 0; }
   .wf-summary-grid { grid-template-columns: 1fr 1fr; }
   .wf-panel { padding: 0.55rem; }
+  .wf-parallel-axis { margin-left: 0; }
+  .wf-parallel-row { grid-template-columns: 1fr; gap: 0.25rem; }
   .wf-io-card header { flex-direction: column; }
   .wf-io-grid { grid-template-columns: 1fr; }
   .wf-approval-actions button { flex: 1 1 120px; }
