@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="100%" height="100%"
+     fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+  <title>botmux</title>
+  <desc>Westworld-style maze: three concentric rings with offset gaps spiralling inward to a dot at the centre.</desc>
+  <circle cx="16" cy="16" r="13" pathLength="100" stroke-dasharray="78 100" transform="rotate(90 16 16)"/>
+  <circle cx="16" cy="16" r="9"  pathLength="100" stroke-dasharray="74 100" transform="rotate(210 16 16)"/>
+  <circle cx="16" cy="16" r="5"  pathLength="100" stroke-dasharray="70 100" transform="rotate(330 16 16)"/>
+  <circle cx="16" cy="16" r="1.6" fill="currentColor" stroke="none"/>
+</svg>

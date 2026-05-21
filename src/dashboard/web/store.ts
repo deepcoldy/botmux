@@ -1,12 +1,12 @@
-// Reactive client cache + SSE consumer for the botmux dashboard SPA.
-type Session = Record<string, any> & { sessionId: string; status: string };
-type Schedule = Record<string, any> & { id: string };
+import { useSyncExternalStore } from 'react';
+import type { Session, Schedule } from './api.js';
 
 class Store {
   sessions = new Map<string, Session>();
   schedules = new Map<string, Schedule>();
   online = true;
   private listeners = new Set<() => void>();
+  private version = 0;
 
   upsertSessions(rows: Session[]) {
     for (const r of rows) this.sessions.set(r.sessionId, r);
@@ -33,39 +33,62 @@ class Store {
     } else if (type === 'schedule.deleted') {
       this.schedules.delete(body.id);
     } else {
-      return; // heartbeat / schedule.fired — no cache mutation
+      return;
     }
     this.emit();
   }
   setOnline(v: boolean) {
-    if (this.online !== v) { this.online = v; this.emit(); }
+    if (this.online !== v) {
+      this.online = v;
+      this.emit();
+    }
   }
-  on(fn: () => void) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
-  private emit() { for (const fn of this.listeners) fn(); }
+  subscribe = (fn: () => void) => {
+    this.listeners.add(fn);
+    return () => {
+      this.listeners.delete(fn);
+    };
+  };
+  getSnapshot = () => this.version;
+  private emit() {
+    this.version += 1;
+    for (const fn of this.listeners) fn();
+  }
 }
 
 export const store = new Store();
 
-export async function bootstrap() {
+export function useStoreVersion(): number {
+  return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+}
+
+export async function bootstrap(): Promise<void> {
   const [s, sch] = await Promise.all([
-    fetch('/api/sessions').then(r => r.json()),
-    fetch('/api/schedules').then(r => r.json()),
+    fetch('/api/sessions').then((r) => r.json()),
+    fetch('/api/schedules').then((r) => r.json()),
   ]);
   store.upsertSessions(s.sessions ?? []);
   store.upsertSchedules(sch.schedules ?? []);
 
   const es = new EventSource('/events');
   const types = [
-    'session.spawned', 'session.update', 'session.exited',
-    'schedule.created', 'schedule.updated', 'schedule.deleted',
-    'schedule.fired', 'heartbeat',
+    'session.spawned',
+    'session.update',
+    'session.exited',
+    'schedule.created',
+    'schedule.updated',
+    'schedule.deleted',
+    'schedule.fired',
+    'heartbeat',
   ];
   for (const t of types) {
-    es.addEventListener(t, e => {
+    es.addEventListener(t, (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data);
         store.applySse(t, data.body ?? data);
-      } catch { /* skip malformed */ }
+      } catch {
+        /* skip malformed */
+      }
     });
   }
   es.onerror = () => store.setOnline(false);

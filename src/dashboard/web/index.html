@@ -4,20 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>botmux dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='black'/%3E%3Cg fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round'%3E%3Ccircle cx='16' cy='16' r='13' pathLength='100' stroke-dasharray='78 100' transform='rotate(90 16 16)'/%3E%3Ccircle cx='16' cy='16' r='9' pathLength='100' stroke-dasharray='74 100' transform='rotate(210 16 16)'/%3E%3Ccircle cx='16' cy='16' r='5' pathLength='100' stroke-dasharray='70 100' transform='rotate(330 16 16)'/%3E%3C/g%3E%3Ccircle cx='16' cy='16' r='1.6' fill='white'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/assets/style.css">
 </head>
-<body>
-  <header class="topbar">
-    <strong>botmux</strong>
-    <nav>
-      <a href="#/" data-route="sessions">Sessions</a>
-      <a href="#/schedules" data-route="schedules">Schedules</a>
-      <a href="#/groups" data-route="groups">Groups &amp; Bots</a>
-      <a href="#/bot-defaults" data-route="bot-defaults">Bot Defaults</a>
-    </nav>
-    <span id="status" class="status"></span>
-  </header>
-  <main id="root"></main>
-  <script src="/assets/app.js"></script>
+<body class="bg-slate-50 text-slate-900 antialiased">
+  <div id="root"></div>
+  <script src="/assets/app.js" defer></script>
 </body>
 </html>
