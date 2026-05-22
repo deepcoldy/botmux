@@ -244,6 +244,7 @@ describe('readRunSnapshot', () => {
       JSON.stringify({
         schemaVersion: 1,
         sessionId: 'wf-r-io-only',
+        cliSessionId: 'native-cli-session-io',
         webPort: 32123,
         status: 'live',
         larkAppId: 'cli_x',
@@ -272,6 +273,7 @@ describe('readRunSnapshot', () => {
     expect(snap?.attemptIO[attemptId]?.log?.text).toContain('stdout running step');
     expect(snap?.attemptIO[attemptId]?.terminal).toEqual({
       sessionId: 'wf-r-io-only',
+      cliSessionId: 'native-cli-session-io',
       webPort: 32123,
       status: 'live',
       larkAppId: 'cli_x',

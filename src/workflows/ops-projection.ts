@@ -274,6 +274,7 @@ export type AttemptIODTO = {
 
 export type AttemptTerminalDTO = {
   sessionId: string;
+  cliSessionId?: string;
   webPort: number;
   status: 'live' | 'closed';
   larkAppId?: string;
@@ -385,6 +386,7 @@ async function readAttemptTerminal(
     }
     return {
       sessionId: parsed.sessionId,
+      cliSessionId: typeof parsed.cliSessionId === 'string' ? parsed.cliSessionId : undefined,
       webPort: parsed.webPort,
       status: parsed.status,
       larkAppId: parsed.larkAppId,

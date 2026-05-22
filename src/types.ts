@@ -176,6 +176,7 @@ export type DaemonToWorker =
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string }
+  | { type: 'cli_session_id'; cliSessionId: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null }
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }

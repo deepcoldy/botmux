@@ -8,6 +8,8 @@ export type AttemptTerminalStatus = 'live' | 'closed';
 export type AttemptTerminalSidecar = {
   schemaVersion: typeof ATTEMPT_TERMINAL_SCHEMA_VERSION;
   sessionId: string;
+  /** CLI-native resume id when available (Claude/Codex/etc.). */
+  cliSessionId?: string;
   webPort: number;
   status: AttemptTerminalStatus;
   larkAppId?: string;

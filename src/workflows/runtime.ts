@@ -92,6 +92,8 @@ export type AbortCancelReason = { cancelOriginEventId: string };
 
 export type WorkerSessionInfo = {
   sessionId: string;
+  /** CLI-native resume id when it differs from botmux's synthetic sessionId. */
+  cliSessionId?: string;
   larkAppId?: string;
   botName: string;
   cliId?: string;

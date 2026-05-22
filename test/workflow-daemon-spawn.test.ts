@@ -315,6 +315,44 @@ describe('createWorkflowDaemonSpawn', () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it('persists CLI-native session id into the result and terminal sidecar', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'wf-daemon-cli-session-'));
+    try {
+      const attemptLogPath = join(tmp, 'terminal.log');
+      const deps = createWorkflowDaemonSpawn({
+        resolveLarkCredentials: () => fakeCreds,
+        quiesceMs: 30,
+        factory: scriptedFactory((s) => {
+          s.emit({ type: 'ready', port: 1, token: 't' });
+          s.emit({ type: 'cli_session_id', cliSessionId: 'native-cli-session-123' });
+          s.emit({
+            type: 'final_output',
+            content: `${WORKFLOW_OUTPUT_BEGIN}{"ok":true}${WORKFLOW_OUTPUT_END}`,
+            lastUuid: 'u',
+            turnId: 'turn-1',
+          });
+          s.emit({ type: 'screen_update', content: '', status: 'idle' });
+          s.emitExit(0);
+        }),
+      });
+
+      const result = await deps.runOneShot({ ...baseInput, attemptLogPath });
+
+      expect(result.session.cliSessionId).toBe('native-cli-session-123');
+      const log = readFileSync(attemptLogPath, 'utf-8');
+      expect(log).toContain('CLI session id observed native-cli-session-123');
+
+      const terminal = JSON.parse(readFileSync(join(tmp, 'terminal.json'), 'utf-8'));
+      expect(terminal).toMatchObject({
+        sessionId: result.session.sessionId,
+        cliSessionId: 'native-cli-session-123',
+        status: 'closed',
+      });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('syntheticSessionUuid', () => {

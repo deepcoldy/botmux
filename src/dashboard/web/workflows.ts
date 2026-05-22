@@ -51,6 +51,7 @@ type AttemptIO = {
 
 type AttemptTerminal = {
   sessionId: string;
+  cliSessionId?: string;
   webPort: number;
   status: 'live' | 'closed';
   larkAppId?: string;

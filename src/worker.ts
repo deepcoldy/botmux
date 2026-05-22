@@ -2116,6 +2116,7 @@ function markPromptReady(): void {
 function persistCliSessionId(cliSessionId: string): void {
   if (!cliSessionId || !sessionId) return;
   if (lastInitConfig) lastInitConfig.cliSessionId = cliSessionId;
+  send({ type: 'cli_session_id', cliSessionId });
   try {
     const session = sessionStore.getSession(sessionId);
     if (!session || session.cliSessionId === cliSessionId) return;

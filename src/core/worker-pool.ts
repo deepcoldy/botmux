@@ -792,6 +792,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         break;
       }
 
+      case 'cli_session_id': {
+        ds.session.cliSessionId = msg.cliSessionId;
+        sessionStore.updateSession(ds.session);
+        break;
+      }
+
       case 'screen_update': {
         if (!ds.workerPort) break;
         const prevStatus = ds.lastScreenStatus;

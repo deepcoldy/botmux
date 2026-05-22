@@ -45,6 +45,7 @@ import { logger } from '../utils/logger.js';
 
 type WorkerEvent =
   | { type: 'ready'; port: number; token: string }
+  | { type: 'cli_session_id'; cliSessionId: string }
   | {
       type: 'final_output';
       content: string;
@@ -229,6 +230,7 @@ async function runOneShotImpl(
   const collectedOutputs: Array<{ content: string; turnId: string }> = [];
   let quiesceTimer: NodeJS.Timeout | undefined;
   const cliId = input.botSnapshot?.cliId ?? 'claude-code';
+  let cliSessionId: string | undefined;
 
   const init = {
     type: 'init' as const,
@@ -342,6 +344,7 @@ async function runOneShotImpl(
     function makeSessionSnapshot(): WorkerSessionInfo {
       return {
         sessionId: synthetic.sessionId,
+        cliSessionId,
         larkAppId: creds.larkAppId,
         botName: input.botName,
         cliId,
@@ -397,6 +400,7 @@ async function runOneShotImpl(
         finalTranscript: last.content,
         session: {
           sessionId: synthetic.sessionId,
+          cliSessionId,
           larkAppId: creds.larkAppId,
           botName: input.botName,
           cliId,
@@ -431,6 +435,14 @@ async function runOneShotImpl(
           // Note: init may already have been sent by tests' scripted
           // factory before 'ready' lands.  Re-sending is a no-op
           // because `lastInitConfig` short-circuits.
+          break;
+        case 'cli_session_id':
+          if (typeof event.cliSessionId !== 'string' || !event.cliSessionId) break;
+          cliSessionId = event.cliSessionId;
+          appendAttemptLog(input, 'system', `CLI session id observed ${event.cliSessionId}`);
+          if (!settled && webPort !== undefined) {
+            writeAttemptTerminalSidecar(input, makeSessionSnapshot(), 'live');
+          }
           break;
         case 'final_output':
           if (settled) break;
@@ -535,6 +547,7 @@ function writeAttemptTerminalSidecar(
     const sidecar: AttemptTerminalSidecar = {
       schemaVersion: ATTEMPT_TERMINAL_SCHEMA_VERSION,
       sessionId: session.sessionId,
+      cliSessionId: session.cliSessionId,
       webPort: session.webPort,
       status,
       larkAppId: session.larkAppId,
