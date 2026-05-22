@@ -3,6 +3,7 @@ import {
   mkdtempSync,
   rmSync,
 } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -461,6 +462,98 @@ describe('dashboard workflow API routes', () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ ok: false, error: 'bad_json' });
     expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+});
+
+describe('dashboard workflow API attempt terminal-log raw', () => {
+  const runId = 'api-replay-01';
+  const activityId = 'api-replay-01::work::draft';
+  const attemptId = 'api-replay-01::work::draft::att-1';
+
+  async function seedTerminalLog(body: Buffer | string): Promise<string> {
+    const dir = join(runsDir, runId, 'attempts', activityId, attemptId);
+    await mkdir(dir, { recursive: true });
+    const logPath = join(dir, 'terminal.log');
+    await writeFile(logPath, body);
+    return logPath;
+  }
+
+  function rawUrl(query = ''): string {
+    return (
+      `${baseUrl}/api/workflows/runs/${encodeURIComponent(runId)}` +
+      `/attempts/${encodeURIComponent(activityId)}` +
+      `/${encodeURIComponent(attemptId)}/terminal-log/raw${query}`
+    );
+  }
+
+  it('streams a small log fully with metadata headers', async () => {
+    const payload = '\x1b[31mhello\x1b[0m world';
+    await seedTerminalLog(payload);
+
+    const res = await fetch(rawUrl());
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toMatch(/^text\/plain/);
+    expect(res.headers.get('x-botmux-log-bytes')).toBe(String(Buffer.byteLength(payload)));
+    expect(res.headers.get('x-botmux-served-bytes')).toBe(String(Buffer.byteLength(payload)));
+    expect(res.headers.get('x-botmux-truncated')).toBe('0');
+    expect(await res.text()).toBe(payload);
+  });
+
+  it('tails the requested bytes and marks truncation', async () => {
+    const tail = '##TAIL_MARKER##\n';
+    const padding = Buffer.alloc(64, 0x61); // 64 bytes of 'a'
+    await seedTerminalLog(Buffer.concat([padding, Buffer.from(tail)]));
+
+    const res = await fetch(rawUrl(`?tailBytes=${tail.length}`));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-botmux-log-bytes')).toBe(
+      String(padding.length + tail.length),
+    );
+    expect(res.headers.get('x-botmux-served-bytes')).toBe(String(tail.length));
+    expect(res.headers.get('x-botmux-truncated')).toBe('1');
+    expect(await res.text()).toBe(tail);
+  });
+
+  it('returns attachment headers when ?download=1', async () => {
+    await seedTerminalLog('payload');
+    const res = await fetch(rawUrl('?download=1'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('application/octet-stream');
+    const disp = res.headers.get('content-disposition');
+    expect(disp).toContain('attachment;');
+    expect(disp).toContain('terminal-');
+    expect(disp).toContain(runId);
+  });
+
+  it('returns 404 when terminal.log is missing', async () => {
+    const res = await fetch(rawUrl());
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'no_terminal_log' });
+  });
+
+  it('rejects malformed activityId that fails the segment regex', async () => {
+    // `*` is outside `[A-Za-z0-9._:-]` so isValidPathSegment rejects it.
+    // (Direct `..` doesn't reach the handler — fetch/URL normalize it away,
+    // which is why the segment regex + isPathInsideDir is defense-in-depth
+    // rather than the primary guard.)
+    const badActivity = encodeURIComponent('with*star');
+    const url =
+      `${baseUrl}/api/workflows/runs/${encodeURIComponent(runId)}` +
+      `/attempts/${badActivity}` +
+      `/${encodeURIComponent(attemptId)}/terminal-log/raw`;
+    const res = await fetch(url);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'bad_id' });
+  });
+
+  it('rejects invalid runId before touching disk', async () => {
+    const url =
+      `${baseUrl}/api/workflows/runs/${encodeURIComponent('..bad')}` +
+      `/attempts/${encodeURIComponent(activityId)}` +
+      `/${encodeURIComponent(attemptId)}/terminal-log/raw`;
+    const res = await fetch(url);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'bad_id' });
   });
 });
 

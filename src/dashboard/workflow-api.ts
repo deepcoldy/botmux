@@ -1,3 +1,4 @@
+import { createReadStream, promises as fs } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import {
@@ -12,6 +13,9 @@ import {
   readRunSnapshot,
   readEventWindow,
   isValidRunId,
+  isValidPathSegment,
+  isPathInsideDir,
+  attemptTerminalLogPath,
   TERMINAL_RUN_STATUSES,
 } from '../workflows/ops-projection.js';
 
@@ -214,6 +218,49 @@ export async function handleWorkflowApi(
     return true;
   }
 
+  // ─── Attempt raw terminal.log ──────────────────────────────────────────────
+  // Public-read (under decideDashboardAuth's `GET /api/workflows/*` allowlist).
+  // Streams `runs/<runId>/attempts/<activityId>/<attemptId>/terminal.log` for
+  // the dashboard replay viewer.  Default behavior tails the last 10 MB; pass
+  // `?tailBytes=N` to widen the window (capped at MAX_TAIL_BYTES) or
+  // `?download=1` to receive an attachment (also unbounded by the tail cap).
+  //
+  // Why a separate endpoint vs reusing `previewAttemptLog`: preview returns a
+  // 100 KB UTF-8 string baked into the snapshot DTO; this endpoint streams raw
+  // bytes (ANSI escapes preserved) so an xterm.js replay viewer can render the
+  // exact terminal state the worker left behind.
+  m = url.pathname.match(
+    /^\/api\/workflows\/runs\/([^/]+)\/attempts\/([^/]+)\/([^/]+)\/terminal-log\/raw$/,
+  );
+  if (req.method === 'GET' && m) {
+    const runId = decodeURIComponent(m[1]);
+    const activityId = decodeURIComponent(m[2]);
+    const attemptId = decodeURIComponent(m[3]);
+    if (
+      !isValidRunId(runId) ||
+      !isValidPathSegment(activityId) ||
+      !isValidPathSegment(attemptId)
+    ) {
+      jsonRes(res, 400, { error: 'bad_id' });
+      return true;
+    }
+    const logPath = attemptTerminalLogPath(deps.runsDir, runId, activityId, attemptId);
+    if (!isPathInsideDir(deps.runsDir, logPath)) {
+      // Defense-in-depth — `isValidPathSegment` already rejects `..` and `/`,
+      // but the path guard keeps us honest if the regex is ever relaxed.
+      jsonRes(res, 400, { error: 'bad_path' });
+      return true;
+    }
+    await streamAttemptTerminalLog(res, logPath, {
+      runId,
+      activityId,
+      attemptId,
+      tailBytesParam: url.searchParams.get('tailBytes'),
+      download: url.searchParams.get('download') === '1',
+    });
+    return true;
+  }
+
   // approve / reject share the same shape: { comment? } body, route to the
   // owner daemon via chat-binding, daemon picks the unique dangling
   // human-gate wait and calls resolveWait().  See `resolveDashboardWait` in
@@ -336,4 +383,101 @@ export async function handleWorkflowApi(
   }
 
   return false;
+}
+
+// ─── Attempt raw terminal.log streaming ──────────────────────────────────────
+
+/**
+ * Tail cap for the replay viewer.  10 MB is enough for ~60-90 minutes of
+ * verbose CLI output and small enough to xterm.write-chunk in a few seconds
+ * without blowing the browser tab.  Operators who want the whole file pass
+ * `?download=1`, which is uncapped (subject to RAW_LOG_DOWNLOAD_MAX).
+ */
+const RAW_LOG_TAIL_BYTES_DEFAULT = 10 * 1024 * 1024;
+const RAW_LOG_TAIL_BYTES_MAX = 64 * 1024 * 1024;
+/** Hard ceiling for `?download=1` so a runaway log can't blow up streaming. */
+const RAW_LOG_DOWNLOAD_MAX = 512 * 1024 * 1024;
+
+async function streamAttemptTerminalLog(
+  res: ServerResponse,
+  logPath: string,
+  opts: {
+    runId: string;
+    activityId: string;
+    attemptId: string;
+    tailBytesParam: string | null;
+    download: boolean;
+  },
+): Promise<void> {
+  let stat: import('node:fs').Stats;
+  try {
+    stat = await fs.stat(logPath);
+  } catch (err: any) {
+    if (err && err.code === 'ENOENT') {
+      jsonRes(res, 404, { error: 'no_terminal_log' });
+      return;
+    }
+    jsonRes(res, 500, {
+      error: 'stat_failed',
+      message: err?.message ?? String(err),
+    });
+    return;
+  }
+  if (!stat.isFile()) {
+    jsonRes(res, 404, { error: 'no_terminal_log' });
+    return;
+  }
+
+  const totalBytes = stat.size;
+  const wantsDownload = opts.download;
+  const tailParam = parsePositiveInt(opts.tailBytesParam);
+  const cap = wantsDownload ? RAW_LOG_DOWNLOAD_MAX : RAW_LOG_TAIL_BYTES_MAX;
+  const requested = wantsDownload
+    ? totalBytes
+    : Math.min(tailParam ?? RAW_LOG_TAIL_BYTES_DEFAULT, cap);
+  const bytesToServe = Math.min(totalBytes, requested);
+  const start = Math.max(0, totalBytes - bytesToServe);
+  const truncated = start > 0;
+
+  const headers: Record<string, string> = {
+    'content-type': wantsDownload
+      ? 'application/octet-stream'
+      : 'text/plain; charset=utf-8',
+    'content-length': String(bytesToServe),
+    'cache-control': 'no-store',
+    'x-botmux-log-bytes': String(totalBytes),
+    'x-botmux-served-bytes': String(bytesToServe),
+    'x-botmux-truncated': truncated ? '1' : '0',
+  };
+  if (wantsDownload) {
+    const filename = `terminal-${opts.runId}-${opts.activityId}-${opts.attemptId}.log`
+      .replace(/[^A-Za-z0-9._:-]/g, '_');
+    headers['content-disposition'] = `attachment; filename="${filename}"`;
+  }
+  res.writeHead(200, headers);
+
+  if (bytesToServe === 0) {
+    res.end();
+    return;
+  }
+  const stream = createReadStream(logPath, { start, end: totalBytes - 1 });
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      jsonRes(res, 500, { error: 'stream_failed' });
+    } else {
+      try {
+        res.end();
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+  stream.pipe(res);
+}
+
+function parsePositiveInt(raw: string | null): number | undefined {
+  if (raw === null) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
 }

@@ -56,6 +56,43 @@ export function isValidRunId(runId: string): boolean {
   return RUN_ID_RE.test(runId);
 }
 
+/**
+ * Activity / attempt id allowlist — accepts `<runId>::work::<nodeId>` and
+ * `<...>::att-N` shaped strings the orchestrator emits, while still rejecting
+ * `/`, `..`, whitespace and anything else that could escape the run dir when
+ * concatenated into an attempt sidecar path.
+ */
+const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+export function isValidPathSegment(s: string): boolean {
+  return SEGMENT_RE.test(s);
+}
+
+/**
+ * Path-traversal guard — returns true iff `child`, after `..`/`.` resolution,
+ * still lives inside `parent`.  Exported so dashboard surfaces that build
+ * paths from caller-supplied ids (e.g. attempt terminal-log raw endpoint)
+ * can apply the same defense-in-depth check on top of `isValidRunId` /
+ * `isValidPathSegment`.
+ */
+export function isPathInsideDir(parent: string, child: string): boolean {
+  return isPathInside(parent, child);
+}
+
+/**
+ * Resolve the on-disk `terminal.log` path for a given attempt sidecar.
+ * Production callers MUST validate runId / activityId / attemptId with
+ * `isValidRunId` + `isValidPathSegment` first, and re-check `isPathInsideDir`
+ * after joining to defend against any future segment-regex relaxation.
+ */
+export function attemptTerminalLogPath(
+  runsDir: string,
+  runId: string,
+  activityId: string,
+  attemptId: string,
+): string {
+  return join(runsDir, runId, 'attempts', activityId, attemptId, 'terminal.log');
+}
+
 // ─── list ──────────────────────────────────────────────────────────────────
 
 export type RunRow = {
