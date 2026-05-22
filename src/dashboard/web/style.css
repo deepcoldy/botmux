@@ -1013,6 +1013,13 @@ input.row-select,
 .wf-parallel-succeeded { background: var(--success); }
 .wf-parallel-failed, .wf-parallel-timedOut { background: var(--danger); }
 .wf-parallel-cancelled { background: var(--faint); }
+:root[data-theme="dark"] .wf-parallel-running,
+:root[data-theme="dark"] .wf-parallel-effectAttempting { color: var(--on-accent); }
+:root[data-theme="dark"] .wf-parallel-waiting,
+:root[data-theme="dark"] .wf-parallel-succeeded,
+:root[data-theme="dark"] .wf-parallel-cancelled { color: var(--bg); }
+:root[data-theme="dark"] .wf-parallel-failed,
+:root[data-theme="dark"] .wf-parallel-timedOut { color: var(--on-danger); }
 .wf-io-list { display: grid; gap: 0.7rem; }
 .wf-io-card { border: 1px solid var(--border); border-radius: 6px; padding: 0.65rem; background: var(--surface); }
 .wf-io-card.is-focused { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
