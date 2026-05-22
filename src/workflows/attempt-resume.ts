@@ -26,6 +26,8 @@ import {
 export const ATTEMPT_RESUME_SCHEMA_VERSION = 1;
 export const ATTEMPT_RESUME_IDLE_MS = 30 * 60 * 1000;
 export const ATTEMPT_RESUME_GRACE_MS = 5000;
+export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'cursor']);
+export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'codex']);
 
 export type AttemptResumeStatus = 'starting' | 'live' | 'closed';
 
@@ -36,7 +38,8 @@ export type AttemptResumeSidecar = {
   activityId: string;
   attemptId: string;
   sessionId: string;
-  cliSessionId: string;
+  originalSessionId: string;
+  cliSessionId?: string;
   webPort?: number;
   writeToken?: string;
   status: AttemptResumeStatus;
@@ -70,7 +73,8 @@ export type AttemptResumeStartResult =
       activityId: string;
       attemptId: string;
       sessionId: string;
-      cliSessionId: string;
+      originalSessionId: string;
+      cliSessionId?: string;
       webPort: number;
       writeToken: string;
       url: string;
@@ -111,7 +115,8 @@ type ResumeEntry = {
   activityId: string;
   attemptId: string;
   sessionId: string;
-  cliSessionId: string;
+  originalSessionId: string;
+  cliSessionId?: string;
   larkAppId: string;
   botName?: string;
   cliId: string;
@@ -165,6 +170,7 @@ export class AttemptResumeManager {
         activityId: existing.activityId,
         attemptId: existing.attemptId,
         sessionId: existing.sessionId,
+        originalSessionId: existing.originalSessionId,
         cliSessionId: existing.cliSessionId,
         webPort: existing.webPort,
         writeToken: existing.writeToken,
@@ -179,18 +185,25 @@ export class AttemptResumeManager {
 
     const terminal = readTerminalSidecar(this.deps.runsDir, input);
     if (!terminal.ok) return terminal;
-    if (!terminal.terminal.cliSessionId) {
-      return {
-        ok: false,
-        error: 'missing_cli_session_id',
-        hint: 'This attempt predates cliSessionId capture; rerun the workflow step before resuming.',
-      };
-    }
     if (!terminal.terminal.larkAppId) {
       return { ok: false, error: 'missing_lark_app_id' };
     }
     const bot = this.deps.resolveBot(terminal.terminal.larkAppId, terminal.terminal);
     if (!bot) return { ok: false, error: 'bot_not_registered' };
+    if (!isResumeCapableCli(bot.cliId)) {
+      return {
+        ok: false,
+        error: 'resume_unsupported_cli',
+        hint: `${bot.cliId} does not support precise session resume.`,
+      };
+    }
+    if (cliRequiresNativeSessionId(bot.cliId) && !terminal.terminal.cliSessionId) {
+      return {
+        ok: false,
+        error: 'missing_cli_session_id',
+        hint: 'This CLI requires a native cliSessionId; rerun the workflow step before resuming.',
+      };
+    }
 
     const startedAt = this.now();
     const resumeId = `resume-${startedAt.toString(36)}-${randomBytes(4).toString('hex')}`;
@@ -213,6 +226,7 @@ export class AttemptResumeManager {
     const sessionId = syntheticSessionUuid(
       `wf-resume-${input.runId}-${input.activityId}-${input.attemptId}-${resumeId}`,
     );
+    const originalSessionId = terminal.terminal.sessionId;
 
     appendResumeLog(logPath, 'system', `starting dashboard resume cwd=${workingDir}`);
     const worker = this.factory.spawn({
@@ -240,6 +254,7 @@ export class AttemptResumeManager {
       activityId: input.activityId,
       attemptId: input.attemptId,
       sessionId,
+      originalSessionId,
       cliSessionId: terminal.terminal.cliSessionId,
       larkAppId: bot.larkAppId,
       botName: bot.botName ?? terminal.terminal.botName,
@@ -269,7 +284,8 @@ export class AttemptResumeManager {
       backendType: bot.backendType ?? 'pty',
       prompt: '',
       resume: true,
-      cliSessionId: terminal.terminal.cliSessionId,
+      originalSessionId,
+      ...(terminal.terminal.cliSessionId ? { cliSessionId: terminal.terminal.cliSessionId } : {}),
       larkAppId: bot.larkAppId,
       larkAppSecret: bot.larkAppSecret,
       botName: bot.botName ?? terminal.terminal.botName,
@@ -333,6 +349,7 @@ export class AttemptResumeManager {
             activityId: entry.activityId,
             attemptId: entry.attemptId,
             sessionId: entry.sessionId,
+            originalSessionId: entry.originalSessionId,
             cliSessionId: entry.cliSessionId,
             webPort,
             writeToken,
@@ -422,6 +439,7 @@ export class AttemptResumeManager {
       activityId: entry.activityId,
       attemptId: entry.attemptId,
       sessionId: entry.sessionId,
+      originalSessionId: entry.originalSessionId,
       cliSessionId: entry.cliSessionId,
       webPort: entry.webPort,
       writeToken: entry.writeToken,
@@ -487,6 +505,14 @@ function isTerminalSidecar(raw: unknown): raw is AttemptTerminalSidecar {
     typeof r.webPort === 'number' &&
     (r.status === 'live' || r.status === 'closed')
   );
+}
+
+export function isResumeCapableCli(cliId: string | undefined): boolean {
+  return !!cliId && (RESUME_USES_SESSION_ID.has(cliId) || RESUME_REQUIRES_CLI_SESSION_ID.has(cliId));
+}
+
+export function cliRequiresNativeSessionId(cliId: string | undefined): boolean {
+  return !!cliId && RESUME_REQUIRES_CLI_SESSION_ID.has(cliId);
 }
 
 function appendResumeLog(logPath: string, label: string, content: string): void {

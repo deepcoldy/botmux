@@ -67,7 +67,7 @@ const bot: AttemptResumeBot = {
   locale: 'zh',
 };
 
-function seedAttempt(tmp: string): {
+function seedAttempt(tmp: string, opts: { cliSessionId?: string | null; cliId?: string } = {}): {
   runId: string;
   activityId: string;
   attemptId: string;
@@ -82,12 +82,12 @@ function seedAttempt(tmp: string): {
     JSON.stringify({
       schemaVersion: ATTEMPT_TERMINAL_SCHEMA_VERSION,
       sessionId: 'synthetic-session',
-      cliSessionId: 'native-cli-session',
+      ...(opts.cliSessionId === null ? {} : { cliSessionId: opts.cliSessionId ?? 'native-cli-session' }),
       webPort: 32123,
       status: 'closed',
       larkAppId: 'cli_x',
       botName: 'Claude',
-      cliId: 'claude-code',
+      cliId: opts.cliId ?? 'claude-code',
       workingDir: '/tmp',
       logPath: join(attemptDir, 'terminal.log'),
       startedAt: 1,
@@ -124,6 +124,7 @@ describe('AttemptResumeManager', () => {
       expect(result).toMatchObject({
         ok: true,
         cliSessionId: 'native-cli-session',
+        originalSessionId: 'synthetic-session',
         webPort: 4567,
         writeToken: 'write-token',
         url: 'http://dash.local:4567?token=write-token',
@@ -136,6 +137,7 @@ describe('AttemptResumeManager', () => {
       );
       expect(init).toMatchObject({
         resume: true,
+        originalSessionId: 'synthetic-session',
         cliSessionId: 'native-cli-session',
         prompt: '',
         larkAppId: 'cli_x',
@@ -146,10 +148,95 @@ describe('AttemptResumeManager', () => {
         schemaVersion: 1,
         resumeId: result.ok ? result.resumeId : '',
         status: 'live',
+        originalSessionId: 'synthetic-session',
         cliSessionId: 'native-cli-session',
         webPort: 4567,
         writeToken: 'write-token',
       });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('allows session-id based CLIs to resume without a native cliSessionId', async () => {
+    const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
+    const ids = seedAttempt(tmp, { cliSessionId: null, cliId: 'coco' });
+    const { factory, handles } = makeFactory((h) => {
+      h.emit({ type: 'ready', port: 4567, token: 'write-token' });
+    });
+    try {
+      const manager = new AttemptResumeManager({
+        runsDir: tmp,
+        externalHost: 'dash.local',
+        workerPath: '/worker.js',
+        factory,
+        resolveBot: () => ({ ...bot, cliId: 'coco' }),
+      });
+
+      const result = await manager.start(ids);
+
+      expect(result).toMatchObject({
+        ok: true,
+        originalSessionId: 'synthetic-session',
+        webPort: 4567,
+      });
+      if (result.ok) expect(result.cliSessionId).toBeUndefined();
+      const init = handles[0]?.sent.find(
+        (msg): msg is Record<string, unknown> =>
+          typeof msg === 'object' && msg !== null && (msg as any).type === 'init',
+      );
+      expect(init).toMatchObject({
+        type: 'init',
+        resume: true,
+        originalSessionId: 'synthetic-session',
+        cliId: 'coco',
+      });
+      expect(init?.sessionId).not.toBe('synthetic-session');
+      expect(init).not.toHaveProperty('cliSessionId');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('requires native cliSessionId only for CLIs that cannot use botmux session id', async () => {
+    const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
+    const ids = seedAttempt(tmp, { cliSessionId: null, cliId: 'cursor' });
+    const { factory, spawns } = makeFactory();
+    try {
+      const manager = new AttemptResumeManager({
+        runsDir: tmp,
+        externalHost: 'dash.local',
+        workerPath: '/worker.js',
+        factory,
+        resolveBot: () => ({ ...bot, cliId: 'cursor' }),
+      });
+
+      const result = await manager.start(ids);
+
+      expect(result).toMatchObject({ ok: false, error: 'missing_cli_session_id' });
+      expect(spawns).toHaveLength(0);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects CLIs without precise resume support', async () => {
+    const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
+    const ids = seedAttempt(tmp, { cliSessionId: null, cliId: 'opencode' });
+    const { factory, spawns } = makeFactory();
+    try {
+      const manager = new AttemptResumeManager({
+        runsDir: tmp,
+        externalHost: 'dash.local',
+        workerPath: '/worker.js',
+        factory,
+        resolveBot: () => ({ ...bot, cliId: 'opencode' }),
+      });
+
+      const result = await manager.start(ids);
+
+      expect(result).toMatchObject({ ok: false, error: 'resume_unsupported_cli' });
+      expect(spawns).toHaveLength(0);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

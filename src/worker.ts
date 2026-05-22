@@ -2564,6 +2564,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
   backend = selectedBackend.backend;
+  const adapterSessionId = cfg.resume
+    ? (cfg.originalSessionId ?? cfg.sessionId)
+    : cfg.sessionId;
 
   // Claude Code appends a line to ~/.claude/projects/<cwd-hash>/<sid>.jsonl each
   // time the user submits. The adapter uses this file to verify paste+Enter
@@ -2572,11 +2575,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // so it needs no per-session wiring here.
   if (cfg.cliId === 'claude-code') {
     (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
-      claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
+      claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir);
   }
 
   const args = cliAdapter.buildArgs({
-    sessionId: cfg.sessionId,
+    sessionId: adapterSessionId,
     resume: cfg.resume ?? false,
     workingDir: cfg.workingDir,
     resumeSessionId: cfg.cliSessionId,
