@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion } from './worker-pool.js';
+import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -553,6 +553,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       };
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
+      if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
       activeSessions.set(sessionKey(anchor, larkAppId), ds);
       forkAdoptWorker(ds, { restoredFromMetadata: true });
       logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adopted.tmuxTarget}, scope: ${scope})`);
@@ -596,6 +597,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
     };
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
+    if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);

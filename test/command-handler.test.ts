@@ -11,12 +11,23 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ─── Mock external modules ──────────────────────────────────────────────────
 
 // Mock node builtins that command-handler imports directly
+// Global bot registry as seen via bots-info.json (the deployment-wide source the
+// /group election reads). Two bots, distinct names — the realistic chat shape.
+const BOTS_INFO = [
+  { larkAppId: 'app-1', botOpenId: 'ou_claude', botName: 'Claude', cliId: 'claude-code' },
+  { larkAppId: 'app-2', botOpenId: 'ou_codex', botName: 'Codex', cliId: 'codex' },
+];
+
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
     ...actual,
     existsSync: vi.fn(() => true),
     statSync: vi.fn(() => ({ isDirectory: () => true })),
+    readFileSync: vi.fn((p: any, ...rest: any[]) => {
+      if (typeof p === 'string' && p.includes('bots-info.json')) return JSON.stringify(BOTS_INFO);
+      return (actual.readFileSync as any)(p, ...rest);
+    }),
   };
 });
 
@@ -29,21 +40,27 @@ vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
     daemon: { workingDir: '~' },
+    session: { dataDir: '/fake/data' },
   },
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn(() => ({
+  getBot: vi.fn((id: string = 'app-1') => ({
+    botName: id === 'app-2' ? 'Codex' : 'Claude',
     config: {
-      larkAppId: 'app-1',
+      larkAppId: id,
       larkAppSecret: 'secret-1',
-      cliId: 'claude-code' as const,
+      cliId: id === 'app-2' ? ('codex' as const) : ('claude-code' as const),
       workingDir: '~/projects',
       workingDirs: ['~/projects'],
     },
   })),
+  // Production runs ONE daemon per bot, so getAllBots() sees only this process's
+  // own bot. Default to the Claude process; the split-brain test overrides this
+  // to prove the /group election does NOT depend on getAllBots().
   getAllBots: vi.fn(() => [
     {
+      botName: 'Claude',
       config: {
         larkAppId: 'app-1',
         larkAppSecret: 'secret-1',
@@ -52,6 +69,7 @@ vi.mock('../src/bot-registry.js', () => ({
       },
     },
   ]),
+  getBotOpenId: vi.fn((id: string = 'app-1') => (id === 'app-2' ? 'ou_codex' : 'ou_claude')),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -106,6 +124,23 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 
 vi.mock('../src/im/lark/client.js', () => ({
   deleteMessage: vi.fn(),
+  sendMessage: vi.fn(async () => 'card-msg-id'),
+  listChatBotMembers: vi.fn(async () => []),
+}));
+
+vi.mock('../src/services/group-creator.js', () => ({
+  createGroupWithBots: vi.fn(async (opts: any) => ({
+    ok: true,
+    chatId: 'oc_new_group',
+    creator: opts.creatorLarkAppId,
+    invalidBotIds: [],
+    invalidUserIds: [],
+    ownerTransferredTo: opts.transferOwnerTo ?? null,
+    transferError: null,
+    notifyMessageId: 'om_notify',
+    notifyError: null,
+    oncallBindings: [],
+  })),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -162,10 +197,12 @@ import { getSessionWorkingDir } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, listChatBotMembers } from '../src/im/lark/client.js';
+import { createGroupWithBots } from '../src/services/group-creator.js';
+import { getAllBots } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
 import { bindOncall } from '../src/services/oncall-store.js';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, statSync, readFileSync } from 'node:fs';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
 
@@ -234,7 +271,7 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt', '/oncall'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt', '/oncall', '/group', '/g'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -251,7 +288,7 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    expect(DAEMON_COMMANDS.size).toBe(11);
+    expect(DAEMON_COMMANDS.size).toBe(13);
   });
 });
 
@@ -1113,6 +1150,172 @@ describe('handleCommand', () => {
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
 
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('Command /close error'));
+    });
+  });
+
+  // ─── /group ───────────────────────────────────────────────────────────────
+
+  describe('/group', () => {
+    const mockedCreate = vi.mocked(createGroupWithBots);
+    const mockedListBots = vi.mocked(listChatBotMembers);
+    const mockedSend = vi.mocked(sendMessage);
+
+    it('creates a solo group (creator only) when no bots are @-mentioned', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group My Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.larkAppIds).toEqual([LARK_APP_ID]);
+      expect(opts.name).toBe('My Project');
+      expect(opts.transferOwnerTo).toBe('ou_sender');
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('My Project');
+      expect(reply).toContain('oc_new_group');
+    });
+
+    it('does NOT auto-post a repo-select card after creating the group', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group X'), deps, LARK_APP_ID);
+
+      // No interactive repo card pushed to the new group.
+      expect(mockedSend).not.toHaveBeenCalled();
+      // No chat-scope session registered for the new group.
+      expect(deps.activeSessions.has(sessionKey('oc_new_group', LARK_APP_ID))).toBe(false);
+    });
+
+    it('invites every @-mentioned bot when the first mentioned bot is us', async () => {
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const msg = makeLarkMessage('/group @Codex 项目讨论', {
+        mentions: [
+          { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+        ],
+      });
+
+      await handleCommand('/group', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.larkAppIds).toEqual(['app-1', 'app-2']);
+      // The @Codex token is stripped from the resolved group name.
+      expect(opts.name).toBe('项目讨论');
+    });
+
+    it('defers silently when we are not the first mentioned bot', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      // Codex is mentioned first → app-2 is the designated creator; app-1 (us) defers.
+      const msg = makeLarkMessage('/group @Codex @Claude 项目', {
+        mentions: [
+          { key: '@_user_1', name: 'Codex', openId: 'ou_codex' },
+          { key: '@_user_2', name: 'Claude', openId: 'ou_claude' },
+        ],
+      });
+
+      await handleCommand('/group', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+      // Election uses the global bot-name registry + our own open_id — a
+      // non-leader decides to defer without any chat-member lookup.
+      expect(mockedListBots).not.toHaveBeenCalled();
+    });
+
+    it('defers in a per-bot daemon even when getAllBots() only knows itself (no split-brain)', async () => {
+      // Faithful to production: the Codex process's in-memory registry has ONLY
+      // Codex. The OLD getAllBots()-based election would make Codex self-elect as
+      // "first known bot" and double-create. The fix reads the global bot-name
+      // registry (bots-info.json), so Codex still defers to the first @-mentioned
+      // bot (Claude).
+      vi.mocked(getAllBots).mockReturnValueOnce([
+        { botName: 'Codex', config: { larkAppId: 'app-2', larkAppSecret: 's', cliId: 'codex', workingDir: '~' } },
+      ] as unknown as ReturnType<typeof getAllBots>);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const msg = makeLarkMessage('/group @Claude @Codex 项目', {
+        mentions: [
+          { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+        ],
+      });
+
+      // Handled by the app-2 (Codex) daemon process.
+      await handleCommand('/group', ROOT_ID, msg, deps, 'app-2');
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('fails closed (no group) when an @-mentioned bot cannot be resolved to an app id', async () => {
+      // We are the leader (Claude, first), but the chat-member roster is missing
+      // Codex → must NOT create a group silently dropping an intended bot.
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+      ]);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const msg = makeLarkMessage('/group @Claude @Codex 项目', {
+        mentions: [
+          { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+        ],
+      });
+
+      await handleCommand('/group', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('无法解析');
+    });
+
+    it('fails closed (no group) when the global bot registry is empty (corrupt bots-info.json)', async () => {
+      // Simulate a missing/corrupt bots-info.json → globalKnownBotNames() empty.
+      vi.mocked(readFileSync).mockImplementationOnce((p: any) => {
+        if (typeof p === 'string' && p.includes('bots-info.json')) return '[]';
+        throw new Error('unexpected read');
+      });
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const msg = makeLarkMessage('/group @Codex 项目', {
+        mentions: [
+          { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+        ],
+      });
+
+      await handleCommand('/group', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('无法解析');
+    });
+
+    it('fails closed (no group) when bots are mentioned but the source chatId is unknown', async () => {
+      const ds = makeDaemonSession({ chatId: undefined as unknown as string });
+      const deps = makeDeps(ds);
+      const msg = makeLarkMessage('/group @Codex 项目', {
+        mentions: [
+          { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+        ],
+      });
+
+      await handleCommand('/group', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('无法解析');
     });
   });
 

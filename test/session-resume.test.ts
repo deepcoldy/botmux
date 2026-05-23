@@ -38,6 +38,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkAdoptWorker: vi.fn(),
   killStalePids: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
+  restoreUsageLimitRuntimeState: vi.fn(),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -80,7 +81,8 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { resumeSession } from '../src/core/session-manager.js';
+import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
+import { restoreUsageLimitRuntimeState } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -197,6 +199,27 @@ describe('resumeSession', () => {
   });
 
   describe('success path', () => {
+    it('restores usage-limit runtime state for active sessions after daemon restart', () => {
+      const s = sessionStore.createSession('oc_chat_limit', 'om_limit', 'Limited topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.usageLimit = {
+        limited: true,
+        kind: 'usage',
+        retryAtMs: Date.now() + 60_000,
+        retryLabel: '10:36 PM',
+        retryReady: false,
+      };
+      sessionStore.updateSession(s);
+      const map = new Map<string, DaemonSession>();
+
+      restoreActiveSessions(map);
+
+      const ds = map.get(sessionKey('om_limit', 'app_test'));
+      expect(ds).toBeDefined();
+      expect(restoreUsageLimitRuntimeState).toHaveBeenCalledWith(ds);
+    });
+
     it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', () => {
       const closed = makeClosedSession({ rootMessageId: 'om_threadA' });
       (closed as any).lastUserPrompt = '继续修复限额后的任务';

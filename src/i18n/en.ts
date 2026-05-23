@@ -141,6 +141,9 @@ export const messages: Record<string, string> = {
   'cmd.group.failed': '⚠️ Failed to create group: {error}',
   'cmd.group.warn_invite_rejected': '⚠️ Feishu rejected the auto-invite (your open_id may not be in this bot\'s app scope). Please join the group manually.',
   'cmd.group.warn_transfer_failed': '⚠️ Owner transfer failed ({reason}); the bot is still the group owner. You can transfer it manually inside the new group.',
+  'cmd.group.bots_invited': '🤖 Bots in the group: {bots}',
+  'cmd.group.warn_bots_rejected': '⚠️ Some bots could not be added ({bots}) — they may not be in this bot\'s app scope. Please add them manually.',
+  'cmd.group.resolve_failed': '⚠️ Could not resolve the @-mentioned bots (chat member info may be temporarily unavailable); group not created. Please retry shortly.',
 
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',

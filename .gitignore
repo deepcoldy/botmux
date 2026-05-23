@@ -11,4 +11,5 @@ storageState.json
 midscene_run/
 .codex
 .claude/
+.antigravitycli/
 

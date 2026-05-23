@@ -5,7 +5,7 @@
 import { fork, execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills } from '../skills/installer.js';
 import { randomBytes } from 'node:crypto';
@@ -114,11 +114,12 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
 
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
   if (ds.lastScreenStatus !== 'limited') return;
-  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) return;
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !port) return;
 
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
-  const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+  const readUrl = `http://${config.web.externalHost}:${port}`;
   const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -163,6 +164,12 @@ function armUsageLimitRetryTimer(ds: DaemonSession, previous?: CliUsageLimitStat
     persistStreamCardState(ds);
     scheduleUsageLimitCardPatch(ds);
   }, delayMs);
+}
+
+export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
+  if (!ds.usageLimit) return;
+  ds.lastScreenStatus = 'limited';
+  armUsageLimitRetryTimer(ds);
 }
 
 function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitState): void {
@@ -453,6 +460,45 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
   cleanupLegacyMcpConfig(cliId);
 }
 
+// ─── Claude Code folder-trust pre-acceptance ─────────────────────────────────
+//
+// A freshly spawned `claude` in a workingDir that has never been trusted blocks
+// on the interactive "Do you trust the files in this folder?" dialog. botmux
+// can't answer it — it then mistypes the user's first message into the dialog
+// and the session breaks (surfaced as `tmux send-keys … failed`). There is no
+// CLI flag to skip it (Claude only auto-skips trust in non-interactive `-p` /
+// non-TTY mode, which botmux is not), so we pre-seed the acceptance.
+
+/** Pre-accept Claude Code's per-project folder-trust dialog for `workingDir`.
+ *  Claude keys trust off realpath(cwd) (its getcwd(3) is already realpath'd),
+ *  so seed that path. Merge-safe + best-effort: only ADDS the flag, never
+ *  clobbers other keys; any failure is swallowed so it can't block spawn. */
+export function ensureClaudeFolderTrust(workingDir: string): void {
+  try {
+    const configPath = join(homedir(), '.claude.json');
+    let canonical: string;
+    try { canonical = realpathSync(workingDir); } catch { canonical = workingDir; }
+
+    let data: any = {};
+    if (existsSync(configPath)) {
+      try { data = JSON.parse(readFileSync(configPath, 'utf-8')); } catch { return; }
+    }
+    if (!data || typeof data !== 'object') return;
+    if (!data.projects || typeof data.projects !== 'object') data.projects = {};
+
+    const entry = data.projects[canonical] && typeof data.projects[canonical] === 'object'
+      ? data.projects[canonical]
+      : (data.projects[canonical] = {});
+    if (entry.hasTrustDialogAccepted === true) return; // already trusted — skip write
+
+    entry.hasTrustDialogAccepted = true;
+    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    logger.info(`[claude-trust] Pre-accepted folder trust for ${canonical}`);
+  } catch (err) {
+    logger.debug(`[claude-trust] seed failed (ignored): ${err}`);
+  }
+}
+
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
 export function killWorker(ds: DaemonSession): void {
@@ -561,6 +607,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   }
 
   ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);
+  // Claude Code blocks on the interactive folder-trust dialog the first time
+  // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
+  if (botCfg.cliId === 'claude-code') ensureClaudeFolderTrust(cwd);
 
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.

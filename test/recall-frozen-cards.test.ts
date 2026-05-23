@@ -7,7 +7,7 @@
  *
  * Run:  pnpm vitest run test/recall-frozen-cards.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
@@ -47,7 +47,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn(),
+  getBot: vi.fn(() => ({
+    config: { larkAppId: 'app_test', cliId: 'claude-code' },
+  })),
   getAllBots: vi.fn(() => []),
 }));
 
@@ -90,8 +92,9 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 
 // ─── Imports under test ────────────────────────────────────────────────────
 
-import { recallFrozenCards, parkStreamCard, scheduleCardPatch } from '../src/core/worker-pool.js';
+import { recallFrozenCards, parkStreamCard, restoreUsageLimitRuntimeState, scheduleCardPatch } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -143,6 +146,11 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReset();
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
+});
+
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
 });
 
 function flush(): Promise<void> {
@@ -282,6 +290,76 @@ describe('recallFrozenCards', () => {
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_only');
+  });
+});
+
+describe('restoreUsageLimitRuntimeState', () => {
+  it('marks restored limit sessions limited and re-arms the retry timer', () => {
+    const now = new Date('2026-05-22T10:00:00Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const ds = makeDs();
+    ds.streamCardId = 'om_live_limit';
+    ds.streamCardNonce = 'nonce_limit';
+    ds.session.webPort = 8080;
+    ds.workerPort = null;
+    ds.usageLimit = {
+      limited: true,
+      kind: 'usage',
+      retryAtMs: now + 1_000,
+      retryLabel: '10:01 AM',
+      retryReady: false,
+    };
+
+    restoreUsageLimitRuntimeState(ds);
+
+    expect(ds.lastScreenStatus).toBe('limited');
+    expect(ds.usageLimitRetryTimer).toBeDefined();
+    expect(ds.usageLimit.retryReady).toBe(false);
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1_000);
+
+    expect(ds.usageLimit.retryReady).toBe(true);
+    expect(persistStreamCardStateMock).toHaveBeenCalledWith(ds);
+    expect(buildStreamingCard).toHaveBeenCalledWith(
+      SESSION_ID,
+      'om_root',
+      'http://localhost:8080',
+      't',
+      '',
+      'limited',
+      'claude-code',
+      'hidden',
+      'nonce_limit',
+      undefined,
+      false,
+      false,
+      'zh',
+      ds.usageLimit,
+    );
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
+  });
+
+  it('marks already-expired restored limits retry-ready immediately', () => {
+    const now = new Date('2026-05-22T10:00:00Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const ds = makeDs();
+    ds.usageLimit = {
+      limited: true,
+      kind: 'usage',
+      retryAtMs: now - 1_000,
+      retryLabel: '9:59 AM',
+      retryReady: false,
+    };
+
+    restoreUsageLimitRuntimeState(ds);
+
+    expect(ds.lastScreenStatus).toBe('limited');
+    expect(ds.usageLimit.retryReady).toBe(true);
+    expect(ds.usageLimitRetryTimer).toBeUndefined();
+    expect(persistStreamCardStateMock).toHaveBeenCalledWith(ds);
   });
 });
 

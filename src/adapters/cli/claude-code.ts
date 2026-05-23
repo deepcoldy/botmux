@@ -388,6 +388,17 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       args.push('--dangerously-skip-permissions');
+      // Suppress the first-run "--dangerously-skip-permissions" risk-acceptance
+      // screen for this spawn only. In a fresh $HOME that has never accepted it,
+      // Claude Code otherwise blocks on an interactive confirmation that botmux
+      // can't answer — it mistypes the user's message into the dialog and the
+      // session breaks (observed as `tmux send-keys … failed`). An inline
+      // --settings JSON is scoped to this process, so it never mutates the
+      // user's global ~/.claude/settings.json or their interactive claude.
+      args.push('--settings', JSON.stringify({
+        skipDangerousModePermissionPrompt: true,
+        permissions: { defaultMode: 'bypassPermissions' },
+      }));
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       const unknown = t('ai.identity.unknown', undefined, locale);
       const identityBlock =

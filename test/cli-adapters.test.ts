@@ -82,6 +82,15 @@ describe('claude-code buildArgs', () => {
     expect(args[idx + 1]).toContain('ExitPlanMode');
   });
 
+  it('passes inline --settings that skips the dangerous-mode prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    const idx = args.indexOf('--settings');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[idx + 1]);
+    expect(parsed.skipDangerousModePermissionPrompt).toBe(true);
+    expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
+  });
+
   it('ignores initialPrompt (not passed via args)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, initialPrompt: 'hello' });
     expect(args).not.toContain('hello');

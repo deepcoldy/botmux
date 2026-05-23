@@ -362,7 +362,7 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 
 | Command | Description |
 |---------|-------------|
-| `/group <name>` (alias `/g`) | Auto-create a new Lark group, invite you, transfer ownership; the whole group acts as one chat-scope CLI session. Empty name falls back to a timestamp. |
+| `/group <name>` (alias `/g`) | Auto-create a new Lark group, invite you, transfer ownership; the whole group acts as one chat-scope CLI session. Empty name falls back to a timestamp. The group does **not** auto-start a session — just go in and start chatting with the bot. Any bots you @-mention in the command are pulled into the new group (the first mentioned bot does the creating). |
 
 **👥 Multi-bot collaboration**
 

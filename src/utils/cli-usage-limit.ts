@@ -51,6 +51,10 @@ function parseMeridiemTime(text: string, now: Date): { retryAtMs: number; retryL
 
     const retryAt = new Date(now);
     retryAt.setHours(hour, minute, 0, 0);
+    // CLI output only includes a wall-clock time, not a date. Roll passed AM
+    // times into tomorrow because afternoon→midnight resets are common. Passed
+    // PM times stay on today: they might mean "just reset" or "tomorrow PM",
+    // and a wrong ready state self-heals when the CLI rejects the retry again.
     if (retryAt.getTime() < now.getTime() && hour < 12) {
       retryAt.setDate(retryAt.getDate() + 1);
     }

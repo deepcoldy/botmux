@@ -8,6 +8,8 @@
  *  - invalidUserIds includes transferTo → skip transfer with 'invitee_rejected'
  *  - invalidUserIds includes notifyTo → skip notify with 'invitee_rejected'
  *  - transferChatOwner failure surfaces as `transferError`, chatId still returned
+ *  - transferChatOwner error but getChatOwner confirms target → treated as success
+ *    (Lark slow-ACK / 504 false-negative recovery)
  *  - sendMessage throw surfaces as `notifyError`, chatId still returned
  *  - createChat throw bubbles up (caller decides exit code)
  */
@@ -15,9 +17,11 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const mockCreateChat = vi.fn();
 const mockTransferChatOwner = vi.fn();
+const mockGetChatOwner = vi.fn();
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: (...args: any[]) => mockCreateChat(...args),
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
+  getChatOwner: (...args: any[]) => mockGetChatOwner(...args),
 }));
 
 const mockSendMessage = vi.fn();
@@ -40,6 +44,7 @@ describe('createGroupWithBots', () => {
   beforeEach(() => {
     mockCreateChat.mockReset();
     mockTransferChatOwner.mockReset();
+    mockGetChatOwner.mockReset();
     mockSendMessage.mockReset();
     mockBindOncall.mockReset();
   });
@@ -123,6 +128,9 @@ describe('createGroupWithBots', () => {
   it('surfaces transferChatOwner failure as transferError without aborting', async () => {
     mockCreateChat.mockResolvedValue({ chatId: 'oc_x', invalidBotIds: [], invalidUserIds: [] });
     mockTransferChatOwner.mockResolvedValue({ ok: false, error: 'permission_denied' });
+    // Readback confirms the transfer really did NOT happen (owner is still
+    // someone other than the target), so the error must surface.
+    mockGetChatOwner.mockResolvedValue('ou_still_the_bot');
     mockSendMessage.mockResolvedValue('om_notify');
     const result = await createGroupWithBots({
       creatorLarkAppId: CREATOR,
@@ -136,6 +144,25 @@ describe('createGroupWithBots', () => {
     // notify still ran
     expect(result.notifyMessageId).toBe('om_notify');
     expect(result.notifyError).toBeNull();
+  });
+
+  it('treats a transfer error as success when getChatOwner confirms the target', async () => {
+    // Lark sometimes returns 504/transient errors on owner transfer even though
+    // the write committed. group-creator reads back the owner; if it already
+    // matches the target, the transfer really succeeded and no error surfaces.
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_x', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: false, error: 'gateway_timeout' });
+    mockGetChatOwner.mockResolvedValue(USER_OPEN_ID);
+    mockSendMessage.mockResolvedValue('om_notify');
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      transferOwnerTo: USER_OPEN_ID,
+      notifyOwnerOpenId: USER_OPEN_ID,
+    });
+    expect(mockGetChatOwner).toHaveBeenCalledWith(CREATOR, 'oc_x');
+    expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+    expect(result.transferError).toBeNull();
   });
 
   it('surfaces sendMessage throw as notifyError without aborting', async () => {
