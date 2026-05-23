@@ -276,6 +276,11 @@ Gemini / OpenCode / Antigravity), with no MCP protocol support required.
 - One-click locate back to the Feishu thread / open Web Terminal / multi-select batch close
 - Create a new group with auto owner-transfer + @-mention notification
 - Disband or leave a chat (associated sessions auto-closed)
+- **Workflows console**:
+  - Run List (5 s poll) + Run Detail with summary, dangling-work red panel, node/activity table, event timeline, and a **parallel-execution timeline** (attempt-level), auto-stopping polling once the run reaches a terminal state
+  - **Cancel a run directly from the dashboard**; approve / reject `humanGate` with reviewer comments
+  - **Workflow Catalog**: lists every workflow under `~/.botmux/workflows/`, drills into schema / dependency graph, and triggers a new run from the UI (with params input)
+  - IM approval / cancel cards remain available; `botmux workflow` CLI subcommands also keep working
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
 

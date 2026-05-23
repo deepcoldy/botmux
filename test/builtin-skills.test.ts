@@ -44,3 +44,42 @@ describe('built-in botmux-quoted skill', () => {
     expect(quoted!.content).toContain('用户引用了消息');
   });
 });
+
+describe('built-in botmux-workflow-create skill', () => {
+  it('exists and teaches validate + current workflow binding constraints', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow-create');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux workflow validate');
+    expect(skill!.content).toContain('botmux bots list');
+    expect(skill!.content).toContain('description');
+    expect(skill!.content).toContain('feishu-send');
+    expect(skill!.content).toContain('feishu-reply');
+    expect(skill!.content).toContain('botmux-schedule');
+    expect(skill!.content).toContain('"$ref": "params.<path>"');
+    // String template interpolation `${...}` is now supported alongside whole-field $ref —
+    // SKILL.md must teach the new syntax so workflow-create LLM uses it instead of writing
+    // upstream "planRequest"-style workaround fields.
+    expect(skill!.content).toContain('${params.city}');
+    expect(skill!.content).toContain('${fetchWeather.output.summary}');
+    expect(skill!.content).toContain('整字段');
+    expect(skill!.content).toContain('内嵌');
+    // The old "no template language" line must be gone so the LLM doesn't keep
+    // building "planRequest"-style upstream wrappers.
+    expect(skill!.content).not.toContain('当前没有字符串模板语言');
+    // workflow.subagent.bot must be larkAppId (cross-daemon stable identifier), not displayName
+    expect(skill!.content).toContain('larkAppId');
+    expect(skill!.content).toContain('cli_xxxxxxxxxxxxxxxx');
+    expect(skill!.content).not.toContain('"bot": "claude-loopy"');
+    // workflow file must live at $HOME/.botmux/workflows/, not in arbitrary cwd
+    expect(skill!.content).toContain('$HOME/.botmux/workflows/');
+    // Params docs must track shared coerceWorkflowParams behavior across CLI + IM.
+    expect(skill!.content).toContain('--param-json');
+    expect(skill!.content).toContain('未知参数：');
+    expect(skill!.content).toContain('缺少必填参数：');
+    expect(skill!.content).toContain('必须是 number');
+    expect(skill!.content).toContain('必须是 boolean');
+    expect(skill!.content).toContain('暂不支持 object / array');
+    expect(skill!.content).toContain('object / array');
+    expect(skill!.content).toContain('default');
+  });
+});

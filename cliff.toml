@@ -1,5 +1,8 @@
-# git-cliff 配置 — 在手写中文 changelog 下面自动追加'本次合并'和'新贡献者'两段。
+# git-cliff 配置 — 在手写中文 changelog 下面自动追加'本次合并'一段。
 # 触发: CI 在 push tag (v*) 时调用; 也可本地预览: GITHUB_TOKEN=$(gh auth token) git-cliff --unreleased
+#
+# 注意:'感谢贡献者'段不在这里渲染。git-cliff 的 github.contributors 只收录'首次贡献者',
+# 会漏掉之前贡献过的人; 故改由 release.yml 用 gh 按区间内 PR 作者去重生成(见该 workflow)。
 
 [changelog]
 header = ""
@@ -14,17 +17,6 @@ body = """
 {%- if commit.remote.username %} — @{{ commit.remote.username }}{%- endif %}
 {% endfor -%}
 {%- endif -%}
-{%- set external = github.contributors | filter(attribute="pr_number") -%}
-{%- set thanked = [] -%}
-{%- for c in external -%}
-  {%- if c.username != "deepcoldy" -%}
-    {%- set_global thanked = thanked | concat(with=c) -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- if thanked | length > 0 %}
-## 感谢贡献者
-{% for c in thanked %}@{{ c.username }}{% if not loop.last %} {% endif %}{% endfor %}
-{%- endif %}
 """
 footer = ""
 trim = true

@@ -1,0 +1,44 @@
+{
+  "workflowId": "hello",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "greet": {
+      "type": "subagent",
+      "bot": "cli_canary_PLACEHOLDER",
+      "description": "subagent.bot is a larkAppId placeholder (cli_*); replace with the real bot id from `botmux bots list` before running.",
+      "prompt": "Write a short, friendly greeting message. Return JSON with two fields: `preview` (the greeting text shown to the human approver) and `finalPrompt` (a string instructing the next node to echo the greeting back verbatim as the final signed-off message). Schema: {\"preview\": string, \"finalPrompt\": string}.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["preview", "finalPrompt"],
+        "properties": {
+          "preview": { "type": "string" },
+          "finalPrompt": { "type": "string" }
+        }
+      }
+    },
+    "confirm": {
+      "type": "subagent",
+      "bot": "cli_canary_PLACEHOLDER",
+      "depends": ["greet"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "greet.output.preview" },
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "prompt": { "$ref": "greet.output.finalPrompt" },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["message"],
+        "properties": { "message": { "type": "string" } }
+      }
+    }
+  }
+}

@@ -31,6 +31,8 @@ import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
+const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
@@ -505,12 +507,31 @@ export function killWorker(ds: DaemonSession): void {
   try {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
-  // Give worker 2s to clean up, then force kill
   const w = ds.worker;
-  setTimeout(() => { if (!w.killed) w.kill('SIGTERM'); }, 2000);
+  armWorkerKillBackstop(w, tag(ds));
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+}
+
+function armWorkerKillBackstop(w: ChildProcess, label: string): void {
+  const sigterm = setTimeout(() => {
+    if (w.exitCode === null && w.signalCode === null) {
+      try { w.kill('SIGTERM'); } catch { /* already gone */ }
+    }
+  }, WORKER_SIGTERM_BACKSTOP_MS);
+  const sigkill = setTimeout(() => {
+    if (w.exitCode === null && w.signalCode === null) {
+      logger.warn(`[${label}] worker did not exit after SIGTERM; escalating to SIGKILL`);
+      try { w.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  }, WORKER_SIGKILL_BACKSTOP_MS);
+  sigterm.unref?.();
+  sigkill.unref?.();
+  w.once('exit', () => {
+    clearTimeout(sigterm);
+    clearTimeout(sigkill);
+  });
 }
 
 // ─── Idempotent session close (dashboard IPC) ───────────────────────────────
@@ -794,6 +815,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           );
           ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
           persistStreamCardState(ds);
+          // Re-sync worker's display mode (it starts fresh in 'hidden')
+          if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
+            ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
+          }
           // New card is live — recall any cards frozen by previous turns.
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
@@ -838,6 +863,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        break;
+      }
+
+      case 'cli_session_id': {
+        ds.session.cliSessionId = msg.cliSessionId;
+        sessionStore.updateSession(ds.session);
         break;
       }
 
@@ -1272,6 +1303,7 @@ function deliverFinalOutput(
 /** Test-only alias so the retry pipeline can be exercised without a real
  *  fork. Intentionally underscored to discourage non-test callers. */
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
+export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 

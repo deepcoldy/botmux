@@ -1,0 +1,23 @@
+{
+  "workflowId": "o1-canary",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "approve": {
+      "type": "subagent",
+      "bot": "cli_canary_PLACEHOLDER",
+      "description": "subagent.bot is a larkAppId placeholder (cli_*); replace with the real bot id from `botmux bots list` before running.",
+      "prompt": "o1-canary: never reached because CLI never approves the gate",
+      "humanGate": {
+        "stage": "before",
+        "prompt": "(o1 dogfood) approve to continue?",
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      }
+    }
+  }
+}

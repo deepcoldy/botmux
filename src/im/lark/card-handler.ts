@@ -11,6 +11,11 @@ import { sendUserMessage, updateMessage, deleteMessage, replyMessage } from './c
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied } from './grant-pending.js';
+import {
+  handleWorkflowApprovalAction,
+  isWorkflowApprovalAction,
+  type WorkflowApprovalHandlerDeps,
+} from './workflow-card-handler.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
@@ -29,6 +34,8 @@ export interface CardHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
   lastRepoScan: Map<string, ProjectInfo[]>;
+  workflowApprovalDeps?: WorkflowApprovalHandlerDeps;
+  workflowApprovalResolved?: (runId: string) => void | Promise<void>;
 }
 
 interface CardActionData {
@@ -180,7 +187,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return JSON.parse(buildGrantResultCard(kind, loc));
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -221,6 +228,31 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
       }
     }
+  }
+
+  if (isWorkflowApprovalAction(value?.action)) {
+    const result = await handleWorkflowApprovalAction(data, deps.workflowApprovalDeps);
+    const runId = value?.run_id;
+    if (result?.ok && !result.duplicate && runId) {
+      await deps.workflowApprovalResolved?.(runId);
+    }
+    // Non-approver: surface a toast so the clicker knows nothing happened
+    // (instead of silently leaving the buttons active).
+    if (result && !result.ok && result.error === 'not_approver') {
+      return { toast: { type: 'warning', content: '你不在该审批人名单里，无法操作' } };
+    }
+    // Successful resolve / reject / cancel: replace the clicked card with a
+    // frozen "已通过/已拒绝/已取消" body so the buttons can't be re-submitted
+    // from this surface. Duplicate clicks just no-op (the first PATCH already
+    // landed).
+    if (result?.ok && !result.duplicate && result.resolvedCardJson) {
+      try {
+        return JSON.parse(result.resolvedCardJson);
+      } catch {
+        // fall through to undefined
+      }
+    }
+    return;
   }
 
   // Handle session card button actions (restart/close)

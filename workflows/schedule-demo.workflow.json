@@ -1,0 +1,30 @@
+{
+  "workflowId": "schedule-demo",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "create-daily-task": {
+      "type": "hostExecutor",
+      "executor": "botmux-schedule",
+      "description": "Demo of the bare botmux-schedule executor mechanics (registering a cron task via the host executor + reconciler). Production workflows should gate this with humanGate.stage='before' so an operator approves the cadence + prompt + target chat before the task is persisted; see canary-multistep.workflow.json for the draft→confirm→side-effect pattern. `unsafeAllowUngated` is the explicit opt-out — never an oversight.",
+      "unsafeAllowUngated": true,
+      "input": {
+        "name": "schedule-demo daily 9am",
+        "schedule": "0 9 * * *",
+        "parsed": {
+          "kind": "cron",
+          "expr": "0 9 * * *",
+          "display": "0 9 * * *"
+        },
+        "prompt": "Schedule demo: run workflow self-check.",
+        "workingDir": "/tmp/botmux-schedule-demo",
+        "chatId": "oc_workflow_demo",
+        "scope": "thread"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "workflowId": "feishu-reply-demo",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "reply-thread": {
+      "type": "hostExecutor",
+      "executor": "feishu-reply",
+      "description": "Demo of the bare feishu-reply executor mechanics. Production workflows should gate this with humanGate.stage='before' so an operator approves the rootMessageId + body; see canary-multistep.workflow.json for the gate-then-send pattern. `unsafeAllowUngated` is the explicit opt-out — never an oversight.",
+      "unsafeAllowUngated": true,
+      "input": {
+        "larkAppId": "cli_demo_PLACEHOLDER",
+        "rootMessageId": "om_demo_PLACEHOLDER",
+        "content": "feishu-reply-demo: workflow A3 reply",
+        "msgType": "text",
+        "replyInThread": false
+      }
+    }
+  }
+}

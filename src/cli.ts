@@ -43,6 +43,10 @@ import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
+import {
+  formatBotInfoEntriesForCli,
+  formatChatBotsForCli,
+} from './cli/bots-list-output.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 
@@ -71,6 +75,7 @@ const CONFIG_DIR = join(homedir(), '.botmux');
 const ENV_FILE = join(CONFIG_DIR, '.env');
 const DATA_DIR = join(CONFIG_DIR, 'data');
 const LOG_DIR = join(CONFIG_DIR, 'logs');
+const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
 const BOTS_JSON_FILE = join(CONFIG_DIR, 'bots.json');
 const PM2_NAME = 'botmux';
 /**
@@ -84,7 +89,7 @@ const PM2_HOME = join(CONFIG_DIR, 'pm2');
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function ensureConfigDir(): void {
-  for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR, PM2_HOME]) {
+  for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR, HEAPSHOT_DIR, PM2_HOME]) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 }
@@ -213,6 +218,13 @@ function ecosystemConfig(): string {
     restart_delay: 3000,
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
+    node_args: [
+      '--max-old-space-size=8192',
+      // Do not enable --heapsnapshot-near-heap-limit here. On large V8
+      // heaps the snapshot generator is synchronous, can add many GiB of
+      // RSS, and blocks the daemon before our memdiag timer can run.
+      `--diagnostic-dir=${HEAPSHOT_DIR}`,
+    ],
   };
 
   const apps: any[] = bots.map((_bot: any, i: number) => ({
@@ -220,7 +232,14 @@ function ecosystemConfig(): string {
     name: botProcessName(_bot, i, PM2_NAME),
     error_file: join(LOG_DIR, `daemon-${i}-error.log`),
     out_file: join(LOG_DIR, `daemon-${i}-out.log`),
-    env: { SESSION_DATA_DIR: DATA_DIR, BOTMUX_BOT_INDEX: String(i) },
+    env: {
+      SESSION_DATA_DIR: DATA_DIR,
+      BOTMUX_BOT_INDEX: String(i),
+      // Native-memory diagnostics. Default off; operator can flip it on
+      // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
+      // RSS regression — turned off in master so logs stay quiet.
+      BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
+    },
   }));
 
   apps.push({
@@ -2502,6 +2521,21 @@ function buildFooterAddressing(
 }
 
 async function cmdSend(rest: string[]): Promise<void> {
+  // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
+  // must not chat-post directly — chat-facing side effects are reserved
+  // for `hostExecutor` activities so they can be tracked via
+  // `effectAttempted` + reconciled across retries / resumes.  Refuse loud
+  // so the agent (and any human reviewing logs) sees the boundary.
+  if (process.env.BOTMUX_WORKFLOW === '1') {
+    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
+    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
+    console.error(
+      `botmux send refused inside workflow subagent (run=${runId} node=${nodeId}).\n` +
+      `Workflow subagents must return structured output via the WORKFLOW_OUTPUT marker;\n` +
+      `chat-facing side effects belong in a hostExecutor activity, not a subagent.`,
+    );
+    process.exit(2);
+  }
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
   const images = argValues(rest, '--image', '--images');
@@ -3063,21 +3097,11 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     // botmux daemon on this host). 'introduce' = discovered via /introduce
     // collaboration command (external bot, possibly other-tenant). isSelf is
     // retained (not filtered) so the model can still identify itself when needed.
-    const result = chatBots.map(cb => ({
-      name: cb.displayName,
-      openId: cb.openId,
-      isSelf: cb.larkAppId === appId,
-      source: cb.source,
-    }));
+    const result = formatChatBotsForCli(chatBots, appId);
     console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
   } catch (err: any) {
     // Fallback to bots-info.json
-    const result = botEntries.filter(b => b.botOpenId).map(b => ({
-      name: b.botName ?? b.cliId,
-      openId: b.botOpenId!,
-      isSelf: b.larkAppId === appId,
-      source: 'configured' as const,
-    }));
+    const result = formatBotInfoEntriesForCli(botEntries, appId);
     console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, note: `chat query failed: ${err.message}` }, null, 2));
   }
 }
@@ -3186,6 +3210,40 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+// Workflow safety gate (Slice C0): a CLI invoked inside a workflow
+// subagent worker (BOTMUX_WORKFLOW=1, set by daemon-spawn) must not
+// trigger chat-facing or schedule-mutation side effects.  Those belong
+// in `hostExecutor` activities so they get `effectAttempted` tracking +
+// reconcile.  Read-only commands (history, quoted, bots list, etc.)
+// stay allowed because they're useful for agents to introspect.
+if (process.env.BOTMUX_WORKFLOW === '1') {
+  const blockedRoot = new Set(['send', 'create-group', 'setup']);
+  const isSchedule = command === 'schedule';
+  const scheduleSub = isSchedule ? (process.argv[3] ?? '') : '';
+  const blockedScheduleSub = new Set([
+    'add',
+    'rm',
+    'remove',
+    'del',
+    'delete',
+    'pause',
+    'disable',
+    'resume',
+    'enable',
+    'run',
+  ]);
+  if (blockedRoot.has(command) || (isSchedule && blockedScheduleSub.has(scheduleSub))) {
+    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
+    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
+    console.error(
+      `botmux ${command}${isSchedule ? ` ${scheduleSub}` : ''} refused inside workflow ` +
+      `subagent (run=${runId} node=${nodeId}).  Chat-facing or schedule-mutating ` +
+      `effects belong in a hostExecutor activity, not a subagent.`,
+    );
+    process.exit(2);
+  }
+}
+
 switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
@@ -3204,6 +3262,11 @@ switch (command) {
   case 'rm':      cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'workflow': {
+    const { cmdWorkflow } = await import('./cli/workflow.js');
+    await cmdWorkflow(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;

@@ -68,3 +68,66 @@ export function parseCookie(header: string | undefined): string | undefined {
 export function buildSetCookie(token: string): string {
   return `botmux_dashboard_token=${token}; HttpOnly; SameSite=Lax; Path=/`;
 }
+
+// ─── Per-request auth decision ──────────────────────────────────────────────
+
+/**
+ * The dashboard splits incoming requests into three categories before the
+ * route handlers run:
+ *
+ *   - `allow`            — request can proceed (auth succeeded OR endpoint
+ *                          is public)
+ *   - `allow+set-cookie` — `?t=<correct-token>` query: the cookie is set
+ *                          and we redirect to a clean URL.  This is the
+ *                          only branch that mints a Set-Cookie header.
+ *   - `deny401`          — endpoint requires an authenticated session and
+ *                          none was presented.
+ *
+ * Public surfaces today (codex review v0.1.2 → canary.3):
+ *   - `GET /` and `GET /assets/*`              — static SPA shell
+ *   - `GET /api/workflows/*`                   — workflow read-only API
+ *
+ * Anything else (sessions, schedules, dashboard rotate, POST /api/workflows
+ * /…/cancel, etc.) requires the active session token, matching the
+ * "get_write_link" pattern that the chat web terminal already uses.
+ */
+export type AuthDecision =
+  | { kind: 'allow' }
+  | { kind: 'allow+set-cookie'; token: string; redirectTo: string }
+  | { kind: 'deny401' };
+
+export function decideDashboardAuth(opts: {
+  method: string;
+  pathname: string;
+  hasTokenParam: boolean;
+  presentedToken: string | undefined;
+  activeToken: string;
+}): AuthDecision {
+  const { method, pathname, hasTokenParam, presentedToken, activeToken } = opts;
+
+  // Workflow read-only paths + static SPA shell are public — the dashboard
+  // must be linkable from Lark cards without forcing a `botmux dashboard`
+  // round-trip.  Write actions still need a cookie / token.
+  const isWorkflowReadOnly =
+    method === 'GET' && pathname.startsWith('/api/workflows/');
+  const isStaticShell =
+    method === 'GET' && (pathname === '/' || pathname.startsWith('/assets/'));
+
+  const authed = !!presentedToken && presentedToken === activeToken;
+
+  if (!authed && !isWorkflowReadOnly && !isStaticShell) {
+    return { kind: 'deny401' };
+  }
+
+  // First hit with `?t=<correct token>` sets the cookie + redirects to the
+  // clean URL.  Only reached when the token matched (`authed === true`).
+  if (hasTokenParam && authed && presentedToken) {
+    return {
+      kind: 'allow+set-cookie',
+      token: presentedToken,
+      redirectTo: pathname || '/',
+    };
+  }
+
+  return { kind: 'allow' };
+}

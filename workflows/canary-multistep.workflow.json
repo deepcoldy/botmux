@@ -1,0 +1,59 @@
+{
+  "workflowId": "canary-multistep",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "draft": {
+      "type": "subagent",
+      "bot": "cli_canary_PLACEHOLDER",
+      "description": "subagent.bot is a larkAppId placeholder (cli_*); replace with the real bot id from `botmux bots list` before running.",
+      "prompt": "Create a short canary message. Return JSON: {\"preview\": string, \"text\": string}.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["preview", "text"],
+        "properties": {
+          "preview": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      }
+    },
+    "confirm": {
+      "type": "subagent",
+      "bot": "cli_canary_PLACEHOLDER",
+      "depends": ["draft"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "draft.output.preview" },
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "prompt": { "$ref": "draft.output.text" },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["approvedText"],
+        "properties": {
+          "approvedText": { "type": "string" }
+        }
+      }
+    },
+    "send": {
+      "type": "hostExecutor",
+      "executor": "feishu-send",
+      "depends": ["confirm"],
+      "description": "Canary deliberately opts out of a per-send gate because `confirm` already gates the chain; the human reviewed the exact text being sent (`approvedText`) one node ago. New workflows should usually put the gate directly on the side-effect node (see feishu-send-demo) — `unsafeAllowUngated: true` is the explicit audit trail when that's not appropriate.",
+      "unsafeAllowUngated": true,
+      "input": {
+        "larkAppId": "cli_canary_PLACEHOLDER",
+        "chatId": "oc_canary_PLACEHOLDER",
+        "content": { "$ref": "confirm.output.approvedText" },
+        "msgType": "text"
+      }
+    }
+  }
+}

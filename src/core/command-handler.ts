@@ -38,7 +38,12 @@ export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help'
  * bypassing the normal prompt-wrapping and bracketed-paste path so the CLI's
  * own slash-command parser sees them.
  */
-export const PASSTHROUGH_COMMANDS = new Set(['/compact', '/model', '/clear', '/plugin', '/usage', '/code-review', '/security-review', '/review']);
+export const PASSTHROUGH_COMMANDS = new Set([
+  '/compact', '/model', '/clear', '/plugin', '/usage',
+  // 只读 / 低副作用，飞书卡片里能直接吐文本：
+  '/context', '/cost', '/mcp', '/diff',
+  '/code-review', '/security-review', '/review',
+]);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -954,7 +959,8 @@ export async function handleCommand(
           t('help.status', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
-          '/compact /model /clear /plugin /usage /code-review /security-review /review',
+          // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移
+          [...PASSTHROUGH_COMMANDS].join(' '),
           '',
           t('help.heading_schedule', undefined, loc),
           t('help.schedule_create', undefined, loc),

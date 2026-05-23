@@ -6,6 +6,8 @@ import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
 import { renderRolesPage } from './roles.js';
+import { renderWorkflowsPage } from './workflows.js';
+import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { t, ui } from './ui.js';
 import type { DashboardLocale } from './i18n.js';
@@ -13,9 +15,24 @@ import type { ThemeMode } from './preferences.js';
 
 const root = document.getElementById('root')!;
 
+// Pages that own a polling loop / cleanup return a disposer; we run it
+// on the next route switch so timers don't leak across navigations.
+let pageDispose: (() => void) | null = null;
+
 function route() {
+  if (pageDispose) { pageDispose(); pageDispose = null; }
   const hash = location.hash || '#/';
-  if (hash.startsWith('#/groups')) renderGroupsPage(root);
+  // Catalog is a sub-route under Workflows now (`#/workflows/catalog[/<id>]`)
+  // so the top nav has a single "Workflows (beta)" entry.  Legacy
+  // `#/workflows-catalog[*]` URLs are kept working for any external links
+  // that may have been pasted before the move.
+  if (
+    hash.startsWith('#/workflows/catalog') ||
+    hash.startsWith('#/workflows-catalog')
+  ) {
+    pageDispose = renderWorkflowCatalogPage(root);
+  } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/roles')) renderRolesPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);

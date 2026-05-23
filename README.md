@@ -156,6 +156,11 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 - 一键定位回飞书话题 / 跳 Web 终端 / 多选批量关闭会话
 - 拉新群、自动转让群主、@ 提醒
 - 解散群聊、bot 退群（关联会话自动清理）
+- **Workflows 管控面**：
+  - Run List 5s 轮询；Run Detail 看 summary / dangling 红区 / node-activity 表 / event timeline / **并发执行 timeline**（attempt 级时序），到 terminal 自动停轮询
+  - **Dashboard 内可直接 cancel run**、批准/拒绝 humanGate（approve/reject + 评论）
+  - **Workflow Catalog**：列所有 `~/.botmux/workflows/` 下的 workflow，点进去看 schema / 依赖图，直接在 UI 触发 run（带 params 输入）
+  - IM 卡片（cancel / approve / reject）仍可用；CLI 子命令也保留
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
 
@@ -413,6 +418,39 @@ botmux autostart enable
 | `botmux autostart disable` | 注销开机自启 |
 | `botmux autostart status` | 查看自启状态 |
 | `botmux dashboard` | 输出一次 Web Dashboard URL（每次刷 token，旧链接立即失效） |
+
+### Workflow 子命令（实验性运维）
+
+`botmux workflow` 把工作流 run 的状态当一等公民暴露出来——查看哪些 run 在跑、读事件流、从崩溃 / awaiting 恢复或取消。所有命令读写 `BOTMUX_WORKFLOW_RUNS_DIR`（默认 `~/.botmux/workflow-runs`），不需要 daemon 在线。
+
+| 命令 | 说明 |
+|------|------|
+| `botmux workflow run <id> [--param k=v ...]` | 离线驱动 workflow（stub spawn）；humanGate 节点跑到 awaiting-wait 退出 |
+| `botmux workflow resume <runId>` | 从磁盘 runDir 冷恢复一个已有 run；R0 recovery 先收 dangling effect，再走 orchestrator |
+| `botmux workflow cancel <runId> [--reason <text>]` | 写 run-level cancelRequested 并驱动 cancel recovery；terminal run 直接 no-op |
+| `botmux workflow ls [--all] [--status running,failed] [--wide] [--json]` | 列 runsDir 下所有 run；默认仅 non-terminal；`dEf/dAct/dWait` 三列分别是 dangling effects / non-effect activities / waits |
+| `botmux workflow tail <runId> [--from N] [--follow] [--json]` | 打印事件简表；默认 history-only，`--follow` 才轮询 events.ndjson 增量 |
+| `botmux workflow show <runId>` | replay 当前 run 的事件，打 Snapshot 摘要 JSON |
+
+典型运维流程：
+
+```bash
+# 看哪些 run 在跑
+botmux workflow ls
+
+# 进一个 run 看事件
+botmux workflow tail wf-abc-123
+
+# run 卡住或 daemon 重启过 → 冷恢复
+botmux workflow resume wf-abc-123
+
+# 实在跑不动 → 取消
+botmux workflow cancel wf-abc-123 --reason '依赖外部超时'
+```
+
+完整端到端 dogfood（run → ls → tail → resume → cancel）参见 `scripts/dogfood-o1.sh`，跑在临时 runsDir 里，不碰真实环境。
+
+---
 
 ### 开机自启
 

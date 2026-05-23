@@ -13,7 +13,7 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, type FSWatcher } from 'node:fs';
+import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -29,6 +29,7 @@ import {
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
+import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -404,6 +405,13 @@ function bridgeProbeOpenSessionIds(): void {
 
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
+  if (!lastInitConfig?.adoptMode) {
+    const cursor = baselineJsonlCursor(bridgeJsonlPath);
+    bridgeOffset = cursor.newOffset;
+    bridgePendingTail = cursor.pendingTail;
+    bridgeBaselineDone = true;
+    return;
+  }
   const result = drainTranscript(bridgeJsonlPath, 0);
   bridgeOffset = result.newOffset;
   bridgePendingTail = result.pendingTail;
@@ -1408,10 +1416,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     codexBridgeBaselineDone = true;
     log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
   } else if (existsSync(rolloutPath)) {
-    const result = structuredBridgeIngestPath(rolloutPath, 0);
-    codexBridgeOffset = result.newOffset;
-    codexBridgePendingTail = result.pendingTail;
-    codexBridgeQueue.absorb(result.events);
+    const cursor = baselineJsonlCursor(rolloutPath);
+    codexBridgeOffset = cursor.newOffset;
+    codexBridgePendingTail = cursor.pendingTail;
     codexBridgeBaselineDone = true;
     log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
   } else {
@@ -1635,6 +1642,10 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
 const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
+const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
+const WORKFLOW_OUTPUT_END_MARKER = '</WORKFLOW_OUTPUT>';
+let workflowTranscript = '';
+let workflowFinalOutputSent = false;
 /** Tracks whether the CLI is currently in the alt screen buffer. Updated by
  *  scanning PTY output for DECSET 1049/47/1047 toggles. Used when trimming
  *  scrollback at cap so replay always starts with the correct buffer mode —
@@ -1650,6 +1661,64 @@ const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
 let screenAnalyzer: ScreenAnalyzer | null = null;
 /** When true, user messages are queued because a TUI prompt is active */
 let tuiPromptBlocking = false;
+
+function isWorkflowWorker(): boolean {
+  return process.env.BOTMUX_WORKFLOW === '1';
+}
+
+/**
+ *  Raw PTY byte stream writer — independent of the IPC `final_output` path.
+ *  Powers the dashboard "terminal replay" view: bytes flow straight through
+ *  without splitting on `\n` or prefixing each line, so ANSI cursor moves /
+ *  status bars / alt-screen toggles all survive and `xterm.write()` on the
+ *  client renders an actual recording of the live session.
+ *
+ *  Lazily opened on first PTY chunk so attempts that never produce data
+ *  don't leave empty `pty.log` files behind.  Closed at worker exit by the
+ *  process-shutdown hook below.
+ */
+let workflowPtyLogStream: WriteStream | undefined;
+let workflowPtyLogOpenFailed = false;
+function appendWorkflowPtyLog(data: string): void {
+  if (!isWorkflowWorker() || workflowPtyLogOpenFailed) return;
+  const path = process.env.BOTMUX_WORKFLOW_PTY_LOG_PATH;
+  if (!path) return;
+  if (!workflowPtyLogStream) {
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      workflowPtyLogStream = createWriteStream(path, { flags: 'a' });
+      workflowPtyLogStream.on('error', (err) => {
+        log(`workflow pty log write error: ${err.message}`);
+      });
+    } catch (err: any) {
+      workflowPtyLogOpenFailed = true;
+      log(`workflow pty log open failed (${path}): ${err.message}`);
+      return;
+    }
+  }
+  workflowPtyLogStream.write(data);
+}
+
+function captureWorkflowTranscript(data: string): void {
+  appendWorkflowPtyLog(data);
+  if (!isWorkflowWorker() || workflowFinalOutputSent) return;
+  workflowTranscript += data;
+  if (workflowTranscript.length > WORKFLOW_TRANSCRIPT_MAX) {
+    workflowTranscript = workflowTranscript.slice(-WORKFLOW_TRANSCRIPT_MAX);
+  }
+}
+
+function maybeEmitWorkflowTranscriptOutput(): void {
+  if (!isWorkflowWorker() || workflowFinalOutputSent) return;
+  if (!workflowTranscript.includes(WORKFLOW_OUTPUT_END_MARKER)) return;
+  send({
+    type: 'final_output',
+    content: workflowTranscript,
+    lastUuid: `workflow-pty-${Date.now()}`,
+    turnId: `workflow-pty-${sessionId || 'unknown'}`,
+  });
+  log('Workflow PTY transcript final_output emitted');
+}
 
 function startScreenAnalyzer(): void {
   const sa = config.screenAnalyzer;
@@ -2000,6 +2069,7 @@ let trustHandled = false;
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
 function onPtyData(data: string): void {
+  captureWorkflowTranscript(data);
   renderer?.write(data);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
@@ -2059,6 +2129,7 @@ function onPtyData(data: string): void {
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
   isPromptReady = true;
+  maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();  // exclude history replay from streaming card
@@ -2079,6 +2150,7 @@ function markPromptReady(): void {
 function persistCliSessionId(cliSessionId: string): void {
   if (!cliSessionId || !sessionId) return;
   if (lastInitConfig) lastInitConfig.cliSessionId = cliSessionId;
+  send({ type: 'cli_session_id', cliSessionId });
   try {
     const session = sessionStore.getSession(sessionId);
     if (!session || session.cliSessionId === cliSessionId) return;
@@ -2526,6 +2598,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
   backend = selectedBackend.backend;
+  const adapterSessionId = cfg.resume
+    ? (cfg.originalSessionId ?? cfg.sessionId)
+    : cfg.sessionId;
 
   // Claude Code appends a line to ~/.claude/projects/<cwd-hash>/<sid>.jsonl each
   // time the user submits. The adapter uses this file to verify paste+Enter
@@ -2534,11 +2609,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // so it needs no per-session wiring here.
   if (cfg.cliId === 'claude-code') {
     (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
-      claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
+      claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir);
   }
 
   const args = cliAdapter.buildArgs({
-    sessionId: cfg.sessionId,
+    sessionId: adapterSessionId,
     resume: cfg.resume ?? false,
     workingDir: cfg.workingDir,
     resumeSessionId: cfg.cliSessionId,
@@ -2626,8 +2701,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the file Claude creates on first submit isn't absorbed as history,
   // and baseline-existing on resume so prior-run turns ARE absorbed (we
   // don't want to re-emit yesterday's conversation as fresh turns).
-  if (cfg.cliId === 'claude-code' && cfg.sessionId) {
-    const claudeJsonl = claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
+  if (cfg.cliId === 'claude-code' && adapterSessionId) {
+    const claudeBridgeSessionId = cfg.cliSessionId ?? adapterSessionId;
+    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir);
     startBridgeWatcher(claudeJsonl, {
       cliPid: cliPid ?? undefined,
       cliCwd: cfg.workingDir,
@@ -3092,6 +3168,9 @@ if(isTouch&&typeof Hammer!=='undefined'){
 // ─── IPC Communication ───────────────────────────────────────────────────────
 
 function send(msg: WorkerToDaemon): void {
+  if (isWorkflowWorker() && msg.type === 'final_output') {
+    workflowFinalOutputSent = true;
+  }
   process.send?.(msg);
 }
 
@@ -3118,8 +3197,14 @@ process.on('message', async (raw: unknown) => {
         const { setDefaultLocale } = await import('./i18n/index.js');
         setDefaultLocale(msg.locale);
       }
-      // Scope session store to this bot's per-bot file
-      if (msg.larkAppId) sessionStore.init(msg.larkAppId);
+      // Scope session store to this bot's per-bot file.
+      // Slice C0: workflow-spawned workers (BOTMUX_WORKFLOW=1) skip this —
+      // their `sessionId` is synthetic (`wf-<runId>-<activityId>-...`) and
+      // must not be appended to the bot's chat-session registry.  The
+      // workflow's own event log is the source of truth for run state.
+      if (msg.larkAppId && process.env.BOTMUX_WORKFLOW !== '1') {
+        sessionStore.init(msg.larkAppId);
+      }
       // Capture credentials for direct image upload from worker
       larkAppIdForUpload = msg.larkAppId;
       larkAppSecretForUpload = msg.larkAppSecret;
@@ -3134,9 +3219,19 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
-        const port = await startWebServer('0.0.0.0', msg.webPort);
-        startScreenUpdates();
-        startScreenAnalyzer();
+        let port = 0;
+        if (!isWorkflowWorker()) {
+          port = await startWebServer('0.0.0.0', msg.webPort);
+          startScreenUpdates();
+          startScreenAnalyzer();
+        } else {
+          // Workflow attempts still expose a read-only web terminal so the
+          // workflow dashboard can observe in-flight subagents.  Keep the
+          // chat-side features disabled: no screen cards, no analyzer, no
+          // sessionStore writes.
+          port = await startWebServer('0.0.0.0', msg.webPort);
+          log('Workflow worker mode: web terminal enabled; skipping screen updates and screen analyzer');
+        }
         spawnCli(msg);
 
         // Queue the initial prompt — flushed when CLI shows idle.
@@ -3348,6 +3443,10 @@ function cleanup(): void {
   wsClients.clear();
   if (wss) { wss.close(); wss = null; }
   if (httpServer) { httpServer.close(); httpServer = null; }
+  if (workflowPtyLogStream) {
+    try { workflowPtyLogStream.end(); } catch { /* already closed */ }
+    workflowPtyLogStream = undefined;
+  }
 }
 
 process.on('SIGTERM', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });

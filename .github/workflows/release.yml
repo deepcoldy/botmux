@@ -88,16 +88,44 @@ jobs:
             PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
           fi
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
-          # cliff.toml 渲染'本次合并' + '新贡献者'两段，GitHub PR 元数据由 GITHUB_TOKEN 拉取。
+
+          # cliff.toml 渲染'本次合并'（PR 标题/链接由 GITHUB_TOKEN 拉 GitHub 元数据）。
           # 用显式区间 PREV_TAG..本 tag，别用 --current：--current 在 HEAD 落在 tag 上时
           # 会把范围撑到好几个历史 release，导致'本次合并'重复堆叠多段。PREV_TAG 上面已算好。
-          CLIFF=$(npx --yes git-cliff "${PREV_TAG}..${GITHUB_REF_NAME}")
+          # git-cliff 会翻全仓 commit 做 PR 关联，偶发触发 GitHub 二级限流 → 401 panic。
+          # 故包成非致命：失败时降级为纯 commit 列表，保证 Release 一定能创建，不再被 changelog 卡死。
+          if ! CLIFF=$(npx --yes git-cliff "${PREV_TAG}..${GITHUB_REF_NAME}" 2>cliff.err); then
+            echo "::warning::git-cliff failed, falling back to plain commit list"
+            cat cliff.err || true
+            CLIFF=$(printf -- '---\n\n## 本次合并\n'; git log --no-merges --reverse --pretty='- %s' "${PREV_TAG}..${GITHUB_REF_NAME}")
+          fi
+
+          # '感谢贡献者'独立用 gh 按区间内每个 commit 反查所属 PR 作者：有界调用（约等于区间 commit 数），
+          # 不翻全仓、不会触发上面那种限流；去重并排除仓库 owner。不再依赖 git-cliff 的
+          # github.contributors —— 那个只收录'首次贡献者'，会漏掉之前贡献过的人。
+          THANKS=""
+          declare -A SEEN
+          for sha in $(git rev-list --no-merges --reverse "${PREV_TAG}..${GITHUB_REF_NAME}"); do
+            for login in $(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" --jq '.[].user.login' 2>/dev/null); do
+              if [ "$login" != "${GITHUB_REPOSITORY_OWNER}" ] && [ -z "${SEEN[$login]:-}" ]; then
+                SEEN[$login]=1
+                THANKS="$THANKS @$login"
+              fi
+            done
+          done
+          THANKS="${THANKS# }"
+
           {
             echo 'body<<CHANGELOG_EOF'
             [ -n "$TAG_MSG" ] && echo "$TAG_MSG"
             echo "$CLIFF"
+            if [ -n "$THANKS" ]; then
+              echo ""
+              echo "## 感谢贡献者"
+              echo "$THANKS"
+            fi
             echo ""
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 

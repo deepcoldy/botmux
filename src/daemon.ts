@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage } from './im/lark/client.js';
+import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -29,7 +29,7 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { t as tr, localeForBot } from './i18n/index.js';
+import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
@@ -43,7 +43,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
 } from './core/worker-pool.js';
-import { setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
+import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -68,18 +68,184 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
+import {
+  executeWorkflowCommand,
+  resolveBotSnapshot,
+  type WorkflowCommandResult,
+} from './im/lark/workflow-slash-command.js';
+import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
+import {
+  buildWorkflowStartingCard,
+  buildWorkflowProgressCard,
+  buildAttemptDeeplinkEnricher,
+} from './im/lark/workflow-progress-card.js';
+import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
+import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
+import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
+import type { WorkflowRuntimeContext, WorkerSpawnFn } from './workflows/runtime.js';
+import { runLoop } from './workflows/loop.js';
+import type { RunLoopResult } from './workflows/loop.js';
+import { createWorkflowDaemonSpawn } from './workflows/daemon-spawn.js';
+import { createDaemonSpawnFn } from './workflows/spawn-bot.js';
+import { attachColdWorkflowRunsForDaemon } from './workflows/cold-attach.js';
+import { getRunsDir } from './workflows/runs-dir.js';
+import { loadEffectInputSidecar } from './workflows/effect-input.js';
+import { isValidWorkflowId } from './workflows/catalog.js';
+import { triggerWorkflowRun } from './workflows/trigger-run.js';
+import type { RawParamInput } from './workflows/params.js';
+import type { AbortCancelReason } from './workflows/runtime.js';
+import {
+  createDefaultHostExecutorRegistry,
+  createDefaultProviderReconcilers,
+} from './workflows/hostExecutors/registry.js';
+import {
+  cancelWorkflowRun,
+  guardWorkflowRunCancelChatScope,
+  isTerminalRunStatus,
+} from './workflows/cancel-run.js';
+import { requestCancel } from './workflows/cancel.js';
+import { resolveWait } from './workflows/wait.js';
+import { replay } from './workflows/events/replay.js';
+import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
+import { AttemptResumeManager } from './workflows/attempt-resume.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
+/**
+ * Per-run state for active workflow loops.
+ *
+ * `aborters` is published by runLoop each tick so that
+ * `cancelWorkflowRunOnDaemon` can fire AbortControllers immediately when
+ * a cancel request arrives (v0.1.4-a).  `cancelling` deduplicates
+ * concurrent cancel calls — if a second cancel comes in while we're
+ * still finalizing the first, it awaits the in-flight finalize instead
+ * of re-firing.
+ */
+type CancelOnDaemonOk = {
+  ok: true;
+  runId: string;
+  status: string;
+  alreadyTerminal: boolean;
+  cancelEventId?: string;
+  loopReason?: string;
+  pending?: boolean;
+  lastSeq: number;
+};
+const workflowRuns = new Map<string, {
+  ctx: WorkflowRuntimeContext;
+  running?: Promise<RunLoopResult>;
+  aborters?: Map<string, AbortController>;
+  cancelling?: Promise<CancelOnDaemonOk>;
+}>();
+// v0.1.5 slice 1: run-level progress card index.  daemon-internal only
+// (codex contract boundary 2: daemon restart drops the cardMessageId
+// and we accept losing card updates for that run — the dashboard link
+// inside any prior card still works).
+const workflowRunCards = new Map<string, {
+  cardMessageId: string;
+  larkAppId: string;
+  chatId: string;
+  /**
+   * Per-runId update-promise chain.  fanout events arrive faster than
+   * `updateMessage` finishes, so multiple `updateWorkflowProgressCard`
+   * calls race — the older snapshot's PATCH can land AFTER the newer
+   * one's, overwriting `red` (failed) with `blue` (still-running).
+   * Chain so each update awaits the previous one's PATCH before
+   * reading the log + sending its own.
+   */
+  updateChain: Promise<void>;
+}>();
+const workflowAttemptResumes = new AttemptResumeManager({
+  runsDir: getRunsDir(),
+  externalHost: config.web.externalHost,
+  resolveBot: (larkAppId, terminal) => {
+    try {
+      const bot = getBot(larkAppId);
+      return {
+        larkAppId: bot.config.larkAppId,
+        larkAppSecret: bot.config.larkAppSecret,
+        cliId: terminal.cliId ?? bot.config.cliId,
+        cliPathOverride: bot.config.cliPathOverride,
+        backendType: bot.config.backendType,
+        botName: bot.botName ?? terminal.botName,
+        botOpenId: bot.botOpenId,
+        locale: botLocale(bot.config),
+      };
+    } catch {
+      return undefined;
+    }
+  },
+});
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
+
+function parsePositiveIntEnv(name: string): number {
+  const raw = process.env[name];
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn(`[memdiag] ignoring invalid ${name}=${JSON.stringify(raw)}`);
+    return 0;
+  }
+  return Math.floor(parsed);
+}
+
+function formatMiB(bytes: number | undefined): string {
+  if (!Number.isFinite(bytes)) return 'n/a';
+  return `${((bytes ?? 0) / 1024 / 1024).toFixed(1)}MiB`;
+}
+
+function summarizeActiveResources(): string {
+  if (typeof process.getActiveResourcesInfo !== 'function') return 'unavailable';
+  const counts = new Map<string, number>();
+  for (const name of process.getActiveResourcesInfo()) {
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  if (counts.size === 0) return 'none';
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 16)
+    .map(([name, count]) => `${name}:${count}`)
+    .join(',');
+}
+
+function logMemoryDiagnostics(reason: string): void {
+  const usage = process.memoryUsage();
+  const external = usage.external ?? 0;
+  const arrayBuffers = usage.arrayBuffers ?? 0;
+  const nativeOther = Math.max(0, usage.rss - usage.heapTotal - external);
+  logger.info(
+    `[memdiag] reason=${reason} ` +
+    `rss=${formatMiB(usage.rss)} ` +
+    `heapUsed=${formatMiB(usage.heapUsed)} ` +
+    `heapTotal=${formatMiB(usage.heapTotal)} ` +
+    `external=${formatMiB(external)} ` +
+    `arrayBuffers=${formatMiB(arrayBuffers)} ` +
+    `nativeOther~=${formatMiB(nativeOther)} ` +
+    `activeSessions=${activeSessions.size} ` +
+    `workflowRuns=${workflowRuns.size} ` +
+    `workflowWatchers=${workflowEventWatchers.size} ` +
+    `resources=${summarizeActiveResources()}`,
+  );
+}
+
+function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
+  const intervalMs = parsePositiveIntEnv('BOTMUX_MEMORY_DIAG_INTERVAL_MS');
+  if (!intervalMs) return undefined;
+  logger.info(`[memdiag] enabled intervalMs=${intervalMs}`);
+  logMemoryDiagnostics('startup');
+  const timer = setInterval(() => logMemoryDiagnostics('interval'), intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
 
 /**
  * Reply into a session — scope-aware.
@@ -275,6 +441,727 @@ function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
 }
 
+export function attachWorkflowEventWatcher(runId: string, ctx?: WorkflowRuntimeContext): WorkflowEventWatcher {
+  if (ctx) {
+    // v0.1.4-a: wire registerAborters so runLoop's per-tick AbortController
+    // map is reachable from `cancelWorkflowRunOnDaemon` without having to
+    // poll the EventLog.  Wrap idempotently — if the caller already set
+    // one, prefer ours so the workflowRuns entry stays the source of truth.
+    ctx.registerAborters = (aborters) => {
+      const entry = workflowRuns.get(runId);
+      if (!entry) return;
+      if (aborters) entry.aborters = aborters;
+      else delete entry.aborters;
+    };
+    const existingRun = workflowRuns.get(runId);
+    workflowRuns.set(runId, { ...existingRun, ctx });
+  }
+  const existing = workflowEventWatchers.get(runId);
+  if (existing) return existing;
+  const watcher = new WorkflowEventWatcher(
+    runId,
+    async (event) => {
+      // Progress card refresh is best-effort and runs first so a stale
+      // card never hangs around through approval / terminal events.
+      // Errors are swallowed inside updateWorkflowProgressCard.
+      await updateWorkflowProgressCard(runId);
+      await handleWorkflowFanoutEvent(event);
+    },
+    {
+      onError: (err) => logger.warn(
+        `[workflow:${runId}] fanout failed: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    },
+  );
+  workflowEventWatchers.set(runId, watcher);
+  watcher.ready.catch((err) => {
+    workflowEventWatchers.delete(runId);
+    logger.warn(
+      `[workflow:${runId}] watcher failed to start: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  });
+  return watcher;
+}
+
+async function driveWorkflowRun(runId: string): Promise<RunLoopResult> {
+  const entry = workflowRuns.get(runId);
+  if (!entry) {
+    throw new Error(`workflow runtime context not registered: ${runId}`);
+  }
+  if (entry.running) return entry.running;
+
+  entry.running = runLoop(entry.ctx)
+    .then(async (result) => {
+      logger.info(`[workflow:${runId}] loop stopped: ${result.reason} (ticks=${result.ticks})`);
+      if (result.reason === 'terminal') {
+        // Codex round 1 blocker: patch the final card BEFORE cleanup deletes
+        // the cardMessageId, otherwise the watcher's drain may run too late
+        // and the user is stuck looking at a "running" tile forever.
+        await updateWorkflowProgressCard(runId);
+        cleanupWorkflowRun(runId);
+      }
+      return result;
+    })
+    .catch((err) => {
+      logger.warn(`[workflow:${runId}] loop failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    })
+    .finally(() => {
+      const current = workflowRuns.get(runId);
+      if (current) current.running = undefined;
+    });
+
+  return entry.running;
+}
+
+function cleanupWorkflowRun(runId: string): void {
+  workflowRuns.delete(runId);
+  workflowRunCards.delete(runId);
+  const watcher = workflowEventWatchers.get(runId);
+  if (watcher) {
+    watcher.close();
+    workflowEventWatchers.delete(runId);
+  }
+}
+
+/**
+ * v0.1.5 slice 1: progress card update path.
+ *
+ * Replay the run's EventLog → build a fresh card JSON → PATCH the
+ * previously-sent message.  Failure is logged at warn and swallowed —
+ * codex contract boundary 1: workflow runtime semantics must never
+ * depend on Feishu PATCH succeeding.
+ *
+ * Called after every event the fanout watcher sees, BEFORE handing the
+ * event off to handleWorkflowFanoutEvent (so an approval card landing
+ * doesn't race the progress card's "waiting" state).
+ */
+async function updateWorkflowProgressCard(runId: string): Promise<void> {
+  const card = workflowRunCards.get(runId);
+  if (!card) return;
+  // Chain on the previous update so two fanout-triggered updates can't
+  // race and PATCH out of order (which manifests as the card briefly
+  // flipping back to an older state, e.g. red → blue after a failed
+  // run).  Each call awaits the predecessor's PATCH to land first.
+  const next = card.updateChain.then(async () => {
+    // Re-fetch the card entry — it may have been GC'd between when
+    // we were enqueued and when our turn came (e.g. terminal cleanup
+    // ran while we were waiting).
+    const current = workflowRunCards.get(runId);
+    if (!current) return;
+    try {
+      const log = new WorkflowEventLog(runId, getRunsDir());
+      const snapshot = replayWorkflow(await log.readAll());
+      // Pull node count from the live workflow definition if we still
+      // hold a runtime context for this run — `snapshot.nodes` only
+      // contains TRIGGERED nodes so its size grows as the run
+      // progresses and gives a misleading "X / Y" fraction otherwise.
+      // (e.g. 1/2 when first node fires → 2/3 at end on a 3-node wf).
+      const runtimeEntry = workflowRuns.get(runId);
+      const totalNodes = runtimeEntry?.ctx.def?.nodes
+        ? Object.keys(runtimeEntry.ctx.def.nodes).length
+        : undefined;
+      const cardJson = buildWorkflowProgressCard(snapshot, {
+        // v0.1.5 slice 3: hand the per-row "查看当前终端" link to the
+        // dashboard deeplink contract codex set up in slice 2 (3335adc).
+        enrichWithTerminalLink: buildAttemptDeeplinkEnricher(runId, snapshot),
+        totalNodes,
+      });
+      await updateMessage(current.larkAppId, current.cardMessageId, cardJson);
+    } catch (err) {
+      logger.warn(
+        `[workflow:${runId}] progress card update failed (continuing): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  });
+  card.updateChain = next;
+  await next;
+}
+
+async function cancelWorkflowRunOnDaemon(
+  runId: string,
+  reason: string,
+  opts: { expectedChatId?: string; by?: string } = {},
+): Promise<{
+  ok: true;
+  runId: string;
+  status: string;
+  alreadyTerminal: boolean;
+  cancelEventId?: string;
+  loopReason?: string;
+  pending?: boolean;
+  lastSeq: number;
+} | {
+  ok: false;
+  error: string;
+  status?: string;
+}> {
+  if (!isValidRunId(runId)) return { ok: false, error: 'bad_run_id' };
+
+  if (opts.expectedChatId) {
+    const scope = await guardWorkflowRunCancelChatScope(getRunsDir(), runId, opts.expectedChatId);
+    if (!scope.ok) return scope;
+  }
+
+  const entry = workflowRuns.get(runId);
+  if (entry?.running) {
+    const snapshot = replay(await entry.ctx.log.readAll());
+    if (isTerminalRunStatus(snapshot.run.status)) {
+      return {
+        ok: true,
+        runId,
+        status: snapshot.run.status,
+        alreadyTerminal: true,
+        lastSeq: snapshot.lastSeq,
+      };
+    }
+    // Dedup concurrent cancel calls (codex round 3 M1).  The first caller
+    // synchronously assigns `entry.cancelling` BEFORE any await so a
+    // second caller arriving mid-flight sees the in-flight promise and
+    // returns the same result instead of re-writing `cancelRequested` or
+    // re-firing aborters.
+    if (entry.cancelling) {
+      return await entry.cancelling;
+    }
+    const cancelling = startRunningCancel(entry, runId, reason, opts.by ?? 'dashboard');
+    entry.cancelling = cancelling;
+    cancelling.catch((err) => {
+      logger.warn(
+        `[workflow:${runId}] cancel foreground failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }).finally(() => {
+      const e = workflowRuns.get(runId);
+      if (e && e.cancelling === cancelling) delete e.cancelling;
+    });
+    return await cancelling;
+  }
+
+  const current = workflowRuns.get(runId);
+  if (!current) {
+    const snapshot = await readRunSnapshot(getRunsDir(), runId);
+    if (!snapshot) return { ok: false, error: 'unknown_run' };
+    if (isTerminalRunStatus(snapshot.run.status)) {
+      return {
+        ok: true,
+        runId,
+        status: snapshot.run.status,
+        alreadyTerminal: true,
+        lastSeq: snapshot.lastSeq,
+      };
+    }
+    return { ok: false, error: 'workflow_not_attached', status: snapshot.run.status };
+  }
+
+  const result = await cancelWorkflowRun({
+    ctx: current.ctx,
+    reason,
+    by: opts.by ?? 'dashboard',
+    actor: 'human',
+    maxTicks: 200,
+  });
+  if (isTerminalRunStatus(result.snapshot.run.status)) {
+    await updateWorkflowProgressCard(runId);
+    cleanupWorkflowRun(runId);
+  }
+  return {
+    ok: true,
+    runId,
+    status: result.snapshot.run.status,
+    alreadyTerminal: result.alreadyTerminal,
+    cancelEventId: result.cancelEventId,
+    loopReason: result.loopResult?.reason,
+    lastSeq: result.snapshot.lastSeq,
+  };
+}
+
+/**
+ * Foreground portion of the running-cancel chain (v0.1.4-a, codex round 3 M1).
+ *
+ * Returns the API response object the caller surfaces to the dashboard /
+ * IM caller.  Synchronously starts a background task that awaits the
+ * running loop draining and then drives `cancelWorkflowRun` to finalize
+ * the cancel chain (cancelDelivered → activityCanceled → nodeCanceled →
+ * runCanceled).
+ *
+ * The function is wrapped in an IIFE'd async closure by the caller and
+ * assigned to `entry.cancelling` BEFORE awaiting it, so that a
+ * concurrent second cancel call sees the in-flight promise and dedupes
+ * onto it instead of re-writing `cancelRequested` or re-firing
+ * aborters.
+ */
+async function startRunningCancel(
+  entry: { ctx: WorkflowRuntimeContext; running?: Promise<RunLoopResult>; aborters?: Map<string, AbortController> },
+  runId: string,
+  reason: string,
+  by: string,
+): Promise<CancelOnDaemonOk> {
+  const snapshot = replay(await entry.ctx.log.readAll());
+  if (isTerminalRunStatus(snapshot.run.status)) {
+    return {
+      ok: true,
+      runId,
+      status: snapshot.run.status,
+      alreadyTerminal: true,
+      cancelEventId: snapshot.cancelledRunIntent?.cancelOriginEventId,
+      lastSeq: snapshot.lastSeq,
+    };
+  }
+
+  // 1) Write `cancelRequested` if not already present.
+  let cancelEventId = snapshot.cancelledRunIntent?.cancelOriginEventId;
+  if (!cancelEventId) {
+    const cancel = await requestCancel(
+      entry.ctx.log,
+      { target: { kind: 'run', runId }, reason, by },
+      'human',
+    );
+    cancelEventId = cancel.eventId;
+  }
+
+  // 2) Fire all in-flight dispatch aborters so workers stop ASAP instead
+  //    of waiting for the EventLog 200ms polling fallback.
+  if (entry.aborters && entry.aborters.size > 0) {
+    const abortReason: AbortCancelReason = { cancelOriginEventId: cancelEventId };
+    for (const ac of entry.aborters.values()) {
+      if (!ac.signal.aborted) ac.abort(abortReason);
+    }
+  }
+
+  // 3) Fire-and-forget background finalize: await the running loop, then
+  //    drive `cancelWorkflowRun` to terminate the run.  Idempotent so a
+  //    redundant invocation (e.g. via a separate cold-attach path) is
+  //    safe — replay short-circuits on already-terminal.
+  void (async () => {
+    try {
+      await entry.running?.catch(() => {});
+    } finally {
+      const current = workflowRuns.get(runId);
+      if (current) {
+        try {
+          const result = await cancelWorkflowRun({
+            ctx: current.ctx,
+            reason,
+            by,
+            actor: 'human',
+            maxTicks: 200,
+          });
+          if (isTerminalRunStatus(result.snapshot.run.status)) {
+            await updateWorkflowProgressCard(runId);
+            cleanupWorkflowRun(runId);
+          }
+        } catch (err) {
+          logger.warn(
+            `[workflow:${runId}] cancel finalize failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+    }
+  })();
+
+  const after = replay(await entry.ctx.log.readAll());
+  return {
+    ok: true,
+    runId,
+    status: after.run.status,
+    alreadyTerminal: false,
+    cancelEventId,
+    loopReason: 'already-running',
+    pending: true,
+    lastSeq: after.lastSeq,
+  };
+}
+
+/**
+ * Result shape for dashboard-side approve/reject — uniform `{ ok, error,
+ * hint?, message? }` failure envelope as agreed with codex so the dashboard
+ * UI only has to render `hint ?? message ?? error`.
+ */
+type ResolveDashboardWaitResult =
+  | {
+      ok: true;
+      runId: string;
+      resolution: 'approved' | 'rejected';
+      activityId: string;
+      attemptId: string;
+      resolvedAt: number;
+      lastSeq: number;
+      /** True when the run was already terminal before this call (idempotent). */
+      alreadyTerminal?: boolean;
+      /** True when the resolveWait wrote but driveWorkflowRun hasn't
+       *  finished propagating downstream nodes yet. */
+      pending?: boolean;
+    }
+  | {
+      ok: false;
+      error:
+        | 'bad_run_id'
+        | 'unknown_run'
+        | 'workflow_not_attached'
+        | 'no_open_wait'
+        | 'ambiguous_wait'
+        | 'needs_lark_approval'
+        | 'internal_error';
+      hint?: string;
+      message?: string;
+      status?: string;
+    };
+
+async function resolveDashboardWait(
+  runId: string,
+  resolution: 'approved' | 'rejected',
+  comment: string | undefined,
+): Promise<ResolveDashboardWaitResult> {
+  if (!isValidRunId(runId)) return { ok: false, error: 'bad_run_id' };
+
+  const entry = workflowRuns.get(runId);
+  if (!entry) {
+    const snapshot = await readRunSnapshot(getRunsDir(), runId);
+    if (!snapshot) return { ok: false, error: 'unknown_run' };
+    if (isTerminalRunStatus(snapshot.run.status)) {
+      // Treat as benign idempotent success — the wait was already resolved
+      // by an earlier action (Lark card, CLI, or this dashboard).
+      return {
+        ok: true,
+        runId,
+        resolution,
+        activityId: '',
+        attemptId: '',
+        resolvedAt: snapshot.updatedAt,
+        lastSeq: snapshot.lastSeq,
+        alreadyTerminal: true,
+      };
+    }
+    return {
+      ok: false,
+      error: 'workflow_not_attached',
+      status: snapshot.run.status,
+      hint: 'Run not attached to this daemon (perhaps still cold). Try again shortly or check daemon logs.',
+    };
+  }
+
+  const events = await entry.ctx.log.readAll();
+  const snapshot = replay(events);
+  const updatedAt = events[events.length - 1]?.timestamp ?? Date.now();
+  if (isTerminalRunStatus(snapshot.run.status)) {
+    return {
+      ok: true,
+      runId,
+      resolution,
+      activityId: '',
+      attemptId: '',
+      resolvedAt: updatedAt,
+      lastSeq: snapshot.lastSeq,
+      alreadyTerminal: true,
+    };
+  }
+
+  // Find the unique pending human-gate wait.  Other wait kinds (time /
+  // condition) aren't approvable through this dashboard route; restricting
+  // to human-gate matches codex's API contract and keeps the surface tight.
+  // `approvers` lives on the original waitCreated event payload, not on
+  // replay state — pull it from there so we don't reshape replay AttemptState
+  // for a single auth check.
+  const waitEventsByActivity = new Map<string, { approvers?: string[] }>();
+  for (const ev of events) {
+    if (ev.type !== 'waitCreated') continue;
+    const p = ev.payload as { activityId?: string; approvers?: unknown };
+    if (typeof p.activityId !== 'string') continue;
+    const approvers = Array.isArray(p.approvers)
+      ? p.approvers.filter((x): x is string => typeof x === 'string')
+      : undefined;
+    // Last waitCreated for the activity wins (re-create case).
+    waitEventsByActivity.set(p.activityId, { approvers });
+  }
+
+  const candidates: Array<{ activityId: string; attemptId: string; approvers?: string[] }> = [];
+  for (const activityId of snapshot.danglingWaits) {
+    const activity = snapshot.activities.get(activityId);
+    const at = activity?.attempts[activity.attempts.length - 1];
+    if (!at?.wait || at.wait.waitKind !== 'human-gate') continue;
+    candidates.push({
+      activityId,
+      attemptId: at.attemptId,
+      approvers: waitEventsByActivity.get(activityId)?.approvers,
+    });
+  }
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      error: 'no_open_wait',
+      hint: 'No pending humanGate wait on this run.',
+    };
+  }
+  if (candidates.length > 1) {
+    return {
+      ok: false,
+      error: 'ambiguous_wait',
+      hint:
+        `Run has ${candidates.length} pending humanGate waits; dashboard cannot ` +
+        `pick one yet. Use the Lark approval card.`,
+    };
+  }
+  const target = candidates[0]!;
+  // approvers allowlist non-empty → preserve restricted-approval semantics.
+  // Dashboard cookie auth doesn't carry user identity, so we don't try to
+  // satisfy the allowlist from this path — defer to the Lark card.
+  // Read approvers from the wait state (we stashed it on the candidate).
+  if ((target.approvers?.length ?? 0) > 0) {
+    return {
+      ok: false,
+      error: 'needs_lark_approval',
+      hint:
+        'This gate has an approver allowlist; the Lark approval card is the ' +
+        'only path that authenticates the approver identity.',
+    };
+  }
+
+  try {
+    const resolved = await resolveWait(entry.ctx.log, {
+      activityId: target.activityId,
+      attemptId: target.attemptId,
+      resolution,
+      by: 'dashboard',
+      comment,
+    });
+    const after = replay(await entry.ctx.log.readAll());
+    // Fire-and-forget re-drive — same pattern as Lark card path
+    // (workflowApprovalResolved hook).  Don't await; the dashboard caller
+    // only needs the wait resolution to be persisted before responding.
+    driveWorkflowRun(runId).catch((err) => {
+      logger.warn(
+        `[workflow:${runId}] re-entry after dashboard approval failed: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    });
+    logger.info(
+      `[workflow:${runId}] wait ${target.activityId}/${target.attemptId} resolved=${resolution} via dashboard`,
+    );
+    return {
+      ok: true,
+      runId,
+      resolution,
+      activityId: target.activityId,
+      attemptId: target.attemptId,
+      resolvedAt: resolved.resolutionEvent.timestamp,
+      lastSeq: after.lastSeq,
+      pending: !isTerminalRunStatus(after.run.status),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'internal_error',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
+  const runsDir = getRunsDir();
+  try {
+    const result = await attachColdWorkflowRunsForDaemon({
+      runsDir,
+      ownerLarkAppId,
+      isAttached: (runId) => workflowRuns.has(runId),
+      makeContext: (run, log) => ({
+        log,
+        def: run.def,
+        spawnSubagent: workflowSpawnFn(),
+        hostExecutors: createDefaultHostExecutorRegistry(),
+        reconcilers: createDefaultProviderReconcilers(),
+        loadEffectInput: (activityId, attemptId) =>
+          loadEffectInputSidecar(log, activityId, attemptId),
+      }),
+      attachWatcher: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
+      driveRun: (runId) => driveWorkflowRun(runId),
+      onSkip: (runId, reason) => logger.debug(`[workflow:${runId}] cold-scan skipped: ${reason}`),
+      onAttached: (run) => {
+        logger.info(
+          `[workflow:${run.runId}] cold-attached status=${run.snapshot.run.status} ` +
+            `danglingEffects=${run.snapshot.danglingEffectAttempted.length} ` +
+            `danglingWaits=${run.snapshot.danglingWaits.length}`,
+        );
+      },
+      onDriveError: (runId, err) => {
+        logger.warn(
+          `[workflow:${runId}] cold-scan drive failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      },
+    });
+    if (result.discovered === 0) {
+      logger.info(`[workflow] cold-scan: no active runs for ${ownerLarkAppId}`);
+    }
+  } catch (err) {
+    logger.warn(
+      `[workflow] cold-scan failed for ${ownerLarkAppId}; continuing daemon startup: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+/**
+ * Build the daemon-backed WorkerSpawnFn lazily.  We avoid touching
+ * bot-registry at module-init time (it isn't loaded yet); each call
+ * resolves credentials by the workflow node's `bot` name, falling
+ * back to the IM larkAppId if the bot rename hasn't propagated.
+ *
+ * Multi-daemon: each process registers only its own bot in memory, but
+ * workflow subagent nodes may target sibling bots (e.g. coco/aiden) that
+ * live in other daemon processes. The shared bots.json is the source of
+ * truth across daemons, so we fall back to it when the in-memory
+ * registry misses.
+ */
+function workflowSpawnFn(): WorkerSpawnFn {
+  const daemonDeps = createWorkflowDaemonSpawn({
+    resolveLarkCredentials: (botName) => {
+      const bot = getAllBots().find(
+        (b) => b.config.name === botName || b.botName === botName || b.config.larkAppId === botName,
+      );
+      if (bot) {
+        return {
+          larkAppId: bot.config.larkAppId,
+          larkAppSecret: bot.config.larkAppSecret,
+        };
+      }
+      const siblingConfigs = loadBotConfigs();
+      const sibling = siblingConfigs.find(
+        (c) => c.name === botName || c.larkAppId === botName,
+      );
+      if (!sibling) {
+        throw new Error(`workflow: bot '${botName}' not found in registry`);
+      }
+      return {
+        larkAppId: sibling.larkAppId,
+        larkAppSecret: sibling.larkAppSecret,
+      };
+    },
+  });
+  return createDaemonSpawnFn(daemonDeps);
+}
+
+async function handleWorkflowCommandIfAny(
+  content: string,
+  anchor: string,
+  chatId: string,
+  larkAppId: string,
+  initiator: string | undefined,
+): Promise<boolean> {
+  // Captured by the `onRunCreated` closure so the trailing text reply can be
+  // suppressed when the run-level progress card already landed.  Codex
+  // round 1 medium: "single self-updating tile" promise breaks if we also
+  // dump a `Workflow loop stopped: …` line at the end.
+  let startingCardSent = false;
+  const result = await executeWorkflowCommand(
+    {
+      content,
+      chatId,
+      larkAppId,
+      initiator: initiator ?? 'unknown',
+    },
+    {
+      attachWorkflowEventWatcher,
+      spawnSubagent: workflowSpawnFn(),
+      runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId),
+      cancelWorkflowRunFn: (runId, reason, opts) => cancelWorkflowRunOnDaemon(runId, reason, opts),
+      onRunCreated: async (info) => {
+        // v0.1.5 slice 1: send the run-level progress card so the user
+        // sees a single self-updating tile.  Best-effort: if the card
+        // send fails we still fall back to a plain-text "started"
+        // reply so they at least see the runId.
+        try {
+          const cardJson = buildWorkflowStartingCard({
+            runId: info.runId,
+            workflowId: info.workflowId,
+          });
+          const cardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+          if (chatId) {
+            workflowRunCards.set(info.runId, {
+              cardMessageId,
+              larkAppId,
+              chatId,
+              updateChain: Promise.resolve(),
+            });
+          }
+          startingCardSent = true;
+        } catch (err) {
+          logger.warn(
+            `[workflow:${info.runId}] failed to send progress card (falling back to text): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          try {
+            await sessionReply(
+              anchor,
+              `Workflow started: ${info.workflowId}\nrunId: ${info.runId}\nWeb: ${workflowRunDetailUrl(info.runId)}`,
+              'text',
+              larkAppId,
+            );
+          } catch (fallbackErr) {
+            logger.warn(
+              `[workflow:${info.runId}] failed to send start reply: ${
+                fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+              }`,
+            );
+          }
+        }
+      },
+    },
+  );
+  if (!result.handled) return false;
+
+  if (!result.ok) {
+    await sessionReply(
+      anchor,
+      `Workflow 命令失败：${result.error}${result.usage ? `\n${result.usage}` : ''}`,
+      'text',
+      larkAppId,
+    );
+    return true;
+  }
+
+  // Skip the trailing text echo only for `run` commands whose progress card
+  // landed — the card already shows status/runId/web link, and the card
+  // patch path covers final state.  `cancel` keeps the text since cancel
+  // doesn't drive `onRunCreated` and may target a card-less run.
+  if (result.command === 'run' && startingCardSent) {
+    return true;
+  }
+
+  await sessionReply(anchor, formatWorkflowCommandResult(result), 'text', larkAppId);
+  return true;
+}
+
+function formatWorkflowCommandResult(result: Extract<WorkflowCommandResult, { ok: true }>): string {
+  if (result.command === 'cancel') {
+    if (result.alreadyTerminal) {
+      return `Workflow already terminal: ${result.status}\nrunId: ${result.runId}`;
+    }
+    if (result.pending) {
+      return `Workflow cancel requested; waiting for running activity to drain.\nrunId: ${result.runId}\nstatus: ${result.status}`;
+    }
+    return `Workflow cancel processed.\nrunId: ${result.runId}\nstatus: ${result.status}`;
+  }
+  const status =
+    result.loopResult.reason === 'awaiting-wait'
+      ? '等待审批'
+      : result.loopResult.reason;
+  const next =
+    result.loopResult.reason === 'awaiting-wait'
+      ? '\n请在群里查看审批卡，点击后 workflow 会继续执行。'
+      : '';
+  return `Workflow loop stopped: ${status}\nrunId: ${result.runId}${next}`;
+}
+
 function getActiveCount(): number {
   let count = 0;
   for (const [, ds] of activeSessions) {
@@ -343,7 +1230,205 @@ const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
+  workflowApprovalResolved: (runId) => {
+    driveWorkflowRun(runId).catch((err) => {
+      logger.warn(`[workflow:${runId}] re-entry after approval failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  },
 };
+
+function dashboardWaitStatus(error: ResolveDashboardWaitResult & { ok: false }): number {
+  switch (error.error) {
+    case 'bad_run_id': return 400;
+    case 'unknown_run': return 404;
+    case 'workflow_not_attached': return 409;
+    case 'no_open_wait': return 409;
+    case 'ambiguous_wait': return 409;
+    case 'needs_lark_approval': return 403;
+    case 'internal_error': return 500;
+  }
+}
+
+for (const [path, resolution] of [
+  ['/api/workflows/runs/:runId/approve', 'approved'] as const,
+  ['/api/workflows/runs/:runId/reject', 'rejected'] as const,
+]) {
+  ipcRoute('POST', path, async (req, res, params) => {
+    let body: { comment?: unknown };
+    try {
+      body = await readJsonBody<{ comment?: unknown }>(req);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
+    const comment =
+      typeof body.comment === 'string' && body.comment.trim()
+        ? body.comment.trim()
+        : undefined;
+    const result = await resolveDashboardWait(params.runId, resolution, comment);
+    if (!result.ok) {
+      return jsonRes(res, dashboardWaitStatus(result), result);
+    }
+    return jsonRes(res, 200, result);
+  });
+}
+
+function attemptResumeStatus(error: { error: string }): number {
+  switch (error.error) {
+    case 'bad_run_id':
+    case 'bad_attempt_id':
+    case 'bad_json':
+      return 400;
+    case 'no_terminal_sidecar':
+    case 'resume_not_running':
+      return 404;
+    case 'missing_cli_session_id':
+    case 'missing_lark_app_id':
+    case 'bot_not_registered':
+      return 409;
+    default:
+      return 500;
+  }
+}
+
+ipcRoute(
+  'POST',
+  '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume',
+  async (_req, res, params) => {
+    const result = await workflowAttemptResumes.start({
+      runId: params.runId,
+      activityId: params.activityId,
+      attemptId: params.attemptId,
+    });
+    if (!result.ok) return jsonRes(res, attemptResumeStatus(result), result);
+    return jsonRes(res, 200, result);
+  },
+);
+
+ipcRoute(
+  'POST',
+  '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume/end',
+  async (req, res, params) => {
+    let body: { reason?: unknown };
+    try {
+      body = await readJsonBody<{ reason?: unknown }>(req);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
+    const result = await workflowAttemptResumes.end({
+      runId: params.runId,
+      activityId: params.activityId,
+      attemptId: params.attemptId,
+      reason:
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason.trim()
+          : 'ended_by_dashboard',
+    });
+    if (!result.ok) return jsonRes(res, attemptResumeStatus(result), result);
+    return jsonRes(res, 200, result);
+  },
+);
+
+ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) => {
+  let body: { reason?: unknown };
+  try {
+    body = await readJsonBody<{ reason?: string }>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const reason =
+    typeof body.reason === 'string' && body.reason.trim()
+      ? body.reason.trim()
+      : 'cancelled via dashboard';
+  const result = await cancelWorkflowRunOnDaemon(params.runId, reason);
+  if (!result.ok) {
+    const status =
+      result.error === 'bad_run_id' ? 400 :
+        result.error === 'unknown_run' ? 404 :
+          result.error === 'workflow_not_attached' ? 409 :
+            result.error === 'wrong_chat' ? 403 :
+              500;
+    return jsonRes(res, status, result);
+  }
+  return jsonRes(res, 200, result);
+});
+
+ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) => {
+  const workflowId = params.id;
+  if (!isValidWorkflowId(workflowId)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_id' });
+  }
+  let body: { params?: unknown; chatBinding?: unknown };
+  try {
+    body = await readJsonBody<{ params?: unknown; chatBinding?: unknown }>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const chatBinding = parseTriggerChatBinding(body.chatBinding);
+  if (!chatBinding) {
+    return jsonRes(res, 400, { ok: false, error: 'missing_chat_binding' });
+  }
+  if (body.params !== undefined) {
+    if (typeof body.params !== 'object' || body.params === null || Array.isArray(body.params)) {
+      return jsonRes(res, 400, { ok: false, error: 'bad_params_shape' });
+    }
+  }
+  // Convert JSON-channel params (decoded values) into the shared RawParamInput
+  // map.  String-channel coercion stays on the IM `/workflow run` path.
+  const rawParams: Record<string, RawParamInput> = {};
+  for (const [k, v] of Object.entries((body.params as Record<string, unknown> | undefined) ?? {})) {
+    rawParams[k] = { kind: 'json', value: v };
+  }
+
+  const result = await triggerWorkflowRun(
+    {
+      workflowId,
+      rawParams,
+      chatBinding,
+      initiator: 'dashboard',
+    },
+    {
+      spawnSubagent: workflowSpawnFn(),
+      botResolver: resolveBotSnapshot,
+      makeRuntimeContext: (log, def, spawnSubagent) => ({
+        log,
+        def,
+        spawnSubagent,
+        hostExecutors: createDefaultHostExecutorRegistry(),
+        reconcilers: createDefaultProviderReconcilers(),
+        loadEffectInput: (activityId, attemptId) =>
+          loadEffectInputSidecar(log, activityId, attemptId),
+      }),
+      attachRuntime: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
+      driveRun: (runId) => {
+        driveWorkflowRun(runId).catch((err) => {
+          logger.warn(
+            `[workflow:${runId}] dashboard-trigger drive failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      },
+    },
+  );
+  if (!result.ok) {
+    const status =
+      result.error === 'unknown_workflow' ? 404 :
+        result.error === 'invalid_params' ? 400 :
+          500;
+    return jsonRes(res, status, result);
+  }
+  return jsonRes(res, 200, result);
+});
+
+function parseTriggerChatBinding(
+  raw: unknown,
+): { chatId: string; larkAppId: string } | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as { chatId?: unknown; larkAppId?: unknown };
+  if (typeof r.chatId !== 'string' || !r.chatId.trim()) return undefined;
+  if (typeof r.larkAppId !== 'string' || !r.larkAppId.trim()) return undefined;
+  return { chatId: r.chatId.trim(), larkAppId: r.larkAppId.trim() };
+}
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
@@ -501,6 +1586,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const botCfg = getBot(larkAppId).config;
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
+
+  if (await handleWorkflowCommandIfAny(cmdContent, anchor, chatId, larkAppId, senderOpenId)) {
+    return;
+  }
 
   // Intercept daemon commands in new topics (no session needed for some commands)
   const invocation = parseSlashCommandInvocation(cmdContent);
@@ -807,6 +1896,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         .catch(err => logger.error(`Failed to reply login result: ${err}`));
       return;
     }
+  }
+
+  if (await handleWorkflowCommandIfAny(
+    cmdContent,
+    anchor,
+    ctxChatId ?? data?.message?.chat_id,
+    larkAppId,
+    parsed.senderId || data?.sender?.sender_id?.open_id,
+  )) {
+    return;
   }
 
   // Intercept daemon commands
@@ -1160,6 +2259,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
 
   writePidFile();
+  const memoryDiagnostics = startMemoryDiagnostics();
 
   // Publish self-descriptor for the dashboard registry. The dashboard sibling
   // process discovers running daemons by scanning ~/.botmux/data/dashboard-daemons/
@@ -1295,6 +2395,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore active sessions from previous run
   restoreActiveSessions(activeSessions);
 
+  await attachColdWorkflowRuns(cfg.larkAppId);
+
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
@@ -1318,7 +2420,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     shuttingDown = true;
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
     scheduler.stopScheduler();
+    for (const watcher of workflowEventWatchers.values()) watcher.close();
+    workflowEventWatchers.clear();
+    workflowRuns.clear();
     clearInterval(descriptorHeartbeat);
+    if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
 
@@ -1382,6 +2488,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // the descriptor so the dashboard doesn't see a phantom daemon.
   process.on('exit', () => {
     clearInterval(descriptorHeartbeat);
+    if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the
     // graceful shutdown above. flushIdentityCacheSync is synchronous and

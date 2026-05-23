@@ -403,12 +403,412 @@ botmux send --mention "ou_yyy:Aiden" "请 @Aiden 帮忙处理"
 \`\`\`
 `;
 
+const WORKFLOW_CREATE_SKILL = `---
+name: botmux-workflow-create
+description: 根据用户自然语言描述生成 botmux workflow JSON 定义文件。触发场景：用户说"我想做个流程"、"创建 workflow"、"把 X 拆成自动化"、"编排"、"orchestrate"、"自动化跑这几步"；或显式提到 botmux workflow create。必须先用 botmux bots list 查看可用 bot，先给用户确认设计，再写 $HOME/.botmux/workflows/<workflowId>.workflow.json，并用 botmux workflow validate 校验。
+---
+
+# botmux-workflow-create — Workflow 编排助手
+
+把用户口头描述的几步任务翻译成可执行的 workflow JSON。本 skill 只负责设计、生成、校验，不负责启动 run；启动用 \`botmux workflow run <id>\` 或 IM \`/workflow run <id>\`。
+
+## 硬规则
+
+1. 不要在用户确认设计稿前写文件。
+2. 必须先跑 \`botmux bots list\`，按输出里的 **\`larkAppId\`**（形如 \`cli_xxxxxxxxxxxxxxxx\`）填 \`subagent.bot\`。**不要填 \`name\`**——\`name\` 是 Lark 群里的 displayName（admin 可改、可能带后缀），跨 daemon 必然解析失败。larkAppId 是 bot 的全局唯一 ID。
+3. 写到 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`（**绝对路径**，daemon 的全局位置）。不要写到当前 cwd 的 \`./workflows/\`——CLI agent 和 daemon 进程的 cwd 不一定一致。\`workflowId\` 推荐 kebab-case。
+4. 写完必须跑 \`botmux workflow validate $HOME/.botmux/workflows/<workflowId>.workflow.json\`，失败就按错误修到通过。
+5. 高风险节点主动建议 \`humanGate\`：发消息、写文件、外部 API、git push、删除/覆盖。纯读、草稿、纯计算通常不加 gate。
+6. 数据流有两套语法：**整字段 \`$ref\` 替换** 和 **字符串内 \`\${...}\` 内嵌引用**。**不要**写 \`{{...}}\` 期望 runtime 展开——支持的是 \`\${...}\`，不是双花括号。
+7. 两套语法的边界：
+   - **整字段 \`$ref\`**（值可以是任意类型，含对象/数组）：
+     - \`{ "$ref": "<nodeId>.output.<path>" }\` 引上游节点输出
+     - \`{ "$ref": "params.<path>" }\` 引启动时的入参（嵌套用点号：\`params.user.email\`）
+     - \`$ref\` 对象必须独占，不能有兄弟 key
+   - **字符串内 \`\${...}\` 内嵌**（仅用在 string 字段里，例如 prompt / humanGate.prompt / hostExecutor.input 的 string 值）：
+     - \`"prompt": "查询 \${params.city} 未来 \${params.days} 天天气"\`
+     - \`"prompt": "基于天气数据 \${fetchWeather.output.summary} 出行规划"\`
+     - 引用值只能是 string / number / boolean / null；object / array 会运行时报 BindingError，要用整字段 \`$ref\` 而非内嵌
+
+## 工作流程
+
+### Step 1 — 理解需求
+
+先复述你理解的流程拆分，必要时问 1-3 个澄清问题。不要直接写 JSON。
+
+### Step 2 — 查 bot 清单
+
+\`\`\`bash
+botmux bots list
+\`\`\`
+
+输出每个 bot 的 \`name\`（人类可读 displayName，仅供你判断哪个 bot 适合做什么）和 \`larkAppId\`（形如 \`cli_xxxxxxxxxxxxxxxx\`，**这是真正要填进 workflow.subagent.bot 的值**）。
+
+### Step 3 — 给用户确认设计草案
+
+用表格展示节点设计（"bot" 列用人类可读名字给用户看，但实际写进 JSON 是 larkAppId）：
+
+| 节点 id | 类型 | bot/executor | 做什么 | 依赖 | humanGate |
+|---|---|---|---|---|---|
+| draft | subagent | claude-loopy (cli_a930…) | 写草稿 | - | - |
+| send | hostExecutor | feishu-send | 发到群里 | draft | 审批草稿 |
+
+同时说明：
+- 为什么选择这个 bot 或 executor；
+- 哪些字段从上游 output 通过 \`$ref\` 传递；
+- 哪些节点需要 humanGate，以及原因。
+
+等用户明确确认后再写文件。
+
+### Step 4 — 生成 JSON
+
+创建 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`（**绝对路径**，不要写相对路径）。每个 subagent 节点的 \`bot\` 字段必须填 larkAppId（\`cli_xxx...\`），不是 displayName。每个 node 建议写 \`description\`，记录设计理由或 bot 选择理由。
+
+### Step 5 — 校验
+
+\`\`\`bash
+botmux workflow validate $HOME/.botmux/workflows/<workflowId>.workflow.json
+\`\`\`
+
+validate 能抓 JSON/schema/graph 错误；但它**不会**检查 bot 是否真的存在，也不会检查 \`$ref\` 指向的 output 字段是否运行时一定存在——所以你仍要人工核对 bots list（larkAppId 一定要逐字符匹配）和 outputSchema。
+
+### Step 6 — 交付
+
+告诉用户文件路径、validate 结果、启动命令：
+
+\`\`\`bash
+botmux workflow run <workflowId> --param key=value
+# 或在飞书话题里:
+/workflow run <workflowId> key=value
+\`\`\`
+
+如果 workflow 定义了 object / array 类型入参，CLI 用 \`--param-json key=<json>\`；IM \`/workflow run\` 暂不支持 object / array 入参。
+
+## Schema 速查
+
+顶层：
+
+\`\`\`json
+{
+  "workflowId": "my-workflow",
+  "version": 1,
+  "params": {
+    "name": { "type": "string", "required": true, "description": "human input metadata" }
+  },
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {}
+}
+\`\`\`
+
+\`params\` 是启动 run 时传入的入参，会被 **严格校验**：
+
+- schema 字段：\`type\`（\`string|number|boolean|object|array\`）、\`required\`、\`default\`、\`description\`、\`format\`。
+- 未知参数会被拒绝：\`未知参数：<key>\`。
+- 缺必填参数会被拒绝：\`缺少必填参数：<key>\`。
+- 类型不匹配会被拒绝，例如 \`参数 retries 必须是 number,收到 "abc"\`、\`参数 dryRun 必须是 boolean (true/false/1/0/yes/no),收到 "maybe"\`。
+- 所有错误会聚合一次性报出，不会让用户一轮只修一个问题。
+- optional 参数没传且有 \`default\`：runtime 会把 default 原样 materialize 到 run input。
+- optional 参数没传且没有 \`default\`：字段缺省；后续引用 \`\${params.X}\` / \`{ "$ref": "params.X" }\` 会在绑定阶段报错。
+
+启动语法：
+
+\`\`\`bash
+# CLI: 标量 string / number / boolean
+botmux workflow run weather-city --param city=上海 --param days=3 --param dryRun=false
+botmux workflow run weather-city --param=city=上海
+
+# CLI: object / array 或者需要保留 JSON 类型的值
+botmux workflow run batch-send --param-json tags='["urgent","cn"]'
+botmux workflow run batch-send --param-json config='{"mode":"safe","limit":3}'
+
+# IM: 只支持 key=value 标量；object / array 暂不支持
+/workflow run weather-city city=上海 days=3 dryRun=false
+\`\`\`
+
+在节点里既可以用 \`{ "$ref": "params.<path>" }\` 整字段替换，也可以在字符串里 \`"\${params.<path>}"\` 内嵌（仅限值是标量时）。嵌套对象用点号路径：\`params.user.email\`。
+
+subagent node：
+
+\`\`\`json
+{
+  "type": "subagent",
+  "bot": "cli_xxxxxxxxxxxxxxxx",
+  "prompt": "Static prompt string, or a whole-field { \\"$ref\\": \\"draft.output.text\\" }",
+  "depends": ["draft"],
+  "humanGate": { "stage": "before", "prompt": { "$ref": "draft.output.preview" } },
+  "outputSchema": { "type": "object" },
+  "description": "Why this bot/node exists"
+}
+\`\`\`
+
+hostExecutor node：
+
+\`\`\`json
+{
+  "type": "hostExecutor",
+  "executor": "feishu-send",
+  "depends": ["draft"],
+  "input": {
+    "larkAppId": "cli_xxx",
+    "chatId": "oc_xxx",
+    "content": { "$ref": "draft.output.text" },
+    "msgType": "text"
+  },
+  "description": "Side effect node; usually gated before execution"
+}
+\`\`\`
+
+已知默认 hostExecutor：
+- \`botmux-schedule\`：创建 botmux schedule task。
+- \`feishu-send\`：向 chatId 发飞书消息。
+- \`feishu-reply\`：回复 rootMessageId。
+
+如果用户提到其他 executor，先问他 executor 名和 input schema，不要猜。
+
+humanGate：
+
+\`\`\`json
+{
+  "stage": "before",
+  "prompt": "literal text or whole-field $ref",
+  "approvers": [],
+  "deadlineMs": 600000,
+  "onTimeout": "fail"
+}
+\`\`\`
+
+- \`stage\` 只支持 \`"before"\`。
+- \`approvers: []\` 或省略 = 任何 bot allowedUsers 都能批；非空 = open_id 白名单。
+- gate prompt 如果要展示上游产物，推荐让上游输出一个完整 \`preview\` 字段，然后写 \`{ "$ref": "draft.output.preview" }\`。
+
+## 数据流规则
+
+两种引用语法：
+
+**整字段 \`$ref\`**（任何类型，独占对象）：
+\`\`\`json
+{ "$ref": "draft.output.text" }
+{ "$ref": "params.user" }
+\`\`\`
+
+**字符串内 \`\${...}\` 内嵌**（只用在 string 字段，引用值必须是标量）：
+\`\`\`json
+"prompt": "查询 \${params.city} 未来 \${params.days} 天天气"
+"prompt": "基于天气 \${fetchWeather.output.summary} 出行建议"
+\`\`\`
+
+共同约束：
+- 引用路径形式：\`<nodeId>.output.<path>\` 或 \`params.<path>\`，路径用点号嵌套。
+- 引用某个 node 的 output 时，当前 node 必须在 \`depends\` 里声明该 node。
+- 引用 \`params.<path>\` 时，不需要写 \`depends\`。
+- validate 不会证明 output 字段存在；用 \`outputSchema\` 和 few-shot prompt 约束 subagent 返回 JSON。
+
+两种语法怎么选：
+- 上游产物本身是字符串、整段灌给下游 → 整字段 \`$ref\`（更便宜，不需要 string concat）
+- 模板需要把多个引用 / 标量参数拼进同一句话 → 字符串内 \`\${...}\`
+- 引用值是对象/数组 → 必须整字段 \`$ref\`，**不能**塞进 \`\${...}\` 拼字符串
+
+\`\${...}\` 内嵌的限制：
+- 只在字符串字段里识别（prompt / humanGate.prompt / hostExecutor.input 的 string 值）；对象 / 数组字段里的 string 也支持。
+- 引用值是 object / array 时报 \`BindingError\`——错误消息会建议改用整字段 \`$ref\`。
+- 整字段 \`$ref\` 对象必须独占，不能有兄弟 key（schema 强制）。
+
+## humanGate 启发式
+
+| 操作 | humanGate | 理由 |
+|---|---|---|
+| 发飞书消息、邮件 | 加 | 不可撤回或高可见 |
+| 写 repo 文件、git commit/push | 加 | 影响代码状态 |
+| 调外部写 API、付费 API | 加 | 副作用或成本 |
+| 删除、覆盖 | 加 | 高风险 |
+| 纯读、草稿、总结、纯计算 | 通常不加 | gate 噪音大 |
+
+一般把 gate 放在副作用节点的 \`humanGate.stage="before"\`，让用户审批最终将要发送/执行的内容。
+
+## 范例 A — subagent → humanGate → subagent
+
+\`\`\`json
+{
+  "workflowId": "hello-review",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "draft": {
+      "type": "subagent",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
+      "prompt": "Write a short greeting. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["preview", "text"],
+        "properties": {
+          "preview": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      },
+      "description": "Generate the draft greeting."
+    },
+    "finalize": {
+      "type": "subagent",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
+      "depends": ["draft"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "draft.output.preview" },
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "prompt": { "$ref": "draft.output.text" },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message"],
+        "properties": { "message": { "type": "string" } }
+      },
+      "description": "Run only after approval and produce the final JSON."
+    }
+  }
+}
+\`\`\`
+
+## 范例 B — subagent → gated feishu-send（演示 params 注入）
+
+启动：\`botmux workflow run weekly-report --param larkAppId=cli_xxx --param chatId=oc_xxx\`
+
+\`\`\`json
+{
+  "workflowId": "weekly-report",
+  "version": 1,
+  "params": {
+    "larkAppId": { "type": "string", "required": true, "description": "Target Lark app for the send" },
+    "chatId": { "type": "string", "required": true, "description": "Target chat (open_chat_id)" }
+  },
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 8192
+  },
+  "nodes": {
+    "draft": {
+      "type": "subagent",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
+      "prompt": "Draft a weekly report covering this week's PRs, decisions, and blockers. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["preview", "text"],
+        "properties": {
+          "preview": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      },
+      "description": "Generate report content. Prompt is static instruction; bot owns content."
+    },
+    "send": {
+      "type": "hostExecutor",
+      "executor": "feishu-send",
+      "depends": ["draft"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "draft.output.preview" },
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "input": {
+        "larkAppId": { "$ref": "params.larkAppId" },
+        "chatId": { "$ref": "params.chatId" },
+        "content": { "$ref": "draft.output.text" },
+        "msgType": "text"
+      },
+      "description": "Target chat parameterized via params — same workflow can target any chat."
+    }
+  }
+}
+\`\`\`
+
+**Params 注入最适合的场景**：路由信息（chat id / app id / recipient）、模式开关（mode='draft'|'send'）、配置（threshold、超时）。也适合在 prompt 模板里用 \`\${params.city}\` 这种标量插值（"查询 \${params.city} 天气"）。**仍不适合**：完整 prompt 指令通过 params 整段传——节点的"任务定义"应该写死在 workflow.json 里，让 caller 传业务变量而非整条指令，否则 workflow 就退化成消息转发器。
+
+## 范例 C — string template 演示
+
+启动：\`botmux workflow run weather-city --param city=上海 --param days=3\`
+
+\`\`\`json
+{
+  "workflowId": "weather-city",
+  "version": 1,
+  "params": {
+    "city": { "type": "string", "required": true, "description": "城市名" },
+    "days": { "type": "number", "required": false, "default": 3, "description": "查几天" }
+  },
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 180000,
+    "maxOutputBytes": 8192
+  },
+  "nodes": {
+    "fetchWeather": {
+      "type": "subagent",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
+      "prompt": "查询 \${params.city} 未来 \${params.days} 天天气，返回 JSON: {\\"summary\\": string, \\"forecast\\": [...]}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["summary", "forecast"],
+        "properties": {
+          "summary": { "type": "string" },
+          "forecast": { "type": "array" }
+        }
+      },
+      "description": "params.city / params.days 通过字符串模板内嵌到 prompt 里；上游不需要再合成 prompt 字段。"
+    },
+    "planTrip": {
+      "type": "subagent",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
+      "depends": ["fetchWeather"],
+      "prompt": "基于 \${params.city} \${params.days} 日天气概要「\${fetchWeather.output.summary}」生成出行建议，返回 JSON: {\\"plan\\": string}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["plan"],
+        "properties": { "plan": { "type": "string" } }
+      },
+      "description": "把 params 和上游 output 混在同一句 prompt 里——string template 比整字段 \$ref 更适合这种 fan-in 场景。"
+    }
+  }
+}
+\`\`\`
+
+注意 \`forecast\` 是数组，**不能**嵌到 \`\${fetchWeather.output.forecast}\` 字符串里（runtime 会报 BindingError）。如果下游真的需要整个 forecast 数组，把 prompt 拆开：用 \`\${fetchWeather.output.summary}\` 做导读，再用整字段 \`{ "$ref": "fetchWeather.output.forecast" }\` 传给 hostExecutor.input 之类支持对象的字段。
+
+## 常见错误
+
+- **\`subagent.bot\` 填了 displayName（如 \`claude-loopy\` 或 \`aiden-oncall(d2)\`）而不是 larkAppId**：跨 daemon 必 fail，runtime 报 "Bot 'X' not found in registry"。一定填 \`cli_xxxxxxxxxxxxxxxx\`。
+- **workflow 文件写到当前 cwd 的 \`./workflows/\` 而不是 \`$HOME/.botmux/workflows/\`**：CLI agent cwd 和 daemon cwd 不一致时 daemon 找不到文件。一定用绝对路径 \`$HOME/.botmux/workflows/<id>.workflow.json\`。
+- 启动时传了 workflow 没声明的参数：会报 \`未知参数：foo\`。要么删掉参数，要么在顶层 \`params\` schema 里声明。
+- 漏传必填参数：会报 \`缺少必填参数：city\`。启动时补 \`--param city=上海\` 或 IM \`city=上海\`。
+- number 参数传了非数字：会报 \`参数 retries 必须是 number,收到 "abc"\`。改成 \`--param retries=3\`。
+- boolean 参数传了非法值：会报 \`参数 dryRun 必须是 boolean (true/false/1/0/yes/no),收到 "maybe"\`。合法值包括 \`true/false/1/0/yes/no/y/n\`。
+- object / array 参数用了 \`--param key=value\` 或 IM \`key=value\`：会报 \`--param-json ... IM 端目前不支持 object/array\`。CLI 改用 \`--param-json tags='["x","y"]'\` 或 \`--param-json config='{"mode":"safe"}'\`；IM 端暂不支持 object/array。
+- 写 \`{{...}}\` 模板：runtime 只识别 \`\${...}\`，不识别双花括号；改成 \`\${...}\` 或整字段 \`$ref\`。
+- 把对象 / 数组塞进 \`\${...}\` 字符串模板里：会报 \`BindingError\`。对象 / 数组必须用整字段 \`$ref\` 替换。
+- \`$ref\` 字符串里没有 \`.output.\` 也不是 \`params.*\` 开头：parse 会报错。
+- \`$ref\` 引用的 node 没写进 \`depends\`：validate 可能过，运行时顺序不可靠。
+- \`humanGate.stage: "after"\`：不支持。
+- \`$ref\` 对象还有其他 key：schema 会拒绝。
+- nodeId 含 \`/\`、\`..\`、空格：schema 会拒绝。
+- executor 名不是默认三种之一且用户没确认：不要猜。
+`;
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
+  { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The

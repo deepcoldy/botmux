@@ -162,7 +162,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; cliSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string }
   | { type: 'raw_input'; content: string }
   | { type: 'close' }
@@ -176,6 +176,7 @@ export type DaemonToWorker =
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string }
+  | { type: 'cli_session_id'; cliSessionId: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null }
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }

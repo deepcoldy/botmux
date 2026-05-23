@@ -38,7 +38,17 @@ function getLarkErrorCode(err: any): number | undefined {
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
 
-export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text'): Promise<string> {
+/**
+ * Send a message to a chat.
+ *
+ * `uuid` is an optional opt-in dedupe token (Feishu IM uuid field, ≤ 50
+ * chars, 1-hour TTL — see spike report §1.2).  When supplied, the Feishu
+ * server returns the original message_id for repeat requests within TTL,
+ * making the send idempotent.  Workflow runtime passes the attempt's
+ * idempotencyKey here so retries don't re-send.  Existing callers omit
+ * the param and get exactly the pre-Step-6 behavior.
+ */
+export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -50,6 +60,7 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
         receive_id: chatId,
         msg_type: msgType as any,
         content: body,
+        ...(uuid ? { uuid } : {}),
       },
     });
   } catch (err: any) {
@@ -70,7 +81,14 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
   return messageId;
 }
 
-export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false): Promise<string> {
+/**
+ * Reply to an existing message.  See {@link sendMessage} for the `uuid`
+ * dedupe parameter — same semantics apply to replies (Feishu reply API
+ * also accepts `uuid` and yields the same 1-hour idempotent return).  See
+ * spike report §1.4 for the reply-specific test results, including the
+ * cross-parent dedupe behavior that informs the inputHash design.
+ */
+export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -82,6 +100,7 @@ export async function replyMessage(larkAppId: string, messageId: string, content
         msg_type: msgType as any,
         content: body,
         ...(replyInThread ? { reply_in_thread: true } : {}),
+        ...(uuid ? { uuid } : {}),
       },
     });
   } catch (err: any) {

@@ -9,11 +9,13 @@ import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import {
-  generateToken, parseCookie, buildSetCookie, verifyHmac,
+  generateToken, parseCookie, buildSetCookie, verifyHmac, decideDashboardAuth,
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
+import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
+import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
@@ -143,11 +145,6 @@ function authedToken(req: IncomingMessage, url: URL): string | undefined {
   return parseCookie(req.headers.cookie);
 }
 
-function jsonRes(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json' });
-  res.end(JSON.stringify(body));
-}
-
 async function proxyToDaemon(
   larkAppId: string, daemonPath: string, init: RequestInit,
 ): Promise<Response> {
@@ -217,19 +214,25 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { url: fullUrl });
     }
 
-    // All other paths require an authenticated session.
-    const tok = authedToken(req, url);
-    if (!tok || tok !== activeToken) {
+    const presentedToken = authedToken(req, url);
+    const decision = decideDashboardAuth({
+      method: req.method ?? 'GET',
+      pathname: url.pathname,
+      hasTokenParam: url.searchParams.has('t'),
+      presentedToken,
+      activeToken: activeToken ?? '',
+    });
+
+    if (decision.kind === 'deny401') {
       res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
       return;
     }
 
-    // First hit with `?t=<token>` sets the cookie + redirects to clean URL.
-    if (url.searchParams.has('t')) {
+    if (decision.kind === 'allow+set-cookie') {
       res.writeHead(302, {
-        'set-cookie': buildSetCookie(tok),
-        'location': url.pathname || '/',
+        'set-cookie': buildSetCookie(decision.token),
+        'location': decision.redirectTo,
       });
       res.end();
       return;
@@ -282,6 +285,21 @@ const server = createServer(async (req, res) => {
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}/${op}`, { method: 'POST' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
+      return;
+    }
+
+    // ─── Workflows (D0 read-only + D1 cancel mutation) ───────────────────────
+    //
+    // Dashboard reads runsDir directly (single-process; cross-daemon ownership
+    // doesn't matter for read-only).  All readers in `ops-projection` are
+    // pure: no mkdir, no EventLog instantiation.  Unknown / corrupt run → 404.
+    // Mutations are intentionally proxied to the owner daemon from
+    // chat-binding.larkAppId so only the daemon with live workflow runtime
+    // context writes the event log.
+    if (await handleWorkflowApi(req, res, url, {
+      runsDir: getRunsDir(),
+      proxyToDaemon,
+    })) {
       return;
     }
 

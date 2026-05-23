@@ -4,7 +4,98 @@ import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from '../core/dashboard-events.js';
+import { computeInputHash } from '../workflows/events/idempotency.js';
 import type { ScheduledTask, ParsedSchedule } from '../types.js';
+
+// ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
+
+/**
+ * Raised by `createTask` when an `id` is supplied but a task already exists
+ * with that id AND its canonical input differs from the incoming params.
+ *
+ * Workflow runtime uses this to detect "same attempt asked to create a
+ * different schedule" — a sign the attempt is being mutated (forbidden by
+ * attempt-immutability rule, events doc §4.2).
+ */
+export class IdempotencyConflictError extends Error {
+  readonly taskId: string;
+  readonly existingInputHash: string;
+  readonly incomingInputHash: string;
+  constructor(detail: {
+    taskId: string;
+    existingInputHash: string;
+    incomingInputHash: string;
+  }) {
+    super(
+      `IdempotencyConflict: schedule task ${detail.taskId} exists with different canonical input ` +
+        `(existing=${detail.existingInputHash.substring(0, 18)}…, incoming=${detail.incomingInputHash.substring(0, 18)}…)`,
+    );
+    this.name = 'IdempotencyConflictError';
+    this.taskId = detail.taskId;
+    this.existingInputHash = detail.existingInputHash;
+    this.incomingInputHash = detail.incomingInputHash;
+  }
+}
+
+/**
+ * Canonical schedule input used for create-or-return-identical comparison.
+ *
+ * Includes only the fields that callers control as task **input** (events
+ * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
+ *   - `chatType` (advisory, derived)
+ *   - `creator*` (audit metadata, not input)
+ *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
+ *     `lastDeliveryError` (runtime state, mutates over task lifetime)
+ *   - `createdAt` (metadata)
+ *   - `repeat.completed` (counter, mutates per run)
+ *   - `parsed.display` (UI-facing string, redundant given `expr`/`runAt`)
+ *
+ * Codex round 4 finding 4: `parsed` is NOT purely derived for one-shot or
+ * relative schedules.  `30m`/`2h`/`明天9:00`/`5分钟后` etc compute a
+ * concrete `runAt` at parse time using "now"; if a workflow retry re-
+ * parses the same raw `schedule`, it gets a different `runAt`.  So the
+ * canonical input freezes the resolved schedule shape (`parsed.kind` and
+ * whichever of `parsed.runAt`/`parsed.minutes`/`parsed.expr` applies).
+ */
+function canonicalScheduleInput(t: {
+  name: string;
+  schedule: string;
+  parsed?: ParsedSchedule;
+  prompt: string;
+  workingDir: string;
+  chatId: string;
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  larkAppId?: string;
+  repeat?: { times: number | null; completed?: number };
+  deliver?: 'origin' | 'local';
+}): unknown {
+  return {
+    name: t.name,
+    schedule: t.schedule,
+    parsed: t.parsed
+      ? {
+          kind: t.parsed.kind,
+          // Only one of these is present per parsed.kind, but inlining all
+          // three keeps the canonical shape uniform — `undefined` slots are
+          // dropped by `computeInputHash` upstream.
+          runAt: t.parsed.runAt,
+          minutes: t.parsed.minutes,
+          expr: t.parsed.expr,
+        }
+      : undefined,
+    prompt: t.prompt,
+    workingDir: t.workingDir,
+    chatId: t.chatId,
+    rootMessageId: t.rootMessageId,
+    scope: t.scope,
+    larkAppId: t.larkAppId,
+    // Strip `completed` — it mutates after the task starts running, but
+    // `times` is the durable user intent.
+    repeat: t.repeat ? { times: t.repeat.times } : undefined,
+    deliver: t.deliver ?? 'origin',
+  };
+}
 
 let tasks: Map<string, ScheduledTask> = new Map();
 let loaded = false;
@@ -123,7 +214,24 @@ function save(): void {
   try { cachedMtime = statSync(fp).mtimeMs; } catch { /* ignore */ }
 }
 
+/**
+ * Create a scheduled task — or return the existing one with the same input
+ * when called with a workflow-supplied `id` that already exists.
+ *
+ * Behaviour matrix (events doc v0.1.2 §2.2 Option A):
+ *
+ *   | scenario                                   | result                       |
+ *   |--------------------------------------------|------------------------------|
+ *   | no `id`                                    | randomUUID(8) — legacy path  |
+ *   | `id` not in store                          | create with the given id     |
+ *   | `id` in store + canonical input matches    | return existing (no mutation)|
+ *   | `id` in store + canonical input differs    | IdempotencyConflictError     |
+ *
+ * Use `wf_<hash...>` prefixed ids when called from workflow runtime to
+ * avoid collisions with the 8-char randomUUID legacy namespace.
+ */
 export function createTask(params: {
+  id?: string;
   name: string;
   schedule: string;
   parsed: ParsedSchedule;
@@ -142,8 +250,33 @@ export function createTask(params: {
   deliver?: 'origin' | 'local';
 }): ScheduledTask {
   load();
+
+  if (params.id) {
+    const existing = tasks.get(params.id);
+    if (existing) {
+      const existingHash = computeInputHash(canonicalScheduleInput(existing));
+      const incomingHash = computeInputHash(canonicalScheduleInput(params));
+      if (existingHash === incomingHash) {
+        // create-or-return-identical: same id + same canonical input → no-op.
+        // Do NOT mutate `enabled`, `nextRunAt`, `lastRunAt` etc — those are
+        // runtime state that the caller has no business overwriting via the
+        // create path.  Use `updateTask` / `enableTask` for those.
+        logger.debug(
+          `[schedule-store] createTask: returning existing task ${params.id} (canonical input identical)`,
+        );
+        return existing;
+      }
+      throw new IdempotencyConflictError({
+        taskId: params.id,
+        existingInputHash: existingHash,
+        incomingInputHash: incomingHash,
+      });
+    }
+    // id given but new task — fall through to create with that id.
+  }
+
   const task: ScheduledTask = {
-    id: randomUUID().substring(0, 8),
+    id: params.id ?? randomUUID().substring(0, 8),
     name: params.name,
     schedule: params.schedule,
     parsed: params.parsed,

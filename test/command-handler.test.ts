@@ -294,8 +294,15 @@ describe('DAEMON_COMMANDS set', () => {
 
 describe('PASSTHROUGH_COMMANDS set', () => {
   it('should contain expected slash commands forwarded to CLI', () => {
-    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage']) {
+    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff']) {
       expect(PASSTHROUGH_COMMANDS.has(cmd), `Expected PASSTHROUGH_COMMANDS to contain ${cmd}`).toBe(true);
+    }
+  });
+
+  it('every passthrough command is a slash command and unique', () => {
+    for (const cmd of PASSTHROUGH_COMMANDS) {
+      expect(cmd.startsWith('/'), `${cmd} should start with /`).toBe(true);
+      expect(cmd, `${cmd} should be lowercase`).toBe(cmd.toLowerCase());
     }
   });
 
@@ -571,6 +578,18 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/compact'); // passthrough list
       expect(replyContent).toContain('/model');
       expect(replyContent).toContain('Claude'); // CLI display name
+    });
+
+    it('renders the passthrough list straight from PASSTHROUGH_COMMANDS (no drift)', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/help', ROOT_ID, makeLarkMessage('/help'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      // /help renders [...PASSTHROUGH_COMMANDS].join(' '); guard against anyone
+      // re-hardcoding a stale list that drifts from the set.
+      expect(replyContent).toContain([...PASSTHROUGH_COMMANDS].join(' '));
     });
 
     it('should return help text when no session exists', async () => {
