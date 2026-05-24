@@ -38,6 +38,8 @@ import type {
   WaitDeadlineExceededEvent,
   WaitResolvedEvent,
 } from './events/types.js';
+import type { WorkflowDefinition } from './definition.js';
+import { parseActivityId } from './orchestrator.js';
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -103,6 +105,21 @@ export type ExpireWaitInput = {
 export type ResolveWaitResult = {
   resolutionEvent: WaitResolvedEvent;
   terminalEvent: ActivitySucceededEvent | ActivityFailedEvent;
+  /** Convenience surface of the resolution event's eventId — useful as
+   *  the loop runtime's `waitResolvedEventId` audit anchor without
+   *  reaching into `.resolutionEvent.eventId`. */
+  waitResolvedEventId: string;
+};
+
+/**
+ * Optional context for resolveWait.  When `def` is supplied, resolveWait
+ * recognises `decision` nodes (v0.2 loop terminators) and writes their
+ * terminal as `activitySucceeded` with a fixed `{resolution, by, comment?}`
+ * output blob — including the `rejected` case, which for plain nodes
+ * still maps to `activityFailed`.  See /tmp/wf-loop-v02.md §4.3 N2.
+ */
+export type ResolveWaitContext = {
+  def?: WorkflowDefinition;
 };
 
 export type ExpireWaitResult = {
@@ -149,14 +166,21 @@ export async function createWait(
 /**
  * Close a wait via external decision.  Writes `waitResolved` followed
  * by the activity terminal.  The terminal mapping is fixed by spec
- * §2.4:
+ * §2.4 for plain nodes:
  *   - approved → activitySucceeded
  *   - rejected → activityFailed { InputValidationFailed, userFault }
  *   - external → activitySucceeded { externalRefs.resolution='external' }
+ *
+ * For v0.2 `decision` nodes (loop terminators), the mapping is different:
+ * BOTH approve and reject resolve to `activitySucceeded` with a fixed
+ * `{resolution, by, comment?}` output blob — rejection is a legal
+ * decision output, not a failure.  Pass `ctx.def` so resolveWait can
+ * look up the node type via `parseActivityId(activityId).nodeId`.
  */
 export async function resolveWait(
   log: EventLog,
   input: ResolveWaitInput,
+  ctx?: ResolveWaitContext,
 ): Promise<ResolveWaitResult> {
   const resolutionEvent = (await log.append({
     runId: log.runId,
@@ -170,11 +194,19 @@ export async function resolveWait(
     },
   })) as WaitResolvedEvent;
 
+  // v0.2: detect decision node so reject doesn't go through activityFailed.
+  const isDecisionNode = (() => {
+    if (!ctx?.def) return false;
+    const parsed = parseActivityId(input.activityId);
+    if (!parsed) return false;
+    return ctx.def.nodes[parsed.nodeId]?.type === 'decision';
+  })();
+
   const terminalEvent = await writeWaitTerminal(log, {
     activityId: input.activityId,
     attemptId: input.attemptId,
     kind:
-      input.resolution === 'rejected'
+      input.resolution === 'rejected' && !isDecisionNode
         ? {
             tag: 'failed',
             errorCode: 'InputValidationFailed',
@@ -194,7 +226,11 @@ export async function resolveWait(
           },
   });
 
-  return { resolutionEvent, terminalEvent };
+  return {
+    resolutionEvent,
+    terminalEvent,
+    waitResolvedEventId: resolutionEvent.eventId,
+  };
 }
 
 // ─── expireWait ────────────────────────────────────────────────────────────

@@ -385,6 +385,64 @@ async function runSettle(
     case 'completeRunFailed':
       await completeRunFailed(ctx, action);
       return;
+    // v0.2 loop lifecycle actions — each maps 1:1 to a loop event in
+    // events/payloads.ts.  Runtime side has no extra side-effects beyond
+    // appending the event; replay (codex Step 2) does the heavy lifting.
+    case 'startLoop':
+      await ctx.log.append({
+        runId: ctx.log.runId,
+        type: 'loopStarted',
+        actor: 'scheduler',
+        payload: {
+          loopId: action.loopId,
+          maxIterations: action.maxIterations,
+        },
+      });
+      return;
+    case 'startLoopIteration':
+      await ctx.log.append({
+        runId: ctx.log.runId,
+        type: 'loopIterationStarted',
+        actor: 'scheduler',
+        payload: {
+          loopId: action.loopId,
+          iteration: action.iteration,
+          prevResolution: action.prevResolution,
+        },
+      });
+      return;
+    case 'finishLoopIteration':
+      await ctx.log.append({
+        runId: ctx.log.runId,
+        type: 'loopIterationFinished',
+        actor: 'scheduler',
+        payload: {
+          loopId: action.loopId,
+          iteration: action.iteration,
+          resolution: action.resolution,
+          decisionActivityId: action.decisionActivityId,
+          waitResolvedEventId: action.waitResolvedEventId,
+          by: action.by,
+          ...(action.comment !== undefined ? { comment: action.comment } : {}),
+          ...(action.timedOut !== undefined ? { timedOut: action.timedOut } : {}),
+        },
+      });
+      return;
+    case 'finishLoop':
+      await ctx.log.append({
+        runId: ctx.log.runId,
+        type: 'loopFinished',
+        actor: 'scheduler',
+        payload: {
+          loopId: action.loopId,
+          finalIteration: action.finalIteration,
+          resolution: action.resolution,
+          ...(action.outputRef ? { outputRef: action.outputRef } : {}),
+          ...(action.errorCode ? { errorCode: action.errorCode } : {}),
+          ...(action.errorClass ? { errorClass: action.errorClass } : {}),
+        },
+      });
+      return;
   }
   // Exhaustive — TS will flag if a new settle kind appears.
   const _exhaustive: never = action;
