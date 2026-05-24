@@ -252,6 +252,14 @@ export type RunSnapshotDTO = {
   lastSeq: number;
   nodes: NodeState[];
   activities: ActivityState[];
+  /**
+   * v0.2 loop blocks indexed by their nodeId.  Optional so v0.1 clients
+   * that don't render iteration timelines stay forward-compatible — if
+   * the field is absent, no loops are present; if it's an empty record,
+   * the workflow used loop schema but no loop instance ran.  See
+   * /tmp/wf-loop-v02.md §8 (dashboard) + §9 (progress card).
+   */
+  loops?: Record<string, LoopSnapshotDTO>;
   dangling: {
     activities: string[];
     effectAttempted: string[];
@@ -262,6 +270,28 @@ export type RunSnapshotDTO = {
   attemptIO: Record<string, AttemptIODTO>;
   chatBinding?: { chatId: string; larkAppId: string };
   updatedAt: number;
+};
+
+export type LoopIterationDTO = {
+  iteration: number;
+  status: 'running' | 'approved' | 'rejected' | 'failed' | 'cancelled';
+  bodyActivityIds: string[];
+  decisionActivityId?: string;
+  waitResolvedEventId?: string;
+  decisionBy?: string;
+  decisionComment?: string;
+  timedOut?: boolean;
+};
+
+export type LoopSnapshotDTO = {
+  loopId: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  iteration: number;
+  maxIterations: number;
+  iterations: LoopIterationDTO[];
+  output?: OutputRef;
+  errorCode?: string;
+  errorClass?: string;
 };
 
 export type BlobPreviewDTO = {
@@ -338,6 +368,7 @@ export async function readRunSnapshot(
     lastSeq: snap.lastSeq,
     nodes: [...snap.nodes.values()],
     activities: [...snap.activities.values()],
+    loops: projectLoops(snap),
     dangling: {
       activities: snap.danglingActivities,
       effectAttempted: snap.danglingEffectAttempted,
@@ -349,6 +380,39 @@ export async function readRunSnapshot(
     chatBinding: binding ?? undefined,
     updatedAt: events[events.length - 1]!.timestamp,
   };
+}
+
+/**
+ * Project the replay's in-memory `snapshot.loops` Map into the
+ * JSON-serializable DTO surface.  Returns `undefined` when no loops
+ * exist so v0.1 clients deserializing the snapshot see no `loops`
+ * key at all (forward-compat for older dashboards).
+ */
+function projectLoops(snap: Snapshot): Record<string, LoopSnapshotDTO> | undefined {
+  if (!snap.loops || snap.loops.size === 0) return undefined;
+  const out: Record<string, LoopSnapshotDTO> = {};
+  for (const [loopId, state] of snap.loops) {
+    out[loopId] = {
+      loopId,
+      status: state.status,
+      iteration: state.iteration,
+      maxIterations: state.maxIterations,
+      iterations: state.iterations.map((it) => ({
+        iteration: it.iteration,
+        status: it.status,
+        bodyActivityIds: [...it.bodyActivityIds],
+        decisionActivityId: it.decisionActivityId,
+        waitResolvedEventId: it.waitResolvedEventId,
+        decisionBy: it.decisionBy,
+        decisionComment: it.decisionComment,
+        timedOut: it.timedOut,
+      })),
+      output: state.output,
+      errorCode: state.errorCode,
+      errorClass: state.errorClass,
+    };
+  }
+  return out;
 }
 
 async function buildAttemptIO(

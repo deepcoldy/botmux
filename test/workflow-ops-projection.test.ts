@@ -25,7 +25,11 @@ import { EventLog } from '../src/workflows/events/append.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { workActivityId } from '../src/workflows/orchestrator.js';
+import {
+  loopGateActivityId,
+  workActivityId,
+} from '../src/workflows/orchestrator.js';
+import { resolveWait } from '../src/workflows/wait.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
 let runsDir: string;
@@ -630,5 +634,139 @@ describe('extractEventContext', () => {
     expect(extractEventContext({ ref: 'b1', bytes: 10, schemaVersion: 1 })).toEqual({});
     expect(extractEventContext(null)).toEqual({});
     expect(extractEventContext(undefined)).toEqual({});
+  });
+});
+
+// ─── readRunSnapshot — v0.2 loop projection (Step 4) ───────────────────────
+//
+// Loop blocks are projected into `RunSnapshotDTO.loops` as a JSON-safe
+// record keyed by loopId.  The field is OPTIONAL (omitted for workflows
+// that don't use loops) so older dashboards staying forward-compatible.
+
+const LOOP_DEF = parseWorkflowDefinition({
+  workflowId: 'proj-loop',
+  version: 1,
+  nodes: {
+    implement: { type: 'subagent', bot: 'b', prompt: 'x' },
+    reviewDecision: {
+      type: 'decision',
+      depends: ['implement'],
+      humanGate: { stage: 'before', prompt: 'ok?' },
+    },
+    'review-loop': {
+      type: 'loop',
+      maxIterations: 2,
+      body: ['implement', 'reviewDecision'],
+      terminate: { node: 'reviewDecision', via: 'humanGate' },
+      output: { from: 'implement' },
+    },
+  },
+});
+
+describe('readRunSnapshot — loop projection', () => {
+  it('omits `loops` field for runs without any loop block', async () => {
+    await seedSucceeded('r-no-loops');
+    const snap = await readRunSnapshot(runsDir, 'r-no-loops');
+    expect(snap).not.toBeNull();
+    expect(snap!.loops).toBeUndefined();
+  });
+
+  it('includes `loops` record once a loop has started', async () => {
+    const log = new EventLog('r-loop-running', runsDir);
+    await createRun(log, {
+      def: LOOP_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    const ctx = { log, def: LOOP_DEF, spawnSubagent: okSpawn };
+    await runLoop(ctx);
+
+    const snap = await readRunSnapshot(runsDir, 'r-loop-running');
+    expect(snap).not.toBeNull();
+    expect(snap!.loops).toBeDefined();
+    const loop = snap!.loops!['review-loop'];
+    expect(loop).toBeDefined();
+    expect(loop.loopId).toBe('review-loop');
+    expect(loop.status).toBe('running');
+    expect(loop.iteration).toBe(1);
+    expect(loop.maxIterations).toBe(2);
+    expect(loop.iterations).toHaveLength(1);
+    expect(loop.iterations[0]?.iteration).toBe(1);
+    expect(loop.iterations[0]?.status).toBe('running');
+  });
+
+  it('iteration audit anchors survive the projection round-trip', async () => {
+    const log = new EventLog('r-loop-anchors', runsDir);
+    await createRun(log, {
+      def: LOOP_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    const ctx = { log, def: LOOP_DEF, spawnSubagent: okSpawn };
+    await runLoop(ctx);
+    const decisionId = loopGateActivityId('r-loop-anchors', 'review-loop', 1, 'reviewDecision');
+    // Need to read the current snapshot to grab the gate attempt id.
+    let snap = await readRunSnapshot(runsDir, 'r-loop-anchors');
+    const decAct = snap!.activities.find((a) => a.activityId === decisionId);
+    await resolveWait(
+      log,
+      {
+        activityId: decisionId,
+        attemptId: decAct!.currentAttemptId!,
+        resolution: 'rejected',
+        by: 'ou_reviewer',
+        comment: 'try again',
+      },
+      { def: LOOP_DEF },
+    );
+    await runLoop(ctx);
+
+    snap = await readRunSnapshot(runsDir, 'r-loop-anchors');
+    const loop = snap!.loops!['review-loop'];
+    expect(loop.iteration).toBe(2);
+    expect(loop.iterations).toHaveLength(2);
+    const it1 = loop.iterations[0]!;
+    expect(it1.status).toBe('rejected');
+    expect(it1.decisionActivityId).toBe(decisionId);
+    expect(it1.waitResolvedEventId).toMatch(/-\d+$/);
+    expect(it1.decisionBy).toBe('ou_reviewer');
+    expect(it1.decisionComment).toBe('try again');
+  });
+
+  it('terminal loop carries output projection ref + errorCode/errorClass', async () => {
+    const log = new EventLog('r-loop-fail', runsDir);
+    await createRun(log, {
+      def: LOOP_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    const ctx = { log, def: LOOP_DEF, spawnSubagent: okSpawn };
+    // Reject twice → max-iterations-exceeded.
+    for (let iter = 1; iter <= 2; iter++) {
+      await runLoop(ctx);
+      const snap = await readRunSnapshot(runsDir, 'r-loop-fail');
+      const decisionId = loopGateActivityId('r-loop-fail', 'review-loop', iter, 'reviewDecision');
+      const decAct = snap!.activities.find((a) => a.activityId === decisionId);
+      await resolveWait(
+        log,
+        {
+          activityId: decisionId,
+          attemptId: decAct!.currentAttemptId!,
+          resolution: 'rejected',
+          by: 'r',
+        },
+        { def: LOOP_DEF },
+      );
+    }
+    await runLoop(ctx);
+
+    const snap = await readRunSnapshot(runsDir, 'r-loop-fail');
+    const loop = snap!.loops!['review-loop'];
+    expect(loop.status).toBe('failed');
+    expect(loop.errorCode).toBe('LoopMaxIterationsExceeded');
+    expect(loop.errorClass).toBe('userFault');
   });
 });

@@ -115,6 +115,7 @@ export function buildWorkflowProgressCard(
   // contradicts the header status.
   const runningRows = isTerminal ? [] : collectRunningRows(snapshot);
   const waitingRows = isTerminal ? [] : collectWaitingRows(snapshot);
+  const loopRows = isTerminal ? [] : collectLoopRows(snapshot);
   const failureSummary = summarizeFailure(snapshot);
 
   const elements: Array<Record<string, unknown>> = [
@@ -146,6 +147,19 @@ export function buildWorkflowProgressCard(
       text: { tag: 'lark_md', content: `**⏸ 等待审批** (${waitingRows.length})` },
     });
     appendRows(elements, waitingRows, maxRows, opts);
+  }
+
+  // v0.2 loop iteration view (collapsible-style summary line per active
+  // loop block).  See /tmp/wf-loop-v02.md §9 — terminal status hides
+  // this section the same way `running` / `waiting` are hidden once
+  // the run reaches a terminal state.
+  if (loopRows.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: `**🔁 循环节点** (${loopRows.length})` },
+    });
+    appendLoopRows(elements, loopRows);
   }
 
   if (failureSummary) {
@@ -219,6 +233,56 @@ function collectWaitingRows(snap: Snapshot): AttemptRow[] {
     });
   }
   return rows;
+}
+
+type LoopRow = {
+  loopId: string;
+  iteration: number;
+  maxIterations: number;
+  iterStatus: 'running' | 'approved' | 'rejected' | 'failed' | 'cancelled';
+};
+
+/**
+ * One row per active loop block (status === 'running').  Settled loops
+ * (succeeded / failed / cancelled) are NOT included because the parent
+ * card hides this whole section once the run reaches a terminal status.
+ * Body-node in-flight activities still show up in the run-level
+ * `running` rows; the loop section is the "where are we in the
+ * iteration cycle" overlay.
+ */
+function collectLoopRows(snap: Snapshot): LoopRow[] {
+  if (!snap.loops || snap.loops.size === 0) return [];
+  const rows: LoopRow[] = [];
+  for (const loop of snap.loops.values()) {
+    if (loop.status !== 'running') continue;
+    // iteration === 0 means startLoop emitted but startLoopIteration
+    // hasn't yet — clamp to 1 so the user-facing "iteration N/M"
+    // doesn't show 0/M during that microsecond window.
+    const iter = Math.max(1, loop.iteration);
+    const currentIterState = loop.iterations[iter - 1];
+    rows.push({
+      loopId: loop.loopId,
+      iteration: iter,
+      maxIterations: loop.maxIterations,
+      iterStatus: currentIterState?.status ?? 'running',
+    });
+  }
+  return rows;
+}
+
+function appendLoopRows(
+  elements: Array<Record<string, unknown>>,
+  rows: LoopRow[],
+): void {
+  const lines: string[] = [];
+  for (const row of rows) {
+    const iterText = `iteration ${row.iteration}/${row.maxIterations}`;
+    lines.push(`• \`${escapeMd(row.loopId)}\` · ${iterText} (${row.iterStatus})`);
+  }
+  elements.push({
+    tag: 'div',
+    text: { tag: 'lark_md', content: lines.join('\n') },
+  });
 }
 
 function summarizeFailure(snap: Snapshot): string | undefined {
