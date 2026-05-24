@@ -24,9 +24,16 @@ describe('invite-store', () => {
     expect(consumeInvite(dataDir, 'nope')).toEqual({ ok: false, reason: 'not_found' });
   });
 
-  it('expires after TTL', () => {
+  it('reports a stable reason for expired vs used vs not_found', () => {
     const { code } = createInvite(dataDir, 'default', 'ou_admin', 1000, 1_000_000);
-    expect(consumeInvite(dataDir, code, 1_002_000)).toEqual({ ok: false, reason: 'not_found' });
+    // expired (looked up before prune) → 'expired', not 'not_found'
+    expect(consumeInvite(dataDir, code, 1_002_000)).toEqual({ ok: false, reason: 'expired' });
+    // used
+    const a = createInvite(dataDir, 'default', 'ou_admin');
+    expect(consumeInvite(dataDir, a.code).ok).toBe(true);
+    expect(consumeInvite(dataDir, a.code)).toEqual({ ok: false, reason: 'used' });
+    // not found
+    expect(consumeInvite(dataDir, 'zzz')).toEqual({ ok: false, reason: 'not_found' });
   });
 
   it('codes are unique', () => {

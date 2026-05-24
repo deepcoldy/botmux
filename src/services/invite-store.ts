@@ -6,6 +6,10 @@
  * invitee self-authenticates via the bot, the invite only grants admission.
  *
  * Storage: `{dataDir}/team-invites.json`, atomic writes; expired/used pruned.
+ *
+ * Concurrency: consume is a read-modify-write. This assumes a SINGLE dashboard
+ * writer process (the current deployment model). If multiple dashboard processes
+ * ever write concurrently, a single-use code would need a file lock here.
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
@@ -67,14 +71,15 @@ export type ConsumeInviteResult =
   | { ok: true; teamId: string }
   | { ok: false; reason: 'not_found' | 'expired' | 'used' };
 
-/** Validate + burn an invite (single-use). */
+/** Validate + burn an invite (single-use). Determines the precise failure
+ *  reason BEFORE pruning, so an expired code reports `expired` (not `not_found`). */
 export function consumeInvite(dataDir: string, code: string, now: number = Date.now()): ConsumeInviteResult {
-  const data = prune(readFile(dataDir), now);
+  const data = readFile(dataDir);
   const inv = data[code?.trim()];
   if (!inv) return { ok: false, reason: 'not_found' };
   if (inv.expiresAt <= now) return { ok: false, reason: 'expired' };
   if (inv.usedAt) return { ok: false, reason: 'used' };
   inv.usedAt = now;
-  writeFileAtomic(dataDir, data);
+  writeFileAtomic(dataDir, prune(data, now)); // burn this one; prune other stale entries
   return { ok: true, teamId: inv.teamId };
 }

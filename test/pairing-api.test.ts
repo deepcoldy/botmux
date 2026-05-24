@@ -77,6 +77,23 @@ describe('pairing-api', () => {
     expect(pairingConsume(dataDir, p2.pairingId, p2.browserToken, undefined, code).status).toBe(403);
   });
 
+  it('surfaces stable invite failure reasons (not_found / used)', () => {
+    ensureDefaultTeam(dataDir);
+    addMember(dataDir, DEFAULT_TEAM_ID, { unionId: 'on_owner' });
+    // bogus invite → invite_not_found
+    let p = start();
+    claimPairing(dataDir, p.code, { openId: 'ou_s', unionId: 'on_s' });
+    expect((pairingConsume(dataDir, p.pairingId, p.browserToken, undefined, 'BOGUS').body as any).reason).toBe('invite_not_found');
+    // first use joins, second use of same code → invite_used
+    const inv = createInvite(dataDir, DEFAULT_TEAM_ID, 'on_owner');
+    let pa = start();
+    claimPairing(dataDir, pa.code, { openId: 'ou_a', unionId: 'on_a' });
+    expect(pairingConsume(dataDir, pa.pairingId, pa.browserToken, undefined, inv.code).status).toBe(200);
+    let pb = start();
+    claimPairing(dataDir, pb.code, { openId: 'ou_b', unionId: 'on_b' });
+    expect((pairingConsume(dataDir, pb.pairingId, pb.browserToken, undefined, inv.code).body as any).reason).toBe('invite_used');
+  });
+
   it('consume before claim fails (not_claimed)', () => {
     const { pairingId, browserToken } = start();
     const r = pairingConsume(dataDir, pairingId, browserToken);

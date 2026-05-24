@@ -16,7 +16,7 @@ import { jsonRes } from './workflow-api.js';
 import { pairingStart, pairingStatusView, pairingConsume, PAIR_COOKIE, SESSION_COOKIE } from './pairing-api.js';
 import { getWebSession, revokeWebSession, type WebSession } from '../services/web-session-store.js';
 import { buildTeamRoster } from '../services/team-roster.js';
-import { getTeam, removeMember } from '../services/team-store.js';
+import { getTeam, removeMember, isMember } from '../services/team-store.js';
 import { createInvite } from '../services/invite-store.js';
 import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import { listConnectors } from '../services/connector-store.js';
@@ -128,6 +128,13 @@ export async function handleTeamRoute(
 
   const session = sessionOf();
   if (!session) { jsonRes(res, 401, { ok: false, error: 'not_authenticated' }); return true; }
+  // Re-check membership on every authenticated request: a removed user's session
+  // must stop working immediately (within its TTL), not keep team write access.
+  if (!isMember(dataDir, session.teamId, { unionId: session.identity.unionId, openId: session.identity.openId })) {
+    jsonRes(res, 403, { ok: false, error: 'not_a_member' });
+    return true;
+  }
+  const knownBot = (app: string) => buildTeamRoster(dataDir, session.teamId).bots.some(b => b.larkAppId === app);
 
   if (path === '/api/team/me' && method === 'GET') {
     jsonRes(res, 200, { ok: true, user: session.identity, teamId: session.teamId });
@@ -141,6 +148,7 @@ export async function handleTeamRoute(
   const botEdit = path.match(/^\/api\/team\/bots\/([^/]+)\/(capability|role)$/);
   if (botEdit && method === 'PUT') {
     const [, larkAppId, field] = botEdit;
+    if (!knownBot(larkAppId)) { jsonRes(res, 404, { ok: false, error: 'unknown_bot' }); return true; }
     let body: any;
     try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
     if (field === 'capability') {
@@ -158,6 +166,7 @@ export async function handleTeamRoute(
   // Read a bot's full team role (for the edit form to prefill).
   const roleGet = path.match(/^\/api\/team\/bots\/([^/]+)\/role$/);
   if (roleGet && method === 'GET') {
+    if (!knownBot(roleGet[1])) { jsonRes(res, 404, { ok: false, error: 'unknown_bot' }); return true; }
     const fp = join(dataDir, 'team-roles', `${roleGet[1]}.md`);
     const content = existsSync(fp) ? readFileSync(fp, 'utf-8') : '';
     jsonRes(res, 200, { ok: true, role: content });
@@ -173,7 +182,11 @@ export async function handleTeamRoute(
   if (path === '/api/team/members' && method === 'DELETE') {
     let body: any;
     try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
-    const removed = removeMember(dataDir, session.teamId, { unionId: body?.unionId, openId: body?.openId });
+    const target = { unionId: body?.unionId as string | undefined, openId: body?.openId as string | undefined };
+    const isSelf = (target.unionId && target.unionId === session.identity.unionId) || (target.openId && target.openId === session.identity.openId);
+    if (isSelf) { jsonRes(res, 400, { ok: false, error: 'cannot_delete_self' }); return true; }
+    if ((getTeam(dataDir, session.teamId)?.members.length ?? 0) <= 1) { jsonRes(res, 400, { ok: false, error: 'cannot_delete_last' }); return true; }
+    const removed = removeMember(dataDir, session.teamId, target);
     jsonRes(res, removed ? 200 : 404, { ok: removed });
     return true;
   }

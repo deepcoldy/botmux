@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { handleTeamRoute } from '../src/dashboard/team-routes.js';
 import { claimPairing } from '../src/services/pairing-store.js';
+import { removeMember, DEFAULT_TEAM_ID } from '../src/services/team-store.js';
 
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-teamroutes-')); });
@@ -156,6 +157,38 @@ describe('handleTeamRoute', () => {
     res = makeRes();
     await call(makeReq('GET', '/api/team/members', { cookie: c }), res, '/api/team/members');
     expect(json(res).members.length).toBe(2);
+  });
+
+  it('a removed member loses access immediately (403)', async () => {
+    const session = await login(); // 张三 is a member
+    removeMember(dataDir, DEFAULT_TEAM_ID, { unionId: 'on_1' }); // kicked out
+    const res = makeRes();
+    await call(makeReq('GET', '/api/team/roster', { cookie: 'bmx_session=' + session }), res, '/api/team/roster');
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('cannot delete self', async () => {
+    const session = await login();
+    const res = makeRes();
+    await call(makeReq('DELETE', '/api/team/members', { cookie: 'bmx_session=' + session, body: { unionId: 'on_1' } }), res, '/api/team/members');
+    expect(res.statusCode).toBe(400);
+    expect(json(res).error).toBe('cannot_delete_self');
+  });
+
+  it('cannot delete the last member', async () => {
+    const session = await login(); // only 张三 in the team
+    const res = makeRes();
+    await call(makeReq('DELETE', '/api/team/members', { cookie: 'bmx_session=' + session, body: { unionId: 'on_other' } }), res, '/api/team/members');
+    expect(res.statusCode).toBe(400);
+    expect(json(res).error).toBe('cannot_delete_last');
+  });
+
+  it('rejects writes to an unknown bot id (404)', async () => {
+    const session = await login();
+    const res = makeRes();
+    await call(makeReq('PUT', '/api/team/bots/cli_nope/capability', { cookie: 'bmx_session=' + session, body: { capability: 'x' } }), res, '/api/team/bots/cli_nope/capability');
+    expect(res.statusCode).toBe(404);
+    expect(json(res).error).toBe('unknown_bot');
   });
 
   it('logout clears the session cookie', async () => {

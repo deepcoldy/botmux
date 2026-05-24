@@ -75,6 +75,8 @@ export function pairingConsume(
     // Join via a valid single-use invite minted by an existing member.
     const inv = consumeInvite(dataDir, inviteCode);
     if (inv.ok && inv.teamId === teamId) { addClaimer(); member = true; }
+    else if (inv.ok) return { status: 403, body: { ok: false, reason: 'invite_wrong_team' } };
+    else return { status: 403, body: { ok: false, reason: `invite_${inv.reason}` } }; // invite_not_found | invite_expired | invite_used
   }
   if (!member) return { status: 403, body: { ok: false, reason: 'not_a_member' } };
 
