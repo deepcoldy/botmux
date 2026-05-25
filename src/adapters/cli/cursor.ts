@@ -6,6 +6,12 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** PTYs that have already received a writeInput. The first write lands while
+ *  cursor-agent's TUI is still doing its startup render, so it needs a longer
+ *  settle + throttle than later writes. Tracked by identity so the warmup state
+ *  is shared across adapter instances. Mirrors claude-code's first-write guard. */
+const cursorFirstWriteSeen = new WeakSet<PtyHandle>();
+
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'cursor-agent');
   return {
@@ -34,19 +40,58 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // No on-disk submit verification yet — cursor stores transcripts as
-      // JSONL but the path isn't documented. Treat like aiden: paste the
-      // text, brief settle, send Enter. Worker still gets quiescence-based
-      // idle and the bridge fallback timer if the model never replies.
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
+      // Emit line-by-line instead of writing the whole message at once.
+      // cursor-agent's paste detector folds a multi-line chunk that arrives in
+      // one burst into a `[Pasted text +N lines]` placeholder the model can't
+      // read; typing each line with a throttle between keeps it under that
+      // threshold so the text lands verbatim. Covers both backends — tmux
+      // (send-keys) and raw PTY (write only). Never use bracketed-paste markers
+      // (\x1b[200~ … \x1b[201~): they trigger the fold.
+      //
+      // Soft-newline differs per backend because the detector counts LF (0x0a)
+      // bytes arriving densely:
+      //   - tmux: Ctrl+J, cursor's native soft-newline — renders cleanly and
+      //     send-keys spaces the bytes out enough to never fold.
+      //   - raw PTY: a fast write('\n') folds, so send `\` + CR; cursor eats the
+      //     backslash-before-CR as a soft-newline (not part of the submitted
+      //     text) and no LF byte hits the stream, making it fold-immune. Costs a
+      //     cosmetic trailing `\` in the local TUI render only.
+      // Submit is always a bare Enter (\r). No on-disk submit verification —
+      // cursor's transcript path isn't documented, so the worker relies on
+      // idle detection + the bridge fallback timer.
+      const useKeys = !!(pty.sendText && pty.sendSpecialKeys);
+      const emitText = (s: string) => (useKeys ? pty.sendText!(s) : pty.write(s));
+      const emitSoftNewline = () => {
+        if (useKeys) {
+          pty.sendSpecialKeys!('C-j');
+        } else {
+          pty.write('\\');
+          pty.write('\r');
+        }
+      };
+      const emitEnter = () => (useKeys ? pty.sendSpecialKeys!('Enter') : pty.write('\r'));
+
+      const isFirstWrite = !cursorFirstWriteSeen.has(pty);
+      if (isFirstWrite) {
+        cursorFirstWriteSeen.add(pty);
         await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
       }
+      const throttleMs = isFirstWrite ? 80 : 30;
+      const tick = () => delay(throttleMs);
+
+      const lines = content.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].length > 0) {
+          emitText(lines[i]);
+          await tick();
+        }
+        if (i < lines.length - 1) {
+          emitSoftNewline();
+          await tick();
+        }
+      }
+      await delay(200);
+      emitEnter();
     },
 
     completionPattern: undefined,
