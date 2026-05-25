@@ -515,6 +515,52 @@ export function validateLoopBlocks(def: WorkflowDefinition): Set<string> {
     }
   }
 
+  // Sink-loop rule (codex PR #47 round-2 finding #1): a loop block that is
+  // a workflow sink (no external dependents) must declare `output.from`.
+  // orchestrator.ts only emits `completeRunSucceeded` when the sink activity
+  // has an output blob; a loop block without `output.from` never writes
+  // `outputs[sinkActivityId]` from `loopFinished`, so the run hangs in
+  // `no-progress` after approval.  Force the author to choose at parse time.
+  const externalDependents = new Map<string, Set<string>>();
+  for (const { loopId } of loopBlocks) externalDependents.set(loopId, new Set());
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (allLoopBodyIds.has(nodeId)) continue;
+    for (const dep of node.depends ?? []) {
+      const deps = externalDependents.get(dep);
+      if (deps) deps.add(nodeId);
+    }
+  }
+  for (const { loopId, node: loopNode } of loopBlocks) {
+    if (loopNode.output) continue;
+    if ((externalDependents.get(loopId) ?? new Set()).size > 0) continue;
+    throw new Error(
+      `Loop '${loopId}' has no external dependents (workflow sink) but does not declare 'output.from' — ` +
+      `without output.from the loopFinished projection writes no sink output and the run cannot complete (no-progress). ` +
+      `Add output.from pointing to a body node, e.g. \`"output": { "from": "${loopNode.body[0]}" }\`.`,
+    );
+  }
+
+  // Decision-timeout rule (codex PR #47 round-2 finding #2): decision nodes
+  // must use `humanGate.onTimeout = 'fail'` (or leave it unset; default is
+  // fail).  `onTimeout='success'` is legal at the schema level but
+  // `expireWait` writes the succeeded blob as `{ defaultedToTimeout,
+  // deadlineAt }` without `resolution`/`by`/`comment`, so the next
+  // iteration's `${decisionNode.previous.comment}` bindings hit
+  // BindingError.  Statically rule this out at validate time — if the
+  // author truly wants "timeout = approve" semantics they can implement
+  // it via a wrapper subagent that produces the structured resolution.
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (node.type !== 'decision') continue;
+    if (node.humanGate?.onTimeout === 'success') {
+      throw new Error(
+        `Decision node '${nodeId}' humanGate.onTimeout='success' is not allowed — ` +
+        `the timeout fallback would write a succeeded blob missing {resolution, by, comment}, ` +
+        `breaking the next iteration's \${${nodeId}.previous.*} bindings. ` +
+        `Use onTimeout='fail' (default) so timeout closes the loop via loopFinished(timeout).`,
+      );
+    }
+  }
+
   return allLoopBodyIds;
 }
 

@@ -710,6 +710,56 @@ describe('loop / decision schema (parse-time strict)', () => {
   });
 });
 
+// Codex PR #47 round-2 finding #1 + #2 — schema-legal but runtime-broken
+// configurations that validateLoopBlocks now rejects at parse time.
+describe('loop sink + decision-timeout validation (PR #47 round 2)', () => {
+  it('rejects sink loop without output.from (no-progress hang)', () => {
+    const raw = loopFixture();
+    delete raw.nodes.publish; // remove the external dependent
+    delete raw.nodes['review-loop'].output; // and the output.from
+    expect(() => parseWorkflowDefinition(raw)).toThrow(
+      /Loop 'review-loop' has no external dependents.*output\.from/,
+    );
+  });
+
+  it('accepts non-sink loop without output.from (downstream exists)', () => {
+    // When `publish` depends on the loop, the loop is not a sink so
+    // `output.from` becomes optional.  This pins that the sink rule
+    // only fires for actual workflow sinks.
+    const raw = loopFixture();
+    delete raw.nodes['review-loop'].output;
+    raw.nodes.publish.prompt = 'announce'; // no longer references loop output
+    expect(() => parseWorkflowDefinition(raw)).not.toThrow();
+  });
+
+  it('accepts sink loop WITH output.from', () => {
+    const raw = loopFixture();
+    delete raw.nodes.publish;
+    // output.from already declared in loopFixture → loop is sink + declares output
+    expect(() => parseWorkflowDefinition(raw)).not.toThrow();
+  });
+
+  it("rejects decision node with humanGate.onTimeout='success'", () => {
+    const raw = loopFixture();
+    raw.nodes.reviewDecision.humanGate.onTimeout = 'success';
+    expect(() => parseWorkflowDefinition(raw)).toThrow(
+      /Decision node 'reviewDecision'.*onTimeout='success'.*not allowed/,
+    );
+  });
+
+  it("accepts decision node with humanGate.onTimeout='fail'", () => {
+    const raw = loopFixture();
+    raw.nodes.reviewDecision.humanGate.onTimeout = 'fail';
+    expect(() => parseWorkflowDefinition(raw)).not.toThrow();
+  });
+
+  it('accepts decision node without onTimeout (defaults to fail)', () => {
+    const raw = loopFixture();
+    // baseline fixture omits onTimeout — re-verify it still passes
+    expect(() => parseWorkflowDefinition(raw)).not.toThrow();
+  });
+});
+
 describe('validateLoopBlocks direct (returns body set)', () => {
   it('returns body-node set for downstream use', () => {
     const def = parseWorkflowDefinition(loopFixture());

@@ -563,6 +563,7 @@ describe('decideNextActions — loop / decision pass-through (Step 1 boundary)',
           maxIterations: 2,
           body: ['implement', 'dec'],
           terminate: { node: 'dec', via: 'humanGate' },
+          output: { from: 'implement' },
         },
       },
     });

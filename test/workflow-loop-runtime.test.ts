@@ -312,6 +312,7 @@ describe('runLoop — non-terminator humanGate.reject in loop body (§10.8)', ()
           maxIterations: 3,
           body: ['implement', 'reviewDecision'],
           terminate: { node: 'reviewDecision', via: 'humanGate' },
+          output: { from: 'implement' },
         },
       },
     });
@@ -406,6 +407,7 @@ describe('runLoop — runFailed.rootCauseEventId for loop failure', () => {
           maxIterations: 3,
           body: ['implement', 'reviewDecision'],
           terminate: { node: 'reviewDecision', via: 'humanGate' },
+          output: { from: 'implement' },
         },
       },
     });
