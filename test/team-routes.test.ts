@@ -100,6 +100,9 @@ describe('handleTeamRoute', () => {
     expect(res.statusCode).toBe(200);
     expect(res._headers['content-type']).toContain('text/html');
     expect(res._body).toContain('botmux 团队平台');
+    // Regression: overlays use class="overlay hide"; .overlay sets display:flex,
+    // so a compound .overlay.hide rule must exist or modals show on load + won't close.
+    expect(res._body).toContain('.overlay.hide { display: none; }');
   });
 
   it('team APIs require a session (401 without bmx_session)', async () => {

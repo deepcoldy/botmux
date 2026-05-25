@@ -32,6 +32,10 @@ export const TEAM_PAGE_HTML = `<!doctype html>
   input.capedit { font: inherit; width: 92%; padding: 4px 8px; border: 1px solid #e5e6eb; border-radius: 6px; }
   input.capedit:focus { border-color: #3370ff; outline: none; }
   .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; }
+  /* .overlay sets display:flex; this compound selector must win over it so a
+     hidden overlay stays hidden (plain .hide has equal specificity and loses
+     to the later .overlay rule). */
+  .overlay.hide { display: none; }
   .modal { background: #fff; border-radius: 10px; padding: 18px 20px; width: min(560px, 92vw); }
   .modal textarea { width: 100%; min-height: 200px; font: 13px/1.5 ui-monospace, Menlo, monospace; padding: 10px; border: 1px solid #e5e6eb; border-radius: 8px; box-sizing: border-box; }
   .modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
