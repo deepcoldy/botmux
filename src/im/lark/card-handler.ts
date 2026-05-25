@@ -16,6 +16,7 @@ import {
   isWorkflowApprovalAction,
   type WorkflowApprovalHandlerDeps,
 } from './workflow-card-handler.js';
+import { handleAskCardAction, isAskCardAction } from './ask-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
@@ -184,6 +185,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
     // 兜底（无 card message_id，或撤回失败）：靠 callback 返回 patch 原地更新卡。
     return JSON.parse(buildGrantResultCard(kind, loc));
+  }
+
+  if (isAskCardAction(value?.action)) {
+    return handleAskCardAction(data);
   }
 
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);

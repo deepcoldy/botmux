@@ -403,6 +403,72 @@ botmux send --mention "ou_yyy:Aiden" "请 @Aiden 帮忙处理"
 \`\`\`
 `;
 
+const ASK_SKILL = `---
+name: botmux-ask
+description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，stdout 只返回选中的 key，适合 shell 脚本和 CLI agent 继续执行。
+---
+
+# botmux-ask — 阻塞式向用户提问
+
+当你需要用户在明确选项里做选择，并且后续步骤必须等用户回答后才能继续时，使用 \`botmux ask buttons\`。
+
+## 什么时候用
+
+- 发布、回滚、删除、写文件、调用外部 API 等风险动作前，需要用户选择
+- 需求存在 2-6 个清晰分支，继续执行前必须拿到其中一个 key
+- 你正在 shell / CLI 里执行任务，需要把用户选择赋给变量继续跑
+
+## 不要用
+
+- 只是给用户汇报进展：用 \`botmux send\`
+- 需要自由文本长回答：v0.1.7 不支持，先用 \`botmux send\` 问用户
+- workflow 节点审批：workflow 已经有 humanGate / decision，不要套两层 ask
+
+## Canonical 用法
+
+\`\`\`bash
+choice=$(botmux ask buttons --options "deploy=继续发布,rollback=回滚,abort=中止" "线上 latency 涨了 30%，下一步怎么处理？")
+case "$choice" in
+  deploy) echo "继续发布" ;;
+  rollback) echo "执行回滚" ;;
+  abort) echo "中止" ;;
+esac
+\`\`\`
+
+\`key=label\` 里，**stdout 永远返回 key**，按钮上显示 label。只写 \`yes,no\` 时 key 和 label 相同。
+
+兼容 alias：\`botmux ask --options "yes,no" "继续吗？"\` 可以用，但文档和新脚本优先写 \`botmux ask buttons\`，给未来 \`ask text\` / \`ask confirm\` 留空间。
+
+## JSON 输出
+
+\`\`\`bash
+botmux ask buttons --json --options "yes=继续,no=停止" "继续执行吗？"
+\`\`\`
+
+stdout 为一行 JSON：
+
+\`\`\`json
+{"selected":"yes","by":"ou_xxx","timedOut":false,"comment":null}
+\`\`\`
+
+## 退出码和 stdout 契约
+
+- 成功：stdout 一行 \`<selected_key>\`，exit 0
+- \`--json\` 成功：stdout 一行 JSON，exit 0
+- 超时：stdout 为空，exit 124
+- 缺少 botmux 环境变量 / 参数错误：stdout 为空，exit 2
+- daemon 不可达或 ask 被 daemon restart 失效：stdout 为空，exit 3
+
+所有人类可读提示都在 stderr，调用方不要 parse stderr。
+
+## 选项规则
+
+- \`--options\` 必填，至少 2 项，逗号分隔
+- 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
+- 不支持 comment / multi-select / free-form text（v0.1.7 范围外）
+- 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
+`;
+
 const WORKFLOW_CREATE_SKILL = `---
 name: botmux-workflow-create
 description: 根据用户自然语言描述生成 botmux workflow JSON 定义文件。触发场景：用户说"我想做个流程"、"创建 workflow"、"把 X 拆成自动化"、"编排"、"orchestrate"、"自动化跑这几步"；或显式提到 botmux workflow create。必须先用 botmux bots list 查看可用 bot，先给用户确认设计，再写 $HOME/.botmux/workflows/<workflowId>.workflow.json，并用 botmux workflow validate 校验。
@@ -808,6 +874,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-quoted', content: QUOTED_SKILL },
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
+  { name: 'botmux-ask', content: ASK_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
 ];
 

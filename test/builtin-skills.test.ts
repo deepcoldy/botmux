@@ -83,3 +83,17 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).toContain('default');
   });
 });
+
+describe('built-in botmux-ask skill', () => {
+  it('documents canonical buttons usage and stdout contract', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-ask');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux ask buttons');
+    expect(skill!.content).toContain('--options');
+    expect(skill!.content).toContain('key=label');
+    expect(skill!.content).toContain('stdout');
+    expect(skill!.content).toContain('exit 124');
+    expect(skill!.content).toContain('--json');
+    expect(skill!.content).toContain('botmux send');
+  });
+});

@@ -113,6 +113,8 @@ import { resolveWait } from './workflows/wait.js';
 import { replay } from './workflows/events/replay.js';
 import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 import { AttemptResumeManager } from './workflows/attempt-resume.js';
+import { setCardDispatcher as setAskCardDispatcher } from './core/ask-broker.js';
+import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -2268,6 +2270,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
+  setAskCardDispatcher(createLarkAskCardDispatcher());
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
