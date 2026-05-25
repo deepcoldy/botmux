@@ -20,12 +20,17 @@ import {
   listRuns,
   readEventWindow,
   readRunSnapshot,
+  scrubSnapshotForUnauthed,
 } from '../src/workflows/ops-projection.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { workActivityId } from '../src/workflows/orchestrator.js';
+import {
+  loopGateActivityId,
+  workActivityId,
+} from '../src/workflows/orchestrator.js';
+import { resolveWait } from '../src/workflows/wait.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
 let runsDir: string;
@@ -461,6 +466,95 @@ describe('readRunSnapshot', () => {
     expect(log!.text).not.toContain(HEAD);
   });
 
+  it('scrubSnapshotForUnauthed strips io.log.text + io.terminal.logPath; keeps metadata', async () => {
+    // Same seeding as the input/output preview test — gives us a snapshot
+    // with both a non-empty `io.log` and a populated `io.terminal.logPath`.
+    await seedSucceeded('r-scrub');
+    const activityId = workActivityId('r-scrub', 'only');
+    const attemptId = 'r-scrub::work::only::att-1';
+    const attemptDir = join(runsDir, 'r-scrub', 'attempts', activityId, attemptId);
+    mkdirSync(attemptDir, { recursive: true });
+    const SECRET_LINE = 'AWS_SECRET=AKIAFAKE_should_not_leak';
+    writeFileSync(
+      join(attemptDir, 'terminal.log'),
+      `[2026-05-25T00:00:00.000Z] stderr ${SECRET_LINE}\n`,
+      'utf-8',
+    );
+    writeFileSync(
+      join(attemptDir, 'terminal.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        sessionId: 'wf-r-scrub-only',
+        webPort: 32200,
+        status: 'closed',
+        cliId: 'claude-code',
+        logPath: join(attemptDir, 'terminal.log'),
+        startedAt: 100,
+        updatedAt: 200,
+      }),
+      'utf-8',
+    );
+
+    const full = await readRunSnapshot(runsDir, 'r-scrub');
+    expect(full).not.toBeNull();
+    // Authed view still gets the full log + logPath — the function only
+    // changes the view served to unauth'd public-read callers.
+    expect(full!.attemptIO[attemptId]?.log?.text).toContain(SECRET_LINE);
+    expect(full!.attemptIO[attemptId]?.terminal?.logPath).toBe(
+      join(attemptDir, 'terminal.log'),
+    );
+
+    const scrubbed = scrubSnapshotForUnauthed(full!);
+    const scrubbedLog = scrubbed.attemptIO[attemptId]?.log;
+    expect(scrubbedLog).toBeDefined();
+    expect(scrubbedLog!.text).toBeUndefined();
+    expect(scrubbedLog!.value).toBeUndefined();
+    expect(scrubbedLog!.redacted).toBe(true);
+    // Metadata stays so the dashboard can render a "log available after
+    // login (N bytes)" placeholder rather than pretending the blob doesn't
+    // exist.
+    expect(scrubbedLog!.outputBytes).toBeGreaterThan(0);
+
+    // Sibling blobs (input/output/resolvedInput/waitPrompt) are workflow
+    // products, not raw process bytes — they stay public, same as before.
+    expect(scrubbed.attemptIO[attemptId]?.input?.value).toBeDefined();
+    expect(scrubbed.attemptIO[attemptId]?.output?.value).toBeDefined();
+
+    const scrubbedTerm = scrubbed.attemptIO[attemptId]?.terminal;
+    expect(scrubbedTerm).toBeDefined();
+    expect(scrubbedTerm!.logPath).toBeUndefined();
+    // Sidecar status / port / sessionId stay — they're needed for the
+    // dashboard to know whether the live terminal stream exists.  The raw
+    // bytes themselves are already cookie-gated at /terminal-log/raw.
+    expect(scrubbedTerm!.sessionId).toBe('wf-r-scrub-only');
+    expect(scrubbedTerm!.status).toBe('closed');
+    expect(scrubbedTerm!.webPort).toBe(32200);
+
+    // Input snapshot must not have been mutated.
+    expect(full!.attemptIO[attemptId]?.log?.text).toContain(SECRET_LINE);
+    expect(full!.attemptIO[attemptId]?.terminal?.logPath).toBe(
+      join(attemptDir, 'terminal.log'),
+    );
+  });
+
+  it('scrubSnapshotForUnauthed is a no-op when attemptIO carries no log/terminal', async () => {
+    await seedSucceeded('r-scrub-empty');
+    const snap = await readRunSnapshot(runsDir, 'r-scrub-empty');
+    expect(snap).not.toBeNull();
+    const scrubbed = scrubSnapshotForUnauthed(snap!);
+    // Same top-level shape; attemptIO keys identical.
+    expect(Object.keys(scrubbed.attemptIO).sort()).toEqual(
+      Object.keys(snap!.attemptIO).sort(),
+    );
+    for (const [aid, io] of Object.entries(scrubbed.attemptIO)) {
+      // No log seeded → no log key after scrub either (we don't synthesize).
+      expect(io.log).toBeUndefined();
+      // input/output stay byte-equal with the source.
+      expect(io.input?.value).toEqual(snap!.attemptIO[aid]?.input?.value);
+      expect(io.output?.value).toEqual(snap!.attemptIO[aid]?.output?.value);
+    }
+  });
+
   it('preserves activityFailed errorMessage in attempt error', async () => {
     const failingSpawn: WorkerSpawnFn = async () => ({
       kind: 'failure',
@@ -630,5 +724,139 @@ describe('extractEventContext', () => {
     expect(extractEventContext({ ref: 'b1', bytes: 10, schemaVersion: 1 })).toEqual({});
     expect(extractEventContext(null)).toEqual({});
     expect(extractEventContext(undefined)).toEqual({});
+  });
+});
+
+// ─── readRunSnapshot — v0.2 loop projection (Step 4) ───────────────────────
+//
+// Loop blocks are projected into `RunSnapshotDTO.loops` as a JSON-safe
+// record keyed by loopId.  The field is OPTIONAL (omitted for workflows
+// that don't use loops) so older dashboards staying forward-compatible.
+
+const LOOP_DEF = parseWorkflowDefinition({
+  workflowId: 'proj-loop',
+  version: 1,
+  nodes: {
+    implement: { type: 'subagent', bot: 'b', prompt: 'x' },
+    reviewDecision: {
+      type: 'decision',
+      depends: ['implement'],
+      humanGate: { stage: 'before', prompt: 'ok?' },
+    },
+    'review-loop': {
+      type: 'loop',
+      maxIterations: 2,
+      body: ['implement', 'reviewDecision'],
+      terminate: { node: 'reviewDecision', via: 'humanGate' },
+      output: { from: 'implement' },
+    },
+  },
+});
+
+describe('readRunSnapshot — loop projection', () => {
+  it('omits `loops` field for runs without any loop block', async () => {
+    await seedSucceeded('r-no-loops');
+    const snap = await readRunSnapshot(runsDir, 'r-no-loops');
+    expect(snap).not.toBeNull();
+    expect(snap!.loops).toBeUndefined();
+  });
+
+  it('includes `loops` record once a loop has started', async () => {
+    const log = new EventLog('r-loop-running', runsDir);
+    await createRun(log, {
+      def: LOOP_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    const ctx = { log, def: LOOP_DEF, spawnSubagent: okSpawn };
+    await runLoop(ctx);
+
+    const snap = await readRunSnapshot(runsDir, 'r-loop-running');
+    expect(snap).not.toBeNull();
+    expect(snap!.loops).toBeDefined();
+    const loop = snap!.loops!['review-loop'];
+    expect(loop).toBeDefined();
+    expect(loop.loopId).toBe('review-loop');
+    expect(loop.status).toBe('running');
+    expect(loop.iteration).toBe(1);
+    expect(loop.maxIterations).toBe(2);
+    expect(loop.iterations).toHaveLength(1);
+    expect(loop.iterations[0]?.iteration).toBe(1);
+    expect(loop.iterations[0]?.status).toBe('running');
+  });
+
+  it('iteration audit anchors survive the projection round-trip', async () => {
+    const log = new EventLog('r-loop-anchors', runsDir);
+    await createRun(log, {
+      def: LOOP_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    const ctx = { log, def: LOOP_DEF, spawnSubagent: okSpawn };
+    await runLoop(ctx);
+    const decisionId = loopGateActivityId('r-loop-anchors', 'review-loop', 1, 'reviewDecision');
+    // Need to read the current snapshot to grab the gate attempt id.
+    let snap = await readRunSnapshot(runsDir, 'r-loop-anchors');
+    const decAct = snap!.activities.find((a) => a.activityId === decisionId);
+    await resolveWait(
+      log,
+      {
+        activityId: decisionId,
+        attemptId: decAct!.currentAttemptId!,
+        resolution: 'rejected',
+        by: 'ou_reviewer',
+        comment: 'try again',
+      },
+      { def: LOOP_DEF },
+    );
+    await runLoop(ctx);
+
+    snap = await readRunSnapshot(runsDir, 'r-loop-anchors');
+    const loop = snap!.loops!['review-loop'];
+    expect(loop.iteration).toBe(2);
+    expect(loop.iterations).toHaveLength(2);
+    const it1 = loop.iterations[0]!;
+    expect(it1.status).toBe('rejected');
+    expect(it1.decisionActivityId).toBe(decisionId);
+    expect(it1.waitResolvedEventId).toMatch(/-\d+$/);
+    expect(it1.decisionBy).toBe('ou_reviewer');
+    expect(it1.decisionComment).toBe('try again');
+  });
+
+  it('terminal loop carries output projection ref + errorCode/errorClass', async () => {
+    const log = new EventLog('r-loop-fail', runsDir);
+    await createRun(log, {
+      def: LOOP_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    const ctx = { log, def: LOOP_DEF, spawnSubagent: okSpawn };
+    // Reject twice → max-iterations-exceeded.
+    for (let iter = 1; iter <= 2; iter++) {
+      await runLoop(ctx);
+      const snap = await readRunSnapshot(runsDir, 'r-loop-fail');
+      const decisionId = loopGateActivityId('r-loop-fail', 'review-loop', iter, 'reviewDecision');
+      const decAct = snap!.activities.find((a) => a.activityId === decisionId);
+      await resolveWait(
+        log,
+        {
+          activityId: decisionId,
+          attemptId: decAct!.currentAttemptId!,
+          resolution: 'rejected',
+          by: 'r',
+        },
+        { def: LOOP_DEF },
+      );
+    }
+    await runLoop(ctx);
+
+    const snap = await readRunSnapshot(runsDir, 'r-loop-fail');
+    const loop = snap!.loops!['review-loop'];
+    expect(loop.status).toBe('failed');
+    expect(loop.errorCode).toBe('LoopMaxIterationsExceeded');
+    expect(loop.errorClass).toBe('userFault');
   });
 });

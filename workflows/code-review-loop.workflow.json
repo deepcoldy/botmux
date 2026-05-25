@@ -1,0 +1,68 @@
+{
+  "workflowId": "code-review-loop",
+  "version": 1,
+  "params": {
+    "task": {
+      "type": "string",
+      "required": true,
+      "description": "What to implement (e.g. 'add a CLI command that prints the loop schema')"
+    }
+  },
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 600000,
+    "maxOutputBytes": 16384
+  },
+  "nodes": {
+    "implement": {
+      "type": "subagent",
+      "bot": "cli_canary_PLACEHOLDER",
+      "description": "Implementer agent. Produces a JSON {code, summary}. On second+ iterations, picks up `${reviewDecision.previous.comment}` from the prior reject as guidance.",
+      "prompt": "实现以下任务：${params.task}\n\n上一轮 review 反馈（如有）：${reviewDecision.previous.comment}\n\n返回 JSON: {\"code\": string, \"summary\": string}",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["code", "summary"],
+        "properties": {
+          "code": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      }
+    },
+    "review": {
+      "type": "subagent",
+      "bot": "cli_canary_PLACEHOLDER",
+      "depends": ["implement"],
+      "description": "Reviewer agent. Produces preview (shown on approval card) + summary (full feedback). Stays a separate node from reviewDecision so reviewDecision's humanGate.before can $ref this output (designed in /tmp/wf-loop-v02.md §3.1 — humanGate.before cannot read same-node output).",
+      "prompt": "审查以下代码：\n\n${implement.output.code}\n\n实现总结：${implement.output.summary}\n\n返回 JSON: {\"preview\": string, \"summary\": string} — preview 用于审批卡片预览（<200 字符），summary 是详细评审意见。",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["preview", "summary"],
+        "properties": {
+          "preview": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      }
+    },
+    "reviewDecision": {
+      "type": "decision",
+      "depends": ["review"],
+      "description": "Loop terminator. Pure humanGate — approve closes the loop, reject opens iteration N+1 with the comment feeding back into `implement.prompt`.",
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "review.output.preview" },
+        "deadlineMs": 1800000,
+        "onTimeout": "fail"
+      }
+    },
+    "review-loop": {
+      "type": "loop",
+      "description": "Wraps implement → review → reviewDecision into a reject-revisit loop. maxIterations=3 is the safe-by-default cap; bump for harder tasks.",
+      "maxIterations": 3,
+      "body": ["implement", "review", "reviewDecision"],
+      "terminate": { "node": "reviewDecision", "via": "humanGate" },
+      "output": { "from": "implement" }
+    }
+  }
+}

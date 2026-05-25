@@ -88,6 +88,33 @@ describe('decideDashboardAuth — public surface', () => {
     expect(d.kind).toBe('allow');
   });
 
+  it('GET /api/workflows/runs/.../terminal-log/raw — NOT public (PTY bytes)', () => {
+    // PTY transcript may have logged API keys / env / token reads that
+    // happened to scroll the terminal — keep it behind cookie auth even
+    // though sibling workflow read paths are link-shareable.
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname:
+        '/api/workflows/runs/run-1/attempts/att-1/node-a/terminal-log/raw',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
+  it('GET /api/workflows/...terminal-log/raw with valid cookie → allow', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname:
+        '/api/workflows/runs/run-1/attempts/att-1/node-a/terminal-log/raw',
+      hasTokenParam: false,
+      presentedToken: TOK,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
   it('GET / — static SPA shell allow without any token', () => {
     const d = decideDashboardAuth({
       method: 'GET',

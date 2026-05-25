@@ -10,6 +10,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const chatCreateStub = vi.fn();
 // chat.update mocks the owner-transfer call.
 const chatUpdateStub = vi.fn();
+// chat.link mocks the share-link fetch.
+const chatLinkStub = vi.fn();
 
 // Mock bot-registry's getBotClient — that's where groups-store imports from.
 // Read-only GETs (listChats / isInChat / getChatOwner) now go through
@@ -49,6 +51,7 @@ vi.mock('../src/bot-registry.js', () => ({
         chat: {
           create: chatCreateStub,
           update: chatUpdateStub,
+          link: chatLinkStub,
         },
         chatMembers: {
           create: vi.fn().mockResolvedValue({
@@ -61,10 +64,10 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
 }));
 
-import { listChats, isInChat, addBotToChat, createChat, transferChatOwner } from '../src/services/groups-store.js';
+import { listChats, isInChat, addBotToChat, createChat, transferChatOwner, getChatShareLink } from '../src/services/groups-store.js';
 
 describe('groups-store wrappers', () => {
-  beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); });
+  beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); chatLinkStub.mockReset(); });
 
   it('listChats returns ChatBrief array', async () => {
     const out = await listChats('appA');
@@ -192,5 +195,39 @@ describe('groups-store wrappers', () => {
     const callArgs = chatCreateStub.mock.calls[0][0];
     expect(callArgs.data.user_id_list).toBeUndefined();
     expect(callArgs.params?.user_id_type).toBeUndefined();
+  });
+
+  it('getChatShareLink returns share_link and passes validity_period (default permanently)', async () => {
+    chatLinkStub.mockResolvedValueOnce({
+      code: 0,
+      data: { share_link: 'https://applink.feishu.cn/.../add_by_link?link_token=tok', is_permanent: true },
+    });
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.shareLink).toMatch(/add_by_link/);
+    const callArgs = chatLinkStub.mock.calls[0][0];
+    expect(callArgs.path.chat_id).toBe('oc_chat');
+    expect(callArgs.data.validity_period).toBe('permanently');
+  });
+
+  it('getChatShareLink surfaces non-zero code as error (e.g. unsupported chat type)', async () => {
+    chatLinkStub.mockResolvedValueOnce({ code: 232001, msg: 'unsupported chat type' });
+    const r = await getChatShareLink('cli_creator', 'oc_p2p');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/unsupported chat type.*232001/);
+  });
+
+  it('getChatShareLink treats empty share_link as error', async () => {
+    chatLinkStub.mockResolvedValueOnce({ code: 0, data: {} });
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/empty share_link/);
+  });
+
+  it('getChatShareLink catches thrown errors', async () => {
+    chatLinkStub.mockRejectedValueOnce(new Error('network down'));
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/network down/);
   });
 });

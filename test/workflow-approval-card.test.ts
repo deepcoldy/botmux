@@ -20,6 +20,9 @@ import {
   handleWorkflowApprovalAction,
   workflowFrozenStoreId,
 } from '../src/im/lark/workflow-card-handler.js';
+import { parseWorkflowDefinition } from '../src/workflows/definition.js';
+import { snapshotWorkflowDefinition } from '../src/workflows/loader.js';
+import { loopGateActivityId } from '../src/workflows/orchestrator.js';
 
 const RUN_ID = 'run-approval-card-01';
 const ACTIVITY_ID = 'act-approval';
@@ -435,5 +438,105 @@ describe('handleWorkflowApprovalAction', () => {
     expect(second).toMatchObject({ ok: true, duplicate: true });
     expect(requestCancelFn).toHaveBeenCalledTimes(1);
     expect(resolveWaitFn).not.toHaveBeenCalled();
+  });
+
+  // v0.2: reject on a `decision` node must write activitySucceeded so the
+  // loop body continues into iteration N+1 (rejection is a legal decision
+  // output, not a wait failure).  Regression for the dogfood crash where
+  // card-handler.ts called resolveWait WITHOUT ctx.def, so isDecisionNode
+  // stayed false → reject wrote activityFailed → orchestrator closed the
+  // loop with `body-failed`.  This pins card-handler to load the run's
+  // workflow.json snapshot and pass it through.
+  it('decision-node reject writes activitySucceeded (loop body proceeds to iter N+1)', async () => {
+    const LOOP_ID = 'review-loop';
+    const ITER = 1;
+    const NODE = 'reviewDecision';
+    const decisionActivityId = loopGateActivityId(RUN_ID, LOOP_ID, ITER, NODE);
+    const decisionAttemptId = `${decisionActivityId}::att-1`;
+
+    // Snapshot a minimal loop def into the run dir so card-handler can load it.
+    const def = parseWorkflowDefinition({
+      workflowId: 'trip-planner',
+      version: 1,
+      nodes: {
+        implement: { type: 'subagent', bot: 'cli_a', prompt: 'impl' },
+        review: { type: 'subagent', bot: 'cli_b', depends: ['implement'], prompt: 'rev' },
+        reviewDecision: {
+          type: 'decision',
+          depends: ['review'],
+          humanGate: { stage: 'before', prompt: 'approve?' },
+        },
+        [LOOP_ID]: {
+          type: 'loop',
+          maxIterations: 3,
+          body: ['implement', 'review', 'reviewDecision'],
+          terminate: { node: 'reviewDecision', via: 'humanGate' },
+          output: { from: 'implement' },
+        },
+      },
+    });
+    await snapshotWorkflowDefinition(RUN_ID, def, { runsDir: baseDir });
+
+    // Bootstrap a waitCreated on the loop gate activity id.
+    await log.append(runCreated);
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: NODE,
+        activityId: decisionActivityId,
+        attemptId: decisionAttemptId,
+        attemptNumber: 1,
+        inputRef: sampleOutputRef,
+      },
+    });
+    await createWait(log, {
+      activityId: decisionActivityId,
+      attemptId: decisionAttemptId,
+      nodeId: NODE,
+      waitKind: 'human-gate',
+      deadlineAt: 2_000_000_000_000,
+      prompt: 'approve?',
+    });
+
+    const cardNonce = workflowApprovalCardNonce(RUN_ID, decisionActivityId, decisionAttemptId);
+    await handleWorkflowApprovalAction(
+      {
+        operator: { open_id: 'ou_approver' },
+        action: {
+          value: {
+            action: WORKFLOW_REJECT_ACTION,
+            run_id: RUN_ID,
+            activity_id: decisionActivityId,
+            attempt_id: decisionAttemptId,
+            card_nonce: cardNonce,
+          },
+          form_value: { [WORKFLOW_COMMENT_FIELD]: 'add error handling' },
+        },
+        context: { open_message_id: 'om_card_reject' },
+      },
+      {
+        runsDir: baseDir,
+        loadFrozenCardsFn: () => new Map(),
+        saveFrozenCardsFn: () => undefined,
+      },
+    );
+
+    const events = await log.readAll();
+    const terminal = events.find(
+      (e) =>
+        (e.type === 'activitySucceeded' || e.type === 'activityFailed') &&
+        (e.payload as any).activityId === decisionActivityId,
+    );
+    expect(terminal?.type).toBe('activitySucceeded');
+    // The reject comment is captured in externalRefs.comment so the next
+    // iteration's `${reviewDecision.previous.comment}` binding can read it.
+    const externalRefs = (terminal?.payload as any)?.externalRefs;
+    expect(externalRefs).toMatchObject({
+      resolution: 'rejected',
+      by: 'ou_approver',
+      comment: 'add error handling',
+    });
   });
 });

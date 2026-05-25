@@ -85,7 +85,12 @@ export function buildSetCookie(token: string): string {
  *
  * Public surfaces today (codex review v0.1.2 → canary.3):
  *   - `GET /` and `GET /assets/*`              — static SPA shell
- *   - `GET /api/workflows/*`                   — workflow read-only API
+ *   - `GET /api/workflows/*`                   — workflow read-only API,
+ *                                                EXCEPT `…/terminal-log/raw`
+ *                                                which serves full PTY byte
+ *                                                streams (may include keys,
+ *                                                env, tokens) and requires
+ *                                                cookie auth.
  *
  * Anything else (sessions, schedules, dashboard rotate, POST /api/workflows
  * /…/cancel, etc.) requires the active session token, matching the
@@ -108,8 +113,16 @@ export function decideDashboardAuth(opts: {
   // Workflow read-only paths + static SPA shell are public — the dashboard
   // must be linkable from Lark cards without forcing a `botmux dashboard`
   // round-trip.  Write actions still need a cookie / token.
+  //
+  // Carve-out: `…/terminal-log/raw` streams full PTY bytes (`?stream=pty`) or
+  // worker diagnostic log (`?stream=diag`).  PTY transcript can leak API
+  // keys / env vars / token reads that happened to scroll the terminal, so
+  // we keep both stream variants behind cookie auth even though the rest of
+  // the read-only API is link-shareable.
   const isWorkflowReadOnly =
-    method === 'GET' && pathname.startsWith('/api/workflows/');
+    method === 'GET' &&
+    pathname.startsWith('/api/workflows/') &&
+    !pathname.endsWith('/terminal-log/raw');
   const isStaticShell =
     method === 'GET' && (pathname === '/' || pathname.startsWith('/assets/'));
 

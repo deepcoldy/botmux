@@ -925,13 +925,20 @@ async function resolveDashboardWait(
   }
 
   try {
-    const resolved = await resolveWait(entry.ctx.log, {
-      activityId: target.activityId,
-      attemptId: target.attemptId,
-      resolution,
-      by: 'dashboard',
-      comment,
-    });
+    const resolved = await resolveWait(
+      entry.ctx.log,
+      {
+        activityId: target.activityId,
+        attemptId: target.attemptId,
+        resolution,
+        by: 'dashboard',
+        comment,
+      },
+      // v0.2: pass def so resolveWait can write activitySucceeded for
+      // `decision` node reject instead of activityFailed.  entry.ctx.def
+      // is the live, in-memory snapshot already loaded for this run.
+      { def: entry.ctx.def },
+    );
     const after = replay(await entry.ctx.log.readAll());
     // Fire-and-forget re-drive — same pattern as Lark card path
     // (workflowApprovalResolved hook).  Don't await; the dashboard caller

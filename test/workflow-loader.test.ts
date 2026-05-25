@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -7,8 +7,10 @@ import { EventLog } from '../src/workflows/events/append.js';
 import { parseWorkflowDefinition, type WorkflowDefinition } from '../src/workflows/definition.js';
 import {
   loadWorkflowDefinition,
+  readWorkflowDefinitionFromRunDir,
   snapshotWorkflowDefinition,
 } from '../src/workflows/loader.js';
+import { logger } from '../src/utils/logger.js';
 import { getRunsDir, runDir } from '../src/workflows/runs-dir.js';
 import { createRun, type BotResolver } from '../src/workflows/run-init.js';
 
@@ -84,6 +86,41 @@ describe('workflow loader', () => {
         's',
       ),
     );
+  });
+
+  it('readWorkflowDefinitionFromRunDir: missing file returns null silently (ENOENT)', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const runDir = join(tempDir, 'runs', 'nonexistent-run');
+      mkdirSync(runDir, { recursive: true });
+      const def = await readWorkflowDefinitionFromRunDir(runDir);
+      expect(def).toBeNull();
+      // Missing snapshot is a normal state for legacy v0.1 runs that
+      // predate the per-run workflow.json file — must NOT warn.
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('readWorkflowDefinitionFromRunDir: corrupt JSON returns null AND warns', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const runDir = join(tempDir, 'runs', 'corrupt-run');
+      mkdirSync(runDir, { recursive: true });
+      // Garbage that will blow up at JSON.parse — exactly the kind of
+      // unexpected failure that used to go silently null pre-fix.
+      writeFileSync(join(runDir, 'workflow.json'), '{not-json}', 'utf-8');
+      const def = await readWorkflowDefinitionFromRunDir(runDir);
+      expect(def).toBeNull();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const msg = String(warnSpy.mock.calls[0]![0]);
+      expect(msg).toContain('readWorkflowDefinitionFromRunDir');
+      expect(msg).toContain('workflow.json');
+      expect(msg).toContain('v0.1 wait semantics');
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('createRun snapshots workflow.json into the actual run directory', async () => {

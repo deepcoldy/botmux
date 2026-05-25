@@ -252,6 +252,14 @@ export type RunSnapshotDTO = {
   lastSeq: number;
   nodes: NodeState[];
   activities: ActivityState[];
+  /**
+   * v0.2 loop blocks indexed by their nodeId.  Optional so v0.1 clients
+   * that don't render iteration timelines stay forward-compatible — if
+   * the field is absent, no loops are present; if it's an empty record,
+   * the workflow used loop schema but no loop instance ran.  See
+   * /tmp/wf-loop-v02.md §8 (dashboard) + §9 (progress card).
+   */
+  loops?: Record<string, LoopSnapshotDTO>;
   dangling: {
     activities: string[];
     effectAttempted: string[];
@@ -264,6 +272,28 @@ export type RunSnapshotDTO = {
   updatedAt: number;
 };
 
+export type LoopIterationDTO = {
+  iteration: number;
+  status: 'running' | 'approved' | 'rejected' | 'failed' | 'cancelled';
+  bodyActivityIds: string[];
+  decisionActivityId?: string;
+  waitResolvedEventId?: string;
+  decisionBy?: string;
+  decisionComment?: string;
+  timedOut?: boolean;
+};
+
+export type LoopSnapshotDTO = {
+  loopId: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  iteration: number;
+  maxIterations: number;
+  iterations: LoopIterationDTO[];
+  output?: OutputRef;
+  errorCode?: string;
+  errorClass?: string;
+};
+
 export type BlobPreviewDTO = {
   outputHash?: string;
   outputBytes?: number;
@@ -272,6 +302,11 @@ export type BlobPreviewDTO = {
   value?: unknown;
   text?: string;
   error?: string;
+  /** Set by `scrubSnapshotForUnauthed`: text/value were stripped because
+   *  the caller wasn't authenticated.  Metadata (bytes, truncated) stays
+   *  so the dashboard can render a "log available after login" placeholder
+   *  instead of pretending the blob doesn't exist. */
+  redacted?: boolean;
 };
 
 export type AttemptIODTO = {
@@ -309,9 +344,50 @@ export type AttemptTerminalDTO = {
 const BLOB_PREVIEW_MAX_BYTES = 64 * 1024;
 
 /**
+ * Scrub fields that leak raw CLI process bytes from a snapshot DTO before
+ * exposing it to an unauthenticated reader.  Companion of the
+ * `…/terminal-log/raw` cookie-auth carve-out: that carve-out hid the full
+ * pty/terminal stream download, but the same data still leaked via
+ * `attemptIO[*].log.text` (last 64 KiB tail of `terminal.log`) on the
+ * public `/snapshot` endpoint.
+ *
+ * What stays public: run/node/activity status, output blob previews
+ * (workflow author's intended product), terminal sidecar metadata.
+ * What gets scrubbed: `io.log.text/value` (the raw stdout/stderr tail
+ * — may contain env-var dumps, API key error messages, secret-bearing
+ * curl responses) and `io.terminal.logPath` (absolute on-disk path
+ * leaks filesystem layout).
+ *
+ * Idempotent + pure: caller is the route handler that already knows
+ * `authed === false`.  Returns a new DTO; input is not mutated.
+ */
+export function scrubSnapshotForUnauthed(snap: RunSnapshotDTO): RunSnapshotDTO {
+  const attemptIO: Record<string, AttemptIODTO> = {};
+  for (const [attemptId, io] of Object.entries(snap.attemptIO)) {
+    const scrubbed: AttemptIODTO = { ...io };
+    if (io.log) {
+      const { text: _text, value: _value, ...logRest } = io.log;
+      scrubbed.log = { ...logRest, redacted: true } as BlobPreviewDTO;
+    }
+    if (io.terminal && io.terminal.logPath !== undefined) {
+      const { logPath: _logPath, ...termRest } = io.terminal;
+      scrubbed.terminal = termRest;
+    }
+    attemptIO[attemptId] = scrubbed;
+  }
+  return { ...snap, attemptIO };
+}
+
+/**
  * Build a JSON-serializable snapshot for a single run.  Returns null when
  * the run is missing / has no events / has a corrupt log.  Callers
  * (dashboard `/snapshot` endpoint) should map null → 404.
+ *
+ * Always returns the full DTO including sensitive log bytes.  Callers
+ * serving unauth'd HTTP requests MUST apply `scrubSnapshotForUnauthed`
+ * before responding — kept as a separate step so internal callers
+ * (cancel-run, daemon-side hooks) keep the full view without
+ * round-tripping through scrub.
  */
 export async function readRunSnapshot(
   runsDir: string,
@@ -338,6 +414,7 @@ export async function readRunSnapshot(
     lastSeq: snap.lastSeq,
     nodes: [...snap.nodes.values()],
     activities: [...snap.activities.values()],
+    loops: projectLoops(snap),
     dangling: {
       activities: snap.danglingActivities,
       effectAttempted: snap.danglingEffectAttempted,
@@ -349,6 +426,39 @@ export async function readRunSnapshot(
     chatBinding: binding ?? undefined,
     updatedAt: events[events.length - 1]!.timestamp,
   };
+}
+
+/**
+ * Project the replay's in-memory `snapshot.loops` Map into the
+ * JSON-serializable DTO surface.  Returns `undefined` when no loops
+ * exist so v0.1 clients deserializing the snapshot see no `loops`
+ * key at all (forward-compat for older dashboards).
+ */
+function projectLoops(snap: Snapshot): Record<string, LoopSnapshotDTO> | undefined {
+  if (!snap.loops || snap.loops.size === 0) return undefined;
+  const out: Record<string, LoopSnapshotDTO> = {};
+  for (const [loopId, state] of snap.loops) {
+    out[loopId] = {
+      loopId,
+      status: state.status,
+      iteration: state.iteration,
+      maxIterations: state.maxIterations,
+      iterations: state.iterations.map((it) => ({
+        iteration: it.iteration,
+        status: it.status,
+        bodyActivityIds: [...it.bodyActivityIds],
+        decisionActivityId: it.decisionActivityId,
+        waitResolvedEventId: it.waitResolvedEventId,
+        decisionBy: it.decisionBy,
+        decisionComment: it.decisionComment,
+        timedOut: it.timedOut,
+      })),
+      output: state.output,
+      errorCode: state.errorCode,
+      errorClass: state.errorClass,
+    };
+  }
+  return out;
 }
 
 async function buildAttemptIO(

@@ -5,10 +5,13 @@ import { replay } from '../../workflows/events/replay.js';
 import type { WorkflowEvent } from '../../workflows/events/schema.js';
 import type { WaitCreatedEvent } from '../../workflows/events/types.js';
 import { getRunsDir } from '../../workflows/runs-dir.js';
+import { readWorkflowDefinitionFromRunDir } from '../../workflows/loader.js';
+import { join } from 'node:path';
 import {
   resolveWait,
   type ResolveWaitInput,
   type ResolveWaitResult,
+  type ResolveWaitContext,
 } from '../../workflows/wait.js';
 import {
   requestCancel,
@@ -38,7 +41,11 @@ export type WorkflowCardActionData = {
 export type WorkflowApprovalHandlerDeps = {
   runsDir?: string;
   makeEventLog?: (runId: string, runsDir: string) => EventLog;
-  resolveWaitFn?: (log: EventLog, input: ResolveWaitInput) => Promise<ResolveWaitResult>;
+  resolveWaitFn?: (
+    log: EventLog,
+    input: ResolveWaitInput,
+    ctx?: ResolveWaitContext,
+  ) => Promise<ResolveWaitResult>;
   requestCancelFn?: (
     log: EventLog,
     input: RequestCancelInput,
@@ -123,13 +130,25 @@ export async function handleWorkflowApprovalAction(
           },
           'human',
         )
-      : await (deps.resolveWaitFn ?? resolveWait)(log, {
-          activityId,
-          attemptId,
-          resolution: action === WORKFLOW_APPROVE_ACTION ? 'approved' : 'rejected',
-          by,
-          comment,
-        });
+      : await (deps.resolveWaitFn ?? resolveWait)(
+          log,
+          {
+            activityId,
+            attemptId,
+            resolution: action === WORKFLOW_APPROVE_ACTION ? 'approved' : 'rejected',
+            by,
+            comment,
+          },
+          // v0.2: resolveWait inspects ctx.def to detect `decision` nodes
+          // so reject writes activitySucceeded instead of activityFailed.
+          // Loading the per-run workflow snapshot (not the catalog) keeps
+          // long-running cards bound to the definition the run was started
+          // with even if the catalog has since been edited.
+          await (async () => {
+            const def = await readWorkflowDefinitionFromRunDir(join(runsDir, runId));
+            return def ? { def } : undefined;
+          })(),
+        );
 
   const resolutionKind: WorkflowApprovalResolutionKind =
     action === WORKFLOW_APPROVE_ACTION

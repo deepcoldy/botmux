@@ -169,6 +169,45 @@ export async function getChatOwner(
 }
 
 /**
+ * Get a shareable join link for a chat — the link others can click to *join*
+ * the group, unlike the applink:// "open chat" URL which only works for members
+ * who are already in the chat.
+ *
+ * Calls POST /open-apis/im/v1/chats/:chat_id/link. Accepted scope is any of
+ * im:chat / im:chat:read / im:chat:readonly (the bot already holds im:chat:read,
+ * verified at startup). `validity_period` is week | year | permanently.
+ *
+ * Not supported for p2p / secret / team chats — those return a non-zero code,
+ * which we surface as an error so the caller can fall back to the applink.
+ */
+export async function getChatShareLink(
+  larkAppId: string,
+  chatId: string,
+  validityPeriod: 'week' | 'year' | 'permanently' = 'permanently',
+): Promise<{ ok: true; shareLink: string } | { ok: false; error: string }> {
+  try {
+    // getBotClient stays inside the try: this fetch is best-effort and must
+    // never turn a successful group creation into a hard failure, so even a
+    // bad/unconfigured larkAppId resolves to {ok:false}, not a thrown error.
+    const client = getBotClient(larkAppId);
+    const res: any = await (client as any).im.v1.chat.link({
+      path: { chat_id: chatId },
+      data: { validity_period: validityPeriod },
+    });
+    if (res.code !== 0 && res.code !== undefined) {
+      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    }
+    const shareLink = res.data?.share_link;
+    if (typeof shareLink !== 'string' || shareLink.length === 0) {
+      return { ok: false, error: 'empty share_link in response' };
+    }
+    return { ok: true, shareLink };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/**
  * Disband (delete) a chat. The Lark API only succeeds when the calling bot is
  * the chat's current owner, OR is the creator AND the app holds
  * `im:chat:operate_as_owner`. Routes that fan-out to multiple bots can use

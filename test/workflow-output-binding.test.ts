@@ -29,7 +29,7 @@ import {
 } from '../src/workflows/runtime.js';
 import { decideNextActions } from '../src/workflows/orchestrator.js';
 import { createRun } from '../src/workflows/run-init.js';
-import { workActivityId } from '../src/workflows/orchestrator.js';
+import { loopGateActivityId, loopWorkActivityId, workActivityId } from '../src/workflows/orchestrator.js';
 
 const RUN_ID = 'run-binding-test';
 
@@ -91,6 +91,7 @@ describe('BoundJsonValueSchema', () => {
 describe('parseRef', () => {
   it('splits on the first .output. occurrence', () => {
     expect(parseRef('draft.output.greeting')).toEqual({
+      kind: 'output',
       nodeId: 'draft',
       pathSegments: ['greeting'],
     });
@@ -98,6 +99,7 @@ describe('parseRef', () => {
 
   it('handles dotted nodeIds (NODE_ID_PATTERN allows dots)', () => {
     expect(parseRef('team.draft.output.x.y')).toEqual({
+      kind: 'output',
       nodeId: 'team.draft',
       pathSegments: ['x', 'y'],
     });
@@ -105,6 +107,7 @@ describe('parseRef', () => {
 
   it('splits on the first .output. only — later .output. is part of path', () => {
     expect(parseRef('node.output.output.x')).toEqual({
+      kind: 'output',
       nodeId: 'node',
       pathSegments: ['output', 'x'],
     });
@@ -140,6 +143,7 @@ describe('parseRef', () => {
 
   it('accepts numeric segments (array indices)', () => {
     expect(parseRef('draft.output.0.x')).toEqual({
+      kind: 'output',
       nodeId: 'draft',
       pathSegments: ['0', 'x'],
     });
@@ -147,8 +151,17 @@ describe('parseRef', () => {
 
   it('accepts params refs without .output. separator', () => {
     expect(parseRef('params.user.email')).toEqual({
+      kind: 'params',
       nodeId: 'params',
       pathSegments: ['user', 'email'],
+    });
+  });
+
+  it('accepts previous refs for loop iterations', () => {
+    expect(parseRef('reviewDecision.previous.comment')).toEqual({
+      kind: 'previous',
+      nodeId: 'reviewDecision',
+      pathSegments: ['comment'],
     });
   });
 });
@@ -349,6 +362,161 @@ describe('resolveOutputRef — snapshot+blob walk', () => {
     await expect(
       resolveOutputRef('params.user.name', { snapshot: snap, def, log }),
     ).rejects.toThrow(/not found/);
+  });
+
+  it('resolves latest successful loop iteration output for a body node', async () => {
+    const def = {
+      workflowId: 'wf-loop-bind',
+      version: 1,
+      nodes: {
+        implement: { type: 'subagent', bot: 'b', prompt: 'x' },
+        'review-loop': {
+          type: 'loop',
+          maxIterations: 2,
+          body: ['implement'],
+          terminate: { node: 'implement', via: 'humanGate' },
+          output: { from: 'implement' },
+        },
+      },
+    } as any;
+    const log = new EventLog(RUN_ID, baseDir);
+    await log.append({
+      runId: RUN_ID,
+      type: 'runCreated',
+      actor: 'scheduler',
+      payload: {
+        workflowId: 'wf-loop-bind',
+        revisionId: 'rev',
+        inputRef: { outputHash: 'sha256:' + '1'.repeat(64), outputBytes: 1, outputSchemaVersion: 1 },
+        initiator: 't',
+      },
+    });
+    const { promises: fsp } = await import('node:fs');
+    await fsp.mkdir(join(baseDir, RUN_ID, 'blobs'), { recursive: true });
+    const firstPath = join(baseDir, RUN_ID, 'blobs', 'loop-1.json');
+    const secondPath = join(baseDir, RUN_ID, 'blobs', 'loop-2.json');
+    writeFileSync(firstPath, JSON.stringify({ code: 'v1' }));
+    writeFileSync(secondPath, JSON.stringify({ code: 'v2' }));
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'implement',
+        activityId: loopWorkActivityId(RUN_ID, 'review-loop', 1, 'implement'),
+        attemptId: 'att-1',
+        attemptNumber: 1,
+        inputRef: { outputHash: 'sha256:' + '5'.repeat(64), outputBytes: 1, outputSchemaVersion: 1 },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'activitySucceeded',
+      actor: 'worker',
+      payload: {
+        activityId: loopWorkActivityId(RUN_ID, 'review-loop', 1, 'implement'),
+        attemptId: 'att-1',
+        outputRef: { outputHash: 'sha256:' + '2'.repeat(64), outputBytes: 13, outputSchemaVersion: 1, outputPath: firstPath },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'implement',
+        activityId: loopWorkActivityId(RUN_ID, 'review-loop', 2, 'implement'),
+        attemptId: 'att-2',
+        attemptNumber: 1,
+        inputRef: { outputHash: 'sha256:' + '6'.repeat(64), outputBytes: 1, outputSchemaVersion: 1 },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'activitySucceeded',
+      actor: 'worker',
+      payload: {
+        activityId: loopWorkActivityId(RUN_ID, 'review-loop', 2, 'implement'),
+        attemptId: 'att-2',
+        outputRef: { outputHash: 'sha256:' + '3'.repeat(64), outputBytes: 13, outputSchemaVersion: 1, outputPath: secondPath },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'loopFinished',
+      actor: 'scheduler',
+      payload: {
+        loopId: 'review-loop',
+        finalIteration: 2,
+        resolution: 'approved',
+        outputRef: { outputHash: 'sha256:' + '3'.repeat(64), outputBytes: 13, outputSchemaVersion: 1, outputPath: secondPath },
+      },
+    });
+    const snap = replay(await log.readAll());
+    await expect(resolveOutputRef('implement.output.code', { snapshot: snap, def, log }))
+      .resolves.toBe('v2');
+    await expect(resolveOutputRef('review-loop.output.code', { snapshot: snap, def, log }))
+      .resolves.toBe('v2');
+  });
+
+  it('resolves previous output only from loop context', async () => {
+    const def = {
+      workflowId: 'wf-loop-bind',
+      version: 1,
+      nodes: {
+        reviewDecision: { type: 'decision', humanGate: { stage: 'before', prompt: 'x' } },
+      },
+    } as any;
+    const log = new EventLog(RUN_ID, baseDir);
+    await log.append({
+      runId: RUN_ID,
+      type: 'runCreated',
+      actor: 'scheduler',
+      payload: {
+        workflowId: 'wf-loop-bind',
+        revisionId: 'rev',
+        inputRef: { outputHash: 'sha256:' + '1'.repeat(64), outputBytes: 1, outputSchemaVersion: 1 },
+        initiator: 't',
+      },
+    });
+    const { promises: fsp } = await import('node:fs');
+    await fsp.mkdir(join(baseDir, RUN_ID, 'blobs'), { recursive: true });
+    const prevPath = join(baseDir, RUN_ID, 'blobs', 'decision-1.json');
+    writeFileSync(prevPath, JSON.stringify({ comment: 'fix tests' }));
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'reviewDecision',
+        activityId: loopGateActivityId(RUN_ID, 'review-loop', 1, 'reviewDecision'),
+        attemptId: 'att-1',
+        attemptNumber: 1,
+        inputRef: { outputHash: 'sha256:' + '7'.repeat(64), outputBytes: 1, outputSchemaVersion: 1 },
+      },
+    });
+    await log.append({
+      runId: RUN_ID,
+      type: 'activitySucceeded',
+      actor: 'human',
+      payload: {
+        activityId: loopGateActivityId(RUN_ID, 'review-loop', 1, 'reviewDecision'),
+        attemptId: 'att-1',
+        outputRef: { outputHash: 'sha256:' + '4'.repeat(64), outputBytes: 23, outputSchemaVersion: 1, outputPath: prevPath },
+      },
+    });
+    const snap = replay(await log.readAll());
+    await expect(
+      resolveOutputRef('reviewDecision.previous.comment', {
+        snapshot: snap,
+        def,
+        log,
+        loopContext: { loopId: 'review-loop', iteration: 2 },
+      }),
+    ).resolves.toBe('fix tests');
+    await expect(
+      resolveOutputRef('reviewDecision.previous.comment', { snapshot: snap, def, log }),
+    ).rejects.toThrow(/outside a loop iteration context/);
   });
 });
 

@@ -14,6 +14,10 @@ import {
   ActivityRunningEventSchema,
   ActivityWaitingEventSchema,
   ActivityTimedOutEventSchema,
+  LoopStartedEventSchema,
+  LoopIterationStartedEventSchema,
+  LoopIterationFinishedEventSchema,
+  LoopFinishedEventSchema,
   ConditionEvaluatedEventSchema,
   LeaseSignedEventSchema,
   AttemptCreatedEventSchema,
@@ -51,6 +55,10 @@ export type NodeCanceledEvent = z.infer<typeof NodeCanceledEventSchema>;
 export type ActivityRunningEvent = z.infer<typeof ActivityRunningEventSchema>;
 export type ActivityWaitingEvent = z.infer<typeof ActivityWaitingEventSchema>;
 export type ActivityTimedOutEvent = z.infer<typeof ActivityTimedOutEventSchema>;
+export type LoopStartedEvent = z.infer<typeof LoopStartedEventSchema>;
+export type LoopIterationStartedEvent = z.infer<typeof LoopIterationStartedEventSchema>;
+export type LoopIterationFinishedEvent = z.infer<typeof LoopIterationFinishedEventSchema>;
+export type LoopFinishedEvent = z.infer<typeof LoopFinishedEventSchema>;
 export type ConditionEvaluatedEvent = z.infer<typeof ConditionEvaluatedEventSchema>;
 export type LeaseSignedEvent = z.infer<typeof LeaseSignedEventSchema>;
 export type AttemptCreatedEvent = z.infer<typeof AttemptCreatedEventSchema>;

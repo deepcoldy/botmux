@@ -151,6 +151,7 @@ export const messages: Record<string, string> = {
   'cmd.group.warn_transfer_failed': '⚠️ 转让群主失败（{reason}），当前机器人仍是群主。可在新群里手动转让。',
   'cmd.group.bots_invited': '🤖 群内机器人：{bots}',
   'cmd.group.warn_bots_rejected': '⚠️ 部分机器人未能加入（{bots}），可能不在当前机器人的 app scope 下。请到群里手动添加。',
+  'cmd.group.warn_share_link_failed': '⚠️ 群分享链接获取失败，上面的链接仅群内成员可点开，非成员请群主手动邀请。',
   'cmd.group.resolve_failed': '⚠️ 无法解析被 @ 的机器人（可能群成员信息暂时拿不到），未建群。请稍后重试。',
 
   // ─── /schedule ───────────────────────────────────────────────────────────

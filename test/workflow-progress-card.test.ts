@@ -424,4 +424,118 @@ describe('workflow-progress-card', () => {
       expect(json).not.toContain(encodeURIComponent('run-x::work::gate::1'));
     });
   });
+
+  // ─── v0.2 loop iteration section (Step 4) ───────────────────────────────
+  //
+  // Active loop blocks surface a `🔁 循环节点` section so the operator can
+  // see "we're on iteration N/M" at a glance.  Settled loops are hidden
+  // (the outer card already shows the run-level terminal state).
+
+  describe('loop iteration section', () => {
+    function snapshotWithLoop(over: {
+      status?: Snapshot['run']['status'];
+      loopId?: string;
+      iteration?: number;
+      maxIterations?: number;
+      loopStatus?: 'running' | 'succeeded' | 'failed' | 'cancelled';
+      iterStatus?: 'running' | 'approved' | 'rejected' | 'failed' | 'cancelled';
+    } = {}): Snapshot {
+      const snap = emptySnapshot({ status: over.status ?? 'running' });
+      // Inject a `loops` Map onto the empty snapshot.  Tests live close
+      // to the replay shape; this mirrors what `replay()` returns once
+      // loopStarted / loopIterationStarted have processed.
+      const loopId = over.loopId ?? 'review-loop';
+      const iteration = over.iteration ?? 1;
+      const maxIterations = over.maxIterations ?? 3;
+      const loopStatus = over.loopStatus ?? 'running';
+      const iterStatus = over.iterStatus ?? 'running';
+      (snap as unknown as { loops: Map<string, unknown> }).loops = new Map([
+        [
+          loopId,
+          {
+            loopId,
+            status: loopStatus,
+            iteration,
+            maxIterations,
+            iterations: Array.from({ length: iteration }, (_, i) => ({
+              iteration: i + 1,
+              status: i === iteration - 1 ? iterStatus : 'rejected',
+              bodyActivityIds: [],
+            })),
+          },
+        ],
+      ]);
+      return snap;
+    }
+
+    it('renders 🔁 循环节点 section with iteration N/M while loop running', () => {
+      const snap = snapshotWithLoop({
+        loopId: 'review-loop',
+        iteration: 2,
+        maxIterations: 3,
+        iterStatus: 'running',
+      });
+      const json = buildWorkflowProgressCard(snap);
+      expect(json).toContain('🔁 循环节点** (1)');
+      expect(json).toContain('iteration 2/3');
+      expect(json).toContain('running');
+      expect(json).toContain('review-loop');
+    });
+
+    it('does NOT render loop section when run is terminal', () => {
+      const snap = snapshotWithLoop({
+        status: 'succeeded',
+        loopStatus: 'succeeded',
+        iteration: 1,
+        iterStatus: 'approved',
+      });
+      const json = buildWorkflowProgressCard(snap);
+      expect(json).not.toContain('🔁 循环节点');
+    });
+
+    it('does NOT render loop section when loop itself is finalized', () => {
+      // run still nominally running (parallel branches?) but the only
+      // loop in the def has succeeded — collectLoopRows excludes
+      // non-running loops.
+      const snap = snapshotWithLoop({
+        status: 'running',
+        loopStatus: 'succeeded',
+        iteration: 1,
+      });
+      const json = buildWorkflowProgressCard(snap);
+      expect(json).not.toContain('🔁 循环节点');
+    });
+
+    it('clamps iteration to 1 in the gap between startLoop and startLoopIteration', () => {
+      // The orchestrator emits startLoop on tick N and
+      // startLoopIteration on tick N+1.  The card might render in
+      // between (iteration === 0); clamp to 1 so the user doesn't see
+      // "iteration 0/3".
+      const snap = emptySnapshot({ status: 'running' });
+      (snap as unknown as { loops: Map<string, unknown> }).loops = new Map([
+        [
+          'review-loop',
+          {
+            loopId: 'review-loop',
+            status: 'running',
+            iteration: 0, // startLoop fired, startLoopIteration not yet
+            maxIterations: 3,
+            iterations: [],
+          },
+        ],
+      ]);
+      const json = buildWorkflowProgressCard(snap);
+      expect(json).toContain('iteration 1/3');
+    });
+
+    it('handles workflow with no loops (loops field absent)', () => {
+      // Backward-compat: emptySnapshot doesn't set `loops` at all;
+      // collectLoopRows must treat that as "no loops" without throwing.
+      const snap = emptySnapshot({ status: 'running' });
+      const json = buildWorkflowProgressCard(snap);
+      expect(json).not.toContain('🔁 循环节点');
+      // sanity — the rest of the card still renders
+      expect(json).toContain('Web 详情');
+    });
+  });
 });

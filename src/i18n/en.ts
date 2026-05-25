@@ -148,6 +148,7 @@ export const messages: Record<string, string> = {
   'cmd.group.warn_transfer_failed': '⚠️ Owner transfer failed ({reason}); the bot is still the group owner. You can transfer it manually inside the new group.',
   'cmd.group.bots_invited': '🤖 Bots in the group: {bots}',
   'cmd.group.warn_bots_rejected': '⚠️ Some bots could not be added ({bots}) — they may not be in this bot\'s app scope. Please add them manually.',
+  'cmd.group.warn_share_link_failed': '⚠️ Couldn\'t fetch a group share link; the link above only opens for members already in the group — the owner should invite non-members manually.',
   'cmd.group.resolve_failed': '⚠️ Could not resolve the @-mentioned bots (chat member info may be temporarily unavailable); group not created. Please retry shortly.',
 
   // ─── /schedule ───────────────────────────────────────────────────────────

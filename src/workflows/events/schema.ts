@@ -17,6 +17,10 @@ import {
   ActivityRunningPayload,
   ActivityWaitingPayload,
   ActivityTimedOutPayload,
+  LoopStartedPayload,
+  LoopIterationStartedPayload,
+  LoopIterationFinishedPayload,
+  LoopFinishedPayload,
   ConditionEvaluatedPayload,
   LeaseSignedPayload,
   AttemptCreatedPayload,
@@ -111,6 +115,18 @@ export const ActivityRunningEventSchema = event('activityRunning', ActivityRunni
 export const ActivityWaitingEventSchema = event('activityWaiting', ActivityWaitingPayload);
 export const ActivityTimedOutEventSchema = event('activityTimedOut', ActivityTimedOutPayload);
 
+// Group 1b — Loop lifecycle (4)
+export const LoopStartedEventSchema = event('loopStarted', LoopStartedPayload);
+export const LoopIterationStartedEventSchema = event(
+  'loopIterationStarted',
+  LoopIterationStartedPayload,
+);
+export const LoopIterationFinishedEventSchema = event(
+  'loopIterationFinished',
+  LoopIterationFinishedPayload,
+);
+export const LoopFinishedEventSchema = event('loopFinished', LoopFinishedPayload);
+
 // Group 2 — Scheduling (5)
 export const ConditionEvaluatedEventSchema = event('conditionEvaluated', ConditionEvaluatedPayload);
 export const LeaseSignedEventSchema = event('leaseSigned', LeaseSignedPayload);
@@ -158,6 +174,10 @@ const EVENT_SCHEMAS = [
   ActivityRunningEventSchema,
   ActivityWaitingEventSchema,
   ActivityTimedOutEventSchema,
+  LoopStartedEventSchema,
+  LoopIterationStartedEventSchema,
+  LoopIterationFinishedEventSchema,
+  LoopFinishedEventSchema,
   ConditionEvaluatedEventSchema,
   LeaseSignedEventSchema,
   AttemptCreatedEventSchema,
@@ -285,6 +305,35 @@ export function checkWaitCreatedPromptInvariant(event: WorkflowEvent): string | 
   return null;
 }
 
+export function checkLoopFinishedInvariant(event: WorkflowEvent): string | null {
+  if (event.type !== 'loopFinished') return null;
+  if (isPayloadRef(event.payload)) return null;
+  const p = event.payload as {
+    resolution: string;
+    errorCode?: string;
+    errorClass?: string;
+  };
+  if (p.resolution === 'max-iterations-exceeded') {
+    if (p.errorCode !== 'LoopMaxIterationsExceeded' || p.errorClass !== 'userFault') {
+      return "loopFinished: max-iterations-exceeded requires errorCode='LoopMaxIterationsExceeded' and errorClass='userFault'";
+    }
+  }
+  if (p.resolution === 'body-failed') {
+    if (p.errorCode !== 'LoopBodyFailed') {
+      return "loopFinished: body-failed requires errorCode='LoopBodyFailed'";
+    }
+    if (!p.errorClass) {
+      return "loopFinished: body-failed requires errorClass (derived from underlying body failure)";
+    }
+  }
+  if (p.resolution === 'timeout') {
+    if (p.errorCode !== 'WaitDeadlineExceeded' || p.errorClass !== 'userFault') {
+      return "loopFinished: timeout requires errorCode='WaitDeadlineExceeded' and errorClass='userFault'";
+    }
+  }
+  return null;
+}
+
 /**
  * Run every post-parse invariant against a WorkflowEvent.  Each entry is
  * a `(event) => string | null` checker; the first failure wins and gets
@@ -298,6 +347,7 @@ const POST_PARSE_INVARIANTS: Array<{
   { path: ['payloadHash'], check: checkPayloadHashInvariant },
   { path: ['payload'], check: checkReconcileResultInvariant },
   { path: ['payload'], check: checkWaitCreatedPromptInvariant },
+  { path: ['payload'], check: checkLoopFinishedInvariant },
 ];
 
 function applyInvariants(event: WorkflowEvent): z.ZodError | null {

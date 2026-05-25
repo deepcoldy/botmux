@@ -17,6 +17,7 @@ import {
   isPathInsideDir,
   attemptTerminalLogPath,
   attemptPtyLogPath,
+  scrubSnapshotForUnauthed,
   TERMINAL_RUN_STATUSES,
 } from '../workflows/ops-projection.js';
 
@@ -64,12 +65,20 @@ function parseChatBinding(
  * Kept separate from `dashboard.ts` so route behavior can be exercised with a
  * small HTTP smoke test without starting the top-level dashboard process,
  * daemon registry, or SSE fanout.
+ *
+ * `authed` reflects whether the request presented a valid cookie/token; the
+ * caller (`dashboard.ts`) computes this from `decideDashboardAuth` and
+ * passes it through.  Public-read endpoints (`GET /snapshot`) use it to
+ * scrub log bytes from the response when the reader is unauthenticated —
+ * see `scrubSnapshotForUnauthed`.  Defaults to `false` so test callers
+ * that omit the flag get the secure-by-default behavior.
  */
 export async function handleWorkflowApi(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
   deps: WorkflowApiDeps,
+  authed: boolean = false,
 ): Promise<boolean> {
   let m: RegExpMatchArray | null;
 
@@ -195,7 +204,11 @@ export async function handleWorkflowApi(
     const runId = decodeURIComponent(m[1]);
     const snap = await readRunSnapshot(deps.runsDir, runId);
     if (!snap) jsonRes(res, 404, { error: 'unknown_run' });
-    else jsonRes(res, 200, snap);
+    // Public-read endpoint — but `io.log.text` carries the last 64 KiB of
+    // `terminal.log` (subagent worker stdout/stderr), which can contain
+    // env-var dumps, API key error responses, etc.  Strip when unauth'd;
+    // a logged-in dashboard still gets the full view.
+    else jsonRes(res, 200, authed ? snap : scrubSnapshotForUnauthed(snap));
     return true;
   }
 
@@ -220,7 +233,11 @@ export async function handleWorkflowApi(
   }
 
   // ─── Attempt raw terminal.log ──────────────────────────────────────────────
-  // Public-read (under decideDashboardAuth's `GET /api/workflows/*` allowlist).
+  // Cookie-auth only (carved OUT of `decideDashboardAuth`'s
+  // `GET /api/workflows/*` public-read allowlist by `b5d23a6` — raw PTY +
+  // diagnostic streams can leak API keys / env / tokens; `/snapshot`'s
+  // log preview is scrubbed under the same posture via
+  // `scrubSnapshotForUnauthed`).
   // Streams `runs/<runId>/attempts/<activityId>/<attemptId>/terminal.log` for
   // the dashboard replay viewer.  Default behavior tails the last 10 MB; pass
   // `?tailBytes=N` to widen the window (capped at MAX_TAIL_BYTES) or

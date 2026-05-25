@@ -913,7 +913,10 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
           });
-          const link = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
+          // Prefer the shareable join link (others can click to *join*); fall
+          // back to the member-only applink URL when Lark's link API failed.
+          const applink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
+          const link = result.shareLink ?? applink;
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
           const hints: string[] = [];
@@ -921,6 +924,12 @@ export async function handleCommand(
             hints.push(t('cmd.group.warn_invite_rejected', undefined, loc));
           } else if (result.transferError) {
             hints.push(t('cmd.group.warn_transfer_failed', { reason: result.transferError }, loc));
+          }
+          // Share-link fetch failed → the displayed link is the member-only
+          // applink; warn the user so they don't expect non-members to join via it.
+          if (!result.shareLink && result.shareLinkError) {
+            logger.warn(`[${logTag}] /group share-link unavailable, using applink: ${result.shareLinkError}`);
+            hints.push(t('cmd.group.warn_share_link_failed', undefined, loc));
           }
           // List every bot in the new group (creator included), and warn about
           // any Feishu rejected. Names come from the chat roster (members) since

@@ -165,9 +165,52 @@ export function isSideEffectExecutor(executor: string): boolean {
   return SIDE_EFFECT_EXECUTORS.has(executor);
 }
 
+// ─── Loop / Decision (v0.2 — see /tmp/wf-loop-v02.md §3.1) ────────────────
+//
+// `loop` is a control-flow node: it wraps a body sub-graph that re-runs
+// until a `decision` terminator approves (or maxIterations hits).
+// `decision` is a gate-only node: no work payload, just a humanGate whose
+// resolution drives the loop state machine.  Both types must be cross-
+// validated by `validateLoopBlocks` after schema parse (membership, no
+// nested loops, external deps surfaced on loop.depends, etc.).
+//
+// Strict object shape — additional keys are rejected at parse time so
+// that a workflow author who writes `outputSchema` / `prompt` / `bot` on
+// a decision node gets a fail-loud error instead of silently dropped
+// fields (codex round 2 N2: decision output contract is runtime-fixed).
+
+export const LoopOutputProjectionSchema = z.object({
+  from: z.string().min(1),
+}).strict();
+export type LoopOutputProjection = z.infer<typeof LoopOutputProjectionSchema>;
+
+export const LoopNodeSchema = z.object({
+  type: z.literal('loop'),
+  description: z.string().optional(),
+  depends: z.array(z.string()).optional(),
+  maxIterations: z.number().int().positive(),
+  body: z.array(z.string().min(1)).min(1),
+  terminate: z.object({
+    node: z.string().min(1),
+    via: z.literal('humanGate'),
+  }).strict(),
+  output: LoopOutputProjectionSchema.optional(),
+}).strict();
+export type LoopNode = z.infer<typeof LoopNodeSchema>;
+
+export const DecisionNodeSchema = z.object({
+  type: z.literal('decision'),
+  description: z.string().optional(),
+  depends: z.array(z.string()).optional(),
+  humanGate: HumanGateSchema,
+}).strict();
+export type DecisionNode = z.infer<typeof DecisionNodeSchema>;
+
 export const WorkflowNodeSchema = z.discriminatedUnion('type', [
   SubagentNodeSchema,
   HostExecutorNodeSchema,
+  LoopNodeSchema,
+  DecisionNodeSchema,
 ]);
 export type WorkflowNode = z.infer<typeof WorkflowNodeSchema>;
 
@@ -252,7 +295,10 @@ export function computeRevisionId(def: WorkflowDefinition): string {
  * Schema parse + cross-field invariants:
  *   1. every `depends` entry references an existing node
  *   2. graph is acyclic
- *   3. at least one root node (no deps)
+ *   3. at least one root node (no deps) among scheduler-visible nodes
+ *      (loop body nodes are excluded from this check — they're scheduled
+ *      by their owning loop block, not the top-level orchestrator)
+ *   4. loop / decision cross-field invariants (see `validateLoopBlocks`)
  *
  * Throws on any failure.  Use `WorkflowDefinitionSchema.safeParse(...)`
  * directly if you only need shape checks (no graph validation).
@@ -307,10 +353,241 @@ function validateGraph(def: WorkflowDefinition): void {
     }
   }
   detectCycle(def);
-  const hasRoot = ids.some((id) => (def.nodes[id]!.depends ?? []).length === 0);
+
+  // Loop / decision cross-field validation runs before the root check so
+  // we can compute the body-node set used to scope "scheduler-visible
+  // roots".
+  const bodyNodeIds = validateLoopBlocks(def);
+
+  // Root check: at least one scheduler-visible node has no deps.  Loop
+  // body nodes are by construction scheduled by their owning loop, so
+  // their "no-deps" status is internal to the loop and must not count
+  // toward workflow-level reachability.
+  const hasRoot = ids.some(
+    (id) => !bodyNodeIds.has(id) && (def.nodes[id]!.depends ?? []).length === 0,
+  );
   if (!hasRoot) {
-    throw new Error('Workflow has no root node (every node has dependencies)');
+    throw new Error(
+      'Workflow has no scheduler-visible root node (every non-loop-body node has dependencies)',
+    );
   }
+}
+
+/**
+ * Loop / decision cross-field validation (v0.2; see /tmp/wf-loop-v02.md §3.4).
+ *
+ * Returns the set of node ids that belong to some loop's body, so the
+ * caller (`validateGraph`) can scope the root-existence check to
+ * scheduler-visible nodes only.
+ *
+ * Throws on any rule violation.  Error messages always include the
+ * offending loopId + nodeId so workflow-create skills and authors can
+ * self-correct without re-reading the spec.
+ */
+export function validateLoopBlocks(def: WorkflowDefinition): Set<string> {
+  const allLoopBodyIds = new Set<string>();
+  // Track which loop owns each body node so we can detect cross-loop
+  // body-membership collisions in one pass.
+  const bodyOwner = new Map<string, string>();
+  // Collect loop blocks up front so cross-block invariants (decision
+  // node membership, external deps surfaced on loop.depends, etc.) can
+  // be checked with full context.
+  const loopBlocks: Array<{ loopId: string; node: LoopNode }> = [];
+
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (node.type !== 'loop') continue;
+    loopBlocks.push({ loopId: nodeId, node });
+    for (const bodyId of node.body) {
+      // Body id must exist as a top-level node.
+      if (!def.nodes[bodyId]) {
+        throw new Error(
+          `Loop '${nodeId}' body references unknown node '${bodyId}'`,
+        );
+      }
+      // A body node cannot be the loop block itself.
+      if (bodyId === nodeId) {
+        throw new Error(
+          `Loop '${nodeId}' body must not include the loop block itself`,
+        );
+      }
+      // A node can belong to at most one loop body — collisions break
+      // iteration / activityId scoping.
+      const prev = bodyOwner.get(bodyId);
+      if (prev && prev !== nodeId) {
+        throw new Error(
+          `Loop body node '${bodyId}' is claimed by both '${prev}' and '${nodeId}'; ` +
+          `a node can belong to at most one loop body`,
+        );
+      }
+      bodyOwner.set(bodyId, nodeId);
+      allLoopBodyIds.add(bodyId);
+
+      // v0.2 rejects nested loops — a body node may not itself be a
+      // loop.  Removing this restriction in a future version requires
+      // re-checking activityId composition + replay determinism.
+      if (def.nodes[bodyId]!.type === 'loop') {
+        throw new Error(
+          `Loop '${nodeId}' body contains nested loop '${bodyId}'; nested loops are not supported in v0.2`,
+        );
+      }
+    }
+    // terminate.node must be in this loop's body and must be a decision.
+    const termId = node.terminate.node;
+    if (!node.body.includes(termId)) {
+      throw new Error(
+        `Loop '${nodeId}' terminate.node '${termId}' is not in body [${node.body.join(', ')}]`,
+      );
+    }
+    const termNode = def.nodes[termId];
+    if (!termNode || termNode.type !== 'decision') {
+      throw new Error(
+        `Loop '${nodeId}' terminate.node '${termId}' must be a decision node (got '${termNode?.type ?? 'undefined'}')`,
+      );
+    }
+    // Each loop body must contain exactly one decision node, and (by
+    // construction since terminate.node is verified to be a decision in
+    // the body above) it must equal terminate.node.
+    //
+    // Why: `wait.ts` decision-mode treats *any* decision-typed node's
+    // reject as a structured `activitySucceeded { resolution: 'rejected' }`
+    // blob, regardless of terminator status (the dispatcher has no
+    // terminator-vs-non-terminator distinction at resolve time).  So if
+    // a body has two decisions, the non-terminator one's reject would
+    // silently "succeed" and the body would continue past a rejection
+    // the author intended to terminate the loop.  Force authors to use
+    // a regular `subagent + humanGate` for intermediate approvals — only
+    // the terminator slot is allowed to be a decision.
+    const decisionsInBody = node.body.filter(
+      (id) => def.nodes[id]?.type === 'decision',
+    );
+    if (decisionsInBody.length !== 1) {
+      throw new Error(
+        `Loop '${nodeId}' body must contain exactly one decision node ` +
+        `(got ${decisionsInBody.length}: [${decisionsInBody.join(', ')}]) — ` +
+        `decision nodes are the loop terminator slot; a non-terminator ` +
+        `decision's reject would be silently treated as success by ` +
+        `wait.ts decision-mode, letting the body continue past the rejection. ` +
+        `Use a regular subagent + humanGate for intermediate approvals.`,
+      );
+    }
+    // output.from (if declared) must be a body node and not the terminator.
+    if (node.output) {
+      if (!node.body.includes(node.output.from)) {
+        throw new Error(
+          `Loop '${nodeId}' output.from '${node.output.from}' is not in body [${node.body.join(', ')}]`,
+        );
+      }
+      if (node.output.from === termId) {
+        throw new Error(
+          `Loop '${nodeId}' output.from '${node.output.from}' must not be the terminate.node ` +
+          `(terminator has no work output; pick a body node that produces real output)`,
+        );
+      }
+    }
+  }
+
+  // Decision nodes must belong to some loop body (v0.2: no standalone
+  // decision use case exists yet; relaxing this needs a separate
+  // dispatch model).
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (node.type !== 'decision') continue;
+    if (!allLoopBodyIds.has(nodeId)) {
+      throw new Error(
+        `Decision node '${nodeId}' is not referenced by any loop's body; ` +
+        `decision nodes are only valid inside a loop terminate.node slot in v0.2`,
+      );
+    }
+  }
+
+  // External dependency rule (codex round 2 N1): if a body node depends
+  // on a node outside the loop body, the loop block itself must list
+  // that external dep in its own `depends`.  We refuse to silently
+  // promote — the workflow JSON should make every cross-loop edge
+  // visible.
+  //
+  // Outside-the-body deps include any node not in *this* loop's body
+  // (siblings, top-level subagent/hostExecutor, other loops).
+  for (const { loopId, node: loopNode } of loopBlocks) {
+    const bodySet = new Set(loopNode.body);
+    const loopDeps = new Set(loopNode.depends ?? []);
+    for (const bodyId of loopNode.body) {
+      const bodyNode = def.nodes[bodyId]!;
+      for (const dep of bodyNode.depends ?? []) {
+        if (bodySet.has(dep)) continue; // internal dep — fine
+        if (!loopDeps.has(dep)) {
+          throw new Error(
+            `Loop '${loopId}' body node '${bodyId}' depends on external node '${dep}', ` +
+            `but loop '${loopId}' does not list '${dep}' in its own depends — ` +
+            `add '${dep}' to loop.depends explicitly so the loop block waits for it`,
+          );
+        }
+      }
+    }
+  }
+
+  // No external node may depend on a loop body node — outsiders are
+  // only allowed to depend on the loop block itself.  This keeps the
+  // top-level scheduler unaware of body nodes.
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (allLoopBodyIds.has(nodeId)) continue; // external = non-body
+    for (const dep of node.depends ?? []) {
+      if (allLoopBodyIds.has(dep)) {
+        throw new Error(
+          `Node '${nodeId}' depends on loop body node '${dep}'; ` +
+          `external dependents must depend on the loop block, not its body — ` +
+          `use the loop block id (and optionally declare output.from on the loop) instead`,
+        );
+      }
+    }
+  }
+
+  // Sink-loop rule (codex PR #47 round-2 finding #1): a loop block that is
+  // a workflow sink (no external dependents) must declare `output.from`.
+  // orchestrator.ts only emits `completeRunSucceeded` when the sink activity
+  // has an output blob; a loop block without `output.from` never writes
+  // `outputs[sinkActivityId]` from `loopFinished`, so the run hangs in
+  // `no-progress` after approval.  Force the author to choose at parse time.
+  const externalDependents = new Map<string, Set<string>>();
+  for (const { loopId } of loopBlocks) externalDependents.set(loopId, new Set());
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (allLoopBodyIds.has(nodeId)) continue;
+    for (const dep of node.depends ?? []) {
+      const deps = externalDependents.get(dep);
+      if (deps) deps.add(nodeId);
+    }
+  }
+  for (const { loopId, node: loopNode } of loopBlocks) {
+    if (loopNode.output) continue;
+    if ((externalDependents.get(loopId) ?? new Set()).size > 0) continue;
+    throw new Error(
+      `Loop '${loopId}' has no external dependents (workflow sink) but does not declare 'output.from' — ` +
+      `without output.from the loopFinished projection writes no sink output and the run cannot complete (no-progress). ` +
+      `Add output.from pointing to a body node, e.g. \`"output": { "from": "${loopNode.body[0]}" }\`.`,
+    );
+  }
+
+  // Decision-timeout rule (codex PR #47 round-2 finding #2): decision nodes
+  // must use `humanGate.onTimeout = 'fail'` (or leave it unset; default is
+  // fail).  `onTimeout='success'` is legal at the schema level but
+  // `expireWait` writes the succeeded blob as `{ defaultedToTimeout,
+  // deadlineAt }` without `resolution`/`by`/`comment`, so the next
+  // iteration's `${decisionNode.previous.comment}` bindings hit
+  // BindingError.  Statically rule this out at validate time — if the
+  // author truly wants "timeout = approve" semantics they can implement
+  // it via a wrapper subagent that produces the structured resolution.
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (node.type !== 'decision') continue;
+    if (node.humanGate?.onTimeout === 'success') {
+      throw new Error(
+        `Decision node '${nodeId}' humanGate.onTimeout='success' is not allowed — ` +
+        `the timeout fallback would write a succeeded blob missing {resolution, by, comment}, ` +
+        `breaking the next iteration's \${${nodeId}.previous.*} bindings. ` +
+        `Use onTimeout='fail' (default) so timeout closes the loop via loopFinished(timeout).`,
+      );
+    }
+  }
+
+  return allLoopBodyIds;
 }
 
 function detectCycle(def: WorkflowDefinition): void {

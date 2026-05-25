@@ -34,6 +34,7 @@ import { replay, type Snapshot } from './events/replay.js';
 import type {
   ActivityFailedEvent,
   AttemptCreatedEvent,
+  LoopFinishedEvent,
   NodeFailedEvent,
   NodeSucceededEvent,
   RunCanceledEvent,
@@ -41,13 +42,14 @@ import type {
   RunSucceededEvent,
   WaitCreatedEvent,
 } from './events/types.js';
-import type {
-  CompleteNodeFailedAction,
-  CompleteNodeSucceededAction,
-  CompleteRunFailedAction,
-  CompleteRunSucceededAction,
-  DispatchGateAction,
-  DispatchWorkAction,
+import {
+  parseActivityId,
+  type CompleteNodeFailedAction,
+  type CompleteNodeSucceededAction,
+  type CompleteRunFailedAction,
+  type CompleteRunSucceededAction,
+  type DispatchGateAction,
+  type DispatchWorkAction,
 } from './orchestrator.js';
 import { createWait } from './wait.js';
 import { executeSideEffect } from './hostExecutors/protocol.js';
@@ -253,8 +255,19 @@ async function resolveWorkflowIdentity(
 function bindingContext(
   ctx: WorkflowRuntimeContext,
   snapshot: Snapshot,
+  activityId?: string,
 ): BindingContext {
   let paramsPromise: Promise<Record<string, unknown>> | undefined;
+  // Loop body nodes need their iteration coordinates surfaced to the
+  // binder so `${node.previous.x}` resolves against the prior iteration.
+  // Caller dispatch sites (dispatchWork / dispatchHumanGate / hostExecutor
+  // path) pass `action.activityId`; parseActivityId picks loop kind and
+  // we forward { loopId, iteration }.  Plain activityIds leave
+  // loopContext undefined and `.previous.` still fails-loud as designed.
+  const parsed = activityId ? parseActivityId(activityId) : undefined;
+  const loopContext = parsed?.kind === 'loop'
+    ? { loopId: parsed.loopId, iteration: parsed.iteration }
+    : undefined;
   return {
     snapshot,
     def: ctx.def,
@@ -263,6 +276,7 @@ function bindingContext(
       paramsPromise ??= loadRunParamsFromSnapshot(snapshot);
       return paramsPromise;
     },
+    loopContext,
   };
 }
 
@@ -371,7 +385,7 @@ export async function dispatchGate(
   try {
     resolvedPrompt = await resolveBoundString(
       action.humanGate.prompt,
-      bindingContext(ctx, options.snapshot ?? replay(await ctx.log.readAll())),
+      bindingContext(ctx, options.snapshot ?? replay(await ctx.log.readAll()), action.activityId),
     );
   } catch (err) {
     if (err instanceof BindingError) {
@@ -545,7 +559,21 @@ export async function dispatchWork(
   const bindingCtx = bindingContext(
     ctx,
     options.snapshot ?? replay(await ctx.log.readAll()),
+    action.activityId,
   );
+
+  if (node.type === 'loop' || node.type === 'decision') {
+    // v0.2 schema introduced these node types but their dispatch is
+    // owned by the loop runtime executor (Step 3 of
+    // feat/workflow-loop-v02; see /tmp/wf-loop-v02.md §13).  The
+    // orchestrator (`decideNextActions`) skips them so we should never
+    // get here in Step 1; throw fail-loud rather than silently no-op so
+    // any regression is caught immediately in tests.
+    throw new Error(
+      `dispatchWork received unexpected node type '${node.type}' for node '${action.nodeId}' ` +
+      `(loop runtime not yet wired in Step 1; orchestrator should intercept upstream)`,
+    );
+  }
 
   if (node.type === 'hostExecutor') {
     // attemptCreated carries the RAW (pre-binding) input.  Operator-side
@@ -872,8 +900,12 @@ async function findRootCauseEventId(
   const events = await ctx.log.readAll();
   // Prefer the activityFailed under the failed node's last activity.
   // Fall back to the nodeFailed event itself (always exists by now).
+  // For loop block failures (v0.2): loop blocks have no own attempts /
+  // nodeFailed; the `loopFinished` event is the authoritative root
+  // cause of a loop-level failure (codex Step 3 review Blocker 2).
   let nodeFailedEventId: string | undefined;
   let activityFailedEventId: string | undefined;
+  let loopFinishedEventId: string | undefined;
   const nodeActivities = new Set<string>();
   for (const e of events) {
     if (e.type === 'attemptCreated') {
@@ -889,9 +921,19 @@ async function findRootCauseEventId(
       if (!('ref' in p) && p.nodeId === nodeId) {
         nodeFailedEventId = e.eventId;
       }
+    } else if (e.type === 'loopFinished') {
+      const p = (e as LoopFinishedEvent).payload;
+      if (!('ref' in p) && p.loopId === nodeId && p.resolution !== 'approved') {
+        loopFinishedEventId = e.eventId;
+      }
     }
   }
-  return activityFailedEventId ?? nodeFailedEventId ?? events[0]!.eventId;
+  return (
+    activityFailedEventId ??
+    nodeFailedEventId ??
+    loopFinishedEventId ??
+    events[0]!.eventId
+  );
 }
 
 export async function completeRunFailed(

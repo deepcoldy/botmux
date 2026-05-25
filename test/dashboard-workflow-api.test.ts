@@ -123,6 +123,87 @@ describe('dashboard workflow API routes', () => {
     ]);
   });
 
+  it('GET /snapshot strips io.log.text for unauth\'d callers but keeps it for auth\'d', async () => {
+    // Seed a succeeded run with a terminal.log carrying a fake secret.
+    await seedSucceededRun('api-secret-01', DONE_DEF);
+    // The runtime helpers in this test seed the events but don't actually
+    // write per-attempt terminal.log files — synthesize one so the
+    // projection has bytes to scrub.
+    const snapPeek = await fetch(`${baseUrl}/api/workflows/runs/api-secret-01/snapshot`, {
+      headers: { 'x-test-authed': '1' },
+    });
+    const snapPeekBody = await snapPeek.json() as {
+      attemptIO: Record<string, { input?: unknown }>;
+    };
+    const attemptId = Object.keys(snapPeekBody.attemptIO)[0];
+    expect(attemptId).toBeTruthy();
+    // attemptId format: <runId>::work::<node>::att-N → strip the att-N suffix
+    // to recover the parent activityId for the on-disk attempts directory.
+    const activityId = attemptId.split('::att-')[0];
+    const attemptDir = join(
+      runsDir,
+      'api-secret-01',
+      'attempts',
+      activityId,
+      attemptId,
+    );
+    await mkdir(attemptDir, { recursive: true });
+    await writeFile(
+      join(attemptDir, 'terminal.log'),
+      '[ts] stderr LEAKED_TOKEN=sk-fake-must-not-leak\n',
+    );
+    await writeFile(
+      join(attemptDir, 'terminal.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        sessionId: 'wf-api-secret',
+        webPort: 32999,
+        status: 'closed',
+        cliId: 'claude-code',
+        logPath: join(attemptDir, 'terminal.log'),
+        startedAt: 1,
+        updatedAt: 2,
+      }),
+    );
+
+    // Unauthenticated public read — log bytes must be stripped, metadata kept.
+    const unauthRes = await fetch(
+      `${baseUrl}/api/workflows/runs/api-secret-01/snapshot`,
+    );
+    expect(unauthRes.status).toBe(200);
+    const unauth = await unauthRes.json() as {
+      attemptIO: Record<string, {
+        log?: { text?: string; redacted?: boolean; outputBytes?: number };
+        terminal?: { logPath?: string; sessionId?: string; webPort?: number };
+      }>;
+    };
+    const unauthIO = unauth.attemptIO[attemptId];
+    expect(unauthIO?.log?.text).toBeUndefined();
+    expect(unauthIO?.log?.redacted).toBe(true);
+    expect(unauthIO?.log?.outputBytes).toBeGreaterThan(0);
+    expect(unauthIO?.terminal?.logPath).toBeUndefined();
+    expect(unauthIO?.terminal?.sessionId).toBe('wf-api-secret');
+    expect(unauthIO?.terminal?.webPort).toBe(32999);
+
+    // Authenticated read still sees the full log + logPath — same data
+    // a logged-in `botmux dashboard` user has always seen.
+    const authRes = await fetch(
+      `${baseUrl}/api/workflows/runs/api-secret-01/snapshot`,
+      { headers: { 'x-test-authed': '1' } },
+    );
+    expect(authRes.status).toBe(200);
+    const authed = await authRes.json() as {
+      attemptIO: Record<string, {
+        log?: { text?: string; redacted?: boolean };
+        terminal?: { logPath?: string };
+      }>;
+    };
+    const authedIO = authed.attemptIO[attemptId];
+    expect(authedIO?.log?.text).toContain('LEAKED_TOKEN=sk-fake-must-not-leak');
+    expect(authedIO?.log?.redacted).toBeUndefined();
+    expect(authedIO?.terminal?.logPath).toBe(join(attemptDir, 'terminal.log'));
+  });
+
   it('short-circuits cancel for terminal runs without proxying to daemon', async () => {
     await seedSucceededRun('api-done-01', DONE_DEF);
 
@@ -641,7 +722,13 @@ async function startWorkflowApiServer(deps: WorkflowApiDeps): Promise<{
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-      if (await handleWorkflowApi(req, res, url, deps)) return;
+      // Test seam: `x-test-authed: 1` request header simulates a logged-in
+      // dashboard session for tests that want to verify the auth-gated
+      // branch (e.g. snapshot scrub).  Default (no header) mirrors a
+      // public-read request that came in via the `decideDashboardAuth`
+      // carve-out — same auth posture as a Lark card recipient.
+      const isAuthed = req.headers['x-test-authed'] === '1';
+      if (await handleWorkflowApi(req, res, url, deps, isAuthed)) return;
       jsonRes(res, 404, { error: 'not_found' });
     } catch (err) {
       jsonRes(res, 500, { error: String(err) });

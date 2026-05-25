@@ -222,6 +222,12 @@ const server = createServer(async (req, res) => {
       presentedToken,
       activeToken: activeToken ?? '',
     });
+    // `authed` is consumed by route handlers that need to distinguish
+    // "request got in via public-read carve-out" from "request has a
+    // valid cookie" — e.g. `/api/workflows/runs/<id>/snapshot` strips
+    // log bytes when unauth'd.  Mirror of the `authed` check in
+    // `decideDashboardAuth`.
+    const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
 
     if (decision.kind === 'deny401') {
       res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
@@ -299,7 +305,7 @@ const server = createServer(async (req, res) => {
     if (await handleWorkflowApi(req, res, url, {
       runsDir: getRunsDir(),
       proxyToDaemon,
-    })) {
+    }, authed)) {
       return;
     }
 

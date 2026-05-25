@@ -17,7 +17,7 @@
  * `notifyOwnerOpenId` MUST be in `creatorLarkAppId`'s app scope. Enforcing
  * this is the decision layer's job — the service trusts its inputs.
  */
-import { createChat, transferChatOwner, getChatOwner } from './groups-store.js';
+import { createChat, transferChatOwner, getChatOwner, getChatShareLink } from './groups-store.js';
 import { sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
 
@@ -46,6 +46,10 @@ export interface CreateGroupResult {
   transferError: string | null;
   notifyMessageId: string | null;
   notifyError: string | null;
+  /** Shareable join link (others can click to *join*). null when the Lark
+   *  link API failed — caller falls back to the member-only applink URL. */
+  shareLink: string | null;
+  shareLinkError: string | null;
   oncallBindings: { larkAppId: string; ok: boolean; created?: boolean; error?: string }[];
 }
 
@@ -59,6 +63,19 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     botIds: otherBots,
     userIds: opts.userOpenIds ?? [],
   });
+
+  // Fetch the shareable join link BEFORE transferring ownership: the creator bot
+  // is the chat owner right after createChat, so it can always read the link. If
+  // we did this after transfer and the tenant restricts "share group" to
+  // owner/admin, the (now demoted) bot would get a permission error. Best-effort:
+  // on failure the caller falls back to the member-only applink URL.
+  let shareLink: string | null = null;
+  let shareLinkError: string | null = null;
+  {
+    const sl = await getChatShareLink(opts.creatorLarkAppId, r.chatId);
+    if (sl.ok) shareLink = sl.shareLink;
+    else shareLinkError = sl.error;
+  }
 
   let ownerTransferredTo: string | null = null;
   let transferError: string | null = null;
@@ -138,6 +155,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     transferError,
     notifyMessageId,
     notifyError,
+    shareLink,
+    shareLinkError,
     oncallBindings,
   };
 }

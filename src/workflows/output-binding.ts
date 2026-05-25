@@ -38,8 +38,9 @@ import { promises as fs } from 'node:fs';
 
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
+import type { OutputRef } from './events/payloads.js';
 import type { Snapshot } from './events/replay.js';
-import { workActivityId } from './orchestrator.js';
+import { parseActivityId, workActivityId } from './orchestrator.js';
 
 export class BindingError extends Error {
   constructor(message: string) {
@@ -49,11 +50,13 @@ export class BindingError extends Error {
 }
 
 export type ParsedRef = {
+  kind: 'output' | 'params' | 'previous';
   nodeId: string;
   pathSegments: string[];
 };
 
 const REF_MARKER = '.output.';
+const PREVIOUS_MARKER = '.previous.';
 const PARAMS_PREFIX = 'params.';
 const SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/;
 const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
@@ -62,11 +65,23 @@ export function parseRef(ref: string): ParsedRef {
   const idx = ref.indexOf(REF_MARKER);
   if (idx < 0 && ref.startsWith(PARAMS_PREFIX)) {
     const rawPath = ref.slice(PARAMS_PREFIX.length);
-    return { nodeId: 'params', pathSegments: parsePathSegments(rawPath, ref) };
+    return { kind: 'params', nodeId: 'params', pathSegments: parsePathSegments(rawPath, ref) };
+  }
+  const previousIdx = ref.indexOf(PREVIOUS_MARKER);
+  if (idx < 0 && previousIdx >= 0) {
+    const nodeId = ref.slice(0, previousIdx);
+    if (!nodeId) {
+      throw new BindingError(`$ref '${ref}' has empty nodeId before '.previous.'`);
+    }
+    const rawPath = ref.slice(previousIdx + PREVIOUS_MARKER.length);
+    if (!rawPath) {
+      throw new BindingError(`$ref '${ref}' has empty path after '.previous.'`);
+    }
+    return { kind: 'previous', nodeId, pathSegments: parsePathSegments(rawPath, ref) };
   }
   if (idx < 0) {
     throw new BindingError(
-      `$ref '${ref}' missing '.output.' separator (expected '<nodeId>.output.<path>' or 'params.<path>')`,
+      `$ref '${ref}' missing '.output.' separator (expected '<nodeId>.output.<path>', '<nodeId>.previous.<path>', or 'params.<path>')`,
     );
   }
   const nodeId = ref.slice(0, idx);
@@ -78,7 +93,7 @@ export function parseRef(ref: string): ParsedRef {
     throw new BindingError(`$ref '${ref}' has empty path after '.output.'`);
   }
   const segments = parsePathSegments(rawPath, ref);
-  return { nodeId, pathSegments: segments };
+  return { kind: 'output', nodeId, pathSegments: segments };
 }
 
 function parsePathSegments(rawPath: string, ref: string): string[] {
@@ -115,15 +130,21 @@ export type BindingContext = {
   def: WorkflowDefinition;
   log: EventLog;
   loadParams?: () => Promise<Record<string, unknown>>;
+  loopContext?: {
+    loopId: string;
+    iteration: number;
+  };
 };
 
 export async function resolveOutputRef(
   ref: string,
   ctx: BindingContext,
+  options?: { allowMissingPrevious?: boolean },
 ): Promise<unknown> {
-  const { nodeId, pathSegments } = parseRef(ref);
+  const parsed = parseRef(ref);
+  const { kind, nodeId, pathSegments } = parsed;
 
-  if (nodeId === 'params' && !ref.includes(REF_MARKER)) {
+  if (kind === 'params') {
     const params = await loadRunParams(ref, ctx);
     return walkPath(params, pathSegments, ref);
   }
@@ -135,8 +156,9 @@ export async function resolveOutputRef(
     );
   }
 
-  const actId = workActivityId(ctx.snapshot.run.runId, nodeId);
-  const outputRef = ctx.snapshot.outputs.get(actId);
+  const outputRef = kind === 'previous'
+    ? findPreviousLoopOutputRef(ref, nodeId, ctx, options)
+    : findLatestOutputRef(nodeId, ctx);
   if (!outputRef) {
     throw new BindingError(
       `$ref '${ref}' references node '${nodeId}' which has not produced a successful output yet`,
@@ -168,11 +190,61 @@ export async function resolveOutputRef(
   // bare `output` payload.  The `.output.` prefix in `$ref` syntax means
   // "the logical output side" — for hostExecutor we go through the
   // wrapping `output` key, for subagent we walk directly.
-  const root = nodeDef.type === 'hostExecutor'
+  const logicalNodeDef = nodeDef.type === 'loop' && nodeDef.output
+    ? ctx.def.nodes[nodeDef.output.from] ?? nodeDef
+    : nodeDef;
+  const root = logicalNodeDef.type === 'hostExecutor'
     ? (blob as { output?: unknown })?.output
     : blob;
 
   return walkPath(root, pathSegments, ref);
+}
+
+function findLatestOutputRef(nodeId: string, ctx: BindingContext): OutputRef | undefined {
+  const plain = ctx.snapshot.outputs.get(workActivityId(ctx.snapshot.run.runId, nodeId));
+  if (plain) return plain;
+  return findLoopOutputRef(nodeId, ctx);
+}
+
+function findPreviousLoopOutputRef(
+  ref: string,
+  nodeId: string,
+  ctx: BindingContext,
+  options?: { allowMissingPrevious?: boolean },
+): OutputRef | undefined {
+  if (!ctx.loopContext) {
+    throw new BindingError(
+      `$ref '${ref}' uses '.previous.' outside a loop iteration context`,
+    );
+  }
+  if (ctx.loopContext.iteration <= 1) {
+    if (options?.allowMissingPrevious) return undefined;
+    throw new BindingError(`$ref '${ref}' has no previous iteration for iteration 1`);
+  }
+  return findLoopOutputRef(nodeId, ctx, ctx.loopContext.loopId, ctx.loopContext.iteration - 1);
+}
+
+function findLoopOutputRef(
+  nodeId: string,
+  ctx: BindingContext,
+  loopId?: string,
+  iteration?: number,
+): OutputRef | undefined {
+  let best: { iteration: number; outputRef: OutputRef } | undefined;
+  for (const [activityId, outputRef] of ctx.snapshot.outputs.entries()) {
+    const parsed = parseActivityId(activityId);
+    if (!parsed || parsed.kind !== 'loop') continue;
+    if (parsed.nodeId !== nodeId) continue;
+    const nodeDef = ctx.def.nodes[nodeId];
+    const expectedKind = nodeDef?.type === 'decision' ? 'gate' : 'work';
+    if (parsed.activityKind !== expectedKind) continue;
+    if (loopId !== undefined && parsed.loopId !== loopId) continue;
+    if (iteration !== undefined && parsed.iteration !== iteration) continue;
+    if (!best || parsed.iteration > best.iteration) {
+      best = { iteration: parsed.iteration, outputRef };
+    }
+  }
+  return best?.outputRef;
 }
 
 async function loadRunParams(ref: string, ctx: BindingContext): Promise<Record<string, unknown>> {
@@ -296,7 +368,14 @@ async function interpolateStringRefs(value: string, ctx: BindingContext): Promis
     if (!ref) {
       throw new BindingError(`empty string ref interpolation in '${value}'`);
     }
-    const resolved = await resolveOutputRef(ref, ctx);
+    const parsed = parseRef(ref);
+    const resolved = parsed.kind === 'previous' && ctx.loopContext?.iteration === 1
+      ? undefined
+      : await resolveOutputRef(ref, ctx, { allowMissingPrevious: true });
+    if (resolved === undefined && parsed.kind === 'previous') {
+      cursor = end + 1;
+      continue;
+    }
     out += stringifyInterpolatedValue(ref, resolved);
     cursor = end + 1;
   }
