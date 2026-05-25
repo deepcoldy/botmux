@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AskArgsError,
   findMissingAskEnv,
+  normalizeAskDispatch,
   parseAskOptions,
   parseAskTimeoutSeconds,
 } from '../src/core/ask-args.js';
@@ -120,6 +121,48 @@ describe('parseAskTimeoutSeconds', () => {
     expect(() =>
       parseAskTimeoutSeconds('3', { default: 5, min: 1, max: 2 }),
     ).toThrowError(/范围/);
+  });
+});
+
+describe('normalizeAskDispatch', () => {
+  it('canonical form: `ask buttons --options ...` keeps sub=buttons', () => {
+    expect(normalizeAskDispatch(['buttons', '--options', 'yes,no', 'prompt'])).toEqual({
+      sub: 'buttons',
+      rest: ['--options', 'yes,no', 'prompt'],
+    });
+  });
+
+  it('bare alias: `ask --options ...` routes to sub="" with all flags in rest', () => {
+    expect(normalizeAskDispatch(['--options', 'yes,no', 'prompt'])).toEqual({
+      sub: '',
+      rest: ['--options', 'yes,no', 'prompt'],
+    });
+  });
+
+  it('bare alias: `ask --json --options ...` (any leading flag triggers alias)', () => {
+    expect(
+      normalizeAskDispatch(['--json', '--options', 'yes,no', 'prompt']),
+    ).toEqual({
+      sub: '',
+      rest: ['--json', '--options', 'yes,no', 'prompt'],
+    });
+  });
+
+  it('empty tail (just `botmux ask`) routes to sub="" with no rest', () => {
+    expect(normalizeAskDispatch([])).toEqual({ sub: '', rest: [] });
+  });
+
+  it('unknown subcommand passes through so cmdAsk can emit a useful error', () => {
+    expect(normalizeAskDispatch(['text', '--options', 'a,b'])).toEqual({
+      sub: 'text',
+      rest: ['--options', 'a,b'],
+    });
+  });
+
+  it('canonical form equivalence: bare alias and `buttons` produce same `rest`', () => {
+    const bare = normalizeAskDispatch(['--options', 'yes,no', 'p']);
+    const explicit = normalizeAskDispatch(['buttons', '--options', 'yes,no', 'p']);
+    expect(bare.rest).toEqual(explicit.rest);
   });
 });
 

@@ -114,6 +114,28 @@ export function parseAskTimeoutSeconds(
   return n * 1000;
 }
 
+/** Resolve the `(sub, rest)` pair for `botmux ask`'s top-level dispatch.
+ *
+ *  Input: positional args *after* the `ask` token. So for the user typing
+ *  `botmux ask buttons --options yes,no "prompt"` we get
+ *  `['buttons', '--options', 'yes,no', 'prompt']`; for the bare alias
+ *  `botmux ask --options yes,no "prompt"` we get
+ *  `['--options', 'yes,no', 'prompt']`.
+ *
+ *  The first positional starting with `--` means the user skipped the
+ *  subcommand and went straight to flags — that's the bare-alias path; we
+ *  return `sub=''` and let `cmdAsk` apply its v0.1.7 `buttons` default.
+ *  Otherwise the first positional is the subcommand. */
+export function normalizeAskDispatch(
+  tail: ReadonlyArray<string>,
+): { sub: string; rest: string[] } {
+  const next = tail[0] ?? '';
+  if (next.startsWith('--')) {
+    return { sub: '', rest: tail.slice(0) };
+  }
+  return { sub: next, rest: tail.slice(1) };
+}
+
 /** Required env vars on the CLI side (§5). Returns the first missing one so
  *  the caller can produce a single, specific error message. */
 export function findMissingAskEnv(

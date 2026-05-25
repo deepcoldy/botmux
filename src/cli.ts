@@ -3456,7 +3456,14 @@ switch (command) {
   case 'rm':      cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
-  case 'ask':      await cmdAsk(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'ask': {
+    // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
+    // `botmux ask --options ...`         → sub='',        rest=['--options', ...]  (bare alias)
+    const { normalizeAskDispatch } = await import('./core/ask-args.js');
+    const { sub, rest } = normalizeAskDispatch(process.argv.slice(3));
+    await cmdAsk(sub, rest);
+    break;
+  }
   case 'workflow': {
     const { cmdWorkflow } = await import('./cli/workflow.js');
     await cmdWorkflow(process.argv[3] ?? '', process.argv.slice(4));
