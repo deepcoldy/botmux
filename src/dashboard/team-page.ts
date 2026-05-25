@@ -292,7 +292,7 @@ async function showApp(){
   $('btn-delteam').classList.remove('hide');
   $('btn-delteam').onclick = async () => {
     const tn = me.body?.teamName || '当前团队';
-    if (!confirm('删除团队「' + tn + '」？\n该团队的成员关系和邀请将被清除；机器人、接入点不受影响，无法撤销。')) return;
+    if (!confirm('删除团队「' + tn + '」？\\n该团队的成员关系和邀请将被清除；机器人、接入点不受影响，无法撤销。')) return;
     const resp = await fetch('/api/team', { method: 'DELETE' });
     const j = await resp.json().catch(() => ({}));
     if (resp.ok && j.ok) showApp(); else alert('删除失败：' + (j.error || resp.status));
