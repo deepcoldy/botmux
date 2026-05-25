@@ -1,5 +1,5 @@
 /**
- * In-memory broker for `botmux ask` (v0.1.7).
+ * In-memory broker for `botmux ask` (v0.1.8).
  *
  * Holds the pending-ask registry, runs the deadline timers, and arbitrates
  * click resolution. IM-agnostic: the im/lark side wires a dispatcher via
@@ -24,6 +24,12 @@ interface InternalPending extends PendingAsk {
   timeoutHandle: NodeJS.Timeout;
   /** epoch ms when settle ran; undefined while still pending. */
   settledAt?: number;
+  /**
+   * 按问题序号（questionIndex）累积的勾选 key 集合。
+   * 单选问题（multiSelect:false）Set 内最多保留 1 个 key。
+   * 多选问题（multiSelect:true）Set 内可保留任意个 key。
+   */
+  selections: Map<number, Set<string>>;
 }
 
 const pending = new Map<string, InternalPending>();
@@ -78,6 +84,12 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
     // Don't keep the event loop alive just because an ask is pending.
     timeoutHandle.unref?.();
 
+    // 为每个问题初始化空的勾选集合
+    const selections = new Map<number, Set<string>>();
+    for (let i = 0; i < input.questions.length; i++) {
+      selections.set(i, new Set<string>());
+    }
+
     const ask: InternalPending = {
       askId,
       nonce,
@@ -86,13 +98,13 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       rootMessageId: input.rootMessageId,
       sessionId: input.sessionId,
       approvers: input.approvers,
-      options: input.options,
-      prompt: input.prompt,
+      questions: input.questions,
       createdAt,
       deadlineAt,
       settled: false,
       resolve,
       timeoutHandle,
+      selections,
     };
     pending.set(askId, ask);
 
@@ -118,8 +130,118 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
   });
 }
 
+/**
+ * 勾选/取消勾选某问题的某个选项（累积模式，不 settle）。
+ *
+ * 校验同 `tryResolveAsk`：askId 存在 / nonce 匹配 / 未 settle / 已授权 /
+ * questionIndex 合法 / key 在该问题的 options 中。
+ *
+ * 对于单选问题（multiSelect:false），翻转时 Set 内只保留该 key（相当于"换选"）。
+ * 对于多选问题（multiSelect:true），翻转规则：已在 Set 中则移除，否则添加。
+ *
+ * 成功返回 `'toggled'`；非法返回对应 AskClickOutcome。
+ */
+export function toggleAsk(args: {
+  askId: string;
+  nonce: string;
+  questionIndex: number;
+  key: string;
+  by: string;
+}): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  if (!ask) return 'stale';
+  if (ask.nonce !== args.nonce) return 'stale';
+  if (ask.settled) return 'already_settled';
+  if (!ask.approvers.has(args.by)) return 'unauthorized';
+
+  const question = ask.questions[args.questionIndex];
+  if (!question) return 'stale';
+  if (!question.options.some((o) => o.key === args.key)) return 'stale';
+
+  const sel = ask.selections.get(args.questionIndex)!;
+
+  if (question.multiSelect) {
+    // 多选：有则删、无则加
+    if (sel.has(args.key)) {
+      sel.delete(args.key);
+    } else {
+      sel.add(args.key);
+    }
+  } else {
+    // 单选：清空后只保留该 key（等价于"换选"，再次 toggle 同一 key 也保留）
+    sel.clear();
+    sel.add(args.key);
+  }
+
+  return 'toggled';
+}
+
+/**
+ * 提交答案并 settle。
+ *
+ * `selections` 显式传入时直接使用（按钮单选 / 一次性表单提交场景）；
+ * 否则使用 `toggleAsk` 累积的勾选状态。
+ *
+ * 对于 `multiSelect:false` 的问题，要求恰好 1 个选中，否则返回 `'stale'`。
+ * 校验通过则 settle 并返回 `'accepted'`；非法返回对应 AskClickOutcome。
+ */
+export function submitAsk(args: {
+  askId: string;
+  nonce: string;
+  by: string;
+  selections?: ReadonlyArray<ReadonlyArray<string>>;
+}): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  if (!ask) return 'stale';
+  if (ask.nonce !== args.nonce) return 'stale';
+  if (ask.settled) return 'already_settled';
+  if (!ask.approvers.has(args.by)) return 'unauthorized';
+
+  // 构建最终答案数组（按问题顺序）
+  let answers: ReadonlyArray<ReadonlyArray<string>>;
+
+  if (args.selections !== undefined) {
+    // 显式传入：逐问校验单选约束 + key 合法性
+    answers = args.selections;
+    for (let i = 0; i < ask.questions.length; i++) {
+      const q = ask.questions[i]!;
+      const sel = answers[i] ?? [];
+      if (!q.multiSelect && sel.length !== 1) return 'stale';
+      // 校验每个选中的 key 必须在该问题的 options 中
+      for (const key of sel) {
+        if (!q.options.some((o) => o.key === key)) return 'stale';
+      }
+    }
+  } else {
+    // 使用累积的勾选状态
+    const built: string[][] = [];
+    for (let i = 0; i < ask.questions.length; i++) {
+      const q = ask.questions[i]!;
+      const sel = ask.selections.get(i)!;
+      if (!q.multiSelect && sel.size !== 1) return 'stale';
+      built.push([...sel]);
+    }
+    answers = built;
+  }
+
+  settle(args.askId, {
+    kind: 'answered',
+    answers,
+    by: args.by,
+    comment: null,
+    timedOut: false,
+  });
+  return 'accepted';
+}
+
 /** Resolve attempt from a card-button click. Returns one of the §10 outcomes;
  *  caller (card click handler) maps to user-facing toast.
+ *
+ *  v0.1.8 起退化为单问单选的便捷封装：等价于
+ *  `submitAsk({..., selections:[[selected]]})`.
+ *  使 `botmux ask buttons` 与其已有测试零回归。
  *
  *  All four "no-op" outcomes (`unauthorized`/`stale`/`already_settled`) leave
  *  the broker state unchanged so the original CLI Promise keeps waiting for
@@ -130,22 +252,12 @@ export function tryResolveAsk(args: {
   selected: string;
   by: string;
 }): AskClickOutcome {
-  gcSettled();
-  const ask = pending.get(args.askId);
-  if (!ask) return 'stale';                       // unknown id (daemon restart, GC'd, etc.)
-  if (ask.nonce !== args.nonce) return 'stale';   // replayed click from a previous card
-  if (ask.settled) return 'already_settled';      // race loser, still within retention window
-  if (!ask.approvers.has(args.by)) return 'unauthorized';
-  if (!ask.options.some((o) => o.key === args.selected)) return 'stale';
-
-  settle(args.askId, {
-    kind: 'answered',
-    selected: args.selected,
+  return submitAsk({
+    askId: args.askId,
+    nonce: args.nonce,
     by: args.by,
-    comment: null,
-    timedOut: false,
+    selections: [[args.selected]],
   });
-  return 'accepted';
 }
 
 /** Invalidate every pending ask. Intended for daemon shutdown / restart paths
@@ -212,7 +324,7 @@ function settle(askId: string, result: AskResult): void {
 /** Strip broker-internal fields before handing a snapshot to the IM-side
  *  dispatcher. Keeps the dispatcher contract narrow. */
 function snapshot(ask: InternalPending): PendingAsk {
-  const { resolve: _r, timeoutHandle: _t, settledAt: _sat, ...rest } = ask;
+  const { resolve: _r, timeoutHandle: _t, settledAt: _sat, selections: _sel, ...rest } = ask;
   return rest;
 }
 
@@ -242,6 +354,12 @@ export function _pendingCount(): number {
 export function _getPending(askId: string): PendingAsk | undefined {
   const a = pending.get(askId);
   return a ? snapshot(a) : undefined;
+}
+
+/** 返回当前 pending map 中所有 askId 列表（含 settled 但仍在 retention 内的条目）。
+ *  仅供测试使用。 */
+export function _allAskIds(): string[] {
+  return [...pending.keys()];
 }
 
 /** Reset broker state — for tests only. Does NOT resolve outstanding promises,
