@@ -24,7 +24,7 @@ vi.mock('../src/config.js', () => ({
 
 import { handleTeamRoute } from '../src/dashboard/team-routes.js';
 import { claimPairing } from '../src/services/pairing-store.js';
-import { removeMember, DEFAULT_TEAM_ID, createTeam } from '../src/services/team-store.js';
+import { removeMember, DEFAULT_TEAM_ID, createTeam, deleteTeam } from '../src/services/team-store.js';
 import { createInvite } from '../src/services/invite-store.js';
 
 let dataDir: string;
@@ -413,6 +413,46 @@ describe('handleTeamRoute', () => {
     expect(json(res).teamId).toBe(DEFAULT_TEAM_ID);
     expect(json(res).teams.map((t: any) => t.id)).toEqual([DEFAULT_TEAM_ID]);
     expect(json(res).teams.find((t: any) => t.id === teamB)).toBeUndefined();
+  });
+
+  it('multi-team: deleting a team invalidates its invites; join with a stale code fails and does not switch', async () => {
+    const session = await login(); // 张三 in DEFAULT
+    const c = 'bmx_session=' + session;
+    // create B (active=B), mint an invite for B
+    let res = makeRes();
+    await call(makeReq('POST', '/api/team/create', { cookie: c, body: { name: 'B' } }), res, '/api/team/create');
+    const teamB = json(res).teamId;
+    res = makeRes();
+    await call(makeReq('POST', '/api/team/invite', { cookie: c }), res, '/api/team/invite');
+    const staleCode = json(res).code;
+    // delete B (active hops to DEFAULT)
+    res = makeRes();
+    await call(makeReq('DELETE', '/api/team', { cookie: c }), res, '/api/team');
+    expect(res.statusCode).toBe(200);
+    // the stale invite for B can no longer be consumed (dropped on delete) → not_found
+    res = makeRes();
+    await call(makeReq('POST', '/api/team/join', { cookie: c, body: { code: staleCode } }), res, '/api/team/join');
+    expect(res.statusCode).toBe(403);
+    expect(json(res).error).toBe('invite_not_found');
+    // session stayed on DEFAULT, never switched to the deleted team
+    res = makeRes();
+    await call(makeReq('GET', '/api/team/me', { cookie: c }), res, '/api/team/me');
+    expect(json(res).teamId).toBe(DEFAULT_TEAM_ID);
+    expect(json(res).teams.map((t: any) => t.id)).toEqual([DEFAULT_TEAM_ID]);
+  });
+
+  it('multi-team: a pre-cleanup stale invite (team gone) is rejected by the join guard', async () => {
+    const session = await login();
+    const c = 'bmx_session=' + session;
+    // mint an invite for an external team, then delete that team WITHOUT cleanup
+    // (simulates a historical residual invite) — join must still refuse it.
+    const ext = createTeam(dataDir, '外部');
+    const inv = createInvite(dataDir, ext.id, 'someone');
+    deleteTeam(dataDir, ext.id); // delete via store directly, leaving the invite behind
+    const res = makeRes();
+    await call(makeReq('POST', '/api/team/join', { cookie: c, body: { code: inv.code } }), res, '/api/team/join');
+    expect(res.statusCode).toBe(403);
+    expect(json(res).error).toBe('invite_team_deleted');
   });
 
   it('logout clears the session cookie', async () => {

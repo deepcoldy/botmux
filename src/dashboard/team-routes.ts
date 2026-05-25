@@ -18,7 +18,7 @@ import { getWebSession, revokeWebSession, updateSessionTeam, type WebSession } f
 import { buildTeamRoster } from '../services/team-roster.js';
 import { getTeam, removeMember, isMember, listTeams, listTeamsForMember, createTeam, addMember, deleteTeam } from '../services/team-store.js';
 import { loadBotConfigs } from '../bot-registry.js';
-import { createInvite, consumeInvite } from '../services/invite-store.js';
+import { createInvite, consumeInvite, deleteInvitesForTeam } from '../services/invite-store.js';
 import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import { setBotOwner, clearBotOwner } from '../services/bot-owner-store.js';
 import { listConnectors } from '../services/connector-store.js';
@@ -192,6 +192,9 @@ export async function handleTeamRoute(
     if (!code) { jsonRes(res, 400, { ok: false, error: 'code_required' }); return true; }
     const inv = consumeInvite(dataDir, code);
     if (!inv.ok) { jsonRes(res, 403, { ok: false, error: `invite_${inv.reason}` }); return true; }
+    // The team may have been deleted after this invite was minted — don't join /
+    // switch into a non-existent team (also catches any pre-cleanup stale invite).
+    if (!getTeam(dataDir, inv.teamId)) { jsonRes(res, 403, { ok: false, error: 'invite_team_deleted' }); return true; }
     addMember(dataDir, inv.teamId, { ...identity, name: session.identity.name });
     if (!updateSessionTeam(dataDir, sessionToken, inv.teamId)) { jsonRes(res, 409, { ok: false, error: 'session_invalid' }); return true; }
     jsonRes(res, 200, { ok: true, teamId: inv.teamId, name: getTeam(dataDir, inv.teamId)?.name });
@@ -215,6 +218,7 @@ export async function handleTeamRoute(
   if (path === '/api/team' && method === 'DELETE') {
     const removed = deleteTeam(dataDir, session.teamId);
     if (!removed) { jsonRes(res, 404, { ok: false, error: 'team_not_found' }); return true; }
+    deleteInvitesForTeam(dataDir, session.teamId); // "members + invites dropped" — kill stale codes
     const remaining = listTeamsForMember(dataDir, identity);
     const next = remaining[0]?.id ?? '';
     updateSessionTeam(dataDir, sessionToken, next);

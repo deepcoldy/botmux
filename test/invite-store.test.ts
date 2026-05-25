@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createInvite, consumeInvite } from '../src/services/invite-store.js';
+import { createInvite, consumeInvite, deleteInvitesForTeam } from '../src/services/invite-store.js';
 
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-invite-')); });
@@ -39,5 +39,17 @@ describe('invite-store', () => {
   it('codes are unique', () => {
     const codes = new Set(Array.from({ length: 30 }, () => createInvite(dataDir, 'default', 'ou').code));
     expect(codes.size).toBe(30);
+  });
+
+  it('deleteInvitesForTeam drops only that team\'s invites, making them unusable', () => {
+    const a = createInvite(dataDir, 'team_a', 'ou');
+    const a2 = createInvite(dataDir, 'team_a', 'ou');
+    const b = createInvite(dataDir, 'team_b', 'ou');
+    expect(deleteInvitesForTeam(dataDir, 'team_a')).toBe(2);
+    expect(consumeInvite(dataDir, a.code)).toEqual({ ok: false, reason: 'not_found' });
+    expect(consumeInvite(dataDir, a2.code)).toEqual({ ok: false, reason: 'not_found' });
+    // other teams untouched
+    expect(consumeInvite(dataDir, b.code)).toEqual({ ok: true, teamId: 'team_b' });
+    expect(deleteInvitesForTeam(dataDir, 'team_none')).toBe(0);
   });
 });

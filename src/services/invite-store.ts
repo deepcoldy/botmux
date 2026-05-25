@@ -67,6 +67,18 @@ export function createInvite(dataDir: string, teamId: string, createdBy: string,
   return { code, expiresAt: now + ttlMs };
 }
 
+/** Drop every invite for a team (e.g. when the team is deleted), so stale codes
+ *  can't later be consumed to join/switch into a non-existent team. Returns count. */
+export function deleteInvitesForTeam(dataDir: string, teamId: string): number {
+  const data = readFile(dataDir);
+  let removed = 0;
+  for (const [code, inv] of Object.entries(data)) {
+    if (inv.teamId === teamId) { delete data[code]; removed++; }
+  }
+  if (removed) writeFileAtomic(dataDir, data);
+  return removed;
+}
+
 export type ConsumeInviteResult =
   | { ok: true; teamId: string }
   | { ok: false; reason: 'not_found' | 'expired' | 'used' };
