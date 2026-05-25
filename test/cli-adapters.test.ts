@@ -23,13 +23,14 @@ import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
+import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode', 'antigravity'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode', 'antigravity', 'mtr'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -234,6 +235,35 @@ describe('opencode buildArgs', () => {
   });
 });
 
+describe('mtr buildArgs', () => {
+  const adapter = createMtrAdapter('/usr/bin/mtr');
+
+  it('fresh session passes deterministic --set-session and initial prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-session-1', resume: false, initialPrompt: 'hello mtr' });
+    const expected = mtrSessionIdForBotmuxSession('bm-session-1');
+    expect(args).toEqual(['--set-session', expected, '--prompt', 'hello mtr']);
+    expect(expected).toMatch(/^ses_[0-9A-Za-z]+$/);
+  });
+
+  it('resume session passes --session with the same deterministic native id', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-session-1', resume: true });
+    expect(args).toEqual(['--session', mtrSessionIdForBotmuxSession('bm-session-1')]);
+  });
+
+  it('resume prefers a stored MTR-native cliSessionId', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'bm-session-1',
+      resume: true,
+      resumeSessionId: 'ses_001122334455abcdefABCDEF12',
+    });
+    expect(args).toEqual(['--session', 'ses_001122334455abcdefABCDEF12']);
+  });
+
+  it('passesInitialPromptViaArgs is true', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+});
+
 describe('antigravity buildArgs', () => {
   const adapter = createAntigravityAdapter('/usr/local/bin/agy');
 
@@ -348,6 +378,10 @@ describe('completionPattern', () => {
   it('antigravity has no completionPattern', () => {
     expect(createAntigravityAdapter('/bin/agy').completionPattern).toBeUndefined();
   });
+
+  it('mtr has no completionPattern', () => {
+    expect(createMtrAdapter('/bin/mtr').completionPattern).toBeUndefined();
+  });
 });
 
 describe('readyPattern', () => {
@@ -387,6 +421,10 @@ describe('readyPattern', () => {
   it('antigravity has no readyPattern', () => {
     expect(createAntigravityAdapter('/bin/agy').readyPattern).toBeUndefined();
   });
+
+  it('mtr has no readyPattern', () => {
+    expect(createMtrAdapter('/bin/mtr').readyPattern).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -405,6 +443,7 @@ describe('systemHints', () => {
     ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
+    ['mtr', () => createMtrAdapter('/bin/mtr')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -427,6 +466,7 @@ describe('id property', () => {
     ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
+    ['mtr', () => createMtrAdapter('/bin/mtr')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -465,6 +505,10 @@ describe('altScreen property', () => {
 
   it('antigravity uses alt screen (TUI)', () => {
     expect(createAntigravityAdapter('/bin/agy').altScreen).toBe(true);
+  });
+
+  it('mtr uses alt screen (TUI)', () => {
+    expect(createMtrAdapter('/bin/mtr').altScreen).toBe(true);
   });
 });
 
@@ -516,6 +560,14 @@ describe('buildResumeCommand', () => {
   it('opencode does not implement buildResumeCommand', () => {
     const a = createOpenCodeAdapter('/bin/opencode');
     expect(a.buildResumeCommand).toBeUndefined();
+  });
+
+  it('mtr emits `mtr --session <native-session-id>`', () => {
+    const a = createMtrAdapter('/bin/mtr');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-mtr' }))
+      .toBe(`mtr --session ${mtrSessionIdForBotmuxSession('bm-mtr')}`);
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-mtr', cliSessionId: 'ses_001122334455abcdefABCDEF12' }))
+      .toBe('mtr --session ses_001122334455abcdefABCDEF12');
   });
 
   it('antigravity emits `agy --conversation <cliSessionId>` when known, null otherwise', () => {

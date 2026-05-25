@@ -1456,7 +1456,7 @@ function terminalOpenInTabLabel(kind: TerminalSurface['kind']): string {
  *    server-side.
  */
 const RESUME_REQUIRES_CLI_SESSION_ID = new Set<string>(['antigravity', 'cursor']);
-const RESUME_USES_SESSION_ID = new Set<string>(['aiden', 'coco', 'claude-code', 'codex']);
+const RESUME_USES_SESSION_ID = new Set<string>(['aiden', 'coco', 'claude-code', 'codex', 'mtr']);
 function isResumeCapableCli(cliId: string | undefined): boolean {
   return !!cliId && (RESUME_USES_SESSION_ID.has(cliId) || RESUME_REQUIRES_CLI_SESSION_ID.has(cliId));
 }
@@ -1490,7 +1490,7 @@ function renderResumeButtonHtml(
     return `<button type="button" class="btn-link" data-wf-resume-button="1" disabled title="${escapeHtml(t('workflow.detail.resumeUnsupportedCli', { cliId: terminal.cliId ?? '?' }))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
   }
   // Only CLIs that have NO botmux-sessionId fallback (antigravity, cursor)
-  // hard-require cliSessionId — aiden / coco / claude-code / codex resume
+  // hard-require cliSessionId — aiden / coco / claude-code / codex / mtr resume
   // through the original attempt sessionId on the server side now.
   if (cliRequiresNativeSessionId(terminal.cliId) && !terminal.cliSessionId) {
     return `<button type="button" class="btn-link" data-wf-resume-button="1" disabled title="${escapeHtml(t('workflow.detail.resumeMissingCliSession'))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;

@@ -20,5 +20,12 @@
     "cliId": "gemini",
     "allowedUsers": ["charlie@company.com"],
     "workingDir": "~/projects"
+  },
+  {
+    "larkAppId": "cli_xxx_bot4",
+    "larkAppSecret": "your_secret_4",
+    "cliId": "mtr",
+    "allowedUsers": ["dana@company.com"],
+    "workingDir": "~/projects"
   }
 ]

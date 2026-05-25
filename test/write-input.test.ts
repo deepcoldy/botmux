@@ -43,6 +43,7 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -124,12 +125,13 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Codex, Gemini, OpenCode. */
+ *  Codex, Gemini, OpenCode, MTR. */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['codex', createCodexAdapter('/bin/codex')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
   ['opencode', createOpenCodeAdapter('/bin/opencode')],
+  ['mtr', createMtrAdapter('/bin/mtr')],
 ];
 
 /** Adapters that type per-line + `\` soft-newline + Enter (Claude Code idiom). */

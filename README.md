@@ -169,7 +169,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 ## 前置要求
 
 - **Node.js** >= 20
-- **AI 编程 CLI** 已安装并完成认证（`claude`、`codex`、`cursor-agent`、`gemini`、`opencode` 或 `agy`（Antigravity）在 PATH 中）
+- **AI 编程 CLI** 已安装并完成认证（`claude`、`codex`、`cursor-agent`、`gemini`、`opencode`、`mtr` 或 `agy`（Antigravity）在 PATH 中）
 - **tmux** >= 3.x（可选，安装后自动启用会话常驻）
 - **CJK 字体**（用于截图渲染中文/emoji）：
   - macOS 自带 PingFang/Hiragino，无需配置
@@ -547,7 +547,7 @@ botmux setup
 | `larkAppId` | 是 | 飞书应用 App ID |
 | `larkAppSecret` | 是 | 飞书应用 App Secret |
 | `name` | 否 | `botmux status` 中的进程名后缀；例如 `claude-main` 会显示为 `botmux-claude-main`，留空默认 `botmux-<序号>` |
-| `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`cursor`、`gemini`、`opencode`、`antigravity`） |
+| `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`cursor`、`gemini`、`opencode`、`antigravity`、`mtr`） |
 | `cliPathOverride` | 否 | CLI 入口的绝对路径，用于套 wrapper / router；典型场景：ccr、claude-w、aiden-x-claude 等自定义入口 |
 | `backendType` | 否 | 会话后端：`pty` 或 `tmux`（默认自动检测） |
 | `workingDir` | 否 | 默认工作目录，支持逗号分隔多个目录。新话题的 repo 选择卡片会**从该目录自身向下**递归查找 git 仓库（最多 3 层），不再向上扫父目录：指向仓库集合根目录（如 `~/projects`）即列出其下所有仓库，指向单个仓库则只列该仓库（及其 linked worktrees） |

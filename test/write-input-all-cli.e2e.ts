@@ -22,6 +22,7 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 
 // ─── Mock PTY recorder ──────────────────────────────────────────────────────
 
@@ -111,6 +112,7 @@ const ADAPTERS = [
   { name: 'codex', create: () => safeCreate(() => createCodexAdapter()) },
   { name: 'gemini', create: () => safeCreate(() => createGeminiAdapter()) },
   { name: 'opencode', create: () => safeCreate(() => createOpenCodeAdapter()) },
+  { name: 'mtr', create: () => safeCreate(() => createMtrAdapter()) },
 ];
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

@@ -288,7 +288,7 @@ export const messages: Record<string, string> = {
   'setup.lark_perm_chat': '  - im:chat (group info)',
   'setup.lark_perm_user_base': '  - contact:user.base:readonly (user info)',
   'setup.lark_enable_events': 'Enable Event Subscription (WebSocket mode):',
-  'setup.supported_clis': 'Supported CLIs: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini  6) opencode',
+  'setup.supported_clis': 'Supported CLIs: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr',
   'setup.prompt_cli_choice': 'CLI adapter [1]: ',
   'setup.prompt_working_dir': 'Default working directory [~]: ',
   'setup.prompt_allowed_users': 'Allowed users (emails or open_ids, comma-separated; empty = no restriction): ',

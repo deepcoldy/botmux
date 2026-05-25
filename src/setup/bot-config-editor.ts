@@ -9,6 +9,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '6': 'gemini',
   '7': 'opencode',
   '8': 'antigravity',
+  '9': 'mtr',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -16,7 +17,7 @@ const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES)
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
  *   - 空 → undefined (调用方决定 "preserve current" 还是套默认 'claude-code')
- *   - "1".."8" → CLI_ID_CHOICES 映射
+ *   - "1".."9" → CLI_ID_CHOICES 映射
  *   - 已是合法 cliId 字面值 → 原样返回
  *   - 其它 → throw (typo 不该静默落盘成 cliId)
  */
@@ -27,7 +28,7 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
   throw new Error(
-    `Unknown CLI 适配器 "${raw}"。请输入序号 1-8 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-9 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
 }
 

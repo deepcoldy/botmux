@@ -424,9 +424,11 @@ export function cleanupLegacyMcpConfig(cliId: CliId): void {
         }
         break;
       }
-      case 'opencode': {
-        // ~/.config/opencode/opencode.json → { mcp: { botmux } } or { mcpServers: { botmux } }
-        const p = join(home, '.config', 'opencode', 'opencode.json');
+      case 'opencode':
+      case 'mtr': {
+        // ~/.config/opencode/{opencode,mtr}.json → { mcp: { botmux } } or { mcpServers: { botmux } }
+        const file = cliId === 'mtr' ? 'mtr.json' : 'opencode.json';
+        const p = join(home, '.config', 'opencode', file);
         const removed =
           removeJsonKey(p, ['mcp'], 'botmux') ||
           removeJsonKey(p, ['mcpServers'], 'botmux') ||

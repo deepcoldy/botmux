@@ -27,7 +27,7 @@ export const ATTEMPT_RESUME_SCHEMA_VERSION = 1;
 export const ATTEMPT_RESUME_IDLE_MS = 30 * 60 * 1000;
 export const ATTEMPT_RESUME_GRACE_MS = 5000;
 export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'cursor']);
-export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'codex']);
+export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'codex', 'mtr']);
 
 export type AttemptResumeStatus = 'starting' | 'live' | 'closed';
 

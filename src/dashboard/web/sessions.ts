@@ -12,6 +12,7 @@ const CLI_FILTER_OPTIONS = [
   'cursor',
   'gemini',
   'opencode',
+  'mtr',
   'aiden',
   'coco',
   'unknown',

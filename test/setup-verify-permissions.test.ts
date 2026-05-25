@@ -12,10 +12,6 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   const scopeApplyMock = vi.fn();
   class FakeClient {
     application = { scope: { list: scopeListMock, apply: scopeApplyMock } };
-    // checkRequiredScopes now reads scopes via client.request() (GET empty-body
-    // 411 guard) instead of the generated scope.list; delegate to the same
-    // scopeListMock so existing mockResolved/mockRejected setups still apply.
-    request = (...args: unknown[]) => scopeListMock(...args);
     constructor(_: unknown) {}
   }
   return {

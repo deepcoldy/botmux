@@ -1,6 +1,5 @@
-import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
-import { pipeline } from 'node:stream/promises';
 import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
@@ -8,27 +7,6 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
-
-type LarkRequestParams = Record<string, string | number | boolean | undefined>;
-
-/**
- * Call a Feishu GET endpoint without a request body.
- *
- * The official SDK currently lets axios attach `{}` as `data` for generated
- * GET calls such as im.v1.message.list/get, im.v1.chat.get/list,
- * im.v1.chatMembers.isInChat and contact.v3.user.get. Some gateway
- * deployments reject GET-with-body and return HTTP 411 before the OpenAPI
- * handler sees the request. The SDK's generic `client.request()` contains an
- * explicit GET empty-body guard (`fix: #153`) while still using the SDK's
- * token/cache/auth plumbing, so route every read-only GET through it.
- *
- * `url` is the API path (e.g. `/open-apis/im/v1/chats/<id>`); path params must
- * already be interpolated by the caller. Returns the parsed JSON body
- * (`{ code, msg, data }`), identical to the generated method's resolved value.
- */
-export async function larkGet(c: any, url: string, params: LarkRequestParams = {}): Promise<any> {
-  return c.request({ method: 'GET', url, params });
-}
 
 // Cached lightweight Lark clients for all configured bots (for isInChat checks)
 let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
@@ -193,7 +171,9 @@ export async function sendUserMessage(larkAppId: string, openId: string, content
 
 export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
   const c = getBotClient(larkAppId);
-  const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+  const res = await (c as any).im.v1.chat.get({
+    path: { chat_id: chatId },
+  });
   if (res.code !== 0) {
     throw new Error(`Failed to get chat info: ${res.msg} (code: ${res.code})`);
   }
@@ -247,7 +227,9 @@ export async function getChatMode(
   let mode: ChatMode = 'group';
   try {
     const c = getBotClient(larkAppId);
-    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    const res = await (c as any).im.v1.chat.get({
+      path: { chat_id: chatId },
+    });
     if (res.code === 0) {
       const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
       const rawType = String(res.data?.chat_type ?? '').toLowerCase();
@@ -332,9 +314,10 @@ export async function getMessageDetail(
   // Without the param, sub-messages still come back in the "Format A"
   // simplified card shape which extractCardContent handles.
   const userCardContent = options.userCardContent ?? true;
-  const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
-  });
+  const res = await c.im.v1.message.get({
+    path: { message_id: messageId },
+    ...(userCardContent ? { params: { card_msg_content_type: 'user_card_content' } } : {}),
+  } as any);
   if (res.code !== 0) {
     throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
   }
@@ -377,15 +360,9 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
 
 async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
   const c = getBotClient(larkAppId);
-  // Route through client.request() (empty-GET-body guard) instead of the
-  // generated messageResource.get, which sends `{}` as a GET body and trips
-  // gateway 411s. responseType:'stream' makes the interceptor resolve to the
-  // raw readable stream; writeResourceToDisk drains it chunk-by-chunk.
-  const res = await (c as any).request({
-    method: 'GET',
-    url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}`,
+  const res = await (c as any).im.v1.messageResource.get({
+    path: { message_id: messageId, file_key: fileKey },
     params: { type },
-    responseType: 'stream',
   });
   await writeResourceToDisk(res, savePath);
 }
@@ -409,12 +386,11 @@ async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
   } else if (res && typeof res === 'object' && 'writeFile' in res) {
     await res.writeFile(savePath);
   } else {
-    // Raw Readable (client.request with responseType:'stream'). Pipe straight
-    // to disk instead of buffering — this resource API serves files up to
-    // 100MB, so Buffer.concat + writeFileSync would spike memory and block the
-    // event loop under concurrent downloads. pipeline handles backpressure and
-    // closes/cleans up both streams on error.
-    await pipeline(res as NodeJS.ReadableStream, createWriteStream(savePath));
+    const chunks: Buffer[] = [];
+    for await (const chunk of res as AsyncIterable<Buffer>) {
+      chunks.push(Buffer.from(chunk));
+    }
+    writeFileSync(savePath, Buffer.concat(chunks));
   }
 }
 
@@ -537,7 +513,7 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
 /** Get the thread_id (omt_xxx) from the root message via message.get. */
 async function resolveThreadId(c: any, rootMessageId: string): Promise<string | undefined> {
   try {
-    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(rootMessageId)}`);
+    const res = await c.im.v1.message.get({ path: { message_id: rootMessageId } });
     if (res.code === 0) {
       return res.data?.items?.[0]?.thread_id;
     }
@@ -557,12 +533,14 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
   let pageToken: string | undefined;
 
   do {
-    const res = await larkGet(c, '/open-apis/im/v1/messages', {
-      container_id_type: 'thread',
-      container_id: threadId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-      sort_type: 'ByCreateTimeAsc',
-      ...(pageToken ? { page_token: pageToken } : {}),
+    const res = await c.im.v1.message.list({
+      params: {
+        container_id_type: 'thread' as any,
+        container_id: threadId,
+        page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+        sort_type: 'ByCreateTimeAsc' as any,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
     });
 
     if (res.code !== 0) {
@@ -594,12 +572,14 @@ export async function listChatMessages(
   let pageToken: string | undefined;
 
   do {
-    const res = await larkGet(c, '/open-apis/im/v1/messages', {
-      container_id_type: 'chat',
-      container_id: chatId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-      sort_type: 'ByCreateTimeDesc',
-      ...(pageToken ? { page_token: pageToken } : {}),
+    const res = await c.im.v1.message.list({
+      params: {
+        container_id_type: 'chat' as any,
+        container_id: chatId,
+        page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+        sort_type: 'ByCreateTimeDesc' as any,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
     });
 
     if (res.code !== 0) {
@@ -679,12 +659,14 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
   let pageToken: string | undefined;
 
   do {
-    const res = await larkGet(c, '/open-apis/im/v1/messages', {
-      container_id_type: 'chat',
-      container_id: chatId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-      sort_type: 'ByCreateTimeDesc',
-      ...(pageToken ? { page_token: pageToken } : {}),
+    const res = await c.im.v1.message.list({
+      params: {
+        container_id_type: 'chat' as any,
+        container_id: chatId,
+        page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+        sort_type: 'ByCreateTimeDesc' as any,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
     });
 
     if (res.code !== 0) {
@@ -765,7 +747,9 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   const configuredResults = await Promise.all(
     clients.map(async ({ appId, cliId, client }): Promise<ChatBotMember | null> => {
       try {
-        const res = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+        const res = await (client as any).im.v1.chatMembers.isInChat({
+          path: { chat_id: chatId },
+        });
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen

@@ -59,6 +59,10 @@ describe('getCliDisplayName', () => {
   it('should return "OpenCode" for opencode', () => {
     expect(getCliDisplayName('opencode')).toBe('OpenCode');
   });
+
+  it('should return "MTR" for mtr', () => {
+    expect(getCliDisplayName('mtr')).toBe('MTR');
+  });
 });
 
 // ─── buildSessionCard ─────────────────────────────────────────────────────

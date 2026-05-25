@@ -36,15 +36,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
     constructor(opts: { appId: string }) {
       this.appId = opts.appId;
-      this.im = { v1: {} };
-    }
-
-    // isInChat now routes through client.request() (empty-GET-body 411 guard).
-    async request({ url }: { url: string }) {
-      if (url.includes('/members/is_in_chat')) {
-        return { code: 0, data: { is_in_chat: true } };
-      }
-      throw new Error(`unexpected GET url in mock: ${url}`);
+      this.im = {
+        v1: {
+          chatMembers: {
+            isInChat: vi.fn(async () => ({ code: 0, data: { is_in_chat: true } })),
+          },
+        },
+      };
     }
   },
 }));
