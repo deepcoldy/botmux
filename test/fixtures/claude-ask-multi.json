@@ -1,0 +1,26 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "AskUserQuestion",
+  "session_id": "abc123",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "选择测试环境？",
+        "multiSelect": true,
+        "options": [
+          { "label": "staging" },
+          { "label": "canary" },
+          { "label": "production" }
+        ]
+      },
+      {
+        "question": "通知方式？",
+        "multiSelect": false,
+        "options": [
+          { "label": "飞书" },
+          { "label": "邮件" }
+        ]
+      }
+    ]
+  }
+}
