@@ -84,19 +84,12 @@ describe('built-in botmux-workflow-create skill', () => {
   });
 });
 
-describe('built-in botmux-ask skill', () => {
-  it('documents canonical buttons usage and stdout contract', () => {
-    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-ask');
-    expect(skill).toBeDefined();
-    expect(skill!.content).toContain('botmux ask buttons');
-    expect(skill!.content).toContain('--options');
-    expect(skill!.content).toContain('key=label');
-    expect(skill!.content).toContain('stdout');
-    expect(skill!.content).toContain('exit 124');
-    expect(skill!.content).toContain('--json');
-    expect(skill!.content).toContain('覆盖所有结果类型');
-    expect(skill!.content).toContain('timedOut');
-    expect(skill!.content).toContain('selected:null');
-    expect(skill!.content).toContain('botmux send');
+describe('botmux-ask skill 退役', () => {
+  it('BUILTIN_SKILLS 不再包含 botmux-ask（改由 hook 接管）', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-ask')).toBeUndefined();
+  });
+
+  it('RETIRED_SKILL_NAMES 包含 botmux-ask（清理已安装的旧 SKILL.md）', () => {
+    expect(RETIRED_SKILL_NAMES).toContain('botmux-ask');
   });
 });
