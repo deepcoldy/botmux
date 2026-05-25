@@ -1,11 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { PendingAsk } from '../src/core/ask-types.js';
+
+// vi.mock 被 vitest 提升到模块顶层，在 import 之前执行。
+// 用 importOriginal 保留所有真实导出，仅把 submitAsk 替换为可监测的 spy。
+vi.mock('../src/core/ask-broker.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/ask-broker.js')>();
+  return { ...actual, submitAsk: vi.fn(actual.submitAsk) };
+});
+
 import {
   _getPending,
   _resetForTest,
   registerAsk,
   setCardDispatcher,
+  submitAsk,
 } from '../src/core/ask-broker.js';
 import {
   ASK_SELECT_ACTION,
@@ -13,10 +22,15 @@ import {
   buildAskCard,
   createLarkAskCardDispatcher,
   handleAskCardAction,
+  parseFormSelections,
 } from '../src/im/lark/ask-card.js';
+
+const mockedSubmitAsk = vi.mocked(submitAsk);
 
 afterEach(() => {
   _resetForTest();
+  // 只清计数/记录，不重置实现（spy 默认透传真实 submitAsk）
+  mockedSubmitAsk.mockClear();
 });
 
 /** 构造一个带 questions/askId/nonce/deadlineAt/approvers 的 PendingAsk。 */
@@ -237,6 +251,242 @@ describe('handleAskCardAction', () => {
     });
     expect(result?.toast.type).toBe('warning');
     expect(result?.toast.content).toContain('没有权限');
+  });
+});
+
+// ─── parseFormSelections 单元测试 ─────────────────────────────────────────────
+
+describe('parseFormSelections', () => {
+  it('form_value 为数组：多选问题 → selections 收集所有 key', () => {
+    const result = parseFormSelections({ q0: ['0::a', '0::b'] }, 1);
+    expect(result).toEqual([['a', 'b']]);
+  });
+
+  it('form_value 为单字符串：单选问题 → selections=[["y"]]', () => {
+    const result = parseFormSelections({ q0: '0::y' }, 1);
+    expect(result).toEqual([['y']]);
+  });
+
+  it('form_value 为逗号分隔字符串：备用格式 → 拆分后收集 key', () => {
+    const result = parseFormSelections({ q0: '0::a,0::b' }, 1);
+    expect(result).toEqual([['a', 'b']]);
+  });
+
+  it('两问混合：第0问单选字符串 + 第1问数组多选', () => {
+    const result = parseFormSelections({ q0: '0::y', q1: ['1::a', '1::b'] }, 2);
+    expect(result).toEqual([['y'], ['a', 'b']]);
+  });
+
+  it('prefix 不匹配的 token 被过滤掉（防御乱序/跨问混入）', () => {
+    // q0 收到一个 1:: 前缀的混入值，应被忽略
+    const result = parseFormSelections({ q0: ['0::y', '1::x'] }, 1);
+    expect(result).toEqual([['y']]);
+  });
+
+  it('字段缺失时返回空数组', () => {
+    const result = parseFormSelections({}, 2);
+    expect(result).toEqual([[], []]);
+  });
+});
+
+// ─── handleAskCardAction: ask_submit 路径 ─────────────────────────────────────
+
+describe('handleAskCardAction: ask_submit 路径', () => {
+  /** 注册一个真实 pending ask，返回其 askId 和 nonce。 */
+  async function registerTestAsk(overrides: Partial<Parameters<typeof registerAsk>[0]> = {}) {
+    let captured: PendingAsk | undefined;
+    setCardDispatcher({
+      async send(ask) {
+        captured = ask;
+        return { messageId: 'om_ask' };
+      },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'sess-1',
+      approvers: new Set(['ou_owner']),
+      questions: [
+        {
+          prompt: '问题1',
+          options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }],
+          multiSelect: false,
+        },
+      ],
+      timeoutMs: 10_000,
+      ...overrides,
+    });
+    await Promise.resolve();
+    return captured!;
+  }
+
+  it('form_value 为数组（multi_select_static）→ submitAsk 收到 selections=[["a","b"]]', async () => {
+    // 注册含 1 个多选问题的 ask
+    setCardDispatcher({ async send(ask) { return { messageId: 'om_ask' }; } });
+    let capturedAsk: PendingAsk | undefined;
+    setCardDispatcher({
+      async send(ask) {
+        capturedAsk = ask;
+        return { messageId: 'om_ask' };
+      },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'sess-1',
+      approvers: new Set(['ou_owner']),
+      questions: [
+        { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+      timeoutMs: 10_000,
+    });
+    await Promise.resolve();
+
+    mockedSubmitAsk.mockReturnValueOnce('accepted');
+
+    handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION, ask_id: capturedAsk!.askId, nonce: capturedAsk!.nonce },
+        form_value: { q0: ['0::a', '0::b'] },
+      },
+    });
+
+    expect(mockedSubmitAsk).toHaveBeenCalledWith({
+      askId: capturedAsk!.askId,
+      nonce: capturedAsk!.nonce,
+      by: 'ou_owner',
+      selections: [['a', 'b']],
+    });
+  });
+
+  it('form_value 为单字符串（select_static）→ submitAsk 收到 selections=[["y"]]', async () => {
+    const captured = await registerTestAsk();
+
+    mockedSubmitAsk.mockReturnValueOnce('accepted');
+
+    handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION, ask_id: captured.askId, nonce: captured.nonce },
+        form_value: { q0: '0::y' },
+      },
+    });
+
+    expect(mockedSubmitAsk).toHaveBeenCalledWith({
+      askId: captured.askId,
+      nonce: captured.nonce,
+      by: 'ou_owner',
+      selections: [['y']],
+    });
+  });
+
+  it('form_value 为逗号分隔字符串（备用格式）→ submitAsk 收到 selections=[["a","b"]]', async () => {
+    setCardDispatcher({
+      async send(ask) { return { messageId: 'om_ask' }; },
+    });
+    let capturedAsk: PendingAsk | undefined;
+    setCardDispatcher({
+      async send(ask) {
+        capturedAsk = ask;
+        return { messageId: 'om_ask' };
+      },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'sess-1',
+      approvers: new Set(['ou_owner']),
+      questions: [
+        { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+      timeoutMs: 10_000,
+    });
+    await Promise.resolve();
+
+    mockedSubmitAsk.mockReturnValueOnce('accepted');
+
+    handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION, ask_id: capturedAsk!.askId, nonce: capturedAsk!.nonce },
+        form_value: { q0: '0::a,0::b' },
+      },
+    });
+
+    expect(mockedSubmitAsk).toHaveBeenCalledWith({
+      askId: capturedAsk!.askId,
+      nonce: capturedAsk!.nonce,
+      by: 'ou_owner',
+      selections: [['a', 'b']],
+    });
+  });
+
+  it('两问混合：q0 单选字符串 + q1 数组多选 → selections=[["y"],["a","b"]]', async () => {
+    let capturedAsk: PendingAsk | undefined;
+    setCardDispatcher({
+      async send(ask) {
+        capturedAsk = ask;
+        return { messageId: 'om_ask' };
+      },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'sess-1',
+      approvers: new Set(['ou_owner']),
+      questions: [
+        { prompt: 'q1', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
+        { prompt: 'q2', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+      timeoutMs: 10_000,
+    });
+    await Promise.resolve();
+
+    mockedSubmitAsk.mockReturnValueOnce('accepted');
+
+    handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION, ask_id: capturedAsk!.askId, nonce: capturedAsk!.nonce },
+        form_value: { q0: '0::y', q1: ['1::a', '1::b'] },
+      },
+    });
+
+    expect(mockedSubmitAsk).toHaveBeenCalledWith({
+      askId: capturedAsk!.askId,
+      nonce: capturedAsk!.nonce,
+      by: 'ou_owner',
+      selections: [['y'], ['a', 'b']],
+    });
+  });
+
+  it('缺少 askId/nonce → 返回 staleToast，submitAsk 不被调用', () => {
+    handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION },
+        form_value: { q0: '0::y' },
+      },
+    });
+
+    expect(mockedSubmitAsk).not.toHaveBeenCalled();
+  });
+
+  it('缺少 askId/nonce → 返回含"失效"字样的 warning toast', () => {
+    const result = handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION },
+        form_value: { q0: '0::y' },
+      },
+    });
+
+    expect(result?.toast.content).toContain('失效');
   });
 });
 

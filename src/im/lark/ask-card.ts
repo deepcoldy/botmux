@@ -4,7 +4,7 @@ import type {
   AskResult,
   PendingAsk,
 } from '../../core/ask-types.js';
-import { tryResolveAsk } from '../../core/ask-broker.js';
+import { submitAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 
@@ -84,7 +84,15 @@ export function handleAskCardAction(data: AskCardActionData): { toast: { type: s
     return toastForOutcome(tryResolveAsk({ askId, nonce, selected, by }));
   }
 
-  // 新 Submit 路径（Task 5 会完整实现）：暂返回 stale，避免未处理静默忽略
+  // 新 Submit 路径：从 form_value 中防御式解析各问答案，调 submitAsk
+  if (action === ASK_SUBMIT_ACTION) {
+    const formValue = data.action?.form_value ?? {};
+    // 推断问题数量：找最大 qN 的 N+1
+    const questionCount = guessQuestionCount(formValue);
+    const selections = parseFormSelections(formValue, questionCount);
+    return toastForOutcome(submitAsk({ askId, nonce, by, selections }));
+  }
+
   return staleToast();
 }
 
@@ -181,6 +189,58 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
     },
     elements,
   });
+}
+
+/**
+ * 从 form_value 中推断问题数量（取最大 qN 索引 + 1，最少 1）。
+ */
+function guessQuestionCount(formValue: Record<string, unknown>): number {
+  let max = -1;
+  for (const key of Object.keys(formValue)) {
+    const m = key.match(/^q(\d+)$/);
+    if (m) {
+      const idx = parseInt(m[1]!, 10);
+      if (idx > max) max = idx;
+    }
+  }
+  return max >= 0 ? max + 1 : 1;
+}
+
+/**
+ * 防御式解析 Lark form_value，将每个 q<i> 字段的编码选项解析为选中 key 数组。
+ *
+ * 字段值可能为：
+ *  - string[]（multi_select_static 多选）
+ *  - string（select_static 单选，或 comma/semicolon 分隔的字符串）
+ *
+ * 每个编码值格式为 `<questionIndex>::<key>`，只收集 prefix 匹配的条目并剥去前缀。
+ * 导出供单元测试直接调用。
+ */
+export function parseFormSelections(
+  formValue: Record<string, unknown>,
+  questionCount: number,
+): string[][] {
+  const result: string[][] = [];
+  for (let i = 0; i < questionCount; i++) {
+    const raw = formValue[`q${i}`];
+    // 规范化为字符串数组
+    let tokens: string[];
+    if (Array.isArray(raw)) {
+      tokens = raw.filter((v): v is string => typeof v === 'string');
+    } else if (typeof raw === 'string') {
+      // 逗号或分号分隔的备用格式
+      tokens = raw.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+    } else {
+      tokens = [];
+    }
+    // 筛选出 prefix 匹配 `i::` 的 token，剥去前缀取 key
+    const prefix = `${i}::`;
+    const keys = tokens
+      .filter((t) => t.startsWith(prefix))
+      .map((t) => t.slice(prefix.length));
+    result.push(keys);
+  }
+  return result;
 }
 
 function toastForOutcome(outcome: AskClickOutcome): { toast: { type: string; content: string } } | undefined {
