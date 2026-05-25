@@ -103,6 +103,10 @@ describe('handleTeamRoute', () => {
     // Regression: overlays use class="overlay hide"; .overlay sets display:flex,
     // so a compound .overlay.hide rule must exist or modals show on load + won't close.
     expect(res._body).toContain('.overlay.hide { display: none; }');
+    // Roster filter bar (① organization): search + CLI filter + selection count.
+    expect(res._body).toContain('id="rf-search"');
+    expect(res._body).toContain('id="rf-cli"');
+    expect(res._body).toContain('已选');
   });
 
   it('team APIs require a session (401 without bmx_session)', async () => {

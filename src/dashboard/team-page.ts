@@ -63,6 +63,14 @@ export const TEAM_PAGE_HTML = `<!doctype html>
   <section id="app" class="hide">
     <section class="card">
       <h2>团队花名册 <span class="muted" id="team-meta"></span></h2>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:13px">
+        <input id="rf-search" placeholder="搜索 名称/能力/CLI…" style="font:inherit;padding:5px 9px;border:1px solid #d0d3d9;border-radius:8px">
+        <select id="rf-cli" style="font:inherit;padding:5px"><option value="">全部 CLI</option></select>
+        <label><input type="checkbox" id="rf-cap"> 有能力标签</label>
+        <label><input type="checkbox" id="rf-role"> 有团队角色</label>
+        <label><input type="checkbox" id="rf-ment"> 仅可点名</label>
+        <span class="muted" id="rf-count"></span>
+      </div>
       <table><thead><tr><th></th><th>机器人</th><th>CLI</th><th>能力标签</th><th>团队角色</th></tr></thead>
         <tbody id="roster"></tbody></table>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -126,6 +134,44 @@ async function jget(u){ const r = await fetch(u); return { status:r.status, body
 async function jpost(u, b){ const r = await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined}); return { status:r.status, body: await r.json().catch(()=>({})) }; }
 async function jput(u, b){ const r = await fetch(u,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(b||{})}); return { status:r.status, body: await r.json().catch(()=>({})) }; }
 
+// Roster state + client-side filtering. Selection (for 拉群) lives in a Set;
+// filtering removes now-hidden bots from it, so a hidden row is never submitted.
+let rosterBots = [];
+const picked = new Set();
+function rosterMatch(b){
+  const q = ($('rf-search').value || '').trim().toLowerCase();
+  if (q && !((b.name||'') + ' ' + (b.cliId||'') + ' ' + (b.capability||'')).toLowerCase().includes(q)) return false;
+  const cli = $('rf-cli').value; if (cli && b.cliId !== cli) return false;
+  if ($('rf-cap').checked && !b.capability) return false;
+  if ($('rf-role').checked && !b.hasTeamRole) return false;
+  if ($('rf-ment').checked && !b.mentionable) return false;
+  return true;
+}
+function updateRosterCount(visibleCount){
+  $('rf-count').textContent = '共 ' + visibleCount + ' / ' + rosterBots.length + ' 个 · 已选 ' + picked.size + '（均可见）';
+}
+function renderRoster(){
+  const f = rosterBots.filter(rosterMatch);
+  const visible = new Set(f.map(b => b.larkAppId).filter(Boolean));
+  [...picked].forEach(a => { if (!visible.has(a)) picked.delete(a); }); // hidden ⇒ deselected
+  $('roster').innerHTML = f.map(b => {
+    const app = esc(b.larkAppId || '');
+    const ck = app && picked.has(b.larkAppId) ? ' checked' : '';
+    return '<tr><td>'+(app?'<input type="checkbox" class="botpick" data-app="'+app+'"'+ck+'>':'')+'</td><td>'+esc(b.name)+'</td><td class="muted">'+esc(b.cliId)+'</td>'
+      + '<td><input class="capedit" data-app="'+app+'" value="'+esc(b.capability||'')+'" placeholder="能力标签…"></td>'
+      + '<td><button class="roleedit" data-app="'+app+'" data-name="'+esc(b.name)+'">'+(b.hasTeamRole?'已设·改':'设置')+'</button></td></tr>';
+  }).join('') || '<tr><td colspan=5 class=muted>没有符合条件的机器人</td></tr>';
+  updateRosterCount(f.length);
+  document.querySelectorAll('.botpick').forEach(cb => {
+    cb.onchange = () => { if (cb.checked) picked.add(cb.dataset.app); else picked.delete(cb.dataset.app); updateRosterCount(f.length); };
+  });
+  document.querySelectorAll('.capedit').forEach(inp => {
+    inp.onchange = async () => { await jput('/api/team/bots/'+encodeURIComponent(inp.dataset.app)+'/capability', { capability: inp.value }); };
+  });
+  document.querySelectorAll('.roleedit').forEach(btn => { btn.onclick = () => openRoleModal(btn.dataset.app, btn.dataset.name); });
+}
+['rf-search','rf-cli','rf-cap','rf-role','rf-ment'].forEach(id => { const el = $(id); if (el) { el.oninput = renderRoster; el.onchange = renderRoster; } });
+
 let pollTimer = null;
 
 async function showApp(){
@@ -138,18 +184,10 @@ async function showApp(){
   const r = await jget('/api/team/roster');
   const t = r.body || {};
   $('team-meta').textContent = (t.team?.name || '') + ' · ' + (t.team?.memberCount ?? 0) + ' 名成员';
-  $('roster').innerHTML = (t.bots||[]).map(b => {
-    const app = esc(b.larkAppId || '');
-    return '<tr><td>'+(app?'<input type="checkbox" class="botpick" data-app="'+app+'">':'')+'</td><td>'+esc(b.name)+'</td><td class="muted">'+esc(b.cliId)+'</td>'
-      + '<td><input class="capedit" data-app="'+app+'" value="'+esc(b.capability||'')+'" placeholder="能力标签…"></td>'
-      + '<td><button class="roleedit" data-app="'+app+'" data-name="'+esc(b.name)+'">'+(b.hasTeamRole?'已设·改':'设置')+'</button></td></tr>';
-  }).join('') || '<tr><td colspan=5 class=muted>暂无机器人</td></tr>';
-  document.querySelectorAll('.capedit').forEach(inp => {
-    inp.onchange = async () => { await jput('/api/team/bots/'+encodeURIComponent(inp.dataset.app)+'/capability', { capability: inp.value }); };
-  });
-  document.querySelectorAll('.roleedit').forEach(btn => {
-    btn.onclick = () => openRoleModal(btn.dataset.app, btn.dataset.name);
-  });
+  rosterBots = t.bots || [];
+  const clis = Array.from(new Set(rosterBots.map(b => b.cliId).filter(Boolean))).sort();
+  $('rf-cli').innerHTML = '<option value="">全部 CLI</option>' + clis.map(c => '<option value="'+esc(c)+'">'+esc(c)+'</option>').join('');
+  renderRoster();
 
   const c = await jget('/api/team/connectors');
   $('connectors').innerHTML = (c.body?.connectors||[]).map(x =>
@@ -235,7 +273,7 @@ async function openConnModal(){
 $('cn-mode').onchange = syncConnFields; $('cn-kind').onchange = syncConnFields;
 $('btn-newconn').onclick = openConnModal;
 $('btn-group').onclick = async () => {
-  const apps = Array.from(document.querySelectorAll('.botpick')).filter(cb => cb.checked).map(cb => cb.dataset.app);
+  const apps = [...picked]; // only currently-visible selected bots (hidden rows pruned from the Set)
   $('grp-out').classList.remove('hide');
   if (apps.length === 0) { $('grp-out').innerHTML = '<span class="err">请先在上方勾选至少一个机器人</span>'; return; }
   const name = $('grp-name').value.trim() || '协作群';
