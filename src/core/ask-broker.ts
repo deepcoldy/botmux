@@ -22,10 +22,18 @@ import type {
 interface InternalPending extends PendingAsk {
   resolve: (result: AskResult) => void;
   timeoutHandle: NodeJS.Timeout;
+  /** epoch ms when settle ran; undefined while still pending. */
+  settledAt?: number;
 }
 
 const pending = new Map<string, InternalPending>();
 let dispatcher: AskCardDispatcher | null = null;
+
+/** Window during which a settled ask is still queryable so race-losers get a
+ *  precise `already_settled` outcome (and the card click handler can show
+ *  "已被 X 答了" instead of a generic "已失效"). After this window expires,
+ *  late clicks fall through to `stale` like any forgotten id. */
+const SETTLED_RETENTION_MS = 60_000;
 
 /** Wire the IM-side dispatcher. Called once during daemon bootstrap from
  *  daemon.ts after im/lark/ask-card.ts is constructed. */
@@ -122,10 +130,11 @@ export function tryResolveAsk(args: {
   selected: string;
   by: string;
 }): AskClickOutcome {
+  gcSettled();
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';                       // unknown id (daemon restart, GC'd, etc.)
   if (ask.nonce !== args.nonce) return 'stale';   // replayed click from a previous card
-  if (ask.settled) return 'already_settled';      // race loser
+  if (ask.settled) return 'already_settled';      // race loser, still within retention window
   if (!ask.approvers.has(args.by)) return 'unauthorized';
   if (!ask.options.some((o) => o.key === args.selected)) return 'stale';
 
@@ -141,9 +150,12 @@ export function tryResolveAsk(args: {
 
 /** Invalidate every pending ask. Intended for daemon shutdown / restart paths
  *  so CLI subprocesses unblock with `kind:'invalidated'` instead of waiting
- *  forever on a dead daemon. */
+ *  forever on a dead daemon. Returns the number of asks actually settled
+ *  (settled-but-retained entries from the race window are skipped). */
 export function invalidateAll(reason: string): number {
-  const ids = [...pending.keys()];
+  const ids = [...pending.entries()]
+    .filter(([, ask]) => !ask.settled)
+    .map(([id]) => id);
   for (const id of ids) {
     settle(id, {
       kind: 'invalidated',
@@ -161,13 +173,18 @@ export function invalidateAll(reason: string): number {
 }
 
 /** Internal — settle an ask exactly once and notify the dispatcher's onSettle
- *  hook (best-effort, never blocks broker state transitions). */
+ *  hook (best-effort, never blocks broker state transitions). The settled
+ *  entry stays in the map for `SETTLED_RETENTION_MS` so late race-losers get
+ *  a precise `already_settled` outcome; `gcSettled` reaps it afterward. */
 function settle(askId: string, result: AskResult): void {
   const ask = pending.get(askId);
   if (!ask || ask.settled) return;
   ask.settled = true;
+  ask.settledAt = Date.now();
   clearTimeout(ask.timeoutHandle);
-  pending.delete(askId);
+  // Reap older settled entries opportunistically — keeps the map bounded
+  // without paying for a dedicated GC timer.
+  gcSettled();
 
   try {
     ask.resolve(result);
@@ -195,15 +212,29 @@ function settle(askId: string, result: AskResult): void {
 /** Strip broker-internal fields before handing a snapshot to the IM-side
  *  dispatcher. Keeps the dispatcher contract narrow. */
 function snapshot(ask: InternalPending): PendingAsk {
-  const { resolve: _r, timeoutHandle: _t, ...rest } = ask;
+  const { resolve: _r, timeoutHandle: _t, settledAt: _sat, ...rest } = ask;
   return rest;
+}
+
+/** Drop settled entries that have aged past the retention window. Cheap O(n)
+ *  walk — n is tiny in practice (≤ a few dozen pending+recent asks). */
+function gcSettled(): void {
+  const cutoff = Date.now() - SETTLED_RETENTION_MS;
+  for (const [id, ask] of pending) {
+    if (ask.settled && ask.settledAt !== undefined && ask.settledAt < cutoff) {
+      pending.delete(id);
+    }
+  }
 }
 
 // ---- diagnostics for tests ---------------------------------------------------
 
-/** Pending ask count — for tests and metrics. Not part of the public API. */
+/** Count of asks still awaiting a click / timeout — excludes settled entries
+ *  retained within the race-loser feedback window. For tests and metrics only. */
 export function _pendingCount(): number {
-  return pending.size;
+  let n = 0;
+  for (const ask of pending.values()) if (!ask.settled) n++;
+  return n;
 }
 
 /** Read a pending ask by id — for tests only. Returns a snapshot; mutating it
