@@ -202,7 +202,12 @@ export async function checkRequiredScopes(
 
   let resp: any;
   try {
-    resp = await client.application.scope.list();
+    // Route through client.request() (GET empty-body guard) instead of the
+    // generated application.scope.list, which sends `{}` as a GET body and
+    // trips gateway 411s — same root cause as the IM read fixes. Inlined here
+    // (rather than importing larkGet) to keep setup code decoupled from the
+    // runtime IM client module. Resolves to { code, msg, data }, unchanged.
+    resp = await (client as any).request({ method: 'GET', url: '/open-apis/application/v6/scopes' });
   } catch (err: any) {
     return { ok: false, error: 'network', message: `scope.list 调用失败: ${err?.code ?? err?.message ?? 'unknown'}` };
   }
