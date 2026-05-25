@@ -10,6 +10,7 @@
  * proxy selection happens at the route layer.
  */
 import { getBotClient } from '../bot-registry.js';
+import { larkGet } from '../im/lark/client.js';
 
 export interface ChatBrief {
   chatId: string;
@@ -28,12 +29,10 @@ export async function listChats(larkAppId: string): Promise<ChatBrief[]> {
   const out: ChatBrief[] = [];
   let pageToken: string | undefined;
   do {
-    const res: any = await (client as any).im.v1.chat.list({
-      params: {
-        page_size: 100,
-        user_id_type: 'open_id',
-        ...(pageToken ? { page_token: pageToken } : {}),
-      },
+    const res: any = await larkGet(client, '/open-apis/im/v1/chats', {
+      page_size: 100,
+      user_id_type: 'open_id',
+      ...(pageToken ? { page_token: pageToken } : {}),
     });
     if (res.code !== 0 && res.code !== undefined) {
       throw new Error(`Failed to list chats: ${res.msg} (code: ${res.code})`);
@@ -63,9 +62,7 @@ export async function listChats(larkAppId: string): Promise<ChatBrief[]> {
 export async function isInChat(larkAppId: string, chatId: string): Promise<boolean> {
   const client = getBotClient(larkAppId);
   try {
-    const res: any = await (client as any).im.v1.chatMembers.isInChat({
-      path: { chat_id: chatId },
-    });
+    const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
     if (res.code !== 0 && res.code !== undefined) return false;
     return !!res.data?.is_in_chat;
   } catch {
@@ -160,9 +157,8 @@ export async function getChatOwner(
 ): Promise<string | undefined> {
   const client = getBotClient(larkAppId);
   try {
-    const res: any = await (client as any).im.v1.chat.get({
-      path: { chat_id: chatId },
-      params: { user_id_type: 'open_id' },
+    const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
+      user_id_type: 'open_id',
     });
     if (res.code !== 0 && res.code !== undefined) return undefined;
     const owner = res.data?.owner_id;

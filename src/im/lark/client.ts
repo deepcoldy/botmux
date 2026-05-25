@@ -14,13 +14,18 @@ type LarkRequestParams = Record<string, string | number | boolean | undefined>;
  * Call a Feishu GET endpoint without a request body.
  *
  * The official SDK currently lets axios attach `{}` as `data` for generated
- * GET calls such as im.v1.message.list/get. Some gateway deployments reject
- * GET-with-body and return HTTP 411 before the OpenAPI handler sees the
- * request. `client.request()` contains an explicit GET empty-body guard, while
- * still using the SDK's token/cache/auth plumbing, so use it for read-only
- * message history/detail calls.
+ * GET calls such as im.v1.message.list/get, im.v1.chat.get/list,
+ * im.v1.chatMembers.isInChat and contact.v3.user.get. Some gateway
+ * deployments reject GET-with-body and return HTTP 411 before the OpenAPI
+ * handler sees the request. The SDK's generic `client.request()` contains an
+ * explicit GET empty-body guard (`fix: #153`) while still using the SDK's
+ * token/cache/auth plumbing, so route every read-only GET through it.
+ *
+ * `url` is the API path (e.g. `/open-apis/im/v1/chats/<id>`); path params must
+ * already be interpolated by the caller. Returns the parsed JSON body
+ * (`{ code, msg, data }`), identical to the generated method's resolved value.
  */
-async function larkGet(c: any, url: string, params: LarkRequestParams = {}): Promise<any> {
+export async function larkGet(c: any, url: string, params: LarkRequestParams = {}): Promise<any> {
   return c.request({ method: 'GET', url, params });
 }
 
@@ -187,9 +192,7 @@ export async function sendUserMessage(larkAppId: string, openId: string, content
 
 export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
   const c = getBotClient(larkAppId);
-  const res = await (c as any).im.v1.chat.get({
-    path: { chat_id: chatId },
-  });
+  const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
   if (res.code !== 0) {
     throw new Error(`Failed to get chat info: ${res.msg} (code: ${res.code})`);
   }
@@ -243,9 +246,7 @@ export async function getChatMode(
   let mode: ChatMode = 'group';
   try {
     const c = getBotClient(larkAppId);
-    const res = await (c as any).im.v1.chat.get({
-      path: { chat_id: chatId },
-    });
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
     if (res.code === 0) {
       const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
       const rawType = String(res.data?.chat_type ?? '').toLowerCase();
@@ -375,9 +376,15 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
 
 async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
   const c = getBotClient(larkAppId);
-  const res = await (c as any).im.v1.messageResource.get({
-    path: { message_id: messageId, file_key: fileKey },
+  // Route through client.request() (empty-GET-body guard) instead of the
+  // generated messageResource.get, which sends `{}` as a GET body and trips
+  // gateway 411s. responseType:'stream' makes the interceptor resolve to the
+  // raw readable stream; writeResourceToDisk drains it chunk-by-chunk.
+  const res = await (c as any).request({
+    method: 'GET',
+    url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}`,
     params: { type },
+    responseType: 'stream',
   });
   await writeResourceToDisk(res, savePath);
 }
@@ -756,9 +763,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   const configuredResults = await Promise.all(
     clients.map(async ({ appId, cliId, client }): Promise<ChatBotMember | null> => {
       try {
-        const res = await (client as any).im.v1.chatMembers.isInChat({
-          path: { chat_id: chatId },
-        });
+        const res = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen

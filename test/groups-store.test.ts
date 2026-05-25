@@ -12,31 +12,45 @@ const chatCreateStub = vi.fn();
 const chatUpdateStub = vi.fn();
 
 // Mock bot-registry's getBotClient — that's where groups-store imports from.
+// Read-only GETs (listChats / isInChat / getChatOwner) now go through
+// `client.request()` to avoid the empty-GET-body 411; mutating calls
+// (chat.create / chat.update / chatMembers.create) stay on generated methods.
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn().mockImplementation(() => ({
+    request: vi.fn().mockImplementation(async ({ url }: { url: string }) => {
+      if (url.includes('/members/is_in_chat')) {
+        return { code: 0, data: { is_in_chat: true } };
+      }
+      if (/\/open-apis\/im\/v1\/chats$/.test(url)) {
+        return {
+          code: 0,
+          data: {
+            items: [
+              {
+                chat_id: 'c1',
+                name: 'one',
+                description: 'first chat',
+                chat_mode: 'group',
+                owner_id: 'ou_owner',
+              },
+            ],
+            has_more: false,
+          },
+        };
+      }
+      // getChatOwner: GET /open-apis/im/v1/chats/<id>
+      if (/\/open-apis\/im\/v1\/chats\/[^/]+$/.test(url)) {
+        return { code: 0, data: { owner_id: 'ou_owner' } };
+      }
+      throw new Error(`unexpected GET url in mock: ${url}`);
+    }),
     im: {
       v1: {
         chat: {
-          list: vi.fn().mockResolvedValue({
-            code: 0,
-            data: {
-              items: [
-                {
-                  chat_id: 'c1',
-                  name: 'one',
-                  description: 'first chat',
-                  chat_mode: 'group',
-                  owner_id: 'ou_owner',
-                },
-              ],
-              has_more: false,
-            },
-          }),
           create: chatCreateStub,
           update: chatUpdateStub,
         },
         chatMembers: {
-          isInChat: vi.fn().mockResolvedValue({ code: 0, data: { is_in_chat: true } }),
           create: vi.fn().mockResolvedValue({
             code: 0,
             data: { invalid_id_list: ['cli_X'] },
