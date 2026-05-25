@@ -23,6 +23,7 @@ import { join, dirname } from 'node:path';
 import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
+import { larkGet } from './client.js';
 
 export type IdentityType = 'user' | 'bot' | 'app' | 'unknown';
 
@@ -214,9 +215,8 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
 async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
   try {
     const c = getBotClient(larkAppId);
-    const res = await (c as any).contact.v3.user.get({
-      path: { user_id: openId },
-      params: { user_id_type: 'open_id' },
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
     });
     if (res?.code === 0) {
       const name: string | undefined = res.data?.user?.name;
