@@ -446,6 +446,14 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
+  // §5 of botmux ask v0.1.7: `botmux ask buttons` / `botmux hook <cli>` read
+  // these to locate the daemon, route the card back to this thread, and
+  // resolve approvers from session.owner. Without them, the hook client falls
+  // back to passthrough and the agent never reaches the Lark card.
+  'BOTMUX_SESSION_ID',
+  'BOTMUX_CHAT_ID',
+  'BOTMUX_LARK_APP_ID',
+  'BOTMUX_ROOT_MESSAGE_ID',
 ] as const;
 
 /**
