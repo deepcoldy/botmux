@@ -712,7 +712,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     systemHints: [],
     altScreen: false,
     skillsDir: '~/.claude/skills',
-    // botmux hook 安装：spawn 时把 PermissionRequest 钩子写入 Claude settings.json，
+    // botmux hook 安装：spawn 时把 PreToolUse/AskUserQuestion 钩子写入 Claude settings.json，
     // 使 AskUserQuestion 事件自动转发到 `botmux hook claude-code`。
     hookInstall: {
       configPath: '~/.claude/settings.json',

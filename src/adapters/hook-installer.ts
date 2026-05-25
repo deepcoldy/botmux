@@ -73,22 +73,38 @@ function isBotmuxAskHookGroup(group: ClaudeHookGroup, hookCommand: string): bool
   );
 }
 
+function removeBotmuxAskHookGroups(
+  hooks: Record<string, ClaudeHookGroup[]>,
+  eventName: string,
+  hookCommand: string,
+): void {
+  const existing = hooks[eventName] ?? [];
+  const filtered = existing.filter((g) => !isBotmuxAskHookGroup(g, hookCommand));
+  if (filtered.length === 0) {
+    delete hooks[eventName];
+  } else {
+    hooks[eventName] = filtered;
+  }
+}
+
 /**
- * 向 Claude settings.json 的 hooks.PermissionRequest 合并 botmux ask hook entry。
+ * 向 Claude settings.json 的 hooks.PreToolUse 合并 botmux ask hook entry。
+ * AskUserQuestion 在 bypassPermissions 模式下不会经过 PermissionRequest，
+ * 但 PreToolUse 仍会在工具执行前触发，因此这里必须挂 PreToolUse。
  * 保留其他事件和 entry，不破坏无关配置。
  */
 function installClaudeSettings(configPath: string, hookCommand: string): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   const existingHooks = settings.hooks ?? {};
 
-  // 构造 botmux PermissionRequest hook group（matcher=* 拦截所有工具，含 AskUserQuestion）
+  // 构造 botmux PreToolUse hook group（只拦截 AskUserQuestion）
   const newEntry: ClaudeHookEntry = { type: 'command', command: hookCommand, timeout: 86400 };
-  const newGroup: ClaudeHookGroup = { matcher: '*', hooks: [newEntry] };
+  const newGroup: ClaudeHookGroup = { matcher: 'AskUserQuestion', hooks: [newEntry] };
 
-  // 过滤掉旧的 botmux ask hook group（幂等：同 hookCommand 只保留一份）
-  const existing = existingHooks['PermissionRequest'] ?? [];
-  const filtered = existing.filter((g) => !isBotmuxAskHookGroup(g, hookCommand));
-  existingHooks['PermissionRequest'] = [...filtered, newGroup];
+  // 过滤掉旧的 botmux ask hook group（幂等 + 从 PermissionRequest 迁移到 PreToolUse）
+  removeBotmuxAskHookGroups(existingHooks, 'PermissionRequest', hookCommand);
+  removeBotmuxAskHookGroups(existingHooks, 'PreToolUse', hookCommand);
+  existingHooks['PreToolUse'] = [...(existingHooks['PreToolUse'] ?? []), newGroup];
 
   settings.hooks = existingHooks;
   const content = JSON.stringify(settings, null, 2) + '\n';

@@ -1,10 +1,10 @@
 /**
  * Claude Code hook adapter。
  *
- * Claude Code 通过 PermissionRequest hook 发起 AskUserQuestion，
+ * Claude Code 通过 PreToolUse hook 发起 AskUserQuestion，
  * payload 形状：
  *   {
- *     hook_event_name: 'PermissionRequest',
+ *     hook_event_name: 'PreToolUse',
  *     tool_name: 'AskUserQuestion',
  *     tool_input: {
  *       questions: [
@@ -20,15 +20,13 @@
  * Claude Code 期望的 answer directive（hookSpecificOutput）形状：
  *   {
  *     hookSpecificOutput: {
- *       hookEventName: 'PermissionRequest',
- *       decision: {
- *         behavior: 'allow',
- *         updatedInput: {
- *           questions: <原始 questions 数组>,
- *           answers: {
- *             '问题文本': '选项label1, 选项label2',
- *             ...
- *           }
+ *       hookEventName: 'PreToolUse',
+ *       permissionDecision: 'allow',
+ *       updatedInput: {
+ *         questions: <原始 questions 数组>,
+ *         answers: {
+ *           '问题文本': '选项label1, 选项label2',
+ *           ...
  *         }
  *       }
  *     }
@@ -37,8 +35,9 @@
  * passthrough（放行）directive 形状：
  *   {
  *     hookSpecificOutput: {
- *       hookEventName: 'PermissionRequest',
- *       decision: { behavior: 'allow', updatedInput: { questions: [...], answers: {} } }
+ *       hookEventName: 'PreToolUse',
+ *       permissionDecision: 'allow',
+ *       updatedInput: { questions: [...], answers: {} }
  *     }
  *   }
  *
@@ -66,8 +65,8 @@ const claudeCodeAdapter: HookAskAdapter = {
     if (!payload || typeof payload !== 'object') return null;
     const p = payload as Record<string, unknown>;
 
-    // 只处理 PermissionRequest + AskUserQuestion 事件
-    if (p.hook_event_name !== 'PermissionRequest') return null;
+    // 处理 PreToolUse + AskUserQuestion。PermissionRequest 保留为迁移期兼容。
+    if (p.hook_event_name !== 'PreToolUse' && p.hook_event_name !== 'PermissionRequest') return null;
     if (p.tool_name !== 'AskUserQuestion') return null;
 
     const rawQuestions = extractRawQuestions(payload);
@@ -92,6 +91,7 @@ const claudeCodeAdapter: HookAskAdapter = {
   formatAnswer(answersByQuestion: ReadonlyArray<ReadonlyArray<string>>, parsed: ParsedAsk): string {
     const rawPayload = parsed.raw;
     const rawQuestions = extractRawQuestions(rawPayload);
+    const eventName = hookEventName(rawPayload);
 
     // Claude updatedInput.answers: { 问题文本: 'label1, label2' }；缺席的 question 不写 key。
     const answers: Record<string, string> = {};
@@ -107,39 +107,50 @@ const claudeCodeAdapter: HookAskAdapter = {
       answers[q.prompt] = labels.join(', ');
     });
 
-    const directive = {
-      hookSpecificOutput: {
-        hookEventName: 'PermissionRequest',
-        decision: {
-          behavior: 'allow',
-          updatedInput: {
-            questions: rawQuestions,
-            answers,
-          },
-        },
-      },
-    };
+    const directive = buildAllowDirective(eventName, rawQuestions, answers);
 
     return JSON.stringify(directive);
   },
 
   passthrough(payload: unknown): string {
-    // 放行：behavior='allow' + 空 answers，让 Claude Code 继续原生终端提问
+    // 放行：allow + 空 answers，让 Claude Code 继续原生终端提问
     const rawQuestions = extractRawQuestions(payload);
-    const directive = {
+    const directive = buildAllowDirective(hookEventName(payload), rawQuestions, {});
+    return JSON.stringify(directive);
+  },
+};
+
+function hookEventName(payload: unknown): 'PreToolUse' | 'PermissionRequest' {
+  if (payload && typeof payload === 'object') {
+    const eventName = (payload as Record<string, unknown>).hook_event_name;
+    if (eventName === 'PermissionRequest') return 'PermissionRequest';
+  }
+  return 'PreToolUse';
+}
+
+function buildAllowDirective(
+  eventName: 'PreToolUse' | 'PermissionRequest',
+  questions: Array<Record<string, unknown>>,
+  answers: Record<string, string>,
+): Record<string, unknown> {
+  if (eventName === 'PermissionRequest') {
+    return {
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',
         decision: {
           behavior: 'allow',
-          updatedInput: {
-            questions: rawQuestions,
-            answers: {},
-          },
+          updatedInput: { questions, answers },
         },
       },
     };
-    return JSON.stringify(directive);
-  },
-};
+  }
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      updatedInput: { questions, answers },
+    },
+  };
+}
 
 export default claudeCodeAdapter;

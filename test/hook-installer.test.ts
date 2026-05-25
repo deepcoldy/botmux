@@ -2,7 +2,7 @@
  * hook-installer.test.ts
  *
  * 测试 installHook 对 claude-settings 格式的行为：
- *   (a) 写入 PermissionRequest hook 指向给定 hookCommand
+ *   (a) 写入 PreToolUse AskUserQuestion hook 指向给定 hookCommand
  *   (b) 幂等——二次调用内容不变
  *   (c) 既有无关配置保留（合并而非覆盖）
  */
@@ -30,11 +30,11 @@ describe('installHook — claude-settings', () => {
     configPath = join(tmpDir, '.claude', 'settings.json');
   });
 
-  it('(a) 写入 PermissionRequest hook 指向给定 hookCommand', () => {
+  it('(a) 写入 PreToolUse AskUserQuestion hook 指向给定 hookCommand', () => {
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
 
     const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
-    const groups: any[] = settings.hooks?.PermissionRequest ?? [];
+    const groups: any[] = settings.hooks?.PreToolUse ?? [];
     expect(groups.length).toBeGreaterThanOrEqual(1);
 
     // 找到含有我们 hookCommand 的 group
@@ -42,7 +42,7 @@ describe('installHook — claude-settings', () => {
       g.hooks?.some((e: any) => e.command === hookCommand),
     );
     expect(found).toBeDefined();
-    expect(found.matcher).toBe('*');
+    expect(found.matcher).toBe('AskUserQuestion');
 
     // 对应 entry 应有 timeout
     const entry = found.hooks.find((e: any) => e.command === hookCommand);
@@ -88,34 +88,62 @@ describe('installHook — claude-settings', () => {
 
     // 其他事件（PreToolUse）的 hook 仍在
     const preToolGroups: any[] = settings.hooks?.PreToolUse ?? [];
-    expect(preToolGroups.length).toBe(1);
-    expect(preToolGroups[0].hooks[0].command).toBe('/usr/bin/some-other-hook');
+    expect(preToolGroups.some((g) => g.hooks?.some((e: any) => e.command === '/usr/bin/some-other-hook'))).toBe(true);
 
-    // PermissionRequest 中有我们新写的 hook
-    const permGroups: any[] = settings.hooks?.PermissionRequest ?? [];
-    const found = permGroups.find((g: any) =>
+    // PreToolUse 中有我们新写的 hook
+    const found = preToolGroups.find((g: any) =>
       g.hooks?.some((e: any) => e.command === hookCommand),
     );
     expect(found).toBeDefined();
+    expect(found.matcher).toBe('AskUserQuestion');
   });
 
-  it('(c2) 已有同 hookCommand 的 PermissionRequest entry 不会重复追加', () => {
+  it('(c2) 已有同 hookCommand 的 PreToolUse entry 不会重复追加', () => {
     // 第一次安装
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
     const afterFirst = JSON.parse(readFileSync(configPath, 'utf-8'));
-    const countFirst = (afterFirst.hooks?.PermissionRequest ?? []).filter((g: any) =>
+    const countFirst = (afterFirst.hooks?.PreToolUse ?? []).filter((g: any) =>
       g.hooks?.some((e: any) => e.command === hookCommand),
     ).length;
 
     // 第二次安装（幂等）
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
     const afterSecond = JSON.parse(readFileSync(configPath, 'utf-8'));
-    const countSecond = (afterSecond.hooks?.PermissionRequest ?? []).filter((g: any) =>
+    const countSecond = (afterSecond.hooks?.PreToolUse ?? []).filter((g: any) =>
       g.hooks?.some((e: any) => e.command === hookCommand),
     ).length;
 
     expect(countFirst).toBe(1);
     expect(countSecond).toBe(1); // 不重复
+  });
+
+  it('(d) 迁移旧 PermissionRequest botmux entry 到 PreToolUse', () => {
+    const existing = {
+      hooks: {
+        PermissionRequest: [
+          {
+            matcher: '*',
+            hooks: [{ type: 'command', command: hookCommand, timeout: 86400 }],
+          },
+          {
+            matcher: 'Bash',
+            hooks: [{ type: 'command', command: '/usr/bin/other-permission-hook' }],
+          },
+        ],
+      },
+    };
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const permGroups: any[] = settings.hooks?.PermissionRequest ?? [];
+    expect(permGroups.some((g) => g.hooks?.some((e: any) => e.command === hookCommand))).toBe(false);
+    expect(permGroups.some((g) => g.hooks?.some((e: any) => e.command === '/usr/bin/other-permission-hook'))).toBe(true);
+
+    const preToolGroups: any[] = settings.hooks?.PreToolUse ?? [];
+    expect(preToolGroups.some((g) => g.matcher === 'AskUserQuestion' && g.hooks?.some((e: any) => e.command === hookCommand))).toBe(true);
   });
 });
 

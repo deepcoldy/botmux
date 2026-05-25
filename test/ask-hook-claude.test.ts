@@ -14,8 +14,8 @@ function loadFixture(name: string): unknown {
 
 describe('Claude Code hook adapter', () => {
   describe('parseQuestions', () => {
-    it('PermissionRequest + AskUserQuestion → 解析出 questions', () => {
-      const payload = loadFixture('claude-ask-single.json');
+    it('PreToolUse + AskUserQuestion → 解析出 questions', () => {
+      const payload = { ...(loadFixture('claude-ask-single.json') as any), hook_event_name: 'PreToolUse' };
       const parsed = claude.parseQuestions(payload);
       expect(parsed).not.toBeNull();
       expect(parsed!.questions).toHaveLength(1);
@@ -25,6 +25,13 @@ describe('Claude Code hook adapter', () => {
       expect(parsed!.questions[0].options[0].key).toBe('继续部署');
       expect(parsed!.questions[0].options[0].label).toBe('继续部署');
       expect(parsed!.questions[0].options[1].key).toBe('回滚');
+    });
+
+    it('PermissionRequest + AskUserQuestion → 迁移期兼容解析', () => {
+      const payload = loadFixture('claude-ask-single.json');
+      const parsed = claude.parseQuestions(payload);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.questions[0].prompt).toBe('继续部署还是回滚？');
     });
 
     it('多问题 + multiSelect=true → 正确解析', () => {
@@ -52,7 +59,7 @@ describe('Claude Code hook adapter', () => {
       expect(claude.parseQuestions(payload)).toBeNull();
     });
 
-    it('非 PermissionRequest → null', () => {
+    it('非 PreToolUse/PermissionRequest → null', () => {
       const payload = {
         hook_event_name: 'PostToolUse',
         tool_name: 'AskUserQuestion',
@@ -83,7 +90,19 @@ describe('Claude Code hook adapter', () => {
   });
 
   describe('formatAnswer', () => {
-    it('单问单选 → hookSpecificOutput.decision.updatedInput.answers 含选中 label', () => {
+    it('单问单选 → PreToolUse hookSpecificOutput.updatedInput.answers 含选中 label', () => {
+      const payload = { ...(loadFixture('claude-ask-single.json') as any), hook_event_name: 'PreToolUse' };
+      const parsed = claude.parseQuestions(payload)!;
+      const directiveStr = claude.formatAnswer([['继续部署']], parsed);
+      const directive = JSON.parse(directiveStr) as Record<string, unknown>;
+      const hso = directive.hookSpecificOutput as Record<string, unknown>;
+      expect(hso.hookEventName).toBe('PreToolUse');
+      expect(hso.permissionDecision).toBe('allow');
+      const updatedInput = hso.updatedInput as Record<string, unknown>;
+      expect(updatedInput.answers).toMatchObject({ '继续部署还是回滚？': '继续部署' });
+    });
+
+    it('PermissionRequest payload → 保持旧 decision.behavior 输出', () => {
       const payload = loadFixture('claude-ask-single.json');
       const parsed = claude.parseQuestions(payload)!;
       const directiveStr = claude.formatAnswer([['继续部署']], parsed);
@@ -135,14 +154,13 @@ describe('Claude Code hook adapter', () => {
   });
 
   describe('passthrough', () => {
-    it('返回 behavior=allow + 空 answers 的 directive', () => {
-      const payload = loadFixture('claude-ask-single.json');
+    it('返回 PreToolUse permissionDecision=allow + 空 answers 的 directive', () => {
+      const payload = { ...(loadFixture('claude-ask-single.json') as any), hook_event_name: 'PreToolUse' };
       const directive = JSON.parse(claude.passthrough(payload)) as Record<string, unknown>;
       const hso = directive.hookSpecificOutput as Record<string, unknown>;
-      expect(hso.hookEventName).toBe('PermissionRequest');
-      const decision = hso.decision as Record<string, unknown>;
-      expect(decision.behavior).toBe('allow');
-      const updatedInput = decision.updatedInput as Record<string, unknown>;
+      expect(hso.hookEventName).toBe('PreToolUse');
+      expect(hso.permissionDecision).toBe('allow');
+      const updatedInput = hso.updatedInput as Record<string, unknown>;
       expect(updatedInput.answers).toEqual({});
     });
 
