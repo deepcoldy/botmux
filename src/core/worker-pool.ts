@@ -376,13 +376,22 @@ const skillsInstalledCliIds = new Set<string>();
 
 /**
  * 构造 `botmux hook <cliId>` 的完整调用字符串。
- * 使用与 autostart 一致的方案：process.execPath（当前 Node 可执行文件）+
- * process.argv[1]（当前运行的 cli.js 入口文件）。
+ *
+ * hook 命令由 CLI（Claude/OpenCode）作为子进程执行，必须指向 botmux 的 CLI 入口
+ * `dist/cli.js`——只有它分发 `hook` 子命令。
+ *
+ * 不能用 `process.argv[1]`：daemon 由 pm2 以 `dist/index-daemon.js` 启动，daemon 进程
+ * 的 argv[1] 是 index-daemon.js（只 `startDaemon()`、不处理 hook 子命令）。源码 checkout
+ * 和 npm global 安装都如此——用 argv[1] 会注入一条跑不通的命令。
+ *
+ * 改为从本模块自身位置回推：编译后本文件是 `<pkgRoot>/dist/core/worker-pool.js`，
+ * CLI 入口固定在 `<pkgRoot>/dist/cli.js`（package.json `bin.botmux` 指向它），即
+ * `../cli.js`。这对源码和 npm global 安装都成立（同一份 dist 布局）。
  */
-function hookCommandFor(cliId: string): string {
-  // process.execPath = 运行 botmux daemon 的 Node 可执行文件绝对路径
-  // process.argv[1]  = 被 Node 执行的脚本（dist/cli.js）的绝对路径
-  return `${process.execPath} ${process.argv[1]} hook ${cliId}`;
+export function hookCommandFor(cliId: string): string {
+  const cliEntry = join(__dirname, '..', 'cli.js');
+  // 加引号防 Node 路径 / 安装路径含空格。
+  return `"${process.execPath}" "${cliEntry}" hook ${cliId}`;
 }
 
 /**
