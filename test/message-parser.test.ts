@@ -395,6 +395,64 @@ describe('isPureCardUpgradeFallback (replace gate)', () => {
 // ─── extractResources for interactive cards ───────────────────────────────
 
 describe('Post message parsing', () => {
+  it('renders post code block with fence boundaries for API and event messages', () => {
+    const post = {
+      zh_cn: {
+        content: [[
+          { tag: 'text', text: '前文' },
+          { tag: 'code_block', language: 'JSON', text: 'print hello\n' },
+          { tag: 'text', text: '后文' },
+        ]],
+      },
+    };
+    const expected = '前文\n```JSON\nprint hello\n```\n后文';
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(expected);
+
+    const event = {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_post_code',
+        message_type: 'post',
+        content: JSON.stringify(post),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    };
+    expect(parseEventMessage(event).parsed.content).toBe(expected);
+  });
+
+  it('uses a longer fence when post code contains triple backticks', () => {
+    const post = {
+      content: [[
+        { tag: 'code_block', language: 'md', text: 'before\n```\ninside\n```\nafter\n' },
+      ]],
+    };
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('````md\nbefore\n```\ninside\n```\nafter\n````');
+  });
+
+  it('does not render unsupported post nodes as noisy text', () => {
+    const post = {
+      zh_cn: {
+        content: [
+          [
+            { tag: 'text', text: '普通' },
+            { tag: 'unknown_text', text: '未知文本' },
+            { tag: 'unknown_object', value: { nested: true } },
+          ],
+          [
+            { tag: 'a', text: '文档', href: 'https://example.com' },
+            { tag: 'at', user_name: 'Alice' },
+          ],
+        ],
+      },
+    };
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档@Alice');
+  });
+
   it('renders img tag in post body as [图片] placeholder when no numberer', () => {
     // Regression: previously dropped to empty string, hiding attached images
     // from `botmux thread messages` and misleading downstream readers.
