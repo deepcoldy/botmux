@@ -102,6 +102,15 @@ export interface CliAdapter {
    *  support skills (or has a non-standard layout not yet integrated). */
   readonly skillsDir?: string;
 
+  /** hook 安装描述：spawn 时写入各 CLI 的 hook 配置，使 askUserQuestion 事件转发到
+   *  `botmux hook <cliId>`。undefined = 不通过 hook 接管 askUserQuestion。 */
+  readonly hookInstall?: {
+    /** 待写入的配置文件路径（~ 由 installer 展开）。 */
+    readonly configPath: string;
+    /** 写入格式：决定 installer 如何合并进既有配置。 */
+    readonly format: 'claude-settings' | 'opencode-plugin';
+  };
+
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
 

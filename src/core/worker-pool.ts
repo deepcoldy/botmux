@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills } from '../skills/installer.js';
+import { installHook } from '../adapters/hook-installer.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -374,6 +375,17 @@ export const restartCounts = new Map<string, { count: number; lastAt: number }>(
 const skillsInstalledCliIds = new Set<string>();
 
 /**
+ * 构造 `botmux hook <cliId>` 的完整调用字符串。
+ * 使用与 autostart 一致的方案：process.execPath（当前 Node 可执行文件）+
+ * process.argv[1]（当前运行的 cli.js 入口文件）。
+ */
+function hookCommandFor(cliId: string): string {
+  // process.execPath = 运行 botmux daemon 的 Node 可执行文件绝对路径
+  // process.argv[1]  = 被 Node 执行的脚本（dist/cli.js）的绝对路径
+  return `${process.execPath} ${process.argv[1]} hook ${cliId}`;
+}
+
+/**
  * Ensure built-in skills are installed for a given CLI.
  * Synchronous and idempotent — runs once per CLI per daemon lifecycle.
  */
@@ -381,6 +393,11 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   if (skillsInstalledCliIds.has(cliId)) return;
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   ensureSkills(cliId, adapter.skillsDir);
+  // 安装 askUserQuestion hook：把 botmux hook 子命令写入各 CLI 配置（幂等）
+  if (adapter.hookInstall) {
+    try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
+    catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
   skillsInstalledCliIds.add(cliId);
 }
 

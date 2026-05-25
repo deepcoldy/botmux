@@ -46,6 +46,12 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // Bubble Tea renders in alternate screen buffer
     skillsDir: '~/.config/opencode/skills',
+    // botmux hook 安装：spawn 时写入 OpenCode 插件文件，
+    // 使 question.asked 事件自动转发到 `botmux hook opencode`。
+    hookInstall: {
+      configPath: '~/.config/opencode/plugin/botmux-ask.js',
+      format: 'opencode-plugin',
+    },
   };
 }
 
