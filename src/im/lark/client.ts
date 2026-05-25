@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
@@ -408,11 +409,12 @@ async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
   } else if (res && typeof res === 'object' && 'writeFile' in res) {
     await res.writeFile(savePath);
   } else {
-    const chunks: Buffer[] = [];
-    for await (const chunk of res as AsyncIterable<Buffer>) {
-      chunks.push(Buffer.from(chunk));
-    }
-    writeFileSync(savePath, Buffer.concat(chunks));
+    // Raw Readable (client.request with responseType:'stream'). Pipe straight
+    // to disk instead of buffering — this resource API serves files up to
+    // 100MB, so Buffer.concat + writeFileSync would spike memory and block the
+    // event loop under concurrent downloads. pipeline handles backpressure and
+    // closes/cleans up both streams on error.
+    await pipeline(res as NodeJS.ReadableStream, createWriteStream(savePath));
   }
 }
 
