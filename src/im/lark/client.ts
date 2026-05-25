@@ -8,6 +8,22 @@ import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 
+type LarkRequestParams = Record<string, string | number | boolean | undefined>;
+
+/**
+ * Call a Feishu GET endpoint without a request body.
+ *
+ * The official SDK currently lets axios attach `{}` as `data` for generated
+ * GET calls such as im.v1.message.list/get. Some gateway deployments reject
+ * GET-with-body and return HTTP 411 before the OpenAPI handler sees the
+ * request. `client.request()` contains an explicit GET empty-body guard, while
+ * still using the SDK's token/cache/auth plumbing, so use it for read-only
+ * message history/detail calls.
+ */
+async function larkGet(c: any, url: string, params: LarkRequestParams = {}): Promise<any> {
+  return c.request({ method: 'GET', url, params });
+}
+
 // Cached lightweight Lark clients for all configured bots (for isInChat checks)
 let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
 function getAllBotClients() {
@@ -314,10 +330,9 @@ export async function getMessageDetail(
   // Without the param, sub-messages still come back in the "Format A"
   // simplified card shape which extractCardContent handles.
   const userCardContent = options.userCardContent ?? true;
-  const res = await c.im.v1.message.get({
-    path: { message_id: messageId },
-    ...(userCardContent ? { params: { card_msg_content_type: 'user_card_content' } } : {}),
-  } as any);
+  const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+  });
   if (res.code !== 0) {
     throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
   }
@@ -513,7 +528,7 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
 /** Get the thread_id (omt_xxx) from the root message via message.get. */
 async function resolveThreadId(c: any, rootMessageId: string): Promise<string | undefined> {
   try {
-    const res = await c.im.v1.message.get({ path: { message_id: rootMessageId } });
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(rootMessageId)}`);
     if (res.code === 0) {
       return res.data?.items?.[0]?.thread_id;
     }
@@ -533,14 +548,12 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
   let pageToken: string | undefined;
 
   do {
-    const res = await c.im.v1.message.list({
-      params: {
-        container_id_type: 'thread' as any,
-        container_id: threadId,
-        page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-        sort_type: 'ByCreateTimeAsc' as any,
-        ...(pageToken ? { page_token: pageToken } : {}),
-      },
+    const res = await larkGet(c, '/open-apis/im/v1/messages', {
+      container_id_type: 'thread',
+      container_id: threadId,
+      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      sort_type: 'ByCreateTimeAsc',
+      ...(pageToken ? { page_token: pageToken } : {}),
     });
 
     if (res.code !== 0) {
@@ -572,14 +585,12 @@ export async function listChatMessages(
   let pageToken: string | undefined;
 
   do {
-    const res = await c.im.v1.message.list({
-      params: {
-        container_id_type: 'chat' as any,
-        container_id: chatId,
-        page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-        sort_type: 'ByCreateTimeDesc' as any,
-        ...(pageToken ? { page_token: pageToken } : {}),
-      },
+    const res = await larkGet(c, '/open-apis/im/v1/messages', {
+      container_id_type: 'chat',
+      container_id: chatId,
+      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      sort_type: 'ByCreateTimeDesc',
+      ...(pageToken ? { page_token: pageToken } : {}),
     });
 
     if (res.code !== 0) {
@@ -659,14 +670,12 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
   let pageToken: string | undefined;
 
   do {
-    const res = await c.im.v1.message.list({
-      params: {
-        container_id_type: 'chat' as any,
-        container_id: chatId,
-        page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-        sort_type: 'ByCreateTimeDesc' as any,
-        ...(pageToken ? { page_token: pageToken } : {}),
-      },
+    const res = await larkGet(c, '/open-apis/im/v1/messages', {
+      container_id_type: 'chat',
+      container_id: chatId,
+      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      sort_type: 'ByCreateTimeDesc',
+      ...(pageToken ? { page_token: pageToken } : {}),
     });
 
     if (res.code !== 0) {
