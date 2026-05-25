@@ -1,0 +1,20 @@
+{
+  "hook_event_name": "QuestionAsked",
+  "session_id": "opencode-ses_abc123",
+  "question_id": "q_001",
+  "question_text": "选择部署策略？",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "选择部署策略？",
+        "header": "部署配置",
+        "options": [
+          { "label": "蓝绿部署", "description": "零停机" },
+          { "label": "滚动更新", "description": "逐步切流" }
+        ],
+        "multiple": false
+      }
+    ]
+  },
+  "_opencode_request_id": "q_001"
+}

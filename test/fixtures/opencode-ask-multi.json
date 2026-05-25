@@ -1,0 +1,30 @@
+{
+  "hook_event_name": "QuestionAsked",
+  "session_id": "opencode-ses_abc123",
+  "question_id": "q_002",
+  "question_text": "选择测试范围？; 通知谁？",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "选择测试范围？",
+        "header": "测试配置",
+        "options": [
+          { "label": "单元测试" },
+          { "label": "集成测试" },
+          { "label": "E2E 测试" }
+        ],
+        "multiple": true
+      },
+      {
+        "question": "通知谁？",
+        "header": "通知设置",
+        "options": [
+          { "label": "研发团队" },
+          { "label": "QA 团队" }
+        ],
+        "multiple": false
+      }
+    ]
+  },
+  "_opencode_request_id": "q_002"
+}
