@@ -191,14 +191,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
-  // ─── /relay picker pickup button ────────────────────────────────────────
-  // Custom owner check — operator must equal the *source* session's owner,
-  // which is a different session from the current chat's ds. Handle this
-  // before the isSensitive gate (which checks canOperate against the
-  // current session, irrelevant here).
-  if (value?.action === 'relay_pickup' && larkAppId) {
+  // ─── /relay picker select_static dropdown selection ────────────────────
+  // The dropdown fires on selection (no separate confirm button — Lark
+  // semantics for select_static). action.value carries target context;
+  // action.option is the selected sessionId. Custom owner check — operator
+  // must equal the *source* session's owner, which is a different session
+  // from the current chat's ds. Handle this before the isSensitive gate
+  // (which checks canOperate against the current session, irrelevant here).
+  if (value?.key === 'relay_pick_select' && action?.option && larkAppId) {
     const loc = localeForBot(larkAppId);
-    const sourceSessionId = value.session_id;
+    const sourceSessionId = action.option;
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
@@ -224,12 +226,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (sourceDs.chatId === targetChatId) {
       return { toast: { type: 'error', content: t('card.relay.toast_same_chat', undefined, loc) } };
     }
+    // Resolve a friendly source chat label for the M1 announcement — falls
+    // back to the raw chatId if Lark can't return a name.
+    const { getChatName } = await import('./client.js');
+    const sourceLabel = (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
     // Send the M1 announcement first — its message_id becomes the new
     // rootMessageId after the transfer (mirrors /relay --create's flow).
     let m1MessageId: string;
     try {
       const m1Body = JSON.stringify({
-        text: t('cmd.relay.m1_announce', { sourceChat: sourceDs.chatId, groupName: targetChatId }, loc),
+        text: t('cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc),
       });
       m1MessageId = await sendMessage(larkAppId, targetChatId, m1Body, 'text');
     } catch (err: any) {
@@ -246,7 +252,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
     }
-    // Best-effort: remove the picker card now that the click resolved.
+    // Best-effort: remove the picker card now that the selection resolved.
     if (cardMessageId && larkAppId) {
       deleteMessage(larkAppId, cardMessageId).catch(() => { /* leave it */ });
     }

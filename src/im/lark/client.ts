@@ -204,6 +204,25 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
   };
 }
 
+/**
+ * Resolve a chat's display name (the user-facing group title). Returns `null`
+ * on any failure (chatId is unknown to this bot, network error, bot not in
+ * chat etc.) — callers should fall back to displaying the raw chatId so the
+ * UI degrades gracefully rather than rendering "undefined". For p2p chats the
+ * returned name may be an empty string; treat that as "no display name" and
+ * also fall back. */
+export async function getChatName(larkAppId: string, chatId: string): Promise<string | null> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0) return null;
+    const name = String(res.data?.name ?? '').trim();
+    return name.length > 0 ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Lark chat-mode classification used by botmux to decide session scope:
  *   - 'topic'  → 话题群: every top-level message becomes a new thread, so
  *                botmux always uses thread-scope sessions. Two underlying

@@ -96,6 +96,7 @@ export const messages: Record<string, string> = {
   'card.relay.title': '📋 选择要接力到本群的会话',
   'card.relay.empty': '当前没有可接力的会话。\n（picker 只列你作为 owner、同一机器人在其他群里的活跃会话。）',
   'card.relay.btn_pull': '接力到本群',
+  'card.relay.placeholder_select': '选择要接力的会话',
   'card.relay.toast_not_found': '会话已不存在或已关闭。',
   'card.relay.toast_not_owner': '只有会话发起人能接力它。',
   'card.relay.toast_same_chat': '该会话已在本群里，无需接力。',

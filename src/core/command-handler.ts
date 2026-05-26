@@ -1034,20 +1034,36 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.target_has_session', { title: conflict.session.title || conflict.session.sessionId.substring(0, 8) }, loc));
             break;
           }
-          const entries: import('../im/lark/card-builder.js').RelayPickerEntry[] = [];
+          // Collect candidates first (no IO yet) so we know which chatIds
+          // need name resolution. Many sessions can share a chat — dedupe
+          // before fanning out the API calls.
+          const candidates: DaemonSession[] = [];
           for (const candidate of activeSessions.values()) {
             if (candidate.larkAppId !== myAppId) continue;
             if (candidate.chatId === targetChatId) continue;
             if (candidate.session.ownerOpenId !== operatorOpenId) continue;
-            entries.push({
-              sessionId: candidate.session.sessionId,
-              chatLabel: candidate.chatId,
-              title: candidate.session.title || candidate.currentTurnTitle || '(no title)',
-              workingDir: candidate.session.workingDir,
-              cliId: candidate.session.cliId,
-              lastMessageAt: candidate.lastMessageAt,
-            });
+            candidates.push(candidate);
           }
+          // Resolve chat names in parallel — best-effort. getChatName returns
+          // null on failure (or empty p2p name); we fall back to the chatId
+          // so the picker still renders something meaningful.
+          const { getChatName } = await import('../im/lark/client.js');
+          const uniqueChatIds = [...new Set(candidates.map(c => c.chatId))];
+          const resolved = await Promise.all(
+            uniqueChatIds.map(async (cid) => [cid, await getChatName(myAppId, cid)] as const),
+          );
+          const chatNameByChatId = new Map<string, string>();
+          for (const [cid, name] of resolved) {
+            if (name) chatNameByChatId.set(cid, name);
+          }
+          const entries: import('../im/lark/card-builder.js').RelayPickerEntry[] = candidates.map(c => ({
+            sessionId: c.session.sessionId,
+            chatLabel: chatNameByChatId.get(c.chatId) ?? c.chatId,
+            title: c.session.title || c.currentTurnTitle || '(no title)',
+            workingDir: c.session.workingDir,
+            cliId: c.session.cliId,
+            lastMessageAt: c.lastMessageAt,
+          }));
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
           const card = buildRelayPickerCard(entries, targetChatId, rootId, loc);
           await sessionReply(rootId, card, 'interactive');

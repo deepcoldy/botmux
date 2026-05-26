@@ -115,17 +115,20 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   ),
   buildRelayPickerCard: vi.fn(
     (entries: any[], targetChatId: string, rootMessageId: string) => JSON.stringify({
-      elements: [
-        ...entries.flatMap((e: any) => [
-          { tag: 'div', text: { content: e.title } },
-          {
-            tag: 'action',
-            actions: [{
-              tag: 'button',
-              value: { action: 'relay_pickup', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId },
-            }],
-          },
-        ]),
+      elements: entries.length === 0 ? [
+        { tag: 'div', text: { content: 'empty' } },
+      ] : [
+        {
+          tag: 'action',
+          actions: [{
+            tag: 'select_static',
+            options: entries.map((e: any) => ({
+              text: { tag: 'plain_text', content: `${e.chatLabel} · ${e.title}` },
+              value: e.sessionId,
+            })),
+            value: { key: 'relay_pick_select', target_chat_id: targetChatId, root_id: rootMessageId },
+          }],
+        },
       ],
     }),
   ),
@@ -142,6 +145,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   deleteMessage: vi.fn(),
   sendMessage: vi.fn(async () => 'card-msg-id'),
   listChatBotMembers: vi.fn(async () => []),
+  // Tests can override per-scenario via vi.mocked(getChatName).mockResolvedValue(...).
+  // Default returns null so picker entries fall back to raw chatId.
+  getChatName: vi.fn(async () => null),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
@@ -1406,10 +1412,12 @@ describe('handleCommand', () => {
       const card = JSON.parse(replyContent as string);
       const actions = card.elements.filter((e: any) => e.tag === 'action');
       expect(actions).toHaveLength(1);
-      const btn = actions[0].actions[0];
-      expect(btn.value.action).toBe('relay_pickup');
-      expect(btn.value.session_id).toBe('sess-other');
-      expect(btn.value.target_chat_id).toBe(CHAT_ID);
+      const select = actions[0].actions[0];
+      expect(select.tag).toBe('select_static');
+      expect(select.value.key).toBe('relay_pick_select');
+      expect(select.value.target_chat_id).toBe(CHAT_ID);
+      expect(select.options).toHaveLength(1);
+      expect(select.options[0].value).toBe('sess-other');
       expect(mockedCreate).not.toHaveBeenCalled();
     });
 
@@ -1432,7 +1440,7 @@ describe('handleCommand', () => {
       expect(reply).toContain('PR review chat');
       expect(reply).toContain('已经有一个活跃会话');
       // Picker card should NOT have been rendered.
-      expect(reply).not.toContain('relay_pickup');
+      expect(reply).not.toContain('relay_pick_select');
     });
 
     it('picker excludes sessions whose owner is not the operator', async () => {

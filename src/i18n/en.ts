@@ -93,6 +93,7 @@ export const messages: Record<string, string> = {
   'card.relay.title': '📋 Pick a session to relay into this chat',
   'card.relay.empty': 'No relayable sessions.\n(Picker only lists sessions you own, on this bot, in other chats.)',
   'card.relay.btn_pull': 'Pull into this chat',
+  'card.relay.placeholder_select': 'Pick a session to relay',
   'card.relay.toast_not_found': 'Session not found or already closed.',
   'card.relay.toast_not_owner': 'Only the session owner can relay it.',
   'card.relay.toast_same_chat': 'That session is already in this chat — nothing to relay.',

@@ -730,49 +730,56 @@ describe('buildRelayPickerCard', () => {
     expect(divs.length).toBeGreaterThan(0);
     const emptyText = divs.map((d: any) => d.text?.content ?? '').join('\n');
     expect(emptyText).toMatch(/没有可接力|No relayable/);
-    // No action buttons in empty state.
+    // No action buttons or dropdowns in empty state.
     expect(card.elements.filter((e: any) => e.tag === 'action').length).toBe(0);
   });
 
-  it('renders one row per session with a relay_pickup button', () => {
+  it('renders a single select_static dropdown with one option per session', () => {
     const entries: RelayPickerEntry[] = [
-      { sessionId: 'sess-a', chatLabel: 'oc_src_1', title: 'PR review', cliId: 'claude-code', workingDir: '/work/proj', lastMessageAt: Date.now() - 60_000 },
-      { sessionId: 'sess-b', chatLabel: 'oc_src_2', title: 'docs sync',                                                  lastMessageAt: Date.now() - 600_000 },
+      { sessionId: 'sess-a', chatLabel: 'Project A discussion', title: 'PR review', cliId: 'claude-code', workingDir: '/work/proj', lastMessageAt: Date.now() - 60_000 },
+      { sessionId: 'sess-b', chatLabel: 'Team docs',            title: 'docs sync',                                                  lastMessageAt: Date.now() - 600_000 },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_target_root'));
+
+    // Exactly one action element containing exactly one select_static.
     const actions = card.elements.filter((e: any) => e.tag === 'action');
-    expect(actions).toHaveLength(2);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].actions).toHaveLength(1);
+    const select = actions[0].actions[0];
+    expect(select.tag).toBe('select_static');
 
-    actions.forEach((a: any, i: number) => {
-      const btn = a.actions[0];
-      expect(btn.value.action).toBe('relay_pickup');
-      expect(btn.value.session_id).toBe(entries[i].sessionId);
-      expect(btn.value.target_chat_id).toBe('oc_target');
-      expect(btn.value.root_id).toBe('om_target_root');
-    });
+    // One option per entry; option value is the sessionId.
+    expect(select.options).toHaveLength(2);
+    expect(select.options[0].value).toBe('sess-a');
+    expect(select.options[1].value).toBe('sess-b');
+
+    // Dropdown carries the target chat context for the card-handler routing.
+    expect(select.value.key).toBe('relay_pick_select');
+    expect(select.value.target_chat_id).toBe('oc_target');
+    expect(select.value.root_id).toBe('om_target_root');
   });
 
-  it('omits the cwd line when entry has no workingDir', () => {
+  it('renders the friendly chat name (not oc_xxx) in option labels when provided', () => {
     const entries: RelayPickerEntry[] = [
-      { sessionId: 'sess-a', chatLabel: 'oc_x', title: 'no cwd' },
+      // chatLabel was already resolved by the caller (command-handler does
+      // a getChatName lookup); the card just renders what it's given.
+      { sessionId: 'sess-1', chatLabel: 'Project Alpha 讨论群', title: 'fix the bug' },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_root'));
-    const md = card.elements
-      .filter((e: any) => e.tag === 'div')
-      .map((d: any) => d.text?.content ?? '')
-      .join('\n');
-    expect(md).toContain('no cwd');
-    expect(md).not.toContain('📂');
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options[0].text.content).toContain('Project Alpha 讨论群');
+    expect(select.options[0].text.content).not.toMatch(/^oc_/);
   });
 
-  it('inserts an hr between consecutive sessions', () => {
+  it('truncates very long labels so the option still fits Lark plain_text limits', () => {
+    const longTitle = 'a'.repeat(200);
     const entries: RelayPickerEntry[] = [
-      { sessionId: 's1', chatLabel: 'oc_a', title: 't1' },
-      { sessionId: 's2', chatLabel: 'oc_b', title: 't2' },
-      { sessionId: 's3', chatLabel: 'oc_c', title: 't3' },
+      { sessionId: 'sess-x', chatLabel: 'Some Group', title: longTitle },
     ];
-    const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_root'));
-    // 3 entries → 2 hrs between them.
-    expect(card.elements.filter((e: any) => e.tag === 'hr').length).toBe(2);
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    const label = select.options[0].text.content;
+    expect(label.length).toBeLessThanOrEqual(80);
+    expect(label.endsWith('…')).toBe(true);
   });
 });

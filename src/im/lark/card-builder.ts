@@ -672,18 +672,18 @@ export interface RelayPickerEntry {
 }
 
 /**
- * Card listing the operator's relayable sessions across other chats — each
- * entry has a "Pull here" button whose action `relay_pickup` carries the
- * source sessionId. Card-handler verifies owner-match before invoking
- * transferSession to move the session into the current chat.
+ * Card listing the operator's relayable sessions as a single dropdown so the
+ * card stays short regardless of how many sessions exist. Selecting an
+ * option triggers `relay_pick_select` immediately — Lark fires the action
+ * callback on selection, so no separate confirm button is needed (same
+ * pattern as `buildAdoptSelectCard`).
  *
- * Empty list and "all-current-chat" lists produce a card with a single
- * "no relayable sessions" notice — keeps the UX consistent (always returns
- * a card, never an empty message).
+ * The select's `value` carries `target_chat_id` + `root_id` (where the
+ * picker was rendered) — card-handler combines those with the option's
+ * `value` (the chosen sessionId) to invoke transferSession.
  *
- * The button's `value.root_id` is the rootMessageId of the current chat's
- * thread where the user invoked /relay, so card-handler can route follow-up
- * card patches back to the same anchor.
+ * Empty list produces a card with a single "no relayable sessions" notice —
+ * keeps the UX consistent (always returns a card, never an empty message).
  */
 export function buildRelayPickerCard(
   entries: RelayPickerEntry[],
@@ -699,33 +699,38 @@ export function buildRelayPickerCard(
       text: { tag: 'lark_md', content: t('card.relay.empty', undefined, locale) },
     });
   } else {
-    entries.forEach((e, i) => {
+    const options = entries.map((e) => {
+      const project = e.workingDir ? (e.workingDir.split('/').filter(Boolean).pop() || e.workingDir) : '';
       const cliName = e.cliId ? getCliDisplayName(e.cliId) : '';
-      const cwdLine = e.workingDir ? `\n📂 \`${escapeMd(e.workingDir)}\`` : '';
-      const ageLine = e.lastMessageAt ? `\n⏱ ${formatDuration(Date.now() - e.lastMessageAt)}` : '';
-      const header = cliName ? `**${escapeMd(e.chatLabel)}** · ${cliName}` : `**${escapeMd(e.chatLabel)}**`;
-      const body = `${header}\n💬 ${escapeMd(e.title)}${cwdLine}${ageLine}`;
-      elements.push({
-        tag: 'div',
-        text: { tag: 'lark_md', content: body },
-      });
-      elements.push({
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.relay.btn_pull', undefined, locale) },
-            type: 'primary',
-            value: {
-              action: 'relay_pickup',
-              session_id: e.sessionId,
-              target_chat_id: targetChatId,
-              root_id: targetRootMessageId,
-            },
+      const age = e.lastMessageAt ? formatDuration(Date.now() - e.lastMessageAt) : '';
+      const parts = [e.chatLabel, e.title];
+      if (project) parts.push(project);
+      if (cliName) parts.push(cliName);
+      if (age) parts.push(age);
+      const label = parts.join(' · ');
+      // Lark plain_text capping — 80 leaves room for the leading bot/CLI
+      // labels and trailing "..." truncation, and stays under Lark's hard
+      // limit (which around ~250 chars).
+      const truncated = label.length > 80 ? label.slice(0, 79) + '…' : label;
+      return {
+        text: { tag: 'plain_text' as const, content: truncated },
+        value: e.sessionId,
+      };
+    });
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'select_static',
+          placeholder: { tag: 'plain_text', content: t('card.relay.placeholder_select', undefined, locale) },
+          options,
+          value: {
+            key: 'relay_pick_select',
+            target_chat_id: targetChatId,
+            root_id: targetRootMessageId,
           },
-        ],
-      });
-      if (i < entries.length - 1) elements.push({ tag: 'hr' });
+        },
+      ],
     });
   }
 
