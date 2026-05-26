@@ -224,6 +224,59 @@ describe('transferSession', () => {
     expect(ds.session.scope).toBe('thread');
   });
 
+  it('refuses with target_chat_has_session when target chat already has a chat-scope session for this bot', async () => {
+    const movingDs = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+
+    // Pre-existing chat-scope session in the target chat for the same bot.
+    // After the rewrite, the moving session's key would collide with this one.
+    const existingDs = makeDs({
+      session: {
+        ...movingDs.session,
+        sessionId: 'existing-sess-in-target',
+        chatId: 'oc_target',
+        rootMessageId: 'om_target_seed',
+        scope: 'chat',
+      },
+      chatId: 'oc_target',
+      scope: 'chat',
+    });
+    registry.set(sessionKey('oc_target', 'cli_app_test'), existingDs);
+
+    const r = await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe('target_chat_has_session');
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    // Moving session must remain untouched — no field rewrites on refusal.
+    expect(movingDs.chatId).toBe('oc_source');
+    expect(movingDs.session.scope).toBe('thread');
+    // Existing target session must still be in the registry.
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(existingDs);
+  });
+
+  it('allows transfer when target chat has only thread-scope sessions (no chat-scope collision)', async () => {
+    const movingDs = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+
+    // Same chat as target, but rooted at a different thread — anchor is
+    // rootMessageId, so sessionKey doesn't collide.
+    const otherThreadDs = makeDs({
+      session: {
+        ...movingDs.session,
+        sessionId: 'thread-sess-in-target',
+        chatId: 'oc_target',
+        rootMessageId: 'om_other_thread_root',
+        scope: 'thread',
+      },
+      chatId: 'oc_target',
+      scope: 'thread',
+    });
+    registry.set(sessionKey('om_other_thread_root', 'cli_app_test'), otherThreadDs);
+
+    const r = await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(true);
+  });
+
   it('proceeds when worker is in limited state (parked on usage-limit prompt)', async () => {
     const fakeWorker = { killed: false } as any;
     const ds = makeDs({ worker: fakeWorker, lastScreenStatus: 'limited' });

@@ -1017,6 +1017,23 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
             break;
           }
+          // ── Existing-session guard ────────────────────────────────────────
+          // If this bot already runs a real session in the target chat, pulling
+          // another session in would collide on sessionKey(targetChatId, larkAppId)
+          // — Map.set would silently overwrite, orphaning the existing worker.
+          // Refuse upfront with an actionable message. The /relay command's own
+          // session (just created by daemon to route this command) is excluded
+          // via sessionId mismatch; only *other* sessions in this chat count.
+          const conflict = [...activeSessions.values()].find(c =>
+            c.larkAppId === myAppId
+            && c.chatId === targetChatId
+            && ds && c.session.sessionId !== ds.session.sessionId
+            && !!c.worker   // real running session, not a placeholder
+          );
+          if (conflict) {
+            await sessionReply(rootId, t('cmd.relay.target_has_session', { title: conflict.session.title || conflict.session.sessionId.substring(0, 8) }, loc));
+            break;
+          }
           const entries: import('../im/lark/card-builder.js').RelayPickerEntry[] = [];
           for (const candidate of activeSessions.values()) {
             if (candidate.larkAppId !== myAppId) continue;

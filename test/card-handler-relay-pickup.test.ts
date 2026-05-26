@@ -177,6 +177,23 @@ describe('relay_pickup action', () => {
     expect(r?.toast?.type).toBe('success');
   });
 
+  it('returns a friendly toast when transferSession reports target_chat_has_session', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    transferSessionMock.mockResolvedValueOnce({ ok: false, error: 'target_chat_has_session' });
+
+    const r = await handleCardAction(actionData(
+      { action: 'relay_pickup', session_id: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_root' },
+    ), deps(map), LARK_APP_ID);
+
+    expect(r?.toast?.type).toBe('error');
+    // Specific message, not the generic "Relay failed: target_chat_has_session" passthrough.
+    expect(r?.toast?.content).toContain('已有');
+    expect(r?.toast?.content).not.toMatch(/target_chat_has_session/);
+  });
+
   it('returns the transferSession error as a toast when transfer fails', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();

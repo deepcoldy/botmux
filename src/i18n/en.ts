@@ -97,6 +97,7 @@ export const messages: Record<string, string> = {
   'card.relay.toast_not_owner': 'Only the session owner can relay it.',
   'card.relay.toast_same_chat': 'That session is already in this chat — nothing to relay.',
   'card.relay.toast_failed': 'Relay failed: {error}',
+  'card.relay.toast_target_has_session': 'This chat already has an active session for the bot. Please /close it first, then relay.',
   'card.relay.toast_success': '✅ Relayed into this chat',
 
   // ─── TUI prompt card ─────────────────────────────────────────────────────
@@ -164,6 +165,7 @@ export const messages: Record<string, string> = {
   // ─── /relay --create ────────────────────────────────────────────────────
   'cmd.relay.empty_group_name': 'Session Relay {ts}',
   'cmd.relay.no_session': '⚠️ /relay must be invoked from a thread with an active session.',
+  'cmd.relay.target_has_session': '⚠️ This bot already has an active session "{title}" in this chat. Please /close it first, then /relay to bring a new one in.',
   'cmd.relay.no_sender': '⚠️ Could not resolve sender open_id; /relay cancelled.',
   'cmd.relay.no_mentions': '⚠️ /relay --create requires at least one @-mentioned bot as a collaborator in the new group.',
   'cmd.relay.not_owner': '⚠️ Only the original session owner can /relay --create this session to a new group.',

@@ -100,6 +100,7 @@ export const messages: Record<string, string> = {
   'card.relay.toast_not_owner': '只有会话发起人能接力它。',
   'card.relay.toast_same_chat': '该会话已在本群里，无需接力。',
   'card.relay.toast_failed': '接力失败：{error}',
+  'card.relay.toast_target_has_session': '本群已有该机器人的活跃会话，请先 /close 它再接力',
   'card.relay.toast_success': '✅ 已接力到本群',
 
   // ─── TUI prompt card ─────────────────────────────────────────────────────
@@ -167,6 +168,7 @@ export const messages: Record<string, string> = {
   // ─── /relay --create ────────────────────────────────────────────────────
   'cmd.relay.empty_group_name': '会话接力 {ts}',
   'cmd.relay.no_session': '⚠️ /relay 必须在已有会话的话题里发起。',
+  'cmd.relay.target_has_session': '⚠️ 本群里这个机器人已经有一个活跃会话「{title}」。请先用 /close 关掉那个会话，再 /relay 接力新的过来。',
   'cmd.relay.no_sender': '⚠️ 无法获取发起人 open_id，/relay 取消。',
   'cmd.relay.no_mentions': '⚠️ /relay --create 必须 @ 至少一个机器人作为新群的协作伙伴。',
   'cmd.relay.not_owner': '⚠️ 只有会话发起人能用 /relay --create 把会话搬到新群。',

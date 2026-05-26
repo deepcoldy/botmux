@@ -1413,6 +1413,28 @@ describe('handleCommand', () => {
       expect(mockedCreate).not.toHaveBeenCalled();
     });
 
+    it('picker refuses upfront when this chat already has an active session for the bot', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      // Existing running session in the SAME chat (would collide on transfer).
+      const existing: DaemonSession = {
+        ...makeDaemonSession({
+          worker: { killed: false } as any,  // truthy → running session
+          session: makeSession({ sessionId: 'existing-in-chat', title: 'PR review chat', ownerOpenId: 'ou_sender' }),
+        }),
+        chatId: CHAT_ID,
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_in_same_chat', LARK_APP_ID), existing);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('PR review chat');
+      expect(reply).toContain('已经有一个活跃会话');
+      // Picker card should NOT have been rendered.
+      expect(reply).not.toContain('relay_pickup');
+    });
+
     it('picker excludes sessions whose owner is not the operator', async () => {
       const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
       const otherUserDs: DaemonSession = {

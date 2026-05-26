@@ -688,6 +688,22 @@ export async function transferSession(
   if (!ds) return { ok: false, error: 'session_not_active' };
   if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
 
+  // Existing-session guard: a chat-scope session at the target chatId would
+  // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
+  // Map.set would silently orphan the prior entry's worker. Refuse instead.
+  // We only check chat-scope entries — thread-scope sessions in the same
+  // chat are keyed by rootMessageId, so they don't collide.
+  if (activeSessionsRegistry) {
+    for (const existing of activeSessionsRegistry.values()) {
+      if (existing === ds) continue;
+      if (existing.larkAppId !== ds.larkAppId) continue;
+      if (existing.chatId !== targetChatId) continue;
+      if (existing.scope === 'chat') {
+        return { ok: false, error: 'target_chat_has_session' };
+      }
+    }
+  }
+
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
   const kw = opts?.killWorkerImpl ?? killWorker;
 

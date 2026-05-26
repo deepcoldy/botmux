@@ -238,6 +238,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const { transferSession } = await import('../../core/worker-pool.js');
     const r = await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId);
     if (!r.ok) {
+      // Friendlier toast for the existing-session collision — the command-time
+      // check normally catches this, but a race between picker render and click
+      // could let it slip through. Keep parity with the /relay command message.
+      if (r.error === 'target_chat_has_session') {
+        return { toast: { type: 'error', content: t('card.relay.toast_target_has_session', undefined, loc) } };
+      }
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
     }
     // Best-effort: remove the picker card now that the click resolved.
