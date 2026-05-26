@@ -29,7 +29,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/relay']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -954,6 +954,253 @@ export async function handleCommand(
           logger.error(`[${logTag}] /group failed: ${err?.message ?? err}`);
           await sessionReply(rootId, t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
         }
+        break;
+      }
+
+      /**
+       * `/relay --create <群名> @bot [@bot...]` — create a new chat, invite
+       * the @-mentioned bots, then migrate every bot's session in this
+       * thread (including the leader's) into the new chat.
+       *
+       * Two-path command:
+       *   • `--create` (PR2) — implemented below; creates a new chat.
+       *   • no flag (PR3)    — picker card listing user's relayable sessions
+       *                         in OTHER chats so the user can pull one into
+       *                         the current chat. Stubbed for now.
+       *
+       * Leader election is `mentions[0]` (identical to /group). The leader
+       * is the only daemon that:
+       *   1. Creates the new chat (createGroupWithBots)
+       *   2. Sends the M1 announcement message (its message_id becomes the
+       *      shared rootMessageId for all relayed sessions — multi-bot
+       *      sessions co-anchor on the same root via different larkAppIds)
+       *   3. Transfers its own session (if any) via local transferSession()
+       *   4. POSTs /api/sessions/migrate-to-chat to every peer daemon to
+       *      ask them to transfer their own session at the same anchor
+       *   5. Aggregates results into a single reply in the source thread
+       *
+       * Owner-only: only the source session's `ownerOpenId` may invoke. Peers
+       * enforce the same check independently inside the migrate endpoint.
+       *
+       * Failure mode: best-effort, no rollback. Peers that timeout / fail /
+       * are offline simply appear in the report as "skipped". The new chat
+       * and any successful transfers stand.
+       */
+      case '/relay': {
+        const argsLine = message.content.replace(/^\/relay\s*/i, '').trim();
+        if (!/^--create\b/i.test(argsLine)) {
+          // PR3 territory — picker mode pulls a session from another chat
+          // into the current chat. Not implemented yet in PR2.
+          await sessionReply(rootId, t('cmd.relay.picker_not_impl', undefined, loc));
+          break;
+        }
+        const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
+
+        const creatorAppId = larkAppId ?? ds?.larkAppId;
+        if (!creatorAppId) {
+          await sessionReply(rootId, t('cmd.group.no_bot', undefined, loc));
+          break;
+        }
+        const senderOpenId = message.senderId;
+        if (!senderOpenId) {
+          await sessionReply(rootId, t('cmd.relay.no_sender', undefined, loc));
+          break;
+        }
+        // `--create` must be invoked inside an existing thread — the source
+        // anchor for peer transfers comes from `ds`. (Picker mode in PR3 is
+        // allowed without a session.)
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
+          break;
+        }
+
+        // ── Mention parsing & leader election (mirror of /group) ───────────
+        const mentions = message.mentions ?? [];
+        const knownBotNames = globalKnownBotNames();
+        if (knownBotNames.size === 0 && mentions.some(m => !!m.name)) {
+          logger.warn(`[${logTag}] /relay --create: global bot registry empty; cannot elect a creator`);
+          await sessionReply(rootId, t('cmd.relay.resolve_failed', undefined, loc));
+          break;
+        }
+        const botMentions = mentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
+        if (botMentions.length === 0) {
+          await sessionReply(rootId, t('cmd.relay.no_mentions', undefined, loc));
+          break;
+        }
+
+        // Am I `mentions[0]`?
+        const firstBot = botMentions[0];
+        const myOpenId = getBotOpenId(creatorAppId);
+        const myName = getBot(creatorAppId).botName?.toLowerCase();
+        const myNameAmbiguous = !!myName
+          && botMentions.filter(m => m.name?.toLowerCase() === myName).length > 1;
+        const iAmFirstBot =
+          (!!myOpenId && firstBot.openId === myOpenId) ||
+          (!myOpenId && !!myName && !myNameAmbiguous && firstBot.name?.toLowerCase() === myName);
+        if (!iAmFirstBot) {
+          logger.info(`[${logTag}] /relay --create: not the first @-mentioned bot, staying silent`);
+          break;
+        }
+
+        // Owner-only — only the source session owner may relay this session.
+        if (ds.session.ownerOpenId && ds.session.ownerOpenId !== senderOpenId) {
+          await sessionReply(rootId, t('cmd.relay.not_owner', undefined, loc));
+          break;
+        }
+
+        // ── Resolve @-bots to larkAppIds via the source chat's bot roster ──
+        const sourceChatId = ds.chatId;
+        let members: Awaited<ReturnType<typeof listChatBotMembers>> = [];
+        try {
+          members = await listChatBotMembers(creatorAppId, sourceChatId);
+        } catch (e: any) {
+          logger.warn(`[${logTag}] /relay --create: failed to list source chat members: ${e?.message ?? e}`);
+        }
+        const memberByOpenId = new Map(members.map(m => [m.openId, m]));
+        const appIdToName = new Map<string, string>();
+        for (const m of members) {
+          if (m.larkAppId && m.displayName) appIdToName.set(m.larkAppId, m.displayName);
+        }
+        const mentionedBotAppIds: string[] = [];
+        const seenApp = new Set<string>();
+        let unresolved: string | undefined;
+        for (const bm of botMentions) {
+          const mem = bm.openId ? memberByOpenId.get(bm.openId) : undefined;
+          if (!mem || !mem.larkAppId) { unresolved = bm.name; break; }
+          if (!seenApp.has(mem.larkAppId)) {
+            seenApp.add(mem.larkAppId);
+            mentionedBotAppIds.push(mem.larkAppId);
+          }
+        }
+        if (unresolved) {
+          logger.warn(`[${logTag}] /relay --create: unresolved bot "${unresolved}"`);
+          await sessionReply(rootId, t('cmd.relay.resolve_failed', undefined, loc));
+          break;
+        }
+
+        // ── Group name extraction (mirror of /group) ───────────────────────
+        let rawArgs = afterFlag;
+        for (const m of mentions) {
+          if (m.name) rawArgs = rawArgs.split(`@${m.name}`).join(' ');
+        }
+        const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const MAX_NAME = 50;
+        let groupName: string;
+        if (firstLine) {
+          groupName = firstLine.length > MAX_NAME ? firstLine.slice(0, MAX_NAME) + '…' : firstLine;
+        } else {
+          const now = new Date();
+          const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+          groupName = t('cmd.relay.empty_group_name', { ts }, loc);
+        }
+
+        // ── Create the new chat ────────────────────────────────────────────
+        const nameOf = (id: string) => appIdToName.get(id) ?? botDisplayName(id);
+        let newChatId: string;
+        let inviteLink: string;
+        try {
+          const { createGroupWithBots } = await import('../services/group-creator.js');
+          const result = await createGroupWithBots({
+            creatorLarkAppId: creatorAppId,
+            larkAppIds: mentionedBotAppIds,
+            name: groupName,
+            userOpenIds: [senderOpenId],
+            transferOwnerTo: senderOpenId,
+          });
+          newChatId = result.chatId;
+          const applink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
+          inviteLink = result.shareLink ?? applink;
+        } catch (err: any) {
+          logger.error(`[${logTag}] /relay --create: createGroup failed: ${err?.message ?? err}`);
+          await sessionReply(rootId, t('cmd.relay.failed', { error: err?.message ?? String(err) }, loc));
+          break;
+        }
+
+        // ── M1 announcement (sets the shared rootMessageId for all peers) ──
+        const sourceChatLabel = (() => {
+          // Try chat title from the roster lookup we already did, else fall back to chatId.
+          // listChatBotMembers doesn't expose the chat title; keep it simple — use the chatId.
+          return sourceChatId.startsWith('oc_') ? sourceChatId : sourceChatId;
+        })();
+        const m1Body = JSON.stringify({
+          text: t('cmd.relay.m1_announce', { sourceChat: sourceChatLabel, groupName }, loc),
+        });
+        let m1MessageId: string;
+        try {
+          m1MessageId = await sendMessage(creatorAppId, newChatId, m1Body, 'text');
+        } catch (err: any) {
+          logger.error(`[${logTag}] /relay --create: failed to send M1 to new chat: ${err?.message ?? err}`);
+          await sessionReply(rootId, t('cmd.relay.failed', { error: err?.message ?? String(err) }, loc));
+          break;
+        }
+
+        // ── Step 1: leader transfers its own session ───────────────────────
+        const reportLines: string[] = [];
+        const leaderName = nameOf(creatorAppId);
+        const { transferSession } = await import('./worker-pool.js');
+        const leaderResult = await transferSession(ds.session.sessionId, newChatId, m1MessageId);
+        if (leaderResult.ok) {
+          reportLines.push(t('cmd.relay.report_leader_ok', { bot: leaderName }, loc));
+        } else {
+          reportLines.push(t('cmd.relay.report_leader_failed', { bot: leaderName, error: leaderResult.error }, loc));
+          // Leader's own transfer failed — abort peer coordination. The leader
+          // can't even relay its own session, so the new chat would be left
+          // half-populated. New chat already exists; user can disband manually.
+          await sessionReply(rootId, t('cmd.relay.created', { name: groupName, link: inviteLink, report: reportLines.join('\n') }, loc));
+          break;
+        }
+
+        // ── Step 2: coordinate peer daemons (parallel) ─────────────────────
+        const { findOnlineDaemon } = await import('../utils/daemon-discovery.js');
+        const peerAppIds = mentionedBotAppIds.filter(id => id !== creatorAppId);
+        const sourceAnchor = ds.session.rootMessageId; // pre-transfer anchor still in peer's activeSessions
+        const peerOutcomes = await Promise.all(peerAppIds.map(async (peerAppId) => {
+          const botName = nameOf(peerAppId);
+          const daemon = findOnlineDaemon(peerAppId);
+          if (!daemon) return { peerAppId, botName, status: 'offline' as const };
+          try {
+            const ctrl = new AbortController();
+            const tt = setTimeout(() => ctrl.abort(), 5000);
+            const res = await fetch(
+              `http://127.0.0.1:${daemon.ipcPort}/api/sessions/migrate-to-chat`,
+              {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  sourceAnchor,
+                  targetChatId: newChatId,
+                  targetRootMessageId: m1MessageId,
+                  requesterLarkAppId: creatorAppId,
+                  requestingUserOpenId: senderOpenId,
+                }),
+                signal: ctrl.signal,
+              },
+            ).finally(() => clearTimeout(tt));
+            const body = await res.json().catch(() => ({} as any));
+            if (res.ok && body.ok) return { peerAppId, botName, status: 'ok' as const };
+            if (body.error === 'no_session_at_anchor') return { peerAppId, botName, status: 'no_session' as const };
+            if (body.error === 'not_session_owner') return { peerAppId, botName, status: 'not_owner' as const };
+            if (body.error === 'worker_busy_timeout') return { peerAppId, botName, status: 'busy' as const };
+            return { peerAppId, botName, status: 'failed' as const, error: body.error ?? `http_${res.status}` };
+          } catch (err: any) {
+            const reason = err?.name === 'AbortError' ? 'busy' : 'failed';
+            return { peerAppId, botName, status: reason as 'busy' | 'failed', error: err?.message ?? String(err) };
+          }
+        }));
+
+        for (const r of peerOutcomes) {
+          switch (r.status) {
+            case 'ok':         reportLines.push(t('cmd.relay.report_peer_ok',         { bot: r.botName },                             loc)); break;
+            case 'no_session': reportLines.push(t('cmd.relay.report_peer_no_session', { bot: r.botName },                             loc)); break;
+            case 'not_owner':  reportLines.push(t('cmd.relay.report_peer_not_owner',  { bot: r.botName },                             loc)); break;
+            case 'offline':    reportLines.push(t('cmd.relay.report_peer_offline',    { bot: r.botName },                             loc)); break;
+            case 'busy':       reportLines.push(t('cmd.relay.report_peer_busy',       { bot: r.botName },                             loc)); break;
+            case 'failed':     reportLines.push(t('cmd.relay.report_peer_failed',     { bot: r.botName, error: r.error ?? 'unknown' }, loc)); break;
+          }
+        }
+
+        await sessionReply(rootId, t('cmd.relay.created', { name: groupName, link: inviteLink, report: reportLines.join('\n') }, loc));
+        logger.info(`[${logTag}] /relay --create completed: chat=${newChatId} leader=${creatorAppId} peers=[${peerAppIds.join(',')}]`);
         break;
       }
 

@@ -155,7 +155,14 @@ vi.mock('../src/utils/logger.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   killWorker: vi.fn(),
   forkWorker: vi.fn(),
+  forkAdoptWorker: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
+  transferSession: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock('../src/utils/daemon-discovery.js', () => ({
+  findOnlineDaemon: vi.fn(() => null),
+  listOnlineDaemons: vi.fn(() => []),
 }));
 
 vi.mock('../src/core/session-manager.js', () => ({
@@ -271,7 +278,7 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/relay'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -288,7 +295,7 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    expect(DAEMON_COMMANDS.size).toBe(14);
+    expect(DAEMON_COMMANDS.size).toBe(15);
   });
 });
 
@@ -1335,6 +1342,198 @@ describe('handleCommand', () => {
       expect(mockedCreate).not.toHaveBeenCalled();
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(reply).toContain('无法解析');
+    });
+  });
+
+  // ─── /relay --create ────────────────────────────────────────────────────
+
+  describe('/relay', () => {
+    const mockedCreate = vi.mocked(createGroupWithBots);
+    const mockedListBots = vi.mocked(listChatBotMembers);
+    const mockedSend = vi.mocked(sendMessage);
+
+    beforeEach(async () => {
+      // Reset the cross-test stubs we manipulate here.
+      const wp = await import('../src/core/worker-pool.js');
+      vi.mocked(wp.transferSession).mockReset();
+      vi.mocked(wp.transferSession).mockResolvedValue({ ok: true });
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReset();
+      vi.mocked(dd.findOnlineDaemon).mockReturnValue(null);
+    });
+
+    it('falls back to picker_not_impl when invoked without --create', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('picker');
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects --create when not invoked inside an active session', async () => {
+      // No ds → command was invoked in an empty thread.
+      const deps = makeDeps(undefined);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create New Group @Codex', {
+        mentions: [{ key: '@_1', name: 'Codex', openId: 'ou_codex' }],
+      }), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('已有会话');
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it('requires at least one @-mentioned bot', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create Just a Name'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('@ 至少一个机器人');
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects --create when sender is not the source session owner', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_other_user' }) });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Codex', {
+        mentions: [{ key: '@_1', name: 'Claude', openId: 'ou_claude' }],
+      }), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('发起人');
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it('defers silently when this bot is not the first @-mentioned bot', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+      // mentions[0] = Codex (app-2). We are app-1 (Claude) → stay silent.
+      const msg = makeLarkMessage('/relay --create G @Codex @Claude', {
+        mentions: [
+          { key: '@_1', name: 'Codex', openId: 'ou_codex' },
+          { key: '@_2', name: 'Claude', openId: 'ou_claude' },
+        ],
+      });
+
+      await handleCommand('/relay', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('happy path: leader builds group, sends M1, transfers self, coordinates peer', async () => {
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValue({ larkAppId: 'app-2', ipcPort: 9999 });
+
+      // Stub global fetch to simulate the peer's migrate-to-chat success.
+      const fetchSpy = vi.fn(async () => new Response(
+        JSON.stringify({ ok: true, sessionId: 'peer-sess-1' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ));
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+      const msg = makeLarkMessage('/relay --create New Group @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      });
+
+      await handleCommand('/relay', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      // Group created with both bots, owner transferred to sender.
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.larkAppIds).toEqual(['app-1', 'app-2']);
+      expect(opts.transferOwnerTo).toBe('ou_sender');
+
+      // M1 announcement was sent to the new chat.
+      expect(mockedSend).toHaveBeenCalled();
+      expect(mockedSend.mock.calls[0][1]).toBe('oc_new_group');
+
+      // Leader transferred its own session.
+      const wp = await import('../src/core/worker-pool.js');
+      expect(wp.transferSession).toHaveBeenCalledWith('sess-001', 'oc_new_group', 'card-msg-id');
+
+      // Peer migrate-to-chat was POSTed exactly once.
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toMatch(/127\.0\.0\.1:9999\/api\/sessions\/migrate-to-chat$/);
+      const body = JSON.parse((init as any).body);
+      expect(body.targetChatId).toBe('oc_new_group');
+      expect(body.targetRootMessageId).toBe('card-msg-id');
+      expect(body.requesterLarkAppId).toBe(LARK_APP_ID);
+      expect(body.requestingUserOpenId).toBe('ou_sender');
+
+      // Reply contains the new chat name and both bot statuses.
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('New Group');
+      expect(reply).toContain('Claude');
+      expect(reply).toContain('Codex');
+
+      vi.unstubAllGlobals();
+    });
+
+    it('reports peer as offline when its daemon is not registered', async () => {
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      // findOnlineDaemon default mock returns null → peer offline.
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      }), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('Codex');
+      expect(reply).toContain('守护进程离线');
+    });
+
+    it('aborts peer coordination when the leader transfer fails', async () => {
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      const wp = await import('../src/core/worker-pool.js');
+      vi.mocked(wp.transferSession).mockResolvedValue({ ok: false, error: 'worker_busy_timeout' });
+
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      }), deps, LARK_APP_ID);
+
+      // Peer fetch must NOT have happened — leader self-transfer failure aborts coordination.
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('worker_busy_timeout');
+
+      vi.unstubAllGlobals();
     });
   });
 

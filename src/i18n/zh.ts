@@ -154,6 +154,27 @@ export const messages: Record<string, string> = {
   'cmd.group.warn_share_link_failed': '⚠️ 群分享链接获取失败，上面的链接仅群内成员可点开，非成员请群主手动邀请。',
   'cmd.group.resolve_failed': '⚠️ 无法解析被 @ 的机器人（可能群成员信息暂时拿不到），未建群。请稍后重试。',
 
+  // ─── /relay --create ────────────────────────────────────────────────────
+  'cmd.relay.empty_group_name': '会话接力 {ts}',
+  'cmd.relay.picker_not_impl': '⚠️ 接力 picker（无参数模式）尚未实现。请用 /relay --create <群名> @机器人 创建新群并接力。',
+  'cmd.relay.no_session': '⚠️ /relay --create 必须在已有会话的话题里发起。',
+  'cmd.relay.no_sender': '⚠️ 无法获取发起人 open_id，/relay 取消。',
+  'cmd.relay.no_mentions': '⚠️ /relay --create 必须 @ 至少一个机器人作为新群的协作伙伴。',
+  'cmd.relay.not_owner': '⚠️ 只有会话发起人能用 /relay --create 把会话搬到新群。',
+  'cmd.relay.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/relay 取消。请稍后重试。',
+  'cmd.relay.m1_announce': '📋 已从「{sourceChat}」接力会话过来。\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。\n@ 对应机器人继续对话即可。',
+  'cmd.relay.created': '✅ 已创建群「{name}」并接力会话\n👉 {link}\n\n{report}',
+  'cmd.relay.report_leader_ok': '• {bot}（当前会话）已接力',
+  'cmd.relay.report_leader_no_session': '• {bot}（当前会话）— 跳过（无活跃会话）',
+  'cmd.relay.report_leader_failed': '• {bot}（当前会话）— 接力失败：{error}',
+  'cmd.relay.report_peer_ok': '• {bot} 已接力',
+  'cmd.relay.report_peer_no_session': '• {bot} — 跳过（在源话题无会话）',
+  'cmd.relay.report_peer_not_owner': '• {bot} — 跳过（会话不属于你）',
+  'cmd.relay.report_peer_offline': '• {bot} — 跳过（守护进程离线）',
+  'cmd.relay.report_peer_busy': '• {bot} — 跳过（会话繁忙，超时）',
+  'cmd.relay.report_peer_failed': '• {bot} — 接力失败：{error}',
+  'cmd.relay.failed': '⚠️ /relay --create 失败：{error}',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报',
   'schedule.list_header': '定时任务列表 ({count})：',

@@ -151,6 +151,27 @@ export const messages: Record<string, string> = {
   'cmd.group.warn_share_link_failed': '⚠️ Couldn\'t fetch a group share link; the link above only opens for members already in the group — the owner should invite non-members manually.',
   'cmd.group.resolve_failed': '⚠️ Could not resolve the @-mentioned bots (chat member info may be temporarily unavailable); group not created. Please retry shortly.',
 
+  // ─── /relay --create ────────────────────────────────────────────────────
+  'cmd.relay.empty_group_name': 'Session Relay {ts}',
+  'cmd.relay.picker_not_impl': '⚠️ Relay picker (no-flag mode) not yet implemented. Use /relay --create <name> @bot to create a new group and relay the session.',
+  'cmd.relay.no_session': '⚠️ /relay --create must be invoked from a thread with an active session.',
+  'cmd.relay.no_sender': '⚠️ Could not resolve sender open_id; /relay cancelled.',
+  'cmd.relay.no_mentions': '⚠️ /relay --create requires at least one @-mentioned bot as a collaborator in the new group.',
+  'cmd.relay.not_owner': '⚠️ Only the original session owner can /relay --create this session to a new group.',
+  'cmd.relay.resolve_failed': '⚠️ Could not resolve the @-mentioned bots; /relay cancelled. Please retry shortly.',
+  'cmd.relay.m1_announce': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\n@ the corresponding bot to continue.',
+  'cmd.relay.created': '✅ Created group "{name}" and relayed sessions\n👉 {link}\n\n{report}',
+  'cmd.relay.report_leader_ok': '• {bot} (current session) relayed',
+  'cmd.relay.report_leader_no_session': '• {bot} (current session) — skipped (no active session)',
+  'cmd.relay.report_leader_failed': '• {bot} (current session) — relay failed: {error}',
+  'cmd.relay.report_peer_ok': '• {bot} relayed',
+  'cmd.relay.report_peer_no_session': '• {bot} — skipped (no session in source thread)',
+  'cmd.relay.report_peer_not_owner': '• {bot} — skipped (session not yours)',
+  'cmd.relay.report_peer_offline': '• {bot} — skipped (daemon offline)',
+  'cmd.relay.report_peer_busy': '• {bot} — skipped (session busy, timed out)',
+  'cmd.relay.report_peer_failed': '• {bot} — relay failed: {error}',
+  'cmd.relay.failed': '⚠️ /relay --create failed: {error}',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',
   'schedule.list_header': 'Scheduled tasks ({count}):',
