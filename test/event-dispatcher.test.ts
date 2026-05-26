@@ -90,9 +90,9 @@ const MY_OPEN_ID = 'ou_bot_a_open_id';
 const OTHER_BOT_OPEN_ID = 'ou_bot_b_open_id';
 const USER_OPEN_ID = 'ou_user_123';
 
-function setupBotState(opts?: { botOpenId?: string | undefined }) {
+function setupBotState(opts?: { botOpenId?: string | undefined; chatGrants?: Record<string, string[]> }) {
   mockGetBot.mockReturnValue({
-    config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+    config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', chatGrants: opts?.chatGrants },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: [],
   });
@@ -389,6 +389,54 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     const event = makeBotMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,
       senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('routes unknown-peer cross-bot @mention in chat-scope when the bot is chat-granted via /grant', async () => {
+    // owner 用 `/grant @bot` 把外部 bot 加进本群 chatGrants：即便它不在 peer
+    // cross-ref（isKnownPeerBot=false），命中 chatGrants 也应与已注册 peer 同等
+    // 放行，拉起 chat-scope session。与上面「unknown peer 被 drop」用例对照。
+    setupBotState({ chatGrants: { 'chat-001': [OTHER_BOT_OPEN_ID] } });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('does not let a chat-grant for one chat leak into a different chat', async () => {
+    // chatGrants 是 per-chat：在 chat-001 授权的 bot 到了 chat-999 仍应被 drop。
+    setupBotState({ chatGrants: { 'chat-001': [OTHER_BOT_OPEN_ID] } });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      chatId: 'chat-999',
       content: JSON.stringify({
         zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
       }),

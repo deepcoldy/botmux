@@ -814,9 +814,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // Oncall 群是显式部署的协作工作区，canTalk 已对任何成员（含真人）放行；这里
           // 对 bot 同等放行，跳过 cross-ref vetting。否则 oncall 群里外部 bot 互相 @
           // 会被静默丢弃、只有真人能拉起会话，与 oncall「全员可对话」语义不符。
+          //
+          // owner 还可用 `/grant @bot` 把外部 bot 加进本群 chatGrants（与真人 /grant
+          // 同一存储、同一 per-chat 语义）。命中 chatGrants 的 bot 即便不在 cross-ref，
+          // 也与已注册 peer 同等放行——这是「授权外部 bot 在本群协作」的入口。
           if (ctx.scope === 'chat' && !isChatOncallBoundForAnyBot(chatId)) {
             const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
-            if (!ownsSession && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) {
+            if (!ownsSession
+                && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+                && !hasChatGrant(larkAppId, chatId, senderOpenId)) {
               return;
             }
           }
