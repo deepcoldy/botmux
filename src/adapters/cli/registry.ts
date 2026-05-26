@@ -10,6 +10,7 @@ import { createGeminiAdapter } from './gemini.js';
 import { createOpenCodeAdapter } from './opencode.js';
 import { createAntigravityAdapter } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
+import { createKimiAdapter } from './kimi.js';
 
 /** Resolve a command name to its absolute path via shell `which`.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
@@ -46,7 +47,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter };
+export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createKimiAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -60,6 +61,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'opencode': return createOpenCodeAdapter(pathOverride);
     case 'antigravity': return createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);
+    case 'kimi': return createKimiAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

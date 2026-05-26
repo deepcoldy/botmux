@@ -15,6 +15,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'opencode': 'OpenCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
+  'kimi': 'Kimi',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
