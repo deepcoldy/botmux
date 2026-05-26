@@ -26,7 +26,7 @@ import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
+import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode, StreamStatus } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
@@ -34,6 +34,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
 const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
+const TERMINAL_HOST_REFRESH_INTERVAL_MS = 30_000;
 
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
@@ -88,6 +89,88 @@ export function findActiveBySessionId(sessionId: string): DaemonSession | undefi
  *  callers should prefer listActiveSessions / findActiveBySessionId. */
 export function getActiveSessionsRegistry(): Map<string, DaemonSession> | undefined {
   return activeSessionsRegistry;
+}
+
+// ─── Terminal URL host refresh ─────────────────────────────────────────────
+
+let lastAdvertisedTerminalHost: string | undefined;
+let terminalHostRefreshTimer: NodeJS.Timeout | undefined;
+
+function terminalReadUrl(port: number): string {
+  return `http://${config.web.externalHost}:${port}`;
+}
+
+function terminalWriteUrl(port: number, token: string): string {
+  return `${terminalReadUrl(port)}?token=${encodeURIComponent(token)}`;
+}
+
+function buildCurrentStreamingCard(ds: DaemonSession): string | undefined {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port) return undefined;
+  const bot = getBot(ds.larkAppId);
+  const effectiveCliId = sessionCliId(ds, bot.config);
+  const readUrl = terminalReadUrl(port);
+  const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  const status: StreamStatus = ds.lastScreenStatus ?? (ds.usageLimit ? 'limited' : 'starting');
+  return buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readUrl,
+    turnTitle,
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    cardUsageLimit(ds),
+  );
+}
+
+export function refreshTerminalHostCards(reason = 'host-change'): number {
+  const currentHost = config.web.externalHost;
+  if (lastAdvertisedTerminalHost === currentHost) return 0;
+  const previousHost = lastAdvertisedTerminalHost;
+  lastAdvertisedTerminalHost = currentHost;
+
+  let patched = 0;
+  for (const ds of listActiveSessions()) {
+    if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) continue;
+    if (!ds.workerPort) continue;
+    const cardJson = buildCurrentStreamingCard(ds);
+    if (!cardJson) continue;
+    scheduleCardPatch(ds, cardJson);
+    patched++;
+  }
+
+  if (previousHost && patched > 0) {
+    logger.info(`Web terminal host changed ${previousHost} -> ${currentHost}; patched ${patched} streaming card(s) (${reason})`);
+  }
+  return patched;
+}
+
+export function startTerminalHostRefreshLoop(intervalMs = TERMINAL_HOST_REFRESH_INTERVAL_MS): void {
+  if (terminalHostRefreshTimer) return;
+  lastAdvertisedTerminalHost = config.web.externalHost;
+  terminalHostRefreshTimer = setInterval(() => {
+    try {
+      refreshTerminalHostCards('timer');
+    } catch (err) {
+      logger.debug(`Web terminal host refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, intervalMs);
+  terminalHostRefreshTimer.unref?.();
+}
+
+export function __testOnly_resetTerminalHostRefresh(): void {
+  if (terminalHostRefreshTimer) {
+    clearInterval(terminalHostRefreshTimer);
+    terminalHostRefreshTimer = undefined;
+  }
+  lastAdvertisedTerminalHost = undefined;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -151,7 +234,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
 
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
-  const readUrl = `http://${config.web.externalHost}:${port}`;
+  const readUrl = terminalReadUrl(port);
   const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -757,8 +840,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // Persist port so it can be reused after daemon restart
         ds.session.webPort = msg.port;
         sessionStore.updateSession(ds.session);
-        const readOnlyUrl = `http://${config.web.externalHost}:${msg.port}`;
-        const writeUrl = `${readOnlyUrl}?token=${msg.token}`;
+        const readOnlyUrl = terminalReadUrl(msg.port);
+        const writeUrl = terminalWriteUrl(msg.port, msg.token);
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
         if (ds.usageLimit) {
           ds.lastScreenStatus = 'limited';

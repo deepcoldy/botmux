@@ -11,6 +11,18 @@ function getLocalIp(): string {
   return 'localhost';
 }
 
+const configuredWebExternalHost = process.env.WEB_EXTERNAL_HOST;
+const configuredDashboardExternalHost =
+  process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST ?? process.env.WEB_EXTERNAL_HOST;
+
+export function getWebExternalHost(): string {
+  return configuredWebExternalHost ?? getLocalIp();
+}
+
+export function getDashboardExternalHost(): string {
+  return configuredDashboardExternalHost ?? getLocalIp();
+}
+
 /**
  * Pick the session backend. tmux is preferred (enables /adopt + per-client
  * Web terminal attach) but only if it can actually start a server. The old
@@ -48,14 +60,12 @@ export const config = {
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
-    externalHost: process.env.WEB_EXTERNAL_HOST ?? getLocalIp(),
+    get externalHost() { return getWebExternalHost(); },
   },
   dashboard: {
     host: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
     port: Number(process.env.BOTMUX_DASHBOARD_PORT) || 7891,
-    externalHost: process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST
-      ?? process.env.WEB_EXTERNAL_HOST
-      ?? getLocalIp(),
+    get externalHost() { return getDashboardExternalHost(); },
     ipcBasePort: Number(process.env.BOTMUX_DAEMON_IPC_BASE_PORT) || 7892,
   },
   screenAnalyzer: {
