@@ -1158,14 +1158,15 @@ export async function handleCommand(
           break;
         }
 
+        // Snapshot the pre-transfer source anchor — peers locate their own
+        // session by this value, and `transferSession()` will overwrite
+        // `ds.session.rootMessageId` once it runs. Must capture BEFORE the
+        // leader transfer call (caught in review).
+        const sourceAnchor = ds.session.rootMessageId;
+
         // ── M1 announcement (sets the shared rootMessageId for all peers) ──
-        const sourceChatLabel = (() => {
-          // Try chat title from the roster lookup we already did, else fall back to chatId.
-          // listChatBotMembers doesn't expose the chat title; keep it simple — use the chatId.
-          return sourceChatId.startsWith('oc_') ? sourceChatId : sourceChatId;
-        })();
         const m1Body = JSON.stringify({
-          text: t('cmd.relay.m1_announce', { sourceChat: sourceChatLabel, groupName }, loc),
+          text: t('cmd.relay.m1_announce', { sourceChat: sourceChatId, groupName }, loc),
         });
         let m1MessageId: string;
         try {
@@ -1195,7 +1196,6 @@ export async function handleCommand(
         // ── Step 2: coordinate peer daemons (parallel) ─────────────────────
         const { findOnlineDaemon } = await import('../utils/daemon-discovery.js');
         const peerAppIds = mentionedBotAppIds.filter(id => id !== creatorAppId);
-        const sourceAnchor = ds.session.rootMessageId; // pre-transfer anchor still in peer's activeSessions
         const peerOutcomes = await Promise.all(peerAppIds.map(async (peerAppId) => {
           const botName = nameOf(peerAppId);
           const daemon = findOnlineDaemon(peerAppId);

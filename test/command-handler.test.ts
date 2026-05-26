@@ -1570,6 +1570,62 @@ describe('handleCommand', () => {
       expect(reply).toContain('守护进程离线');
     });
 
+    // Regression: leader's transferSession overwrites ds.session.rootMessageId
+    // to the new (M1) value. Reading sourceAnchor AFTER the leader transfer
+    // would feed peers a stale anchor (M1), so they'd 404 in their own
+    // registries. Make the mock simulate this overwrite to catch any future
+    // refactor that re-introduces the bug.
+    it('passes the ORIGINAL pre-transfer rootMessageId as sourceAnchor to peers (regression)', async () => {
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValue({ larkAppId: 'app-2', ipcPort: 9999 });
+
+      // Mock transferSession to actually mutate the session record like the
+      // real implementation does — this is what makes the test fail under
+      // the buggy code that reads sourceAnchor after the call.
+      const wp = await import('../src/core/worker-pool.js');
+      vi.mocked(wp.transferSession).mockImplementationOnce(async (sid, newChat, newRoot) => {
+        // Look the session up in the registry (the only ds in this test) and
+        // overwrite rootMessageId — that's the side effect the real
+        // transferSession has at worker-pool.ts:723.
+        for (const candidate of deps.activeSessions.values()) {
+          if (candidate.session.sessionId === sid) {
+            candidate.session.rootMessageId = newRoot;
+            candidate.session.chatId = newChat;
+            break;
+          }
+        }
+        return { ok: true };
+      });
+
+      const fetchSpy = vi.fn(async () => new Response(
+        JSON.stringify({ ok: true }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ));
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', rootMessageId: ROOT_ID }) });
+      const deps = makeDeps(ds);
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      }), deps, LARK_APP_ID);
+
+      // sourceAnchor in the POST body MUST be the pre-transfer thread root,
+      // not the M1 message id the leader transfer just wrote.
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as any).body);
+      expect(body.sourceAnchor).toBe(ROOT_ID);
+      expect(body.sourceAnchor).not.toBe('card-msg-id');
+
+      vi.unstubAllGlobals();
+    });
+
     it('aborts peer coordination when the leader transfer fails', async () => {
       mockedListBots.mockResolvedValueOnce([
         { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
