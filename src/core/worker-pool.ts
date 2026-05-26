@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
+import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -375,26 +376,6 @@ export const restartCounts = new Map<string, { count: number; lastAt: number }>(
 const skillsInstalledCliIds = new Set<string>();
 
 /**
- * 构造 `botmux hook <cliId>` 的完整调用字符串。
- *
- * hook 命令由 CLI（Claude/OpenCode）作为子进程执行，必须指向 botmux 的 CLI 入口
- * `dist/cli.js`——只有它分发 `hook` 子命令。
- *
- * 不能用 `process.argv[1]`：daemon 由 pm2 以 `dist/index-daemon.js` 启动，daemon 进程
- * 的 argv[1] 是 index-daemon.js（只 `startDaemon()`、不处理 hook 子命令）。源码 checkout
- * 和 npm global 安装都如此——用 argv[1] 会注入一条跑不通的命令。
- *
- * 改为从本模块自身位置回推：编译后本文件是 `<pkgRoot>/dist/core/worker-pool.js`，
- * CLI 入口固定在 `<pkgRoot>/dist/cli.js`（package.json `bin.botmux` 指向它），即
- * `../cli.js`。这对源码和 npm global 安装都成立（同一份 dist 布局）。
- */
-export function hookCommandFor(cliId: string): string {
-  const cliEntry = join(__dirname, '..', 'cli.js');
-  // 加引号防 Node 路径 / 安装路径含空格。
-  return `"${process.execPath}" "${cliEntry}" hook ${cliId}`;
-}
-
-/**
  * Ensure built-in skills are installed for a given CLI.
  * Synchronous and idempotent — runs once per CLI per daemon lifecycle.
  */
@@ -403,15 +384,16 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   ensureSkills(cliId, adapter.skillsDir);
   // askUserQuestion 接管策略：hook 优先 + 非 hook CLI 用 skill 兜底。
-  // - 有 hookInstall（Claude/OpenCode）：装 hook 拦截原生 AskUserQuestion，并删掉
+  // - asksViaHook=true（Claude/OpenCode）：通过 hook 拦截原生 AskUserQuestion，删掉
   //   botmux-ask skill，避免 skill 与 hook 双重弹卡。
-  // - 无 hookInstall（Codex/Cursor/尚未接 hook 的终端原生 CLI）：保留 botmux-ask
+  //   Claude 走 --settings 进程级注入；OpenCode 走 hookInstall 插件写文件。
+  // - asksViaHook 未设（Codex/Cursor/尚未接 hook 的终端原生 CLI）：保留 botmux-ask
   //   skill 作兜底，让 agent 仍可用 `botmux ask` 把选择题引到飞书。
   if (adapter.hookInstall) {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
     catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
-  ensureAskSkill(cliId, adapter.skillsDir, !adapter.hookInstall);
+  ensureAskSkill(cliId, adapter.skillsDir, !adapter.asksViaHook);
   skillsInstalledCliIds.add(cliId);
 }
 

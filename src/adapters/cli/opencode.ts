@@ -52,6 +52,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       configPath: '~/.config/opencode/plugin/botmux-ask.js',
       format: 'opencode-plugin',
     },
+    asksViaHook: true,
   };
 }
 

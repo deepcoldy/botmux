@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { hookCommandFor } from '../hook-command.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { t } from '../../i18n/index.js';
 
@@ -388,16 +389,17 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       args.push('--dangerously-skip-permissions');
-      // Suppress the first-run "--dangerously-skip-permissions" risk-acceptance
-      // screen for this spawn only. In a fresh $HOME that has never accepted it,
-      // Claude Code otherwise blocks on an interactive confirmation that botmux
-      // can't answer — it mistypes the user's message into the dialog and the
-      // session breaks (observed as `tmux send-keys … failed`). An inline
-      // --settings JSON is scoped to this process, so it never mutates the
-      // user's global ~/.claude/settings.json or their interactive claude.
+      // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
+      // 同时注入 PreToolUse hook（matcher='*'），使 AskUserQuestion 事件自动转发到
+      // `botmux hook claude-code`——进程级注入，不污染非 botmux 的 Claude 会话。
       args.push('--settings', JSON.stringify({
         skipDangerousModePermissionPrompt: true,
         permissions: { defaultMode: 'bypassPermissions' },
+        hooks: {
+          PreToolUse: [
+            { matcher: '*', hooks: [{ type: 'command', command: hookCommandFor('claude-code'), timeout: 86400 }] },
+          ],
+        },
       }));
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       const unknown = t('ai.identity.unknown', undefined, locale);
@@ -712,12 +714,9 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     systemHints: [],
     altScreen: false,
     skillsDir: '~/.claude/skills',
-    // botmux hook 安装：spawn 时把 PreToolUse/AskUserQuestion 钩子写入 Claude settings.json，
-    // 使 AskUserQuestion 事件自动转发到 `botmux hook claude-code`。
-    hookInstall: {
-      configPath: '~/.claude/settings.json',
-      format: 'claude-settings',
-    },
+    // hook 通过 buildArgs 的 --settings 内联 JSON 注入（进程级），不写全局 settings.json，
+    // 不污染非 botmux 的 Claude 会话。
+    asksViaHook: true,
   };
 }
 

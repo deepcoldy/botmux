@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { hookCommandFor } from '../src/core/worker-pool.js';
+import { hookCommandFor } from '../src/adapters/hook-command.js';
 
 // 回归保护：hook 命令必须指向 cli.js（有 `hook` 子命令分发），
 // 绝不能指向 index-daemon.js（只 startDaemon、不处理 hook）。
