@@ -43,7 +43,6 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
-  startTerminalHostRefreshLoop,
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -2327,7 +2326,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
-  startTerminalHostRefreshLoop();
   // Seed dashboard IPC botName with the bot's config id; the friendly name from
   // /bot/v3/info is wired into the registry descriptor (below) but the IPC server
   // also needs its own copy for SessionRow.botName.
