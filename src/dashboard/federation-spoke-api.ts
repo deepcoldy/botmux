@@ -30,7 +30,34 @@ import { setBotCapability, clearBotCapability } from '../services/bot-profile-st
 import { setBotOwner } from '../services/bot-owner-store.js';
 import { setDeploymentOwner } from '../services/deployment-identity.js';
 import { createPairing, getPairingStatus, consumePairing } from '../services/pairing-store.js';
+import { resolveAllowedUsersWithMap, resolveUserUnionId } from '../im/lark/client.js';
 import { fetchWithTimeout, hubError, orchestrateFederatedGroup, type Fetcher } from './federated-group-core.js';
+
+export interface OwnerCandidate { unionId: string; name: string }
+
+/** Resolve this deployment's owner identity from bots.json `allowedUsers` using
+ *  each bot's OWN app credentials (no /pair, no shared pairings.json — so it's
+ *  immune to the dataDir-split that broke /pair). Uses the FIRST bot that has
+ *  allowedUsers (they're almost always the single owner); returns the distinct
+ *  resolved {unionId,name} so the UI can auto-bind (1) or let the owner pick (N). */
+async function resolveOwnerCandidatesFromAllowedUsers(): Promise<OwnerCandidate[]> {
+  let configs: { larkAppId: string; allowedUsers?: string[] }[] = [];
+  try { configs = loadBotConfigs(); } catch { return []; }
+  for (const cfg of configs) {
+    const allowed = cfg.allowedUsers ?? [];
+    if (allowed.length === 0) continue;
+    let openIds: string[] = [];
+    try { openIds = (await resolveAllowedUsersWithMap(cfg.larkAppId, allowed)).resolved; } catch { return []; }
+    const byUnion = new Map<string, OwnerCandidate>();
+    for (const oid of openIds) {
+      if (!oid.startsWith('ou_')) continue;
+      const u = await resolveUserUnionId(cfg.larkAppId, oid);
+      if (u.unionId) byUnion.set(u.unionId, { unionId: u.unionId, name: u.name ?? '' });
+    }
+    return [...byUnion.values()];
+  }
+  return [];
+}
 
 const MAX_ROLE_BYTES = 4 * 1024;
 /** Team-level role file at {dataDir}/team-roles/{larkAppId}.md (matches role-resolver). */
@@ -116,6 +143,9 @@ export interface FederationSpokeDeps {
   createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
     ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
   }>;
+  /** Test seam: resolve owner candidates from allowedUsers (defaults to the real
+   *  Feishu-backed resolver). */
+  ownerCandidates?: () => Promise<OwnerCandidate[]>;
 }
 
 export async function handleFederationSpokeApi(
@@ -126,7 +156,7 @@ export async function handleFederationSpokeApi(
 ): Promise<boolean> {
   const path = url.pathname;
   const LOCAL = new Set(['/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment', '/api/team/federated-group',
-    '/api/team/identity/start', '/api/team/identity/status', '/api/team/identity/consume']);
+    '/api/team/identity/start', '/api/team/identity/status', '/api/team/identity/consume', '/api/team/identity/auto-bind']);
   const REMOTE = new Set(['/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote', '/api/team/remote-group']);
   const localBotEdit = path.match(/^\/api\/team\/local-bots\/([^/]+)\/(capability|role)$/);
   if (!LOCAL.has(path) && !REMOTE.has(path) && !localBotEdit) return false;
@@ -218,6 +248,28 @@ export async function handleFederationSpokeApi(
     return true;
   }
 
+  // ── Bind owner WITHOUT /pair: resolve allowedUsers via the bots' own creds ──
+  // No code to copy, no shared pairings.json (immune to dataDir-split). If the
+  // bots' allowedUsers resolve to exactly one person, bind them; if several,
+  // return candidates for the owner to pick (re-POST with {unionId}).
+  if (path === '/api/team/identity/auto-bind' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const candidates = await (deps.ownerCandidates ?? resolveOwnerCandidatesFromAllowedUsers)();
+    if (candidates.length === 0) { jsonRes(res, 200, { ok: false, error: 'no_candidates' }); return true; }
+    const want = String(body?.unionId ?? '').trim();
+    const chosen = want ? candidates.find(c => c.unionId === want) : (candidates.length === 1 ? candidates[0] : undefined);
+    if (!chosen) { jsonRes(res, 200, { ok: true, needChoice: true, candidates }); return true; }
+    const owner = { unionId: chosen.unionId, name: chosen.name };
+    setDeploymentOwner(dataDir, owner);
+    for (const b of buildTeamRoster(dataDir, undefined, undefined, live).bots) {
+      setBotOwner(dataDir, b.larkAppId, { unionId: owner.unionId, name: owner.name }, { override: false });
+    }
+    const sync = await syncAllMemberships(dataDir, fetcher, live).catch(() => ({ synced: 0, failed: 0 }));
+    jsonRes(res, 200, { ok: true, owner, hubsSynced: sync.synced, hubsFailed: sync.failed });
+    return true;
+  }
+
   // ── Initiate 拉群 on a JOINED remote team (spoke → hub orchestrates) ────────
   if (path === '/api/team/remote-group' && method === 'POST') {
     let body: any;
@@ -230,6 +282,11 @@ export async function handleFederationSpokeApi(
     if (larkAppIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'no_bots_selected' }); return true; }
     const m = listMemberships(dataDir).find(x => x.hubUrl === hubUrl && x.teamId === teamId);
     if (!m) { jsonRes(res, 404, { ok: false, error: 'not_a_member' }); return true; }
+    // Push our latest owner + bots to the hub BEFORE it orchestrates, so the
+    // operator union_id (hub-derived from our synced record) is fresh — otherwise
+    // a 拉群 right after binding could still see a stale/empty owner (the periodic
+    // sync is every 2 min) → operator not invited.
+    await syncAllMemberships(dataDir, fetcher, live).catch(() => { /* best-effort; group still works without it */ });
     try {
       const r = await fetchWithTimeout(fetcher, `${hubUrl}/api/federation/group`, {
         method: 'POST',

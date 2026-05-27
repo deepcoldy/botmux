@@ -11,6 +11,7 @@
  */
 import { getBotClient } from '../bot-registry.js';
 import { larkGet } from '../im/lark/client.js';
+import { logger } from '../utils/logger.js';
 
 export interface ChatBrief {
   chatId: string;
@@ -312,9 +313,15 @@ export async function addUsersToChatByUnionId(
       params: { member_id_type: 'union_id' },
       data: { id_list: ids },
     });
-    if (res.code !== 0 && res.code !== undefined) return { invalidUserIds: ids };
-    return { invalidUserIds: res.data?.invalid_id_list ?? [] };
-  } catch {
+    if (res.code !== 0 && res.code !== undefined) {
+      logger.warn(`[groups] addUsersByUnionId failed: code=${res.code} msg=${res.msg} (proxy=${proxyLarkAppId}, n=${ids.length})`);
+      return { invalidUserIds: ids };
+    }
+    const invalid = res.data?.invalid_id_list ?? [];
+    if (invalid.length) logger.warn(`[groups] addUsersByUnionId: ${invalid.length}/${ids.length} union_ids rejected by Lark (proxy=${proxyLarkAppId})`);
+    return { invalidUserIds: invalid };
+  } catch (e: any) {
+    logger.warn(`[groups] addUsersByUnionId threw: ${e?.message ?? e} (proxy=${proxyLarkAppId}, n=${ids.length})`);
     return { invalidUserIds: ids };
   }
 }

@@ -50,8 +50,10 @@ function pageHtml(): string {
   <p>名称：<b id="tf-dep-name">…</b>
     <button id="tf-rename" class="ghost" style="margin-left:8px">重命名</button></p>
   <p>我的飞书身份：<b id="tf-owner">未绑定</b>
-    <button id="tf-bind" class="ghost" style="margin-left:8px">绑定</button>
+    <button id="tf-autobind" class="primary" style="margin-left:8px">自动绑定</button>
+    <button id="tf-bind" class="ghost" style="margin-left:6px">用 /pair 绑定</button>
     <span class="muted" style="font-size:13px">（绑定后拉群会自动把你拉进群；你的机器人也归到你名下）</span></p>
+  <p class="muted" style="font-size:13px">推荐「自动绑定」：用机器人凭证从允许使用者里识别你，免发码。</p>
   <div id="tf-bind-out" style="display:none;margin-top:6px"></div>
   <p class="muted" style="font-size:13px">别人加入你的团队时，需要你的 Hub 地址 + 邀请码。邀请码发给<b>别的部署</b>的人用（不能加入自己）。</p>
   <p><button id="tf-invite" class="primary">生成邀请码</button></p>
@@ -351,6 +353,33 @@ export function renderTeamFederationPage(root: HTMLElement): void {
     const r = await jpost('/api/team/federated-group', { name, larkAppIds: apps });
     renderGroupResult(out, r.body as any, r.status);
     if ((r.body as any)?.ok) loadLocal();
+  };
+
+  // Bind this deployment's Feishu identity WITHOUT /pair: resolve allowedUsers
+  // via the bots' own credentials. One candidate → bind; several → pick.
+  $('tf-autobind').onclick = async () => {
+    const out = $('tf-bind-out');
+    out.style.display = '';
+    out.innerHTML = '<span class="muted">识别中…</span>';
+    const r = await jpost('/api/team/identity/auto-bind');
+    const b: any = r.body;
+    if (b?.ok && b.owner) { out.innerHTML = `<span class="ok">已绑定：${escapeHtml(b.owner.name || b.owner.unionId)}</span>`; loadLocal(); return; }
+    if (b?.ok && b.needChoice && Array.isArray(b.candidates)) {
+      const opts = b.candidates.map((c: any) => `<button class="tf-pickowner ghost" data-union="${escapeHtml(c.unionId)}" style="margin:2px">${escapeHtml(c.name || c.unionId)}</button>`).join(' ');
+      out.innerHTML = `识别到多个候选，点你自己：<br>${opts}`;
+      out.querySelectorAll<HTMLButtonElement>('.tf-pickowner').forEach(btn => {
+        btn.onclick = async () => {
+          out.innerHTML = '<span class="muted">绑定中…</span>';
+          const r2 = await jpost('/api/team/identity/auto-bind', { unionId: btn.dataset.union });
+          const b2: any = r2.body;
+          if (b2?.ok && b2.owner) { out.innerHTML = `<span class="ok">已绑定：${escapeHtml(b2.owner.name || b2.owner.unionId)}</span>`; loadLocal(); }
+          else { out.innerHTML = `<span class="err">绑定失败：${escapeHtml(String(b2?.error || 'unknown'))}</span>`; }
+        };
+      });
+      return;
+    }
+    if (b?.error === 'no_candidates') { out.innerHTML = '<span class="err">没识别到身份（机器人 allowedUsers 为空或解析失败）。可改用「用 /pair 绑定」。</span>'; return; }
+    out.innerHTML = `<span class="err">自动绑定失败：${escapeHtml(String(b?.error || 'unknown'))}。可改用「用 /pair 绑定」。</span>`;
   };
 
   // Bind this deployment's Feishu identity via /pair (start → poll → consume).

@@ -133,6 +133,55 @@ describe('handleFederationSpokeApi', () => {
     expect(synced).toMatchObject({ syncToken: 'STOK', ownerUnionId: 'on_me' }); // hub gets owner NOW, not 2 min later
   });
 
+  it('identity/auto-bind: single candidate binds owner + owns bots (no /pair) + pushes to hub', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
+    addMembership(dataDir, { hubUrl: 'http://hub:7891', teamId: 'default', teamName: 'T', syncToken: 'STOK', deploymentId: 'dep_me' });
+    let synced: any = null;
+    const fetcher = vi.fn(async (u: any, init: any) => { if (String(u).endsWith('/api/federation/sync')) synced = JSON.parse(init.body); return jsonResp(200, { ok: true }); });
+    const res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/auto-bind', {}), res, url('/api/team/identity/auto-bind'),
+      { dataDir, fetcher: fetcher as any, ownerCandidates: async () => [{ unionId: 'on_me', name: '申晗' }] });
+    expect(res.statusCode).toBe(200);
+    expect(json(res).owner).toMatchObject({ unionId: 'on_me', name: '申晗' });
+    expect(getDeploymentIdentity(dataDir).ownerUnionId).toBe('on_me'); // bound, no /pair
+    expect(getBotOwner(dataDir, 'cli_a')!.unionId).toBe('on_me');       // owns local bot
+    expect(synced).toMatchObject({ ownerUnionId: 'on_me' });            // pushed to hub
+  });
+
+  it('identity/auto-bind: multiple candidates → needChoice, then bind the chosen one', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
+    const cands = async () => [{ unionId: 'on_1', name: '甲' }, { unionId: 'on_2', name: '乙' }];
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/auto-bind', {}), res, url('/api/team/identity/auto-bind'), { dataDir, ownerCandidates: cands });
+    expect(json(res).needChoice).toBe(true);
+    expect(json(res).candidates.length).toBe(2);
+    expect(getDeploymentIdentity(dataDir).ownerUnionId).toBeUndefined(); // not bound yet
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/auto-bind', { unionId: 'on_2' }), res, url('/api/team/identity/auto-bind'), { dataDir, ownerCandidates: cands });
+    expect(json(res).owner).toMatchObject({ unionId: 'on_2', name: '乙' });
+    expect(getDeploymentIdentity(dataDir).ownerUnionId).toBe('on_2');
+  });
+
+  it('identity/auto-bind: no candidates → ok:false no_candidates', async () => {
+    const res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/auto-bind', {}), res, url('/api/team/identity/auto-bind'), { dataDir, ownerCandidates: async () => [] });
+    expect(json(res).ok).toBe(false);
+    expect(json(res).error).toBe('no_candidates');
+  });
+
+  it('remote-group: pushes owner+bots to the hub BEFORE initiating the group (fresh operator)', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
+    addMembership(dataDir, { hubUrl: 'http://hub:7891', teamId: 'default', teamName: 'T', syncToken: 'STOK', deploymentId: 'dep_me' });
+    const calls: string[] = [];
+    const fetcher = vi.fn(async (u: any) => { calls.push(String(u)); return jsonResp(200, { ok: true, chatId: 'oc' }); });
+    const res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/remote-group', { hubUrl: 'http://hub:7891', teamId: 'default', name: 'g', larkAppIds: ['cli_a'] }), res, url('/api/team/remote-group'), { dataDir, fetcher: fetcher as any });
+    const iSync = calls.findIndex(u => u.endsWith('/api/federation/sync'));
+    const iGroup = calls.findIndex(u => u.endsWith('/api/federation/group'));
+    expect(iSync).toBeGreaterThanOrEqual(0);
+    expect(iGroup).toBeGreaterThan(iSync); // sync strictly before group
+  });
+
   it('federated-group: includes the bound operator (this deployment owner) in invitees', async () => {
     writeBots([{ larkAppId: 'cli_local', botOpenId: null, botName: '本地', cliId: 'claude' }]);
     // bind owner
