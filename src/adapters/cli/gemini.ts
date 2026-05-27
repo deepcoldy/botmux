@@ -12,10 +12,13 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     id: 'gemini',
     resolvedBin: bin,
 
-    buildArgs({ initialPrompt }) {
+    buildArgs({ initialPrompt, model }) {
       // Gemini CLI manages sessions internally (--resume takes "latest" or
       // an index/UUID, not our daemon session IDs).  We always start fresh.
       const args = ['--yolo'];
+      if (model && model.trim()) {
+        args.push('--model', model.trim());
+      }
       // Use -i (prompt-interactive) for the initial prompt.  Gemini's Ink TUI
       // has a startup phase where the TextInput component isn't mounted yet
       // (auth, model loading, extensions).  Writing to stdin during this phase
@@ -46,6 +49,7 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // Ink renders in alternate screen buffer by default
     skillsDir: '~/.gemini/skills',
+    modelChoices: ['gemini-2.5-pro', 'gemini-2.5-flash'],
   };
 }
 

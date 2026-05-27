@@ -43,6 +43,10 @@ export interface CliAdapter {
     botOpenId?: string;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
+    /** Optional model name from BotConfig.model. Adapters whose CLI accepts a
+     *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
+     *  such concept simply ignore the field. Empty / undefined → CLI default. */
+    model?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
@@ -157,6 +161,13 @@ export interface CliAdapter {
 
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
+
+  /** Curated model candidates surfaced in `botmux setup`. When undefined the
+   *  setup flow skips the model prompt for this CLI entirely (e.g. CLIs whose
+   *  model is fixed or set via a config file we don't manage). The order is
+   *  presented as-is; the setup prompt always appends an "Other / custom"
+   *  free-text option, so this list is curation, not a hard whitelist. */
+  readonly modelChoices?: readonly string[];
 }
 
 export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes';

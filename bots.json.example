@@ -3,6 +3,7 @@
     "larkAppId": "cli_xxx_bot1",
     "larkAppSecret": "your_secret_1",
     "cliId": "claude-code",
+    "model": "sonnet",
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],
     "workingDir": "~/projects"
@@ -18,6 +19,7 @@
     "larkAppId": "cli_xxx_bot3",
     "larkAppSecret": "your_secret_3",
     "cliId": "gemini",
+    "model": "gemini-2.5-pro",
     "allowedUsers": ["charlie@company.com"],
     "workingDir": "~/projects"
   },

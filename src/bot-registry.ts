@@ -37,6 +37,15 @@ export interface BotConfig {
   name?: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /**
+   * Optional model name passed to the CLI at spawn time (e.g. `claude --model
+   * opus`). Each adapter decides how to inject it — adapters whose CLI has no
+   * `--model` flag silently ignore the field. When unset, the CLI uses its own
+   * default model. Multiple bots sharing the same `cliId` can therefore run
+   * different models without resorting to wrapper scripts. See each adapter's
+   * `modelChoices` for the curated candidates surfaced in `botmux setup`.
+   */
+  model?: string;
   backendType?: 'pty' | 'tmux';
   workingDir?: string;
   workingDirs?: string[];
@@ -422,6 +431,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
+      model: typeof entry.model === 'string' && entry.model.trim()
+        ? entry.model.trim()
+        : undefined,
       backendType: entry.backendType,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,

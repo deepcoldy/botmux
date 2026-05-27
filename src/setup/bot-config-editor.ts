@@ -65,6 +65,13 @@ export interface BotConfigEditInput {
   larkAppSecret?: string;
   cliChoice?: string;
   cliPathOverride?: string;
+  /**
+   * Model 字段三态语义：
+   *   - undefined → 这次编辑没问过 model（adapter 没声明 modelChoices 自动跳过），保持原值
+   *   - string    → 设为这个 model
+   *   - null      → 清空（删字段，回到 CLI 默认）
+   */
+  model?: string | null;
   backendType?: string;
   workingDir?: string;
   allowedUsers?: string;
@@ -239,6 +246,17 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   if (cliId) out.cliId = cliId;
 
   applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
+
+  // Model 字段：null = 清空，string = 设置，undefined = 不动。promptModel 已经
+  // 把"adapter 不支持 model"折叠成 undefined 直接跳过；这里不再去查 adapter。
+  if (input.model === null) {
+    delete out.model;
+  } else if (typeof input.model === 'string') {
+    const v = input.model.trim();
+    if (v === '-') delete out.model;
+    else if (v) out.model = v;
+    else delete out.model;
+  }
 
   if (input.backendType !== undefined) {
     const backendType = input.backendType.trim();

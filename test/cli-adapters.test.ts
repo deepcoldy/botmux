@@ -112,6 +112,18 @@ describe('claude-code buildArgs', () => {
     expect(prompt).toContain('botmux send "第一行\\n第二行"');
     expect(prompt).toContain('字面量');
   });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'opus' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('opus');
+  });
+
+  it('surfaces curated model choices for setup', () => {
+    expect(adapter.modelChoices).toContain('sonnet');
+    expect(adapter.modelChoices).toContain('opus');
+  });
 });
 
 describe('aiden buildArgs', () => {
@@ -157,6 +169,13 @@ describe('coco buildArgs', () => {
     expect(args[indices[0] + 1]).toBe('EnterPlanMode');
     expect(args[indices[1] + 1]).toBe('ExitPlanMode');
   });
+
+  it('passes configured model through coco config override', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'Doubao-Seed-2.0-Code' });
+    const idx = args.indexOf('--config');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('model=Doubao-Seed-2.0-Code');
+  });
 });
 
 describe('codex buildArgs', () => {
@@ -183,6 +202,13 @@ describe('codex buildArgs', () => {
       '-C',
       '/repo/root',
     ]);
+  });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, model: 'gpt-5-codex' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('gpt-5-codex');
   });
 });
 
@@ -228,6 +254,13 @@ describe('gemini buildArgs', () => {
     expect(args[idx + 1]).toBe('do something');
   });
 
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, model: 'gemini-3-pro-preview' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('gemini-3-pro-preview');
+  });
+
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
@@ -253,6 +286,13 @@ describe('opencode buildArgs', () => {
     expect(args[idx + 1]).toBe('hello world');
   });
 
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, model: 'anthropic/claude-sonnet-4.5' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('anthropic/claude-sonnet-4.5');
+  });
+
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
@@ -272,6 +312,12 @@ describe('mtr buildArgs', () => {
     const expected = mtrSessionIdForBotmuxSession('bm-session-1');
     expect(args).toEqual(['--set-session', expected, '--prompt', 'hello mtr']);
     expect(expected).toMatch(/^ses_[0-9A-Za-z]+$/);
+  });
+
+  it('ignores configured model because this adapter has no modelChoices', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-session-1', resume: false, model: 'anything' });
+    expect(args).not.toContain('--model');
+    expect(adapter.modelChoices).toBeUndefined();
   });
 
   it('resume session passes --session with the same deterministic native id', () => {
@@ -345,6 +391,12 @@ describe('antigravity buildArgs', () => {
     expect(args).toContain('--conversation');
     const idx = args.indexOf('--conversation');
     expect(args[idx + 1]).toBe('eb4cabea-3060-4b76-8e85-5778cc7ddb49');
+  });
+
+  it('ignores configured model because this adapter has no modelChoices', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-7', resume: false, model: 'gemini-3-pro-preview' });
+    expect(args).not.toContain('--model');
+    expect(adapter.modelChoices).toBeUndefined();
   });
 
   it('resume without resumeSessionId starts fresh (no --continue, no random id)', () => {

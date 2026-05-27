@@ -520,7 +520,7 @@ dashboard 走单独 pm2 进程 `botmux-dashboard`，跟着 `pnpm daemon:restart`
 botmux setup
 ```
 
-已有 `~/.botmux/bots.json` 时，`botmux setup` 支持添加新机器人、重新配置、编辑现有机器人，以及删除机器人配置。编辑或删除时用 `botmux status` 里的进程名（如 `botmux-1` 或自定义的 `botmux-claude-main`）或 `larkAppId` 选择目标；字段留空表示保留当前值，`name`、`cliPathOverride`、`backendType`、`workingDir`、`allowedUsers` 等可选字段输入 `-` 表示清空。修改 `larkAppId` 会提示确认，因为旧 appId 下的历史会话和群聊状态数据不会自动迁移。删除机器人只移除本机 `bots.json` 中的一项，不删除飞书开放平台应用、历史消息或本地会话数据；修改完成后运行 `botmux restart` 生效。
+已有 `~/.botmux/bots.json` 时，`botmux setup` 支持添加新机器人、重新配置、编辑现有机器人，以及删除机器人配置。编辑或删除时用 `botmux status` 里的进程名（如 `botmux-1` 或自定义的 `botmux-claude-main`）或 `larkAppId` 选择目标；字段留空表示保留当前值，`name`、`model`、`cliPathOverride`、`backendType`、`workingDir`、`allowedUsers` 等可选字段输入 `-` 表示清空。修改 `larkAppId` 会提示确认，因为旧 appId 下的历史会话和群聊状态数据不会自动迁移。删除机器人只移除本机 `bots.json` 中的一项，不删除飞书开放平台应用、历史消息或本地会话数据；修改完成后运行 `botmux restart` 生效。
 
 **bots.json 格式：**
 
@@ -531,6 +531,7 @@ botmux setup
     "larkAppSecret": "secret_1",
     "name": "claude-main",
     "cliId": "claude-code",
+    "model": "sonnet",
     "workingDir": "~/projects",
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"]
@@ -539,6 +540,7 @@ botmux setup
     "larkAppId": "cli_xxx_bot2",
     "larkAppSecret": "secret_2",
     "cliId": "codex",
+    "model": "gpt-5-codex",
     "workingDir": "~/work"
   }
 ]
@@ -550,6 +552,7 @@ botmux setup
 | `larkAppSecret` | 是 | 飞书应用 App Secret |
 | `name` | 否 | `botmux status` 中的进程名后缀；例如 `claude-main` 会显示为 `botmux-claude-main`，留空默认 `botmux-<序号>` |
 | `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`codex-app`、`cursor`、`gemini`、`opencode`、`antigravity`、`mtr`、`hermes`） |
+| `model` | 否 | 启动 CLI 时使用的模型名；留空走 CLI 默认。当前会注入到支持模型参数的适配器：`claude-code` / `codex` / `coco` / `cursor` / `gemini` / `opencode`；其它适配器会忽略该字段 |
 | `cliPathOverride` | 否 | CLI 入口的绝对路径，用于套 wrapper / router；典型场景：ccr、claude-w、aiden-x-claude 等自定义入口 |
 | `backendType` | 否 | 会话后端：`pty` 或 `tmux`（默认自动检测） |
 | `workingDir` | 否 | 默认工作目录，支持逗号分隔多个目录。新话题的 repo 选择卡片会**从该目录自身向下**递归查找 git 仓库（最多 3 层），不再向上扫父目录：指向仓库集合根目录（如 `~/projects`）即列出其下所有仓库，指向单个仓库则只列该仓库（及其 linked worktrees） |

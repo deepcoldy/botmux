@@ -387,12 +387,15 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       return `claude --resume ${cliSessionId ?? sessionId}`;
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
       } else {
         args.push('--session-id', sessionId);
+      }
+      if (model && model.trim()) {
+        args.push('--model', model.trim());
       }
       args.push('--dangerously-skip-permissions');
       // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
@@ -723,6 +726,9 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // installed into the global ~/.claude/skills — so they never leak into the
     // user's standalone `claude`. pluginDir is consumed by ensurePluginSkills.
     pluginDir: CLAUDE_PLUGIN_DIR,
+    // 候选 model：alias（opus/sonnet/haiku）会被 Claude Code 解析成当前推荐的具体
+    // 版本；具体 ID 锁版本。setup 选 Other 可自由填，比如要回退或试 canary 模型。
+    modelChoices: ['opus', 'sonnet', 'haiku', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
     // askUserQuestion hook 写全局 ~/.claude/settings.json（matcher='AskUserQuestion' 的 PreToolUse），
     // 把 AskUserQuestion 事件转发到 `botmux hook claude-code`。
     // 选全局而非进程级 --settings：adopt 模式接管的是 botmux 没启动、拿不到 --settings

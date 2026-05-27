@@ -12,12 +12,15 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     id: 'opencode',
     resolvedBin: bin,
 
-    buildArgs({ initialPrompt }) {
+    buildArgs({ initialPrompt, model }) {
       // OpenCode manages sessions internally (SQLite store).
       // Resume not supported — always start fresh.  --continue exits
       // immediately (code 0) when there is no prior session, causing a
       // crash-loop in the daemon auto-restart path.
       const args: string[] = [];
+      if (model && model.trim()) {
+        args.push('--model', model.trim());
+      }
       // Use --prompt for the initial prompt.  OpenCode's Bubble Tea TUI
       // has an async startup phase; writing to stdin during this window
       // may be lost.  --prompt injects it once the TUI is ready.
@@ -53,6 +56,14 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       format: 'opencode-plugin',
     },
     asksViaHook: true,
+    // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
+    // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
+    modelChoices: [
+      'anthropic/claude-sonnet-4',
+      'anthropic/claude-opus-4',
+      'openai/gpt-5',
+      'google/gemini-2.5-pro',
+    ],
   };
 }
 

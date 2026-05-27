@@ -119,7 +119,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     id: 'coco',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume }) {
+    buildArgs({ sessionId, resume, model }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
@@ -127,6 +127,9 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       args.push('--yolo');
+      if (model && model.trim()) {
+        args.push('--config', `model=${model.trim()}`);
+      }
       args.push('--disallowed-tool', 'EnterPlanMode', '--disallowed-tool', 'ExitPlanMode');
       return args;
     },
@@ -267,6 +270,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // leaving Codex serial.
     supportsTypeAhead: true,
     altScreen: false,
+    modelChoices: [
+      'Seed-Dogfooding-2.0',
+      'Doubao-Seed-2.0-Code',
+      'Doubao-Seed-Code',
+      'Gemini-3.1-Pro-Preview',
+    ],
   };
 }
 
