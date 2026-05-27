@@ -228,11 +228,27 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
  * 话题群 / p2p) — saves a duplicate API call when the caller wants both
  * (the /relay picker needs name for display and mode for the type tag).
  * Falls back to `{ name: null, mode: 'group' }` on any error, mirroring
- * getChatMode's safer-default behaviour. */
+ * getChatMode's safer-default behaviour.
+ *
+ * Cached per (appId, chatId) for 5 minutes — the /relay picker re-renders
+ * on every select / paginate / search click, and without the cache each
+ * click would fire N parallel chat.get API calls (one per unique source
+ * chat) which the user perceives as a loading spinner. Mirrors the TTL
+ * cache `getChatMode` already has. */
+interface ChatInfoCacheEntry { name: string | null; mode: ChatMode; cachedAt: number }
+const chatInfoCache = new Map<string, ChatInfoCacheEntry>();
+const CHAT_INFO_TTL_MS = 5 * 60 * 1000;
+
 export async function getChatNameAndMode(
   larkAppId: string,
   chatId: string,
 ): Promise<{ name: string | null; mode: ChatMode }> {
+  const cacheKey = `${larkAppId}::${chatId}`;
+  const cached = chatInfoCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < CHAT_INFO_TTL_MS) {
+    return { name: cached.name, mode: cached.mode };
+  }
+
   let name: string | null = null;
   let mode: ChatMode = 'group';
   try {
@@ -252,6 +268,7 @@ export async function getChatNameAndMode(
   } catch {
     /* keep safe defaults */
   }
+  chatInfoCache.set(cacheKey, { name, mode, cachedAt: Date.now() });
   return { name, mode };
 }
 
