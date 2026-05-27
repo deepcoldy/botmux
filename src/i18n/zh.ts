@@ -51,7 +51,7 @@ export const messages: Record<string, string> = {
   'card.repo.placeholder_switch': '选择仓库并切换',
   'card.repo.current_active': '当前活跃项目：',
   'card.repo.current_marker': ' ← 当前',
-  'card.repo.note': '也可以回复 `/repo <编号>` 切换，例如：`/repo 1`',
+  'card.repo.note': '也可以回复 `/repo <编号>` 切换（如 `/repo 1`），或直接 `/repo <路径|项目名>`（如 `/repo botmux`、`/repo ~/projects/foo`）跳过本卡片',
 
   // 群内授权卡片
   'card.grant.title': '🔑 使用授权',

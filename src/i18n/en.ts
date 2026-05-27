@@ -48,7 +48,7 @@ export const messages: Record<string, string> = {
   'card.repo.placeholder_switch': 'Pick a repo to switch to',
   'card.repo.current_active': 'Currently active project:',
   'card.repo.current_marker': ' ← current',
-  'card.repo.note': 'You can also reply `/repo <N>` to switch — e.g. `/repo 1`.',
+  'card.repo.note': 'You can also reply `/repo <N>` (e.g. `/repo 1`), or `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`) to skip this card.',
 
   // In-group authorization card
   'card.grant.title': '🔑 Access Request',
