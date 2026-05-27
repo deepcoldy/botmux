@@ -191,16 +191,41 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
-  // ─── /relay picker interactive_container click ─────────────────────────
-  // Each session in the picker card is rendered as a v2 interactive_container
-  // whose `behaviors[0].callback.value` carries the source sessionId, target
-  // chat, and root id. Clicking anywhere in the container fires this
-  // callback with the full value as `action.value` (same shape as a button
-  // click — no `action.option`). Custom owner check — operator must equal
-  // the *source* session's owner, which is a different session from the
-  // current chat's ds. Handle this before the isSensitive gate (which
-  // checks canOperate against the current session, irrelevant here).
-  if (value?.action === 'relay_pickup' && larkAppId) {
+  // ─── /relay picker: select a session (stage 1 → 2) ─────────────────────
+  // Click on any interactive_container re-renders the card with that card
+  // highlighted + a "确认接力到本群" button appended. The actual transfer
+  // doesn't happen yet — that's relay_confirm below. Two-stage flow lets
+  // the user review their selection before committing.
+  if (value?.action === 'relay_select' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    const sourceSessionId = value.session_id;
+    const targetChatId = value.target_chat_id;
+    const targetRootId = value.root_id;
+    if (!sourceSessionId || !targetChatId || !targetRootId || !operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    const { collectRelayPickerEntries } = await import('../../services/relay-picker.js');
+    const entries = await collectRelayPickerEntries(activeSessions, larkAppId, targetChatId, operatorOpenId);
+    const selectedExists = entries.some(e => e.sessionId === sourceSessionId);
+    const { buildRelayPickerCard } = await import('./card-builder.js');
+    const cardJson = buildRelayPickerCard(
+      entries,
+      targetChatId,
+      targetRootId,
+      loc,
+      selectedExists ? sourceSessionId : undefined,
+    );
+    // Return an updated card body — event-dispatcher wraps this as
+    // { card: { type: 'raw', data: <body> } } so Lark patches the picker
+    // in place rather than appending a new message.
+    return JSON.parse(cardJson);
+  }
+
+  // ─── /relay picker: confirm transfer (stage 2 → done) ──────────────────
+  // The confirm button on the picker card fires this. Same logic as the
+  // original (pre-two-stage) relay_pickup action: owner-check, pre-flight
+  // conflict check, send M1, transferSession, delete picker card.
+  if (value?.action === 'relay_confirm' && larkAppId) {
     const loc = localeForBot(larkAppId);
     const sourceSessionId = value.session_id;
     const targetChatId = value.target_chat_id;

@@ -1,22 +1,17 @@
 /**
- * Tests for the `relay_pickup` card action: target-chat picker
- * interactive_container click.
+ * Tests for the `relay_confirm` card action: target-chat picker confirm
+ * button (stage 2 of the two-stage picker).
  *
- * Each picker option is a Lark v2 interactive_container whose callback
- * value carries `{ action: 'relay_pickup', session_id, target_chat_id,
- * root_id }`. Clicking the container fires the callback with this value
- * as `action.value`. card-handler resolves the source session,
- * owner-checks, sends M1, then transferSession.
+ * Picker flow:
+ *   stage 1 — initial picker, each session = interactive_container that
+ *             fires `relay_select` on click.
+ *   stage 2 — clicking a card re-renders the picker with that card
+ *             highlighted + a confirm button; the button fires
+ *             `relay_confirm` with the chosen sessionId.
  *
- * We test:
- *   - operator must match the source session's ownerOpenId
- *   - source session must be active and known to this bot
- *   - same-chat short-circuit
- *   - happy path → sends M1 with friendly chat name, calls transferSession
- *     with the new M1 id, returns success toast
- *   - transferSession failure variants → friendly toasts for
- *     target_chat_has_session and adopt_not_relayable; raw error
- *     passthrough for everything else
+ * These tests cover the `relay_confirm` handler (the actual transfer
+ * trigger). The `relay_select` re-render handler is tested separately
+ * since it only updates card content, no side effects.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -92,13 +87,13 @@ function makeDs(overrides: Partial<Session> & { chatId?: string } = {}): DaemonS
   } as DaemonSession;
 }
 
-// interactive_container click shape: callback value carries the full context.
+// Confirm button click shape — value carries full context after selection.
 function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id?: string; operator?: string } = {}) {
   return {
     operator: { open_id: opts.operator ?? OWNER },
     action: {
       value: {
-        action: 'relay_pickup',
+        action: 'relay_confirm',
         session_id: opts.sessionId ?? 'sess-source-1',
         target_chat_id: opts.target_chat_id ?? 'oc_target',
         root_id: opts.root_id ?? 'om_target_root',
@@ -124,11 +119,11 @@ beforeEach(() => {
   transferSessionMock.mockResolvedValue({ ok: true });
 });
 
-describe('relay_pickup interactive_container click', () => {
+describe('relay_confirm button click', () => {
   it('rejects when required value fields are missing', async () => {
     const r = await handleCardAction({
       operator: { open_id: OWNER },
-      action: { value: { action: 'relay_pickup' /* nothing else */ } },
+      action: { value: { action: 'relay_confirm' /* nothing else */ } },
     } as any, deps(new Map()), LARK_APP_ID);
     expect(r?.toast?.type).toBe('error');
     expect(transferSessionMock).not.toHaveBeenCalled();
@@ -172,7 +167,7 @@ describe('relay_pickup interactive_container click', () => {
     const r = await handleCardAction({
       operator: { open_id: OWNER },
       action: {
-        value: { action: 'relay_pickup', session_id: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_target_root' },
+        value: { action: 'relay_confirm', session_id: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_target_root' },
       },
       context: { open_message_id: 'om_picker_card' },
     } as any, deps(map), LARK_APP_ID);

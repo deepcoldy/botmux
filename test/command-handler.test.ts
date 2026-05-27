@@ -123,7 +123,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
           tag: 'interactive_container',
           behaviors: [{
             type: 'callback',
-            value: { action: 'relay_pickup', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId },
+            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId },
           }],
           elements: [{ tag: 'markdown', content: `**${e.title}**\n${e.chatMode ?? 'group'}\n${e.chatLabel}` }],
         })),
@@ -205,6 +205,33 @@ vi.mock('../src/core/session-discovery.js', () => ({
 vi.mock('../src/utils/user-token.js', () => ({
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://open.feishu.cn/auth/v1/test' })),
   getTokenStatus: vi.fn(() => 'User token: active'),
+}));
+
+// The picker query helper now lives in services/relay-picker.ts — mock it so
+// the /relay picker tests can control the entry list directly without
+// patching activeSessions in lots of places.
+vi.mock('../src/services/relay-picker.js', () => ({
+  // Default returns whatever sessions are in the registry that match the
+  // picker filter (same shape as the real impl). Tests can override.
+  collectRelayPickerEntries: vi.fn(async (activeSessions: Map<string, any>, larkAppId: string, currentChatId: string, operatorOpenId: string) => {
+    const out: any[] = [];
+    for (const c of activeSessions.values()) {
+      if (c.larkAppId !== larkAppId) continue;
+      if (c.chatId === currentChatId) continue;
+      if (c.session.ownerOpenId !== operatorOpenId) continue;
+      if (c.session.adoptedFrom) continue;
+      out.push({
+        sessionId: c.session.sessionId,
+        chatLabel: c.chatId,
+        title: c.session.title,
+        workingDir: c.session.workingDir,
+        cliId: c.session.cliId,
+        lastMessageAt: c.lastMessageAt,
+        chatMode: 'group',
+      });
+    }
+    return out;
+  }),
 }));
 
 vi.mock('../src/services/oncall-store.js', () => ({
@@ -1413,7 +1440,7 @@ describe('handleCommand', () => {
       expect(containers).toHaveLength(1);
       const cb = containers[0].behaviors[0];
       expect(cb.type).toBe('callback');
-      expect(cb.value.action).toBe('relay_pickup');
+      expect(cb.value.action).toBe('relay_select');
       expect(cb.value.session_id).toBe('sess-other');
       expect(cb.value.target_chat_id).toBe(CHAT_ID);
       expect(mockedCreate).not.toHaveBeenCalled();

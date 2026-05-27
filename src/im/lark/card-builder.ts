@@ -685,22 +685,27 @@ function relayPickerTypeTag(mode: 'group' | 'topic' | 'p2p' | undefined, locale?
 
 /**
  * Card listing the operator's relayable sessions as Lark v2 schema
- * `interactive_container` blocks — each session is a clickable card body
- * with rich markdown content. Clicking anywhere in a container fires a
- * `relay_pickup` callback with the session id, so there's no separate
- * dropdown or per-card button: the whole container IS the action surface.
+ * `interactive_container` blocks. Two-stage flow:
+ *
+ *  Stage 1 (selectedSessionId is undefined — initial render):
+ *    Each session is a clickable container. Click → fires `relay_select`
+ *    callback. card-handler re-renders the card with that session
+ *    highlighted (Stage 2).
+ *
+ *  Stage 2 (selectedSessionId set):
+ *    The chosen card gets a blue background + thicker border so the user
+ *    sees what's selected; a "确认接力到本群" button appears at the
+ *    bottom whose callback fires `relay_confirm` with the chosen
+ *    sessionId. Clicking another session re-fires `relay_select` to
+ *    update the highlight.
  *
  * Per王皓 spec ("卡片结构为会话标题、会话类型、会话所在群、会话时间"):
  *
  *   ┌────────────────────────────────────────┐
- *   │ **会话标题**                            │  ← clickable container
+ *   │ **会话标题**                            │  ← clickable
  *   │ 类型: 普通群                            │
  *   │ 位置: Project Alpha 讨论群              │
  *   │ 活跃: 10 分钟前                         │
- *   └────────────────────────────────────────┘
- *
- *   ┌────────────────────────────────────────┐
- *   │ ... next session                        │
  *   └────────────────────────────────────────┘
  *
  * Empty list produces a card with a single "no relayable sessions" notice —
@@ -711,6 +716,7 @@ export function buildRelayPickerCard(
   targetChatId: string,
   targetRootMessageId: string,
   locale?: Locale,
+  selectedSessionId?: string,
 ): string {
   const elements: any[] = [];
 
@@ -724,15 +730,18 @@ export function buildRelayPickerCard(
     const labelType     = t('card.relay.field_type',     undefined, locale);
     const labelLocation = t('card.relay.field_location', undefined, locale);
     const labelTime     = t('card.relay.field_time',     undefined, locale);
+    const selectedTag   = t('card.relay.selected_tag',   undefined, locale);
+    const hasValidSelection = !!selectedSessionId && entries.some(e => e.sessionId === selectedSessionId);
 
     entries.forEach((e) => {
+      const isSelected = e.sessionId === selectedSessionId;
       const typeTag = relayPickerTypeTag(e.chatMode, locale);
-      // For p2p chats the "location" is conceptually the same as the type
-      // (it's a direct message — no group name). Per spec ("含单聊，单聊
-      // 就写单聊") we render the literal "单聊" / "direct message" string.
       const locationLine = e.chatMode === 'p2p' ? p2pLocationLabel : e.chatLabel;
+      const titleLine = isSelected
+        ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\``
+        : `**${escapeMd(e.title)}**`;
       const lines: string[] = [
-        `**${escapeMd(e.title)}**`,
+        titleLine,
         `${labelType}: ${typeTag}`,
         `${labelLocation}: ${escapeMd(locationLine)}`,
       ];
@@ -743,15 +752,15 @@ export function buildRelayPickerCard(
         tag: 'interactive_container',
         width: 'fill',
         padding: '8px 12px',
-        background_style: 'default',
+        background_style: isSelected ? 'laser' : 'default',
         has_border: true,
-        border_color: 'grey-200',
+        border_color: isSelected ? 'blue-500' : 'grey-200',
         corner_radius: '8px',
         behaviors: [
           {
             type: 'callback',
             value: {
-              action: 'relay_pickup',
+              action: 'relay_select',
               session_id: e.sessionId,
               target_chat_id: targetChatId,
               root_id: targetRootMessageId,
@@ -763,6 +772,46 @@ export function buildRelayPickerCard(
         ],
       });
     });
+
+    // Stage 2 — confirm action row.
+    if (hasValidSelection) {
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        background_style: 'default',
+        columns: [
+          {
+            tag: 'column',
+            width: 'weighted',
+            weight: 1,
+            elements: [
+              {
+                tag: 'button',
+                text: { tag: 'plain_text', content: t('card.relay.btn_confirm', undefined, locale) },
+                type: 'primary',
+                behaviors: [
+                  {
+                    type: 'callback',
+                    value: {
+                      action: 'relay_confirm',
+                      session_id: selectedSessionId,
+                      target_chat_id: targetChatId,
+                      root_id: targetRootMessageId,
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      });
+    } else {
+      // Subtle hint that the user needs to click a card first.
+      elements.push({
+        tag: 'markdown',
+        content: `<font color='grey'>${t('card.relay.hint_pick_first', undefined, locale)}</font>`,
+      });
+    }
   }
 
   const card = {

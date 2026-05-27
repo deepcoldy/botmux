@@ -739,7 +739,7 @@ describe('buildRelayPickerCard', () => {
     expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container').length).toBe(0);
   });
 
-  it('renders each session as a clickable interactive_container with callback carrying the sessionId', () => {
+  it('stage 1 (no selection): each session is an interactive_container that fires relay_select on click', () => {
     const entries: RelayPickerEntry[] = [
       { sessionId: 'sess-a', chatLabel: 'Project A 讨论群', title: 'PR review', chatMode: 'group', lastMessageAt: Date.now() - 60_000 },
       { sessionId: 'sess-b', chatLabel: 'Team docs',         title: 'docs sync', chatMode: 'topic', lastMessageAt: Date.now() - 600_000 },
@@ -750,17 +750,55 @@ describe('buildRelayPickerCard', () => {
     expect(containers).toHaveLength(2);
 
     containers.forEach((c: any, i: number) => {
-      expect(c.behaviors).toHaveLength(1);
       const cb = c.behaviors[0];
       expect(cb.type).toBe('callback');
-      expect(cb.value.action).toBe('relay_pickup');
+      expect(cb.value.action).toBe('relay_select');
       expect(cb.value.session_id).toBe(entries[i].sessionId);
       expect(cb.value.target_chat_id).toBe('oc_target');
       expect(cb.value.root_id).toBe('om_target_root');
-      // The container holds a markdown element with the rich content.
-      expect(c.elements).toHaveLength(1);
-      expect(c.elements[0].tag).toBe('markdown');
+      // No "selected" highlight on either card.
+      expect(c.background_style).toBe('default');
     });
+
+    // Stage 1: no confirm button yet, only a hint markdown at the bottom.
+    const columnSets = card.body.elements.filter((e: any) => e.tag === 'column_set');
+    expect(columnSets).toHaveLength(0);
+    const last = card.body.elements[card.body.elements.length - 1];
+    expect(last.tag).toBe('markdown');
+    expect(last.content).toMatch(/点击上方|Tap any/);
+  });
+
+  it('stage 2 (selectedSessionId set): selected card is highlighted and a confirm button appears', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-a', chatLabel: 'A', title: 'first', chatMode: 'group' },
+      { sessionId: 'sess-b', chatLabel: 'B', title: 'second', chatMode: 'group' },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_target_root', undefined, 'sess-b'));
+
+    const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers).toHaveLength(2);
+    expect(containers[0].background_style).toBe('default');
+    expect(containers[1].background_style).toBe('laser'); // highlighted
+
+    // Confirm button appears in a column_set after the cards.
+    const cols = card.body.elements.filter((e: any) => e.tag === 'column_set');
+    expect(cols).toHaveLength(1);
+    const btn = cols[0].columns[0].elements[0];
+    expect(btn.tag).toBe('button');
+    expect(btn.behaviors[0].value.action).toBe('relay_confirm');
+    expect(btn.behaviors[0].value.session_id).toBe('sess-b');
+    expect(btn.behaviors[0].value.target_chat_id).toBe('oc_target');
+  });
+
+  it('falls back to no-selection state if selectedSessionId does not match any entry', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-a', chatLabel: 'A', title: 't', chatMode: 'group' },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', undefined, 'sess-vanished'));
+    // No confirm button, no highlight, just the hint.
+    expect(card.body.elements.filter((e: any) => e.tag === 'column_set')).toHaveLength(0);
+    const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers[0].background_style).toBe('default');
   });
 
   it('container markdown shows title / type / location / time on four labelled lines', () => {

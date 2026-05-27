@@ -1034,49 +1034,13 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.target_has_session', { title: conflict.session.title || conflict.session.sessionId.substring(0, 8) }, loc));
             break;
           }
-          // Collect candidates first (no IO yet) so we know which chatIds
-          // need name+mode resolution. Many sessions can share a chat —
-          // dedupe before fanning out the API calls. Filter out:
-          //   • sessions in OTHER bots
-          //   • the current chat (can't relay to self)
-          //   • sessions not owned by the operator
-          //   • adopt sessions — they wrap a user's external tmux, we don't
-          //     own the lifecycle, refuse to relay them (matches the
-          //     defense-in-depth guard in transferSession itself)
-          const candidates: DaemonSession[] = [];
-          for (const candidate of activeSessions.values()) {
-            if (candidate.larkAppId !== myAppId) continue;
-            if (candidate.chatId === targetChatId) continue;
-            if (candidate.session.ownerOpenId !== operatorOpenId) continue;
-            if (candidate.session.adoptedFrom) continue;
-            candidates.push(candidate);
-          }
-          // Resolve chat names + modes in parallel — best-effort. Failure
-          // → null name (fall back to chatId) and mode='group' (the safer
-          // default that matches getChatMode's behaviour).
-          const { getChatNameAndMode } = await import('../im/lark/client.js');
-          const uniqueChatIds = [...new Set(candidates.map(c => c.chatId))];
-          const resolved = await Promise.all(
-            uniqueChatIds.map(async (cid) => [cid, await getChatNameAndMode(myAppId, cid)] as const),
-          );
-          const chatInfoByChatId = new Map<string, { name: string | null; mode: 'group' | 'topic' | 'p2p' }>();
-          for (const [cid, info] of resolved) chatInfoByChatId.set(cid, info);
-          const entries: import('../im/lark/card-builder.js').RelayPickerEntry[] = candidates.map(c => {
-            const info = chatInfoByChatId.get(c.chatId);
-            // Prefer mode from the live Lark API. Fall back to the session's
-            // own chatType for p2p (since p2p chats sometimes return empty
-            // names but we know they're p2p from the session record).
-            const fallbackMode: 'group' | 'topic' | 'p2p' = c.chatType === 'p2p' ? 'p2p' : 'group';
-            return {
-              sessionId: c.session.sessionId,
-              chatLabel: info?.name ?? c.chatId,
-              title: c.session.title || c.currentTurnTitle || '(no title)',
-              workingDir: c.session.workingDir,
-              cliId: c.session.cliId,
-              lastMessageAt: c.lastMessageAt,
-              chatMode: info?.mode ?? fallbackMode,
-            };
-          });
+          // Shared candidate-collection logic — used here at initial render
+          // and again in card-handler when the user clicks a card to switch
+          // selection (the card re-render needs the same filtered list).
+          // Filters out: other bots / current chat / non-owned / adopt
+          // sessions. Resolves friendly chat names + modes in parallel.
+          const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
+          const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetChatId, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
           const card = buildRelayPickerCard(entries, targetChatId, rootId, loc);
           await sessionReply(rootId, card, 'interactive');
