@@ -128,7 +128,9 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       }
       args.push('--yolo');
       if (model && model.trim()) {
-        args.push('--config', `model=${model.trim()}`);
+        // CoCo expects nested key path for model override. `model=...` exits 1,
+        // while `model.name=...` starts correctly.
+        args.push('--config', `model.name=${model.trim()}`);
       }
       args.push('--disallowed-tool', 'EnterPlanMode', '--disallowed-tool', 'ExitPlanMode');
       return args;

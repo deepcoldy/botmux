@@ -174,7 +174,7 @@ describe('coco buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'Doubao-Seed-2.0-Code' });
     const idx = args.indexOf('--config');
     expect(idx).toBeGreaterThanOrEqual(0);
-    expect(args[idx + 1]).toBe('model=Doubao-Seed-2.0-Code');
+    expect(args[idx + 1]).toBe('model.name=Doubao-Seed-2.0-Code');
   });
 });
 
