@@ -683,150 +683,307 @@ function relayPickerTypeTag(mode: 'group' | 'topic' | 'p2p' | undefined, locale?
   }
 }
 
+export interface RelayPickerState {
+  /** Currently selected sessionId, if any (drives the highlight + confirm button). */
+  selectedSessionId?: string;
+  /** Case-insensitive substring filter applied to title / chatLabel / workingDir. */
+  searchQuery?: string;
+  /** 0-indexed page within the filtered list. Clamped to valid range at render time. */
+  page?: number;
+}
+
+const RELAY_PICKER_PAGE_SIZE = 5;
+const RELAY_SEARCH_FIELD = 'search';
+
 /**
- * Card listing the operator's relayable sessions as Lark v2 schema
- * `interactive_container` blocks. Two-stage flow:
+ * Match against title / chatLabel / workingDir / cliId. Case-insensitive
+ * substring. Empty / whitespace query matches everything.
+ */
+function relayPickerFilter(entries: RelayPickerEntry[], query: string | undefined): RelayPickerEntry[] {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return entries;
+  return entries.filter((e) => {
+    const haystack = [e.title, e.chatLabel, e.workingDir, e.cliId]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    return haystack.includes(q);
+  });
+}
+
+/**
+ * Card listing the operator's relayable sessions, paginated 5 per page with
+ * a search box at the top and a confirm button at the bottom. Layout:
  *
- *  Stage 1 (selectedSessionId is undefined — initial render):
- *    Each session is a clickable container. Click → fires `relay_select`
- *    callback. card-handler re-renders the card with that session
- *    highlighted (Stage 2).
+ *   ┌──────────────────────────────────────┐
+ *   │ 📋 选择要接力的会话                   │  header
+ *   ├──────────────────────────────────────┤
+ *   │ 🔍 [______________] [搜索]            │  form: input + submit button
+ *   ├──────────────────────────────────────┤
+ *   │  [interactive_container 1]            │  current page (≤5 cards),
+ *   │  [interactive_container 2]            │  each clickable for selection
+ *   │   ...                                 │
+ *   ├──────────────────────────────────────┤
+ *   │  [← 上一页]  1 / 4  [下一页 →]        │  paginator row
+ *   ├──────────────────────────────────────┤
+ *   │   [确认接力到本群]                    │  primary button (only when
+ *   │                                       │   a selected session is on
+ *   │                                       │   the current filtered set)
+ *   └──────────────────────────────────────┘
  *
- *  Stage 2 (selectedSessionId set):
- *    The chosen card gets a blue background + thicker border so the user
- *    sees what's selected; a "确认接力到本群" button appears at the
- *    bottom whose callback fires `relay_confirm` with the chosen
- *    sessionId. Clicking another session re-fires `relay_select` to
- *    update the highlight.
+ * State (search / page / selected) is propagated entirely via the value
+ * objects on each button and container — Lark cards are stateless, so any
+ * server-side re-render must reconstruct from what the click sent us.
+ * That's why every interactive value here carries `search`, `page`,
+ * `target_chat_id`, `root_id`.
  *
- * Per王皓 spec ("卡片结构为会话标题、会话类型、会话所在群、会话时间"):
- *
- *   ┌────────────────────────────────────────┐
- *   │ **会话标题**                            │  ← clickable
- *   │ 类型: 普通群                            │
- *   │ 位置: Project Alpha 讨论群              │
- *   │ 活跃: 10 分钟前                         │
- *   └────────────────────────────────────────┘
- *
- * Empty list produces a card with a single "no relayable sessions" notice —
- * keeps the UX consistent (always returns a card, never an empty message).
+ * Note: typing into the search box without clicking 搜索 does NOT update
+ * the in-callback state — container/paginator clicks use whatever search
+ * was applied at card-render time. To apply a new filter, click 搜索.
  */
 export function buildRelayPickerCard(
   entries: RelayPickerEntry[],
   targetChatId: string,
   targetRootMessageId: string,
   locale?: Locale,
-  selectedSessionId?: string,
+  state?: RelayPickerState,
 ): string {
+  const searchQuery = state?.searchQuery ?? '';
+  const requestedPage = state?.page ?? 0;
+  const selectedSessionId = state?.selectedSessionId;
   const elements: any[] = [];
 
-  if (entries.length === 0) {
-    elements.push({
-      tag: 'markdown',
-      content: t('card.relay.empty', undefined, locale),
-    });
-  } else {
-    const p2pLocationLabel = t('card.relay.type_p2p', undefined, locale);
-    const labelType     = t('card.relay.field_type',     undefined, locale);
-    const labelLocation = t('card.relay.field_location', undefined, locale);
-    const labelTime     = t('card.relay.field_time',     undefined, locale);
-    const selectedTag   = t('card.relay.selected_tag',   undefined, locale);
-    const hasValidSelection = !!selectedSessionId && entries.some(e => e.sessionId === selectedSessionId);
+  // ─── Filter & paginate ───────────────────────────────────────────────
+  const filtered = relayPickerFilter(entries, searchQuery);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / RELAY_PICKER_PAGE_SIZE));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  const start = page * RELAY_PICKER_PAGE_SIZE;
+  const visible = filtered.slice(start, start + RELAY_PICKER_PAGE_SIZE);
 
-    entries.forEach((e) => {
-      const isSelected = e.sessionId === selectedSessionId;
-      const typeTag = relayPickerTypeTag(e.chatMode, locale);
-      const locationLine = e.chatMode === 'p2p' ? p2pLocationLabel : e.chatLabel;
-      const titleLine = isSelected
-        ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\``
-        : `**${escapeMd(e.title)}**`;
-      const lines: string[] = [
-        titleLine,
-        `${labelType}: ${typeTag}`,
-        `${labelLocation}: ${escapeMd(locationLine)}`,
-      ];
-      if (e.lastMessageAt) {
-        lines.push(`${labelTime}: ${formatDuration(Date.now() - e.lastMessageAt)}`);
-      }
-      elements.push({
-        tag: 'interactive_container',
-        width: 'fill',
-        padding: '8px 12px',
-        background_style: isSelected ? 'laser' : 'default',
-        has_border: true,
-        border_color: isSelected ? 'blue-500' : 'grey-200',
-        corner_radius: '8px',
-        behaviors: [
-          {
-            type: 'callback',
-            value: {
-              action: 'relay_select',
-              session_id: e.sessionId,
-              target_chat_id: targetChatId,
-              root_id: targetRootMessageId,
-            },
-          },
-        ],
-        elements: [
-          { tag: 'markdown', content: lines.join('\n') },
-        ],
-      });
-    });
+  // Common state object carried by every interactive value so re-renders
+  // can reconstruct what the user was looking at.
+  const stateValue = {
+    target_chat_id: targetChatId,
+    root_id: targetRootMessageId,
+    search: searchQuery,
+    page,
+    selected: selectedSessionId ?? '',
+  };
 
-    // Stage 2 — confirm action row.
-    if (hasValidSelection) {
-      elements.push({
+  // ─── Search box (form) ──────────────────────────────────────────────
+  // form_submit on the 搜索 button collects the input value into
+  // form_value.search; daemon re-renders with that as the new query.
+  elements.push({
+    tag: 'form',
+    name: 'relay_picker_form',
+    elements: [
+      {
         tag: 'column_set',
         flex_mode: 'none',
-        background_style: 'default',
+        horizontal_spacing: 'default',
         columns: [
           {
             tag: 'column',
             width: 'weighted',
+            weight: 5,
+            vertical_align: 'center',
+            elements: [
+              {
+                tag: 'input',
+                name: RELAY_SEARCH_FIELD,
+                placeholder: { tag: 'plain_text', content: t('card.relay.search_placeholder', undefined, locale) },
+                default_value: searchQuery,
+                width: 'fill',
+              },
+            ],
+          },
+          {
+            tag: 'column',
+            width: 'weighted',
             weight: 1,
+            vertical_align: 'center',
             elements: [
               {
                 tag: 'button',
-                text: { tag: 'plain_text', content: t('card.relay.btn_confirm', undefined, locale) },
-                type: 'primary',
-                behaviors: [
-                  {
-                    type: 'callback',
-                    value: {
-                      action: 'relay_confirm',
-                      session_id: selectedSessionId,
-                      target_chat_id: targetChatId,
-                      root_id: targetRootMessageId,
-                    },
-                  },
-                ],
+                text: { tag: 'plain_text', content: t('card.relay.btn_search', undefined, locale) },
+                action_type: 'form_submit',
+                name: 'relay_picker_search_btn',
+                value: { action: 'relay_search', ...stateValue, selected: '' /* reset selection on new search */ },
               },
             ],
           },
         ],
-      });
-    } else {
-      // Subtle hint that the user needs to click a card first.
-      elements.push({
-        tag: 'markdown',
-        content: `<font color='grey'>${t('card.relay.hint_pick_first', undefined, locale)}</font>`,
-      });
-    }
+      },
+    ],
+  });
+
+  elements.push({ tag: 'hr' });
+
+  // ─── Empty / no-match notice ────────────────────────────────────────
+  if (entries.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.relay.empty', undefined, locale) });
+    return JSON.stringify(wrapCard(elements, locale));
+  }
+  if (filtered.length === 0) {
+    elements.push({
+      tag: 'markdown',
+      content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
+    });
+    return JSON.stringify(wrapCard(elements, locale));
   }
 
-  const card = {
+  // ─── Session cards (current page) ───────────────────────────────────
+  const p2pLocationLabel = t('card.relay.type_p2p', undefined, locale);
+  const labelType     = t('card.relay.field_type',     undefined, locale);
+  const labelLocation = t('card.relay.field_location', undefined, locale);
+  const labelTime     = t('card.relay.field_time',     undefined, locale);
+  const selectedTag   = t('card.relay.selected_tag',   undefined, locale);
+  const hasValidSelection = !!selectedSessionId && filtered.some(e => e.sessionId === selectedSessionId);
+
+  visible.forEach((e) => {
+    const isSelected = e.sessionId === selectedSessionId;
+    const typeTag = relayPickerTypeTag(e.chatMode, locale);
+    const locationLine = e.chatMode === 'p2p' ? p2pLocationLabel : e.chatLabel;
+    const titleLine = isSelected
+      ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\``
+      : `**${escapeMd(e.title)}**`;
+    const lines: string[] = [
+      titleLine,
+      `${labelType}: ${typeTag}`,
+      `${labelLocation}: ${escapeMd(locationLine)}`,
+    ];
+    if (e.lastMessageAt) {
+      lines.push(`${labelTime}: ${formatDuration(Date.now() - e.lastMessageAt)}`);
+    }
+    elements.push({
+      tag: 'interactive_container',
+      width: 'fill',
+      padding: '8px 12px',
+      background_style: isSelected ? 'laser' : 'default',
+      has_border: true,
+      border_color: isSelected ? 'blue-500' : 'grey-200',
+      corner_radius: '8px',
+      behaviors: [
+        {
+          type: 'callback',
+          value: { action: 'relay_select', session_id: e.sessionId, ...stateValue },
+        },
+      ],
+      elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    });
+  });
+
+  // ─── Paginator (only when more than one page) ───────────────────────
+  if (totalPages > 1) {
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'default',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'center',
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_prev_page', undefined, locale) },
+              type: 'default',
+              disabled: page === 0,
+              behaviors: [
+                {
+                  type: 'callback',
+                  value: { action: 'relay_page', ...stateValue, page: Math.max(0, page - 1) },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 2,
+          vertical_align: 'center',
+          elements: [
+            {
+              tag: 'markdown',
+              text_align: 'center',
+              content: t('card.relay.page_indicator', { current: page + 1, total: totalPages }, locale),
+            },
+          ],
+        },
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'center',
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_next_page', undefined, locale) },
+              type: 'default',
+              disabled: page === totalPages - 1,
+              behaviors: [
+                {
+                  type: 'callback',
+                  value: { action: 'relay_page', ...stateValue, page: Math.min(totalPages - 1, page + 1) },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  // ─── Confirm button or hint ─────────────────────────────────────────
+  elements.push({ tag: 'hr' });
+  if (hasValidSelection) {
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_confirm', undefined, locale) },
+              type: 'primary',
+              behaviors: [
+                {
+                  type: 'callback',
+                  value: { action: 'relay_confirm', session_id: selectedSessionId, ...stateValue },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  } else {
+    elements.push({
+      tag: 'markdown',
+      content: `<font color='grey'>${t('card.relay.hint_pick_first', undefined, locale)}</font>`,
+    });
+  }
+
+  return JSON.stringify(wrapCard(elements, locale));
+}
+
+function wrapCard(elements: any[], locale?: Locale): any {
+  return {
     schema: '2.0',
     config: { update_multi: true },
     header: {
       title: { tag: 'plain_text', content: t('card.relay.title', undefined, locale) },
       template: 'blue',
     },
-    body: {
-      direction: 'vertical',
-      elements,
-    },
+    body: { direction: 'vertical', elements },
   };
-  return JSON.stringify(card);
 }
 
 export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId?: string, locale?: Locale): string {

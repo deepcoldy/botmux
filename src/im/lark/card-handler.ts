@@ -191,29 +191,60 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
-  // ─── /relay picker: select a session (stage 1 → 2) ─────────────────────
-  // Click on any interactive_container re-renders the card with that card
-  // highlighted + a "确认接力到本群" button appended. The actual transfer
-  // doesn't happen yet — that's relay_confirm below. Two-stage flow lets
-  // the user review their selection before committing.
-  if (value?.action === 'relay_select' && larkAppId) {
+  // ─── /relay picker: state-changing actions (select / page / search) ────
+  // These three actions all re-render the picker card with updated state:
+  //   • relay_select — user clicked a session card → set as selectedSessionId
+  //   • relay_page   — user clicked prev/next page → bump page index
+  //   • relay_search — user submitted the search form → apply new query (reset page)
+  //
+  // The card is stateless on the Lark side, so each callback value carries
+  // the FULL state (search / page / selected / target_chat_id / root_id);
+  // we just compute the new state from the action and re-render.
+  if (value?.action && larkAppId && ['relay_select', 'relay_page', 'relay_search'].includes(value.action as string)) {
     const loc = localeForBot(larkAppId);
-    const sourceSessionId = value.session_id;
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
-    if (!sourceSessionId || !targetChatId || !targetRootId || !operatorOpenId) {
+    if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
     }
+
+    // Reconstruct the next state from the action.
+    const carriedSearch = (value.search as string) ?? '';
+    const carriedPage = Number(value.page ?? 0) || 0;
+    const carriedSelected = (value.selected as string) ?? '';
+
+    let nextSearch = carriedSearch;
+    let nextPage = carriedPage;
+    let nextSelected: string | undefined = carriedSelected || undefined;
+
+    if (value.action === 'relay_search') {
+      // Search form_submit — pull the new query out of form_value and reset page.
+      const formValue = (action as any)?.form_value ?? {};
+      nextSearch = String(formValue.search ?? '').trim();
+      nextPage = 0;
+      // Don't carry over the selection on a new search — the selected entry
+      // may not match the new filter, and even if it does, "I just searched
+      // for something else" implies the user is changing what they want.
+      nextSelected = undefined;
+    } else if (value.action === 'relay_page') {
+      nextPage = Number(value.page ?? 0) || 0;
+    } else if (value.action === 'relay_select') {
+      nextSelected = value.session_id;
+    }
+
     const { collectRelayPickerEntries } = await import('../../services/relay-picker.js');
     const entries = await collectRelayPickerEntries(activeSessions, larkAppId, targetChatId, operatorOpenId);
-    const selectedExists = entries.some(e => e.sessionId === sourceSessionId);
     const { buildRelayPickerCard } = await import('./card-builder.js');
     const cardJson = buildRelayPickerCard(
       entries,
       targetChatId,
       targetRootId,
       loc,
-      selectedExists ? sourceSessionId : undefined,
+      {
+        selectedSessionId: nextSelected,
+        searchQuery: nextSearch,
+        page: nextPage,
+      },
     );
     // Return an updated card body — event-dispatcher wraps this as
     // { card: { type: 'raw', data: <body> } } so Lark patches the picker
