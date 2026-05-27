@@ -45,6 +45,7 @@ export const messages: Record<string, string> = {
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
+  'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开终端」查看实时画面。',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -101,6 +102,10 @@ export const messages: Record<string, string> = {
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
   'cmd.card.not_ready': '终端尚未就绪，等会话起好后流式卡片会自动出现。',
+  'cmd.card.private_not_group': '🔒 私密卡片仅支持普通群聊，话题群 / 单聊无法发送（飞书限制）。',
+  'cmd.card.private_no_audience': '🔒 没有可见对象：当前没有被授权与本 bot 对话的用户。',
+  'cmd.card.private_failed': '🔒 私密卡片发送失败 —— 可能是缺少消息发送权限、bot 不在群内，或当前为话题群。',
+  'cmd.card.private_partial': '🔒 私密卡片已发送 {sent}/{total}，部分接收人发送失败。',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
@@ -181,7 +186,7 @@ export const messages: Record<string, string> = {
   'help.repo_n': '/repo <N>   - 切换到第 N 个项目',
   'help.repo_path': '/repo <路径|项目名> - 直接指定路径或 workingDir 下的项目名，跳过选择卡片',
   'help.status': '/status     - 查看当前会话状态（含终端链接）',
-  'help.card': '/card       - 手动弹出当前会话的流式卡片（关流式时也能临时召唤，并恢复实时刷新）',
+  'help.card': '/card       - 手动弹出当前会话的流式卡片（关流式时也能临时召唤，并恢复实时刷新；开了私密卡片则改发仅授权人可见的静态快照）',
   'help.heading_passthrough': '🔀 透传给 {cliName}（字面送达，供其内置 slash 命令处理）：',
   'help.heading_schedule': '⏰ 定时任务：',
   'help.schedule_create': '/schedule 每日17:50 帮我看AI新闻   - 创建定时任务（自然语言）',

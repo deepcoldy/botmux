@@ -14,8 +14,8 @@ import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
-import { updateMessage, deleteMessage, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { updateMessage, deleteMessage, sendEphemeralCard, MessageWithdrawnError } from '../im/lark/client.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -411,6 +411,71 @@ export async function postFreshStreamingCard(
     logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
     return false;
   }
+}
+
+/**
+ * Audience for a private `/card`: the explicit talk-grant union (allowedUsers ∪
+ * globalGrants ∪ this chat's chatGrants) plus the triggerer, deduped, `ou_` only.
+ * The "everyone can talk" sets (oncall / allowedChatGroups / open mode) are NOT
+ * enumerable, so they're intentionally excluded — we fail-closed to the curated
+ * list rather than broadcast to the whole room.
+ */
+export function resolvePrivateCardAudience(
+  ds: DaemonSession,
+  triggererOpenId: string | undefined,
+): string[] {
+  const bot = getBot(ds.larkAppId);
+  const set = new Set<string>();
+  for (const u of bot.resolvedAllowedUsers) if (u.startsWith('ou_')) set.add(u);
+  for (const u of bot.config.globalGrants ?? []) if (u.startsWith('ou_')) set.add(u);
+  for (const u of bot.config.chatGrants?.[ds.chatId] ?? []) if (u.startsWith('ou_')) set.add(u);
+  if (triggererOpenId?.startsWith('ou_')) set.add(triggererOpenId);
+  return [...set];
+}
+
+/**
+ * Private `/card`: build a one-shot snapshot of the current terminal and send it
+ * as an ephemeral (visible-to-one) card to each open_id in `audience`, one API
+ * call each (concurrency-capped). Never posts a group-visible card and never
+ * patches — privacy is the whole point, so there is deliberately no fallback.
+ * Returns per-recipient counts so the caller can report progress without leaking
+ * the audience list into the chat.
+ */
+export async function postPrivateSnapshotCard(
+  ds: DaemonSession,
+  audience: string[],
+  triggererOpenId: string | undefined,
+): Promise<{ sent: number; total: number; triggererSent: boolean; notReady: boolean }> {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port) return { sent: 0, total: audience.length, triggererSent: false, notReady: true };
+
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const readUrl = terminalReadUrl(port);
+  const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  const status = ds.lastScreenStatus ?? 'idle';
+  const cardJson = buildPrivateSnapshotCard(
+    readUrl, title, status, effectiveCliId, ds.currentImageKey, localeForBot(ds.larkAppId), cardUsageLimit(ds),
+  );
+
+  let sent = 0;
+  let triggererSent = false;
+  // Cap concurrency: Feishu per-chat ~40 QPS, ephemeral total 50/s.
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async (openId) => {
+      try {
+        await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, cardJson);
+        sent++;
+        if (openId === triggererOpenId) triggererSent = true;
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] private /card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`);
+      }
+    }));
+  }
+  logger.info(`[${tag(ds)}] private /card: ephemeral sent ${sent}/${audience.length}`);
+  return { sent, total: audience.length, triggererSent, notReady: false };
 }
 
 // ─── Card PATCH serialization queue ─────────────────────────────────────────

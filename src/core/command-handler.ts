@@ -12,9 +12,9 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, listChatBotMembers } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, listChatBotMembers, getChatMode } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
@@ -1042,6 +1042,38 @@ export async function handleCommand(
       case '/card': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        // Private mode (`privateCard`): send a one-shot snapshot only to the
+        // explicit talk-grant audience via the ephemeral API, instead of the
+        // group-visible live card. Ephemeral cards only work in plain `group`
+        // chats and can't be patched — so no live updates, and we fail closed
+        // (never fall back to a group-visible card) since not leaking is the
+        // entire point of this mode.
+        if (getBot(ds.larkAppId).config.privateCard) {
+          const mode = await getChatMode(ds.larkAppId, ds.chatId);
+          if (mode !== 'group') {
+            await sessionReply(rootId, t('cmd.card.private_not_group', undefined, loc));
+            break;
+          }
+          const triggerer = message.senderId;
+          const audience = resolvePrivateCardAudience(ds, triggerer);
+          if (audience.length === 0) {
+            await sessionReply(rootId, t('cmd.card.private_no_audience', undefined, loc));
+            break;
+          }
+          const r = await postPrivateSnapshotCard(ds, audience, triggerer);
+          if (r.notReady) {
+            await sessionReply(rootId, t('cmd.card.not_ready', undefined, loc));
+          } else if (r.sent === 0) {
+            // Total failure — surface a non-sensitive error (no terminal content,
+            // no open_id list). Most likely cause: missing send permission / bot
+            // not in chat / topic-thread chat.
+            await sessionReply(rootId, t('cmd.card.private_failed', undefined, loc));
+          } else if (r.sent < r.total) {
+            // Partial — report counts only, never the audience identities.
+            await sessionReply(rootId, t('cmd.card.private_partial', { sent: r.sent, total: r.total }, loc));
+          }
           break;
         }
         // Manual summon. Force the live card on for the rest of this session —

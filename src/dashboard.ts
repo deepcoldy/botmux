@@ -589,6 +589,7 @@ const server = createServer(async (req, res) => {
             brandLabel: j.brandLabel ?? null,
             disableStreamingCard: j.disableStreamingCard === true,
             writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
+            privateCard: j.privateCard === true,
           };
         } catch (e: any) {
           return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };

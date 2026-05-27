@@ -99,6 +99,15 @@ export interface BotConfig {
    * {@link disableStreamingCard} is on (no card to embed it in).
    */
   writableTerminalLinkInCard?: boolean;
+  /**
+   * When true, `/card` sends a **private** static snapshot card via the ephemeral
+   * API (visible only to the explicit talk-grant audience + triggerer) instead of
+   * the group-visible live streaming card. Only works in plain `group` chats
+   * (topic/thread/p2p fail closed) and cannot live-update (ephemeral cards can't
+   * be patched). Scoped to the `/card` command only — the auto streaming card is
+   * unaffected. Default (undefined) keeps `/card` group-visible & live.
+   */
+  privateCard?: boolean;
 }
 
 export interface BotState {
@@ -441,6 +450,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
+      privateCard: entry.privateCard === true || undefined,
     });
   }
 

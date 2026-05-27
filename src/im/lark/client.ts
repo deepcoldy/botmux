@@ -298,6 +298,35 @@ export async function deleteMessage(larkAppId: string, messageId: string): Promi
   }
 }
 
+/** Error code Feishu returns from `ephemeral/v1/send` when the target chat is a
+ *  topic / thread chat. Ephemeral cards only work in plain `group` chats (see
+ *  /tmp design notes: empirically code 18053 `chat can not be thread`). */
+export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
+
+/**
+ * Send a "visible-to-one-user" ephemeral card (`ephemeral/v1/send`). The card is
+ * only shown to `openId`, sends no notification, and — unlike normal messages —
+ * **cannot be PATCH-updated** (legacy interface). Multiple recipients require one
+ * call each. Only works in plain `group` chats; topic/thread/p2p chats reject
+ * with {@link LARK_CODE_EPHEMERAL_NOT_GROUP}. Returns the ephemeral message_id.
+ */
+export async function sendEphemeralCard(
+  larkAppId: string, chatId: string, openId: string, cardJson: string,
+): Promise<string> {
+  const c = getBotClient(larkAppId);
+  const res: any = await (c as any).request({
+    method: 'POST',
+    url: '/open-apis/ephemeral/v1/send',
+    data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card: JSON.parse(cardJson) },
+  });
+  if (res.code !== 0) {
+    throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);
+  }
+  const messageId = res.data?.message_id;
+  logger.info(`Sent ephemeral card ${messageId ?? '(no id)'} to ${openId} in chat ${chatId}`);
+  return messageId ?? '';
+}
+
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
   const c = getBotClient(larkAppId);
   let res: any;

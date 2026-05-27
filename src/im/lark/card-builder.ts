@@ -185,6 +185,50 @@ export function truncateContent(content: string, locale?: Locale): string {
   return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
 }
 
+const STREAM_TEMPLATE_MAP = {
+  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green',
+} as const;
+
+/** Header status label for a streaming/snapshot card. Shared by the live card
+ *  and the private snapshot so the two never drift. */
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale): string {
+  switch (status) {
+    case 'starting': return t('card.status.starting', undefined, locale);
+    case 'working': return t('card.status.working', undefined, locale);
+    case 'idle': return t('card.status.idle', undefined, locale);
+    case 'analyzing': return t('card.status.analyzing', undefined, locale);
+    case 'limited': return usageLimit?.retryReady
+      ? t('card.status.retry_ready', undefined, locale)
+      : t('card.status.limited', undefined, locale);
+  }
+}
+
+/** Push the shared "output body" elements (usage-limit notice + screenshot) used
+ *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
+function pushStreamBody(
+  elements: any[],
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale },
+): void {
+  const { status, usageLimit, displayMode, imageKey, cliName, locale } = opts;
+  if (status === 'limited' && usageLimit) {
+    elements.push({
+      tag: 'markdown',
+      content: usageLimit.retryReady
+        ? t('card.usage_limit.retry_ready', { cliName }, locale)
+        : t('card.usage_limit.retry_at', { cliName, retryLabel: usageLimit.retryLabel }, locale),
+    });
+    elements.push({ tag: 'hr' });
+  }
+  if (displayMode === 'screenshot') {
+    if (imageKey) {
+      elements.push({ tag: 'img', img_key: imageKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true });
+    } else {
+      elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
+    }
+    elements.push({ tag: 'hr' });
+  }
+}
+
 /**
  * Build a Feishu streaming card that shows live terminal output + controls.
  * This card is PATCHed in-place as the CLI works.
@@ -217,46 +261,11 @@ export function buildStreamingCard(
   const cliName = getCliDisplayName(effectiveCliId);
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
-  const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green' } as const;
-  const statusLabel = (s: typeof status): string => {
-    switch (s) {
-      case 'starting': return t('card.status.starting', undefined, locale);
-      case 'working': return t('card.status.working', undefined, locale);
-      case 'idle': return t('card.status.idle', undefined, locale);
-      case 'analyzing': return t('card.status.analyzing', undefined, locale);
-      case 'limited': return usageLimit?.retryReady
-        ? t('card.status.retry_ready', undefined, locale)
-        : t('card.status.limited', undefined, locale);
-    }
-  };
 
   const elements: any[] = [];
 
-  // ── Output body ─────────────────────────────────────────────────────────
-  if (status === 'limited' && usageLimit) {
-    elements.push({
-      tag: 'markdown',
-      content: usageLimit.retryReady
-        ? t('card.usage_limit.retry_ready', { cliName }, locale)
-        : t('card.usage_limit.retry_at', { cliName, retryLabel: usageLimit.retryLabel }, locale),
-    });
-    elements.push({ tag: 'hr' });
-  }
-
-  if (displayMode === 'screenshot') {
-    if (imageKey) {
-      elements.push({
-        tag: 'img',
-        img_key: imageKey,
-        alt: { tag: 'plain_text', content: '' },
-        mode: 'fit_horizontal',
-        preview: true,
-      });
-    } else {
-      elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
-    }
-    elements.push({ tag: 'hr' });
-  }
+  // ── Output body (shared with the private snapshot card) ──────────────────
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale });
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
@@ -374,8 +383,63 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${statusLabel(status)}` },
-      template: templateMap[displayStatus],
+      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      template: STREAM_TEMPLATE_MAP[displayStatus],
+    },
+    elements,
+  };
+  return JSON.stringify(card);
+}
+
+/**
+ * Build a static "private snapshot" card for `/card` in private mode — sent via
+ * the ephemeral API to one user at a time. Unlike {@link buildStreamingCard} it
+ * is **never PATCH-updated** (ephemeral cards can't be), so it carries only a
+ * one-shot snapshot of the terminal screenshot plus a read-only "open terminal"
+ * link. All callback-driven controls (toggle/refresh/close/get-write-link/term
+ * keys) and the writable-terminal link are intentionally omitted: ephemeral
+ * cards can't be patched back, and most of the audience is talk-only (can't
+ * `canOperate`), so those buttons would dead-end.
+ */
+export function buildPrivateSnapshotCard(
+  terminalUrl: string,
+  title: string,
+  status: StreamStatus,
+  cliId: CliId | undefined,
+  imageKey: string | undefined,
+  locale?: Locale,
+  usageLimit?: CliUsageLimitState,
+): string {
+  const effectiveCliId = cliId ?? 'claude-code';
+  const cliName = getCliDisplayName(effectiveCliId);
+  const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+
+  const elements: any[] = [];
+  // Force the screenshot into view when we have one (the snapshot exists to let
+  // the audience SEE the terminal once); fall back to hidden when there's none.
+  pushStreamBody(elements, {
+    status, usageLimit, displayMode: imageKey ? 'screenshot' : 'hidden', imageKey, cliName, locale,
+  });
+
+  elements.push({
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+      type: 'primary',
+      multi_url: { url: terminalUrl, pc_url: terminalUrl, android_url: terminalUrl, ios_url: terminalUrl },
+    }],
+  });
+  elements.push({
+    tag: 'note',
+    elements: [{ tag: 'lark_md', content: t('card.private.snapshot_note', undefined, locale) }],
+  });
+
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };

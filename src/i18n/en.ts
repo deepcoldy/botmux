@@ -42,6 +42,7 @@ export const messages: Record<string, string> = {
   'card.body.choose_label': 'Choice:',
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
+  'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Terminal for the live view.',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -98,6 +99,10 @@ export const messages: Record<string, string> = {
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
   'cmd.card.not_ready': 'Terminal not ready yet — the streaming card will appear once the session is up.',
+  'cmd.card.private_not_group': '🔒 Private cards only work in regular group chats — topic groups / DMs are unsupported (Feishu limitation).',
+  'cmd.card.private_no_audience': '🔒 No audience: nobody is currently authorized to talk to this bot.',
+  'cmd.card.private_failed': '🔒 Failed to send the private card — likely missing send permission, the bot is not in this chat, or this is a topic group.',
+  'cmd.card.private_partial': '🔒 Private card sent to {sent}/{total}; some recipients failed.',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',
   'cmd.restart.terminated': '{cliName} has been terminated; it will auto-resume on your next message.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
@@ -178,7 +183,7 @@ export const messages: Record<string, string> = {
   'help.repo_n': '/repo <N>   - Switch to project #N',
   'help.repo_path': '/repo <path|name> - Use a path or a project name under workingDir, skipping the card',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
-  'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates)',
+  'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates; with private-card mode on, sends a static snapshot visible only to authorized users instead)',
   'help.heading_passthrough': '🔀 Passthrough to {cliName} (forwarded verbatim to its built-in slash commands):',
   'help.heading_schedule': '⏰ Scheduled tasks:',
   'help.schedule_create': '/schedule daily 17:50 summarize AI news  - create a scheduled task (natural language)',

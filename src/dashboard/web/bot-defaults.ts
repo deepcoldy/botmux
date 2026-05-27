@@ -176,6 +176,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
   function renderCardBehaviorSection(b: any): string {
     const disableStreaming = b.disableStreamingCard === true;
     const writableLink = b.writableTerminalLinkInCard === true;
+    const privateCard = b.privateCard === true;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionCard')}</h3>
       <label class="checkbox-row">
@@ -187,6 +188,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <input type="checkbox" data-action="toggle-writable-link" ${writableLink ? 'checked' : ''} ${disableStreaming ? 'disabled' : ''}>
         <strong>${t('botDefaults.writableLink')}</strong>
         <small>${t('botDefaults.writableLinkHelp')}</small>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-private-card" ${privateCard ? 'checked' : ''}>
+        <strong>${t('botDefaults.privateCard')}</strong>
+        <small>${t('botDefaults.privateCardHelp')}</small>
       </label>
       <div class="actions">
         <small data-card-pref-moot class="hint-warn-inline" ${disableStreaming ? '' : 'hidden'}>${t('botDefaults.writableLinkMoot')}</small>
@@ -309,6 +315,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       // ── Card behaviour toggles (auto-save on change) ──────────────────────
       const disableStreamingCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-disable-streaming]');
       const writableLinkCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-writable-link]');
+      const privateCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-private-card]');
       const cardPrefStatusEl = card.querySelector<HTMLSpanElement>('[data-card-pref-status]');
       const cardPrefMootEl = card.querySelector<HTMLElement>('[data-card-pref-moot]');
 
@@ -333,6 +340,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             if (cached) {
               cached.disableStreamingCard = body.disableStreamingCard;
               cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
+              cached.privateCard = body.privateCard;
             }
           } else {
             cardPrefStatusEl.textContent = `✗ ${body.error ?? r.status}`;
@@ -360,6 +368,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (writableLinkCb) {
         writableLinkCb.addEventListener('change', () => {
           putCardPref({ writableTerminalLinkInCard: writableLinkCb.checked }, writableLinkCb);
+        });
+      }
+      if (privateCardCb) {
+        privateCardCb.addEventListener('change', () => {
+          putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
         });
       }
     });
