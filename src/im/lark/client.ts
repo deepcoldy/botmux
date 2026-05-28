@@ -8,6 +8,8 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
+import { getBotCapability } from '../../services/bot-profile-store.js';
+import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -676,6 +678,29 @@ export async function resolveAllowedUsersWithMap(
   return { resolved: openIds, map };
 }
 
+/**
+ * Best-effort resolve a user's open_id → canonical union_id (+ display name)
+ * for pairing-login. Requires `contact:user.base:readonly` scope; on failure
+ * (no scope / API error) returns {} so callers degrade to open_id-only identity.
+ */
+export async function resolveUserUnionId(larkAppId: string, openId: string): Promise<{ unionId?: string; name?: string }> {
+  if (!openId) return {};
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).contact.v3.user.get({
+      path: { user_id: openId },
+      params: { user_id_type: 'open_id' },
+    });
+    if (res.code === 0 && res.data?.user) {
+      return { unionId: res.data.user.union_id ?? undefined, name: res.data.user.name ?? undefined };
+    }
+    logger.debug(`resolveUserUnionId non-zero code: ${res.code} ${res.msg}`);
+  } catch (err: any) {
+    logger.debug(`resolveUserUnionId failed: ${err?.message ?? err}`);
+  }
+  return {};
+}
+
 export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Promise<string[]> {
   return (await resolveAllowedUsersWithMap(larkAppId, raw)).resolved;
 }
@@ -891,6 +916,18 @@ export type ChatBotMember = {
   name: string;
   displayName: string;
   source: 'configured' | 'introduce';
+  /** Short capability label (team-level), for roster discovery. Configured bots only. */
+  capability?: string;
+  /** Whether this bot has a team-level role registered. Configured bots only. */
+  hasTeamRole: boolean;
+  /**
+   * Whether the observing app (the `larkAppId` arg) can RELIABLY @-mention this
+   * member. Lark open_id is per-app scoped, so a bot's self-reported open_id is
+   * not usable by another app. Reliable only when learned via cross-ref (from
+   * @mention events) or via /introduce (observed, already observer-scoped).
+   */
+  mentionable: boolean;
+  mentionSource: 'cross-ref' | 'self' | 'observed' | 'fallback';
 };
 
 export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<ChatBotMember[]> {
@@ -929,15 +966,26 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen
-          const openId = (info?.botName && crossRef.get(info.botName.toLowerCase()))
-            ?? info?.botOpenId
-            ?? appId;
+          const crossHit = info?.botName ? crossRef.get(info.botName.toLowerCase()) : undefined;
+          const openId = crossHit ?? info?.botOpenId ?? appId;
+          const isSelf = appId === larkAppId;
+          // Reliable @-mention only when the per-app open_id was learned via
+          // cross-ref; self-view open_id (info.botOpenId) is wrong for OTHER
+          // apps, and the appId fallback is no handle at all. Self is always fine.
+          const mentionSource: ChatBotMember['mentionSource'] = crossHit
+            ? 'cross-ref'
+            : (info?.botOpenId ? 'self' : 'fallback');
+          const mentionable = isSelf || mentionSource === 'cross-ref';
           return {
             larkAppId: appId,
             openId,
             name: cliId,
             displayName: info?.botName ?? cliId,
             source: 'configured',
+            capability: getBotCapability(config.session.dataDir, appId) ?? undefined,
+            hasTeamRole: resolveTeamRoleFile(appId) !== null,
+            mentionable,
+            mentionSource,
           };
         }
       } catch (err) {
@@ -948,25 +996,53 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   );
   const configured: ChatBotMember[] = configuredResults.filter((r): r is ChatBotMember => r !== null);
 
-  // Merge in observed entries (from /introduce) — scoped to the caller's
-  // observer app so the open_ids match how THIS daemon should @-mention them
-  // (Lark open_id is per-app scoped). Dedup by openId (configured wins).
-  const seenOpenIds = new Set(configured.map(b => b.openId));
-  let observed: ChatBotMember[] = [];
+  // Merge observed entries (from /introduce), scoped to the caller's observer
+  // app so open_ids match how THIS daemon should @-mention them (open_id is
+  // per-app scoped). Two cases:
+  //   1) An observed entry uniquely matches a configured row by display name AND
+  //      that row isn't already a reliable cross-ref handle → UPGRADE it in
+  //      place: adopt the observed (observer-scoped) open_id and mark it
+  //      reliably mentionable, while keeping larkAppId/capability/hasTeamRole.
+  //      (A configured peer's own open_id is its self-view — wrong for us to @.)
+  //   2) Otherwise (no/ambiguous match) → append as an external bot.
   try {
     const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
-    observed = observedList
-      .filter(o => !seenOpenIds.has(o.openId))
-      .map(o => ({
+    const seenOpenIds = new Set(configured.map(b => b.openId));
+    const norm = (s: string) => s.trim().toLowerCase();
+    const byName = new Map<string, number[]>();
+    configured.forEach((b, i) => {
+      const k = norm(b.displayName);
+      const arr = byName.get(k);
+      if (arr) arr.push(i); else byName.set(k, [i]);
+    });
+
+    for (const o of observedList) {
+      if (seenOpenIds.has(o.openId)) continue;
+      const matches = byName.get(norm(o.name)) ?? [];
+      if (matches.length === 1) {
+        const row = configured[matches[0]];
+        // Upgrade only if not already a reliable cross-ref handle.
+        if (row.mentionSource !== 'cross-ref') {
+          configured[matches[0]] = { ...row, openId: o.openId, mentionable: true, mentionSource: 'observed' };
+          seenOpenIds.add(o.openId);
+        }
+        continue; // matched → never also append as an external duplicate
+      }
+      configured.push({
         larkAppId: '',
         openId: o.openId,
         name: o.name,
         displayName: o.name,
-        source: 'introduce' as const,
-      }));
+        source: 'introduce',
+        hasTeamRole: false,
+        mentionable: true,
+        mentionSource: 'observed',
+      });
+      seenOpenIds.add(o.openId);
+    }
   } catch (err) {
     logger.debug(`Failed to load observed bots for ${chatId}: ${err}`);
   }
 
-  return [...configured, ...observed];
+  return configured;
 }

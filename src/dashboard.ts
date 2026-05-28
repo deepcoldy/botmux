@@ -14,9 +14,17 @@ import {
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
+import { planGroupCreator } from './dashboard/team-group.js';
 import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
+import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { handleConnectorApi } from './dashboard/connector-api.js';
+import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleFederationApi } from './dashboard/federation-api.js';
+import { handleFederationSpokeApi, syncAllMemberships } from './dashboard/federation-spoke-api.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
+import type { ConnectorDefinition } from './services/connector-store.js';
+import type { WebhookLifecycleRecord } from './services/webhook-lifecycle-store.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
@@ -150,12 +158,127 @@ async function proxyToDaemon(
 ): Promise<Response> {
   const d = registry.getByAppId(larkAppId);
   if (!d) {
-    return new Response(JSON.stringify({ ok: false, error: 'daemon_offline' }), {
+    return new Response(JSON.stringify({ ok: false, error: 'daemon_offline', errorCode: 'daemon_offline' }), {
       status: 503,
       headers: { 'content-type': 'application/json' },
     });
   }
   return fetch(`http://127.0.0.1:${d.ipcPort}${daemonPath}`, init);
+}
+
+/** Create a Feishu group from the team UI: pick a creator daemon among the
+ *  selected bots, proxy to its /api/groups/create, invite the requesting user.
+ *  Surfaces invalidBotIds/invalidUserIds so the UI never implies a non-added
+ *  bot/user joined. */
+/** Live daemon-registry bots — authoritative source for THIS deployment's
+ *  bots (cliId added from bots-info.json downstream). Fixes an empty/stale
+ *  bots-info.json hiding running bots from the team roster / federation. */
+function liveBots(): { larkAppId: string; botName: string }[] {
+  return registry.list().map(d => ({ larkAppId: d.larkAppId, botName: d.botName }));
+}
+
+async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[] }): Promise<{
+  ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidUserIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string; autoInviteUnavailable?: boolean;
+}> {
+  const selectedIds = Array.from(new Set(args.larkAppIds.filter(Boolean)));
+  if (selectedIds.length === 0) return { ok: false, error: 'no_bots_selected' };
+  // Only auto-invite the web user when their paired bot is the creator (open_id
+  // is scoped to that app); otherwise create the group but don't forward a
+  // wrong-scope open_id — UI will flag autoInviteUnavailable.
+  const plan = planGroupCreator(
+    selectedIds,
+    args.preferredCreator,
+    (id) => !!registry.getByAppId(id),
+    (ids) => {
+      const p = pickCreatorForGroup(ids, (id) => {
+        const d = registry.getByAppId(id);
+        return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
+      });
+      return p ? p.creatorLarkAppId : null;
+    },
+  );
+  if (!plan.creatorLarkAppId) return { ok: false, error: 'no_online_daemon' };
+  const userOpenIds = plan.inviteUser && args.userOpenId ? [args.userOpenId] : [];
+  try {
+    const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: args.name, larkAppIds: selectedIds, userOpenIds, ownerUnionIds: args.ownerUnionIds ?? [] }),
+    });
+    const text = await upstream.text();
+    let parsed: any = null;
+    try { parsed = JSON.parse(text); } catch { /* leave null */ }
+    if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
+      return { ok: false, error: parsed?.error ?? `group_create_http_${upstream.status}` };
+    }
+    return { ok: true, chatId: parsed.chatId, shareLink: typeof parsed.shareLink === 'string' ? parsed.shareLink : undefined, invalidBotIds: parsed.invalidBotIds ?? [], invalidUserIds: parsed.invalidUserIds ?? [], invalidOwnerUnionIds: parsed.invalidOwnerUnionIds ?? [], autoInviteUnavailable: !plan.inviteUser };
+  } catch {
+    return { ok: false, error: 'group_create_proxy_failed' };
+  }
+}
+
+function lifecycleBotIds(connector: ConnectorDefinition): string[] {
+  return Array.from(new Set([connector.target.botId, ...(connector.target.botIds ?? [])].filter(Boolean)));
+}
+
+function lifecycleGroupName(connector: ConnectorDefinition, dedupKey: string): string {
+  const cleanKey = dedupKey.replace(/\s+/g, ' ').trim();
+  const name = `${connector.name}: ${cleanKey}`;
+  return name.length <= 58 ? name : `${name.slice(0, 55)}...`;
+}
+
+async function createLifecycleGroupForWebhook(
+  connector: ConnectorDefinition,
+  args: { dedupKey: string },
+): Promise<{ chatId: string; creatorLarkAppId?: string }> {
+  const selectedIds = lifecycleBotIds(connector);
+  const pick = pickCreatorForGroup(selectedIds, (id) => {
+    const d = registry.getByAppId(id);
+    return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
+  });
+  if (!pick) throw new Error('no_online_daemon');
+  const creator = registry.getByAppId(pick.creatorLarkAppId);
+  if (!creator) throw new Error('creator_daemon_offline');
+  const upstream = await fetch(`http://127.0.0.1:${creator.ipcPort}/api/groups/create`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      name: lifecycleGroupName(connector, args.dedupKey),
+      larkAppIds: selectedIds,
+    }),
+  });
+  const text = await upstream.text();
+  let parsed: any = null;
+  try { parsed = JSON.parse(text); } catch { /* leave null */ }
+  if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
+    throw new Error(parsed?.error ?? `group_create_http_${upstream.status}`);
+  }
+  return { chatId: parsed.chatId, creatorLarkAppId: parsed.creator ?? pick.creatorLarkAppId };
+}
+
+async function closeLifecycleGroupForWebhook(
+  connector: ConnectorDefinition,
+  record: WebhookLifecycleRecord,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!record.chatId) return { ok: true };
+  const candidates = Array.from(new Set([
+    record.creatorLarkAppId,
+    ...lifecycleBotIds(connector),
+  ].filter((x): x is string => typeof x === 'string' && x.length > 0)));
+  let lastError = 'no_candidate_bot';
+  for (const appId of candidates) {
+    try {
+      const upstream = await proxyToDaemon(appId, `/api/groups/${encodeURIComponent(record.chatId)}/disband`, { method: 'POST' });
+      const text = await upstream.text();
+      let parsed: any = null;
+      try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+      if (upstream.ok && parsed?.ok) return { ok: true };
+      lastError = parsed?.error ?? `group_disband_http_${upstream.status}`;
+    } catch (e: any) {
+      lastError = e?.message ?? String(e);
+    }
+  }
+  return { ok: false, error: lastError };
 }
 
 /**
@@ -196,6 +319,25 @@ const server = createServer(async (req, res) => {
     // Health probe (no auth) — for pm2
     if (url.pathname === '/__health') {
       return jsonRes(res, 200, { ok: true });
+    }
+
+    if (await handleWebhookRoute(req, res, url, {
+      proxyToDaemon,
+      createLifecycleGroup: createLifecycleGroupForWebhook,
+      closeLifecycleGroup: closeLifecycleGroupForWebhook,
+    })) {
+      return;
+    }
+
+    // (The legacy bmx_session /team page + pairing-login were removed; the team
+    // platform now lives entirely in the SPA dashboard under the token gate —
+    // see handleFederationSpokeApi below.)
+
+    // Federation HUB endpoints — cross-deployment, self-authed by invite code /
+    // syncToken, so mounted before the token gate (like webhook/team routes).
+    // createTeamGroup injected for the delegate-group path (hub→spoke 拉群).
+    if (await handleFederationApi(req, res, url, { createTeamGroup, liveBots })) {
+      return;
     }
 
     // CLI rotate (HMAC + loopback only) — for `botmux dashboard`
@@ -260,6 +402,19 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       return jsonRes(res, 200, { schedules: aggregator.getSchedules() });
+    }
+
+    if (await handleConnectorApi(req, res, url)) {
+      return;
+    }
+
+    // Federation SPOKE endpoints (owner actions) — token-gated above.
+    if (await handleFederationSpokeApi(req, res, url, { createTeamGroup, liveBots })) {
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/trigger') {
+      return handleDashboardTriggerApi(req, res, { proxyToDaemon });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
@@ -763,6 +918,13 @@ const server = createServer(async (req, res) => {
 server.listen(config.dashboard.port, config.dashboard.host, () => {
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${config.dashboard.port}`);
 });
+
+// Federation: periodically push this deployment's bots + heartbeat to every hub
+// it has joined (best-effort; no-op when not federated). Keeps remote rosters fresh.
+const federationSync = setInterval(() => {
+  syncAllMemberships(config.session.dataDir, fetch, liveBots()).catch(() => { /* best-effort */ });
+}, 2 * 60 * 1000);
+federationSync.unref();
 
 // Graceful shutdown
 function shutdown(): void {

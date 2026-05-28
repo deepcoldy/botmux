@@ -1,0 +1,380 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import {
+  deleteConnector,
+  getConnector,
+  listConnectors,
+  newConnectorId,
+  upsertConnector,
+  type ConnectorDefinition,
+} from '../services/connector-store.js';
+import {
+  createWebhookSecret,
+  deleteWebhookSecret,
+  generateWebhookSecretPlaintext,
+  listWebhookSecretRefs,
+  setWebhookSecret,
+} from '../services/webhook-key.js';
+import { listTriggerLogs, pruneTriggerLogs, summarizeTriggerLogs, type TriggerLogStats } from '../services/trigger-log-store.js';
+import type { TriggerErrorCode } from '../services/trigger-types.js';
+import { jsonRes } from './workflow-api.js';
+
+const DEFAULT_VERIFY_HEADERS = {
+  signatureHeader: 'x-botmux-signature',
+  timestampHeader: 'x-botmux-timestamp',
+  nonceHeader: 'x-botmux-nonce',
+  toleranceSeconds: 300,
+};
+
+async function readJsonBody<T = unknown>(req: IncomingMessage, maxBytes = 256 * 1024): Promise<T> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const c of req) {
+    const b = c as Buffer;
+    total += b.length;
+    if (total > maxBytes) throw new Error('body_too_large');
+    chunks.push(b);
+  }
+  if (chunks.length === 0) return {} as T;
+  return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+}
+
+function record(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {};
+}
+
+function stringList(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+
+function bool(v: unknown, fallback: boolean): boolean {
+  return typeof v === 'boolean' ? v : fallback;
+}
+
+function positiveInt(v: unknown, fallback: number, min = 1, max = Number.MAX_SAFE_INTEGER): number {
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function logStatus(v: string | null): 'ok' | 'error' | undefined {
+  return v === 'ok' || v === 'error' ? v : undefined;
+}
+
+function emptyStats(connectorId: string): TriggerLogStats {
+  return { connectorId, total: 0, ok: 0, error: 0, actions: {}, errorCodes: {} };
+}
+
+function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycleExtractors'] {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const r = v as Record<string, unknown>;
+  if (typeof r.dedupKey !== 'string' || !r.dedupKey.trim()) return null;
+  if (typeof r.status !== 'string' || !r.status.trim()) return null;
+  const rawMap = record(r.statusMap);
+  const statusMap = Object.fromEntries(
+    Object.entries(rawMap).filter((e): e is [string, string] => typeof e[1] === 'string'),
+  );
+  return {
+    dedupKey: r.dedupKey.trim(),
+    status: r.status.trim(),
+    ...(Object.keys(statusMap).length > 0 ? { statusMap } : {}),
+  };
+}
+
+function normalizeConnectorInput(
+  raw: unknown,
+  opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string },
+): { ok: true; connector: ConnectorDefinition } | { ok: false; error: string } {
+  const body = record(raw);
+  const c = record(body.connector ?? body);
+  const prior = opts.prior ?? null;
+  const verify = record(c.verify ?? prior?.verify);
+  const target = record(c.target ?? prior?.target);
+  const promptEnvelope = record(c.promptEnvelope ?? prior?.promptEnvelope);
+  const loggingPolicy = record(c.loggingPolicy ?? prior?.loggingPolicy);
+  const rateLimitCleared = c.rateLimit === null;
+  const rateLimit = rateLimitCleared ? null : record(c.rateLimit ?? prior?.rateLimit);
+  const id = opts.id ?? (typeof c.id === 'string' && c.id.trim() ? c.id.trim() : prior?.id ?? newConnectorId());
+  const name = typeof c.name === 'string' && c.name.trim() ? c.name.trim() : prior?.name;
+  if (!name) return { ok: false, error: 'name_required' };
+
+  const targetMode = typeof target.mode === 'string' ? target.mode : prior?.target.mode ?? 'dynamic';
+  if (!['dynamic', 'fixed', 'new-group'].includes(targetMode)) return { ok: false, error: 'bad_target_mode' };
+  const targetKind = typeof target.kind === 'string' ? target.kind : prior?.target.kind ?? 'turn';
+  if (!['turn', 'workflow'].includes(targetKind)) return { ok: false, error: 'bad_target_kind' };
+  const botId = typeof target.botId === 'string' && target.botId.trim() ? target.botId.trim() : prior?.target.botId;
+  if (!botId) return { ok: false, error: 'target_bot_required' };
+  const botIds = hasOwn(target, 'botIds')
+    ? Array.from(new Set(stringList(target.botIds).map(x => x.trim()).filter(Boolean)))
+    : prior?.target.botIds;
+  const chatId = typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId;
+  if (targetMode === 'fixed' && !chatId) return { ok: false, error: 'fixed_chat_required' };
+  const workflowId = typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId;
+  if (targetKind === 'workflow' && !workflowId) return { ok: false, error: 'workflow_id_required' };
+  const lifecycleExtractors = c.lifecycleExtractors === undefined
+    ? (prior?.lifecycleExtractors ?? null)
+    : normalizeLifecycleExtractors(c.lifecycleExtractors);
+  if (targetMode === 'new-group' && !lifecycleExtractors) {
+    return { ok: false, error: 'lifecycle_extractors_required' };
+  }
+
+  const secretRef =
+    opts.secretRef ||
+    (typeof verify.secretRef === 'string' && verify.secretRef.trim() ? verify.secretRef.trim() : prior?.verify.secretRef);
+  if (!secretRef) return { ok: false, error: 'secret_required' };
+
+  const now = new Date().toISOString();
+  const next: ConnectorDefinition = {
+    id,
+    name,
+    enabled: bool(c.enabled, prior?.enabled ?? true),
+    verify: {
+      type: 'hmac-sha256',
+      secretRef,
+      signatureHeader: typeof verify.signatureHeader === 'string' && verify.signatureHeader.trim()
+        ? verify.signatureHeader.trim().toLowerCase()
+        : prior?.verify.signatureHeader ?? DEFAULT_VERIFY_HEADERS.signatureHeader,
+      timestampHeader: typeof verify.timestampHeader === 'string' && verify.timestampHeader.trim()
+        ? verify.timestampHeader.trim().toLowerCase()
+        : prior?.verify.timestampHeader ?? DEFAULT_VERIFY_HEADERS.timestampHeader,
+      nonceHeader: typeof verify.nonceHeader === 'string' && verify.nonceHeader.trim()
+        ? verify.nonceHeader.trim().toLowerCase()
+        : prior?.verify.nonceHeader ?? DEFAULT_VERIFY_HEADERS.nonceHeader,
+      toleranceSeconds: positiveInt(verify.toleranceSeconds, prior?.verify.toleranceSeconds ?? DEFAULT_VERIFY_HEADERS.toleranceSeconds, 30, 86_400),
+    },
+    target: {
+      mode: targetMode as ConnectorDefinition['target']['mode'],
+      kind: targetKind as ConnectorDefinition['target']['kind'],
+      botId,
+      ...(botIds && botIds.length > 0 ? { botIds: botIds.includes(botId) ? botIds : [botId, ...botIds] } : {}),
+      ...(chatId ? { chatId } : {}),
+      ...(hasOwn(target, 'allowChats') ? { allowChats: stringList(target.allowChats) } : prior?.target.allowChats ? { allowChats: prior.target.allowChats } : {}),
+      ...(workflowId ? { workflowId } : {}),
+    },
+    promptEnvelope: {
+      sourceName: typeof promptEnvelope.sourceName === 'string' && promptEnvelope.sourceName.trim()
+        ? promptEnvelope.sourceName.trim()
+        : prior?.promptEnvelope.sourceName ?? name,
+      headerAllowlist: hasOwn(promptEnvelope, 'headerAllowlist')
+        ? stringList(promptEnvelope.headerAllowlist).map(h => h.toLowerCase())
+        : prior?.promptEnvelope.headerAllowlist ?? [],
+      includeRawText: bool(promptEnvelope.includeRawText, prior?.promptEnvelope.includeRawText ?? false),
+      maxBodyBytes: positiveInt(promptEnvelope.maxBodyBytes, prior?.promptEnvelope.maxBodyBytes ?? 256 * 1024, 1, 10 * 1024 * 1024),
+    },
+    loggingPolicy: {
+      storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? false),
+      storeHeaders: bool(loggingPolicy.storeHeaders, prior?.loggingPolicy.storeHeaders ?? true),
+      retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
+    },
+    lifecycleExtractors,
+    ...(rateLimitCleared ? {} : rateLimit && Object.keys(rateLimit).length > 0 ? {
+      rateLimit: {
+        windowSeconds: positiveInt(rateLimit.windowSeconds, prior?.rateLimit?.windowSeconds ?? 60, 1, 86_400),
+        maxRequests: positiveInt(rateLimit.maxRequests, prior?.rateLimit?.maxRequests ?? 60, 1, 100_000),
+      },
+    } : prior?.rateLimit ? { rateLimit: prior.rateLimit } : {}),
+    createdAt: prior?.createdAt ?? now,
+    updatedAt: prior?.updatedAt ?? now,
+  };
+  return { ok: true, connector: next };
+}
+
+function publicWebhookUrl(req: IncomingMessage, connectorId: string): string {
+  const proto = typeof req.headers['x-forwarded-proto'] === 'string' ? req.headers['x-forwarded-proto'] : 'http';
+  const host = req.headers.host ?? 'localhost';
+  return `${proto}://${host}/webhook/${encodeURIComponent(connectorId)}`;
+}
+
+export async function handleConnectorApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+): Promise<boolean> {
+  if (req.method === 'GET' && url.pathname === '/api/connectors') {
+    jsonRes(res, 200, { connectors: listConnectors() });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/connectors/stats') {
+    const since = url.searchParams.get('since') ?? undefined;
+    const rawStats = summarizeTriggerLogs({ since });
+    const byId = new Map(rawStats.filter(s => s.connectorId).map(s => [s.connectorId!, s]));
+    const connectors = listConnectors();
+    const known = new Set(connectors.map(c => c.id));
+    const stats: Array<TriggerLogStats & { name?: string; enabled?: boolean }> = connectors.map(c => ({
+      name: c.name,
+      enabled: c.enabled,
+      ...emptyStats(c.id),
+      ...byId.get(c.id),
+    }));
+    for (const stat of rawStats) {
+      if (!stat.connectorId || !known.has(stat.connectorId)) stats.push(stat);
+    }
+    jsonRes(res, 200, { stats });
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/webhook-secrets') {
+    try {
+      const body = await readJsonBody<{ secret?: unknown }>(req);
+      const secret = typeof body.secret === 'string' && body.secret ? body.secret : generateWebhookSecretPlaintext();
+      const record = createWebhookSecret(secret);
+      jsonRes(res, 201, { ok: true, secretRef: record.ref, secret });
+    } catch (e: any) {
+      jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/webhook-secrets') {
+    jsonRes(res, 200, { secrets: listWebhookSecretRefs() });
+    return true;
+  }
+
+  let mSecret: RegExpMatchArray | null;
+  if ((mSecret = url.pathname.match(/^\/api\/webhook-secrets\/([^/]+)$/))) {
+    const ref = decodeURIComponent(mSecret[1]);
+    if (req.method === 'PUT') {
+      try {
+        const body = await readJsonBody<{ secret?: unknown }>(req);
+        const secret = typeof body.secret === 'string' && body.secret ? body.secret : generateWebhookSecretPlaintext();
+        const record = setWebhookSecret(ref, secret);
+        jsonRes(res, 200, { ok: true, secretRef: record.ref, secret });
+      } catch (e: any) {
+        jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
+      }
+      return true;
+    }
+    if (req.method === 'DELETE') {
+      jsonRes(res, 200, { ok: true, deleted: deleteWebhookSecret(ref) });
+      return true;
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/connectors') {
+    try {
+      const body = await readJsonBody<any>(req);
+      const providedSecret = typeof body.secret === 'string' && body.secret ? body.secret : undefined;
+      const generatedSecret = providedSecret ? undefined : generateWebhookSecretPlaintext();
+      const record = createWebhookSecret(providedSecret ?? generatedSecret!);
+      const normalized = normalizeConnectorInput(body, { secretRef: record.ref });
+      if (!normalized.ok) {
+        deleteWebhookSecret(record.ref);
+        jsonRes(res, 400, { ok: false, error: normalized.error });
+        return true;
+      }
+      const connector = upsertConnector(normalized.connector);
+      jsonRes(res, 201, {
+        ok: true,
+        connector,
+        secretRef: record.ref,
+        ...(generatedSecret ? { secret: generatedSecret } : {}),
+        webhookUrl: publicWebhookUrl(req, connector.id),
+      });
+    } catch (e: any) {
+      jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
+    }
+    return true;
+  }
+
+  let m: RegExpMatchArray | null;
+  if ((m = url.pathname.match(/^\/api\/connectors\/([^/]+)$/))) {
+    const id = decodeURIComponent(m[1]);
+    if (req.method === 'PUT') {
+      const prior = getConnector(id);
+      if (!prior) {
+        jsonRes(res, 404, { ok: false, error: 'unknown_connector' });
+        return true;
+      }
+      try {
+        const body = await readJsonBody<any>(req);
+        let generatedSecret: string | undefined;
+        let secretRef: string | undefined;
+        if (typeof body.secret === 'string' && body.secret) {
+          secretRef = prior.verify.secretRef || createWebhookSecret(body.secret).ref;
+          setWebhookSecret(secretRef, body.secret);
+        } else if (body.rotateSecret === true) {
+          generatedSecret = generateWebhookSecretPlaintext();
+          secretRef = prior.verify.secretRef || createWebhookSecret(generatedSecret).ref;
+          setWebhookSecret(secretRef, generatedSecret);
+        }
+        const normalized = normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
+        if (!normalized.ok) {
+          jsonRes(res, 400, { ok: false, error: normalized.error });
+          return true;
+        }
+        const connector = upsertConnector(normalized.connector);
+        jsonRes(res, 200, {
+          ok: true,
+          connector,
+          ...(secretRef ? { secretRef } : {}),
+          ...(generatedSecret ? { secret: generatedSecret } : {}),
+          webhookUrl: publicWebhookUrl(req, connector.id),
+        });
+      } catch (e: any) {
+        jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
+      }
+      return true;
+    }
+    if (req.method === 'PATCH') {
+      const prior = getConnector(id);
+      if (!prior) {
+        jsonRes(res, 404, { ok: false, error: 'unknown_connector' });
+        return true;
+      }
+      try {
+        const body = await readJsonBody<{ enabled?: unknown }>(req);
+        const connector = upsertConnector({ ...prior, enabled: bool(body.enabled, prior.enabled) });
+        jsonRes(res, 200, { ok: true, connector });
+      } catch (e: any) {
+        jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
+      }
+      return true;
+    }
+    if (req.method === 'DELETE') {
+      jsonRes(res, 200, { ok: true, deleted: deleteConnector(id) });
+      return true;
+    }
+  }
+
+  if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/connectors\/([^/]+)$/))) {
+    const connector = getConnector(decodeURIComponent(m[1]));
+    if (!connector) {
+      jsonRes(res, 404, { ok: false, error: 'unknown_connector' });
+      return true;
+    }
+    jsonRes(res, 200, { connector });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/trigger-logs') {
+    const limit = Number(url.searchParams.get('limit') ?? '100');
+    const connectorId = url.searchParams.get('connectorId') ?? undefined;
+    const status = logStatus(url.searchParams.get('status'));
+    const errorCode = url.searchParams.get('errorCode') as TriggerErrorCode | null;
+    const since = url.searchParams.get('since') ?? undefined;
+    jsonRes(res, 200, { logs: listTriggerLogs({ limit, connectorId, status, errorCode: errorCode ?? undefined, since }) });
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/trigger-logs/prune') {
+    try {
+      const body = await readJsonBody<{ retentionDays?: unknown; maxEntries?: unknown }>(req);
+      const retentionDays = body.retentionDays === undefined
+        ? undefined
+        : positiveInt(body.retentionDays, 14, 1, 3650);
+      const maxEntries = body.maxEntries === undefined
+        ? undefined
+        : positiveInt(body.maxEntries, 1000, 1, 1_000_000);
+      jsonRes(res, 200, { ok: true, ...pruneTriggerLogs({ retentionDays, maxEntries }) });
+    } catch (e: any) {
+      jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
+    }
+    return true;
+  }
+
+  return false;
+}

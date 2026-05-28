@@ -11,6 +11,7 @@
  */
 import { getBotClient } from '../bot-registry.js';
 import { larkGet } from '../im/lark/client.js';
+import { logger } from '../utils/logger.js';
 
 export interface ChatBrief {
   chatId: string;
@@ -288,4 +289,47 @@ export async function addBotToChat(
     for (const id of targetLarkAppIds) out.push({ id, ok: false, error: msg });
   }
   return out;
+}
+
+/**
+ * Add USERS to an existing chat by **union_id** (tenant-stable, NOT app-scoped
+ * like open_id). Used to pull bot owners into a federated group regardless of
+ * which bot they paired through. Returns the union_ids Lark could not add.
+ * Best-effort: total failure reports all ids invalid.
+ *
+ * Uses /open-apis/im/v1/chats/:chat_id/members with member_id_type=union_id.
+ */
+export async function addUsersToChatByUnionId(
+  proxyLarkAppId: string,
+  chatId: string,
+  unionIds: string[],
+): Promise<{ invalidUserIds: string[] }> {
+  const ids = Array.from(new Set(unionIds.filter(Boolean)));
+  if (ids.length === 0) return { invalidUserIds: [] };
+  const client = getBotClient(proxyLarkAppId);
+  // Add ONE id per call: Lark fails the WHOLE batch (HTTP 400, code 232024) if any
+  // single union_id is outside the bot's app visibility scope — that would drop
+  // valid owners too. Per-id calls isolate the out-of-scope ones so the rest land.
+  const invalidUserIds: string[] = [];
+  for (const id of ids) {
+    try {
+      const res: any = await (client as any).im.v1.chatMembers.create({
+        path: { chat_id: chatId },
+        params: { member_id_type: 'union_id' },
+        data: { id_list: [id] },
+      });
+      if (res.code !== 0 && res.code !== undefined) {
+        logger.warn(`[groups] addUsersByUnionId rejected: code=${res.code} msg=${res.msg} (proxy=${proxyLarkAppId})`);
+        invalidUserIds.push(id);
+      } else if ((res.data?.invalid_id_list ?? []).length) {
+        invalidUserIds.push(id);
+      }
+    } catch (e: any) {
+      // code 232024 = user not in app's visibility scope / no collaboration perm.
+      const code = e?.response?.data?.code ?? e?.code;
+      logger.warn(`[groups] addUsersByUnionId threw: code=${code} ${e?.message ?? e} (proxy=${proxyLarkAppId})`);
+      invalidUserIds.push(id);
+    }
+  }
+  return { invalidUserIds };
 }

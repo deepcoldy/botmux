@@ -44,6 +44,21 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+// Mock role/profile stores so /role routing tests assert on calls (no real FS).
+vi.mock('../src/core/role-resolver.js', () => ({
+  writeRoleFile: vi.fn(),
+  deleteRoleFile: vi.fn(() => true),
+  resolveRole: vi.fn(() => ({ content: null, source: 'none' })),
+  resolveTeamRoleFile: vi.fn(() => null),
+  writeTeamRoleFile: vi.fn(),
+  deleteTeamRoleFile: vi.fn(() => true),
+}));
+vi.mock('../src/services/bot-profile-store.js', () => ({
+  getBotCapability: vi.fn(() => null),
+  setBotCapability: vi.fn(),
+  clearBotCapability: vi.fn(() => true),
+}));
+
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -251,6 +266,8 @@ vi.mock('../src/services/oncall-store.js', () => ({
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { writeTeamRoleFile, deleteTeamRoleFile, resolveRole } from '../src/core/role-resolver.js';
+import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -334,7 +351,7 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/relay', '/card'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/pair', '/login', '/adopt', '/oncall', '/group', '/g', '/relay', '/card'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -355,7 +372,7 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    expect(DAEMON_COMMANDS.size).toBe(15);
+    expect(DAEMON_COMMANDS.size).toBe(16);
   });
 });
 
@@ -2100,5 +2117,42 @@ describe('formatUptime (internal, tested indirectly via /status)', () => {
     // Should contain "Xs" or "Xm" format
     expect(replyContent).toMatch(/Uptime: \d+s/);
     expect(replyContent).toMatch(/Last message: \d+s ago/);
+  });
+});
+
+describe('/role subcommand routing', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('routes "/role team set <md>" to writeTeamRoleFile (team role, not chat role)', async () => {
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role team set 团队后端角色'), deps, LARK_APP_ID);
+    expect(writeTeamRoleFile).toHaveBeenCalledWith(LARK_APP_ID, '团队后端角色');
+  });
+
+  it('routes "/role team delete" to deleteTeamRoleFile', async () => {
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role team delete'), deps, LARK_APP_ID);
+    expect(deleteTeamRoleFile).toHaveBeenCalledWith(LARK_APP_ID);
+  });
+
+  it('routes "/role cap set <label>" to setBotCapability with sender as updatedBy', async () => {
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role cap set 后端排查能手'), deps, LARK_APP_ID);
+    expect(setBotCapability).toHaveBeenCalledWith('/fake/data', LARK_APP_ID, '后端排查能手', 'ou_sender');
+  });
+
+  it('routes "/role cap clear" to clearBotCapability', async () => {
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role cap clear'), deps, LARK_APP_ID);
+    expect(clearBotCapability).toHaveBeenCalledWith('/fake/data', LARK_APP_ID);
+  });
+
+  it('plain "/role" shows the EFFECTIVE role via resolveRole (chat override ＞ team)', async () => {
+    (resolveRole as ReturnType<typeof vi.fn>).mockReturnValue({ content: 'TEAMROLE_MARKER', source: 'team' });
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role'), deps, LARK_APP_ID);
+    expect(resolveRole).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('TEAMROLE_MARKER');
   });
 });

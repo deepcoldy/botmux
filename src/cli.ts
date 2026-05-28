@@ -264,6 +264,12 @@ function ecosystemConfig(): string {
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
     env: {
+      // MUST match the bot daemons' SESSION_DATA_DIR: the dashboard shares
+      // pairings/federations/memberships with them via {dataDir}/*.json. Without
+      // it the dashboard falls back to an install-relative ../data and reads a
+      // DIFFERENT store → /pair「配对码无效」, auto-bind hubsSynced:0,
+      // remote-group not_a_member (cross-deployment 拉群 silently broken).
+      SESSION_DATA_DIR: DATA_DIR,
       BOTMUX_DASHBOARD_HOST: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
       BOTMUX_DASHBOARD_PORT: process.env.BOTMUX_DASHBOARD_PORT ?? '7891',
     },

@@ -46,7 +46,7 @@ import {
   ensureCliEnv,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
+import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -1369,6 +1369,32 @@ ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) =
   return jsonRes(res, 200, result);
 });
 
+/** Heavy deps for triggerWorkflowRun, shared by the catalog `…/run` route and
+ *  the `/api/trigger` (kind=workflow) thin layer. */
+function workflowTriggerDeps() {
+  return {
+    spawnSubagent: workflowSpawnFn(),
+    botResolver: resolveBotSnapshot,
+    makeRuntimeContext: (log: any, def: any, spawnSubagent: any) => ({
+      log,
+      def,
+      spawnSubagent,
+      hostExecutors: createDefaultHostExecutorRegistry(),
+      reconcilers: createDefaultProviderReconcilers(),
+      loadEffectInput: (activityId: any, attemptId: any) =>
+        loadEffectInputSidecar(log, activityId, attemptId),
+    }),
+    attachRuntime: (runId: string, ctx: any) => attachWorkflowEventWatcher(runId, ctx),
+    driveRun: (runId: string) => {
+      driveWorkflowRun(runId).catch((err) => {
+        logger.warn(
+          `[workflow:${runId}] trigger drive failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    },
+  };
+}
+
 ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) => {
   const workflowId = params.id;
   if (!isValidWorkflowId(workflowId)) {
@@ -1403,29 +1429,7 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
       chatBinding,
       initiator: 'dashboard',
     },
-    {
-      spawnSubagent: workflowSpawnFn(),
-      botResolver: resolveBotSnapshot,
-      makeRuntimeContext: (log, def, spawnSubagent) => ({
-        log,
-        def,
-        spawnSubagent,
-        hostExecutors: createDefaultHostExecutorRegistry(),
-        reconcilers: createDefaultProviderReconcilers(),
-        loadEffectInput: (activityId, attemptId) =>
-          loadEffectInputSidecar(log, activityId, attemptId),
-      }),
-      attachRuntime: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
-      driveRun: (runId) => {
-        driveWorkflowRun(runId).catch((err) => {
-          logger.warn(
-            `[workflow:${runId}] dashboard-trigger drive failed: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      },
-    },
+    workflowTriggerDeps(),
   );
   if (!result.ok) {
     const status =
@@ -2447,6 +2451,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
+  // Wire the workflow runner for /api/trigger (kind=workflow): reuse the same
+  // heavy deps as the catalog run route.
+  setWorkflowRunner((input) => triggerWorkflowRun(input, workflowTriggerDeps()));
   // Seed dashboard IPC botName with the bot's config id; the friendly name from
   // /bot/v3/info is wired into the registry descriptor (below) but the IPC server
   // also needs its own copy for SessionRow.botName.
