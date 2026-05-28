@@ -449,7 +449,7 @@ export async function postPrivateSnapshotCard(
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const status = ds.lastScreenStatus ?? 'idle';
   const cardJson = buildPrivateSnapshotCard(
-    readUrl, title, status, effectiveCliId, ds.currentImageKey,
+    readUrl, title, status, effectiveCliId, ds.currentImageKey, ds.lastScreenContent ?? '',
     ds.session.sessionId, sessionAnchorId(ds), localeForBot(ds.larkAppId), cardUsageLimit(ds),
   );
 

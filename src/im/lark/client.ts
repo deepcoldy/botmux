@@ -233,6 +233,43 @@ const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a
  *  Calling this with a chat that's already known to be p2p (from
  *  message.chat_type === 'p2p') is fine but wasteful — prefer skipping the
  *  call in that case. */
+/**
+ * Resolve a chat's mode by hitting the API directly. Returns `'unknown'` when
+ * the chat type can't be confirmed (non-zero code or thrown) — it does NOT guess
+ * `'group'`. Use this for privacy-critical gates that must fail closed (private
+ * `/card`). Always queries the API (no cache read), but populates the shared
+ * cache on success so a following {@link getChatMode} hits it.
+ */
+export async function getChatModeStrict(larkAppId: string, chatId: string): Promise<ChatMode | 'unknown'> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0) {
+      logger.warn(`getChatModeStrict(${chatId}) failed: ${res.msg} (code: ${res.code})`);
+      return 'unknown';
+    }
+    const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+    const rawType = String(res.data?.chat_type ?? '').toLowerCase();
+    // group_message_type is the actual "is this a 话题群" signal. The Lark
+    // client UI lets users flip a chat between flat mode and topic mode at any
+    // time — that toggle writes group_message_type ('chat' ↔ 'thread'), NOT
+    // chat_mode. chat_mode is the creation-time topology classification and
+    // stays 'group' even for user-converted topic chats; in our tenant we have
+    // only ever seen chat_mode='topic' on a small set of legacy chats. Treating
+    // chat_mode='topic' OR group_message_type='thread' as 'topic' covers both.
+    const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
+    let mode: ChatMode;
+    if (rawType === 'p2p') mode = 'p2p';
+    else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
+    else mode = 'group';
+    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    return mode;
+  } catch (err: any) {
+    logger.warn(`getChatModeStrict(${chatId}) errored: ${err?.message ?? err}`);
+    return 'unknown';
+  }
+}
+
 export async function getChatMode(
   larkAppId: string,
   chatId: string,
@@ -243,36 +280,13 @@ export async function getChatMode(
   if (!options.forceRefresh && cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) {
     return cached.mode;
   }
-
-  let mode: ChatMode = 'group';
-  try {
-    const c = getBotClient(larkAppId);
-    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
-    if (res.code === 0) {
-      const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
-      const rawType = String(res.data?.chat_type ?? '').toLowerCase();
-      // group_message_type is the actual "is this a 话题群" signal. The
-      // Lark client UI lets users flip a chat between flat mode and topic
-      // mode at any time — that toggle writes group_message_type
-      // ('chat' ↔ 'thread'), NOT chat_mode. chat_mode is the chat's
-      // creation-time topology classification and stays 'group' even for
-      // user-converted topic chats; in our tenant we have only ever seen
-      // chat_mode='topic' on a small set of legacy/specially-created chats.
-      // Treating chat_mode='topic' OR group_message_type='thread' as 'topic'
-      // covers both shapes, and matches the behaviour the Lark client
-      // displays: every top-level message wraps into a fresh thread, so a
-      // bot's sendMessage(chatId) creates a new visible topic each turn.
-      const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
-      if (rawType === 'p2p') mode = 'p2p';
-      else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
-      else mode = 'group';
-    } else {
-      logger.warn(`getChatMode(${chatId}) failed: ${res.msg} (code: ${res.code}); falling back to 'group'`);
-    }
-  } catch (err: any) {
-    logger.warn(`getChatMode(${chatId}) errored: ${err?.message ?? err}; falling back to 'group'`);
-  }
-
+  // Lenient default: an unconfirmed chat is treated as 'group' (a flat group is
+  // the safer routing default than wrongly forcing threads). getChatModeStrict
+  // already cached the result on success; cache the fallback on 'unknown' too.
+  const strict = await getChatModeStrict(larkAppId, chatId);
+  if (strict !== 'unknown') return strict;
+  const mode: ChatMode = 'group';
+  logger.warn(`getChatMode(${chatId}) unconfirmed; falling back to 'group'`);
   chatModeCache.set(cacheKey, { mode, cachedAt: Date.now() });
   return mode;
 }
@@ -314,10 +328,16 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   const c = getBotClient(larkAppId);
+  let card: unknown;
+  try {
+    card = JSON.parse(cardJson);
+  } catch (err) {
+    throw new Error(`Invalid ephemeral card JSON: ${err}`);
+  }
   const res: any = await (c as any).request({
     method: 'POST',
     url: '/open-apis/ephemeral/v1/send',
-    data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card: JSON.parse(cardJson) },
+    data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card },
   });
   if (res.code !== 0) {
     throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);

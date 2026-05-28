@@ -413,6 +413,7 @@ export function buildPrivateSnapshotCard(
   status: StreamStatus,
   cliId: CliId | undefined,
   imageKey: string | undefined,
+  screenContent: string,
   sessionId: string,
   rootId: string,
   locale?: Locale,
@@ -424,11 +425,22 @@ export function buildPrivateSnapshotCard(
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
 
   const elements: any[] = [];
-  // Force the screenshot into view when we have one (the snapshot exists to let
-  // the audience SEE the terminal once); fall back to hidden when there's none.
+  // Show the terminal once: prefer the rendered screenshot when present;
+  // otherwise fall back to a code-block of the latest screen text so the
+  // snapshot isn't empty (common when the bot has the streaming card disabled
+  // or display mode never flipped to screenshot — `lastScreenContent` is still
+  // kept up to date regardless). pushStreamBody also emits the usage-limit
+  // notice, which applies in either case.
   pushStreamBody(elements, {
     status, usageLimit, displayMode: imageKey ? 'screenshot' : 'hidden', imageKey, cliName, locale,
   });
+  if (!imageKey) {
+    const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
+    if (text) {
+      elements.push({ tag: 'markdown', content: '```\n' + truncateContent(text, locale) + '\n```' });
+      elements.push({ tag: 'hr' });
+    }
+  }
 
   elements.push({
     tag: 'action',

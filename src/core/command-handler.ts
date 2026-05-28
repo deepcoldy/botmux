@@ -12,7 +12,7 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, listChatBotMembers, getChatMode } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, listChatBotMembers, getChatModeStrict } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
@@ -1051,7 +1051,10 @@ export async function handleCommand(
         // (never fall back to a group-visible card) since not leaking is the
         // entire point of this mode.
         if (getBot(ds.larkAppId).config.privateCard) {
-          const mode = await getChatMode(ds.larkAppId, ds.chatId);
+          // Strict gate: only a *confirmed* plain group is safe — getChatModeStrict
+          // returns 'unknown' on API error instead of guessing 'group', so we fail
+          // closed (no leak) when we can't verify the chat type.
+          const mode = await getChatModeStrict(ds.larkAppId, ds.chatId);
           if (mode !== 'group') {
             await sessionReply(rootId, t('cmd.card.private_not_group', undefined, loc));
             break;
