@@ -12,6 +12,7 @@ import {
   buildStreamingCard,
   buildRepoSelectCard,
   buildSessionClosedCard,
+  buildPrivateSnapshotCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -722,5 +723,97 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.value.session_id).toBe('sess-4');
     expect(resumeBtn.value.root_id).toBe('om_root_X');
     expect(resumeBtn.type).toBe('primary');
+  });
+});
+
+// ─── buildPrivateSnapshotCard (private /card ephemeral snapshot) ─────────────
+
+describe('buildPrivateSnapshotCard', () => {
+  const build = (over: Partial<{
+    imageKey?: string; screen: string; status: any; usageLimit: any;
+  }> = {}) => parse(buildPrivateSnapshotCard(
+    'https://t.example/ro',
+    'my session',
+    over.status ?? 'idle',
+    'claude-code',
+    over.imageKey,
+    over.screen ?? '',
+    'sess-9',
+    'om_anchor',
+    'zh',
+    over.usageLimit,
+  ));
+
+  function allButtons(card: any): any[] {
+    return card.elements
+      .filter((e: any) => e.tag === 'action')
+      .flatMap((e: any) => e.actions ?? []);
+  }
+
+  it('exposes exactly open-terminal (link), get_write_link, close — no patch-driven controls', () => {
+    const card = build({ screen: 'hello' });
+    const btns = allButtons(card);
+    const actions = btns.map((b: any) => b.value?.action).filter(Boolean);
+    expect(actions.sort()).toEqual(['close', 'get_write_link']);
+    // open-terminal is a URL button (no callback action)
+    const link = btns.find((b: any) => b.multi_url);
+    expect(link.multi_url.url).toBe('https://t.example/ro');
+    // none of the patch-driven / quick-key controls leak in
+    for (const bad of ['toggle_display', 'export_text', 'refresh_screenshot', 'term_action']) {
+      expect(actions).not.toContain(bad);
+    }
+  });
+
+  it('callback buttons carry root_id/session_id/cli_id for handler resolution', () => {
+    const card = build({ screen: 'x' });
+    const btns = allButtons(card);
+    for (const action of ['get_write_link', 'close']) {
+      const b = btns.find((x: any) => x.value?.action === action);
+      expect(b.value).toMatchObject({ root_id: 'om_anchor', session_id: 'sess-9', cli_id: 'claude-code' });
+    }
+  });
+
+  it('never embeds a writable terminal link', () => {
+    const json = buildPrivateSnapshotCard('https://t.example/ro', 't', 'idle', 'claude-code', undefined, 'tok-bearing-content', 'sess-9', 'om_anchor', 'zh');
+    // only the read-only URL appears; no second token-bearing markdown link
+    const mdLinks = JSON.parse(json).elements.filter((e: any) => e.tag === 'markdown');
+    expect(mdLinks.every((m: any) => !m.content.includes('?token='))).toBe(true);
+  });
+
+  it('renders a code-block text fallback when there is no screenshot', () => {
+    const card = build({ screen: 'line1\nline2\n$ done' });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && /```/.test(e.content));
+    expect(md).toBeDefined();
+    expect(md.content).toContain('line1');
+    expect(md.content).toContain('$ done');
+  });
+
+  it('renders the screenshot (no text block) when an imageKey is present', () => {
+    const card = build({ imageKey: 'img_v2_abc', screen: 'should-not-render' });
+    const img = card.elements.find((e: any) => e.tag === 'img');
+    expect(img.img_key).toBe('img_v2_abc');
+    const codeMd = card.elements.find((e: any) => e.tag === 'markdown' && /```/.test(e.content));
+    expect(codeMd).toBeUndefined();
+  });
+
+  it('omits the body entirely when there is neither screenshot nor screen text', () => {
+    const card = build({ screen: '   \n  ' });
+    expect(card.elements.find((e: any) => e.tag === 'img')).toBeUndefined();
+    expect(card.elements.find((e: any) => e.tag === 'markdown' && /```/.test(e.content))).toBeUndefined();
+  });
+
+  it('uses a fence longer than any backtick run in the content', () => {
+    const card = build({ screen: 'a\n```\nfenced\n```\nb' });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && /`{4,}/.test(e.content));
+    // content has a ``` run → fence must be at least 4 backticks
+    expect(md).toBeDefined();
+    expect(md.content.startsWith('````')).toBe(true);
+  });
+
+  it('marks the header with the private lock glyph and carries the private note', () => {
+    const card = build({ screen: 'x' });
+    expect(card.header.title.content.startsWith('🔒')).toBe(true);
+    const note = card.elements.find((e: any) => e.tag === 'note');
+    expect(JSON.stringify(note)).toContain('🔒');
   });
 });

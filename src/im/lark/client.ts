@@ -248,8 +248,10 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
       logger.warn(`getChatModeStrict(${chatId}) failed: ${res.msg} (code: ${res.code})`);
       return 'unknown';
     }
+    // 'p2p' (single chat) lives in chat_mode, NOT chat_type. chat_type is the
+    // group's visibility (public/private) and is undefined for p2p — checking it
+    // for 'p2p' never matches, so a DM would fall through to 'group'.
     const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
-    const rawType = String(res.data?.chat_type ?? '').toLowerCase();
     // group_message_type is the actual "is this a 话题群" signal. The Lark
     // client UI lets users flip a chat between flat mode and topic mode at any
     // time — that toggle writes group_message_type ('chat' ↔ 'thread'), NOT
@@ -259,7 +261,7 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
     // chat_mode='topic' OR group_message_type='thread' as 'topic' covers both.
     const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
     let mode: ChatMode;
-    if (rawType === 'p2p') mode = 'p2p';
+    if (rawMode === 'p2p') mode = 'p2p';
     else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
     else mode = 'group';
     chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
