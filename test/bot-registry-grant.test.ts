@@ -15,6 +15,20 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].chatGrants).toBeUndefined();
   });
 
+  it('parseBotConfigsFromText preserves & filters globalGrants (open_id strings only)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'gg1', larkAppSecret: 's',
+      globalGrants: ['ou_a', 'ou_b', 123, '', '   ', 'ou_c'],
+    }]));
+    expect(cfgs[0].globalGrants).toEqual(['ou_a', 'ou_b', 'ou_c']);
+  });
+
+  it('parseBotConfigsFromText leaves globalGrants undefined when absent / all-invalid / non-array', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg2', larkAppSecret: 's' }]))[0].globalGrants).toBeUndefined();
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg3', larkAppSecret: 's', globalGrants: [1, 2, ''] }]))[0].globalGrants).toBeUndefined();
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg4', larkAppSecret: 's', globalGrants: 'nope' }]))[0].globalGrants).toBeUndefined();
+  });
+
   it('parseBotConfigsFromText preserves brandLabel, distinguishing unset/off/custom', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'b_unset', larkAppSecret: 's' },

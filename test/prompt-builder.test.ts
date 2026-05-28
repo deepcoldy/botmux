@@ -189,6 +189,16 @@ describe('buildFollowUpContent', () => {
     expect(content).not.toContain('<session_id>');
     expect(content).toContain('path="/tmp/img.jpg"');
   });
+
+  it('omits botmux_reminder for Mira follow-ups', () => {
+    const content = buildFollowUpContent('继续', SESSION_ID, {
+      isAdoptMode: false,
+      cliId: 'mira',
+    });
+
+    expect(content).not.toContain('<botmux_reminder>');
+    expect(content).not.toContain('botmux send');
+  });
 });
 
 // ─── buildReforkPrompt — wraps re-fork branch (resume / daemon-restart) ─────
@@ -243,6 +253,14 @@ describe('buildReforkPrompt', () => {
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('<user_message>');
     expect(out).toContain('<botmux_reminder>');
+  });
+
+  it('omits botmux_reminder for Mira re-fork prompts', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, 'hello', { cliId: 'mira' });
+    expect(out).toContain('<user_message>');
+    expect(out).not.toContain('<session_id>');
+    expect(out).not.toContain('<botmux_reminder>');
   });
 
   it('forwards attachments and mentions to the wrapper', () => {

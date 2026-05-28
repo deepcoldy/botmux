@@ -44,6 +44,8 @@ import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
+import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
+import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -125,13 +127,20 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Codex, Gemini, OpenCode, MTR. */
+ *  Codex, Gemini, OpenCode, MTR, Hermes. */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['codex', createCodexAdapter('/bin/codex')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
   ['opencode', createOpenCodeAdapter('/bin/opencode')],
   ['mtr', createMtrAdapter('/bin/mtr')],
+  ['hermes', createHermesAdapter('/bin/hermes')],
+];
+
+/** Node runner adapters use a one-line base64 control protocol so multiline
+ *  content cannot be split by terminal Enter semantics. */
+const APP_RUNNER_ADAPTERS: AdapterEntry[] = [
+  ['mira', createMiraAdapter()],
 ];
 
 /** Adapters that type per-line + `\` soft-newline + Enter (Claude Code idiom). */
@@ -157,7 +166,14 @@ const ALL_ADAPTERS: AdapterEntry[] = [
   ...HUMAN_TYPING_ADAPTERS,
   ...PASTE_BUFFER_ADAPTERS,
   ...PLAIN_ADAPTERS,
+  ...APP_RUNNER_ADAPTERS,
 ];
+
+function decodeRunnerLine(line: string, prefix: string): any {
+  expect(line.startsWith(prefix)).toBe(true);
+  const encoded = line.slice(prefix.length).replace(/\r$/, '');
+  return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+}
 
 // =========================================================================
 // 1. Single-line content
@@ -179,6 +195,15 @@ describe('writeInput: single-line, tmux mode', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.sendText).not.toHaveBeenCalled();
   });
+
+  it.each(APP_RUNNER_ADAPTERS)('%s: sends a base64 runner control line + Enter', async (_name, adapter) => {
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, 'hello world');
+    const line = pty.sendText.mock.calls[0]?.[0] ?? '';
+    expect(decodeRunnerLine(line, '::botmux-mira:')).toEqual({ type: 'message', content: 'hello world' });
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
 });
 
 describe('writeInput: single-line, non-tmux mode', () => {
@@ -198,6 +223,14 @@ describe('writeInput: single-line, non-tmux mode', () => {
     expect(allWritten).toContain('\x1b[201~');
     expect(allWritten.endsWith('\r')).toBe(true);
   });
+
+  it.each(APP_RUNNER_ADAPTERS)('%s: writes a base64 runner control line + CR', async (_name, adapter) => {
+    const pty = makeRawPty();
+    await adapter.writeInput(pty, 'hello world');
+    const allWritten = pty.write.mock.calls.map(c => c[0]).join('');
+    expect(decodeRunnerLine(allWritten, '::botmux-mira:')).toEqual({ type: 'message', content: 'hello world' });
+    expect(allWritten.endsWith('\r')).toBe(true);
+  });
 });
 
 // =========================================================================
@@ -215,6 +248,15 @@ describe('writeInput: multiline, tmux mode', () => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, MULTILINE);
     expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it.each(APP_RUNNER_ADAPTERS)('%s: preserves multiline content inside the control payload', async (_name, adapter) => {
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+    const line = pty.sendText.mock.calls[0]?.[0] ?? '';
+    expect(decodeRunnerLine(line, '::botmux-mira:')).toEqual({ type: 'message', content: MULTILINE });
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.pasteText).not.toHaveBeenCalled();
   });
@@ -415,8 +457,8 @@ describe('supportsTypeAhead flag', () => {
     expect(createClaudeCodeAdapter('/bin/claude').supportsTypeAhead).toBe(true);
   });
 
-  it('coco: undefined (input handling is fork of claude-code but type-ahead untested)', () => {
-    expect(createCocoAdapter('/bin/coco').supportsTypeAhead).toBeUndefined();
+  it('coco: true (0.120.32+ parks submit-while-busy in its TUI queue, dequeues at idle)', () => {
+    expect(createCocoAdapter('/bin/coco').supportsTypeAhead).toBe(true);
   });
 
   it.each(PLAIN_ADAPTERS)('%s: undefined (default behavior)', (_name, adapter) => {

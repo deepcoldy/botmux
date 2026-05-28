@@ -154,6 +154,7 @@ The `CliAdapter` interface requires:
 | `readyPattern` | Regex to detect when the CLI is ready for input (optional) |
 | `systemHints` | System-level hints injected into the CLI (optional) |
 | `altScreen` | Whether the CLI uses alternate screen mode |
+| `modelChoices` | Curated model candidates surfaced in `botmux setup` (optional). Set when the CLI accepts a model flag (consumed in `buildArgs` via the `model` opt); omit when the CLI has no `--model` concept — setup then skips the model prompt for that CLI |
 
 ## Tests
 

@@ -45,6 +45,11 @@ export interface RequiredScope {
 export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   { name: 'im:message', desc: '收发消息', critical: true },
   { name: 'im:message.group_at_msg:readonly', desc: '群消息接收', critical: true },
+  // 没有这个 scope，listChatMessages（container_id_type=chat）只能拿到 @bot 的
+  // 消息，拉不到群里的全量历史，botmux history / 群上下文回溯失效。标 critical 是
+  // 为了让启动自检在它缺失时也会 DM 管理员——非 critical 的缺失只在同时缺别的
+  // critical 项时才会被提示。
+  { name: 'im:message.group_msg', desc: '群组历史消息读取（botmux history、群上下文）', critical: true },
   { name: 'im:resource', desc: '消息附件下载', critical: true },
   { name: 'im:chat:read', desc: '群信息读取', critical: true },
   // /group 多 bot 建群解析靠 chatMembers.isInChat 判断每个 bot 是否在群。该 API

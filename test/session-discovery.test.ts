@@ -329,6 +329,21 @@ describe('discoverAdoptableSessions', () => {
     expect(results[0]!.cwd).toBe('/workspace/mtr');
   });
 
+  it('should detect Hermes CLI process', () => {
+    setupMocks({
+      paneLines: 'hermessession:0.0 1000\n',
+      commMap: { 1000: 'hermes' },
+      cwdMap: { 1000: '/workspace/hermes' },
+      dimsMap: { 'hermessession:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions();
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('hermes');
+    expect(results[0]!.cwd).toBe('/workspace/hermes');
+  });
+
   it('should not include sessionId for non-claude CLI types', () => {
     setupMocks({
       paneLines: 'mysession:0.0 1000\n',

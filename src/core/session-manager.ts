@@ -337,7 +337,9 @@ export function buildFollowUpContent(
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
 
-  parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
+  if (opts?.cliId !== 'mira') {
+    parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
+  }
 
   return parts.join('\n\n');
 }

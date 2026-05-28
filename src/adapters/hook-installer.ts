@@ -67,10 +67,32 @@ interface ClaudeSettings {
   [key: string]: unknown;
 }
 
-/** 判断某个 hook group 是否是 botmux ask hook（用于幂等替换）。 */
+/**
+ * 从完整 hookCommand 中提取 `hook <cliId>` 尾签名。
+ * hookCommand 形如：`"<node>" "<...dist/cli.js>" hook claude-code`，
+ * 尾部 `hook <cliId>` 不随 node / cli.js 安装路径变化。
+ */
+function botmuxHookSuffix(hookCommand: string): string {
+  const idx = hookCommand.lastIndexOf(' hook ');
+  return idx === -1 ? hookCommand : hookCommand.slice(idx + 1); // "hook <cliId>"
+}
+
+/**
+ * 判断某个 hook group 是否是 botmux ask hook（用于幂等替换）。
+ *
+ * 不能只按命令字符串完全相等比对：同一台机器上 dev 源码 checkout 与 npm global
+ * 安装的 cli.js 绝对路径不同，命令字符串就不同，会导致两条 botmux hook 同时残留、
+ * 同一次 AskUserQuestion 触发两次 → 飞书发出两张卡。
+ * 因此结构化识别：命令引用了 botmux 的 `cli.js` 且尾部是相同的 `hook <cliId>` 签名，
+ * 即视为 botmux hook，无论它指向哪个安装路径。
+ */
 function isBotmuxAskHookGroup(group: ClaudeHookGroup, hookCommand: string): boolean {
+  const suffix = botmuxHookSuffix(hookCommand); // e.g. "hook claude-code"
   return group.hooks.some(
-    (e) => e.type === 'command' && e.command === hookCommand,
+    (e) =>
+      e.type === 'command' &&
+      (e.command === hookCommand ||
+        (e.command.includes('cli.js') && e.command.trimEnd().endsWith(suffix))),
   );
 }
 

@@ -7,6 +7,7 @@ import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
+import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
@@ -553,13 +554,36 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
 ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
+  const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
+    disableStreamingCard: cardPrefs.disableStreamingCard,
+    writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
+    privateCard: cardPrefs.privateCard,
   });
+});
+
+// Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
+// present keys are applied. `{ disableStreamingCard?, writableTerminalLinkInCard?, privateCard? }`.
+ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const patch: { disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean } = {};
+  if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
+  if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+
+  const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, ...r.prefs });
 });
 
 // Per-bot card footer brand label. Body `{ brandLabel: string | null }`:

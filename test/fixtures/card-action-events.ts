@@ -17,9 +17,9 @@ export function makeRestartEvent(rootId: string, operatorOpenId = 'ou_user') {
   };
 }
 
-export function makeCloseEvent(rootId: string, operatorOpenId = 'ou_user') {
+export function makeCloseEvent(rootId: string, operatorOpenId = 'ou_user', visibility?: string) {
   return {
-    action: { value: { action: 'close', root_id: rootId } },
+    action: { value: { action: 'close', root_id: rootId, ...(visibility ? { visibility } : {}) } },
     operator: { open_id: operatorOpenId },
   };
 }

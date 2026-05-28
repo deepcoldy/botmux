@@ -9,10 +9,13 @@ function th(sort: string, label: string): string {
 const CLI_FILTER_OPTIONS = [
   'claude-code',
   'codex',
+  'codex-app',
   'cursor',
   'gemini',
   'opencode',
   'mtr',
+  'hermes',
+  'mira',
   'aiden',
   'coco',
   'unknown',

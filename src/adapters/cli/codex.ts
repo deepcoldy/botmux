@@ -110,11 +110,15 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     id: 'codex',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model }) {
       const baseArgs = [
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
       ];
+      if (model && model.trim()) {
+        // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
+        baseArgs.push('--model', model.trim());
+      }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
       const freshArgs = workingDir
         ? [...baseArgs, '-C', workingDir]
@@ -201,6 +205,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: false,   // --no-alt-screen disables alternate screen
+    modelChoices: ['gpt-5', 'gpt-5-codex', 'o3', 'o3-mini'],
   };
 }
 

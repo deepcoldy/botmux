@@ -43,6 +43,7 @@ import {
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
 import type { CliId } from './adapters/cli/types.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -291,6 +292,66 @@ function printInputHelp(title: string, lines: string[]): void {
   }
 }
 
+/**
+ * 读取指定 CLI 适配器声明的候选 model 列表 —— 不支持 model 配置的 CLI（aiden/
+ * antigravity/mtr 等没声明 modelChoices）返回 null，promptModel 据此整段
+ * 跳过提问。适配器解析失败也按"不支持"处理，避免在 setup 中冒出陌生堆栈。
+ */
+function cliModelChoices(cliId: CliId): readonly string[] | null {
+  try {
+    const adapter = createCliAdapterSync(cliId);
+    return adapter.modelChoices && adapter.modelChoices.length > 0
+      ? adapter.modelChoices
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 询问"指定 CLI 用哪个 model"。
+ *   - cliId 对应的 adapter 没声明 modelChoices → return undefined（跳过提问）
+ *   - 用户输入序号 → 取候选列表对应项
+ *   - 输入空 + 提供 current → 保留当前值（current 透传出去）
+ *   - 输入空 + 无 current → return undefined（用 CLI 默认）
+ *   - 输入 `-` → return null（语义：清空，调用方据此 delete model 字段）
+ *   - 输入自由文本 → 原样返回
+ */
+async function promptModel(
+  rl: ReturnType<typeof createInterface>,
+  cliId: CliId,
+  current?: string,
+): Promise<string | null | undefined> {
+  const choices = cliModelChoices(cliId);
+  if (!choices) return undefined;
+
+  const numbered = choices.map((m, i) => `${i + 1}) ${m}`).join('  ');
+  printInputHelp(`CLI Model（${cliId}）`, [
+    '可选。在 spawn CLI 时注入 model 参数；同一 CLI 配多个 bot 可以跑不同 model。',
+    `候选: ${numbered}  ${choices.length + 1}) Other（自定义输入）`,
+    current
+      ? '留空保留当前值；输入 - 清空（回到 CLI 默认）。'
+      : '留空 = 不设置（用 CLI 默认）。',
+  ]);
+  const label = current ? formatOptionalValue(current) : '未设置';
+  const raw = (await ask(rl, `CLI Model [${label}]: `)).trim();
+  if (!raw) return current ?? undefined;
+  if (raw === '-') return null;
+
+  const numIdx = Number(raw);
+  if (Number.isInteger(numIdx) && numIdx >= 1 && numIdx <= choices.length) {
+    return choices[numIdx - 1];
+  }
+  if (Number.isInteger(numIdx) && numIdx === choices.length + 1) {
+    // 选了 Other，进一步要 free-form
+    const customRaw = (await ask(rl, '请输入 model 名: ')).trim();
+    if (!customRaw) return current ?? undefined;
+    return customRaw;
+  }
+  // 直接当成自由输入
+  return raw;
+}
+
 // Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
 // the same name without passing BOTS_JSON_FILE explicitly each time.
 function writeBotsJsonAtomic(bots: any[]): void {
@@ -518,7 +579,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   let cliId: CliId;
   try {
@@ -529,6 +590,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     return null;
   }
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
+  const modelChoice = await promptModel(rl, cliId);
 
   // 不再持久化 brand 字段: setup 阶段 brand=lark 直接被 obtainCredentials 中止,
   // 落盘的永远是 'feishu', 写进配置是死字段. 等 lark 完整接入再加回来, 那时
@@ -542,6 +604,10 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     // 在哪儿, 不用去 README 查字段名.
     workingDir: workingDir.trim() || '~',
   };
+  // modelChoice === undefined → 该 CLI 没声明候选 / 用户跳过；不写 model 字段
+  if (typeof modelChoice === 'string' && modelChoice) {
+    bot.model = modelChoice;
+  }
   // 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id), 天然就是 owner.
   // 手动 fallback 场景没 open_id —— 必须显式指定 owner, 否则配置无 owner:
   // allowedUsers 为空时虽然"全开放", 但一旦后续加了 allowedChatGroups 就会变成
@@ -612,7 +678,7 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira');
   printInputHelp('CLI 适配器', [
     '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
     '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
@@ -625,6 +691,29 @@ async function promptEditBotConfig(
     '留空保留当前值；输入 - 清空覆盖，回到 PATH 查 cliId 对应的默认二进制。',
   ]);
   input.cliPathOverride = await ask(rl, `CLI 可执行文件路径覆盖 [${formatOptionalValue(bot.cliPathOverride)}]: `);
+
+  // promptModel 返回 string | null | undefined，直接灌进 BotConfigEditInput.model:
+  //   undefined = 用户跳过 / adapter 不支持 → applyBotConfigEdits 不改 model
+  //   null      = 用户输 `-` 清空 → delete model
+  //   string    = 设值
+  // 用本轮编辑后的 cliId 而非 bot.cliId —— 用户可能刚换了 CLI。
+  const effectiveCliIdForModel = (resolveCliId(input.cliChoice) ?? bot.cliId ?? 'claude-code') as CliId;
+  const cliChanged = !!resolveCliId(input.cliChoice) && resolveCliId(input.cliChoice) !== bot.cliId;
+  if (cliChanged && !cliModelChoices(effectiveCliIdForModel)) {
+    // 切到一个不支持 model 的 adapter（例如 aiden / mtr / antigravity）：
+    // 即使原本配了 model 也要主动清空，避免 bots.json 里残留陈旧字段——
+    // 否则用户后面再换回支持 model 的 adapter 一路回车时，旧 model
+    // 会被当作"当前值"保留下来误套到新 CLI 上。
+    console.log('\n⚠️  新 CLI 不支持 --model 参数，已清空原 model 字段。');
+    input.model = null;
+  } else {
+    const promptCurrent = cliChanged ? undefined : (typeof bot.model === 'string' ? bot.model : undefined);
+    const result = await promptModel(rl, effectiveCliIdForModel, promptCurrent);
+    // 切换 CLI 时哪怕用户留空也要清掉旧 model —— 旧值是上一个 CLI 的 model，
+    // 套到新 CLI 上没意义。result === undefined 在"未变 CLI"分支等价于"保留旧值"，
+    // 但在 cliChanged 分支等价于"用户没指定，回到新 CLI 默认"，必须 force null。
+    input.model = cliChanged && result === undefined ? null : result;
+  }
 
   printInputHelp('会话后端 backendType', [
     '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着。',

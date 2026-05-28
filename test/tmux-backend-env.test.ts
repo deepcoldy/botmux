@@ -53,6 +53,19 @@ describe('buildBotmuxEnvAssignments()', () => {
     ]);
   });
 
+  it('forwards CLAUDE_CODE_RESUME_TOKEN_THRESHOLD so the resume-summary bypass reaches the tmux pane (issue #62)', () => {
+    // The worker injects this for claude-code to suppress Claude Code 2.1.x's
+    // blocking resume-summary menu. Under the tmux backend it ONLY reaches the
+    // CLI if it's allowlisted here — `...process.env` passthrough is dead.
+    const out = buildBotmuxEnvAssignments({
+      LARK_APP_ID: 'cli_abc',
+      CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '2147483647',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=2147483647');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {
     const out = buildBotmuxEnvAssignments({
       LARK_APP_ID: 'cli_abc',

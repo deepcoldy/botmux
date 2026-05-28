@@ -587,6 +587,9 @@ const server = createServer(async (req, res) => {
             defaultOncall: j.defaultOncall,
             autoboundChatCount: j.autoboundChatCount ?? 0,
             brandLabel: j.brandLabel ?? null,
+            disableStreamingCard: j.disableStreamingCard === true,
+            writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
+            privateCard: j.privateCard === true,
           };
         } catch (e: any) {
           return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
@@ -620,6 +623,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-brand-label`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/card-prefs — proxy to that bot's daemon. Body carries
+    // either/both `{ disableStreamingCard?, writableTerminalLinkInCard? }` booleans.
+    let mBotCardPrefs: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCardPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/card-prefs$/))) {
+      const appId = decodeURIComponent(mBotCardPrefs[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-card-prefs`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

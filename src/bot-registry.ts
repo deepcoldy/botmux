@@ -37,6 +37,15 @@ export interface BotConfig {
   name?: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /**
+   * Optional model name passed to the CLI at spawn time (e.g. `claude --model
+   * opus`). Each adapter decides how to inject it — adapters whose CLI has no
+   * `--model` flag silently ignore the field. When unset, the CLI uses its own
+   * default model. Multiple bots sharing the same `cliId` can therefore run
+   * different models without resorting to wrapper scripts. See each adapter's
+   * `modelChoices` for the curated candidates surfaced in `botmux setup`.
+   */
+  model?: string;
   backendType?: 'pty' | 'tmux';
   workingDir?: string;
   workingDirs?: string[];
@@ -69,6 +78,13 @@ export interface BotConfig {
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
+   * 全局对话授权名单：被授权在**任意群**与本 bot 对话的 open_id 列表（人或 bot 通用）。
+   * 与 chatGrants 同属 talk-only —— 仅放行 canTalk / bot 路由闸，**canOperate 绝不读它**
+   * （敏感操作仍仅限 allowedUsers）。这是 chatGrants 的全局版：作用域升到全局，talk-only
+   * 性质不变。可由 /grant 卡片「全局」按钮写入，也可在 bots.json 手配 open_id。
+   */
+  globalGrants?: string[];
+  /**
    * Custom footer brand label for cards this bot sends. Three states:
    *   • `undefined` (unset)  → default `[botmux](github)` link
    *   • `''` (empty)         → brand suppressed (footer shows only 发送给 if any)
@@ -77,6 +93,32 @@ export interface BotConfig {
    * routing or permissions.
    */
   brandLabel?: string;
+  /**
+   * When true, suppress the live streaming session card entirely. The web
+   * terminal still runs and the final answer still arrives via `botmux send`;
+   * only the auto-updating status card is never posted/patched. Default
+   * (undefined) keeps the streaming card. For users who find the live card noisy.
+   */
+  disableStreamingCard?: boolean;
+  /**
+   * When true, the streaming card embeds a directly-usable WRITABLE terminal
+   * link in its body (token included → anyone who can see the card can drive
+   * the terminal). Default (undefined) keeps the write link behind the
+   * "get write link" button, which DMs it privately to the clicker. Moot when
+   * {@link disableStreamingCard} is on (no card to embed it in).
+   */
+  writableTerminalLinkInCard?: boolean;
+  /**
+   * When true, `/card` sends a **private** static snapshot card via the ephemeral
+   * API, visible only to the bot's `allowedUsers` (owner / co-owners), instead of
+   * the group-visible live streaming card. Talk-only grants (globalGrants /
+   * chatGrants) and a bare triggerer do NOT receive it — it's owner-only. Only
+   * works in plain `group` chats (topic/thread/p2p fail closed) and cannot
+   * live-update (ephemeral cards can't be patched). Scoped to the `/card` command
+   * only — the auto streaming card is unaffected. Default (undefined) keeps
+   * `/card` group-visible & live.
+   */
+  privateCard?: boolean;
 }
 
 export interface BotState {
@@ -386,12 +428,23 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatGrants = out;
     }
 
+    // globalGrants：只保留非空 string[]（open_id 列表），逐项校验 typeof === 'string'。
+    // 未配置或全部非法 → undefined。
+    let globalGrants: string[] | undefined;
+    if (Array.isArray(entry.globalGrants)) {
+      const ids = (entry.globalGrants as any[]).filter((x): x is string => typeof x === 'string' && x.trim().length > 0);
+      if (ids.length > 0) globalGrants = ids;
+    }
+
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
+      model: typeof entry.model === 'string' && entry.model.trim()
+        ? entry.model.trim()
+        : undefined,
       backendType: entry.backendType,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
@@ -404,10 +457,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.defaultWorkingDir.trim()
         : undefined,
       chatGrants,
+      globalGrants,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
+      privateCard: entry.privateCard === true || undefined,
     });
   }
 

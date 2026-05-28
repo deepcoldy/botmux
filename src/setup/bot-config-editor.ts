@@ -10,6 +10,9 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '7': 'opencode',
   '8': 'antigravity',
   '9': 'mtr',
+  '10': 'hermes',
+  '11': 'codex-app',
+  '12': 'mira',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -17,7 +20,7 @@ const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES)
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
  *   - 空 → undefined (调用方决定 "preserve current" 还是套默认 'claude-code')
- *   - "1".."9" → CLI_ID_CHOICES 映射
+ *   - "1".."12" → CLI_ID_CHOICES 映射
  *   - 已是合法 cliId 字面值 → 原样返回
  *   - 其它 → throw (typo 不该静默落盘成 cliId)
  */
@@ -28,7 +31,7 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
   throw new Error(
-    `Unknown CLI 适配器 "${raw}"。请输入序号 1-9 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-12 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
 }
 
@@ -63,6 +66,13 @@ export interface BotConfigEditInput {
   larkAppSecret?: string;
   cliChoice?: string;
   cliPathOverride?: string;
+  /**
+   * Model 字段三态语义：
+   *   - undefined → 这次编辑没问过 model（adapter 没声明 modelChoices 自动跳过），保持原值
+   *   - string    → 设为这个 model
+   *   - null      → 清空（删字段，回到 CLI 默认）
+   */
+  model?: string | null;
   backendType?: string;
   workingDir?: string;
   allowedUsers?: string;
@@ -237,6 +247,17 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   if (cliId) out.cliId = cliId;
 
   applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
+
+  // Model 字段：null = 清空，string = 设置，undefined = 不动。promptModel 已经
+  // 把"adapter 不支持 model"折叠成 undefined 直接跳过；这里不再去查 adapter。
+  if (input.model === null) {
+    delete out.model;
+  } else if (typeof input.model === 'string') {
+    const v = input.model.trim();
+    if (v === '-') delete out.model;
+    else if (v) out.model = v;
+    else delete out.model;
+  }
 
   if (input.backendType !== undefined) {
     const backendType = input.backendType.trim();

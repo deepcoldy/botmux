@@ -1,4 +1,4 @@
-import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
@@ -6,6 +6,75 @@ import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, ASK_SKILL, ASK_SKILL_NAME } from '
 
 function expandHome(p: string): string {
   return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
+}
+
+/** Claude Code plugin manifest written to `{pluginDir}/.claude-plugin/plugin.json`.
+ *  `name` is the only required field; it namespaces the bundled skills. */
+const PLUGIN_MANIFEST = JSON.stringify({
+  name: 'botmux',
+  description: 'botmux 飞书话题桥接内置 skill —— 仅在 botmux 拉起的会话内通过 --plugin-dir 注入，不写入全局 ~/.claude/skills。',
+  version: '1.0.0',
+  author: { name: 'botmux' },
+}, null, 2) + '\n';
+
+/**
+ * Materialise the built-in skills as a Claude Code *plugin* under `pluginDir`,
+ * so they can be injected per-session via `--plugin-dir` instead of polluting
+ * the user's global `~/.claude/skills`. Writes:
+ *   - {pluginDir}/.claude-plugin/plugin.json   (manifest, name='botmux')
+ *   - {pluginDir}/skills/<name>/SKILL.md        (one per built-in skill)
+ * Idempotent — only writes when content differs. Skill files are written by
+ * reusing `ensureSkills` against `{pluginDir}/skills` (same flat layout).
+ */
+export function ensurePluginSkills(cliId: string, pluginDir: string | undefined): void {
+  if (!pluginDir) return;
+  const root = expandHome(pluginDir);
+  const manifestDir = join(root, '.claude-plugin');
+  const manifestFile = join(manifestDir, 'plugin.json');
+  try {
+    mkdirSync(manifestDir, { recursive: true });
+    if (!(existsSync(manifestFile) && readFileSync(manifestFile, 'utf-8') === PLUGIN_MANIFEST)) {
+      writeFileSync(manifestFile, PLUGIN_MANIFEST, 'utf-8');
+      logger.info(`[skills] Wrote plugin manifest for ${cliId} → ${manifestFile}`);
+    }
+  } catch (err: any) {
+    logger.warn(`[skills] Failed to write plugin manifest for ${cliId}: ${err.message}`);
+  }
+  ensureSkills(cliId, join(root, 'skills'));
+}
+
+/**
+ * Remove botmux-owned skill directories that earlier versions installed into a
+ * shared global skills dir (e.g. `~/.claude/skills`). Once skills move to a
+ * per-session plugin dir, these stale global copies would keep leaking into the
+ * user's standalone CLI sessions, so we delete them on upgrade.
+ *
+ * Matches by the `botmux-` directory-name prefix (the namespace botmux owns)
+ * rather than the static `BUILTIN_SKILLS` list — a daemon may have previously
+ * installed skills that a *different* botmux version shipped (e.g.
+ * `botmux-handoff`), and those must be cleaned too. Non-`botmux-` user skills
+ * are never touched.
+ */
+export function removeGlobalBotmuxSkills(globalSkillsDir: string | undefined): void {
+  if (!globalSkillsDir) return;
+  const dir = expandHome(globalSkillsDir);
+  if (!existsSync(dir)) return;
+  let names: string[];
+  try { names = readdirSync(dir); }
+  catch (err: any) { logger.warn(`[skills] Failed to scan ${dir}: ${err.message}`); return; }
+  for (const name of names) {
+    if (!name.startsWith('botmux-')) continue;
+    const skillDir = join(dir, name);
+    let isDir = false;
+    try { isDir = statSync(skillDir).isDirectory(); } catch { continue; }
+    if (!isDir) continue;
+    try {
+      rmSync(skillDir, { recursive: true, force: true });
+      logger.info(`[skills] Removed leaked global skill ${name} → ${skillDir}`);
+    } catch (err: any) {
+      logger.warn(`[skills] Failed to remove leaked global skill ${name}: ${err.message}`);
+    }
+  }
 }
 
 /**

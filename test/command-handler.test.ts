@@ -104,6 +104,7 @@ vi.mock('../src/core/scheduler.js', () => ({
 vi.mock('../src/services/project-scanner.js', () => ({
   scanProjects: vi.fn(() => []),
   scanMultipleProjects: vi.fn(() => []),
+  describeProjectDir: vi.fn(() => null),
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
@@ -179,6 +180,10 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkAdoptWorker: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
   transferSession: vi.fn(async () => ({ ok: true })),
+  // /relay --create empty-leader path closes the scratch via this; default
+  // resolves as idempotent close so unrelated tests don't need to think
+  // about it.
+  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -195,6 +200,9 @@ vi.mock('../src/core/session-manager.js', () => ({
     ds.lastUserPrompt = userPrompt;
     ds.lastCliInput = cliInput;
   }),
+  // Dynamically imported by the /repo pending-launch path (bare /repo + repo selection).
+  buildNewTopicPrompt: vi.fn((prompt: string) => `WRAPPED:${prompt}`),
+  getAvailableBots: vi.fn(async () => []),
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({
@@ -326,10 +334,14 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/relay'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/relay', '/card'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
+  });
+
+  it('should no longer contain the removed /skip command (folded into bare /repo)', () => {
+    expect(DAEMON_COMMANDS.has('/skip')).toBe(false);
   });
 
   it('should not contain passthrough or unknown commands', () => {
@@ -834,29 +846,92 @@ describe('handleCommand', () => {
         LARK_APP_ID,
       );
     });
-  });
 
-  // ─── /skip ──────────────────────────────────────────────────────────────
+    it('should resolve a first-level project name and switch repo (mid-session)', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(scanMultipleProjects).mockReturnValue([
+        { name: 'payments', path: '/home/testuser/payments', branch: 'main' },
+      ]);
+      const ds = makeDaemonSession({ pendingRepo: false, repoCardMessageId: 'om_card' });
+      const deps = makeDeps(ds);
 
-  describe('/skip', () => {
-    it('should reply no pending repo when not waiting for selection', async () => {
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo payments'), deps, LARK_APP_ID);
+
+      expect(ds.workingDir).toBe('/home/testuser/payments');
+      expect(sessionStore.createSession).toHaveBeenCalledWith(
+        CHAT_ID, ROOT_ID, 'payments (main)', 'group',
+      );
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      // the pending repo-selection card must be withdrawn after resolving
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_card');
+      expect(ds.repoCardMessageId).toBeUndefined();
+    });
+
+    it('should reply path_not_found when the arg resolves to nothing', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(scanMultipleProjects).mockReturnValue([]);
+      vi.mocked(statSync).mockImplementation(() => { throw new Error('ENOENT'); });
       const ds = makeDaemonSession({ pendingRepo: false });
       const deps = makeDeps(ds);
 
-      await handleCommand('/skip', ROOT_ID, makeLarkMessage('/skip'), deps, LARK_APP_ID);
+      try {
+        await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo ./nope'), deps, LARK_APP_ID);
+      } finally {
+        // restore the shared statSync mock for subsequent tests
+        vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
+      }
 
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('当前没有待选择的仓库');
+      expect(replyContent).toContain('找不到目录或项目');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
     });
+  });
 
-    it('should reply no pending repo when session does not exist', async () => {
-      const deps = makeDeps();
+  // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
-      await handleCommand('/skip', ROOT_ID, makeLarkMessage('/skip'), deps, LARK_APP_ID);
+  describe('/repo (bare) while pending', () => {
+    it('should launch the CLI in the default workingDir without showing a card', async () => {
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', repoCardMessageId: 'om_card' });
+      const deps = makeDeps(ds);
 
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      // Forked the pending CLI (not the close+recreate switch path).
+      expect(forkWorker).toHaveBeenCalledWith(ds, expect.any(String));
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      // Cleared pending state + withdrew the (already-sent) card.
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.pendingPrompt).toBeUndefined();
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_card');
+      expect(ds.repoCardMessageId).toBeUndefined();
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('当前没有待选择的仓库');
+      expect(replyContent).toContain('已直接开启会话');
+      // Did NOT fall through to the card-display scan path.
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
     });
+
+    it('should report an invalid workingDir and not spawn (keeps pending for recovery)', async () => {
+      // forkWorker doesn't validate cwd, so a dead workingDir must be caught
+      // before launch. Keep pendingRepo so the user can `/repo <valid-path>`.
+      vi.mocked(statSync).mockImplementation(() => { throw new Error('ENOENT'); });
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', workingDir: '/gone' });
+      const deps = makeDeps(ds);
+
+      try {
+        await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+      } finally {
+        vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
+      }
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(true); // pending kept — recoverable
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('配置的工作目录不存在');
+    });
+    // The non-pending (mid-session) bare `/repo` → card path is covered by
+    // "should show project list card when called without argument" above.
   });
 
   // ─── /schedule ──────────────────────────────────────────────────────────
@@ -1508,10 +1583,14 @@ describe('handleCommand', () => {
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {
       const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
       // Existing running session in the SAME chat (would collide on transfer).
+      // Must be chat-scope — thread-scope sessions (e.g. /t force-topic) live
+      // at a different sessionKey anchor and don't collide; the picker only
+      // refuses on chat-scope collisions.
       const existing: DaemonSession = {
         ...makeDaemonSession({
           worker: { killed: false } as any,  // truthy → running session
-          session: makeSession({ sessionId: 'existing-in-chat', title: 'PR review chat', ownerOpenId: 'ou_sender' }),
+          session: makeSession({ sessionId: 'existing-in-chat', title: 'PR review chat', ownerOpenId: 'ou_sender', scope: 'chat' }),
+          scope: 'chat',
         }),
         chatId: CHAT_ID,
       };
@@ -1537,7 +1616,11 @@ describe('handleCommand', () => {
     it('picker refuses even when ds itself IS the chat\'s only running session', async () => {
       const ds = makeDaemonSession({
         worker: { killed: false } as any,  // truthy → this IS a real running session
-        session: makeSession({ sessionId: 'real-in-chat', title: 'live work', ownerOpenId: 'ou_sender' }),
+        // Chat-scope: thread-scope sessions don't trip the picker conflict
+        // (different sessionKey anchor), only chat-scope ds is a real
+        // collision target for an incoming chat-scope relay.
+        session: makeSession({ sessionId: 'real-in-chat', title: 'live work', ownerOpenId: 'ou_sender', scope: 'chat' }),
+        scope: 'chat',
       });
       // makeDeps registers ds at sessionKey(ROOT_ID, LARK_APP_ID); ds.chatId
       // === CHAT_ID === targetChatId by default, so the conflict scan must
@@ -1808,6 +1891,96 @@ describe('handleCommand', () => {
       expect(reply).toContain('worker_busy');
 
       vi.unstubAllGlobals();
+    });
+
+    it('empty-leader path: skips transferSession, closes scratch, still dispatches peers', async () => {
+      // Regression for the "/relay --create in an unused chat creates an
+      // empty placeholder transfer" bug. When the leader ds is the daemon-
+      // command scratch (worker:null + hasHistory:false) we MUST NOT call
+      // transferSession (would forkWorker against a non-existent tmux and
+      // lie "已就绪" in the M1). Instead: close the scratch, bucket leader
+      // as no_session, and continue to peers so they can still migrate
+      // their own real sessions.
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValue({ larkAppId: 'app-2', ipcPort: 9999 });
+
+      const fetchSpy = vi.fn(async () => new Response(
+        JSON.stringify({ ok: true }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ));
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const wp = await import('../src/core/worker-pool.js');
+      vi.mocked(wp.closeSession).mockClear();
+      vi.mocked(wp.transferSession).mockClear();
+      mockedSend.mockResolvedValue('final-m1-id' as any);
+
+      // Empty leader: worker null + hasHistory false (scratch shape).
+      const ds = makeDaemonSession({
+        worker: null,
+        hasHistory: false,
+        session: makeSession({ ownerOpenId: 'ou_sender' }),
+      });
+      const deps = makeDeps(ds);
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      }), deps, LARK_APP_ID);
+
+      // transferSession NOT called for empty leader.
+      expect(wp.transferSession).not.toHaveBeenCalled();
+      // Scratch closed (empty leader hygiene).
+      expect(wp.closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      // Peer fetch DID happen (continuation past empty leader).
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      // M1 sent with partial template (peer success + leader in failed bucket).
+      const m1Body = mockedSend.mock.calls[0][2] as string;
+      expect(m1Body).toContain('Codex');           // peer in success
+      expect(m1Body).toContain('Claude');          // leader in failed
+      expect(m1Body).toMatch(/未能迁移|Failed to migrate/);
+
+      vi.unstubAllGlobals();
+    });
+
+    it('all-fresh path: empty leader + offline peer → M1 uses all_fresh template', async () => {
+      // Both leader is empty AND all peers couldn't migrate → no bot
+      // actually brought a session in. Don't send a partial-M1 with an
+      // empty success list (looks weird); use the dedicated all_fresh
+      // template that frames the new group as a fresh start.
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      // Peer offline → outcome 'offline' lands in failed bucket.
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValue(null);
+
+      mockedSend.mockResolvedValue('final-m1-id' as any);
+
+      const ds = makeDaemonSession({
+        worker: null,
+        hasHistory: false,
+        session: makeSession({ ownerOpenId: 'ou_sender' }),
+      });
+      const deps = makeDeps(ds);
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      }), deps, LARK_APP_ID);
+
+      const m1Body = mockedSend.mock.calls[0][2] as string;
+      // all_fresh template — no "已就绪" (success list line), no "未能迁移"
+      // (failed list line), instead "新群已建好" / "New group created".
+      expect(m1Body).toMatch(/新群已建好|New group created/);
+      expect(m1Body).not.toMatch(/已就绪：|Ready:/);
     });
 
     it('posts the final M1 AFTER transfers settle, with success-only template when all migrated', async () => {

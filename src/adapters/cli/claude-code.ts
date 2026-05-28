@@ -29,6 +29,13 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string): strin
   return join(homedir(), '.claude', 'projects', projectHash, `${sessionId}.jsonl`);
 }
 
+/** botmux ships its built-in skills as a Claude Code plugin here and injects it
+ *  per-session via `--plugin-dir` (see buildArgs). Kept out of the global
+ *  `~/.claude/skills` so a standalone `claude` never surfaces (and mis-fires)
+ *  them. Single source of truth for both the adapter's `pluginDir` field and
+ *  the spawn-time flag. */
+const CLAUDE_PLUGIN_DIR = join(homedir(), '.botmux', 'claude-plugin');
+
 /** Substrings that indicate Claude Code received our submit. We accept either:
  *  - `"role":"user","content":"` — direct submission while idle (the canonical
  *    user-message line; tool-result lines have array content `"content":[{...`
@@ -380,12 +387,15 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       return `claude --resume ${cliSessionId ?? sessionId}`;
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
       } else {
         args.push('--session-id', sessionId);
+      }
+      if (model && model.trim()) {
+        args.push('--model', model.trim());
       }
       args.push('--dangerously-skip-permissions');
       // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
@@ -397,6 +407,10 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         permissions: { defaultMode: 'bypassPermissions' },
       }));
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
+      // Inject botmux's built-in skills as a plugin scoped to THIS session only.
+      // Keeps them out of the user's global ~/.claude/skills so a standalone
+      // `claude` never surfaces/mis-fires `botmux send` etc.
+      args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       const unknown = t('ai.identity.unknown', undefined, locale);
       const identityBlock =
         botName || botOpenId
@@ -708,7 +722,13 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /❯/,
     systemHints: [],
     altScreen: false,
-    skillsDir: '~/.claude/skills',
+    // Skills are injected per-session via --plugin-dir (see buildArgs), NOT
+    // installed into the global ~/.claude/skills — so they never leak into the
+    // user's standalone `claude`. pluginDir is consumed by ensurePluginSkills.
+    pluginDir: CLAUDE_PLUGIN_DIR,
+    // 候选 model：alias（opus/sonnet/haiku）会被 Claude Code 解析成当前推荐的具体
+    // 版本；具体 ID 锁版本。setup 选 Other 可自由填，比如要回退或试 canary 模型。
+    modelChoices: ['opus', 'sonnet', 'haiku', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
     // askUserQuestion hook 写全局 ~/.claude/settings.json（matcher='AskUserQuestion' 的 PreToolUse），
     // 把 AskUserQuestion 事件转发到 `botmux hook claude-code`。
     // 选全局而非进程级 --settings：adopt 模式接管的是 botmux 没启动、拿不到 --settings

@@ -64,7 +64,7 @@ describe('grant-store', () => {
     writeConfig({ allowedUsers: ['ou_owner', 'ou_guest'], chatGrants: { oc_1: ['ou_guest'] } });
     const { registry, store } = await freshModules();
     const r = await store.revokeGrant('a1', 'oc_1', 'ou_guest');
-    expect(r).toEqual({ ok: true, removed: { chat: true, global: true } });
+    expect(r).toEqual({ ok: true, removed: { chat: true, global: true, globalTalk: false } });
     const disk = readConfig();
     expect(disk.allowedUsers).toEqual(['ou_owner']);
     expect(disk.chatGrants).toEqual({});
@@ -83,6 +83,39 @@ describe('grant-store', () => {
     expect(r.ok).toBe(true);
     expect(readConfig().allowedUsers).toEqual(['owner@x.com']);
     expect(bot.resolvedAllowedUsers).toEqual(['ou_owner']);
+  });
+
+  it('addGlobalGrant persists & syncs in-memory; idempotent; never touches allowedUsers', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { registry, store } = await freshModules();
+    const r = await store.addGlobalGrant('a1', 'ou_peer_bot');
+    expect(r).toEqual({ ok: true, created: true });
+    expect(readConfig().globalGrants).toEqual(['ou_peer_bot']);
+    expect(registry.getBot('a1').config.globalGrants).toEqual(['ou_peer_bot']);
+    expect(readConfig().allowedUsers).toEqual(['ou_owner']);  // talk-only: operate tier untouched
+    // idempotent
+    expect(await store.addGlobalGrant('a1', 'ou_peer_bot')).toEqual({ ok: true, created: false });
+    expect(readConfig().globalGrants).toEqual(['ou_peer_bot']);
+  });
+
+  it('revokeGrant removes a globalGrants-only target (globalTalk), not blocked by would_open guard', async () => {
+    // ou_peer 只在 globalGrants 里、不在 allowedUsers → would_open_bot 守卫不该拦它。
+    writeConfig({ allowedUsers: ['ou_owner'], globalGrants: ['ou_peer', 'ou_other'] });
+    const { registry, store } = await freshModules();
+    const r = await store.revokeGrant('a1', 'oc_x', 'ou_peer');
+    expect(r).toEqual({ ok: true, removed: { chat: false, global: false, globalTalk: true } });
+    expect(readConfig().globalGrants).toEqual(['ou_other']);
+    expect(registry.getBot('a1').config.globalGrants).toEqual(['ou_other']);
+    expect(readConfig().allowedUsers).toEqual(['ou_owner']);  // untouched
+  });
+
+  it('revokeGrant deletes the globalGrants key entirely when it becomes empty', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'], globalGrants: ['ou_solo'] });
+    const { registry, store } = await freshModules();
+    const r = await store.revokeGrant('a1', 'oc_x', 'ou_solo');
+    expect(r.ok).toBe(true);
+    expect(readConfig().globalGrants).toBeUndefined();
+    expect(registry.getBot('a1').config.globalGrants).toBeUndefined();
   });
 
   it('addAllowedChatGroup persists the chat_id & syncs in-memory; idempotent', async () => {

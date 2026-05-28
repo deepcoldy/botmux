@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Gemini, OpenCode, MTR) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Gemini, OpenCode, MTR, Hermes) and collects metadata needed to adopt them.
  */
 import { execSync } from 'node:child_process';
 import { readFileSync, readlinkSync } from 'node:fs';
@@ -40,6 +40,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   gemini: 'gemini',
   opencode: 'opencode',
   mtr: 'mtr',
+  hermes: 'hermes',
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

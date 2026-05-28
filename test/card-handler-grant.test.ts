@@ -100,4 +100,25 @@ describe('card-handler grant actions', () => {
     expect(pending.isThrottled('h1', 'oc_1', 'ou_g')).toBe(true);
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
   });
+
+  it('owner grant_global → writes globalGrants (not chatGrants/allowedUsers), notifies + withdraws', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const res = await handler.handleCardAction(action('grant_global', { nonce }, 'om_card'), deps, 'h1');
+    expect(res).toBeUndefined();
+    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
+    expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
+    const cfg = registry.getBot('h1').config;
+    expect(cfg.globalGrants).toEqual(['ou_g']);
+    expect(cfg.chatGrants).toBeUndefined();
+    expect(cfg.allowedUsers).toEqual(['ou_owner']);   // owner-only; never widened
+  });
+
+  it('non-owner grant_global → owner_only toast, no grant', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const res = await handler.handleCardAction(action('grant_global', { operator: 'ou_x', nonce }), deps, 'h1');
+    expect(res?.toast?.type).toBe('error');
+    expect(registry.getBot('h1').config.globalGrants).toBeUndefined();
+  });
 });

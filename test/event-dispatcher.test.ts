@@ -90,11 +90,11 @@ const MY_OPEN_ID = 'ou_bot_a_open_id';
 const OTHER_BOT_OPEN_ID = 'ou_bot_b_open_id';
 const USER_OPEN_ID = 'ou_user_123';
 
-function setupBotState(opts?: { botOpenId?: string | undefined }) {
+function setupBotState(opts?: { botOpenId?: string | undefined; chatGrants?: Record<string, string[]>; globalGrants?: string[]; allowedUsers?: string[] }) {
   mockGetBot.mockReturnValue({
-    config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+    config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', chatGrants: opts?.chatGrants, globalGrants: opts?.globalGrants },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
-    resolvedAllowedUsers: [],
+    resolvedAllowedUsers: opts?.allowedUsers ?? [],
   });
 }
 
@@ -401,6 +401,80 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('routes unknown-peer cross-bot @mention in chat-scope when the bot is chat-granted via /grant', async () => {
+    // owner 用 `/grant @bot` 把外部 bot 加进本群 chatGrants：即便它不在 peer
+    // cross-ref（isKnownPeerBot=false），命中 chatGrants 也应与已注册 peer 同等
+    // 放行，拉起 chat-scope session。与上面「unknown peer 被 drop」用例对照。
+    setupBotState({ chatGrants: { 'chat-001': [OTHER_BOT_OPEN_ID] } });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('does not let a chat-grant for one chat leak into a different chat', async () => {
+    // chatGrants 是 per-chat：在 chat-001 授权的 bot 到了 chat-999 仍应被 drop。
+    setupBotState({ chatGrants: { 'chat-001': [OTHER_BOT_OPEN_ID] } });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      chatId: 'chat-999',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('routes unknown-peer cross-bot @mention in ANY chat when the bot is globally granted', async () => {
+    // 全局对话授权（globalGrants）：被授权 bot 不在 peer cross-ref、也没在本群 chatGrants，
+    // 但命中 globalGrants → 在任意群（这里用一个全新的 chat-777）都应放行拉起 chat-scope session。
+    setupBotState({ globalGrants: [OTHER_BOT_OPEN_ID] });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      chatId: 'chat-777',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-777',
+      larkAppId: MY_APP_ID,
+    }));
   });
 
   it('routes unknown-peer cross-bot @mention in oncall chat-scope (auto-create, no /introduce needed)', async () => {
@@ -767,6 +841,43 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     await capturedHandlers['im.message.receive_v1'](event);
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('globalGrants — global talk-only authorization (canTalk / canOperate)', () => {
+  beforeEach(() => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('{}');  // empty peer cross-ref
+  });
+
+  it('canTalk: a globally-granted user can talk in ANY chat', () => {
+    setupBotState({ globalGrants: [USER_OPEN_ID] });
+    expect(canTalk(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(true);
+    expect(canTalk(MY_APP_ID, 'chat-B', USER_OPEN_ID)).toBe(true);
+  });
+
+  it('canTalk: configuring globalGrants establishes an allowlist — non-granted users blocked', () => {
+    // 只配 globalGrants（无 allowedUsers / allowedChatGroups）也算限制态，不能 fall through 到全开放。
+    setupBotState({ globalGrants: ['ou_someone_else'] });
+    expect(canTalk(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('canOperate: a globally-granted user does NOT gain operate (PR#46 boundary)', () => {
+    setupBotState({ globalGrants: [USER_OPEN_ID] });
+    expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('canOperate: globalGrants alone does NOT leave operate open to everyone', () => {
+    // 回归：globalGrants 必须计入 canOperate 的 hasAllowlist，否则只配 globalGrants 会让
+    // operate fall through 到「无白名单=全开放」，把 talk-only 授权放大成 operate 全开。
+    setupBotState({ globalGrants: ['ou_granted'] });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(false);
+  });
+
+  it('canOperate: allowedUsers member still gains operate alongside globalGrants', () => {
+    setupBotState({ globalGrants: ['ou_talk_only'], allowedUsers: ['ou_admin'] });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_admin')).toBe(true);
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_talk_only')).toBe(false);
   });
 });
 

@@ -117,6 +117,35 @@ describe('installHook — claude-settings', () => {
     expect(countSecond).toBe(1); // 不重复
   });
 
+  it('(c3) 不同安装路径的旧 botmux hook 在重装时被去重（避免双卡）', () => {
+    // 模拟 dev 源码安装残留的 hook，命令路径与本次 npm-global 安装不同
+    const devCommand =
+      '"/root/.local/share/fnm/.../bin/node" "/root/claude-code-workspace/botmux/dist/cli.js" hook claude-code';
+    const existing = {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'AskUserQuestion',
+            hooks: [{ type: 'command', command: devCommand, timeout: 86400 }],
+          },
+        ],
+      },
+    };
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+
+    // 用另一安装路径的 hookCommand 重装
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const groups: any[] = settings.hooks?.PreToolUse ?? [];
+    // 旧 dev 路径 hook 应被结构化识别并移除，只留下本次安装的一条
+    const askGroups = groups.filter((g) => g.matcher === 'AskUserQuestion');
+    expect(askGroups.length).toBe(1);
+    expect(askGroups[0].hooks.some((e: any) => e.command === devCommand)).toBe(false);
+    expect(askGroups[0].hooks.some((e: any) => e.command === hookCommand)).toBe(true);
+  });
+
   it('(d) 迁移旧 PermissionRequest botmux entry 到 PreToolUse', () => {
     const existing = {
       hooks: {

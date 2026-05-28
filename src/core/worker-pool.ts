@@ -7,15 +7,15 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ensureSkills, ensureAskSkill } from '../skills/installer.js';
+import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
-import { updateMessage, deleteMessage, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { updateMessage, deleteMessage, sendEphemeralCard, MessageWithdrawnError } from '../im/lark/client.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -105,6 +105,27 @@ function terminalWriteUrl(port: number, token: string): string {
   return `${terminalReadUrl(port)}?token=${encodeURIComponent(token)}`;
 }
 
+// Per-bot opt-out: when true, botmux never posts/patches the live streaming
+// session card. Read fresh from the in-memory registry so a dashboard toggle
+// takes effect without a daemon restart. The `/card` command can override it
+// per-session via `ds.streamingCardForced` (manually summon a live card).
+function streamingCardDisabled(ds: DaemonSession): boolean {
+  if (ds.streamingCardForced) return false;
+  try { return getBot(ds.larkAppId).config.disableStreamingCard === true; } catch { return false; }
+}
+
+// Per-bot opt-in: the writable terminal link to embed directly in the streaming
+// card body (token included). Returns undefined unless the bot enabled it AND
+// the worker port/token are known. Exported for card-handler's re-renders so the
+// link stays put across button-driven card updates.
+export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
+  try {
+    if (getBot(ds.larkAppId).config.writableTerminalLinkInCard !== true) return undefined;
+  } catch { return undefined; }
+  if (!ds.workerPort || !ds.workerToken) return undefined;
+  return terminalWriteUrl(ds.workerPort, ds.workerToken);
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function tag(ds: DaemonSession): string {
@@ -183,6 +204,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     false,
     localeForBot(ds.larkAppId),
     ds.usageLimit,
+    writableTerminalLinkFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -318,6 +340,137 @@ export function recallFrozenCards(ds: DaemonSession): void {
   logger.info(`[${tag(ds)}] Recalled ${targets.length} previous streaming card(s)`);
 }
 
+/**
+ * Force-post a fresh streaming card for `ds`, bypassing the per-bot
+ * `disableStreamingCard` opt-out. Backs the `/card` command: a user can
+ * manually summon a live card in an otherwise-quiet session. Parks the current
+ * card (if any) first so `recallFrozenCards` withdraws it once the fresh one
+ * lands — the thread ends up with a single live card. Returns false when the
+ * worker terminal isn't ready yet (no port), so the caller can surface a
+ * friendly "not ready" message.
+ *
+ * Note: this does NOT itself flip `ds.streamingCardForced` — the caller sets
+ * that so the card keeps live-patching afterwards even when the bot opted out.
+ */
+export async function postFreshStreamingCard(
+  ds: DaemonSession,
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>,
+): Promise<boolean> {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port) return false;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const readUrl = terminalReadUrl(port);
+  const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  const status = ds.lastScreenStatus ?? 'idle';
+
+  // Park the current card (no-op when there's none) so the fresh one replaces
+  // rather than duplicates it.
+  parkStreamCard(ds);
+
+  // Snapshot prior identity for rollback on POST failure (restore all three
+  // together so a failed /card leaves no orphaned nonce/pending state).
+  const prevCardId = ds.streamCardId;
+  const prevNonce = ds.streamCardNonce;
+  const prevPending = ds.streamCardPending;
+
+  ds.streamCardNonce = randomBytes(4).toString('hex');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readUrl,
+    title,
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    cardUsageLimit(ds),
+    writableTerminalLinkFor(ds),
+  );
+  ds.streamCardId = CARD_POSTING_SENTINEL;
+  try {
+    ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+    // This card is now the live one for the current turn. Clear the new-turn
+    // pending flag so the next screen_update PATCHes it instead of POSTing a
+    // duplicate (the gate above only suppresses cards when disabled+unforced;
+    // /card forces them on, so a stale pending flag would otherwise re-POST).
+    ds.streamCardPending = false;
+    persistStreamCardState(ds);
+    recallFrozenCards(ds);
+    logger.info(`[${tag(ds)}] Posted streaming card via /card`);
+    return true;
+  } catch (err) {
+    ds.streamCardId = prevCardId;
+    ds.streamCardNonce = prevNonce;
+    ds.streamCardPending = prevPending;
+    logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
+    return false;
+  }
+}
+
+/**
+ * Audience for a private `/card`: the bot's `allowedUsers` (the canOperate set —
+ * owner & co-owners), deduped, `ou_` only. Talk-only grants (`globalGrants` /
+ * `chatGrants`) and a bare triggerer are intentionally NOT included: the private
+ * card is owner-only. A grant-authorized user who runs `/card` therefore does
+ * not receive a card (matches the "授权人不发" rule). Empty when the bot has no
+ * `allowedUsers` (fully-open mode → no owner to send to).
+ */
+export function resolvePrivateCardAudience(ds: DaemonSession): string[] {
+  const bot = getBot(ds.larkAppId);
+  const set = new Set<string>();
+  for (const u of bot.resolvedAllowedUsers) if (u.startsWith('ou_')) set.add(u);
+  return [...set];
+}
+
+/**
+ * Private `/card`: build a one-shot snapshot of the current terminal and send it
+ * as an ephemeral (visible-to-one) card to each open_id in `audience`, one API
+ * call each (concurrency-capped). Never posts a group-visible card and never
+ * patches — privacy is the whole point, so there is deliberately no fallback.
+ * Returns per-recipient counts so the caller can report progress without leaking
+ * the audience list into the chat.
+ */
+export async function postPrivateSnapshotCard(
+  ds: DaemonSession,
+  audience: string[],
+): Promise<{ sent: number; total: number; notReady: boolean }> {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port) return { sent: 0, total: audience.length, notReady: true };
+
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const readUrl = terminalReadUrl(port);
+  const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  const status = ds.lastScreenStatus ?? 'idle';
+  const cardJson = buildPrivateSnapshotCard(
+    readUrl, title, status, effectiveCliId, ds.currentImageKey, ds.lastScreenContent ?? '',
+    ds.session.sessionId, sessionAnchorId(ds), localeForBot(ds.larkAppId), cardUsageLimit(ds),
+  );
+
+  let sent = 0;
+  // Cap concurrency: Feishu per-chat ~40 QPS, ephemeral total 50/s.
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async (openId) => {
+      try {
+        await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, cardJson);
+        sent++;
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] private /card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`);
+      }
+    }));
+  }
+  logger.info(`[${tag(ds)}] private /card: ephemeral sent ${sent}/${audience.length}`);
+  return { sent, total: audience.length, notReady: false };
+}
+
 // ─── Card PATCH serialization queue ─────────────────────────────────────────
 // Only one PATCH in-flight at a time per session. New PATCHes queue on
 // ds.pendingCardJson (latest wins). When the in-flight PATCH completes,
@@ -331,6 +484,8 @@ export function recallFrozenCards(ds: DaemonSession): void {
  * any previously queued value — only the latest state matters).
  */
 export function scheduleCardPatch(ds: DaemonSession, cardJson: string): void {
+  // Bot opted out of the streaming card — never patch one into existence.
+  if (streamingCardDisabled(ds)) return;
   ds.pendingCardJson = cardJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
@@ -395,7 +550,14 @@ const skillsInstalledCliIds = new Set<string>();
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   if (skillsInstalledCliIds.has(cliId)) return;
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
-  ensureSkills(cliId, adapter.skillsDir);
+  if (adapter.pluginDir) {
+    // 动态注入：skill 写进插件目录，spawn 时用 --plugin-dir 注入，仅本次会话可见。
+    // 不再写全局 skillsDir。（全局 ~/.claude/skills 的历史残留清理改由
+    // cleanupGlobalBotmuxSkillsOnce 在启动时独立于 cliId 执行。）
+    ensurePluginSkills(cliId, adapter.pluginDir);
+  } else {
+    ensureSkills(cliId, adapter.skillsDir);
+  }
   // askUserQuestion 接管策略：hook 优先 + 非 hook CLI 用 skill 兜底。
   // - asksViaHook=true（Claude/OpenCode）：通过 hook 拦截原生 AskUserQuestion，删掉
   //   botmux-ask skill，避免 skill 与 hook 双重弹卡。
@@ -406,7 +568,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
     catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
-  ensureAskSkill(cliId, adapter.skillsDir, !adapter.asksViaHook);
+  // botmux-ask 落在与其它 skill 同一目录：plugin 模式下是 {pluginDir}/skills。
+  const askSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
+  ensureAskSkill(cliId, askSkillsDir, !adapter.asksViaHook);
   skillsInstalledCliIds.add(cliId);
 }
 
@@ -516,8 +680,22 @@ export function cleanupLegacyMcpConfig(cliId: CliId): void {
  * Both steps are idempotent and best-effort.
  */
 export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
+  cleanupGlobalBotmuxSkillsOnce();
   ensureCliSkills(cliId, cliPathOverride);
   cleanupLegacyMcpConfig(cliId);
+}
+
+let globalBotmuxSkillsCleaned = false;
+/** One-time, CLI-independent cleanup of botmux skills that older versions
+ *  installed into the global `~/.claude/skills`. Claude now injects skills via
+ *  `--plugin-dir`, so any leftover `botmux-*` there leaks into the user's
+ *  standalone `claude` regardless of which CLI THIS daemon's bot uses — so the
+ *  cleanup must NOT be gated on `adapter.pluginDir` (which only fires for a
+ *  Claude bot). Runs at daemon startup via ensureCliEnv. */
+function cleanupGlobalBotmuxSkillsOnce(): void {
+  if (globalBotmuxSkillsCleaned) return;
+  globalBotmuxSkillsCleaned = true;
+  removeGlobalBotmuxSkills('~/.claude/skills');
 }
 
 // ─── Claude Code folder-trust pre-acceptance ─────────────────────────────────
@@ -964,6 +1142,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     workingDir: cwd,
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
+    model: botCfg.model,
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
@@ -1046,6 +1225,15 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           },
         });
 
+        // Bot opted out of the streaming card: the terminal is up and the
+        // final answer will still arrive via `botmux send`; just don't post the
+        // live status card. (workerPort/token above are still set so the web
+        // terminal + dashboard keep working.)
+        if (streamingCardDisabled(ds)) {
+          logger.info(`[${t}] Streaming card disabled for this bot — skipping card post`);
+          break;
+        }
+
         // If a previous streaming card survived (e.g. daemon restart), try to
         // PATCH it with the new "starting" state instead of POSTing a fresh card.
         // ds.streamCardPending forces a new card (e.g. mid-session repo switch
@@ -1081,6 +1269,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               showTakeover,
               loc,
               initStatus === 'limited' ? ds.usageLimit : undefined,
+              writableTerminalLinkFor(ds),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             persistStreamCardState(ds);
@@ -1132,6 +1321,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             showTakeover,
             loc,
             initStatus === 'limited' ? ds.usageLimit : undefined,
+            writableTerminalLinkFor(ds),
           );
           ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
           persistStreamCardState(ds);
@@ -1217,6 +1407,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           });
         }
 
+        // Bot opted out of the streaming card — dashboard SSE above already got
+        // the status patch; just don't touch any Lark card.
+        if (streamingCardDisabled(ds)) break;
+
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
@@ -1247,6 +1441,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             showTakeover,
             loc,
             cardUsageLimit(ds),
+            writableTerminalLinkFor(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -1294,6 +1489,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             showTakeover,
             loc,
             cardUsageLimit(ds),
+            writableTerminalLinkFor(ds),
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -1327,6 +1523,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           showTakeover,
           loc,
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -1401,7 +1598,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
-              isAdopt, showTakeover,
+              isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -1438,7 +1635,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
-              isAdopt, showTakeover, loc,
+              isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -1705,6 +1902,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
+    model: botCfg.model,
     backendType: 'tmux',
     prompt: '',
     resume: false,
