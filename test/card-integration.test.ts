@@ -40,6 +40,9 @@ let sessionReplyCallIndex = 0;
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => fakeLark.createMock('updateMessage')(...args),
   sendUserMessage: (...args: any[]) => fakeLark.createMock('sendUserMessage')(...args),
+  // Resolves immediately (no manual orchestration) — the private-close path just
+  // awaits it; tests assert on the recorded args.
+  sendEphemeralCard: vi.fn(async () => 'om_eph'),
   getChatInfo: vi.fn(),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
@@ -499,6 +502,45 @@ describe('Card integration: full event flow', () => {
         'interactive',
         APP_ID,
       );
+    });
+
+    it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const botRegMod = await import('../src/bot-registry.js');
+      // privateCard on + an owner in allowedUsers. Sticky (close path calls
+      // getBot several times); restored in finally so it can't leak.
+      vi.mocked(botRegMod.getBot).mockReturnValue({
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true },
+        resolvedAllowedUsers: ['ou_owner'],
+        botOpenId: 'ou_bot',
+      } as any);
+      try {
+        const ds = makeDaemonSession();
+        const sessions = new Map<string, DaemonSession>();
+        const sKey = sessionKey(ROOT_ID, APP_ID);
+        sessions.set(sKey, ds);
+        const deps = makeDeps(sessions);
+
+        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner'), deps, APP_ID);
+
+        expect(killWorker).toHaveBeenCalledWith(ds);
+        expect(sessions.has(sKey)).toBe(false);
+        // Closed card goes ephemeral to the owner …
+        expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+          APP_ID, ds.chatId, 'ou_owner', expect.stringContaining('"type":"closed"'),
+        );
+        // … and NOT posted to the group thread (no leak of session/CLI/workingDir).
+        const groupClosed = (deps.sessionReply as any).mock.calls.find(
+          (c: any[]) => typeof c[1] === 'string' && c[1].includes('"type":"closed"'),
+        );
+        expect(groupClosed).toBeUndefined();
+      } finally {
+        vi.mocked(botRegMod.getBot).mockReturnValue({
+          config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+          resolvedAllowedUsers: [],
+          botOpenId: 'ou_bot',
+        } as any);
+      }
     });
 
     it('resume should call resumeSession and reply with success notice', async () => {

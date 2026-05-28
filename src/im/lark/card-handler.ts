@@ -7,7 +7,7 @@ import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
-import { sendUserMessage, updateMessage, deleteMessage, replyMessage } from './client.js';
+import { sendUserMessage, updateMessage, deleteMessage, replyMessage, sendEphemeralCard } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied } from './grant-pending.js';
@@ -21,7 +21,7 @@ import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
@@ -332,8 +332,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         cliResumeCommand,
         localeForBot(ds.larkAppId),
       );
-      await sessionReply(rootId, card, 'interactive');
-      logger.info(`[${tag(ds)}] Closed via card button`);
+      // The closed card carries session title / CLI name / workingDir / resume
+      // command. In private-card mode those must not leak to the group — send the
+      // closed card ephemeral to the same owner audience instead. No group
+      // fallback on failure (privacy wins; the session is already closed).
+      if (botCfg.privateCard) {
+        const audience = resolvePrivateCardAudience(ds);
+        for (const openId of audience) {
+          await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, card).catch(err =>
+            logger.warn(`[${tag(ds)}] private close card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`));
+        }
+        logger.info(`[${tag(ds)}] Closed via card button (private close card → ${audience.length} owner(s))`);
+      } else {
+        await sessionReply(rootId, card, 'interactive');
+        logger.info(`[${tag(ds)}] Closed via card button`);
+      }
     }
 
     if (actionType === 'resume') {

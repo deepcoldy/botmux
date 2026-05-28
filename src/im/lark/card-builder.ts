@@ -398,10 +398,11 @@ export function buildStreamingCard(
  * one-shot snapshot of the terminal screenshot plus three buttons:
  *   • read-only "open terminal" link (a plain URL button — no callback);
  *   • "get write link", whose callback DMs the writable link to the clicker;
- *   • "close session", whose callback kills the session and posts a fresh
- *     "closed" card to the thread.
+ *   • "close session", whose callback kills the session and (in private mode)
+ *     sends the "closed" card ephemeral to the owner audience too — so the
+ *     session title / CLI name / workingDir on it don't leak to the group.
  * The last two have callbacks but neither patches THIS card (one DMs, the other
- * posts a new card), so both work fine on an ephemeral card. Both are
+ * sends a fresh card), so both work fine on an ephemeral card. Both are
  * `canOperate`-gated in the handler — talk-only viewers who tap them are denied.
  * The patch-driven controls (toggle/refresh/export/term keys) and the inline
  * writable link are still omitted: those need to update this card, which
