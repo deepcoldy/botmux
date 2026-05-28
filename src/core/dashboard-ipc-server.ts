@@ -6,6 +6,8 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
+import * as brandStore from '../services/brand-store.js';
+import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
@@ -16,6 +18,17 @@ import { locateLimiter } from './dashboard-locate.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import { triggerSessionTurn } from './trigger-session.js';
+import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
+import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
+import { validateTriggerRequest } from '../services/trigger-types.js';
+
+// Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
+// deps). Until set, workflow-targeted triggers report not-implemented.
+let workflowRunner: ((input: TriggerInput) => Promise<TriggerResult>) | null = null;
+export function setWorkflowRunner(fn: (input: TriggerInput) => Promise<TriggerResult>): void {
+  workflowRunner = fn;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -279,6 +292,43 @@ ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
 
+ipcRoute('POST', '/api/trigger', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: 'active session registry unavailable' });
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error: 'invalid JSON body' });
+  }
+  const valid = validateTriggerRequest(body);
+  if (!valid.ok) return jsonRes(res, valid.status, valid.body);
+  try {
+    let result;
+    if (valid.request.target.kind === 'workflow') {
+      if (!workflowRunner) {
+        return jsonRes(res, 501, { ok: false, errorCode: 'workflow_trigger_not_implemented', error: 'workflow runner not wired on this daemon' });
+      }
+      result = await triggerWorkflowFromEnvelope(valid.request, { larkAppId: cachedLarkAppId, runWorkflow: workflowRunner });
+    } else {
+      result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    }
+    const status = result.ok
+      ? 200
+      : result.errorCode === 'bot_not_in_chat'
+        ? 403
+        : result.errorCode === 'session_not_found'
+          ? 404
+        : result.errorCode === 'target_required' || result.errorCode === 'bad_request'
+          ? 400
+          : 500;
+    return jsonRes(res, status, result);
+  } catch (e: any) {
+    return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
+  }
+});
+
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
 ipcRoute('GET', '/api/groups', async (_req, res) => {
@@ -431,12 +481,51 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
 ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
+  const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     autoboundChatCount: autoboundChats.length,
+    brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
+    disableStreamingCard: cardPrefs.disableStreamingCard,
+    writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
+    privateCard: cardPrefs.privateCard,
   });
+});
+
+// Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
+// present keys are applied. `{ disableStreamingCard?, writableTerminalLinkInCard?, privateCard? }`.
+ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const patch: { disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean } = {};
+  if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
+  if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+
+  const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, ...r.prefs });
+});
+
+// Per-bot card footer brand label. Body `{ brandLabel: string | null }`:
+//   • string (incl. '')  → store verbatim ('' = brand off)
+//   • null / absent      → clear the key (revert to default botmux brand)
+ipcRoute('PUT', '/api/bot-brand-label', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { brandLabel?: unknown };
+  try { body = await readJsonBody<{ brandLabel?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const next: string | null = typeof body.brandLabel === 'string' ? body.brandLabel : null;
+  const r = await brandStore.updateBotBrandLabel(cachedLarkAppId, next);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, brandLabel: r.brandLabel });
 });
 
 ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {
@@ -473,6 +562,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
     name?: unknown;
     larkAppIds?: unknown;
     userOpenIds?: unknown;
+    ownerUnionIds?: unknown;
     transferOwnerTo?: unknown;
     notifyOwnerOpenId?: unknown;
     bindWorkingDir?: unknown;
@@ -482,6 +572,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       name?: string;
       larkAppIds?: string[];
       userOpenIds?: string[];
+      ownerUnionIds?: string[];
       transferOwnerTo?: string;
       notifyOwnerOpenId?: string;
       bindWorkingDir?: string;
@@ -499,6 +590,10 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
   // dashboard/operator-selector.ts).
   const userIds = Array.isArray(body.userOpenIds) && body.userOpenIds.every(x => typeof x === 'string')
     ? (body.userOpenIds as string[])
+    : [];
+  // Owner union_ids (tenant-stable) to pull bot owners into a federated group.
+  const ownerUnionIds = Array.isArray(body.ownerUnionIds) && body.ownerUnionIds.every(x => typeof x === 'string')
+    ? (body.ownerUnionIds as string[])
     : [];
   const transferTo = typeof body.transferOwnerTo === 'string' && body.transferOwnerTo.trim()
     ? body.transferOwnerTo.trim()
@@ -519,6 +614,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       larkAppIds: body.larkAppIds as string[],
       name,
       userOpenIds: userIds,
+      ownerUnionIds,
       transferOwnerTo: transferTo ?? undefined,
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,

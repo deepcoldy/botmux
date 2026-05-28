@@ -36,6 +36,15 @@ function roleFilePath(larkAppId: string, chatId: string): string {
   return join(config.session.dataDir, 'roles', larkAppId, `${chatId}.md`);
 }
 
+/** Absolute path to the team-level (per-bot, chat-independent) role file. */
+function teamRoleFilePath(larkAppId: string): string {
+  return join(config.session.dataDir, 'team-roles', `${larkAppId}.md`);
+}
+
+function teamCacheKey(larkAppId: string): string {
+  return `team::${larkAppId}`;
+}
+
 /** Truncate `content` to at most MAX_ROLE_BYTES UTF-8 bytes. */
 function truncateToByteLimit(content: string): string {
   let out = content;
@@ -45,16 +54,8 @@ function truncateToByteLimit(content: string): string {
   return out;
 }
 
-/**
- * Resolve the role content for a given bot (larkAppId) and chat.
- * Returns the role markdown string, or null if no role file exists.
- */
-export function resolveRoleFile(larkAppId: string, chatId: string): string | null {
-  if (!larkAppId || !chatId) return null;
-
-  const key = cacheKey(larkAppId, chatId);
-  const filePath = roleFilePath(larkAppId, chatId);
-
+/** Shared stat + cache + read + truncate logic for chat and team role files. */
+function readRoleFile(filePath: string, key: string, logLabel: string): string | null {
   let stat: ReturnType<typeof statSync> | null = null;
   try {
     if (!existsSync(filePath)) {
@@ -91,13 +92,22 @@ export function resolveRoleFile(larkAppId: string, chatId: string): string | nul
     }
 
     cache.set(key, { mtimeMs: stat.mtimeMs, content });
-    logger.info(`[role] chat=${chatId} file=${filePath} (${Buffer.byteLength(content, 'utf-8')} bytes)`);
+    logger.info(`[role] ${logLabel} file=${filePath} (${Buffer.byteLength(content, 'utf-8')} bytes)`);
     return content;
   } catch (err: any) {
     logger.warn(`[role] failed to read ${filePath}: ${err?.message ?? err}`);
     cache.set(key, { mtimeMs: 0, content: null });
     return null;
   }
+}
+
+/**
+ * Resolve the per-chat role content for a given bot (larkAppId) and chat.
+ * Returns the role markdown string, or null if no role file exists.
+ */
+export function resolveRoleFile(larkAppId: string, chatId: string): string | null {
+  if (!larkAppId || !chatId) return null;
+  return readRoleFile(roleFilePath(larkAppId, chatId), cacheKey(larkAppId, chatId), `chat=${chatId}`);
 }
 
 /** Clear the in-memory cache (useful for testing or manual reload). */
@@ -134,4 +144,50 @@ export function deleteRoleFile(larkAppId: string, chatId: string): boolean {
     logger.warn(`[role] failed to delete ${filePath}: ${err?.message ?? err}`);
     return false;
   }
+}
+
+export type RoleSource = 'chat' | 'team' | 'none';
+
+/** Resolve the team-level (per-bot) role, or null. */
+export function resolveTeamRoleFile(larkAppId: string): string | null {
+  if (!larkAppId) return null;
+  return readRoleFile(teamRoleFilePath(larkAppId), teamCacheKey(larkAppId), `team app=${larkAppId}`);
+}
+
+/** Write or overwrite the team-level role for a bot. */
+export function writeTeamRoleFile(larkAppId: string, content: string): void {
+  const filePath = teamRoleFilePath(larkAppId);
+  mkdirSync(dirname(filePath), { recursive: true });
+  const trimmed = truncateToByteLimit(content.trim());
+  writeFileSync(filePath, trimmed, 'utf-8');
+  cache.delete(teamCacheKey(larkAppId));
+  logger.info(`[role] wrote team app=${larkAppId} file=${filePath} (${Buffer.byteLength(trimmed, 'utf-8')} bytes)`);
+}
+
+/** Delete the team-level role for a bot. */
+export function deleteTeamRoleFile(larkAppId: string): boolean {
+  const filePath = teamRoleFilePath(larkAppId);
+  try {
+    unlinkSync(filePath);
+    cache.delete(teamCacheKey(larkAppId));
+    logger.info(`[role] deleted team app=${larkAppId} file=${filePath}`);
+    return true;
+  } catch (err: any) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    logger.warn(`[role] failed to delete ${filePath}: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+/**
+ * Layered role resolution: per-chat override ＞ team-level default ＞ none.
+ * Returns the effective content plus its source, so callers/UI/logs can
+ * explain *why* a given role is in effect.
+ */
+export function resolveRole(larkAppId: string, chatId: string): { content: string | null; source: RoleSource } {
+  const chat = (larkAppId && chatId) ? resolveRoleFile(larkAppId, chatId) : null;
+  if (chat !== null) return { content: chat, source: 'chat' };
+  const team = larkAppId ? resolveTeamRoleFile(larkAppId) : null;
+  if (team !== null) return { content: team, source: 'team' };
+  return { content: null, source: 'none' };
 }

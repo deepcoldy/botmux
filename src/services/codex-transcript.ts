@@ -112,6 +112,7 @@ export interface CodexBridgeEvent {
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). */
   text: string;
+  sourceSessionId?: string;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge

@@ -43,8 +43,10 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
+  ensureCliEnv,
+  writableTerminalLinkFor,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
+import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -113,6 +115,12 @@ import { resolveWait } from './workflows/wait.js';
 import { replay } from './workflows/events/replay.js';
 import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 import { AttemptResumeManager } from './workflows/attempt-resume.js';
+import {
+  setCardDispatcher as setAskCardDispatcher,
+  registerAsk as registerAskBroker,
+} from './core/ask-broker.js';
+import { parseAskBody, resolveAskApprovers } from './core/ask-api.js';
+import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -1199,6 +1207,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       ds.lastScreenContent ?? '', previousStatus, dsBotCfg.cliId,
       prevMode, ds.streamCardNonce, ds.currentImageKey,
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
+      writableTerminalLinkFor(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -1360,6 +1369,32 @@ ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) =
   return jsonRes(res, 200, result);
 });
 
+/** Heavy deps for triggerWorkflowRun, shared by the catalog `…/run` route and
+ *  the `/api/trigger` (kind=workflow) thin layer. */
+function workflowTriggerDeps() {
+  return {
+    spawnSubagent: workflowSpawnFn(),
+    botResolver: resolveBotSnapshot,
+    makeRuntimeContext: (log: any, def: any, spawnSubagent: any) => ({
+      log,
+      def,
+      spawnSubagent,
+      hostExecutors: createDefaultHostExecutorRegistry(),
+      reconcilers: createDefaultProviderReconcilers(),
+      loadEffectInput: (activityId: any, attemptId: any) =>
+        loadEffectInputSidecar(log, activityId, attemptId),
+    }),
+    attachRuntime: (runId: string, ctx: any) => attachWorkflowEventWatcher(runId, ctx),
+    driveRun: (runId: string) => {
+      driveWorkflowRun(runId).catch((err) => {
+        logger.warn(
+          `[workflow:${runId}] trigger drive failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    },
+  };
+}
+
 ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) => {
   const workflowId = params.id;
   if (!isValidWorkflowId(workflowId)) {
@@ -1394,29 +1429,7 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
       chatBinding,
       initiator: 'dashboard',
     },
-    {
-      spawnSubagent: workflowSpawnFn(),
-      botResolver: resolveBotSnapshot,
-      makeRuntimeContext: (log, def, spawnSubagent) => ({
-        log,
-        def,
-        spawnSubagent,
-        hostExecutors: createDefaultHostExecutorRegistry(),
-        reconcilers: createDefaultProviderReconcilers(),
-        loadEffectInput: (activityId, attemptId) =>
-          loadEffectInputSidecar(log, activityId, attemptId),
-      }),
-      attachRuntime: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
-      driveRun: (runId) => {
-        driveWorkflowRun(runId).catch((err) => {
-          logger.warn(
-            `[workflow:${runId}] dashboard-trigger drive failed: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      },
-    },
+    workflowTriggerDeps(),
   );
   if (!result.ok) {
     const status =
@@ -1426,6 +1439,80 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
     return jsonRes(res, status, result);
   }
   return jsonRes(res, 200, result);
+});
+
+// ─── botmux ask v0.1.7 IPC route ─────────────────────────────────────────────
+//
+// CLI side: `botmux ask buttons --options "..."` POSTs here and keeps the
+// connection open until the broker settles the ask. Long keep-alive is OK —
+// the request's lifetime is bounded by `body.timeoutMs` which the broker
+// enforces. Default fetch on the CLI side has no read timeout.
+
+ipcRoute('POST', '/api/asks', async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const parsed = parseAskBody(raw);
+  if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
+
+  const approvers = resolveAskApprovers({
+    larkAppId: parsed.larkAppId,
+    sessionId: parsed.sessionId,
+    explicit: parsed.approvers,
+    getBotAllowedUsers: (id) => {
+      try { return getBot(id).resolvedAllowedUsers; } catch { return []; }
+    },
+    getSessionOwner: (sid) => {
+      for (const ds of activeSessions.values()) {
+        if (ds.session.sessionId === sid) return ds.ownerOpenId;
+      }
+      return undefined;
+    },
+  });
+  if (approvers.size === 0) {
+    // Nobody can answer — fail loud rather than registering a
+    // guaranteed-timeout. CLI side maps this to exit 2.
+    return jsonRes(res, 400, { ok: false, error: 'no_approvers' });
+  }
+
+  const result = await registerAskBroker({
+    larkAppId: parsed.larkAppId,
+    chatId: parsed.chatId,
+    rootMessageId: parsed.rootMessageId,
+    sessionId: parsed.sessionId,
+    approvers,
+    questions: parsed.questions,
+    timeoutMs: parsed.timeoutMs,
+  });
+  return jsonRes(res, 200, result);
+});
+
+// ─── adopt-session 查询端点 ───────────────────────────────────────────────────
+// CLI side（botmux hook）通过祖先 PID 匹配 adopt 会话，路由 askUserQuestion。
+// GET /api/adopt-session/:pid — 返回该 pid 对应的 adopt 会话路由信息。
+// 仅匹配**当前活跃**的 adopt 会话（按 originalCliPid）。残留风险：OS 的 PID 复用——
+// 若原 adopt 的 Claude 已退出、同号 PID 被别的进程复用，理论上可能误命中；但 hook
+// 进程是该 Claude 的子孙，只有 Claude 仍在跑时其祖先链里才会出现这个 PID，且 session
+// 必须仍在 activeSessions 里，复用窗口极小，可接受（不为此引入进程级鉴权）。
+ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
+  const pid = Number(params.pid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_pid' });
+  }
+  for (const ds of activeSessions.values()) {
+    if (ds.adoptedFrom?.originalCliPid === pid) {
+      return jsonRes(res, 200, {
+        sessionId: ds.session.sessionId,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        rootMessageId: sessionAnchorId(ds),
+      });
+    }
+  }
+  return jsonRes(res, 404, { ok: false, error: 'no_adopt_session' });
 });
 
 function parseTriggerChatBinding(
@@ -1523,6 +1610,38 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
     `falling back to repo-select card`,
   );
   return undefined;
+}
+
+/**
+ * Resolve the pinned working dir for a brand-new topic via the layered lookup:
+ *   1) an existing oncall binding (this bot or a sibling)
+ *   2) this bot's defaultOncall — auto-binds a brand-new chat when the flag is on
+ *      (this WRITES state, so it must run identically on every spawn path)
+ *   3) a sibling session's workingDir (cross-bot / chat-scope inheritance)
+ *   4) this bot's `defaultWorkingDir` (pure runtime fallback)
+ * Returns the dir plus the oncall / inherited source so callers can log the reason.
+ * Shared by the normal spawn path and the first-message `/repo` command branch so
+ * both honor the defaultOncall auto-bind the same way.
+ */
+async function resolvePinnedWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  larkAppId: string;
+}) {
+  let oncallEntry = findOncallChatForAnyBot(ctx.chatId);
+  if (!oncallEntry) {
+    oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
+  }
+  const inheritedFrom = !oncallEntry
+    ? findInheritablePeer({ scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType, selfAppId: ctx.larkAppId })
+    : null;
+  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
+    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
+    : undefined;
+  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  return { pinnedWorkingDir, oncallEntry, inheritedFrom };
 }
 
 async function replyInvalidWorkingDirs(
@@ -1629,6 +1748,22 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       session.lastCallerOpenId = senderOpenId;
       session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
+
+      // First-message `/repo`: seed the same pending-repo state the card flow
+      // uses, so the `/repo` handler launches the CLI straight away —
+      // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
+      // instead of taking the mid-session close+recreate path or re-showing the
+      // card. Use the SAME pinned-dir resolver as the normal spawn path (incl.
+      // defaultOncall auto-bind) so a bound/auto-bound chat still launches in the
+      // right place when no arg is given.
+      let cmdPending: Partial<DaemonSession> | undefined;
+      if (cmd === '/repo') {
+        const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+        if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+        // pendingPrompt is empty (the message *is* the command), so the CLI just
+        // boots and waits for the user's next message; no sender tag needed.
+        cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+      }
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(anchor, larkAppId), {
         session,
@@ -1644,6 +1779,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         lastMessageAt: now,
         hasHistory: false,
         ownerOpenId: senderOpenId,
+        ...cmdPending,
       });
       // Pass mention-stripped content so /command argument parsing works.
       await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
@@ -1690,40 +1826,24 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
+  session.lastCallerOpenId = senderOpenId;
+  // First turn of a brand-new topic: seed quoteTarget* so the very first
+  // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
+  // Without this the first reply hits hasQuoteTargetSender=false (exit 2) and
+  // chat-scope首条不引用. Use the event's sender open_id (correct app scope).
+  session.quoteTargetId = parsed.messageId;
+  session.quoteTargetSenderOpenId = senderOpenId;
+  session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
-  // Oncall group: pin working dir from the chat-level binding, even if a
-  // sibling bot (running in another daemon) is the one that persisted it.
-  // Layered lookup:
-  //   1) any existing binding (this bot or sibling)
-  //   2) this bot's defaultOncall — auto-binds the chat if it's brand new
-  //      and the flag is on. Once auto-bound, the chat appears in oncallChats
-  //      so the next handleNewTopic sees it via (1).
-  let oncallEntry = findOncallChatForAnyBot(chatId);
-  if (!oncallEntry) {
-    oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, chatId, chatType);
-  }
-
-  // Cross-bot / chat-scope inheritance: reuse a sibling session's workingDir
-  // and skip the repo card. Same block lives in handleThreadReply's auto-create
-  // branch — both handlers land unowned messages after the 4fec43c routing
-  // change. Helper is shared.
-  const inheritedFrom = !oncallEntry
-    ? findInheritablePeer({ scope, anchor, chatId, chatType, selfAppId: larkAppId })
-    : null;
-
-  // Last-resort fallback: this bot's `defaultWorkingDir`. Pure runtime — no
-  // oncall binding written, no permission-model change. Lets a single-repo
-  // bot skip the repo-select card without committing to oncall semantics.
-  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-    ? resolveBotDefaultWorkingDir(larkAppId)
-    : undefined;
-
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  // Pin the working dir via the layered oncall / inherit / default lookup
+  // (auto-binds a defaultOncall chat as a side effect). Shared with the
+  // first-message `/repo` command branch so both paths stay consistent.
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -1995,10 +2115,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (ds) {
     markSessionActivity(ds);
     const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+    // quoteTargetId changes every inbound message (always a new message_id), so
+    // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
+    // default chat-scope quote chain + --mention-back.
+    ds.session.quoteTargetId = parsed.messageId;
+    ds.session.quoteTargetSenderOpenId = callerOpenId;
+    ds.session.quoteTargetSenderIsBot = isForeignBot;
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
-      sessionStore.updateSession(ds.session);
     }
+    sessionStore.updateSession(ds.session);
   }
 
   // If waiting for repo selection, buffer the message and remind user
@@ -2014,12 +2140,17 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       });
       enriched += `\n\n${tr('daemon.enriched_mentions_label', undefined, localeForBot(larkAppId))}\n${mentionLines.join('\n')}`;
     }
-    // Stamp each buffered follow-up with its own <sender> tag — pendingFollowUps
-    // can contain messages from multiple users while a single ds.pendingSender
-    // is fixed at the first message, so without per-message attribution the
-    // CLI can't tell which user said what after repo selection unlocks the spawn.
-    const followUpSenderTag = renderSenderTag(await getThreadSender());
-    if (followUpSenderTag) enriched = `${followUpSenderTag}\n${enriched}`;
+    // Stamp a buffered follow-up with its own <sender> tag ONLY when it comes
+    // from a different user than the first message (ds.pendingSender) — the
+    // deferred spawn already carries that sender's <sender> block, and the
+    // follow-ups now fold into the same <user_message>, so a same-user tag is
+    // pure duplication. A differing sender still gets attributed so the CLI can
+    // tell multi-user buffered messages apart after repo selection unlocks.
+    const followUpSender = await getThreadSender();
+    if (followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
+      const followUpSenderTag = renderSenderTag(followUpSender);
+      if (followUpSenderTag) enriched = `${followUpSenderTag}\n${enriched}`;
+    }
     if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
     ds.pendingFollowUps.push(enriched);
     await sessionReply(anchor, tr('daemon.choose_repo_first', undefined, localeForBot(larkAppId)), 'text', larkAppId);
@@ -2052,9 +2183,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
     const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType);
     const now = Date.now();
+    // Bot-started handoff sessions have no human owner; keeping the bot as
+    // owner makes daemon-generated footers wake that bot again.
+    const ownerOpenId = isForeignBot ? undefined : senderOId;
     session.larkAppId = larkAppId;
-    session.ownerOpenId = senderOId;
+    session.ownerOpenId = ownerOpenId;
     session.lastCallerOpenId = senderOId;
+    session.quoteTargetId = parsed.messageId;
+    session.quoteTargetSenderOpenId = senderOId;
+    session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
     sessionStore.updateSession(session);
@@ -2110,7 +2247,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
       pendingSender: autoCreateSender,
-      ownerOpenId: senderOId,
+      ownerOpenId,
       currentTurnTitle: parsed.content.substring(0, 50),
       workingDir: pinnedWorkingDir,
     };
@@ -2259,12 +2396,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   const cfg = botConfigs[idx];
   registerBot(cfg);
+  // 启动即为本 bot 的 CLI 预装环境（skills + askUserQuestion hook + 兜底 skill）。
+  // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
+  // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
+  // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
+  try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
+  catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
   // Watch schedules.json for external writes (e.g. `botmux schedule add`
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
+  setAskCardDispatcher(createLarkAskCardDispatcher());
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
@@ -2301,6 +2445,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
+  // Wire the workflow runner for /api/trigger (kind=workflow): reuse the same
+  // heavy deps as the catalog run route.
+  setWorkflowRunner((input) => triggerWorkflowRun(input, workflowTriggerDeps()));
   // Seed dashboard IPC botName with the bot's config id; the friendly name from
   // /bot/v3/info is wired into the registry descriptor (below) but the IPC server
   // also needs its own copy for SessionRow.botName.

@@ -20,17 +20,20 @@ import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
+import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
+import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode', 'antigravity', 'mtr'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -49,7 +52,8 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    expect(adapter.resolvedBin).toBe(`/opt/${id}`);
+    if (id === 'codex-app' || id === 'mira') expect(adapter.resolvedBin).toBe(process.execPath);
+    else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
 
@@ -109,6 +113,18 @@ describe('claude-code buildArgs', () => {
     expect(prompt).toContain('botmux send "第一行\\n第二行"');
     expect(prompt).toContain('字面量');
   });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'opus' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('opus');
+  });
+
+  it('surfaces curated model choices for setup', () => {
+    expect(adapter.modelChoices).toContain('sonnet');
+    expect(adapter.modelChoices).toContain('opus');
+  });
 });
 
 describe('aiden buildArgs', () => {
@@ -154,6 +170,13 @@ describe('coco buildArgs', () => {
     expect(args[indices[0] + 1]).toBe('EnterPlanMode');
     expect(args[indices[1] + 1]).toBe('ExitPlanMode');
   });
+
+  it('passes configured model through coco config override', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'Doubao-Seed-2.0-Code' });
+    const idx = args.indexOf('--config');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('model.name=Doubao-Seed-2.0-Code');
+  });
 });
 
 describe('codex buildArgs', () => {
@@ -181,6 +204,63 @@ describe('codex buildArgs', () => {
       '/repo/root',
     ]);
   });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, model: 'gpt-5-codex' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('gpt-5-codex');
+  });
+});
+
+describe('codex-app buildArgs', () => {
+  const adapter = createCodexAppAdapter('/usr/bin/codex');
+
+  it('spawns the node runner and passes the Codex binary', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-app', resume: false, workingDir: '/repo/root' });
+    expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(args[0]).toMatch(/codex-app-runner\.js$/);
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-app');
+    expect(args).toContain('--codex-bin');
+    expect(args).toContain('/usr/bin/codex');
+    expect(args).toContain('--cwd');
+    expect(args).toContain('/repo/root');
+  });
+
+  it('resumes with the persisted Codex App thread id', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-app',
+      resume: true,
+      resumeSessionId: 'thread-123',
+    });
+    expect(args).toContain('--thread-id');
+    expect(args).toContain('thread-123');
+  });
+});
+
+describe('mira buildArgs', () => {
+  const adapter = createMiraAdapter();
+
+  it('spawns the node runner', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-mira', resume: false, model: 'kimi-k2.5' });
+    expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(args[0]).toMatch(/mira-runner\.js$/);
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-mira');
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('kimi-k2.5');
+  });
+
+  it('resumes with the persisted Mira session id', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-mira',
+      resume: true,
+      resumeSessionId: 'mira-session-123',
+    });
+    expect(args).toContain('--mira-session-id');
+    expect(args).toContain('mira-session-123');
+  });
 });
 
 describe('gemini buildArgs', () => {
@@ -197,6 +277,13 @@ describe('gemini buildArgs', () => {
     expect(args).toContain('-i');
     const idx = args.indexOf('-i');
     expect(args[idx + 1]).toBe('do something');
+  });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, model: 'gemini-3-pro-preview' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('gemini-3-pro-preview');
   });
 
   it('passesInitialPromptViaArgs is true', () => {
@@ -224,6 +311,13 @@ describe('opencode buildArgs', () => {
     expect(args[idx + 1]).toBe('hello world');
   });
 
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, model: 'anthropic/claude-sonnet-4.5' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('anthropic/claude-sonnet-4.5');
+  });
+
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
@@ -245,6 +339,12 @@ describe('mtr buildArgs', () => {
     expect(expected).toMatch(/^ses_[0-9A-Za-z]+$/);
   });
 
+  it('ignores configured model because this adapter has no modelChoices', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-session-1', resume: false, model: 'anything' });
+    expect(args).not.toContain('--model');
+    expect(adapter.modelChoices).toBeUndefined();
+  });
+
   it('resume session passes --session with the same deterministic native id', () => {
     const args = adapter.buildArgs({ sessionId: 'bm-session-1', resume: true });
     expect(args).toEqual(['--session', mtrSessionIdForBotmuxSession('bm-session-1')]);
@@ -261,6 +361,26 @@ describe('mtr buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+});
+
+describe('hermes buildArgs', () => {
+  const adapter = createHermesAdapter('/usr/bin/hermes');
+
+  it('fresh session passes yolo, hooks, and session-id passthrough flags', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-hermes-1', resume: false });
+    expect(args).toEqual(['--yolo', '--accept-hooks', '--pass-session-id']);
+  });
+
+  it('resume session passes --resume with botmux session id', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-hermes-1', resume: true });
+    expect(args).toEqual(['--resume', 'bm-hermes-1', '--yolo', '--accept-hooks', '--pass-session-id']);
+  });
+
+  it('does not bake initialPrompt into args', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-hermes-1', resume: false, initialPrompt: 'hello hermes' });
+    expect(args).not.toContain('hello hermes');
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
 });
 
@@ -296,6 +416,12 @@ describe('antigravity buildArgs', () => {
     expect(args).toContain('--conversation');
     const idx = args.indexOf('--conversation');
     expect(args[idx + 1]).toBe('eb4cabea-3060-4b76-8e85-5778cc7ddb49');
+  });
+
+  it('ignores configured model because this adapter has no modelChoices', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-7', resume: false, model: 'gemini-3-pro-preview' });
+    expect(args).not.toContain('--model');
+    expect(adapter.modelChoices).toBeUndefined();
   });
 
   it('resume without resumeSessionId starts fresh (no --continue, no random id)', () => {
@@ -367,6 +493,14 @@ describe('completionPattern', () => {
     expect(createCodexAdapter('/bin/codex').completionPattern).toBeUndefined();
   });
 
+  it('codex-app has no completionPattern', () => {
+    expect(createCodexAppAdapter('/bin/codex').completionPattern).toBeUndefined();
+  });
+
+  it('mira has no completionPattern', () => {
+    expect(createMiraAdapter().completionPattern).toBeUndefined();
+  });
+
   it('gemini has no completionPattern', () => {
     expect(createGeminiAdapter('/bin/gemini').completionPattern).toBeUndefined();
   });
@@ -381,6 +515,10 @@ describe('completionPattern', () => {
 
   it('mtr has no completionPattern', () => {
     expect(createMtrAdapter('/bin/mtr').completionPattern).toBeUndefined();
+  });
+
+  it('hermes has no completionPattern', () => {
+    expect(createHermesAdapter('/bin/hermes').completionPattern).toBeUndefined();
   });
 });
 
@@ -406,6 +544,18 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern!.test('97% left')).toBe(true);
   });
 
+  it('codex-app matches runner prompt indicator', () => {
+    const adapter = createCodexAppAdapter('/bin/codex');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('›')).toBe(true);
+  });
+
+  it('mira matches runner prompt indicator', () => {
+    const adapter = createMiraAdapter();
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('›')).toBe(true);
+  });
+
   it('aiden has no readyPattern', () => {
     expect(createAidenAdapter('/bin/aiden').readyPattern).toBeUndefined();
   });
@@ -425,6 +575,10 @@ describe('readyPattern', () => {
   it('mtr has no readyPattern', () => {
     expect(createMtrAdapter('/bin/mtr').readyPattern).toBeUndefined();
   });
+
+  it('hermes has no readyPattern', () => {
+    expect(createHermesAdapter('/bin/hermes').readyPattern).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -436,6 +590,17 @@ describe('systemHints', () => {
     expect(createClaudeCodeAdapter('/bin/claude').systemHints).toEqual([]);
   });
 
+  it('codex-app has empty systemHints (runner injects app-server instructions)', () => {
+    expect(createCodexAppAdapter('/bin/codex').systemHints).toEqual([]);
+    expect(createCodexAppAdapter('/bin/codex').injectsSessionContext).toBe(true);
+  });
+
+  it('mira has empty systemHints (runner injects API instructions)', () => {
+    expect(createMiraAdapter().systemHints).toEqual([]);
+    expect(createMiraAdapter().injectsSessionContext).toBe(true);
+    expect(createMiraAdapter().modelChoices).toBeUndefined();
+  });
+
   const nonClaudeAdapters: Array<[string, () => CliAdapter]> = [
     ['aiden', () => createAidenAdapter('/bin/aiden')],
     ['coco', () => createCocoAdapter('/bin/coco')],
@@ -444,6 +609,7 @@ describe('systemHints', () => {
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
+    ['hermes', () => createHermesAdapter('/bin/hermes')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -463,10 +629,13 @@ describe('id property', () => {
     ['aiden', () => createAidenAdapter('/bin/aiden')],
     ['coco', () => createCocoAdapter('/bin/coco')],
     ['codex', () => createCodexAdapter('/bin/codex')],
+    ['codex-app', () => createCodexAppAdapter('/bin/codex')],
     ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
+    ['hermes', () => createHermesAdapter('/bin/hermes')],
+    ['mira', () => createMiraAdapter()],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -503,12 +672,24 @@ describe('altScreen property', () => {
     expect(createCodexAdapter('/bin/codex').altScreen).toBe(false);
   });
 
+  it('codex-app does not use alt screen', () => {
+    expect(createCodexAppAdapter('/bin/codex').altScreen).toBe(false);
+  });
+
   it('antigravity uses alt screen (TUI)', () => {
     expect(createAntigravityAdapter('/bin/agy').altScreen).toBe(true);
   });
 
   it('mtr uses alt screen (TUI)', () => {
     expect(createMtrAdapter('/bin/mtr').altScreen).toBe(true);
+  });
+
+  it('hermes does not use alt screen', () => {
+    expect(createHermesAdapter('/bin/hermes').altScreen).toBe(false);
+  });
+
+  it('mira does not use alt screen', () => {
+    expect(createMiraAdapter().altScreen).toBe(false);
   });
 });
 
@@ -552,6 +733,16 @@ describe('buildResumeCommand', () => {
       .toBe('codex resume cdx-uuid-1');
   });
 
+  it('codex-app has no copy-paste resume command', () => {
+    const a = createCodexAppAdapter('/bin/codex');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-x', cliSessionId: 'thread-1' })).toBeNull();
+  });
+
+  it('mira has no copy-paste resume command', () => {
+    const a = createMiraAdapter();
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-x', cliSessionId: 'mira-session-1' })).toBeNull();
+  });
+
   it('gemini does not implement buildResumeCommand (no precise resume)', () => {
     const a = createGeminiAdapter('/bin/gemini');
     expect(a.buildResumeCommand).toBeUndefined();
@@ -568,6 +759,12 @@ describe('buildResumeCommand', () => {
       .toBe(`mtr --session ${mtrSessionIdForBotmuxSession('bm-mtr')}`);
     expect(a.buildResumeCommand?.({ sessionId: 'bm-mtr', cliSessionId: 'ses_001122334455abcdefABCDEF12' }))
       .toBe('mtr --session ses_001122334455abcdefABCDEF12');
+  });
+
+  it('hermes emits `hermes --resume <sessionId>`', () => {
+    const a = createHermesAdapter('/bin/hermes');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-hermes', cliSessionId: 'ignored' }))
+      .toBe('hermes --resume bm-hermes');
   });
 
   it('antigravity emits `agy --conversation <cliSessionId>` when known, null otherwise', () => {

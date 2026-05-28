@@ -8,6 +8,8 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
+import { getBotCapability } from '../../services/bot-profile-store.js';
+import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -233,6 +235,54 @@ const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a
  *  Calling this with a chat that's already known to be p2p (from
  *  message.chat_type === 'p2p') is fine but wasteful — prefer skipping the
  *  call in that case. */
+/**
+ * Resolve a chat's mode by hitting the API directly. Returns `'unknown'` when
+ * the chat type can't be confirmed (non-zero code or thrown) — it does NOT guess
+ * `'group'`. Use this for privacy-critical gates that must fail closed (private
+ * `/card`). Always queries the API (no cache read), but populates the shared
+ * cache on success so a following {@link getChatMode} hits it.
+ */
+export async function getChatModeStrict(larkAppId: string, chatId: string): Promise<ChatMode | 'unknown'> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0) {
+      logger.warn(`getChatModeStrict(${chatId}) failed: ${res.msg} (code: ${res.code})`);
+      return 'unknown';
+    }
+    // 'p2p' (single chat) lives in chat_mode, NOT chat_type. chat_type is the
+    // group's visibility (public/private) and is undefined for p2p — checking it
+    // for 'p2p' never matches, so a DM would fall through to 'group'.
+    const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+    // group_message_type is the actual "is this a 话题群" signal. The Lark
+    // client UI lets users flip a chat between flat mode and topic mode at any
+    // time — that toggle writes group_message_type ('chat' ↔ 'thread'), NOT
+    // chat_mode. chat_mode is the creation-time topology classification and
+    // stays 'group' even for user-converted topic chats; in our tenant we have
+    // only ever seen chat_mode='topic' on a small set of legacy chats. Treating
+    // chat_mode='topic' OR group_message_type='thread' as 'topic' covers both.
+    const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
+    let mode: ChatMode;
+    if (rawMode === 'p2p') mode = 'p2p';
+    else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
+    else if (rawMode === 'group') mode = 'group';
+    else {
+      // Empty / unrecognized chat_mode (e.g. data={}, or a future enum value):
+      // we genuinely can't confirm the type, so fail closed with 'unknown'
+      // rather than guessing 'group' — honours this function's contract for
+      // privacy-critical callers. (getChatMode still maps 'unknown'→'group' for
+      // lenient routing, so non-strict consumers are unaffected.)
+      logger.warn(`getChatModeStrict(${chatId}) unrecognized chat_mode='${rawMode}' — returning 'unknown'`);
+      return 'unknown';
+    }
+    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    return mode;
+  } catch (err: any) {
+    logger.warn(`getChatModeStrict(${chatId}) errored: ${err?.message ?? err}`);
+    return 'unknown';
+  }
+}
+
 export async function getChatMode(
   larkAppId: string,
   chatId: string,
@@ -243,36 +293,13 @@ export async function getChatMode(
   if (!options.forceRefresh && cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) {
     return cached.mode;
   }
-
-  let mode: ChatMode = 'group';
-  try {
-    const c = getBotClient(larkAppId);
-    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
-    if (res.code === 0) {
-      const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
-      const rawType = String(res.data?.chat_type ?? '').toLowerCase();
-      // group_message_type is the actual "is this a 话题群" signal. The
-      // Lark client UI lets users flip a chat between flat mode and topic
-      // mode at any time — that toggle writes group_message_type
-      // ('chat' ↔ 'thread'), NOT chat_mode. chat_mode is the chat's
-      // creation-time topology classification and stays 'group' even for
-      // user-converted topic chats; in our tenant we have only ever seen
-      // chat_mode='topic' on a small set of legacy/specially-created chats.
-      // Treating chat_mode='topic' OR group_message_type='thread' as 'topic'
-      // covers both shapes, and matches the behaviour the Lark client
-      // displays: every top-level message wraps into a fresh thread, so a
-      // bot's sendMessage(chatId) creates a new visible topic each turn.
-      const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
-      if (rawType === 'p2p') mode = 'p2p';
-      else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
-      else mode = 'group';
-    } else {
-      logger.warn(`getChatMode(${chatId}) failed: ${res.msg} (code: ${res.code}); falling back to 'group'`);
-    }
-  } catch (err: any) {
-    logger.warn(`getChatMode(${chatId}) errored: ${err?.message ?? err}; falling back to 'group'`);
-  }
-
+  // Lenient default: an unconfirmed chat is treated as 'group' (a flat group is
+  // the safer routing default than wrongly forcing threads). getChatModeStrict
+  // already cached the result on success; cache the fallback on 'unknown' too.
+  const strict = await getChatModeStrict(larkAppId, chatId);
+  if (strict !== 'unknown') return strict;
+  const mode: ChatMode = 'group';
+  logger.warn(`getChatMode(${chatId}) unconfirmed; falling back to 'group'`);
   chatModeCache.set(cacheKey, { mode, cachedAt: Date.now() });
   return mode;
 }
@@ -296,6 +323,41 @@ export async function deleteMessage(larkAppId: string, messageId: string): Promi
     logger.debug(`Failed to delete message ${messageId}: ${err}`);
     return false;
   }
+}
+
+/** Error code Feishu returns from `ephemeral/v1/send` when the target chat is a
+ *  topic / thread chat. Ephemeral cards only work in plain `group` chats (see
+ *  /tmp design notes: empirically code 18053 `chat can not be thread`). */
+export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
+
+/**
+ * Send a "visible-to-one-user" ephemeral card (`ephemeral/v1/send`). The card is
+ * only shown to `openId`, sends no notification, and — unlike normal messages —
+ * **cannot be PATCH-updated** (legacy interface). Multiple recipients require one
+ * call each. Only works in plain `group` chats; topic/thread/p2p chats reject
+ * with {@link LARK_CODE_EPHEMERAL_NOT_GROUP}. Returns the ephemeral message_id.
+ */
+export async function sendEphemeralCard(
+  larkAppId: string, chatId: string, openId: string, cardJson: string,
+): Promise<string> {
+  const c = getBotClient(larkAppId);
+  let card: unknown;
+  try {
+    card = JSON.parse(cardJson);
+  } catch (err) {
+    throw new Error(`Invalid ephemeral card JSON: ${err}`);
+  }
+  const res: any = await (c as any).request({
+    method: 'POST',
+    url: '/open-apis/ephemeral/v1/send',
+    data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card },
+  });
+  if (res.code !== 0) {
+    throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);
+  }
+  const messageId = res.data?.message_id;
+  logger.info(`Sent ephemeral card ${messageId ?? '(no id)'} to ${openId} in chat ${chatId}`);
+  return messageId ?? '';
 }
 
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
@@ -516,6 +578,29 @@ export async function resolveAllowedUsersWithMap(
   return { resolved: openIds, map };
 }
 
+/**
+ * Best-effort resolve a user's open_id → canonical union_id (+ display name)
+ * for pairing-login. Requires `contact:user.base:readonly` scope; on failure
+ * (no scope / API error) returns {} so callers degrade to open_id-only identity.
+ */
+export async function resolveUserUnionId(larkAppId: string, openId: string): Promise<{ unionId?: string; name?: string }> {
+  if (!openId) return {};
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).contact.v3.user.get({
+      path: { user_id: openId },
+      params: { user_id_type: 'open_id' },
+    });
+    if (res.code === 0 && res.data?.user) {
+      return { unionId: res.data.user.union_id ?? undefined, name: res.data.user.name ?? undefined };
+    }
+    logger.debug(`resolveUserUnionId non-zero code: ${res.code} ${res.msg}`);
+  } catch (err: any) {
+    logger.debug(`resolveUserUnionId failed: ${err?.message ?? err}`);
+  }
+  return {};
+}
+
 export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Promise<string[]> {
   return (await resolveAllowedUsersWithMap(larkAppId, raw)).resolved;
 }
@@ -731,6 +816,18 @@ export type ChatBotMember = {
   name: string;
   displayName: string;
   source: 'configured' | 'introduce';
+  /** Short capability label (team-level), for roster discovery. Configured bots only. */
+  capability?: string;
+  /** Whether this bot has a team-level role registered. Configured bots only. */
+  hasTeamRole: boolean;
+  /**
+   * Whether the observing app (the `larkAppId` arg) can RELIABLY @-mention this
+   * member. Lark open_id is per-app scoped, so a bot's self-reported open_id is
+   * not usable by another app. Reliable only when learned via cross-ref (from
+   * @mention events) or via /introduce (observed, already observer-scoped).
+   */
+  mentionable: boolean;
+  mentionSource: 'cross-ref' | 'self' | 'observed' | 'fallback';
 };
 
 export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<ChatBotMember[]> {
@@ -769,15 +866,26 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen
-          const openId = (info?.botName && crossRef.get(info.botName.toLowerCase()))
-            ?? info?.botOpenId
-            ?? appId;
+          const crossHit = info?.botName ? crossRef.get(info.botName.toLowerCase()) : undefined;
+          const openId = crossHit ?? info?.botOpenId ?? appId;
+          const isSelf = appId === larkAppId;
+          // Reliable @-mention only when the per-app open_id was learned via
+          // cross-ref; self-view open_id (info.botOpenId) is wrong for OTHER
+          // apps, and the appId fallback is no handle at all. Self is always fine.
+          const mentionSource: ChatBotMember['mentionSource'] = crossHit
+            ? 'cross-ref'
+            : (info?.botOpenId ? 'self' : 'fallback');
+          const mentionable = isSelf || mentionSource === 'cross-ref';
           return {
             larkAppId: appId,
             openId,
             name: cliId,
             displayName: info?.botName ?? cliId,
             source: 'configured',
+            capability: getBotCapability(config.session.dataDir, appId) ?? undefined,
+            hasTeamRole: resolveTeamRoleFile(appId) !== null,
+            mentionable,
+            mentionSource,
           };
         }
       } catch (err) {
@@ -788,25 +896,53 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   );
   const configured: ChatBotMember[] = configuredResults.filter((r): r is ChatBotMember => r !== null);
 
-  // Merge in observed entries (from /introduce) — scoped to the caller's
-  // observer app so the open_ids match how THIS daemon should @-mention them
-  // (Lark open_id is per-app scoped). Dedup by openId (configured wins).
-  const seenOpenIds = new Set(configured.map(b => b.openId));
-  let observed: ChatBotMember[] = [];
+  // Merge observed entries (from /introduce), scoped to the caller's observer
+  // app so open_ids match how THIS daemon should @-mention them (open_id is
+  // per-app scoped). Two cases:
+  //   1) An observed entry uniquely matches a configured row by display name AND
+  //      that row isn't already a reliable cross-ref handle → UPGRADE it in
+  //      place: adopt the observed (observer-scoped) open_id and mark it
+  //      reliably mentionable, while keeping larkAppId/capability/hasTeamRole.
+  //      (A configured peer's own open_id is its self-view — wrong for us to @.)
+  //   2) Otherwise (no/ambiguous match) → append as an external bot.
   try {
     const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
-    observed = observedList
-      .filter(o => !seenOpenIds.has(o.openId))
-      .map(o => ({
+    const seenOpenIds = new Set(configured.map(b => b.openId));
+    const norm = (s: string) => s.trim().toLowerCase();
+    const byName = new Map<string, number[]>();
+    configured.forEach((b, i) => {
+      const k = norm(b.displayName);
+      const arr = byName.get(k);
+      if (arr) arr.push(i); else byName.set(k, [i]);
+    });
+
+    for (const o of observedList) {
+      if (seenOpenIds.has(o.openId)) continue;
+      const matches = byName.get(norm(o.name)) ?? [];
+      if (matches.length === 1) {
+        const row = configured[matches[0]];
+        // Upgrade only if not already a reliable cross-ref handle.
+        if (row.mentionSource !== 'cross-ref') {
+          configured[matches[0]] = { ...row, openId: o.openId, mentionable: true, mentionSource: 'observed' };
+          seenOpenIds.add(o.openId);
+        }
+        continue; // matched → never also append as an external duplicate
+      }
+      configured.push({
         larkAppId: '',
         openId: o.openId,
         name: o.name,
         displayName: o.name,
-        source: 'introduce' as const,
-      }));
+        source: 'introduce',
+        hasTeamRole: false,
+        mentionable: true,
+        mentionSource: 'observed',
+      });
+      seenOpenIds.add(o.openId);
+    }
   } catch (err) {
     logger.debug(`Failed to load observed bots for ${chatId}: ${err}`);
   }
 
-  return [...configured, ...observed];
+  return configured;
 }

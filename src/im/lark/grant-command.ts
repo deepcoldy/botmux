@@ -14,7 +14,8 @@ import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 
-/** 从 mention 列表取第一个非本 bot 的人类对象。 */
+/** 从 mention 列表取第一个非本 bot 的对象（可以是真人，也可以是另一个 bot——
+ *  授权 bot 走同一条路，命中后写本群 chatGrants，放行其在本群拉起 chat-scope 会话）。 */
 export function parseGrantTarget(message: any, botOpenId: string | undefined): { openId: string; name: string } | undefined {
   const m = (message?.mentions ?? []).find((x: any) => x?.id?.open_id && x.id.open_id !== botOpenId);
   return m ? { openId: m.id.open_id, name: m.name ?? m.id.open_id } : undefined;
@@ -84,7 +85,7 @@ export async function tryHandleGrantCommand(
         ? t('cmd.revoke.would_open', undefined, loc)
         : t('cmd.revoke.failed', { reason: r.reason }, loc);
     } else {
-      const scope = `${r.removed.chat ? t('cmd.revoke.scope_chat', undefined, loc) : ''}${r.removed.global ? t('cmd.revoke.scope_global', undefined, loc) : ''}`.trim()
+      const scope = `${r.removed.chat ? t('cmd.revoke.scope_chat', undefined, loc) : ''}${r.removed.globalTalk ? t('cmd.revoke.scope_global_talk', undefined, loc) : ''}${r.removed.global ? t('cmd.revoke.scope_global', undefined, loc) : ''}`.trim()
         || t('cmd.revoke.scope_none', undefined, loc);
       txt = t('cmd.revoke.done', { name: target.name, scope }, loc);
     }

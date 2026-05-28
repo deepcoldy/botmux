@@ -11,6 +11,18 @@ function getLocalIp(): string {
   return 'localhost';
 }
 
+const configuredWebExternalHost = process.env.WEB_EXTERNAL_HOST;
+const configuredDashboardExternalHost =
+  process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST ?? process.env.WEB_EXTERNAL_HOST;
+
+export function getWebExternalHost(): string {
+  return configuredWebExternalHost ?? getLocalIp();
+}
+
+export function getDashboardExternalHost(): string {
+  return configuredDashboardExternalHost ?? getLocalIp();
+}
+
 /**
  * Pick the session backend. tmux is preferred (enables /adopt + per-client
  * Web terminal attach) but only if it can actually start a server. The old
@@ -31,6 +43,13 @@ export const config = {
   session: {
     dataDir: process.env.SESSION_DATA_DIR ?? new URL('../data', import.meta.url).pathname,
   },
+  send: {
+    /** @ hard-gate: every model-initiated `botmux send` reply must explicitly
+     *  choose --mention / --mention-back / --no-mention. Set
+     *  BOTMUX_REQUIRE_MENTION_DECISION=false to disable (kill-switch if the
+     *  gate misfires in production). */
+    requireMentionDecision: (process.env.BOTMUX_REQUIRE_MENTION_DECISION ?? 'true').toLowerCase() !== 'false',
+  },
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
     cliPathOverride: process.env.CLI_PATH,
@@ -41,14 +60,12 @@ export const config = {
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
-    externalHost: process.env.WEB_EXTERNAL_HOST ?? getLocalIp(),
+    get externalHost() { return getWebExternalHost(); },
   },
   dashboard: {
     host: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
     port: Number(process.env.BOTMUX_DASHBOARD_PORT) || 7891,
-    externalHost: process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST
-      ?? process.env.WEB_EXTERNAL_HOST
-      ?? getLocalIp(),
+    get externalHost() { return getDashboardExternalHost(); },
     ipcBasePort: Number(process.env.BOTMUX_DAEMON_IPC_BASE_PORT) || 7892,
   },
   screenAnalyzer: {

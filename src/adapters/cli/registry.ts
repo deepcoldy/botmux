@@ -1,15 +1,20 @@
 import { execSync } from 'node:child_process';
-import { isAbsolute } from 'node:path';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import type { CliAdapter, CliId } from './types.js';
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createAidenAdapter } from './aiden.js';
 import { createCocoAdapter } from './coco.js';
 import { createCodexAdapter } from './codex.js';
+import { createCodexAppAdapter } from './codex-app.js';
 import { createCursorAdapter } from './cursor.js';
 import { createGeminiAdapter } from './gemini.js';
 import { createOpenCodeAdapter } from './opencode.js';
 import { createAntigravityAdapter } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
+import { createHermesAdapter } from './hermes.js';
+import { createMiraAdapter } from './mira.js';
 
 /** Resolve a command name to its absolute path via shell `which`.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
@@ -31,6 +36,15 @@ export function resolveCommand(cmd: string): string {
       } catch { /* try next */ }
     }
   }
+  if (process.platform === 'darwin' && cmd === 'codex') {
+    const bundledCodexCandidates = [
+      '/Applications/Codex.app/Contents/Resources/codex',
+      join(homedir(), 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
+    ];
+    for (const candidate of bundledCodexCandidates) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
   return cmd;
 }
 
@@ -46,7 +60,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter };
+export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -55,11 +69,14 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'aiden': return createAidenAdapter(pathOverride);
     case 'coco': return createCocoAdapter(pathOverride);
     case 'codex': return createCodexAdapter(pathOverride);
+    case 'codex-app': return createCodexAppAdapter(pathOverride);
     case 'cursor': return createCursorAdapter(pathOverride);
     case 'gemini': return createGeminiAdapter(pathOverride);
     case 'opencode': return createOpenCodeAdapter(pathOverride);
     case 'antigravity': return createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);
+    case 'hermes': return createHermesAdapter(pathOverride);
+    case 'mira': return createMiraAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

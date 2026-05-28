@@ -1,0 +1,17 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "AskUserQuestion",
+  "session_id": "abc123",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "继续部署还是回滚？",
+        "multiSelect": false,
+        "options": [
+          { "label": "继续部署" },
+          { "label": "回滚" }
+        ]
+      }
+    ]
+  }
+}

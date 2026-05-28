@@ -10,6 +10,9 @@ import { describe, it, expect } from 'vitest';
 import {
   buildCardBodyElements,
   buildMarkdownCard,
+  buildContextualReplyCard,
+  brandFooterSegment,
+  DEFAULT_BRAND_LABEL,
   hasMarkdown,
 } from '../src/im/lark/md-card.js';
 
@@ -220,4 +223,68 @@ describe('hasMarkdown', () => {
   it('detects pipe tables', () => expect(hasMarkdown('| a | b |\n| - | - |')).toBe(true));
   it('returns false for plain text', () => expect(hasMarkdown('just words here')).toBe(false));
   it('returns false for empty', () => expect(hasMarkdown('')).toBe(false));
+});
+
+// ─── Footer brand label (per-bot configurable) ────────────────────────────
+
+describe('brandFooterSegment', () => {
+  it('undefined (unset) → default botmux brand', () => {
+    expect(brandFooterSegment(undefined)).toBe(DEFAULT_BRAND_LABEL);
+  });
+  it('empty / whitespace → null (brand off)', () => {
+    expect(brandFooterSegment('')).toBeNull();
+    expect(brandFooterSegment('   ')).toBeNull();
+  });
+  it('custom string → verbatim (markdown allowed)', () => {
+    expect(brandFooterSegment('[Acme](https://acme.test)')).toBe('[Acme](https://acme.test)');
+  });
+});
+
+describe('buildMarkdownCard footer brand', () => {
+  const lastEl = (json: string) => { const els = JSON.parse(json).body.elements; return els[els.length - 1]; };
+
+  it('unset brand → default botmux footer', () => {
+    expect(lastEl(buildMarkdownCard('hi', 'ou_x')).content).toContain(DEFAULT_BRAND_LABEL);
+  });
+
+  it('custom brand → custom footer, no botmux', () => {
+    const c = lastEl(buildMarkdownCard('hi', 'ou_x', '[Acme](https://acme.test)')).content;
+    expect(c).toContain('[Acme](https://acme.test)');
+    expect(c).toContain('发送给');
+    expect(c).not.toContain('botmux');
+  });
+
+  it('empty brand + recipient → footer keeps 发送给 only, no brand', () => {
+    const c = lastEl(buildMarkdownCard('hi', 'ou_x', '')).content;
+    expect(c).toContain('发送给');
+    expect(c).not.toContain('botmux');
+  });
+
+  it('empty brand + no recipient → no footer at all (no orphan hr)', () => {
+    const els = JSON.parse(buildMarkdownCard('hi', undefined, '')).body.elements;
+    expect(els.some((e: any) => e.tag === 'hr')).toBe(false);
+    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(JSON.stringify(els)).not.toContain('botmux');
+    expect(els.some((e: any) => e.tag === 'markdown' && /hi/.test(e.content))).toBe(true);
+  });
+});
+
+describe('buildContextualReplyCard footer brand', () => {
+  it('custom brand renders; default botmux omitted', () => {
+    const els = JSON.parse(buildContextualReplyCard({
+      title: 'T', assistantText: 'a', assistantLabel: 'Claude', recipientOpenId: 'ou_x', brand: 'Acme',
+    })).body.elements;
+    const last = els[els.length - 1];
+    expect(last.text_size).toBe('notation_small_v2');
+    expect(last.content).toContain('Acme');
+    expect(last.content).not.toContain('botmux');
+  });
+
+  it('empty brand + no recipient → no grey footer element', () => {
+    const els = JSON.parse(buildContextualReplyCard({
+      title: 'T', assistantText: 'a', assistantLabel: 'Claude', brand: '',
+    })).body.elements;
+    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(JSON.stringify(els)).not.toContain('botmux');
+  });
 });

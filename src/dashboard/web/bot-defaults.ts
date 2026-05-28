@@ -21,9 +21,6 @@ function pageHtml(): string {
   <input type="search" name="q" placeholder="${t('botDefaults.search')}" />
   <button type="button" id="bd-refresh">${t('botDefaults.refresh')}</button>
 </form>
-<p class="hint-warn" style="max-width:760px">
-  ${t('botDefaults.warning')}
-</p>
 <div id="bd-list"></div>
 </section>`;
 }
@@ -113,28 +110,95 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <small>${escapeHtml(b.larkAppId)}</small>
       </header>
       <div class="bd-body">
-        <label class="checkbox-row">
-          <input type="checkbox" data-action="toggle" ${enabled ? 'checked' : ''}>
-          <strong>${t('botDefaults.defaultOncall')}</strong>
-          <small>${t('botDefaults.defaultOncallHelp')}</small>
-        </label>
-        <div class="bd-row">
-          <label>
-            <span>${t('botDefaults.workingDir')}</span>
-            <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux"
-              value="${escapeHtml(def.workingDir ?? '')}" ${enabled ? '' : 'disabled'}>
+        <section class="bd-section">
+          <h3 class="bd-section-title">${t('botDefaults.sectionOncall')}</h3>
+          <label class="checkbox-row">
+            <input type="checkbox" data-action="toggle" ${enabled ? 'checked' : ''}>
+            <strong>${t('botDefaults.defaultOncall')}</strong>
+            <small>${t('botDefaults.defaultOncallHelp')}</small>
           </label>
-        </div>
-        <div class="bd-meta">
-          <small>${t('botDefaults.lastEnabled')}: ${escapeHtml(fmtSince(def.since ?? 0))}</small>
-          <small>${t('botDefaults.autobound', { count: b.autoboundChatCount ?? 0 })}</small>
-        </div>
-        <div class="actions">
-          <button type="button" data-action="save">${t('botDefaults.save')}</button>
-          <span class="oncall-status" data-status></span>
-        </div>
+          <div class="bd-row">
+            <label>
+              <span>${t('botDefaults.workingDir')}</span>
+              <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux"
+                value="${escapeHtml(def.workingDir ?? '')}" ${enabled ? '' : 'disabled'}>
+            </label>
+          </div>
+          <p class="bd-section-note">${t('botDefaults.warning')}</p>
+          <div class="bd-meta">
+            <small>${t('botDefaults.lastEnabled')}: ${escapeHtml(fmtSince(def.since ?? 0))}</small>
+            <small>${t('botDefaults.autobound', { count: b.autoboundChatCount ?? 0 })}</small>
+          </div>
+          <div class="actions">
+            <button type="button" data-action="save">${t('botDefaults.save')}</button>
+            <span class="oncall-status" data-status></span>
+          </div>
+        </section>
+        ${renderBrandSection(b)}
+        ${renderCardBehaviorSection(b)}
       </div>
     </article>`;
+  }
+
+  // brandLabel is null when unset (→ default botmux), '' when off, else custom.
+  // The input shows the configured string ('' for both unset and off); a small
+  // state line disambiguates which of the three the bot is currently in.
+  function brandStateLabel(brand: string | null): string {
+    if (brand == null) return t('botDefaults.brandStateDefault');
+    return brand.trim() === '' ? t('botDefaults.brandStateOff') : t('botDefaults.brandStateCustom');
+  }
+
+  function renderBrandSection(b: any): string {
+    const brand: string | null = b.brandLabel ?? null;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionBrand')}</h3>
+      <div class="bd-row bd-brand">
+        <label>
+          <span>${t('botDefaults.brandLabel')}</span>
+          <input type="text" data-input="brandLabel"
+            placeholder="${escapeHtml(t('botDefaults.brandLabelPlaceholder'))}"
+            value="${escapeHtml(brand ?? '')}">
+        </label>
+        <small data-brand-state>${escapeHtml(brandStateLabel(brand))}</small>
+        <small>${t('botDefaults.brandLabelHelp')}</small>
+        <div class="actions">
+          <button type="button" data-action="save-brand">${t('botDefaults.brandSave')}</button>
+          <button type="button" data-action="reset-brand">${t('botDefaults.brandReset')}</button>
+          <span class="oncall-status" data-brand-status></span>
+        </div>
+      </div>
+    </section>`;
+  }
+
+  // Two per-bot card-behaviour toggles. Both auto-save on change (no explicit
+  // save button — each checkbox PUTs immediately). The writable-link toggle is
+  // moot while the streaming card is disabled, so we disable it in that state.
+  function renderCardBehaviorSection(b: any): string {
+    const disableStreaming = b.disableStreamingCard === true;
+    const writableLink = b.writableTerminalLinkInCard === true;
+    const privateCard = b.privateCard === true;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionCard')}</h3>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-disable-streaming" ${disableStreaming ? 'checked' : ''}>
+        <strong>${t('botDefaults.disableStreaming')}</strong>
+        <small>${t('botDefaults.disableStreamingHelp')}</small>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-writable-link" ${writableLink ? 'checked' : ''} ${disableStreaming ? 'disabled' : ''}>
+        <strong>${t('botDefaults.writableLink')}</strong>
+        <small>${t('botDefaults.writableLinkHelp')}</small>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-private-card" ${privateCard ? 'checked' : ''}>
+        <strong>${t('botDefaults.privateCard')}</strong>
+        <small>${t('botDefaults.privateCardHelp')}</small>
+      </label>
+      <div class="actions">
+        <small data-card-pref-moot class="hint-warn-inline" ${disableStreaming ? '' : 'hidden'}>${t('botDefaults.writableLinkMoot')}</small>
+        <span class="oncall-status" data-card-pref-status></span>
+      </div>
+    </section>`;
   }
 
   function wireCardHandlers() {
@@ -198,6 +262,119 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           saveBtn.disabled = false;
         }
       });
+
+      // ── Brand label (independent of oncall save) ──────────────────────────
+      const brandInput = card.querySelector<HTMLInputElement>('input[data-input=brandLabel]');
+      const brandSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-brand]');
+      const brandResetBtn = card.querySelector<HTMLButtonElement>('button[data-action=reset-brand]');
+      const brandStatusEl = card.querySelector<HTMLSpanElement>('[data-brand-status]');
+      const brandStateEl = card.querySelector<HTMLElement>('[data-brand-state]');
+
+      // PUT the given brandLabel (string '' = off, null = revert to default),
+      // then reflect the new state inline without a full rerender.
+      async function putBrand(brandLabel: string | null, btn: HTMLButtonElement) {
+        if (!brandStatusEl) return;
+        brandStatusEl.textContent = '';
+        brandStatusEl.className = 'oncall-status';
+        btn.disabled = true;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/brand-label`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ brandLabel }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok && body.ok) {
+            const next: string | null = body.brandLabel ?? null;
+            brandStatusEl.textContent = '✓';
+            brandStatusEl.classList.add('hint-ok');
+            if (brandInput) brandInput.value = next ?? '';
+            if (brandStateEl) brandStateEl.textContent = brandStateLabel(next);
+            const cached = cache.bots.find((b: any) => b.larkAppId === appId);
+            if (cached) cached.brandLabel = next;
+          } else {
+            brandStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+            brandStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          brandStatusEl.textContent = `✗ ${e?.message ?? e}`;
+          brandStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      if (brandInput && brandSaveBtn) {
+        // Empty input saved as '' = brand off (per "配置为空就可以关").
+        brandSaveBtn.addEventListener('click', () => putBrand(brandInput.value, brandSaveBtn));
+      }
+      if (brandResetBtn) {
+        brandResetBtn.addEventListener('click', () => putBrand(null, brandResetBtn));
+      }
+
+      // ── Card behaviour toggles (auto-save on change) ──────────────────────
+      const disableStreamingCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-disable-streaming]');
+      const writableLinkCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-writable-link]');
+      const privateCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-private-card]');
+      const cardPrefStatusEl = card.querySelector<HTMLSpanElement>('[data-card-pref-status]');
+      const cardPrefMootEl = card.querySelector<HTMLElement>('[data-card-pref-moot]');
+
+      // PUT a partial card-prefs patch; `selfCb` is the checkbox that triggered
+      // it (disabled during the request to block double-submit).
+      async function putCardPref(patch: Record<string, boolean>, selfCb: HTMLInputElement) {
+        if (!cardPrefStatusEl) return;
+        cardPrefStatusEl.textContent = '';
+        cardPrefStatusEl.className = 'oncall-status';
+        selfCb.disabled = true;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/card-prefs`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(patch),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok && body.ok) {
+            cardPrefStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+            cardPrefStatusEl.classList.add('hint-ok');
+            const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+            if (cached) {
+              cached.disableStreamingCard = body.disableStreamingCard;
+              cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
+              cached.privateCard = body.privateCard;
+            }
+          } else {
+            cardPrefStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+            cardPrefStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          cardPrefStatusEl.textContent = `✗ ${e?.message ?? e}`;
+          cardPrefStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          // The writable-link checkbox stays disabled while streaming is off.
+          if (selfCb === writableLinkCb) selfCb.disabled = !!disableStreamingCb?.checked;
+          else selfCb.disabled = false;
+        }
+      }
+
+      if (disableStreamingCb) {
+        disableStreamingCb.addEventListener('change', () => {
+          const off = disableStreamingCb.checked;
+          // Streaming off → the writable-link toggle has nothing to attach to.
+          if (writableLinkCb) writableLinkCb.disabled = off;
+          if (cardPrefMootEl) cardPrefMootEl.hidden = !off;
+          putCardPref({ disableStreamingCard: off }, disableStreamingCb);
+        });
+      }
+      if (writableLinkCb) {
+        writableLinkCb.addEventListener('change', () => {
+          putCardPref({ writableTerminalLinkInCard: writableLinkCb.checked }, writableLinkCb);
+        });
+      }
+      if (privateCardCb) {
+        privateCardCb.addEventListener('change', () => {
+          putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
     });
   }
 

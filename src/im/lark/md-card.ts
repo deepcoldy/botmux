@@ -24,6 +24,23 @@ import type Token from 'markdown-it/lib/token.mjs';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
 
+/** Default footer brand when a bot has no custom `brandLabel` configured. */
+export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
+
+/**
+ * Resolve the brand segment to render in a card footer from a bot's configured
+ * `brandLabel` (see {@link resolveBrandLabel}):
+ *   • `undefined` (unset)  → the default botmux link
+ *   • `''` / whitespace    → `null` (brand suppressed)
+ *   • any other string     → returned verbatim (markdown allowed)
+ * Returning `null` lets callers drop the brand — and, when there's also no
+ * recipient, the whole footer (HR included) — so an empty brand reads clean.
+ */
+export function brandFooterSegment(brand: string | undefined): string | null {
+  if (brand === undefined) return DEFAULT_BRAND_LABEL;
+  return brand.trim() ? brand : null;
+}
+
 /** Build a Feishu native `table` element from a `table_open … table_close` token slice. */
 function buildTableFromTokens(tokens: Token[]): any | null {
   const headerCells: string[] = [];
@@ -238,22 +255,32 @@ export function hasMarkdown(text: string): boolean {
 /**
  * Build a complete Feishu interactive card (schema 2.0) from a markdown
  * body, with the same footer chrome `botmux send` uses: HR + small grey
- * `[botmux](github)` link + optional `发送给：@<owner>` mention.
+ * brand segment + optional `发送给：@<owner>` mention.
  *
  * `recipientOpenId` (when given) renders as `<at id=…></at>` in the
  * footer — typically the session owner. Pass `undefined` to omit the
  * addressing line (e.g. top-level broadcasts have no specific recipient).
+ *
+ * `brand` is the sending bot's configured `brandLabel` (see
+ * {@link brandFooterSegment}): unset → default botmux link, `''` → brand
+ * suppressed, else custom. When brand and recipient are both absent the whole
+ * footer (HR included) is omitted.
  */
-export function buildMarkdownCard(md: string, recipientOpenId?: string): string {
+export function buildMarkdownCard(md: string, recipientOpenId?: string, brand?: string): string {
   const elements = md ? buildCardBodyElements(md) : [];
-  const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
+  const footerParts: string[] = [];
+  const brandSeg = brandFooterSegment(brand);
+  if (brandSeg) footerParts.push(brandSeg);
   if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
-  elements.push({ tag: 'hr' });
-  elements.push({
-    tag: 'markdown',
-    text_size: 'notation_small_v2',
-    content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
-  });
+  // Empty brand + no recipient → no footer at all (skip the orphan HR too).
+  if (footerParts.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+    });
+  }
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true },
@@ -291,8 +318,9 @@ export function buildContextualReplyCard(opts: {
   assistantText: string;
   assistantLabel: string;
   recipientOpenId?: string;
+  brand?: string;
 }): string {
-  const { title, userText, assistantText, assistantLabel, recipientOpenId } = opts;
+  const { title, userText, assistantText, assistantLabel, recipientOpenId, brand } = opts;
   const elements: any[] = [];
 
   elements.push({
@@ -320,14 +348,18 @@ export function buildContextualReplyCard(opts: {
     : [{ tag: 'markdown', content: '*(空)*' }];
   for (const el of bodyElements) elements.push(el);
 
-  const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
+  const footerParts: string[] = [];
+  const brandSeg = brandFooterSegment(brand);
+  if (brandSeg) footerParts.push(brandSeg);
   if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
-  elements.push({ tag: 'hr' });
-  elements.push({
-    tag: 'markdown',
-    text_size: 'notation_small_v2',
-    content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
-  });
+  if (footerParts.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+    });
+  }
 
   return JSON.stringify({
     schema: '2.0',

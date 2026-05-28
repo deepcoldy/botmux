@@ -45,6 +45,11 @@ export interface RequiredScope {
 export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   { name: 'im:message', desc: '收发消息', critical: true },
   { name: 'im:message.group_at_msg:readonly', desc: '群消息接收', critical: true },
+  // 没有这个 scope，listChatMessages（container_id_type=chat）只能拿到 @bot 的
+  // 消息，拉不到群里的全量历史，botmux history / 群上下文回溯失效。标 critical 是
+  // 为了让启动自检在它缺失时也会 DM 管理员——非 critical 的缺失只在同时缺别的
+  // critical 项时才会被提示。
+  { name: 'im:message.group_msg', desc: '群组历史消息读取（botmux history、群上下文）', critical: true },
   { name: 'im:resource', desc: '消息附件下载', critical: true },
   { name: 'im:chat:read', desc: '群信息读取', critical: true },
   // /group 多 bot 建群解析靠 chatMembers.isInChat 判断每个 bot 是否在群。该 API
@@ -52,6 +57,10 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 任一即可（OR），但实际可申请的只有 im:chat.members:read，故只校验它。缺它时
   // isInChat 抛 Access denied 被吞，bot 静默掉出 roster，/group fail-closed 建不了群。
   { name: 'im:chat.members:read', desc: '群成员读取（/group 建群解析、判断 bot 是否在群）', critical: true },
+  // 拉群把人/机器人加进群（chatMembers.create）需要写权限；缺它时建群能成、加成员
+  // 报 code 99991672 Access denied → 跨部署拉群「机器人进了但人没进」。非 critical：
+  // 核心收发消息不依赖它，只 /group 与跨部署 federation 拉群需要，缺失只 WARN。
+  { name: 'im:chat.members:write_only', desc: '群成员写入（/group、跨部署拉群把人和机器人加进群）', critical: false },
   { name: 'contact:user.base:readonly', desc: '用户基本信息', critical: true },
   // event-dispatcher.checkRequiredScopes 历史上一直对这一项 DM 管理员（"多 bot
   // 协作收不到事件"），等价于 critical 处理；保留 critical 标记是为了让启动

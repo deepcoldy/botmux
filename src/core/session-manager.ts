@@ -27,7 +27,7 @@ import { markSessionActivity } from './session-activity.js';
 import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
-import { resolveRoleFile } from './role-resolver.js';
+import { resolveRole } from './role-resolver.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -140,12 +140,15 @@ export async function getAvailableBots(
   chatId: string,
 ): Promise<Array<{ name: string; displayName: string; openId: string }>> {
   try {
-    const currentBot = getBot(currentAppId);
-    const myCliId = currentBot.config.cliId;
     const chatBots = await listChatBotMembers(currentAppId, chatId);
 
     return chatBots
-      .filter(b => b.name !== myCliId)
+      // Exclude self by larkAppId — NOT by cliId, since two bots can share a
+      // cliId (e.g. both run "codex") and a name-based check would wrongly drop
+      // a same-cliId peer. Only surface bots we can RELIABLY @-mention from
+      // here: an unreliable open_id (peer self-view / appId fallback) would make
+      // the model's `botmux send --mention <open_id>` miss its target.
+      .filter(b => b.larkAppId !== currentAppId && b.mentionable)
       .map(b => ({
         name: b.name,
         displayName: b.displayName,
@@ -233,9 +236,10 @@ export function buildNewTopicPrompt(
 
   let roleBlock = '';
   if (opts?.larkAppId && opts?.chatId) {
-    const roleContent = resolveRoleFile(opts.larkAppId, opts.chatId);
+    const { content: roleContent, source: roleSource } = resolveRole(opts.larkAppId, opts.chatId);
     if (roleContent) {
-      roleBlock = `<role context="group" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`;
+      const ctx = roleSource === 'team' ? 'team' : 'group';
+      roleBlock = `<role context="${ctx}" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`;
     }
   }
 
@@ -260,17 +264,20 @@ export function buildNewTopicPrompt(
     }
   }
 
-  const userBlock = `<user_message>\n${userMessage}\n</user_message>`;
+  // Messages the user sent while the repo-selection card was still pending are
+  // buffered as followUps. Fold them into the single <user_message> body
+  // (blank-line separated) rather than emitting a separate <follow_up_message>
+  // block per message: the deferred spawn is conceptually one opening turn, so
+  // one block reads cleanly and the surrounding metadata envelope
+  // (sender/mention) isn't repeated for every buffered line.
+  const mergedMessage = followUps && followUps.length > 0
+    ? [userMessage, ...followUps].join('\n\n')
+    : userMessage;
+  const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
   const parts: string[] = [userBlock];
 
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
-
-  if (followUps && followUps.length > 0) {
-    for (const fu of followUps) {
-      parts.push(`<follow_up_message>\n${fu}\n</follow_up_message>`);
-    }
-  }
 
   const attachHint = formatAttachmentsHint(attachments, locale);
   if (attachHint) parts.push(attachHint);
@@ -309,11 +316,12 @@ export function buildFollowUpContent(
     : '';
   if (attachHint) parts.push(attachHint);
 
-  // Inject per-chat role for follow-up messages (same as buildNewTopicPrompt)
+  // Inject role for follow-up messages: per-chat override ＞ team default (same as buildNewTopicPrompt)
   if (opts?.larkAppId && opts?.chatId) {
-    const roleContent = resolveRoleFile(opts.larkAppId, opts.chatId);
+    const { content: roleContent, source: roleSource } = resolveRole(opts.larkAppId, opts.chatId);
     if (roleContent) {
-      parts.push(`<role context="group" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`);
+      const ctx = roleSource === 'team' ? 'team' : 'group';
+      parts.push(`<role context="${ctx}" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`);
     }
   }
 
@@ -334,7 +342,9 @@ export function buildFollowUpContent(
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
 
-  parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
+  if (opts?.cliId !== 'mira') {
+    parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
+  }
 
   return parts.join('\n\n');
 }

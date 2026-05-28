@@ -43,6 +43,10 @@ export interface CliAdapter {
     botOpenId?: string;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
+    /** Optional model name from BotConfig.model. Adapters whose CLI accepts a
+     *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
+     *  such concept simply ignore the field. Empty / undefined → CLI default. */
+    model?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
@@ -102,6 +106,28 @@ export interface CliAdapter {
    *  support skills (or has a non-standard layout not yet integrated). */
   readonly skillsDir?: string;
 
+  /** Optional: absolute path (with ~ expansion handled by caller) to a Claude
+   *  Code *plugin* root. When set, built-in skills are written into
+   *  `{pluginDir}/skills/<name>/SKILL.md` alongside a `.claude-plugin/plugin.json`
+   *  manifest, and the adapter passes `--plugin-dir {pluginDir}` at spawn so the
+   *  skills are scoped to botmux-spawned sessions only — they never land in the
+   *  user's global `~/.claude/skills`, so a standalone `claude` won't surface
+   *  (and mis-fire) them. Mutually exclusive with `skillsDir`. */
+  readonly pluginDir?: string;
+
+  /** hook 安装描述：spawn 时写入各 CLI 的 hook 配置，使 askUserQuestion 事件转发到
+   *  `botmux hook <cliId>`。undefined = 不通过 hook 接管 askUserQuestion。 */
+  readonly hookInstall?: {
+    /** 待写入的配置文件路径（~ 由 installer 展开）。 */
+    readonly configPath: string;
+    /** 写入格式：决定 installer 如何合并进既有配置。 */
+    readonly format: 'claude-settings' | 'opencode-plugin';
+  };
+
+  /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
+   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件）。 */
+  readonly asksViaHook?: boolean;
+
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
 
@@ -126,11 +152,22 @@ export interface CliAdapter {
    *  queued messages immediately instead of waiting for idle detection.
    *  Only set for CLIs whose input handling is known to tolerate this —
    *  Claude Code buffers input internally and processes it after the current
-   *  turn. Others (e.g. CoCo) may drop or garble input while rendering. */
+   *  turn; CoCo (0.120.32+) parks it in its own TUI queue and dequeues it when
+   *  the current turn ends. NOTE: for the structured (codex/coco) bridge, the
+   *  worker additionally requires the CLI not be Codex — Codex's rollout
+   *  attribution hasn't been validated for type-ahead, so even an adapter that
+   *  set this flag would stay serial there. */
   readonly supportsTypeAhead?: boolean;
 
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
+
+  /** Curated model candidates surfaced in `botmux setup`. When undefined the
+   *  setup flow skips the model prompt for this CLI entirely (e.g. CLIs whose
+   *  model is fixed or set via a config file we don't manage). The order is
+   *  presented as-is; the setup prompt always appends an "Other / custom"
+   *  free-text option, so this list is curation, not a hard whitelist. */
+  readonly modelChoices?: readonly string[];
 }
 
-export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr';
+export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira';

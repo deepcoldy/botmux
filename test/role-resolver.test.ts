@@ -85,3 +85,55 @@ describe('buildNewTopicPrompt role injection', () => {
     expect(prompt).not.toContain('<role');
   });
 });
+
+describe('team-level role + layered resolution', () => {
+  it('writes/reads team role under {dataDir}/team-roles/{larkAppId}.md', async () => {
+    const { writeTeamRoleFile, resolveTeamRoleFile } = await fresh();
+    writeTeamRoleFile('app1', '# 后端机器人\n擅长服务端。');
+    expect(existsSync(join(dataDir, 'team-roles', 'app1.md'))).toBe(true);
+    expect(resolveTeamRoleFile('app1')).toContain('后端机器人');
+  });
+
+  it('resolveRole layers: chat override ＞ team ＞ none', async () => {
+    const { writeRoleFile, writeTeamRoleFile, deleteRoleFile, resolveRole } = await fresh();
+    expect(resolveRole('app1', 'oc_a')).toEqual({ content: null, source: 'none' });
+    writeTeamRoleFile('app1', 'TEAM_ROLE');
+    expect(resolveRole('app1', 'oc_a')).toEqual({ content: 'TEAM_ROLE', source: 'team' });
+    writeRoleFile('app1', 'oc_a', 'CHAT_ROLE');
+    expect(resolveRole('app1', 'oc_a')).toEqual({ content: 'CHAT_ROLE', source: 'chat' });
+    deleteRoleFile('app1', 'oc_a');
+    expect(resolveRole('app1', 'oc_a')).toEqual({ content: 'TEAM_ROLE', source: 'team' });
+  });
+
+  it('team role is per-bot (keyed on larkAppId), shared across chats', async () => {
+    const { writeTeamRoleFile, resolveRole } = await fresh();
+    writeTeamRoleFile('app1', 'A');
+    writeTeamRoleFile('app2', 'B');
+    expect(resolveRole('app1', 'oc_any').content).toBe('A');
+    expect(resolveRole('app2', 'oc_any').content).toBe('B');
+  });
+
+  it('deleteTeamRoleFile removes it', async () => {
+    const { writeTeamRoleFile, deleteTeamRoleFile, resolveTeamRoleFile } = await fresh();
+    writeTeamRoleFile('app1', 'X');
+    expect(deleteTeamRoleFile('app1')).toBe(true);
+    expect(resolveTeamRoleFile('app1')).toBeNull();
+    expect(deleteTeamRoleFile('app1')).toBe(false);
+  });
+});
+
+describe('buildNewTopicPrompt team-role injection', () => {
+  it('injects team role with context="team" when no per-chat override', async () => {
+    await fresh();
+    const { writeTeamRoleFile } = await import('../src/core/role-resolver.js');
+    writeTeamRoleFile('app1', 'TEAM_PERSONA');
+    const { buildNewTopicPrompt } = await import('../src/core/session-manager.js');
+    const prompt = buildNewTopicPrompt(
+      'hello', 'sess1', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { larkAppId: 'app1', chatId: 'oc_team' },
+    );
+    expect(prompt).toContain('<role context="team" chat_id="oc_team">');
+    expect(prompt).toContain('TEAM_PERSONA');
+  });
+});

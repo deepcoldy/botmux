@@ -381,6 +381,51 @@ function resolveMentions(text: string, mentions?: RawEventData['message']['menti
   return result.trim();
 }
 
+function normalizeFenceLanguage(lang: unknown): string {
+  return typeof lang === 'string' ? lang.trim().replace(/\s+/g, '_') : '';
+}
+
+function renderPostCodeBlock(node: any): string {
+  const raw = typeof node.text === 'string'
+    ? node.text
+    : typeof node.content === 'string'
+      ? node.content
+      : typeof node.code === 'string'
+        ? node.code
+        : '';
+  const code = raw.replace(/\n+$/, '');
+  const lang = normalizeFenceLanguage(node.language ?? node.lang);
+  const longestFence = Math.max(2, ...[...code.matchAll(/`+/g)].map(m => m[0].length));
+  const fence = '`'.repeat(longestFence + 1);
+  return `\n${fence}${lang}\n${code}\n${fence}\n`;
+}
+
+function renderPostNode(node: any, numberer?: ImgNumberer): string {
+  if (node.tag === 'text') return node.text ?? '';
+  if (node.tag === 'a') return node.text ?? node.href ?? '';
+  if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
+  if (node.tag === 'code_block') return renderPostCodeBlock(node);
+  if (node.tag === 'img' || node.tag === 'media') {
+    const key = node.image_key ?? node.file_key;
+    if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
+    return '[图片]';
+  }
+  if (node.tag === 'file') {
+    const key = node.file_key;
+    const name = node.file_name ?? '';
+    if (key && numberer) {
+      const n = numberer.assign(`file:${key}`).num;
+      return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
+    }
+    return name ? `[文件: ${name}]` : '[文件]';
+  }
+  return '';
+}
+
+function joinPostNodeText(parts: string[]): string {
+  return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
     if (msgType === 'text') {
@@ -393,32 +438,7 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       const body = content
         .map((paragraph: any[]) => {
           const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
-          return nodes
-            .map((node: any) => {
-              if (node.tag === 'text') return node.text ?? '';
-              if (node.tag === 'a') return node.text ?? node.href ?? '';
-              if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
-              // Render img/media tags as a placeholder. Without this fallback,
-              // a post message with images surfaces as text-only — which lets
-              // a reader (e.g. another bot scanning thread history) believe
-              // no image was attached and prompt the sender to retry.
-              if (node.tag === 'img' || node.tag === 'media') {
-                const key = node.image_key ?? node.file_key;
-                if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
-                return '[图片]';
-              }
-              if (node.tag === 'file') {
-                const key = node.file_key;
-                const name = node.file_name ?? '';
-                if (key && numberer) {
-                  const n = numberer.assign(`file:${key}`).num;
-                  return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
-                }
-                return name ? `[文件: ${name}]` : '[文件]';
-              }
-              return '';
-            })
-            .join('');
+          return joinPostNodeText(nodes.map((node: any) => renderPostNode(node, numberer)));
         })
         .filter(Boolean)
         .join('\n');
@@ -453,6 +473,26 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
   } catch {
     return rawContent;
   }
+}
+
+/**
+ * botmux-generated card footer signature. Every card `botmux send` /
+ * buildMarkdownCard emits ends with a small grey note linking back to the repo
+ * (`[botmux](https://github.com/deepcoldy/botmux)`, optionally `· 发送给：@owner`).
+ * That footer is human-facing chrome — when another bot receives the card it
+ * must NOT leak into the receiving bot's prompt (it surfaces as a stray
+ * `<font color='grey'>botmux</font>` block and duplicates mention info). Both
+ * Lark render formats carry the canonical repo URL on that footer line (Format B
+ * as the markdown link target, Format A as the `<a href>`), so the URL is a
+ * reliable, format-agnostic marker. Anchored on the full repo URL so genuine
+ * body text merely mentioning "botmux" survives. Known, accepted trade-off: a
+ * card whose own body puts this exact repo URL on a line would lose that line
+ * too — vanishingly rare versus the value of a simple format-agnostic anchor.
+ */
+const BOTMUX_FOOTER_MARKER = 'github.com/deepcoldy/botmux';
+
+function isBotmuxFooterLine(line: string): boolean {
+  return line.includes(BOTMUX_FOOTER_MARKER);
 }
 
 /**
@@ -545,7 +585,15 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
       }
     }
 
-    return parts.join('\n') || '[卡片]';
+    // Drop the botmux footer chrome so a receiving bot's prompt isn't polluted
+    // by the grey `botmux` badge / `发送给：@owner` line. Line-level (not
+    // part-level) so a footer never takes adjacent real content with it.
+    const cleaned = parts
+      .join('\n')
+      .split('\n')
+      .filter(line => !isBotmuxFooterLine(line))
+      .join('\n');
+    return cleaned || '[卡片]';
   } catch {
     return '[卡片]';
   }
@@ -719,6 +767,18 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   if (!el || typeof el !== 'object') return;
 
   const tag = el.tag;
+
+  // botmux card footer: the only element rendered as a small grey notation
+  // (text_size 'notation_small_v2' + a grey <font> wrapper). Drop it
+  // structurally — brand-agnostic, so a peer bot's *custom* brandLabel footer
+  // is stripped from cross-bot / quote / history prompts without us needing to
+  // know its label (the receiving bot can't see the sender's config). The
+  // repo-URL line filter below still covers the default brand in the simplified
+  // Format A representation, which carries no text_size.
+  if ((tag === 'markdown' || tag === 'div' || tag === 'plain_text') && el.text_size === 'notation_small_v2') {
+    const c = el.text?.content ?? el.content ?? '';
+    if (/color=['"]grey['"]/i.test(c)) return;
+  }
 
   // div / markdown / plain_text blocks
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {

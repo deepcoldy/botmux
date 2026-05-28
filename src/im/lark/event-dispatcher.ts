@@ -200,7 +200,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
 
     // Diff against the canonical list. Critical-missing is the main signal;
     // non-critical is mentioned only when something critical is also missing,
-    // so single-bot deployments don't get nagged about `include_bot:readonly`.
+    // so deployments don't get nagged about purely optional scopes like
+    // `application:application:self_manage`.
     const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedScopes.has(s.name));
     const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
 
@@ -492,16 +493,27 @@ function hasChatGrant(larkAppId: string, chatId: string | undefined, openId: str
   return !!chatId && !!openId && !!getBot(larkAppId).config.chatGrants?.[chatId]?.includes(openId);
 }
 
+/** 全局对话授权命中判断（人/bot 通用，仅用于 canTalk / bot 路由闸 —— 不给管理命令权）。 */
+function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean {
+  return !!openId && !!getBot(larkAppId).config.globalGrants?.includes(openId);
+}
+
 export function canTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined): boolean {
   if (chatId && isChatOncallBoundForAnyBot(chatId)) return true;
   if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return true;
   if (hasChatGrant(larkAppId, chatId, senderOpenId)) return true;
+  // 全局对话授权（talk-only，人/bot 通用）：命中即在任意群放行，与 chatGrants 同级、不授 operate。
+  if (hasGlobalGrant(larkAppId, senderOpenId)) return true;
   const bot = getBot(larkAppId);
   // allowedChatGroups 是"talk-open 的 chat_id 列表"：当前消息来自其中之一即放行（仅 canTalk）。
   // 成员关系隐含在"能在该 chat 发言"里 —— 退群者发不了言自动失权，新人进群即生效，无需成员快照。
   if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return true;
   const allowedUsers = bot.resolvedAllowedUsers;
-  const hasAllowlist = allowedUsers.length > 0 || (bot.config.allowedChatGroups?.length ?? 0) > 0;
+  // globalGrants 与 allowedChatGroups 同样确立"有白名单"语义：只配 globalGrants 也算限制态，
+  // 不能 fall through 到"全开放"。
+  const hasAllowlist = allowedUsers.length > 0
+    || (bot.config.allowedChatGroups?.length ?? 0) > 0
+    || (bot.config.globalGrants?.length ?? 0) > 0;
   if (!hasAllowlist) return true;
   if (!senderOpenId) return false;
   return allowedUsers.includes(senderOpenId);
@@ -510,7 +522,12 @@ export function canTalk(larkAppId: string, chatId: string | undefined, senderOpe
 export function canOperate(larkAppId: string, _chatId: string | undefined, senderOpenId: string | undefined): boolean {
   const bot = getBot(larkAppId);
   const allowedUsers = bot.resolvedAllowedUsers;
-  const hasAllowlist = allowedUsers.length > 0 || (bot.config.allowedChatGroups?.length ?? 0) > 0;
+  // globalGrants（与 allowedChatGroups 同理）确立"有白名单"语义：只配 globalGrants 也算限制态，
+  // 否则 canOperate 会 fall through 到"全开放"，把 talk-only 授权变成 operate 全开——正是 PR #46
+  // 要堵的洞。注意 globalGrants 只进 hasAllowlist 判定，operate 命中仍只认 allowedUsers。
+  const hasAllowlist = allowedUsers.length > 0
+    || (bot.config.allowedChatGroups?.length ?? 0) > 0
+    || (bot.config.globalGrants?.length ?? 0) > 0;
   if (!hasAllowlist) return true;
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
 }
@@ -814,9 +831,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // Oncall 群是显式部署的协作工作区，canTalk 已对任何成员（含真人）放行；这里
           // 对 bot 同等放行，跳过 cross-ref vetting。否则 oncall 群里外部 bot 互相 @
           // 会被静默丢弃、只有真人能拉起会话，与 oncall「全员可对话」语义不符。
+          //
+          // owner 还可用 `/grant @bot` 把外部 bot 加进本群 chatGrants（与真人 /grant
+          // 同一存储、同一 per-chat 语义）。命中 chatGrants 的 bot 即便不在 cross-ref，
+          // 也与已注册 peer 同等放行——这是「授权外部 bot 在本群协作」的入口。
+          // 全局授权（globalGrants）同理：命中即在任意群放行，是上面的全局版。
           if (ctx.scope === 'chat' && !isChatOncallBoundForAnyBot(chatId)) {
             const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
-            if (!ownsSession && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) {
+            if (!ownsSession
+                && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+                && !hasChatGrant(larkAppId, chatId, senderOpenId)
+                && !hasGlobalGrant(larkAppId, senderOpenId)) {
               return;
             }
           }

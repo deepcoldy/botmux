@@ -331,6 +331,46 @@ botmux send --mention "ou_xxx:Aiden" "请 @Aiden 帮忙 review 这段代码"
 botmux send --mention ou_xxx "帮忙看下这段代码"
 \`\`\`
 
+### @ 决策硬门（必读）
+
+每条回复**必须显式做出 @ 决策**，否则 \`botmux send\` 报错（exit 2）不发送。三选一：
+
+| flag | 何时用 |
+|---|---|
+| \`--mention <ou_xxx:Name>\` | 点名某人/某 bot（可重复） |
+| \`--mention-back\` | @ 回**本轮触发消息的发送者**（open_id 自动从会话取，你不用记） |
+| \`--no-mention\` | 明确声明本条不 @ 任何人 |
+
+决策规则（**按内容价值判断，不是按"人还是 bot"**）：
+- **有实质结论、需要对方继续看 / 确认 / 决策** → \`--mention-back\`（@回触发者）或 \`--mention\` 点名，确保对方看到。
+- **纯记录 / 低优先级进度 / 简短确认（"收到""在看"）** → \`--no-mention\`，别打扰。
+- **如果只是没信息量的"收到"** → 不如不发，等下一条有内容时再回。
+- ⚠️ 别把 \`--no-mention\` 当默认随手带；也别无意义地 @ 打扰人。
+
+\`\`\`bash
+# 回复触发你的那个人，并 @ 回 ta
+botmux send --mention-back "好的，已处理完成。"
+# 纯状态更新，不想惊动任何人
+botmux send --no-mention "后台任务还在跑，预计 5 分钟。"
+\`\`\`
+
+（可设环境变量 \`BOTMUX_REQUIRE_MENTION_DECISION=false\` 关闭此硬门。）
+
+### 引用串联（普通群）
+
+普通群里，回复默认会**引用本轮触发的那条消息**（飞书"引用"样式），把对话串成可追溯的链——你无需做任何事。
+
+\`\`\`bash
+# 默认：自动引用本轮触发消息
+botmux send --no-mention "收到，开始处理。"
+# 引用某条特定历史消息
+botmux send --quote om_xxxxxx --no-mention "针对上面这条补充一点"
+# 发独立消息、不引用任何人
+botmux send --no-quote --no-mention "📢 全员通知"
+\`\`\`
+
+话题群（话题形态）不支持逐条引用，此能力仅在普通群生效。
+
 ### 顶层广播 / 跨群发布
 
 默认行为：消息**回复**到当前话题里。如果要把内容发到群里作为新的顶层消息（不绑定到任何已有话题），或要发到**另一个群**，用 \`--top-level\` 和 \`--chat-id\`。
@@ -356,6 +396,10 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 | \`--images <path>\` | 内联图片，可重复多次 |
 | \`--files <path>\` | 附件文件，可重复多次，每个单独发送 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
+| \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
+| \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
+| \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
+| \`--no-quote\` | 不引用，发独立消息（普通群） |
 | \`--card\` / \`--text\` | 强制卡片或纯文本模式（默认按 md 语法自动判断） |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
 | \`--chat-id <oc_xxx>\` | 指定目标群（默认当前会话所在群）；常和 \`--top-level\` 一起用做跨群发布 |
@@ -363,16 +407,17 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 
 ## 输出
 
-成功返回 JSON: \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`
-失败打印错误到 stderr 并 exit 1。
+成功返回 JSON: \`{"success":true,"messageId":"om_xxx","sessionId":"...","quotedMessageId":"om_yyy 或 null","mentioned":[{"open_id":"ou_x","name":"Codex"}]}\`
+其中 \`quotedMessageId\` 是实际引用的消息（纯发为 null），\`mentioned\` 是实际 @ 的对象。stderr 另给一行人类可读摘要。
+失败 exit 1；**未做 @ 决策 exit 2**（按提示补 \`--mention\`/\`--mention-back\`/\`--no-mention\`）。
 `;
 
 const BOTS_SKILL = `---
 name: botmux-bots
-description: 列出当前飞书群聊中的机器人及其 open_id。在需要 @mention 其他机器人协作时使用。
+description: 列出当前飞书群里可协作的机器人（协作花名册：含能力标签、是否有团队角色、以及你能否可靠 @ 到它）。在需要点名其他机器人协作、或交棒给队友前查看时使用。
 ---
 
-# botmux-bots — 查询可用机器人
+# botmux-bots — 群内协作花名册
 
 ## 用法
 
@@ -380,27 +425,81 @@ description: 列出当前飞书群聊中的机器人及其 open_id。在需要 @
 botmux bots list
 \`\`\`
 
-## 输出
+## 输出（JSON）
 
-JSON 格式：
+每个机器人一行，关键字段：
+- \`name\` / \`openId\` / \`isSelf\`
+- \`larkAppId\`：本机托管的机器人才有（可用作 workflow 的 bot id）
+- \`capability\`：团队能力标签（它擅长什么）——挑选交棒/协作对象的依据
+- \`hasTeamRole\`：是否配置了团队级角色
+- \`mentionable\`：**你能不能可靠地 @ 到它**（关键）
+- \`mentionSource\`：\`cross-ref\` | \`observed\` | \`self\` | \`fallback\`
+
 \`\`\`json
 {
   "sessionId": "...",
   "chatId": "...",
   "bots": [
-    { "name": "Claude", "openId": "ou_xxx", "isSelf": true },
-    { "name": "Aiden", "openId": "ou_yyy", "isSelf": false }
+    { "name": "后端Bot", "openId": "ou_yyy", "isSelf": false, "larkAppId": "cli_b",
+      "capability": "服务端排查，擅长日志", "hasTeamRole": true,
+      "mentionable": true, "mentionSource": "cross-ref" }
   ],
-  "total": 2
+  "total": 1
 }
 \`\`\`
 
-## 配合 botmux send 使用
+## 关键规则
+
+1. **只 @ \`mentionable=true\` 的机器人**。\`mentionable=false\` 表示"知道它在群里，但当前点不准"（飞书 open_id 按 app 隔离）——这种先让它 / 用户在群里 \`/introduce\` 一次，再点名。
+2. 按 \`capability\` 挑合适的队友，而不是乱点。
+3. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+
+## 要把任务交棒给别的机器人？
+
+见 **botmux-handoff** 技能（结构化交接）。
+`;
+
+const HANDOFF_SKILL = `---
+name: botmux-handoff
+description: 把当前任务交棒给团队里另一个机器人时使用（多机器人协作接力）。当你做完自己负责的部分、需要另一个机器人接手下一步，或用户说"交给X""让X接着做""@某bot继续""下一步谁谁来"时触发。先用 botmux-bots 查花名册挑对象，再用结构化交接发给对方。
+---
+
+# botmux-handoff — 机器人接力交棒
+
+多机器人协作里，一个机器人干完自己那段后把任务交给另一个机器人接手。**随意闲聊可以不拘格式**，但正式交棒要带最小结构，否则接手方拿不到足够上下文、交接质量不可控。
+
+## 步骤
+
+1. 用 \`botmux bots list\`（见 botmux-bots 技能）查群内协作花名册：
+   - 按 \`capability\` 挑**合适**的接手机器人；
+   - 确认它 \`mentionable: true\`（若为 false，先让它/用户 \`/introduce\` 一次再点名）。
+2. 用 \`botmux send --mention\` 发一条**结构化交接**给它。
+
+## 交接必须包含 5 要素
+
+- **交给谁**：@ 目标机器人
+- **当前结论**：你已经做完/查清了什么
+- **相关上下文**：链接、关键消息、文件路径、数据
+- **期望下一步**：希望它具体做什么
+- **完成标准**：怎样算这一步做完
+
+## 示例
 
 \`\`\`bash
-# 查到 Aiden 的 open_id 后
-botmux send --mention "ou_yyy:Aiden" "请 @Aiden 帮忙处理"
+botmux send --mention "ou_yyy:后端Bot" <<'EOF'
+@后端Bot 交接：
+- 当前结论：定位到支付回调超时，错误集中在 09:00–09:10，日志 https://...
+- 上下文：服务 pay-gateway，最近一次变更 PR #1234
+- 期望下一步：判断是否回滚 #1234，并给出修复方案
+- 完成标准：给出根因结论 + 可执行的修复/回滚决定
+EOF
 \`\`\`
+
+## 注意
+
+- 跨部署的外部机器人若 \`mentionable: false\`，**先 \`/introduce\` 一次**再交棒（飞书 open_id 按 app 隔离）。
+- 人主导的协作可以不走这套结构；本技能针对**机器人自主接力**。
+- 交棒后简短告知用户"已交给 @X 接手"，保持可见。
 `;
 
 const WORKFLOW_CREATE_SKILL = `---
@@ -802,12 +901,82 @@ humanGate：
 - executor 名不是默认三种之一且用户没确认：不要猜。
 `;
 
+export const ASK_SKILL = `---
+name: botmux-ask
+description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，stdout 只返回选中的 key，适合 shell 脚本和 CLI agent 继续执行。
+---
+
+# botmux-ask — 阻塞式向用户提问
+
+当你需要用户在明确选项里做选择，并且后续步骤必须等用户回答后才能继续时，使用 \`botmux ask buttons\`。
+
+## 什么时候用
+
+- 发布、回滚、删除、写文件、调用外部 API 等风险动作前，需要用户选择
+- 需求存在 2-6 个清晰分支，继续执行前必须拿到其中一个 key
+- 你正在 shell / CLI 里执行任务，需要把用户选择赋给变量继续跑
+
+## 不要用
+
+- 只是给用户汇报进展：用 \`botmux send\`
+- 需要自由文本长回答：v0.1.7 不支持，先用 \`botmux send\` 问用户
+- workflow 节点审批：workflow 已经有 humanGate / decision，不要套两层 ask
+
+## Canonical 用法
+
+\`\`\`bash
+choice=$(botmux ask buttons --options "deploy=继续发布,rollback=回滚,abort=中止" "线上 latency 涨了 30%，下一步怎么处理？")
+case "$choice" in
+  deploy) echo "继续发布" ;;
+  rollback) echo "执行回滚" ;;
+  abort) echo "中止" ;;
+esac
+\`\`\`
+
+\`key=label\` 里，**stdout 永远返回 key**，按钮上显示 label。只写 \`yes,no\` 时 key 和 label 相同。
+
+兼容 alias：\`botmux ask --options "yes,no" "继续吗？"\` 可以用，但文档和新脚本优先写 \`botmux ask buttons\`，给未来 \`ask text\` / \`ask confirm\` 留空间。
+
+## JSON 输出
+
+\`\`\`bash
+botmux ask buttons --json --options "yes=继续,no=停止" "继续执行吗？"
+\`\`\`
+
+stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 失效时也会输出 JSON，
+同时保留非 0 exit code。脚本判断超时必须看 exit code 或 \`timedOut\` 字段。
+
+\`\`\`json
+{"selected":"yes","by":"ou_xxx","timedOut":false,"comment":null}
+\`\`\`
+
+## 退出码和 stdout 契约
+
+- 成功：stdout 一行 \`<selected_key>\`，exit 0
+- \`--json\`：stdout 一行 JSON（包括超时 / 失效），exit code 仍按结果返回
+- 超时：默认模式 stdout 为空，exit 124；\`--json\` 时 \`{"selected":null,"timedOut":true,...}\`
+- 缺少 botmux 环境变量 / 参数错误：stdout 为空，exit 2
+- daemon 不可达或 ask 被 daemon restart 失效：默认模式 stdout 为空，exit 3；\`--json\` 时 \`selected:null\`
+
+所有人类可读提示都在 stderr，调用方不要 parse stderr。
+
+## 选项规则
+
+- \`--options\` 必填，至少 2 项，逗号分隔
+- 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
+- 不支持 comment / multi-select / free-form text（v0.1.7 范围外）
+- 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
+`;
+
+export const ASK_SKILL_NAME = 'botmux-ask';
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
+  { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
 ];
 

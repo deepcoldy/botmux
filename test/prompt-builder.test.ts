@@ -95,7 +95,7 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain('</user_message>');
   });
 
-  it('should include follow-up messages wrapped in <follow_up_message>', () => {
+  it('folds buffered follow-ups into the single <user_message> block', () => {
     const prompt = buildNewTopicPrompt(
       'first message',
       SESSION_ID,
@@ -106,8 +106,10 @@ describe('buildNewTopicPrompt', () => {
       undefined,
       ['second message', 'third message'],
     );
-    expect(prompt).toContain('<follow_up_message>\nsecond message\n</follow_up_message>');
-    expect(prompt).toContain('<follow_up_message>\nthird message\n</follow_up_message>');
+    // No separate <follow_up_message> blocks anymore — messages buffered during
+    // repo selection merge into the opening turn, blank-line separated.
+    expect(prompt).not.toContain('<follow_up_message>');
+    expect(prompt).toContain('<user_message>\nfirst message\n\nsecond message\n\nthird message\n</user_message>');
   });
 
   it('should include mention metadata in <mentions>', () => {
@@ -187,6 +189,16 @@ describe('buildFollowUpContent', () => {
     expect(content).not.toContain('<session_id>');
     expect(content).toContain('path="/tmp/img.jpg"');
   });
+
+  it('omits botmux_reminder for Mira follow-ups', () => {
+    const content = buildFollowUpContent('继续', SESSION_ID, {
+      isAdoptMode: false,
+      cliId: 'mira',
+    });
+
+    expect(content).not.toContain('<botmux_reminder>');
+    expect(content).not.toContain('botmux send');
+  });
 });
 
 // ─── buildReforkPrompt — wraps re-fork branch (resume / daemon-restart) ─────
@@ -241,6 +253,14 @@ describe('buildReforkPrompt', () => {
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('<user_message>');
     expect(out).toContain('<botmux_reminder>');
+  });
+
+  it('omits botmux_reminder for Mira re-fork prompts', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, 'hello', { cliId: 'mira' });
+    expect(out).toContain('<user_message>');
+    expect(out).not.toContain('<session_id>');
+    expect(out).not.toContain('<botmux_reminder>');
   });
 
   it('forwards attachments and mentions to the wrapper', () => {
@@ -321,10 +341,11 @@ describe('renderSenderTag', () => {
 // finally happens.
 
 describe('buildNewTopicPrompt with multi-user follow-ups', () => {
-  it('preserves per-follow-up <sender> tags embedded by the daemon', () => {
-    // daemon.ts prefixes each buffered enriched string with a <sender> tag
-    // rendered from THAT message's sender. Builder then drops each into its
-    // own <follow_up_message> wrapper.
+  it('folds buffered follow-ups into <user_message> while keeping per-message <sender> tags', () => {
+    // daemon.ts prefixes a buffered enriched string with a <sender> tag rendered
+    // from THAT message's sender when the sender differs from the first message.
+    // Builder now merges them all into the single opening <user_message> body
+    // rather than separate <follow_up_message> wrappers.
     const followUps = [
       `${renderSenderTag({ openId: 'ou_alice', type: 'user', name: 'Alice' })}\nAlice 的补充约束 1`,
       `${renderSenderTag({ openId: 'ou_bob', type: 'user', name: 'Bob' })}\nBob 的补充约束 2`,
@@ -344,17 +365,17 @@ describe('buildNewTopicPrompt with multi-user follow-ups', () => {
       { openId: 'ou_alice', type: 'user', name: 'Alice' },
     );
 
-    // Main message keeps its sibling <sender>
-    expect(prompt).toContain('<user_message>\n主消息（来自 Alice）\n</user_message>');
-    // Each follow-up wrapper contains the matching open_id — no cross-contamination
-    const fu1Match = prompt.match(/<follow_up_message>\n([\s\S]*?)\n<\/follow_up_message>/g);
-    expect(fu1Match).toHaveLength(2);
-    expect(fu1Match![0]).toContain('open_id="ou_alice"');
-    expect(fu1Match![0]).toContain('Alice 的补充约束 1');
-    expect(fu1Match![1]).toContain('open_id="ou_bob"');
-    expect(fu1Match![1]).toContain('Bob 的补充约束 2');
-    // Bob's sender does NOT leak into Alice's follow-up and vice versa
-    expect(fu1Match![0]).not.toContain('ou_bob');
-    expect(fu1Match![1]).not.toContain('ou_alice');
+    // No separate follow-up blocks — everything folds into the opening turn.
+    expect(prompt).not.toContain('<follow_up_message>');
+    // One <user_message> carries the main message plus both buffered ones.
+    const umMatch = prompt.match(/<user_message>\n([\s\S]*?)\n<\/user_message>/);
+    expect(umMatch).not.toBeNull();
+    const body = umMatch![1];
+    expect(body).toContain('主消息（来自 Alice）');
+    expect(body).toContain('Alice 的补充约束 1');
+    expect(body).toContain('Bob 的补充约束 2');
+    // Per-message sender attribution survives inline for multi-user buffers.
+    expect(body).toContain('open_id="ou_alice"');
+    expect(body).toContain('open_id="ou_bob"');
   });
 });

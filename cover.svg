@@ -111,7 +111,7 @@
     <circle cx="15" cy="-10" r="4" fill="#ef4444"/>
     <circle cx="27" cy="-10" r="4" fill="#eab308"/>
     <circle cx="39" cy="-10" r="4" fill="#22c55e"/>
-    <text x="15" y="14" class="bot-text" fill="#10b981"><tspan fill="#a1a1aa">~ </tspan>aiden</text>
+    <text x="15" y="14" class="bot-text" fill="#10b981"><tspan fill="#a1a1aa">~ </tspan>opencode</text>
   </g>
 
   <g transform="translate(900, 434)">
@@ -119,7 +119,7 @@
     <circle cx="15" cy="-10" r="4" fill="#ef4444"/>
     <circle cx="27" cy="-10" r="4" fill="#eab308"/>
     <circle cx="39" cy="-10" r="4" fill="#22c55e"/>
-    <text x="15" y="14" class="bot-text" fill="#c084fc"><tspan fill="#a1a1aa">~ </tspan>coco</text>
+    <text x="15" y="14" class="bot-text" fill="#c084fc"><tspan fill="#a1a1aa">~ </tspan>antigravity</text>
   </g>
 
   <g transform="translate(900, 500)">

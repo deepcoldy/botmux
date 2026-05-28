@@ -75,7 +75,7 @@ function load(): void {
 function save(): void {
   ensureDir();
   const fp = getFilePath();
-  const tmpFp = fp + '.tmp';
+  const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
   const obj: Record<string, Session> = {};
   for (const [k, v] of sessions) {
     obj[k] = v;

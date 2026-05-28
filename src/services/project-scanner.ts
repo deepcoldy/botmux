@@ -32,6 +32,17 @@ export interface ProjectInfo {
   branch: string;
 }
 
+/**
+ * Describe a single directory as a project: its basename + current git ref,
+ * or null if the directory isn't a git repo/worktree. Used by `/repo <path>`
+ * to label an explicitly given path that may sit outside the scanned roots
+ * (the card's project list, by contrast, only covers the scan dirs).
+ */
+export function describeProjectDir(dir: string): { name: string; branch: string } | null {
+  if (!isValidGitMarker(dir)) return null;
+  return { name: basename(dir), branch: getGitRef(dir) };
+}
+
 /** `rev-parse --abbrev-ref HEAD` returns the literal string `HEAD` when
  *  detached — that's the signal to fall through to tag/SHA. */
 function getGitRef(dir: string): string {

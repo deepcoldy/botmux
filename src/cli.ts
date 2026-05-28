@@ -43,6 +43,7 @@ import {
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
 import type { CliId } from './adapters/cli/types.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -50,6 +51,13 @@ import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
 } from './cli/bots-list-output.js';
+import {
+  buildFooterAddressing,
+  hasKnownBotMention,
+  knownBotOpenIdsFromCrossRef,
+  orderedFooterRecipients,
+  type BotMentionEntry,
+} from './utils/bot-routing.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 
@@ -256,6 +264,12 @@ function ecosystemConfig(): string {
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
     env: {
+      // MUST match the bot daemons' SESSION_DATA_DIR: the dashboard shares
+      // pairings/federations/memberships with them via {dataDir}/*.json. Without
+      // it the dashboard falls back to an install-relative ../data and reads a
+      // DIFFERENT store → /pair「配对码无效」, auto-bind hubsSynced:0,
+      // remote-group not_a_member (cross-deployment 拉群 silently broken).
+      SESSION_DATA_DIR: DATA_DIR,
       BOTMUX_DASHBOARD_HOST: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
       BOTMUX_DASHBOARD_PORT: process.env.BOTMUX_DASHBOARD_PORT ?? '7891',
     },
@@ -282,6 +296,66 @@ function printInputHelp(title: string, lines: string[]): void {
   for (const line of lines) {
     console.log(`  ${line}`);
   }
+}
+
+/**
+ * 读取指定 CLI 适配器声明的候选 model 列表 —— 不支持 model 配置的 CLI（aiden/
+ * antigravity/mtr 等没声明 modelChoices）返回 null，promptModel 据此整段
+ * 跳过提问。适配器解析失败也按"不支持"处理，避免在 setup 中冒出陌生堆栈。
+ */
+function cliModelChoices(cliId: CliId): readonly string[] | null {
+  try {
+    const adapter = createCliAdapterSync(cliId);
+    return adapter.modelChoices && adapter.modelChoices.length > 0
+      ? adapter.modelChoices
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 询问"指定 CLI 用哪个 model"。
+ *   - cliId 对应的 adapter 没声明 modelChoices → return undefined（跳过提问）
+ *   - 用户输入序号 → 取候选列表对应项
+ *   - 输入空 + 提供 current → 保留当前值（current 透传出去）
+ *   - 输入空 + 无 current → return undefined（用 CLI 默认）
+ *   - 输入 `-` → return null（语义：清空，调用方据此 delete model 字段）
+ *   - 输入自由文本 → 原样返回
+ */
+async function promptModel(
+  rl: ReturnType<typeof createInterface>,
+  cliId: CliId,
+  current?: string,
+): Promise<string | null | undefined> {
+  const choices = cliModelChoices(cliId);
+  if (!choices) return undefined;
+
+  const numbered = choices.map((m, i) => `${i + 1}) ${m}`).join('  ');
+  printInputHelp(`CLI Model（${cliId}）`, [
+    '可选。在 spawn CLI 时注入 model 参数；同一 CLI 配多个 bot 可以跑不同 model。',
+    `候选: ${numbered}  ${choices.length + 1}) Other（自定义输入）`,
+    current
+      ? '留空保留当前值；输入 - 清空（回到 CLI 默认）。'
+      : '留空 = 不设置（用 CLI 默认）。',
+  ]);
+  const label = current ? formatOptionalValue(current) : '未设置';
+  const raw = (await ask(rl, `CLI Model [${label}]: `)).trim();
+  if (!raw) return current ?? undefined;
+  if (raw === '-') return null;
+
+  const numIdx = Number(raw);
+  if (Number.isInteger(numIdx) && numIdx >= 1 && numIdx <= choices.length) {
+    return choices[numIdx - 1];
+  }
+  if (Number.isInteger(numIdx) && numIdx === choices.length + 1) {
+    // 选了 Other，进一步要 free-form
+    const customRaw = (await ask(rl, '请输入 model 名: ')).trim();
+    if (!customRaw) return current ?? undefined;
+    return customRaw;
+  }
+  // 直接当成自由输入
+  return raw;
 }
 
 // Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
@@ -511,7 +585,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   let cliId: CliId;
   try {
@@ -522,6 +596,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     return null;
   }
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
+  const modelChoice = await promptModel(rl, cliId);
 
   // 不再持久化 brand 字段: setup 阶段 brand=lark 直接被 obtainCredentials 中止,
   // 落盘的永远是 'feishu', 写进配置是死字段. 等 lark 完整接入再加回来, 那时
@@ -535,6 +610,10 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     // 在哪儿, 不用去 README 查字段名.
     workingDir: workingDir.trim() || '~',
   };
+  // modelChoice === undefined → 该 CLI 没声明候选 / 用户跳过；不写 model 字段
+  if (typeof modelChoice === 'string' && modelChoice) {
+    bot.model = modelChoice;
+  }
   // 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id), 天然就是 owner.
   // 手动 fallback 场景没 open_id —— 必须显式指定 owner, 否则配置无 owner:
   // allowedUsers 为空时虽然"全开放", 但一旦后续加了 allowedChatGroups 就会变成
@@ -605,7 +684,7 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira');
   printInputHelp('CLI 适配器', [
     '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
     '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
@@ -618,6 +697,29 @@ async function promptEditBotConfig(
     '留空保留当前值；输入 - 清空覆盖，回到 PATH 查 cliId 对应的默认二进制。',
   ]);
   input.cliPathOverride = await ask(rl, `CLI 可执行文件路径覆盖 [${formatOptionalValue(bot.cliPathOverride)}]: `);
+
+  // promptModel 返回 string | null | undefined，直接灌进 BotConfigEditInput.model:
+  //   undefined = 用户跳过 / adapter 不支持 → applyBotConfigEdits 不改 model
+  //   null      = 用户输 `-` 清空 → delete model
+  //   string    = 设值
+  // 用本轮编辑后的 cliId 而非 bot.cliId —— 用户可能刚换了 CLI。
+  const effectiveCliIdForModel = (resolveCliId(input.cliChoice) ?? bot.cliId ?? 'claude-code') as CliId;
+  const cliChanged = !!resolveCliId(input.cliChoice) && resolveCliId(input.cliChoice) !== bot.cliId;
+  if (cliChanged && !cliModelChoices(effectiveCliIdForModel)) {
+    // 切到一个不支持 model 的 adapter（例如 aiden / mtr / antigravity）：
+    // 即使原本配了 model 也要主动清空，避免 bots.json 里残留陈旧字段——
+    // 否则用户后面再换回支持 model 的 adapter 一路回车时，旧 model
+    // 会被当作"当前值"保留下来误套到新 CLI 上。
+    console.log('\n⚠️  新 CLI 不支持 --model 参数，已清空原 model 字段。');
+    input.model = null;
+  } else {
+    const promptCurrent = cliChanged ? undefined : (typeof bot.model === 'string' ? bot.model : undefined);
+    const result = await promptModel(rl, effectiveCliIdForModel, promptCurrent);
+    // 切换 CLI 时哪怕用户留空也要清掉旧 model —— 旧值是上一个 CLI 的 model，
+    // 套到新 CLI 上没意义。result === undefined 在"未变 CLI"分支等价于"保留旧值"，
+    // 但在 cliChanged 分支等价于"用户没指定，回到新 CLI 默认"，必须 force null。
+    input.model = cliChanged && result === undefined ? null : result;
+  }
 
   printInputHelp('会话后端 backendType', [
     '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着。',
@@ -1289,6 +1391,11 @@ interface SessionData {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;
+  lastCallerOpenId?: string;
+  /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
+  quoteTargetId?: string;
+  quoteTargetSenderOpenId?: string;
+  quoteTargetSenderIsBot?: boolean;
 }
 
 /**
@@ -2108,9 +2215,17 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --images <path>                 内联图片（可重复）
        --files <path>                  附件（可重复）
        --mention <open_id:name>        @提及（可重复）
+       --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
+       --no-mention                    明确声明本条不@任何人
+       --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）
+       --no-quote                      不引用，发独立消息（普通群）
        --card | --text                 强制卡片 / 纯文本（默认按 md 语法自动判断）
        --top-level                     发顶层消息（不回复进当前话题）
        --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
+    @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。
+    按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
+    纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
+    （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
   bots list                            列出当前群聊中的机器人（含 open_id）
   history [--limit N] [--scope session|thread|chat|ambient]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
@@ -2550,24 +2665,10 @@ function argValues(args: string[], ...flags: string[]): string[] {
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildCardBodyElements` and `hasMarkdown` from there.
-import { buildCardBodyElements, hasMarkdown } from './im/lark/md-card.js';
-
-/**
- * Decide who the reply card should @ in its footer.
- *
- * Non-oncall chats: `发送给: @<owner>`.
- * Oncall chats: `发送给: @<last caller>` (falls back to owner if unknown) —
- *   permission is governed by allowedUsers, so there's no per-chat list to cc.
- */
-function buildFooterAddressing(
-  s: { ownerOpenId?: string; lastCallerOpenId?: string },
-  oncall: { workingDir: string } | undefined,
-): { sendTo: string | undefined; cc: string[] } {
-  const owner = s.ownerOpenId;
-  const caller = s.lastCallerOpenId ?? owner;
-  if (!oncall) return { sendTo: owner, cc: [] };
-  return { sendTo: caller, cc: [] };
-}
+import { buildCardBodyElements, hasMarkdown, brandFooterSegment } from './im/lark/md-card.js';
+import { resolveBrandLabel } from './bot-registry.js';
+import { config } from './config.js';
+import { resolveQuoteTarget, validateMentionDecision } from './services/send-policy.js';
 
 async function cmdSend(rest: string[]): Promise<void> {
   // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
@@ -2599,6 +2700,13 @@ async function cmdSend(rest: string[]): Promise<void> {
   // for streaming-card / progress UI.
   const sendTopLevel = rest.includes('--top-level');
   const overrideChatId = argValue(rest, '--chat-id');
+  // Quote chain (chat scope): --quote <message_id> overrides the auto target,
+  // --no-quote forces a plain (un-quoted) send.
+  const explicitQuote = argValue(rest, '--quote');
+  const noQuote = rest.includes('--no-quote');
+  // @ hard-gate: every reply must explicitly choose one of these.
+  const mentionBack = rest.includes('--mention-back');
+  const noMention = rest.includes('--no-mention');
 
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
@@ -2617,7 +2725,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -2644,6 +2752,27 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
 
+  // @ hard-gate (config.send.requireMentionDecision, default on): force the
+  // model to make an explicit @ decision before sending. --top-level publish
+  // is exempt. The error text adapts to who is being replied to (人 / bot).
+  const mentionGate = validateMentionDecision({
+    enabled: config.send.requireMentionDecision,
+    sendTopLevel,
+    hasMentionArgs: mentionArgs.length > 0,
+    mentionBack,
+    noMention,
+    hasQuoteTargetSender: !!s.quoteTargetSenderOpenId,
+  });
+  if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
+
+  // --mention-back: @ the sender of the message this turn is replying to
+  // (open_id from the session — model needn't know it). Bare-name form so it
+  // renders as a trailing <at>.
+  if (mentionBack && s.quoteTargetSenderOpenId
+      && !mentions.some(m => m.open_id === s.quoteTargetSenderOpenId)) {
+    mentions.push({ open_id: s.quoteTargetSenderOpenId, name: '' });
+  }
+
   // Validate file paths
   for (const p of [...images, ...files]) {
     if (!existsSync(p)) { console.error(`文件不存在: ${p}`); process.exit(1); }
@@ -2653,7 +2782,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -2668,11 +2797,37 @@ async function cmdSend(rest: string[]): Promise<void> {
   // addressing to go to the last caller in the shared oncall workspace.
   const oncallEntry = !sendTopLevel && !overrideChatId && s.chatId
     ? findOncallChatForAnyBot(s.chatId) : undefined;
-  // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single decision point
+  // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
+  // decision point. Used for file attachments (always plain in chat scope).
   const dispatch = (content: string, msgType: string): Promise<string> =>
     (sendTopLevel || isChatScope)
       ? sendMessage(appId, targetChatId, content, msgType)
       : replyMessage(appId, s.rootMessageId, content, msgType, true);
+
+  // Quote chain (普通群): the primary message replies to the turn's target so
+  // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
+  // scope and --top-level never quote. Withdrawn target → fall back to plain.
+  const quoteTargetId = resolveQuoteTarget({
+    isChatScope, sendTopLevel, noQuote, explicitQuote,
+    sessionQuoteTargetId: s.quoteTargetId,
+  });
+  let primaryQuotedId: string | null = null;
+  const dispatchPrimary = async (content: string, msgType: string): Promise<string> => {
+    if (quoteTargetId) {
+      try {
+        const id = await replyMessage(appId, quoteTargetId, content, msgType, false);
+        primaryQuotedId = quoteTargetId;
+        return id;
+      } catch (err: any) {
+        if (err instanceof MessageWithdrawnError) {
+          console.error(`引用目标 ${quoteTargetId} 已撤回，改为普通发送`);
+          return sendMessage(appId, targetChatId, content, msgType);
+        }
+        throw err;
+      }
+    }
+    return dispatch(content, msgType);
+  };
 
   try {
     // Upload images in parallel
@@ -2708,15 +2863,20 @@ async function cmdSend(rest: string[]): Promise<void> {
     // "获取群组中其他机器人和用户@当前机器人的消息"权限），不再走任何本地
     // 转发——botmux 历史上为绕过 Lark 不投递跨 bot 事件搞过 signal-file，
     // 那套已经在该权限上线后整体下线。
+    let botEntries: BotMentionEntry[] = [];
+    let crossRef: Record<string, string> = {};
     try {
       const dataDir = resolveDataDir();
       const botInfoPath = join(dataDir, 'bots-info.json');
-      type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
-      const botEntries: BotInfoEntry[] = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
+      botEntries = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
       const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
-      const crossRef: Record<string, string> = existsSync(crossRefPath)
+      crossRef = existsSync(crossRefPath)
         ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
         : {};
+      // --no-mention 显式不 @ 任何人：跳过正文 @BotName 的自动注入，否则正文里
+      // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
+      // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
+      if (!noMention) {
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
       // Sort by name length desc so longer names ("Claude分身") win over their
       // prefix ("Claude") when both could match — break-on-first-hit otherwise
@@ -2724,9 +2884,17 @@ async function cmdSend(rest: string[]): Promise<void> {
       const sortedEntries = [...botEntries].sort(
         (a, b) => (b.botName?.length ?? 0) - (a.botName?.length ?? 0),
       );
+      const selfAliases = new Set(
+        botEntries
+          .filter(entry => entry.larkAppId === appId)
+          .flatMap(entry => [entry.botName, entry.cliId])
+          .filter((name): name is string => !!name)
+          .map(name => name.toLowerCase()),
+      );
       for (const entry of sortedEntries) {
         if (!entry.botName || entry.larkAppId === appId) continue;
-        const names = [entry.botName, entry.cliId].filter(Boolean) as string[];
+        const names = [entry.botName, entry.cliId]
+          .filter((name): name is string => !!name && !selfAliases.has(name.toLowerCase()));
         for (const name of names) {
           const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           // Boundary: lookbehind blocks only ASCII word chars (so `user@Claude`
@@ -2751,7 +2919,21 @@ async function cmdSend(rest: string[]): Promise<void> {
           break;
         }
       }
+      }
     } catch { /* best-effort */ }
+
+    const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
+    const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
+    // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
+    // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
+    // （Codex review P2）。--top-level 同样无特定收件人。
+    const footerAddressing = (sendTopLevel || noMention)
+      ? { sendTo: undefined as string | undefined, cc: [] as string[] }
+      : buildFooterAddressing(s, {
+          isOncall: !!oncallEntry,
+          hasExplicitBotMention: explicitKnownBotMention,
+          knownBotOpenIds,
+        });
 
     // Decide: interactive card (renders markdown) vs. post (plain text).
     // Explicit --card / --text wins; otherwise auto-detect markdown syntax.
@@ -2786,9 +2968,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           return `<at id=${openId}></at>`;
         });
       }
-      const trailingAts: string[] = [];
-      for (const m of mentions) if (!usedIds.has(m.open_id)) trailingAts.push(`<at id=${m.open_id}></at>`);
-      if (trailingAts.length > 0) md = md ? `${md}\n\n${trailingAts.join(' ')}` : trailingAts.join(' ');
+      // Non-inlined mentions are no longer dangled as a trailing @ block at the
+      // body bottom — they're consolidated onto the footer `发送给：` line below
+      // (human addressee first, then explicit targets). See orderedFooterRecipients.
 
       // Inline images into the markdown via ![](img_key). If caller used an
       // `![alt](img:N)` placeholder, substitute by 0-based index; any remaining
@@ -2813,31 +2995,43 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
       // text size + grey font tag so it reads like a footnote below the hr.
-      // Oncall groups: `发送给` targets whoever triggered this turn (may not
-      // be the session owner). Non-oncall: keep owner-only behaviour.
-      const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-      // Top-level publish has no specific recipient — drop "发送给/cc" addressing
-      // so the message doesn't @ the session owner who isn't even in the target chat.
-      const addressing = sendTopLevel
-        ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-        : buildFooterAddressing(s, oncallEntry);
-      if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
-      if (addressing.cc.length > 0) {
-        footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
-      }
-      elements.push({ tag: 'hr' });
-      elements.push({
-        tag: 'markdown',
-        text_size: 'notation_small_v2',
-        content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+      // Oncall groups usually address whoever triggered this turn (may not be
+      // the session owner). Bot recipients are filtered out so footer chrome
+      // cannot accidentally wake a sibling bot.
+      // Brand segment honours this bot's configured brandLabel (unset →
+      // default botmux, '' → suppressed, else custom). Same resolver/rule as
+      // the daemon's card builders so both send paths render identically.
+      const footerParts: string[] = [];
+      const brandSeg = brandFooterSegment(resolveBrandLabel(appId));
+      if (brandSeg) footerParts.push(brandSeg);
+      // All real mentions land on one footer line: human addressee first, then
+      // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
+      // the body prose are skipped. Top-level publish keeps sendTo empty.
+      const footerRecipients = orderedFooterRecipients({
+        sendTo: footerAddressing.sendTo,
+        mentionIds: mentions.map(m => m.open_id),
+        cc: footerAddressing.cc,
+        inlinedIds: usedIds,
       });
+      if (footerRecipients.length > 0) {
+        footerParts.push(`发送给：${footerRecipients.map(id => `<at id=${id}></at>`).join(' ')}`);
+      }
+      // Empty brand + no recipients → no footer at all (skip the orphan HR).
+      if (footerParts.length > 0) {
+        elements.push({ tag: 'hr' });
+        elements.push({
+          tag: 'markdown',
+          text_size: 'notation_small_v2',
+          content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+        });
+      }
 
       const cardJson = JSON.stringify({
         schema: '2.0',
         config: { update_multi: true },
         body: { direction: 'vertical', elements },
       });
-      messageId = await dispatch(cardJson, 'interactive');
+      messageId = await dispatchPrimary(cardJson, 'interactive');
     } else {
       // Plain-text path: build post content, paragraph per line.
       const postContent: any[][] = text ? text.split('\n').map((line: string) => {
@@ -2857,34 +3051,28 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       for (const key of imageKeys) postContent.push([{ tag: 'img', image_key: key }]);
 
-      if (mentions.length > 0) {
-        const usedIds = new Set<string>();
-        for (const para of postContent) for (const n of para) if (n.tag === 'at') usedIds.add(n.user_id);
-        const unused = mentions.filter(m => !usedIds.has(m.open_id));
-        if (unused.length > 0) {
-          if (postContent.length === 0) postContent.push([]);
-          for (const m of unused) postContent[postContent.length - 1].push({ tag: 'at', user_id: m.open_id });
-        }
-      }
-
-      // Footer: mirror the card layout — a blank paragraph separates the body
-      // from the addressing line(s). `发送给: @<caller>` always. Top-level
-      // publish has no specific recipient — skip addressing entirely.
-      const addressing = sendTopLevel
-        ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-        : buildFooterAddressing(s, oncallEntry);
-      if (addressing.sendTo || addressing.cc.length > 0) {
+      // Footer: mirror the card layout — all real mentions go on one
+      // `发送给：` line (human addressee first, then explicit targets, then cc),
+      // separated from the body by a blank paragraph. Ids already inlined in the
+      // body prose are skipped. Top-level publish keeps sendTo empty.
+      const inlinedIds = new Set<string>();
+      for (const para of postContent) for (const n of para) if (n.tag === 'at') inlinedIds.add(n.user_id);
+      const footerRecipients = orderedFooterRecipients({
+        sendTo: footerAddressing.sendTo,
+        mentionIds: mentions.map(m => m.open_id),
+        cc: footerAddressing.cc,
+        inlinedIds,
+      });
+      if (footerRecipients.length > 0) {
         if (postContent.length > 0) postContent.push([{ tag: 'text', text: '' }]);
-        if (addressing.sendTo) {
-          postContent.push([{ tag: 'text', text: '发送给：' }, { tag: 'at', user_id: addressing.sendTo }]);
-        }
-        if (addressing.cc.length > 0) {
-          postContent.push([{ tag: 'text', text: 'cc：' }, ...addressing.cc.map(id => ({ tag: 'at', user_id: id }))]);
-        }
+        postContent.push([
+          { tag: 'text', text: '发送给：' },
+          ...footerRecipients.map(id => ({ tag: 'at', user_id: id })),
+        ]);
       }
 
       const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
-      messageId = await dispatch(postJson, 'post');
+      messageId = await dispatchPrimary(postJson, 'post');
     }
 
     // Bridge fallback marker — append-only jsonl per session. The worker
@@ -2917,7 +3105,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     // --mention 的 open_id 解析（在上方 mentions 数组里完成）仍然必要，它让
     // Lark 在消息里渲染真正的 @at 元素，从而触发对方 bot 的 WS 事件投递。
 
-    console.log(JSON.stringify({ success: true, messageId, sessionId: sid }));
+    const atSummary = mentions.length > 0
+      ? `@${mentions.map(m => m.name || m.open_id).join(',')}`
+      : '未@任何人';
+    console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
+    console.log(JSON.stringify({
+      success: true,
+      messageId,
+      sessionId: sid,
+      quotedMessageId: primaryQuotedId,
+      mentioned: mentions.map(m => ({ open_id: m.open_id, name: m.name })),
+    }));
   } catch (err: any) {
     console.error(`发送失败: ${err.message}`);
     process.exit(1);
@@ -3106,6 +3304,355 @@ botmux create-group — 用一组机器人新建飞书群
 }
 
 // ─── Bots subcommand ─────────────────────────────────────────────────────────
+
+// ─── botmux ask v0.1.7 ───────────────────────────────────────────────────────
+//
+// CLI agent inside a botmux-spawned session calls `botmux ask buttons
+// --options "..." "<prompt>"`. Daemon sends a Lark card; user clicks; CLI
+// process unblocks with the selected key (or exit 124 on timeout, exit 3 if
+// the daemon dies). See /tmp/botmux-ask.md (or design memory).
+
+/**
+ * postAsk: 找到 daemon → POST /api/asks → 返回 AskResult。
+ * 连接失败 / HTTP 错误时抛出带 exitCode 属性的 Error：
+ *   - exitCode=3：daemon 不可达或 HTTP 非 400
+ *   - exitCode=2：400 + no_approvers
+ */
+async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
+  type AskResult = import('./core/ask-types.js').AskResult;
+
+  const larkAppId = body.larkAppId as string;
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) {
+    const err = new Error(
+      `botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`,
+    ) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      // No client-side timeout — broker enforces `timeoutMs` and will respond
+      // with `kind:'timedOut'` so this fetch always settles.
+    });
+  } catch (fetchErr) {
+    const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+    const err = new Error(
+      `botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`,
+    ) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+
+  if (!res.ok) {
+    let errBody = '';
+    try { errBody = (await res.text()).slice(0, 200); } catch { /* */ }
+    if (res.status === 400 && /no_approvers/.test(errBody)) {
+      const err = new Error(
+        'botmux ask: 当前会话没有可批准者（session.owner 不在 bot.allowedUsers 里，且 --approver 未指定）',
+      ) as Error & { exitCode: number };
+      err.exitCode = 2;
+      throw err;
+    }
+    const err = new Error(`botmux ask: daemon HTTP ${res.status}: ${errBody}`) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+
+  try {
+    return (await res.json()) as AskResult;
+  } catch (jsonErr) {
+    const err = new Error(`botmux ask: daemon 返回非 JSON: ${jsonErr}`) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+}
+
+async function cmdAsk(sub: string, rest: string[]): Promise<void> {
+  // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
+  // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
+  // approvals belong in humanGate / decision nodes so the choice is part of
+  // the run's event log; an ad-hoc `botmux ask` would bypass that audit
+  // trail entirely.
+  if (process.env.BOTMUX_WORKFLOW === '1') {
+    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
+    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
+    console.error(
+      `botmux ask refused inside workflow subagent (run=${runId} node=${nodeId}).\n` +
+        `Workflow subagents must surface approvals via humanGate / decision nodes\n` +
+        `so the resolution is recorded in the run's event log; ask would bypass it.`,
+    );
+    process.exit(2);
+  }
+
+  // Only `buttons` shipped in v0.1.7. The bare alias (`botmux ask --options`)
+  // routes here with sub='' — accept it and behave identically. `ask text` /
+  // `ask confirm` are reserved for later versions.
+  if (sub && sub !== 'buttons') {
+    console.error(
+      `botmux ask: 未知 subcommand "${sub}"（v0.1.7 仅支持 \`buttons\` 或省略）`,
+    );
+    process.exit(2);
+  }
+
+  const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
+    await import('./core/ask-args.js');
+  type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
+  const { toLegacySelected } = await import('./core/ask-types.js');
+
+  const missing = findMissingAskEnv(process.env);
+  if (missing) {
+    console.error(
+      `botmux ask: 缺少必需环境变量 ${missing}。` +
+        ` 请在 botmux daemon spawn 的 CLI 会话内运行。`,
+    );
+    process.exit(2);
+  }
+
+  const optionsRaw = argValue(rest, '--options');
+  const timeoutRaw = argValue(rest, '--timeout');
+  const useJson = rest.includes('--json');
+  const approverArgs = argValues(rest, '--approver');
+  const positionalArgs = positionals(rest, ['--json']);
+
+  let options;
+  let timeoutMs;
+  try {
+    options = parseAskOptions(optionsRaw);
+    timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
+  } catch (err) {
+    if (err instanceof AskArgsError) {
+      console.error(`botmux ask: ${err.message}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+
+  const prompt = positionalArgs.join(' ').trim();
+  if (!prompt) {
+    console.error(
+      'botmux ask: 缺少 prompt。用法: botmux ask buttons --options "yes,no" "继续发版吗？"',
+    );
+    process.exit(2);
+  }
+
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
+  const body = {
+    sessionId: process.env.BOTMUX_SESSION_ID!,
+    chatId: process.env.BOTMUX_CHAT_ID!,
+    larkAppId,
+    rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
+    options,
+    prompt,
+    timeoutMs,
+    approvers: approverArgs,
+  };
+
+  let result;
+  try {
+    result = await postAsk(body);
+  } catch (err) {
+    const code = (err as any).exitCode ?? 3;
+    console.error((err as Error).message);
+    process.exit(code);
+  }
+
+  // result.kind==='answered' 时用 toLegacySelected 取回旧的 string（单问单选）
+  const selected = toLegacySelected(result);
+
+  if (useJson) {
+    const out: AskJsonOutput = {
+      selected,
+      answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
+      by: result.kind === 'answered' ? result.by : null,
+      comment: null,
+      timedOut: result.kind === 'timedOut',
+    };
+    process.stdout.write(JSON.stringify(out) + '\n');
+  } else if (result.kind === 'answered') {
+    // 非 JSON 模式：输出 selected key（单问单选），多选/多问输出空字符串
+    process.stdout.write((selected ?? '') + '\n');
+  }
+
+  switch (result.kind) {
+    case 'answered':
+      process.exit(0);
+    case 'timedOut':
+      console.error(`botmux ask: 超时（${timeoutMs / 1000}s），无回复`);
+      process.exit(124);
+    case 'invalidated':
+      console.error(`botmux ask: 已失效 (${result.reason})`);
+      process.exit(3);
+  }
+}
+
+// ─── botmux hook <cliId> ──────────────────────────────────────────────────────
+//
+// hook 模式：各 CLI hook 配置调用 `botmux hook <cliId>`，stdin 注入 hook payload，
+// 本命令解析问题 → POST /api/asks → 等结果 → 写 directive 到 stdout。
+// 任何失败（daemon 不可达、env 缺失、解析错误）均输出 passthrough directive 并 exit 0，
+// 绝不挂死，保证 CLI 可以继续原生终端提问。
+
+/**
+ * runHook: hook 命令的纯业务逻辑，接受已解析的 payload/env/postAskFn，
+ * 返回应写到 stdout 的字符串。通过依赖注入使单元测试无需真实 daemon/env。
+ *
+ * @param payload              已经 JSON.parse 的 hook payload 对象
+ * @param env                  包含 BOTMUX_* 环境变量的字典
+ * @param postAskFn            替代真实 postAsk 的可注入函数（测试用）
+ * @param cliId                CLI 适配器 ID
+ * @param resolveAdoptRouteFn  可选：替代真实 adopt 路由解析的注入函数（测试用）；
+ *                             缺省时使用真实 resolveAdoptRoute（查祖先 PID → daemon）
+ * @returns                    { stdout: string } 应写到 stdout 的内容
+ */
+export async function runHook(
+  payload: unknown,
+  env: Record<string, string | undefined>,
+  postAskFn: (body: Record<string, unknown>) => Promise<import('./core/ask-types.js').AskResult>,
+  cliId: string,
+  resolveAdoptRouteFn?: () => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
+): Promise<{ stdout: string }> {
+  const { getHookAdapter } = await import('./core/ask-hook/registry.js');
+
+  // 未知 cliId → 无 adapter，输出空字符串静默放行
+  const adapter = getHookAdapter(cliId);
+  if (!adapter) {
+    return { stdout: '' };
+  }
+
+  // Workflow-subagent 安全门：workflow 子 agent 内直接 passthrough
+  if (env.BOTMUX_WORKFLOW === '1') {
+    return { stdout: adapter.passthrough(payload) };
+  }
+
+  // 解析问题：非 askUserQuestion 类事件 → passthrough 放行
+  const parsed = adapter.parseQuestions(payload);
+  if (!parsed) {
+    return { stdout: adapter.passthrough(payload) };
+  }
+
+  // 检查必需的 BOTMUX_* env
+  const sessionId = env.BOTMUX_SESSION_ID;
+  const chatId = env.BOTMUX_CHAT_ID;
+  const larkAppId = env.BOTMUX_LARK_APP_ID;
+
+  // 路由变量：优先用 env，env 缺失时尝试 adopt 路由
+  let routeSessionId = sessionId;
+  let routeChatId = chatId;
+  let routeLarkAppId = larkAppId;
+  let routeRoot: string | null = env.BOTMUX_ROOT_MESSAGE_ID || null;
+
+  if (!sessionId || !chatId || !larkAppId) {
+    // env 缺失 → 尝试通过祖先 PID 匹配在线 adopt 会话
+    const resolver = resolveAdoptRouteFn ?? (() => {
+      // 延迟 import 避免冷启动开销
+      return import('./adapters/adopt-route.js').then(({ resolveAdoptRoute, queryAdoptSession }) =>
+        resolveAdoptRoute({
+          startPid: process.pid,
+          listDaemons: listOnlineDaemons,
+          queryDaemon: queryAdoptSession,
+        }),
+      );
+    });
+    let adopt: import('./adapters/adopt-route.js').AdoptRoute | null = null;
+    try {
+      adopt = await resolver();
+    } catch {
+      // 解析失败 → 视作真非 botmux 会话，passthrough 放行
+    }
+    if (!adopt) {
+      // 真非 botmux 会话 → passthrough 放行
+      return { stdout: adapter.passthrough(payload) };
+    }
+    // adopt 命中 → 使用 adopt 路由信息
+    routeSessionId = adopt.sessionId;
+    routeChatId = adopt.chatId;
+    routeLarkAppId = adopt.larkAppId;
+    routeRoot = adopt.rootMessageId;
+  }
+
+  // 解析 timeoutMs：默认 1 小时，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖
+  const DEFAULT_TIMEOUT_MS = 3_600_000;
+  let timeoutMs = DEFAULT_TIMEOUT_MS;
+  const timeoutEnv = env.BOTMUX_ASK_TIMEOUT_MS;
+  if (timeoutEnv) {
+    const parsed_timeout = parseInt(timeoutEnv, 10);
+    if (Number.isInteger(parsed_timeout) && parsed_timeout > 0) {
+      timeoutMs = parsed_timeout;
+    }
+  }
+
+  const body: Record<string, unknown> = {
+    sessionId: routeSessionId,
+    chatId: routeChatId,
+    larkAppId: routeLarkAppId,
+    rootMessageId: routeRoot,
+    questions: parsed.questions,
+    timeoutMs,
+    approvers: [],
+  };
+
+  let result: import('./core/ask-types.js').AskResult;
+  try {
+    result = await postAskFn(body);
+  } catch {
+    // 任何失败（daemon 不可达、HTTP 错误等）→ passthrough 放行
+    return { stdout: adapter.passthrough(payload) };
+  }
+
+  if (result.kind === 'answered') {
+    return { stdout: adapter.formatAnswer(result.answers, parsed) };
+  }
+
+  // timedOut / invalidated → passthrough 放行
+  return { stdout: adapter.passthrough(payload) };
+}
+
+/**
+ * cmdHook: `botmux hook <cliId>` 入口。
+ * 读取 stdin 全文 → JSON.parse → runHook → 写 stdout，exit 0。
+ */
+async function cmdHook(cliId: string): Promise<void> {
+  // 读取 stdin 全文
+  let stdinText = '';
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    stdinText = Buffer.concat(chunks).toString('utf-8');
+  } catch {
+    // stdin 读取失败 → 无法处理，静默退出
+    process.exit(0);
+  }
+
+  // JSON.parse 失败 → 输出空并退出（不挂死）
+  let payload: unknown;
+  try {
+    payload = JSON.parse(stdinText);
+  } catch {
+    process.exit(0);
+  }
+
+  const { getHookAdapter } = await import('./core/ask-hook/registry.js');
+  const adapter = getHookAdapter(cliId);
+  // 未知 cliId → 静默放行
+  if (!adapter) {
+    process.exit(0);
+  }
+
+  const env = process.env as Record<string, string | undefined>;
+  const result = await runHook(payload, env, postAsk, cliId);
+  if (result.stdout) {
+    console.log(result.stdout);
+  }
+  process.exit(0);
+}
 
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
@@ -3311,6 +3858,20 @@ switch (command) {
   case 'rm':      cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'ask': {
+    // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
+    // `botmux ask --options ...`         → sub='',        rest=['--options', ...]  (bare alias)
+    const { normalizeAskDispatch } = await import('./core/ask-args.js');
+    const { sub, rest } = normalizeAskDispatch(process.argv.slice(3));
+    await cmdAsk(sub, rest);
+    break;
+  }
+  case 'hook': {
+    // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
+    const cliId = process.argv[3] ?? '';
+    await cmdHook(cliId);
+    break;
+  }
   case 'workflow': {
     const { cmdWorkflow } = await import('./cli/workflow.js');
     await cmdWorkflow(process.argv[3] ?? '', process.argv.slice(4));

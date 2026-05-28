@@ -599,20 +599,26 @@ button.primary {
 
 .cli-claude-code { background: #e8f0ff; color: #234fb4; border-color: #c8d9ff; }
 .cli-codex       { background: #fff0df; color: #a14c11; border-color: #ffd8ad; }
+.cli-codex-app   { background: #e9f7ff; color: #11638f; border-color: #bde4fa; }
 .cli-cursor      { background: #ece9ff; color: #5b4ac7; border-color: #d9d2ff; }
 .cli-gemini      { background: #fde7f1; color: #a13268; border-color: #fac8df; }
 .cli-opencode    { background: #e7f7ec; color: #176b36; border-color: #bfe8ce; }
 .cli-mtr         { background: #e5f5ff; color: #0f6388; border-color: #b8e2f7; }
+.cli-hermes      { background: #f0f4e4; color: #546b14; border-color: #d9e9a8; }
+.cli-mira        { background: #e8f6f6; color: #12686d; border-color: #b9e4e5; }
 .cli-aiden       { background: #fff7d1; color: #8b6508; border-color: #f7df87; }
 .cli-coco        { background: #e4f7f2; color: #0c695b; border-color: #b7e4d9; }
 .cli-unknown     { background: var(--surface-muted); color: var(--muted); }
 
 :root[data-theme="dark"] .cli-claude-code,
 :root[data-theme="dark"] .cli-codex,
+:root[data-theme="dark"] .cli-codex-app,
 :root[data-theme="dark"] .cli-cursor,
 :root[data-theme="dark"] .cli-gemini,
 :root[data-theme="dark"] .cli-opencode,
 :root[data-theme="dark"] .cli-mtr,
+:root[data-theme="dark"] .cli-hermes,
+:root[data-theme="dark"] .cli-mira,
 :root[data-theme="dark"] .cli-aiden,
 :root[data-theme="dark"] .cli-coco {
   background: var(--surface-muted);
@@ -869,6 +875,20 @@ input.row-select,
 .bd-body .bd-row input[type=text] { font-family: var(--mono); font-size: 12px; }
 .bd-meta { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 8px 0; }
 .oncall-status.hint-ok { background: transparent; border: none; padding: 0; margin: 0; color: var(--success); }
+
+/* Each bd-card groups several independent defaults (oncall, signature, …);
+   bd-section gives every group its own labelled, divided block. */
+.bd-section { padding-top: 14px; }
+.bd-section + .bd-section { margin-top: 14px; border-top: 1px solid var(--border-soft); }
+.bd-section-title {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.bd-section-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 
 @media (max-width: 980px) {
   .app-shell {

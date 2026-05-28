@@ -17,7 +17,7 @@
  * `notifyOwnerOpenId` MUST be in `creatorLarkAppId`'s app scope. Enforcing
  * this is the decision layer's job — the service trusts its inputs.
  */
-import { createChat, transferChatOwner, getChatOwner, getChatShareLink } from './groups-store.js';
+import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId } from './groups-store.js';
 import { sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
 
@@ -28,6 +28,10 @@ export interface CreateGroupOpts {
   larkAppIds: string[];
   name?: string;
   userOpenIds?: string[];
+  /** Users to add by union_id (tenant-stable) — used to pull bot OWNERS into a
+   *  federated group regardless of which bot they paired through (open_id is
+   *  app-scoped, union_id is not). Added after the chat is created. */
+  ownerUnionIds?: string[];
   transferOwnerTo?: string;
   notifyOwnerOpenId?: string;
   /** Optional working directory to bind the newly created chat to oncall for
@@ -42,6 +46,8 @@ export interface CreateGroupResult {
   creator: string;
   invalidBotIds: string[];
   invalidUserIds: string[];
+  /** Owner union_ids Lark could not add to the chat (best-effort). */
+  invalidOwnerUnionIds: string[];
   ownerTransferredTo: string | null;
   transferError: string | null;
   notifyMessageId: string | null;
@@ -75,6 +81,15 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     const sl = await getChatShareLink(opts.creatorLarkAppId, r.chatId);
     if (sl.ok) shareLink = sl.shareLink;
     else shareLinkError = sl.error;
+  }
+
+  // Pull bot owners into the chat by union_id (tenant-stable; the creator bot
+  // adds them). Best-effort — failures surface as invalidOwnerUnionIds, the chat
+  // still exists. The creator's own owner (if any) is harmless to re-add.
+  let invalidOwnerUnionIds: string[] = [];
+  if (opts.ownerUnionIds && opts.ownerUnionIds.length > 0) {
+    const ar = await addUsersToChatByUnionId(opts.creatorLarkAppId, r.chatId, opts.ownerUnionIds);
+    invalidOwnerUnionIds = ar.invalidUserIds;
   }
 
   let ownerTransferredTo: string | null = null;
@@ -151,6 +166,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     creator: opts.creatorLarkAppId,
     invalidBotIds: r.invalidBotIds,
     invalidUserIds: r.invalidUserIds,
+    invalidOwnerUnionIds,
     ownerTransferredTo,
     transferError,
     notifyMessageId,

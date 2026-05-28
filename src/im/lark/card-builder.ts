@@ -10,11 +10,14 @@ const cliDisplayNames: Record<CliId, string> = {
   'aiden': 'Aiden',
   'coco': 'CoCo',
   'codex': 'Codex',
+  'codex-app': 'Codex App',
   'cursor': 'Cursor',
   'gemini': 'Gemini',
   'opencode': 'OpenCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
+  'hermes': 'Hermes',
+  'mira': 'Mira',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -164,9 +167,14 @@ export function buildSessionClosedCard(
  */
 const MAX_CONTENT_BYTES = 100_000;
 
-/** Truncate content to fit within MAX_CONTENT_BYTES, keeping the tail (most recent output). */
-export function truncateContent(content: string, locale?: Locale): string {
-  if (Buffer.byteLength(content, 'utf-8') <= MAX_CONTENT_BYTES) return content;
+/**
+ * Truncate content to fit within `maxBytes`, keeping the tail (most recent
+ * output). Defaults to {@link MAX_CONTENT_BYTES}; callers that wrap the content
+ * in additional card JSON (e.g. the private snapshot's code fence) pass a
+ * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
+ */
+export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
+  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -174,13 +182,61 @@ export function truncateContent(content: string, locale?: Locale): string {
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= MAX_CONTENT_BYTES - 30) {
+    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
     }
   }
   return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
+}
+
+/** Byte budget for the private snapshot's text fallback. Well under the ~109 KB
+ *  card limit, leaving room for JSON escaping + the card's structural overhead. */
+const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
+
+const STREAM_TEMPLATE_MAP = {
+  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green',
+} as const;
+
+/** Header status label for a streaming/snapshot card. Shared by the live card
+ *  and the private snapshot so the two never drift. */
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale): string {
+  switch (status) {
+    case 'starting': return t('card.status.starting', undefined, locale);
+    case 'working': return t('card.status.working', undefined, locale);
+    case 'idle': return t('card.status.idle', undefined, locale);
+    case 'analyzing': return t('card.status.analyzing', undefined, locale);
+    case 'limited': return usageLimit?.retryReady
+      ? t('card.status.retry_ready', undefined, locale)
+      : t('card.status.limited', undefined, locale);
+  }
+}
+
+/** Push the shared "output body" elements (usage-limit notice + screenshot) used
+ *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
+function pushStreamBody(
+  elements: any[],
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale },
+): void {
+  const { status, usageLimit, displayMode, imageKey, cliName, locale } = opts;
+  if (status === 'limited' && usageLimit) {
+    elements.push({
+      tag: 'markdown',
+      content: usageLimit.retryReady
+        ? t('card.usage_limit.retry_ready', { cliName }, locale)
+        : t('card.usage_limit.retry_at', { cliName, retryLabel: usageLimit.retryLabel }, locale),
+    });
+    elements.push({ tag: 'hr' });
+  }
+  if (displayMode === 'screenshot') {
+    if (imageKey) {
+      elements.push({ tag: 'img', img_key: imageKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true });
+    } else {
+      elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
+    }
+    elements.push({ tag: 'hr' });
+  }
 }
 
 /**
@@ -209,51 +265,17 @@ export function buildStreamingCard(
   showTakeover?: boolean,
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
+  writableTerminalUrl?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
-  const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green' } as const;
-  const statusLabel = (s: typeof status): string => {
-    switch (s) {
-      case 'starting': return t('card.status.starting', undefined, locale);
-      case 'working': return t('card.status.working', undefined, locale);
-      case 'idle': return t('card.status.idle', undefined, locale);
-      case 'analyzing': return t('card.status.analyzing', undefined, locale);
-      case 'limited': return usageLimit?.retryReady
-        ? t('card.status.retry_ready', undefined, locale)
-        : t('card.status.limited', undefined, locale);
-    }
-  };
 
   const elements: any[] = [];
 
-  // ── Output body ─────────────────────────────────────────────────────────
-  if (status === 'limited' && usageLimit) {
-    elements.push({
-      tag: 'markdown',
-      content: usageLimit.retryReady
-        ? t('card.usage_limit.retry_ready', { cliName }, locale)
-        : t('card.usage_limit.retry_at', { cliName, retryLabel: usageLimit.retryLabel }, locale),
-    });
-    elements.push({ tag: 'hr' });
-  }
-
-  if (displayMode === 'screenshot') {
-    if (imageKey) {
-      elements.push({
-        tag: 'img',
-        img_key: imageKey,
-        alt: { tag: 'plain_text', content: '' },
-        mode: 'fit_horizontal',
-        preview: true,
-      });
-    } else {
-      elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
-    }
-    elements.push({ tag: 'hr' });
-  }
+  // ── Output body (shared with the private snapshot card) ──────────────────
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale });
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
@@ -325,6 +347,17 @@ export function buildStreamingCard(
   }
   elements.push({ tag: 'action', actions: headerActions });
 
+  // ── Writable terminal link (opt-in) ─────────────────────────────────────
+  // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
+  // link right in the card so anyone here can open a writable terminal without
+  // the get-write-link → DM round-trip. The link is intentionally group-visible.
+  if (writableTerminalUrl) {
+    elements.push({
+      tag: 'markdown',
+      content: t('card.writable_terminal_link', { url: writableTerminalUrl }, locale),
+    });
+  }
+
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
   if (displayMode === 'screenshot') {
@@ -360,8 +393,109 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${statusLabel(status)}` },
-      template: templateMap[displayStatus],
+      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      template: STREAM_TEMPLATE_MAP[displayStatus],
+    },
+    elements,
+  };
+  return JSON.stringify(card);
+}
+
+/**
+ * Build a static "private snapshot" card for `/card` in private mode — sent via
+ * the ephemeral API to one user at a time. Unlike {@link buildStreamingCard} it
+ * is **never PATCH-updated** (ephemeral cards can't be), so it carries only a
+ * one-shot snapshot of the terminal screenshot plus three buttons:
+ *   • read-only "open terminal" link (a plain URL button — no callback);
+ *   • "get write link", whose callback DMs the writable link to the clicker;
+ *   • "close session", whose callback kills the session and (in private mode)
+ *     sends the "closed" card ephemeral to the owner audience too — so the
+ *     session title / CLI name / workingDir on it don't leak to the group.
+ * The last two have callbacks but neither patches THIS card (one DMs, the other
+ * sends a fresh card), so both work fine on an ephemeral card. Both are
+ * `canOperate`-gated in the handler — talk-only viewers who tap them are denied.
+ * The patch-driven controls (toggle/refresh/export/term keys) and the inline
+ * writable link are still omitted: those need to update this card, which
+ * ephemeral cards can't do.
+ */
+export function buildPrivateSnapshotCard(
+  terminalUrl: string,
+  title: string,
+  status: StreamStatus,
+  cliId: CliId | undefined,
+  imageKey: string | undefined,
+  screenContent: string,
+  sessionId: string,
+  rootId: string,
+  locale?: Locale,
+  usageLimit?: CliUsageLimitState,
+): string {
+  const effectiveCliId = cliId ?? 'claude-code';
+  const cliName = getCliDisplayName(effectiveCliId);
+  const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+  // `visibility: 'private'` pins this card's privacy intent onto the action
+  // itself, so a later callback (notably `close`) keeps sending ephemeral even
+  // if the bot's `privateCard` config is toggled off after the card was sent —
+  // otherwise the closed card (session title / workingDir / resume command)
+  // could leak to the group. See the `close` handler in card-handler.ts.
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, visibility: 'private' as const };
+
+  const elements: any[] = [];
+  // Show the terminal once: prefer the rendered screenshot when present;
+  // otherwise fall back to a code-block of the latest screen text so the
+  // snapshot isn't empty (common when the bot has the streaming card disabled
+  // or display mode never flipped to screenshot — `lastScreenContent` is still
+  // kept up to date regardless). pushStreamBody also emits the usage-limit
+  // notice, which applies in either case.
+  pushStreamBody(elements, {
+    status, usageLimit, displayMode: imageKey ? 'screenshot' : 'hidden', imageKey, cliName, locale,
+  });
+  if (!imageKey) {
+    const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
+    if (text) {
+      const body = truncateContent(text, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
+      // Fence must be longer than the longest backtick run in the body, else
+      // terminal output containing ``` would break out of the code block.
+      const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+      const fence = '`'.repeat(Math.max(3, maxRun + 1));
+      elements.push({ tag: 'markdown', content: `${fence}\n${body}\n${fence}` });
+      elements.push({ tag: 'hr' });
+    }
+  }
+
+  elements.push({
+    tag: 'action',
+    actions: [
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+        type: 'primary',
+        multi_url: { url: terminalUrl, pc_url: terminalUrl, android_url: terminalUrl, ios_url: terminalUrl },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+        type: 'default',
+        value: { action: 'get_write_link', ...actionBase },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+        type: 'danger',
+        value: { action: 'close', ...actionBase },
+      },
+    ],
+  });
+  elements.push({
+    tag: 'note',
+    elements: [{ tag: 'lark_md', content: t('card.private.snapshot_note', undefined, locale) }],
+  });
+
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };
@@ -450,19 +584,22 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     ? t('card.grant.body_request', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale)
     : t('card.grant.body_owner', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale);
   const v = { target_open_id: o.requesterOpenId, chat_id: o.chatId, nonce: o.nonce };
+  // 「全局授权对话」只在 owner 主动发卡时出现：owner 一眼明确要给全局；request 模式（成员
+  // 自助申请）只提供「本群」，避免成员把自己申请到全局。两个授权按钮都是 talk-only。
+  const grantButtons: any[] = [
+    { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.grant.btn_chat', undefined, locale) }, value: { action: 'grant_chat', ...v } },
+  ];
+  if (o.mode === 'owner') {
+    grantButtons.push({ tag: 'button', type: 'default', text: { tag: 'plain_text', content: t('card.grant.btn_global', undefined, locale) }, value: { action: 'grant_global', ...v } });
+  }
+  grantButtons.push({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.grant.btn_deny', undefined, locale) }, value: { action: 'grant_deny', ...v } });
   const card = {
     config: { wide_screen_mode: true },
     header: { template: 'orange', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: body } },
       { tag: 'hr' },
-      {
-        tag: 'action',
-        actions: [
-          { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.grant.btn_chat', undefined, locale) }, value: { action: 'grant_chat', ...v } },
-          { tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.grant.btn_deny', undefined, locale) }, value: { action: 'grant_deny', ...v } },
-        ],
-      },
+      { tag: 'action', actions: grantButtons },
       { tag: 'note', elements: [{ tag: 'lark_md', content: t('card.grant.note', undefined, locale) }] },
     ],
   };

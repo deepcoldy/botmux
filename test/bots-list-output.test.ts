@@ -14,6 +14,10 @@ describe('botmux bots list CLI output mapping', () => {
         name: 'codex',
         displayName: 'Codex Loopy',
         source: 'configured',
+        capability: '后端排查',
+        hasTeamRole: true,
+        mentionable: true,
+        mentionSource: 'cross-ref',
       },
       {
         larkAppId: 'cli_peer',
@@ -21,6 +25,9 @@ describe('botmux bots list CLI output mapping', () => {
         name: 'claude',
         displayName: 'Claude Loopy',
         source: 'configured',
+        hasTeamRole: false,
+        mentionable: false,
+        mentionSource: 'self',
       },
       {
         larkAppId: '',
@@ -28,6 +35,9 @@ describe('botmux bots list CLI output mapping', () => {
         name: 'external-loopy',
         displayName: 'External Loopy',
         source: 'introduce',
+        hasTeamRole: false,
+        mentionable: true,
+        mentionSource: 'observed',
       },
     ], 'cli_self');
 
@@ -39,6 +49,10 @@ describe('botmux bots list CLI output mapping', () => {
         source: 'configured',
         larkAppId: 'cli_self',
         workflowBot: 'cli_self',
+        capability: '后端排查',
+        hasTeamRole: true,
+        mentionable: true,
+        mentionSource: 'cross-ref',
       },
       {
         name: 'Claude Loopy',
@@ -47,6 +61,10 @@ describe('botmux bots list CLI output mapping', () => {
         source: 'configured',
         larkAppId: 'cli_peer',
         workflowBot: 'cli_peer',
+        capability: null,
+        hasTeamRole: false,
+        mentionable: false,
+        mentionSource: 'self',
       },
       {
         name: 'External Loopy',
@@ -55,6 +73,10 @@ describe('botmux bots list CLI output mapping', () => {
         source: 'introduce',
         larkAppId: '',
         workflowBot: null,
+        capability: null,
+        hasTeamRole: false,
+        mentionable: true,
+        mentionSource: 'observed',
       },
     ]);
   });
@@ -89,6 +111,10 @@ describe('botmux bots list CLI output mapping', () => {
         source: 'configured',
         larkAppId: 'cli_self',
         workflowBot: 'cli_self',
+        capability: null,
+        hasTeamRole: false,
+        mentionable: true,
+        mentionSource: 'self',
       },
       {
         name: 'Claude Loopy',
@@ -97,6 +123,10 @@ describe('botmux bots list CLI output mapping', () => {
         source: 'configured',
         larkAppId: 'cli_peer',
         workflowBot: 'cli_peer',
+        capability: null,
+        hasTeamRole: false,
+        mentionable: false,
+        mentionSource: 'fallback',
       },
     ]);
   });

@@ -73,6 +73,8 @@ import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // Build a fake worker child process whose IPC `message` event we can fire
 // manually, then wire it through setupWorkerHandlers via forkAdoptWorker.
@@ -128,9 +130,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    rmSync('/tmp/test-sessions', { recursive: true, force: true });
+    mkdirSync('/tmp/test-sessions', { recursive: true });
   });
 
   afterEach(() => {
+    rmSync('/tmp/test-sessions', { recursive: true, force: true });
     vi.useRealTimers();
   });
 
@@ -176,6 +181,58 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
+  });
+
+  it('does not address daemon final-output footers to a known bot owner', async () => {
+    writeFileSync(
+      join('/tmp/test-sessions', 'bot-openids-app_test.json'),
+      JSON.stringify({ Claude: 'ou_foreign_bot' }),
+    );
+
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_foreign_bot';
+    ds.ownerOpenId = 'ou_foreign_bot';
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain('[botmux](');
+    expect(cardJson).not.toContain('<at id=ou_foreign_bot></at>');
+  });
+
+  it('keeps daemon final-output footer addressing for a human owner', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_human';
+    ds.ownerOpenId = 'ou_human';
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain('<at id=ou_human></at>');
   });
 
   it('retries on transient failure and commits after success', async () => {

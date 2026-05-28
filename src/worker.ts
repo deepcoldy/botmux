@@ -29,6 +29,7 @@ import {
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
+import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -86,7 +87,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -234,6 +235,8 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+let hermesBridgeOffset = 0;
+let hermesBridgeBaselineDone = false;
 /** Codex sessionId we received via writeInput but haven't yet resolved a
  *  rollout file for. The poller keeps retrying — the file appears on
  *  Codex's first user submit, but with some race delay after our submit
@@ -302,6 +305,11 @@ function formatHeadlessLocalTurnContent(assistantText: string): string | null {
 // needed. Append-only over a shared file (instead of a per-turn marker) is
 // type-ahead safe: type-ahead'd turns each have their own [markTimeMs,
 // nextTurn.markTimeMs) window, and a stray send only fills its own bucket.
+// This relies on each turn's markTimeMs reflecting when it ACTUALLY started
+// processing, not when the worker marked it — the structured queue overrides
+// markTimeMs to the dequeue-time transcript event (CodexBridgeQueue.ingest)
+// and emitReadyCodexTurns only treats a STARTED next turn as a boundary, so
+// the early back-to-back marks type-ahead produces don't collapse the windows.
 function bridgeMarkerPath(): string | undefined {
   if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
   return join(process.env.SESSION_DATA_DIR, 'turn-sends', `${sessionId}.jsonl`);
@@ -1297,20 +1305,25 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 
 function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
-  // from append-only JSONL when the model forgets to call `botmux send`.
-  // Codex uses ~/.codex rollouts; CoCo uses ~/.cache/coco events. Both
-  // work in adopt mode now that CoCo's PID→sessionId discovery is wired.
-  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco';
+  // when the model forgets to call `botmux send`.
+  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes';
 }
 
 function structuredBridgeIsCodex(): boolean {
   return lastInitConfig?.cliId === 'codex';
 }
 
+function structuredBridgeIsHermes(): boolean {
+  return lastInitConfig?.cliId === 'hermes';
+}
+
 function structuredBridgeIngestPath(path: string, offset: number) {
-  return structuredBridgeIsCodex()
-    ? drainCodexRollout(path, offset)
-    : drainCocoEvents(path, offset);
+  if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
+  if (structuredBridgeIsHermes()) {
+    const result = drainHermesStateDb(offset);
+    return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
+  }
+  return drainCocoEvents(path, offset);
 }
 
 function codexBridgeStartTimer(): void {
@@ -1328,6 +1341,12 @@ function codexBridgeStartTimer(): void {
   // publish a half-streamed response.
   codexBridgeTimer = setInterval(() => {
     try {
+      if (structuredBridgeIsHermes()) {
+        if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastInitConfig?.resume ? 'baseline-existing' : 'fresh-empty');
+        hermesBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+        return;
+      }
       if (!codexBridgeRolloutPath) {
         // Two discovery paths, in order: cliSessionId (known via writeInput
         // result for non-adopt or daemon-side probe for adopt) → exact
@@ -1374,6 +1393,23 @@ function codexBridgeStartTimer(): void {
       log(`Codex bridge tick error: ${err.message}`);
     }
   }, 1000);
+}
+
+function hermesBridgeAttach(mode: 'baseline-existing' | 'fresh-empty'): void {
+  hermesBridgeOffset = currentHermesStateOffset();
+  hermesBridgeBaselineDone = true;
+  log(`Hermes bridge ${mode}: state.db offset=${hermesBridgeOffset}`);
+  codexBridgeStartTimer();
+}
+
+function hermesBridgeIngest(): void {
+  if (!hermesBridgeBaselineDone) return;
+  const result = drainHermesStateDb(hermesBridgeOffset);
+  hermesBridgeOffset = result.newOffset;
+  codexBridgeQueue.ingest(result.events);
+  if (result.events.some(e => e.kind === 'assistant_final')) {
+    idleDetector?.fireIdle();
+  }
 }
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fresh-empty' | 'split-live'): void {
@@ -1460,6 +1496,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
 }
 
 function codexBridgeIngest(): void {
+  if (structuredBridgeIsHermes()) {
+    hermesBridgeIngest();
+    return;
+  }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
@@ -1488,7 +1528,7 @@ function codexBridgeMarkPendingTurn(messageText: string): boolean {
 
 function codexBridgeDrainAndMaybeEmit(): void {
   if (!codexBridgeFallbackActive()) return;
-  if (codexBridgeRolloutPath && codexBridgeBaselineDone) {
+  if (structuredBridgeIsHermes() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
     try { codexBridgeIngest(); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
   }
   emitReadyCodexTurns();
@@ -1503,7 +1543,17 @@ function emitReadyCodexTurns(): void {
   // should reach the thread. Skip marker IO entirely.
   const markers = adoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
-  const nextPendingMarkTimeMs = remaining.length > 0 ? remaining[0].markTimeMs : undefined;
+  // Only a STARTED pending turn can bound the last ready turn's send window.
+  // An unstarted turn hasn't been dequeued yet (its user event hasn't landed),
+  // so it has produced no sends to leak backwards — and under type-ahead its
+  // markTimeMs is still the early flush-time mark, which would prematurely
+  // (often invalidly, lower>upper) close the ready turn's window and let its
+  // own send escape suppression → duplicate. A started-but-not-final turn
+  // (model mid-tool-use for N+1) keeps its real overridden markTimeMs as the
+  // boundary, preserving the original leak guard.
+  const nextPendingMarkTimeMs = remaining.length > 0 && remaining[0].started
+    ? remaining[0].markTimeMs
+    : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
@@ -1546,6 +1596,8 @@ function stopCodexBridge(): void {
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
+  hermesBridgeOffset = 0;
+  hermesBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2066,9 +2118,94 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
 let trustHandled = false;
 
+// Codex App runner sends botmux control messages as OSC sequences so they do
+// not pollute the visible terminal. Strip them before xterm rendering and
+// translate them back into worker IPC.
+const CODEX_APP_OSC_PREFIX = '\x1b]777;botmux:';
+const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira']);
+let codexAppOscPending = '';
+
+function decodeCodexAppPayload(payload: string): any | undefined {
+  try {
+    return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function handleCodexAppMarker(body: string): void {
+  const sep = body.indexOf(':');
+  if (sep < 0) return;
+  const kind = body.slice(0, sep);
+  const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (!payload || typeof payload !== 'object') return;
+
+  if (kind === 'thread' && typeof payload.threadId === 'string') {
+    persistCliSessionId(payload.threadId);
+    return;
+  }
+
+  if (kind === 'final' && typeof payload.content === 'string') {
+    const startedAtMs = typeof payload.startedAtMs === 'number' ? payload.startedAtMs : undefined;
+    const completedAtMs = typeof payload.completedAtMs === 'number' ? payload.completedAtMs : Date.now();
+    if (startedAtMs !== undefined) {
+      const sentByModel = readSendMarkers().some(m =>
+        m.sentAtMs >= startedAtMs && m.sentAtMs <= completedAtMs + 5_000,
+      );
+      if (sentByModel) {
+        log(`${cliName()} final_output suppressed (model already called botmux send)`);
+        return;
+      }
+    }
+    const turnId = typeof payload.turnId === 'string' ? payload.turnId : `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`;
+    send({
+      type: 'final_output',
+      content: payload.content,
+      lastUuid: turnId,
+      turnId,
+    });
+  }
+}
+
+function splitCodexAppControl(data: string): string {
+  if (!APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? '') && codexAppOscPending.length === 0) return data;
+  const input = codexAppOscPending + data;
+  codexAppOscPending = '';
+
+  let out = '';
+  let cursor = 0;
+  for (;;) {
+    const start = input.indexOf(CODEX_APP_OSC_PREFIX, cursor);
+    if (start < 0) {
+      let tailStart = input.length;
+      const tail = input.slice(cursor);
+      for (let n = Math.min(CODEX_APP_OSC_PREFIX.length - 1, tail.length); n > 0; n--) {
+        if (CODEX_APP_OSC_PREFIX.startsWith(tail.slice(tail.length - n))) {
+          tailStart = input.length - n;
+          break;
+        }
+      }
+      out += input.slice(cursor, tailStart);
+      codexAppOscPending = input.slice(tailStart);
+      return out;
+    }
+
+    out += input.slice(cursor, start);
+    const end = input.indexOf('\x07', start + CODEX_APP_OSC_PREFIX.length);
+    if (end < 0) {
+      codexAppOscPending = input.slice(start);
+      return out;
+    }
+    handleCodexAppMarker(input.slice(start + CODEX_APP_OSC_PREFIX.length, end));
+    cursor = end + 1;
+  }
+}
+
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
 function onPtyData(data: string): void {
+  data = splitCodexAppControl(data);
+  if (data.length === 0) return;
   captureWorkflowTranscript(data);
   renderer?.write(data);
 
@@ -2251,10 +2388,23 @@ async function flushPending(): Promise<void> {
   // Lark message. Now that the queue handles queued_command identically to
   // role:user (and overrides markTimeMs to the dequeue-time event timestamp
   // so the gate window is correct), Claude bridge can run with type-ahead
-  // again. Codex bridge stays serial because its queue hasn't been upgraded.
+  // again.
+  //
+  // CoCo (0.120.32+) also tolerates type-ahead, but for a different reason
+  // than Claude: it parks a submit-while-busy message in its own TUI queue
+  // ("↑ Press up to edit queued messages") and only writes the user event to
+  // events.jsonl when it DEQUEUES and starts processing it — i.e. AFTER the
+  // previous turn's assistant_final. So the transcript stays strictly
+  // interleaved (user1 → asst1 → user2 → asst2) and CodexBridgeQueue's
+  // single-`collecting` attribution stays correct without the queued_command
+  // upgrade Claude needed. (The submit log history.jsonl, which the adapter's
+  // writeInput verification polls, IS written at submit time even for a queued
+  // message, so verification doesn't spuriously fail either.) Only the Codex
+  // rollout bridge stays serial — its queue hasn't been validated for the
+  // back-to-back user_message ordering that type-ahead can produce there.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !codexBridgeActive;
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !structuredBridgeIsCodex();
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
@@ -2321,16 +2471,18 @@ async function flushPending(): Promise<void> {
       if (result && result.submitted === false && backend) {
         scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, turnSeq);
       }
-      // Codex bridge: stop after one writeInput per idle cycle. Codex's
-      // bridge queue doesn't yet attribute queued_command-equivalents, so
-      // type-ahead'd submits would have their assistant text dropped or
+      // Codex rollout bridge: stop after one writeInput per idle cycle.
+      // Codex's bridge queue doesn't yet attribute queued_command-equivalents,
+      // so type-ahead'd submits would have their assistant text dropped or
       // mis-attributed. We resume on the next idle, by which point Codex
       // has finished and the next message can be a normal user_message
-      // submit. Claude bridge no longer takes this break — its
+      // submit. Claude bridge and CoCo no longer take this break — Claude's
       // BridgeTurnQueue handles `attachment(queued_command)` events
-      // identically to `role:user`, so type-ahead'd turns are correctly
-      // attributed and no longer need the serial-per-idle guard.
-      if (codexBridgeActive && pendingMessages.length > 0) break;
+      // identically to `role:user`, and CoCo parks queued submits in its own
+      // TUI queue (writing the events.jsonl user event only at dequeue time),
+      // so both keep the transcript interleaved and attribute correctly. We
+      // WANT CoCo to drain all pending here so they land in its TUI queue.
+      if (structuredBridgeIsCodex() && pendingMessages.length > 0) break;
     }
   } finally {
     isFlushing = false;
@@ -2353,12 +2505,12 @@ function sendToPty(content: string): void {
     // Tear down the prompt card so the user doesn't see stale options.
     send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
   }
-  // See flushPending: only Codex bridge still serialises type-ahead.
-  // Claude bridge now attributes `attachment(queued_command)` events
-  // identically to `role:user`, so type-ahead'd submits land in the right
-  // turn and we no longer need to gate the entry path on claudeBridgeActive.
-  const codexBridgeActive = codexBridgeFallbackActive();
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !codexBridgeActive;
+  // See flushPending: only the Codex rollout bridge still serialises
+  // type-ahead. Claude attributes `attachment(queued_command)` events
+  // identically to `role:user`, and CoCo parks queued submits in its own TUI
+  // queue, so both land type-ahead'd submits in the right turn — only Codex
+  // needs the entry path gated.
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !structuredBridgeIsCodex();
   if (isPromptReady || isFlushing || typeAheadAllowed) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
@@ -2621,6 +2773,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
+    model: cfg.model,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -2637,6 +2790,17 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (injectClaudeSandbox) {
     log('Detected root user — injecting IS_SANDBOX=1 for Claude Code');
   }
+
+  // Claude Code 2.1.x：`--resume` 一个「空闲 >70min 且累计 >10 万 token」的会话会弹
+  // 交互式菜单（Resume from summary / full / Don't ask again），botmux 无法导航 →
+  // 进程卡死（issue #62）。把 token 阈值顶到极大让触发门永远命中 `tokens < threshold`
+  // 而 return null → 菜单不弹、按 full session 原样续（走 summary 会触发 /compact，
+  // 破坏 bridge 的会话连续性追踪）。用户显式设了就尊重。注意：该 key 必须同时进
+  // BOTMUX_INJECTED_ENV_KEYS 白名单，否则 tmux backend 不会把它透传进 pane。
+  const claudeResumeTokenThreshold =
+    cfg.cliId === 'claude-code'
+      ? process.env.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD ?? '2147483647'
+      : undefined;
 
   // Predict reattach vs fresh so the log line tells the truth. When a bmx-*
   // tmux session is still alive, TmuxBackend.spawn ignores the bin/args and
@@ -2657,7 +2821,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     env: {
       ...process.env,
       CLAUDECODE: undefined,
+      // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find
+      // the daemon socket, route the card back to this thread, and resolve
+      // the approver allowlist against session.owner. Missing env → exit 2.
+      BOTMUX_SESSION_ID: cfg.sessionId,
+      BOTMUX_CHAT_ID: cfg.chatId,
+      BOTMUX_LARK_APP_ID: cfg.larkAppId,
+      BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId,
       ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
+      ...(claudeResumeTokenThreshold ? { CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: claudeResumeTokenThreshold } : {}),
     } as unknown as Record<string, string>,
   });
 
@@ -2715,8 +2887,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // calling `botmux send`, harvest the final answer from the CLI transcript
   // and post it to Lark. Codex needs late attach because its rollout id is
   // discovered after the first submit; CoCo's events path is deterministic
-  // from botmux sessionId.
-  if (cfg.cliId === 'codex') {
+  // from botmux sessionId. Hermes uses a global SQLite store, so baseline its
+  // row id at spawn and poll for rows after each queued prompt is flushed.
+  if (cfg.cliId === 'hermes') {
+    hermesBridgeAttach(cfg.resume ? 'baseline-existing' : 'fresh-empty');
+  } else if (cfg.cliId === 'codex') {
     if (cfg.cliSessionId) {
       const rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
       if (rolloutPath) {
@@ -2805,6 +2980,7 @@ function killCli(): void {
   scrollback = '';
   altBufferActive = false;
   trustHandled = false;
+  codexAppOscPending = '';
 }
 
 // ─── HTTP + WebSocket Server ─────────────────────────────────────────────────

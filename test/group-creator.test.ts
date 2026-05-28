@@ -19,11 +19,13 @@ const mockCreateChat = vi.fn();
 const mockTransferChatOwner = vi.fn();
 const mockGetChatOwner = vi.fn();
 const mockGetChatShareLink = vi.fn();
+const mockAddUsersByUnionId = vi.fn();
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: (...args: any[]) => mockCreateChat(...args),
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
   getChatOwner: (...args: any[]) => mockGetChatOwner(...args),
   getChatShareLink: (...args: any[]) => mockGetChatShareLink(...args),
+  addUsersToChatByUnionId: (...args: any[]) => mockAddUsersByUnionId(...args),
 }));
 
 const SHARE_LINK = 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=tok';
@@ -52,9 +54,33 @@ describe('createGroupWithBots', () => {
     mockGetChatShareLink.mockReset();
     mockSendMessage.mockReset();
     mockBindOncall.mockReset();
+    mockAddUsersByUnionId.mockReset();
     // Default: share-link fetch succeeds. group-creator always calls this after
     // createChat; individual tests override to exercise the fallback path.
     mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
+    mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
+  });
+
+  it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_fed', invalidBotIds: [], invalidUserIds: [] });
+    mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: ['on_gone'] });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      name: 'fed',
+      ownerUnionIds: ['on_me', 'on_gone'],
+    });
+    // owners added via union_id by the creator bot
+    expect(mockAddUsersByUnionId).toHaveBeenCalledWith(CREATOR, 'oc_fed', ['on_me', 'on_gone']);
+    expect(result.invalidOwnerUnionIds).toEqual(['on_gone']);
+    expect(result.chatId).toBe('oc_fed');
+  });
+
+  it('skips the union_id owner add when no ownerUnionIds given', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_x', invalidBotIds: [], invalidUserIds: [] });
+    const result = await createGroupWithBots({ creatorLarkAppId: CREATOR, larkAppIds: [CREATOR] });
+    expect(mockAddUsersByUnionId).not.toHaveBeenCalled();
+    expect(result.invalidOwnerUnionIds).toEqual([]);
   });
 
   it('returns chatId + all status fields on a clean happy path', async () => {
@@ -81,6 +107,7 @@ describe('createGroupWithBots', () => {
       creator: CREATOR,
       invalidBotIds: [],
       invalidUserIds: [],
+      invalidOwnerUnionIds: [],
       ownerTransferredTo: USER_OPEN_ID,
       transferError: null,
       notifyMessageId: 'om_notify_1',

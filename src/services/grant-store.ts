@@ -46,6 +46,29 @@ export async function addChatGrant(
 }
 
 /**
+ * 全局对话授权：把 open_id 加入 globalGrants（被授权在任意群与本 bot 对话的名单，人/bot 通用）。
+ * talk-only —— 只进 canTalk / bot 路由闸，绝不写 allowedUsers、不授 canOperate（与 addChatGrant 同源）。
+ */
+export async function addGlobalGrant(
+  larkAppId: string, openId: string,
+): Promise<{ ok: true; created: boolean } | Fail> {
+  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<{ created: boolean }>(larkAppId, (entry) => {
+    const cur: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
+    const created = !cur.includes(openId);
+    if (created) cur.push(openId);
+    entry.globalGrants = cur;
+    return { write: created, result: { created } };
+  });
+  if (!r.ok) return r;
+  if (r.result.created) {
+    bot.config.globalGrants = [...(bot.config.globalGrants ?? []), openId];
+    logger.info(`[grant:${larkAppId}] +global ${openId}`);
+  }
+  return { ok: true, created: r.result.created };
+}
+
+/**
  * 整群 talk 授权：把 chatId 加入 allowedChatGroups（"talk-open 的 chat_id 列表"）。
  * 命中后该 chat 任何成员都过 canTalk（见 event-dispatcher.canTalk），不授 canOperate。
  */
@@ -92,15 +115,16 @@ export async function removeAllowedChatGroup(
 }
 
 /**
- * 原子彻底撤销：同一 RMW 内删 chatGrants[chatId] 与全局 allowedUsers（email 反查）。
- * 三重防开放守卫：
+ * 原子彻底撤销：同一 RMW 内删 chatGrants[chatId]、全局 allowedUsers（email 反查）与
+ * globalGrants（全局对话授权）。三重防开放守卫只约束 allowedUsers 这一支（operate/owner 安全），
+ * chatGrants / globalGrants 是 talk-only，删空不会让 bot 对所有人开放 operate，无需守卫：
  *   #2  禁止撤销当前 owner 本人（否则 owner 身份会漂移到别人）。
  *   R2#3 移除后运行时 resolvedAllowedUsers 不能变空（catch 未解析 email 导致 resolved 空）。
  *   R3#3 在 RMW 锁内按最新磁盘 entry 再判一次（catch 并发写把 allowlist 删空）。
  */
 export async function revokeGrant(
   larkAppId: string, chatId: string, openId: string,
-): Promise<{ ok: true; removed: { chat: boolean; global: boolean } } | Fail> {
+): Promise<{ ok: true; removed: { chat: boolean; global: boolean; globalTalk: boolean } } | Fail> {
   let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
   // #2：owner 本人不可撤。
@@ -112,7 +136,7 @@ export async function revokeGrant(
     return { ok: false, reason: 'would_open_bot' };
   }
 
-  type Res = { chat: boolean; global: boolean };
+  type Res = { chat: boolean; global: boolean; globalTalk: boolean };
   const r = await rmwBotEntry<Res | { guard: 'would_open_bot' }>(larkAppId, (entry) => {
     const rawList: string[] = Array.isArray(entry.allowedUsers) ? entry.allowedUsers : [];
     const willRemoveGlobal = !!rawEntry && rawList.includes(rawEntry);
@@ -120,7 +144,7 @@ export async function revokeGrant(
     if (willRemoveGlobal && rawList.filter(u => u !== rawEntry).length === 0) {
       return { write: false, result: { guard: 'would_open_bot' as const } };
     }
-    let chat = false, global = false;
+    let chat = false, global = false, globalTalk = false;
     const map = (entry.chatGrants && typeof entry.chatGrants === 'object') ? entry.chatGrants : {};
     if (Array.isArray(map[chatId]) && map[chatId].includes(openId)) {
       map[chatId] = map[chatId].filter((u: string) => u !== openId);
@@ -132,7 +156,15 @@ export async function revokeGrant(
       entry.allowedUsers = rawList.filter((u: string) => u !== rawEntry);
       global = true;
     }
-    return { write: chat || global, result: { chat, global } };
+    // 全局对话授权（talk-only）：从 globalGrants 移除 open_id。与 allowedUsers 无关，
+    // 因此不受 would_open_bot 守卫约束（清空它只是收回对话权，不会让 bot 对所有人开放 operate）。
+    const gg: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
+    if (gg.includes(openId)) {
+      const next = gg.filter((u: string) => u !== openId);
+      if (next.length > 0) entry.globalGrants = next; else delete entry.globalGrants;
+      globalTalk = true;
+    }
+    return { write: chat || global || globalTalk, result: { chat, global, globalTalk } };
   });
   if (!r.ok) return r;
   if ('guard' in r.result) return { ok: false, reason: r.result.guard };
@@ -148,6 +180,10 @@ export async function revokeGrant(
       bot.rawAllowedUserResolution.delete(rawEntry);
     }
     bot.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u !== openId);
+  }
+  if (r.result.globalTalk) {
+    const next = (bot.config.globalGrants ?? []).filter(u => u !== openId);
+    if (next.length > 0) bot.config.globalGrants = next; else delete bot.config.globalGrants;
   }
   logger.info(`[grant:${larkAppId}] revoke chat=${chatId} ${openId} removed=${JSON.stringify(r.result)}`);
   return { ok: true, removed: r.result };

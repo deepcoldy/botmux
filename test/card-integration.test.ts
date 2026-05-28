@@ -40,6 +40,9 @@ let sessionReplyCallIndex = 0;
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => fakeLark.createMock('updateMessage')(...args),
   sendUserMessage: (...args: any[]) => fakeLark.createMock('sendUserMessage')(...args),
+  // Resolves immediately (no manual orchestration) — the private-close path just
+  // awaits it; tests assert on the recorded args.
+  sendEphemeralCard: vi.fn(async () => 'om_eph'),
   getChatInfo: vi.fn(),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
@@ -501,6 +504,85 @@ describe('Card integration: full event flow', () => {
       );
     });
 
+    it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const botRegMod = await import('../src/bot-registry.js');
+      // privateCard on + an owner in allowedUsers. Sticky (close path calls
+      // getBot several times); restored in finally so it can't leak.
+      vi.mocked(botRegMod.getBot).mockReturnValue({
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true },
+        resolvedAllowedUsers: ['ou_owner'],
+        botOpenId: 'ou_bot',
+      } as any);
+      try {
+        const ds = makeDaemonSession();
+        const sessions = new Map<string, DaemonSession>();
+        const sKey = sessionKey(ROOT_ID, APP_ID);
+        sessions.set(sKey, ds);
+        const deps = makeDeps(sessions);
+
+        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner'), deps, APP_ID);
+
+        expect(killWorker).toHaveBeenCalledWith(ds);
+        expect(sessions.has(sKey)).toBe(false);
+        // Closed card goes ephemeral to the owner …
+        expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+          APP_ID, ds.chatId, 'ou_owner', expect.stringContaining('"type":"closed"'),
+        );
+        // … and NOT posted to the group thread (no leak of session/CLI/workingDir).
+        const groupClosed = (deps.sessionReply as any).mock.calls.find(
+          (c: any[]) => typeof c[1] === 'string' && c[1].includes('"type":"closed"'),
+        );
+        expect(groupClosed).toBeUndefined();
+      } finally {
+        vi.mocked(botRegMod.getBot).mockReturnValue({
+          config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+          resolvedAllowedUsers: [],
+          botOpenId: 'ou_bot',
+        } as any);
+      }
+    });
+
+    it('close from a private card stays ephemeral even after privateCard was turned off (no group leak)', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const botRegMod = await import('../src/bot-registry.js');
+      // Config has since been flipped OFF, but the card itself was built in
+      // private mode and carries visibility:'private'. The closed card must
+      // still go ephemeral — its visibility is pinned to the card, not to the
+      // current (mutable) config.
+      vi.mocked(botRegMod.getBot).mockReturnValue({
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false },
+        resolvedAllowedUsers: ['ou_owner'],
+        botOpenId: 'ou_bot',
+      } as any);
+      try {
+        const ds = makeDaemonSession();
+        const sessions = new Map<string, DaemonSession>();
+        const sKey = sessionKey(ROOT_ID, APP_ID);
+        sessions.set(sKey, ds);
+        const deps = makeDeps(sessions);
+
+        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner', 'private'), deps, APP_ID);
+
+        expect(killWorker).toHaveBeenCalledWith(ds);
+        // Closed card still goes ephemeral to the owner …
+        expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+          APP_ID, ds.chatId, 'ou_owner', expect.stringContaining('"type":"closed"'),
+        );
+        // … and NOT posted to the group thread.
+        const groupClosed = (deps.sessionReply as any).mock.calls.find(
+          (c: any[]) => typeof c[1] === 'string' && c[1].includes('"type":"closed"'),
+        );
+        expect(groupClosed).toBeUndefined();
+      } finally {
+        vi.mocked(botRegMod.getBot).mockReturnValue({
+          config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+          resolvedAllowedUsers: [],
+          botOpenId: 'ou_bot',
+        } as any);
+      }
+    });
+
     it('resume should call resumeSession and reply with success notice', async () => {
       const sessionId = 'closed-uuid-1';
       const sessions = new Map<string, DaemonSession>();
@@ -569,6 +651,34 @@ describe('Card integration: full event flow', () => {
       } as any]);
 
       const sessionId = 'closed-uuid-fallback';
+      const sessions = new Map<string, DaemonSession>();
+      const deps = makeDeps(sessions);
+
+      const sessionStoreMod = await import('../src/services/session-store.js');
+      vi.mocked(sessionStoreMod.getSession).mockReturnValue({
+        sessionId, chatId: 'oc_chat', rootMessageId: ROOT_ID,
+        title: 'closed', status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
+        scope: 'thread',
+      } as any);
+      const sm = await import('../src/core/session-manager.js');
+
+      await handleCardAction(makeResumeEvent(ROOT_ID, sessionId, 'ou_user'), deps, undefined);
+
+      expect(sm.resumeSession).not.toHaveBeenCalled();
+    });
+
+    it('sensitive fallback should reject when only globalGrants is configured', async () => {
+      // 回归（Codex P2）：只配 globalGrants（talk-only）且进入无 effectiveAppId 的 fallback 时，
+      // hasAllowlist 必须算成 true，否则敏感动作 fall through 成全开放。operator 不在 allowedUsers
+      // （空）→ 应被拒，resumeSession 不被调用。
+      const botRegMod = await import('../src/bot-registry.js');
+      vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', globalGrants: ['ou_peer'] } as any,
+        resolvedAllowedUsers: [],
+        botOpenId: 'ou_bot',
+      } as any]);
+
+      const sessionId = 'closed-uuid-fallback-global';
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
 

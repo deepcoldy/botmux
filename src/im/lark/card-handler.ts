@@ -7,20 +7,21 @@ import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
-import { sendUserMessage, updateMessage, deleteMessage, replyMessage } from './client.js';
+import { sendUserMessage, updateMessage, deleteMessage, replyMessage, sendEphemeralCard } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
-import { addChatGrant } from '../../services/grant-store.js';
+import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied } from './grant-pending.js';
 import {
   handleWorkflowApprovalAction,
   isWorkflowApprovalAction,
   type WorkflowApprovalHandlerDeps,
 } from './workflow-card-handler.js';
+import { handleAskCardAction, isAskCardAction } from './ask-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
@@ -136,9 +137,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  // ─── 群内授权卡片动作（grant_chat / grant_deny，talk-only）─────────────
+  // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
-  if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_deny') && larkAppId) {
+  if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {
     const loc = localeForBot(larkAppId);
     const owner = getOwnerOpenId(larkAppId);
     // owner 强闸门：必须是当前 app 的 owner 本人（比 canOperate 更严）
@@ -158,15 +159,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       markDenied(larkAppId, grantChatId, target);
       return JSON.parse(buildGrantResultCard('deny', loc));
     }
-    // 授权（talk-only）：只写本群 chatGrants，绝不碰 allowedUsers（operate 只由 bots.json 配）。
+    // 授权（talk-only）：grant_chat 写本群 chatGrants，grant_global 写全局 globalGrants，
+    // 两者都绝不碰 allowedUsers（operate 只由 bots.json 配）。
     // 落库失败不撤卡、保留 pending（owner 可重试），给 toast。
-    const res = await addChatGrant(larkAppId, grantChatId, target);
+    const kind = value.action === 'grant_global' ? 'global' as const : 'chat' as const;
+    const res = kind === 'global'
+      ? await addGlobalGrant(larkAppId, target)
+      : await addChatGrant(larkAppId, grantChatId, target);
     if (!res.ok) {
       logger.warn(`Grant action "${value.action}" store failed: ${res.reason}`);
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: res.reason }, loc) } };
     }
     clearPending(larkAppId, grantChatId, target);
-    const kind = 'chat' as const;
     // 授权成功后：在原线程 @ 被授权人发通知 + 撤回授权卡（用户要求）。
     // 这两步失败不回滚授权（已落库），仅记日志，并兜底用 in-place patch 让 owner 看到结果。
     if (cardMessageId) {
@@ -184,6 +188,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
     // 兜底（无 card message_id，或撤回失败）：靠 callback 返回 patch 原地更新卡。
     return JSON.parse(buildGrantResultCard(kind, loc));
+  }
+
+  if (isAskCardAction(value?.action)) {
+    return handleAskCardAction(data);
   }
 
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
@@ -220,7 +228,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     } else {
       const bots = getAllBots();
       const allowedUsers = bots.flatMap(b => b.resolvedAllowedUsers);
-      const hasAllowlist = allowedUsers.length > 0 || bots.some(b => (b.config.allowedChatGroups?.length ?? 0) > 0);
+      // globalGrants 与 allowedChatGroups 同理计入 hasAllowlist：只配 globalGrants（talk-only）
+      // 也算限制态，否则这条手写 fallback 会算成 false → 敏感动作 fall through 成全开放。
+      // 注意只进 hasAllowlist 判定，命中仍只认 allowedUsers（与 canOperate 一致，不授 operate）。
+      const hasAllowlist = allowedUsers.length > 0
+        || bots.some(b => (b.config.allowedChatGroups?.length ?? 0) > 0)
+        || bots.some(b => (b.config.globalGrants?.length ?? 0) > 0);
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         return;
@@ -319,8 +332,24 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         cliResumeCommand,
         localeForBot(ds.larkAppId),
       );
-      await sessionReply(rootId, card, 'interactive');
-      logger.info(`[${tag(ds)}] Closed via card button`);
+      // The closed card carries session title / CLI name / workingDir / resume
+      // command. In private-card mode those must not leak to the group — send the
+      // closed card ephemeral to the same owner audience instead. No group
+      // fallback on failure (privacy wins; the session is already closed).
+      // `value.visibility === 'private'` pins the decision to the card that was
+      // clicked, so a card built in private mode stays ephemeral even if the
+      // bot's `privateCard` config was turned off in the meantime.
+      if (value?.visibility === 'private' || botCfg.privateCard) {
+        const audience = resolvePrivateCardAudience(ds);
+        for (const openId of audience) {
+          await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, card).catch(err =>
+            logger.warn(`[${tag(ds)}] private close card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`));
+        }
+        logger.info(`[${tag(ds)}] Closed via card button (private close card → ${audience.length} owner(s))`);
+      } else {
+        await sessionReply(rootId, card, 'interactive');
+        logger.info(`[${tag(ds)}] Closed via card button`);
+      }
     }
 
     if (actionType === 'resume') {
@@ -402,6 +431,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           locDs,
+          undefined,
+          writableTerminalLinkFor(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -589,6 +620,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               false,
               localeForBot(ds.larkAppId),
               cardUsageLimit(ds),
+              writableTerminalLinkFor(ds),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -630,6 +662,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -669,6 +702,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -733,6 +767,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -772,6 +807,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

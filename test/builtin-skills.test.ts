@@ -83,3 +83,41 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).toContain('default');
   });
 });
+
+describe('built-in botmux-bots skill (collaboration roster)', () => {
+  it('documents the enhanced roster fields and the mentionable rule', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('capability');
+    expect(skill!.content).toContain('mentionable');
+    expect(skill!.content).toContain('hasTeamRole');
+    expect(skill!.content).toContain('/introduce');
+    expect(skill!.content).toContain('botmux-handoff');
+  });
+});
+
+describe('built-in botmux-handoff skill', () => {
+  it('is registered and teaches the 5-part structured handoff', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-handoff');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('交给谁');
+    expect(skill!.content).toContain('当前结论');
+    expect(skill!.content).toContain('相关上下文');
+    expect(skill!.content).toContain('期望下一步');
+    expect(skill!.content).toContain('完成标准');
+    expect(skill!.content).toContain('botmux bots list');
+    expect(skill!.content).toContain('mentionable');
+    expect(skill!.content).toContain('/introduce');
+    expect(skill!.content).toContain('botmux send --mention');
+  });
+});
+
+describe('botmux-ask skill 条件兜底（hook 优先 + 非 hook CLI 保留）', () => {
+  it('不在 BUILTIN_SKILLS（不再无条件装到所有 CLI）', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-ask')).toBeUndefined();
+  });
+
+  it('不在 RETIRED_SKILL_NAMES（改为按 CLI 条件管理，非全量退役）', () => {
+    expect(RETIRED_SKILL_NAMES).not.toContain('botmux-ask');
+  });
+});

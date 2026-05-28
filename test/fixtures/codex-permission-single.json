@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "session_id": "codex-sess-001",
+  "tool_input": {
+    "description": "Run npm install",
+    "command": "npm install"
+  },
+  "permission_mode": "default"
+}

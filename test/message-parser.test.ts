@@ -8,6 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { buildMarkdownCard } from '../src/im/lark/md-card.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -253,6 +254,95 @@ describe('Interactive card parsing: Format B (original card JSON)', () => {
   });
 });
 
+// ─── botmux footer chrome filtering ───────────────────────────────────────
+
+describe('Interactive card parsing: botmux footer is stripped from prompt', () => {
+  it('drops the Format B grey footer element but keeps body', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        { tag: 'markdown', text_size: 'notation_small_v2',
+          content: "<font color='grey'>[botmux](https://github.com/deepcoldy/botmux) · 发送给：<at id=ou_owner></at></font>" },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops the Format A (API simplified) footer line', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+          { tag: 'text', text: ' · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('botmux');
+  });
+
+  it('round-trips a real buildMarkdownCard output without footer leakage', () => {
+    const raw = buildMarkdownCard('帮我看下这个 bug', 'ou_owner');
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+    expect(result.content).toContain('帮我看下这个 bug');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps body text that merely mentions botmux without the repo link', () => {
+    // The filter anchors on the canonical repo URL, so genuine prose about
+    // botmux survives — only the footer chrome is removed.
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: 'botmux 这个项目挺好用的' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('botmux 这个项目挺好用的');
+  });
+});
+
+// ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
+
+describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
+  it('drops a custom-brand grey notation_small_v2 footer element (no botmux URL to anchor on)', () => {
+    // A peer bot configured brandLabel='Acme' — the receiving bot can't know
+    // that label, so the URL anchor can't catch it. The text_size+grey
+    // structural signal does.
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        { tag: 'markdown', text_size: 'notation_small_v2',
+          content: "<font color='grey'>[Acme](https://acme.test) · 发送给：<at id=ou_owner></at></font>" },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps a small-text element that is NOT a grey footer (foreign card content survives)', () => {
+    // notation_small_v2 alone is not enough — the botmux footer is always grey.
+    // A foreign card's small note without grey font must not be dropped.
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', text_size: 'notation_small_v2', content: '报警时间 17:45' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('报警时间 17:45');
+  });
+});
+
 // ─── mergeCardText: A+B union ─────────────────────────────────────────────
 
 describe('mergeCardText', () => {
@@ -395,6 +485,64 @@ describe('isPureCardUpgradeFallback (replace gate)', () => {
 // ─── extractResources for interactive cards ───────────────────────────────
 
 describe('Post message parsing', () => {
+  it('renders post code block with fence boundaries for API and event messages', () => {
+    const post = {
+      zh_cn: {
+        content: [[
+          { tag: 'text', text: '前文' },
+          { tag: 'code_block', language: 'JSON', text: 'print hello\n' },
+          { tag: 'text', text: '后文' },
+        ]],
+      },
+    };
+    const expected = '前文\n```JSON\nprint hello\n```\n后文';
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(expected);
+
+    const event = {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_post_code',
+        message_type: 'post',
+        content: JSON.stringify(post),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    };
+    expect(parseEventMessage(event).parsed.content).toBe(expected);
+  });
+
+  it('uses a longer fence when post code contains triple backticks', () => {
+    const post = {
+      content: [[
+        { tag: 'code_block', language: 'md', text: 'before\n```\ninside\n```\nafter\n' },
+      ]],
+    };
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('````md\nbefore\n```\ninside\n```\nafter\n````');
+  });
+
+  it('does not render unsupported post nodes as noisy text', () => {
+    const post = {
+      zh_cn: {
+        content: [
+          [
+            { tag: 'text', text: '普通' },
+            { tag: 'unknown_text', text: '未知文本' },
+            { tag: 'unknown_object', value: { nested: true } },
+          ],
+          [
+            { tag: 'a', text: '文档', href: 'https://example.com' },
+            { tag: 'at', user_name: 'Alice' },
+          ],
+        ],
+      },
+    };
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档@Alice');
+  });
+
   it('renders img tag in post body as [图片] placeholder when no numberer', () => {
     // Regression: previously dropped to empty string, hiding attached images
     // from `botmux thread messages` and misleading downstream readers.

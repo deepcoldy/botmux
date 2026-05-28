@@ -62,6 +62,11 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  /** Session-scoped override: when true, the streaming card is posted/patched
+   *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
+   *  command so a user can manually summon a live card in an otherwise-quiet
+   *  session. In-memory only (resets on daemon restart). */
+  streamingCardForced?: boolean;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */

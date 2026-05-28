@@ -3,7 +3,7 @@
  *
  * Claude Code has its own `--append-system-prompt` text baked into
  * `claude-code.ts`; this constant is only consumed by CLIs that don't expose
- * a system-prompt flag (coco / codex / gemini / opencode / aiden / mtr).
+ * a system-prompt flag (coco / codex / gemini / opencode / aiden / mtr / hermes).
  *
  * Each array element becomes one line inside the `<botmux_routing>` XML block
  * rendered by `buildNewTopicPrompt` in `session-manager.ts`.
@@ -19,6 +19,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.heredoc_example', undefined, locale),
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
+    t('ai.shell.mention_gate', undefined, locale),
   ];
 }
 

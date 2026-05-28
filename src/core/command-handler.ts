@@ -2,26 +2,28 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
-import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
+import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, listChatBotMembers } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
+import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
-import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import { writeRoleFile, deleteRoleFile, resolveRole, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
+import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -29,7 +31,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/pair', '/login', '/adopt', '/oncall', '/group', '/g', '/card']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -59,6 +61,69 @@ const MULTILINE_COMMANDS = new Set(['/schedule', '/role']);
 // `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
 // import without the daemon graph); re-exported here for existing callers.
 export { validateWorkingDir };
+
+/**
+ * Resolve a non-numeric `/repo <arg>` into a concrete repo path + display name.
+ * `arg` is either a path (absolute or relative) or a first-level project name
+ * under one of the bot's scan dirs — letting the user skip the selection card.
+ *
+ * Resolution:
+ *   1. Build candidate absolute paths — absolute / `~` taken as-is; relative or
+ *      bare names resolved against each scan dir, then the daemon cwd (mirrors
+ *      how the card's project list is rooted).
+ *   2. Prefer a candidate matching a scanned git project (carries a branch label).
+ *   3. For a bare name, also match a scanned project by basename (covers projects
+ *      nested deeper than the scan-dir top level).
+ *   4. Fall back to any existing directory — lenient like `/cd`, whose trust model
+ *      is "owner explicitly chose a dir"; the CLI already runs with full FS access.
+ * Returns null when nothing resolves to an existing directory.
+ */
+export function resolveRepoSelection(
+  repoArg: string,
+  scanDirs: string[],
+): { path: string; displayName: string } | null {
+  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
+  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
+
+  const isExplicitPath =
+    repoArg.startsWith('/') ||
+    repoArg.startsWith('~') ||
+    repoArg.startsWith('.') ||
+    repoArg.includes('/');
+
+  const candidates: string[] = [];
+  if (repoArg.startsWith('/') || repoArg.startsWith('~')) {
+    candidates.push(resolve(expandHome(repoArg)));
+  } else {
+    for (const d of scanDirs) candidates.push(resolve(d, repoArg));
+    candidates.push(resolve(expandHome(repoArg))); // daemon-cwd fallback (matches /cd)
+  }
+
+  // 1) Exact scanned-project match — preferred, gives the "name (branch)" label.
+  for (const cand of candidates) {
+    const proj = projects.find((p) => resolve(p.path) === cand);
+    if (proj) return { path: proj.path, displayName: `${proj.name} (${proj.branch})` };
+  }
+  // 2) Bare name → match a scanned project by basename.
+  if (!isExplicitPath) {
+    const byName = projects.find((p) => p.name === repoArg);
+    if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
+  }
+  // 3) Lenient fallback: any existing directory. Label it with a git ref when
+  //    it's a repo (covers explicit paths outside the scan roots), else basename.
+  for (const cand of candidates) {
+    try {
+      if (!statSync(cand).isDirectory()) continue;
+    } catch {
+      continue; // missing / not a dir — try next candidate
+    }
+    const desc = describeProjectDir(cand);
+    return desc
+      ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
+      : { path: cand, displayName: basename(cand) };
+  }
+  return null;
+}
 
 /**
  * Parse a force-topic invocation: `/t [prompt]` or `/topic [prompt]`.
@@ -186,19 +251,68 @@ async function handleRoleCommand(
   rootId: string,
   chatId: string,
   larkAppId: string,
+  senderId: string | undefined,
   deps: CommandHandlerDeps,
 ): Promise<void> {
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const trimmed = args.trim();
   const loc = localeForBot(larkAppId);
+  const dataDir = config.session.dataDir;
 
-  // /role → show current role
+  // /role team [...] — manage the team-level (per-bot, cross-chat) role
+  const teamMatch = trimmed.match(/^team\b([\s\S]*)$/);
+  if (teamMatch) {
+    const teamArgs = teamMatch[1].trim();
+    const teamSet = teamArgs.match(/^set\s+([\s\S]+)/);
+    if (teamSet) {
+      const content = teamSet[1].trim();
+      if (!content) { await sessionReply(rootId, t('role.set_empty', undefined, loc)); return; }
+      writeTeamRoleFile(larkAppId, content);
+      await sessionReply(rootId, t('role.team_saved', { bytes: Buffer.byteLength(content, 'utf-8'), max: 4096 }, loc));
+      return;
+    }
+    if (teamArgs === 'delete' || teamArgs === '删除') {
+      await sessionReply(rootId, deleteTeamRoleFile(larkAppId) ? t('role.team_deleted', undefined, loc) : t('role.team_nothing', undefined, loc));
+      return;
+    }
+    const content = resolveTeamRoleFile(larkAppId);
+    if (content) {
+      await sessionReply(rootId, `${t('role.team_current', undefined, loc)}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: Buffer.byteLength(content, 'utf-8'), max: 4096 }, loc)}`);
+    } else {
+      await sessionReply(rootId, t('role.team_empty', undefined, loc));
+    }
+    return;
+  }
+
+  // /role cap [...] — manage the short capability label shown in the roster
+  const capMatch = trimmed.match(/^cap\b([\s\S]*)$/);
+  if (capMatch) {
+    const capArgs = capMatch[1].trim();
+    const capSet = capArgs.match(/^set\s+([\s\S]+)/);
+    if (capSet) {
+      const label = capSet[1].trim();
+      if (!label) { await sessionReply(rootId, t('role.cap_set_empty', undefined, loc)); return; }
+      setBotCapability(dataDir, larkAppId, label, senderId);
+      await sessionReply(rootId, t('role.cap_saved', { cap: getBotCapability(dataDir, larkAppId) ?? label }, loc));
+      return;
+    }
+    if (capArgs === 'clear' || capArgs === '清除') {
+      await sessionReply(rootId, clearBotCapability(dataDir, larkAppId) ? t('role.cap_cleared', undefined, loc) : t('role.cap_empty', undefined, loc));
+      return;
+    }
+    const cap = getBotCapability(dataDir, larkAppId);
+    await sessionReply(rootId, cap ? t('role.cap_current', { cap }, loc) : t('role.cap_empty', undefined, loc));
+    return;
+  }
+
+  // /role → show the EFFECTIVE role + where it comes from (chat override > team > none)
   if (!trimmed) {
-    const content = resolveRoleFile(larkAppId, chatId);
+    const { content, source } = resolveRole(larkAppId, chatId);
     if (content) {
       const len = Buffer.byteLength(content, 'utf-8');
-      await sessionReply(rootId, `${t('role.current', undefined, loc)}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: len, max: 4096 }, loc)}`);
+      const srcLabel = source === 'chat' ? t('role.src_chat', undefined, loc) : t('role.src_team', undefined, loc);
+      await sessionReply(rootId, `${t('role.current', undefined, loc)} ${srcLabel}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: len, max: 4096 }, loc)}`);
     } else {
       await sessionReply(rootId, t('role.empty', undefined, loc));
     }
@@ -457,9 +571,76 @@ export async function handleCommand(
 
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
-        const repoIndex = repoArg ? parseInt(repoArg, 10) : NaN;
 
-        if (!isNaN(repoIndex) && ds) {
+        // First-spawn fork: consume the buffered prompt/attachments and start the
+        // CLI in whatever workingDir is currently set on the session. Shared by
+        // `commitRepoSelection` (a repo was named) and the bare-`/repo` launch
+        // (use the default workingDir) — both only run while `pendingRepo`.
+        const forkPendingCli = async (replyText: string) => {
+          const selfBot = getBot(ds!.larkAppId);
+          const botCfg = selfBot.config;
+          ds!.pendingRepo = false;
+          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+          const pendingPrompt = ds!.pendingPrompt ?? '';
+          const prompt = buildNewTopicPrompt(
+            pendingPrompt,
+            ds!.session.sessionId,
+            botCfg.cliId,
+            botCfg.cliPathOverride,
+            ds!.pendingAttachments,
+            ds!.pendingMentions,
+            await getAvailableBots(ds!.larkAppId, ds!.chatId),
+            ds!.pendingFollowUps,
+            { name: selfBot.botName, openId: selfBot.botOpenId },
+            loc,
+            ds!.pendingSender,
+            { larkAppId, chatId: ds!.chatId },
+          );
+          rememberLastCliInput(ds!, pendingPrompt, prompt);
+          ds!.pendingPrompt = undefined;
+          ds!.pendingAttachments = undefined;
+          ds!.pendingMentions = undefined;
+          ds!.pendingSender = undefined;
+          ds!.pendingFollowUps = undefined;
+          forkWorker(ds!, prompt);
+          await sessionReply(rootId, replyText);
+        };
+
+        // Shared commit path for an already-resolved repo: update the session's
+        // working dir, then either fork into the pending CLI (first spawn) or
+        // close + recreate the session (mid-session switch). Used by both the
+        // numeric `/repo <N>` form and the `/repo <path|name>` form.
+        const commitRepoSelection = async (selectedPath: string, displayName: string, how: string) => {
+          ds!.workingDir = selectedPath;
+          ds!.session.workingDir = selectedPath;
+          sessionStore.updateSession(ds!.session);
+
+          if (ds!.pendingRepo) {
+            await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
+          } else {
+            killWorker(ds!);
+            sessionStore.closeSession(ds!.session.sessionId);
+            const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
+            ds!.session = session;
+            ds!.lastUserPrompt = undefined;
+            ds!.lastCliInput = undefined;
+            ds!.session.workingDir = selectedPath;
+            ds!.session.larkAppId = ds!.larkAppId;
+            sessionStore.updateSession(ds!.session);
+            ds!.hasHistory = false;
+            forkWorker(ds!, '', false);
+            await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
+          }
+          if (ds!.repoCardMessageId) {
+            deleteMessage(ds!.larkAppId, ds!.repoCardMessageId);
+            ds!.repoCardMessageId = undefined;
+          }
+          logger.info(`[${logTag}] Repo selected via ${how}: ${selectedPath}`);
+        };
+
+        // Numeric arg → pick by 1-based index from the last scan.
+        if (repoArg && ds && /^\d+$/.test(repoArg)) {
+          const repoIndex = parseInt(repoArg, 10);
           const cached = lastRepoScan.get(ds.chatId);
           if (!cached || cached.length === 0) {
             await sessionReply(rootId, t('cmd.repo.no_prior_scan', undefined, loc));
@@ -470,59 +651,43 @@ export async function handleCommand(
             break;
           }
           const project = cached[repoIndex - 1];
-          const selectedPath = project.path;
-          const displayName = `${project.name} (${project.branch})`;
-          ds.workingDir = selectedPath;
-          ds.session.workingDir = selectedPath;
-          sessionStore.updateSession(ds.session);
+          await commitRepoSelection(project.path, `${project.name} (${project.branch})`, `/repo ${repoIndex}`);
+          break;
+        }
 
-          if (ds.pendingRepo) {
-            const selfBot = getBot(ds.larkAppId);
-            const botCfg = selfBot.config;
-            ds.pendingRepo = false;
-            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
-            const pendingPrompt = ds.pendingPrompt ?? '';
-            const prompt = buildNewTopicPrompt(
-              pendingPrompt,
-              ds.session.sessionId,
-              botCfg.cliId,
-              botCfg.cliPathOverride,
-              ds.pendingAttachments,
-              ds.pendingMentions,
-              await getAvailableBots(ds.larkAppId, ds.chatId),
-              ds.pendingFollowUps,
-              { name: selfBot.botName, openId: selfBot.botOpenId },
-              loc,
-              ds.pendingSender,
-              { larkAppId, chatId: ds.chatId },
-            );
-            rememberLastCliInput(ds, pendingPrompt, prompt);
-            ds.pendingPrompt = undefined;
-            ds.pendingAttachments = undefined;
-            ds.pendingMentions = undefined;
-            ds.pendingSender = undefined;
-            ds.pendingFollowUps = undefined;
-            forkWorker(ds, prompt);
-            await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, loc));
-          } else {
-            killWorker(ds);
-            sessionStore.closeSession(ds.session.sessionId);
-            const session = sessionStore.createSession(ds.chatId, rootId, displayName, ds.chatType);
-            ds.session = session;
-            ds.lastUserPrompt = undefined;
-            ds.lastCliInput = undefined;
-            ds.session.workingDir = selectedPath;
-            ds.session.larkAppId = ds.larkAppId;
-            sessionStore.updateSession(ds.session);
-            ds.hasHistory = false;
-            forkWorker(ds, '', false);
-            await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
+        // Non-numeric arg → a path (relative/absolute) or first-level project
+        // name under workingDir; resolve it directly and skip the card.
+        if (repoArg && ds) {
+          const resolved = resolveRepoSelection(repoArg, getProjectScanDirs(ds));
+          if (!resolved) {
+            await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: repoArg }, loc));
+            break;
           }
+          await commitRepoSelection(resolved.path, resolved.displayName, `/repo ${repoArg}`);
+          break;
+        }
+
+        // Bare `/repo` while a repo card is pending → launch right away in the
+        // default workingDir. This is the text-command twin of the card's
+        // "start directly" button (and replaces the old `/skip` command).
+        // Mid-session bare `/repo` (no pending) still falls through to the card.
+        if (!repoArg && ds?.pendingRepo) {
+          // Validate the configured workingDir before spawning — `forkWorker`
+          // doesn't, so a dead cwd would otherwise spawn-and-fail silently. Same
+          // guard the card path runs below. On failure we keep the pending state
+          // so the user can recover with `/repo <valid-path>` (no card here).
+          const invalidDirs = invalidConfiguredWorkingDirs(ds, ds.larkAppId ?? larkAppId);
+          if (invalidDirs.length > 0) {
+            await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
+            break;
+          }
+          const cwd = getSessionWorkingDir(ds);
+          await forkPendingCli(t('cmd.skip.opened', { cwd }, loc));
           if (ds.repoCardMessageId) {
             deleteMessage(ds.larkAppId, ds.repoCardMessageId);
             ds.repoCardMessageId = undefined;
           }
-          logger.info(`[${logTag}] Repo selected via /repo ${repoIndex}: ${selectedPath}`);
+          logger.info(`[${logTag}] Bare /repo while pending → launch in workingDir ${cwd}`);
           break;
         }
 
@@ -552,47 +717,6 @@ export async function handleCommand(
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) ds.repoCardMessageId = repoCardMsgId;
         logger.info(`[${logTag}] Sent repo card with ${projects.length} project(s)`);
-        break;
-      }
-
-      case '/skip': {
-        if (ds?.pendingRepo) {
-          const selfBot = getBot(ds.larkAppId);
-          const botCfg = selfBot.config;
-          ds.pendingRepo = false;
-          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
-          const pendingPrompt = ds.pendingPrompt ?? '';
-          const prompt = buildNewTopicPrompt(
-            pendingPrompt,
-            ds.session.sessionId,
-            botCfg.cliId,
-            botCfg.cliPathOverride,
-            ds.pendingAttachments,
-            ds.pendingMentions,
-            await getAvailableBots(ds.larkAppId, ds.chatId),
-            ds.pendingFollowUps,
-            { name: selfBot.botName, openId: selfBot.botOpenId },
-            loc,
-            ds.pendingSender,
-            { larkAppId, chatId: ds.chatId },
-          );
-          rememberLastCliInput(ds, pendingPrompt, prompt);
-          ds.pendingPrompt = undefined;
-          ds.pendingAttachments = undefined;
-          ds.pendingMentions = undefined;
-          ds.pendingSender = undefined;
-          ds.pendingFollowUps = undefined;
-          forkWorker(ds, prompt);
-          const cwd = getSessionWorkingDir(ds);
-          await sessionReply(rootId, t('cmd.skip.opened', { cwd }, loc));
-          if (ds.repoCardMessageId) {
-            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
-            ds.repoCardMessageId = undefined;
-          }
-          logger.info(`[${logTag}] Skip repo via /skip, spawning CLI in ${cwd}`);
-        } else {
-          await sessionReply(rootId, t('cmd.skip.no_pending', undefined, loc));
-        }
         break;
       }
 
@@ -638,8 +762,24 @@ export async function handleCommand(
           break;
         }
         const roleArgs = message.content.replace(/^\/role\s*/, '');
-        await handleRoleCommand(roleArgs, rootId, chatId, larkAppId, deps);
+        await handleRoleCommand(roleArgs, rootId, chatId, larkAppId, message.senderId, deps);
         logger.info(`[${logTag}] Role command handled`);
+        break;
+      }
+
+      case '/pair': {
+        const code = message.content.replace(/^\/pair\s*/, '').trim();
+        if (!larkAppId) { await sessionReply(rootId, t('role.no_chat', undefined, loc)); break; }
+        if (!code) { await sessionReply(rootId, t('pair.usage', undefined, loc)); break; }
+        // Resolve the sender's canonical union_id (best-effort) so the web
+        // session is keyed stably across apps; degrade to open_id-only.
+        const who = await resolveUserUnionId(larkAppId, message.senderId);
+        const result = claimPairing(config.session.dataDir, code, { openId: message.senderId, unionId: who.unionId, name: who.name, larkAppId });
+        if (result.ok) await sessionReply(rootId, t('pair.ok', undefined, loc));
+        else if (result.reason === 'expired') await sessionReply(rootId, t('pair.expired', undefined, loc));
+        else if (result.reason === 'already_claimed') await sessionReply(rootId, t('pair.already', undefined, loc));
+        else await sessionReply(rootId, t('pair.not_found', undefined, loc));
+        logger.info(`[${logTag}] Pair command handled: ${result.ok ? 'ok' : result.reason}`);
         break;
       }
 
@@ -957,6 +1097,57 @@ export async function handleCommand(
         break;
       }
 
+      case '/card': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        // Private mode (`privateCard`): send a one-shot snapshot only to the
+        // explicit talk-grant audience via the ephemeral API, instead of the
+        // group-visible live card. Ephemeral cards only work in plain `group`
+        // chats and can't be patched — so no live updates, and we fail closed
+        // (never fall back to a group-visible card) since not leaking is the
+        // entire point of this mode.
+        if (getBot(ds.larkAppId).config.privateCard) {
+          // Strict gate: only a *confirmed* plain group is safe — getChatModeStrict
+          // returns 'unknown' on API error instead of guessing 'group', so we fail
+          // closed (no leak) when we can't verify the chat type.
+          const mode = await getChatModeStrict(ds.larkAppId, ds.chatId);
+          if (mode !== 'group') {
+            await sessionReply(rootId, t('cmd.card.private_not_group', undefined, loc));
+            break;
+          }
+          const audience = resolvePrivateCardAudience(ds);
+          if (audience.length === 0) {
+            await sessionReply(rootId, t('cmd.card.private_no_audience', undefined, loc));
+            break;
+          }
+          const r = await postPrivateSnapshotCard(ds, audience);
+          if (r.notReady) {
+            await sessionReply(rootId, t('cmd.card.private_not_ready', undefined, loc));
+          } else if (r.sent === 0) {
+            // Total failure — surface a non-sensitive error (no terminal content,
+            // no open_id list). Most likely cause: missing send permission / bot
+            // not in chat / topic-thread chat.
+            await sessionReply(rootId, t('cmd.card.private_failed', undefined, loc));
+          } else if (r.sent < r.total) {
+            // Partial — report counts only, never the audience identities.
+            await sessionReply(rootId, t('cmd.card.private_partial', { sent: r.sent, total: r.total }, loc));
+          }
+          break;
+        }
+        // Manual summon. Force the live card on for the rest of this session —
+        // even when the bot has `disableStreamingCard` set — then post a fresh
+        // card. If the worker terminal isn't up yet, the force flag still sticks
+        // so the card appears (and live-updates) as soon as the worker is ready.
+        ds.streamingCardForced = true;
+        const posted = await postFreshStreamingCard(ds, deps.sessionReply);
+        if (!posted) {
+          await sessionReply(rootId, t('cmd.card.not_ready', undefined, loc));
+        }
+        break;
+      }
+
       case '/help': {
         const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
@@ -967,7 +1158,9 @@ export async function handleCommand(
           t('help.cd', { cliName }, loc),
           t('help.repo_list', undefined, loc),
           t('help.repo_n', undefined, loc),
+          t('help.repo_path', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.card', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移
