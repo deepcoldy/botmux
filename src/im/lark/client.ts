@@ -263,7 +263,16 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
     let mode: ChatMode;
     if (rawMode === 'p2p') mode = 'p2p';
     else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
-    else mode = 'group';
+    else if (rawMode === 'group') mode = 'group';
+    else {
+      // Empty / unrecognized chat_mode (e.g. data={}, or a future enum value):
+      // we genuinely can't confirm the type, so fail closed with 'unknown'
+      // rather than guessing 'group' — honours this function's contract for
+      // privacy-critical callers. (getChatMode still maps 'unknown'→'group' for
+      // lenient routing, so non-strict consumers are unaffected.)
+      logger.warn(`getChatModeStrict(${chatId}) unrecognized chat_mode='${rawMode}' — returning 'unknown'`);
+      return 'unknown';
+    }
     chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
     return mode;
   } catch (err: any) {

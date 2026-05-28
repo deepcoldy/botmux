@@ -26,7 +26,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import { getChatModeStrict } from '../src/im/lark/client.js';
+import { getChatModeStrict, getChatMode } from '../src/im/lark/client.js';
 
 const ok = (data: any) => ({ code: 0, msg: 'success', data });
 
@@ -60,6 +60,16 @@ describe('getChatModeStrict', () => {
     expect(await getChatModeStrict('app', 'oc_dm2')).not.toBe('group');
   });
 
+  it("returns 'unknown' for an empty response body (can't confirm → fail closed)", async () => {
+    mockRequest.mockResolvedValueOnce(ok({}));
+    expect(await getChatModeStrict('app', 'oc_empty')).toBe('unknown');
+  });
+
+  it("returns 'unknown' for an unrecognized chat_mode (future enum value)", async () => {
+    mockRequest.mockResolvedValueOnce(ok({ chat_mode: 'super_secret_mode' }));
+    expect(await getChatModeStrict('app', 'oc_future')).toBe('unknown');
+  });
+
   it("returns 'unknown' on a non-zero API code (no 'group' fallback)", async () => {
     mockRequest.mockResolvedValueOnce({ code: 99991663, msg: 'rate limited', data: null });
     expect(await getChatModeStrict('app', 'oc_err')).toBe('unknown');
@@ -68,5 +78,13 @@ describe('getChatModeStrict', () => {
   it("returns 'unknown' when the API call throws", async () => {
     mockRequest.mockRejectedValueOnce(new Error('network down'));
     expect(await getChatModeStrict('app', 'oc_throw')).toBe('unknown');
+  });
+});
+
+describe('getChatMode (lenient) — routing unaffected by the strict change', () => {
+  it("still maps an unconfirmable chat (empty body → strict 'unknown') to 'group'", async () => {
+    mockRequest.mockResolvedValueOnce(ok({}));
+    // fresh chatId to avoid the module-level cache
+    expect(await getChatMode('app', 'oc_lenient_empty')).toBe('group');
   });
 });

@@ -166,9 +166,14 @@ export function buildSessionClosedCard(
  */
 const MAX_CONTENT_BYTES = 100_000;
 
-/** Truncate content to fit within MAX_CONTENT_BYTES, keeping the tail (most recent output). */
-export function truncateContent(content: string, locale?: Locale): string {
-  if (Buffer.byteLength(content, 'utf-8') <= MAX_CONTENT_BYTES) return content;
+/**
+ * Truncate content to fit within `maxBytes`, keeping the tail (most recent
+ * output). Defaults to {@link MAX_CONTENT_BYTES}; callers that wrap the content
+ * in additional card JSON (e.g. the private snapshot's code fence) pass a
+ * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
+ */
+export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
+  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -176,7 +181,7 @@ export function truncateContent(content: string, locale?: Locale): string {
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= MAX_CONTENT_BYTES - 30) {
+    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
@@ -184,6 +189,10 @@ export function truncateContent(content: string, locale?: Locale): string {
   }
   return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
 }
+
+/** Byte budget for the private snapshot's text fallback. Well under the ~109 KB
+ *  card limit, leaving room for JSON escaping + the card's structural overhead. */
+const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
 const STREAM_TEMPLATE_MAP = {
   starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green',
@@ -438,7 +447,7 @@ export function buildPrivateSnapshotCard(
   if (!imageKey) {
     const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
     if (text) {
-      const body = truncateContent(text, locale);
+      const body = truncateContent(text, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
       // Fence must be longer than the longest backtick run in the body, else
       // terminal output containing ``` would break out of the code block.
       const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
