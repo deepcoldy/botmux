@@ -32,6 +32,7 @@ pnpm daemon:logs          # 查看日志
 - **日常提交**：正常 `git commit` + `git push`，不会触发发版
 - **发版**：打 `v*` tag 并 push 即可，GitHub Action 自动从 tag 提取版本号写入 `package.json` 后发布 npm + 创建 GitHub Release
 - **不要**手动修改 `package.json` 的 `version` 字段来发版，CI 会自动处理
+- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`（直接在 master 上打 tag，或在已 rebase 到最新 master 的子分支上打）。落后/分叉的分支打正式版会被拒绝。要从非 master 分支灰度，用 `-canary`/`-beta`/`-rc` 后缀走旁路 dist-tag
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文
 - 发版的 annotated tag message 用中文撰写，CI 会把 tag message 作为 GitHub Release body
 

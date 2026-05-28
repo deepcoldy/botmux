@@ -66,6 +66,25 @@ jobs:
             exit 1
           fi
 
+      - name: Guard — stable release must contain the latest master
+        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
+        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
+        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
+        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+        # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
+        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
+        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        run: |
+          git fetch origin master --quiet
+          if ! git merge-base --is-ancestor origin/master HEAD; then
+            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
+            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
+            echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
+            exit 1
+          fi
+          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
+
       - run: pnpm build
 
       - name: Publish to npm
