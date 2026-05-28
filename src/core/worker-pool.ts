@@ -1019,7 +1019,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
             if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
-            const initStatus = ds.usageLimit ? 'limited' : 'starting';
+            // Prefer the last-known screen status when we have one — for /relay
+            // resume the worker was idle/limited at transfer time and the
+            // CLI didn't actually stop, so showing "starting" right after
+            // the M1 "已接力" announcement is misleading. Fresh-spawn worker
+            // and post-daemon-restart paths still see lastScreenStatus
+            // undefined and fall back to 'starting' (unchanged behavior).
+            const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
@@ -1063,13 +1069,20 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
           const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
-          const initStatus = ds.usageLimit ? 'limited' : 'starting';
+          // See PATCH-branch comment above re: lastScreenStatus preference.
+          // For relay (kill+fork with surviving tmux/CLI), this avoids the
+          // jarring "启动中" right after the M1 "已接力" announcement.
+          const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
             readOnlyUrl,
             initTitle,
-            '',
+            // For /relay resume, ds.lastScreenContent is the cached pane
+            // from before the kill+fork — using it avoids a blank flash
+            // before the first screen_update lands. Fresh worker spawn
+            // has lastScreenContent undefined → '' (unchanged).
+            ds.lastScreenContent ?? '',
             initStatus,
             effectiveCliId,
             ds.displayMode ?? 'hidden',
