@@ -773,6 +773,13 @@ describe('buildPrivateSnapshotCard', () => {
     }
   });
 
+  it("pins visibility:'private' on callback buttons so close stays ephemeral if privateCard is later turned off", () => {
+    const card = build({ screen: 'x' });
+    const btns = allButtons(card);
+    const closeBtn = btns.find((b: any) => b.value?.action === 'close');
+    expect(closeBtn.value.visibility).toBe('private');
+  });
+
   it('never embeds a writable terminal link', () => {
     const json = buildPrivateSnapshotCard('https://t.example/ro', 't', 'idle', 'claude-code', undefined, 'tok-bearing-content', 'sess-9', 'om_anchor', 'zh');
     // only the read-only URL appears; no second token-bearing markdown link

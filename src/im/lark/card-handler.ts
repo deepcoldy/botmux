@@ -336,7 +336,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
       // fallback on failure (privacy wins; the session is already closed).
-      if (botCfg.privateCard) {
+      // `value.visibility === 'private'` pins the decision to the card that was
+      // clicked, so a card built in private mode stays ephemeral even if the
+      // bot's `privateCard` config was turned off in the meantime.
+      if (value?.visibility === 'private' || botCfg.privateCard) {
         const audience = resolvePrivateCardAudience(ds);
         for (const openId of audience) {
           await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, card).catch(err =>

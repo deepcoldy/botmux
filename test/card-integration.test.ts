@@ -543,6 +543,46 @@ describe('Card integration: full event flow', () => {
       }
     });
 
+    it('close from a private card stays ephemeral even after privateCard was turned off (no group leak)', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const botRegMod = await import('../src/bot-registry.js');
+      // Config has since been flipped OFF, but the card itself was built in
+      // private mode and carries visibility:'private'. The closed card must
+      // still go ephemeral — its visibility is pinned to the card, not to the
+      // current (mutable) config.
+      vi.mocked(botRegMod.getBot).mockReturnValue({
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false },
+        resolvedAllowedUsers: ['ou_owner'],
+        botOpenId: 'ou_bot',
+      } as any);
+      try {
+        const ds = makeDaemonSession();
+        const sessions = new Map<string, DaemonSession>();
+        const sKey = sessionKey(ROOT_ID, APP_ID);
+        sessions.set(sKey, ds);
+        const deps = makeDeps(sessions);
+
+        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner', 'private'), deps, APP_ID);
+
+        expect(killWorker).toHaveBeenCalledWith(ds);
+        // Closed card still goes ephemeral to the owner …
+        expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+          APP_ID, ds.chatId, 'ou_owner', expect.stringContaining('"type":"closed"'),
+        );
+        // … and NOT posted to the group thread.
+        const groupClosed = (deps.sessionReply as any).mock.calls.find(
+          (c: any[]) => typeof c[1] === 'string' && c[1].includes('"type":"closed"'),
+        );
+        expect(groupClosed).toBeUndefined();
+      } finally {
+        vi.mocked(botRegMod.getBot).mockReturnValue({
+          config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+          resolvedAllowedUsers: [],
+          botOpenId: 'ou_bot',
+        } as any);
+      }
+    });
+
     it('resume should call resumeSession and reply with success notice', async () => {
       const sessionId = 'closed-uuid-1';
       const sessions = new Map<string, DaemonSession>();

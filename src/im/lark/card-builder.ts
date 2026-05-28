@@ -432,7 +432,12 @@ export function buildPrivateSnapshotCard(
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
-  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
+  // `visibility: 'private'` pins this card's privacy intent onto the action
+  // itself, so a later callback (notably `close`) keeps sending ephemeral even
+  // if the bot's `privateCard` config is toggled off after the card was sent —
+  // otherwise the closed card (session title / workingDir / resume command)
+  // could leak to the group. See the `close` handler in card-handler.ts.
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, visibility: 'private' as const };
 
   const elements: any[] = [];
   // Show the terminal once: prefer the rendered screenshot when present;
