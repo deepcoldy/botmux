@@ -17,6 +17,44 @@ import type { ThemeMode } from './preferences.js';
 
 const root = document.getElementById('root')!;
 
+// ── Auth-expiry overlay ──────────────────────────────────────────────────────
+// Any 401 from an API call means the dashboard token was rotated (a new access
+// link was generated). Show a blocking overlay so the user knows to switch tabs.
+let _expiredShown = false;
+export function showAuthExpiredOverlay(): void {
+  if (_expiredShown) return;
+  _expiredShown = true;
+  const el = document.createElement('div');
+  el.id = 'auth-expired-overlay';
+  el.style.cssText =
+    'position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;' +
+    'align-items:center;justify-content:center;z-index:9999';
+  el.innerHTML =
+    '<div style="background:var(--card,#fff);color:var(--text,#1f2329);border-radius:12px;' +
+    'padding:36px 40px;max-width:460px;width:90vw;text-align:center;' +
+    'box-shadow:0 12px 40px rgba(0,0,0,.35)">' +
+    '<h2 style="margin:0 0 14px;font-size:19px">访问链接已失效</h2>' +
+    '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted,#8f959e);font-size:14px">' +
+    '当前链接/访问已失效，请使用最新授权链接重新进入。<br>最好关闭当前页。</p>' +
+    '<button onclick="window.close()" ' +
+    'style="padding:8px 22px;background:var(--accent,#3370ff);color:#fff;border:none;' +
+    'border-radius:8px;cursor:pointer;font-size:14px">关闭此页</button>' +
+    '</div>';
+  document.body.appendChild(el);
+}
+
+// Patch the global fetch so every 401 from any API call triggers the overlay.
+// Public routes (static shell, read-only workflow API) never return 401, so any
+// 401 we see means the session token was rotated while this tab was open.
+const _origFetch = window.fetch.bind(window);
+window.fetch = async function patchedFetch(
+  ...args: Parameters<typeof fetch>
+): ReturnType<typeof fetch> {
+  const res = await _origFetch(...args);
+  if (res.status === 401) showAuthExpiredOverlay();
+  return res;
+};
+
 // Pages that own a polling loop / cleanup return a disposer; we run it
 // on the next route switch so timers don't leak across navigations.
 let pageDispose: (() => void) | null = null;
