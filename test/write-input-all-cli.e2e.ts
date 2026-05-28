@@ -116,7 +116,7 @@ const ADAPTERS = [
   { name: 'opencode', create: () => safeCreate(() => createOpenCodeAdapter()) },
   { name: 'mtr', create: () => safeCreate(() => createMtrAdapter()) },
   { name: 'hermes', create: () => safeCreate(() => createHermesAdapter()) },
-  { name: 'mira', create: () => safeCreate(() => createMiraAdapter()), wrapsPayload: true },
+  { name: 'mira', create: () => safeCreate(() => createMiraAdapter()) },
 ];
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -143,7 +143,7 @@ describe('writeInput: write sequence verification (all CLIs × all scenarios)', 
           ).toBe(true);
         });
 
-        if (scenario.hasNewline && !adapterDef.wrapsPayload) {
+        if (scenario.hasNewline) {
           it(`${scenario.name}: multi-line uses bracketed paste OR delay+CR`, async () => {
             const pty = createMockPty();
             await adapter.writeInput(pty, scenario.content);
