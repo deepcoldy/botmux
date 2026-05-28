@@ -205,7 +205,7 @@ describe('relay_confirm button click', () => {
     expect(m1Payload).toContain('Friendly Source Chat Name');
     expect(m1Payload).not.toContain('oc_source');
 
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1', 'group');
     expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_picker_card');
     expect(r?.toast?.type).toBe('success');
   });

@@ -1017,6 +1017,33 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
             break;
           }
+          // ── Chat-type guard ───────────────────────────────────────────────
+          // Picker mode only makes sense in regular group chats. p2p (1:1 with
+          // bot) has no relay concept — there's no other participant to
+          // collaborate with — and topic chats route per-thread, so a chat-
+          // scope session pulled in would have no thread anchor.
+          //
+          // p2p is detectable from `ds.chatType` locally (cheap). Topic vs
+          // regular group is NOT captured in chatType — both record 'group'
+          // — so we hit the Lark API (getChatNameAndMode) to resolve the
+          // mode. One API call per /relay invocation; picker is user-
+          // triggered so latency is acceptable.
+          if (ds?.chatType === 'p2p') {
+            await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
+            break;
+          }
+          {
+            const { getChatNameAndMode } = await import('../im/lark/client.js');
+            const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
+            if (info?.mode === 'p2p') {
+              await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
+              break;
+            }
+            if (info?.mode === 'topic') {
+              await sessionReply(rootId, t('cmd.relay.picker_topic_unsupported', undefined, loc));
+              break;
+            }
+          }
           // ── Existing-session guard ────────────────────────────────────────
           // If this bot already runs a real session in the target chat, pulling
           // another session in would collide on sessionKey(targetChatId, larkAppId)
@@ -1219,7 +1246,9 @@ export async function handleCommand(
         const reportLines: string[] = [];
         const leaderName = nameOf(creatorAppId);
         const { transferSession } = await import('./worker-pool.js');
-        const leaderResult = await transferSession(ds.session.sessionId, newChatId, placeholderRootMessageId);
+        // Target chat was just built by createGroupWithBots — by
+        // construction a regular group.
+        const leaderResult = await transferSession(ds.session.sessionId, newChatId, placeholderRootMessageId, 'group');
         if (!leaderResult.ok) {
           // Leader's own transfer failed. Don't post any M1 — there's no
           // misleading announcement to clean up. New chat exists but is

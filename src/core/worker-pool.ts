@@ -719,6 +719,16 @@ export async function transferSession(
   sessionId: string,
   targetChatId: string,
   targetRootMessageId: string,
+  /**
+   * Target chat type — narrowed to `'group'` at the type level. The picker-
+   * mode entry guard in command-handler.ts refuses p2p and topic chats
+   * upfront; `/relay --create` builds the target by createGroupWithBots so
+   * it's a regular group by construction; the cross-daemon migrate-to-chat
+   * IPC inherits the same target. Every call site can vouch — TS prevents
+   * any non-'group' literal from reaching here, and the runtime check just
+   * below catches mock data / future bypasses.
+   */
+  targetChatType: 'group',
   opts?: {
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
@@ -728,6 +738,11 @@ export async function transferSession(
     killWorkerImpl?: typeof killWorker;
   },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
+  // Depth defense — unreachable per TS narrowing above, but guards against
+  // raw-string casting at module boundaries (mocks, HTTP body parses, etc.).
+  if ((targetChatType as string) !== 'group') {
+    return { ok: false, error: 'target_chat_type_unsupported' };
+  }
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
   if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
@@ -829,7 +844,7 @@ export async function transferSession(
   ds.session.chatId = targetChatId;
   ds.session.rootMessageId = targetRootMessageId;
   ds.session.scope = 'chat';
-  ds.session.chatType = 'group';
+  ds.session.chatType = targetChatType;
   ds.session.lastMessageAt = new Date().toISOString();
   // Card state was pinned to the source chat — clear so the new worker posts
   // a fresh card in the target chat instead of trying to PATCH a message that
@@ -840,7 +855,7 @@ export async function transferSession(
 
   // Mirror onto runtime DaemonSession.
   ds.chatId = targetChatId;
-  ds.chatType = 'group';
+  ds.chatType = targetChatType;
   ds.scope = 'chat';
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
@@ -861,7 +876,7 @@ export async function transferSession(
         chatId: targetChatId,
         rootMessageId: targetRootMessageId,
         scope: 'chat',
-        chatType: 'group',
+        chatType: targetChatType,
       },
     },
   });

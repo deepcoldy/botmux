@@ -198,6 +198,8 @@ export const messages: Record<string, string> = {
   'cmd.relay.adopt_not_relayable': '⚠️ 该会话是 /adopt 接入的外部 tmux 进程，CLI 在你电脑里跑，botmux 控不了 tmux 生命周期，无法接力。',
   'cmd.relay.not_started_yet': '⚠️ 会话还没选仓库、CLI 没起来，无法接力。请先在本会话里选仓库把 CLI 起起来。',
   'cmd.relay.worker_busy': '⚠️ 会话正在处理中（mid-turn），无法接力。请等当前回合结束（idle）后再发 /relay。',
+  'cmd.relay.picker_p2p_unsupported': '⚠️ 单聊不支持接力会话。请在普通群里使用 /relay。',
+  'cmd.relay.picker_topic_unsupported': '⚠️ 话题群不支持接力会话（话题群按话题路由，搬过来的会话没有 thread 锚点）。请在普通群里使用 /relay。',
   'cmd.relay.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/relay 取消。请稍后重试。',
   'cmd.relay.m1_announce': '📋 已从「{sourceChat}」接力会话过来。\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。\n@ 对应机器人继续对话即可。',
   'cmd.relay.m1_final_all_ok': '🚀 会话已接力到本群\n📋 来源：{sourceChat}\n✅ 已就绪：{successBots}\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。@ 对应机器人继续对话。',

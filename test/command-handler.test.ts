@@ -1472,6 +1472,39 @@ describe('handleCommand', () => {
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
     });
 
+    it('picker refuses upfront in p2p chats (chatType local check)', async () => {
+      // p2p (1:1 with bot) has no relay concept; relay-picker entry refuses
+      // before rendering. Detection is via ds.chatType — no Lark API hit.
+      const ds = makeDaemonSession({
+        session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
+        chatType: 'p2p',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toMatch(/单聊不支持|not supported in direct/);
+      // Picker MUST NOT have rendered.
+      expect(reply).not.toContain('选择要接力');
+    });
+
+    it('picker refuses upfront in topic chats (getChatNameAndMode → topic)', async () => {
+      // Topic chats record chatType='group' locally — must be resolved via
+      // Lark API. Force the mock to report 'topic' for this scenario.
+      const { getChatNameAndMode } = await import('../src/im/lark/client.js');
+      vi.mocked(getChatNameAndMode).mockResolvedValueOnce({ name: 'Topic Room', mode: 'topic' });
+
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toMatch(/话题群不支持|not supported in topic/);
+      expect(reply).not.toContain('选择要接力');
+    });
+
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {
       const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
       // Existing running session in the SAME chat (would collide on transfer).
@@ -1639,7 +1672,7 @@ describe('handleCommand', () => {
       // settle. The leader's session.rootMessageId is patched to the real
       // M1 id later, see the m1_final_all_ok / m1_final_partial flow.
       const wp = await import('../src/core/worker-pool.js');
-      expect(wp.transferSession).toHaveBeenCalledWith('sess-001', 'oc_new_group', 'oc_new_group');
+      expect(wp.transferSession).toHaveBeenCalledWith('sess-001', 'oc_new_group', 'oc_new_group', 'group');
 
       // Peer migrate-to-chat was POSTed exactly once.
       expect(fetchSpy).toHaveBeenCalledTimes(1);

@@ -195,6 +195,8 @@ export const messages: Record<string, string> = {
   'cmd.relay.adopt_not_relayable': '⚠️ This session was attached via /adopt to an external tmux. The CLI runs on your machine and botmux does not control its tmux lifecycle, so it cannot be relayed.',
   'cmd.relay.not_started_yet': '⚠️ The session has not picked a repo and the CLI has never started — nothing to relay yet. Pick a repo in this session first.',
   'cmd.relay.worker_busy': '⚠️ The session is mid-turn (working). Wait for the current turn to finish (idle), then try /relay again.',
+  'cmd.relay.picker_p2p_unsupported': '⚠️ Relay is not supported in direct (p2p) chats. Use /relay in a regular group chat.',
+  'cmd.relay.picker_topic_unsupported': '⚠️ Relay is not supported in topic chats (they route per thread, leaving a relayed session with no thread anchor). Use /relay in a regular group chat.',
   'cmd.relay.resolve_failed': '⚠️ Could not resolve the @-mentioned bots; /relay cancelled. Please retry shortly.',
   'cmd.relay.m1_announce': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\n@ the corresponding bot to continue.',
   'cmd.relay.m1_final_all_ok': '🚀 Sessions relayed into this chat\n📋 Source: {sourceChat}\n✅ Ready: {successBots}\n⚠️ Lark message history stays in the source chat; AI memory has been carried over. @ the corresponding bot to continue.',

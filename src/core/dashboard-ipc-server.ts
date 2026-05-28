@@ -251,7 +251,9 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'not_session_owner' });
   }
 
-  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId);
+  // Target chat was built by the leader's /relay --create — by
+  // construction a regular group. The peer inherits that guarantee.
+  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group');
   if (!result.ok) {
     return jsonRes(res, 500, { ok: false, error: result.error });
   }

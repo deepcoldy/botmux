@@ -102,7 +102,8 @@ describe('transferSession', () => {
     sessionId: string,
     targetChatId: string,
     targetRootMessageId: string,
-  ) => transferSession(sessionId, targetChatId, targetRootMessageId, {
+    targetChatType: 'group' = 'group',
+  ) => transferSession(sessionId, targetChatId, targetRootMessageId, targetChatType, {
     forkWorkerImpl: forkWorkerSpy as any,
     killWorkerImpl: killWorkerSpy as any,
   });
@@ -111,6 +112,21 @@ describe('transferSession', () => {
     vi.clearAllMocks();
     registry = new Map();
     setActiveSessionsRegistry(registry);
+  });
+
+  it('refuses with target_chat_type_unsupported when target chat type is not group (depth defense)', async () => {
+    // TS narrows targetChatType to 'group' for normal callers — this case
+    // simulates a bypass (e.g. peer HTTP endpoint feeding a body field
+    // through, or a future caller passing through a raw chatType string).
+    // The runtime check inside transferSession must catch it.
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target', 'p2p' as any);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe('target_chat_type_unsupported');
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    // Source ds must not have been mutated.
+    expect(ds.chatId).toBe('oc_source');
   });
 
   it('returns session_not_active when sessionId not in registry', async () => {
