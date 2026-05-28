@@ -437,7 +437,12 @@ export function buildPrivateSnapshotCard(
   if (!imageKey) {
     const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
     if (text) {
-      elements.push({ tag: 'markdown', content: '```\n' + truncateContent(text, locale) + '\n```' });
+      const body = truncateContent(text, locale);
+      // Fence must be longer than the longest backtick run in the body, else
+      // terminal output containing ``` would break out of the code block.
+      const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+      const fence = '`'.repeat(Math.max(3, maxRun + 1));
+      elements.push({ tag: 'markdown', content: `${fence}\n${body}\n${fence}` });
       elements.push({ tag: 'hr' });
     }
   }
