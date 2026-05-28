@@ -1056,15 +1056,14 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.card.private_not_group', undefined, loc));
             break;
           }
-          const triggerer = message.senderId;
-          const audience = resolvePrivateCardAudience(ds, triggerer);
+          const audience = resolvePrivateCardAudience(ds);
           if (audience.length === 0) {
             await sessionReply(rootId, t('cmd.card.private_no_audience', undefined, loc));
             break;
           }
-          const r = await postPrivateSnapshotCard(ds, audience, triggerer);
+          const r = await postPrivateSnapshotCard(ds, audience);
           if (r.notReady) {
-            await sessionReply(rootId, t('cmd.card.not_ready', undefined, loc));
+            await sessionReply(rootId, t('cmd.card.private_not_ready', undefined, loc));
           } else if (r.sent === 0) {
             // Total failure — surface a non-sensitive error (no terminal content,
             // no open_id list). Most likely cause: missing send permission / bot

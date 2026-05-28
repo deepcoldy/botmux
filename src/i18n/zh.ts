@@ -102,8 +102,9 @@ export const messages: Record<string, string> = {
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
   'cmd.card.not_ready': '终端尚未就绪，等会话起好后流式卡片会自动出现。',
+  'cmd.card.private_not_ready': '🔒 终端尚未就绪，等会话起好后再发一次 /card。',
   'cmd.card.private_not_group': '🔒 私密卡片仅支持普通群聊，话题群 / 单聊无法发送（飞书限制）。',
-  'cmd.card.private_no_audience': '🔒 没有可见对象：当前没有被授权与本 bot 对话的用户。',
+  'cmd.card.private_no_audience': '🔒 没有可见对象：当前 bot 未配置 owner（allowedUsers 为空）。',
   'cmd.card.private_failed': '🔒 私密卡片发送失败 —— 可能是缺少消息发送权限、bot 不在群内，或当前为话题群。',
   'cmd.card.private_partial': '🔒 私密卡片已发送 {sent}/{total}，部分接收人发送失败。',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',

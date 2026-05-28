@@ -414,22 +414,17 @@ export async function postFreshStreamingCard(
 }
 
 /**
- * Audience for a private `/card`: the explicit talk-grant union (allowedUsers ∪
- * globalGrants ∪ this chat's chatGrants) plus the triggerer, deduped, `ou_` only.
- * The "everyone can talk" sets (oncall / allowedChatGroups / open mode) are NOT
- * enumerable, so they're intentionally excluded — we fail-closed to the curated
- * list rather than broadcast to the whole room.
+ * Audience for a private `/card`: the bot's `allowedUsers` (the canOperate set —
+ * owner & co-owners), deduped, `ou_` only. Talk-only grants (`globalGrants` /
+ * `chatGrants`) and a bare triggerer are intentionally NOT included: the private
+ * card is owner-only. A grant-authorized user who runs `/card` therefore does
+ * not receive a card (matches the "授权人不发" rule). Empty when the bot has no
+ * `allowedUsers` (fully-open mode → no owner to send to).
  */
-export function resolvePrivateCardAudience(
-  ds: DaemonSession,
-  triggererOpenId: string | undefined,
-): string[] {
+export function resolvePrivateCardAudience(ds: DaemonSession): string[] {
   const bot = getBot(ds.larkAppId);
   const set = new Set<string>();
   for (const u of bot.resolvedAllowedUsers) if (u.startsWith('ou_')) set.add(u);
-  for (const u of bot.config.globalGrants ?? []) if (u.startsWith('ou_')) set.add(u);
-  for (const u of bot.config.chatGrants?.[ds.chatId] ?? []) if (u.startsWith('ou_')) set.add(u);
-  if (triggererOpenId?.startsWith('ou_')) set.add(triggererOpenId);
   return [...set];
 }
 
@@ -444,10 +439,9 @@ export function resolvePrivateCardAudience(
 export async function postPrivateSnapshotCard(
   ds: DaemonSession,
   audience: string[],
-  triggererOpenId: string | undefined,
-): Promise<{ sent: number; total: number; triggererSent: boolean; notReady: boolean }> {
+): Promise<{ sent: number; total: number; notReady: boolean }> {
   const port = ds.workerPort ?? ds.session.webPort;
-  if (!port) return { sent: 0, total: audience.length, triggererSent: false, notReady: true };
+  if (!port) return { sent: 0, total: audience.length, notReady: true };
 
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
@@ -455,11 +449,11 @@ export async function postPrivateSnapshotCard(
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const status = ds.lastScreenStatus ?? 'idle';
   const cardJson = buildPrivateSnapshotCard(
-    readUrl, title, status, effectiveCliId, ds.currentImageKey, localeForBot(ds.larkAppId), cardUsageLimit(ds),
+    readUrl, title, status, effectiveCliId, ds.currentImageKey,
+    ds.session.sessionId, sessionAnchorId(ds), localeForBot(ds.larkAppId), cardUsageLimit(ds),
   );
 
   let sent = 0;
-  let triggererSent = false;
   // Cap concurrency: Feishu per-chat ~40 QPS, ephemeral total 50/s.
   const CONCURRENCY = 5;
   for (let i = 0; i < audience.length; i += CONCURRENCY) {
@@ -468,14 +462,13 @@ export async function postPrivateSnapshotCard(
       try {
         await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, cardJson);
         sent++;
-        if (openId === triggererOpenId) triggererSent = true;
       } catch (err) {
         logger.warn(`[${tag(ds)}] private /card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`);
       }
     }));
   }
   logger.info(`[${tag(ds)}] private /card: ephemeral sent ${sent}/${audience.length}`);
-  return { sent, total: audience.length, triggererSent, notReady: false };
+  return { sent, total: audience.length, notReady: false };
 }
 
 // ─── Card PATCH serialization queue ─────────────────────────────────────────

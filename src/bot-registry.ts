@@ -101,11 +101,13 @@ export interface BotConfig {
   writableTerminalLinkInCard?: boolean;
   /**
    * When true, `/card` sends a **private** static snapshot card via the ephemeral
-   * API (visible only to the explicit talk-grant audience + triggerer) instead of
-   * the group-visible live streaming card. Only works in plain `group` chats
-   * (topic/thread/p2p fail closed) and cannot live-update (ephemeral cards can't
-   * be patched). Scoped to the `/card` command only — the auto streaming card is
-   * unaffected. Default (undefined) keeps `/card` group-visible & live.
+   * API, visible only to the bot's `allowedUsers` (owner / co-owners), instead of
+   * the group-visible live streaming card. Talk-only grants (globalGrants /
+   * chatGrants) and a bare triggerer do NOT receive it — it's owner-only. Only
+   * works in plain `group` chats (topic/thread/p2p fail closed) and cannot
+   * live-update (ephemeral cards can't be patched). Scoped to the `/card` command
+   * only — the auto streaming card is unaffected. Default (undefined) keeps
+   * `/card` group-visible & live.
    */
   privateCard?: boolean;
 }

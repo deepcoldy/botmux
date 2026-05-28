@@ -99,8 +99,9 @@ export const messages: Record<string, string> = {
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
   'cmd.card.not_ready': 'Terminal not ready yet — the streaming card will appear once the session is up.',
+  'cmd.card.private_not_ready': '🔒 Terminal not ready yet — send /card again once the session is up.',
   'cmd.card.private_not_group': '🔒 Private cards only work in regular group chats — topic groups / DMs are unsupported (Feishu limitation).',
-  'cmd.card.private_no_audience': '🔒 No audience: nobody is currently authorized to talk to this bot.',
+  'cmd.card.private_no_audience': '🔒 No audience: this bot has no owner configured (allowedUsers is empty).',
   'cmd.card.private_failed': '🔒 Failed to send the private card — likely missing send permission, the bot is not in this chat, or this is a topic group.',
   'cmd.card.private_partial': '🔒 Private card sent to {sent}/{total}; some recipients failed.',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',

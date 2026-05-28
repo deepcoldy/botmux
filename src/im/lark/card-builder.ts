@@ -395,11 +395,17 @@ export function buildStreamingCard(
  * Build a static "private snapshot" card for `/card` in private mode — sent via
  * the ephemeral API to one user at a time. Unlike {@link buildStreamingCard} it
  * is **never PATCH-updated** (ephemeral cards can't be), so it carries only a
- * one-shot snapshot of the terminal screenshot plus a read-only "open terminal"
- * link. All callback-driven controls (toggle/refresh/close/get-write-link/term
- * keys) and the writable-terminal link are intentionally omitted: ephemeral
- * cards can't be patched back, and most of the audience is talk-only (can't
- * `canOperate`), so those buttons would dead-end.
+ * one-shot snapshot of the terminal screenshot plus three buttons:
+ *   • read-only "open terminal" link (a plain URL button — no callback);
+ *   • "get write link", whose callback DMs the writable link to the clicker;
+ *   • "close session", whose callback kills the session and posts a fresh
+ *     "closed" card to the thread.
+ * The last two have callbacks but neither patches THIS card (one DMs, the other
+ * posts a new card), so both work fine on an ephemeral card. Both are
+ * `canOperate`-gated in the handler — talk-only viewers who tap them are denied.
+ * The patch-driven controls (toggle/refresh/export/term keys) and the inline
+ * writable link are still omitted: those need to update this card, which
+ * ephemeral cards can't do.
  */
 export function buildPrivateSnapshotCard(
   terminalUrl: string,
@@ -407,12 +413,15 @@ export function buildPrivateSnapshotCard(
   status: StreamStatus,
   cliId: CliId | undefined,
   imageKey: string | undefined,
+  sessionId: string,
+  rootId: string,
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
 
   const elements: any[] = [];
   // Force the screenshot into view when we have one (the snapshot exists to let
@@ -423,12 +432,26 @@ export function buildPrivateSnapshotCard(
 
   elements.push({
     tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-      type: 'primary',
-      multi_url: { url: terminalUrl, pc_url: terminalUrl, android_url: terminalUrl, ios_url: terminalUrl },
-    }],
+    actions: [
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+        type: 'primary',
+        multi_url: { url: terminalUrl, pc_url: terminalUrl, android_url: terminalUrl, ios_url: terminalUrl },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+        type: 'default',
+        value: { action: 'get_write_link', ...actionBase },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+        type: 'danger',
+        value: { action: 'close', ...actionBase },
+      },
+    ],
   });
   elements.push({
     tag: 'note',
