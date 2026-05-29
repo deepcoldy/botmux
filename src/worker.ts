@@ -63,6 +63,7 @@ import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
 import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
+import { redactChildEnv } from './utils/child-env.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
@@ -2909,36 +2910,32 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
   }
 
+  // Build the child env. redactChildEnv() DELETES the keys that must not leak
+  // (the bot's bare LARK_APP_* creds + CLAUDECODE) rather than setting them to
+  // `undefined`: node-pty stringifies an `undefined` env value to the literal
+  // string "undefined" instead of omitting the key, so `{ ...env, LARK_APP_ID:
+  // undefined }` would leave LARK_APP_ID="undefined" visible to the child and
+  // any SDK probing `process.env.LARK_APP_ID` would still take the Lark path.
+  // The child needs neither bare cred: `botmux send` resolves creds from
+  // bots.json on disk (im/lark/client.ts), `botmux ask` routes via the
+  // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
+  // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
+  const childEnv = redactChildEnv(process.env);
+  // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
+  // daemon socket, route the card back to this thread, and resolve the
+  // approver allowlist against session.owner. Missing env → exit 2.
+  childEnv.BOTMUX_SESSION_ID = cfg.sessionId;
+  childEnv.BOTMUX_CHAT_ID = cfg.chatId;
+  childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
+  if (claudeResumeTokenThreshold) childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = claudeResumeTokenThreshold;
+
   backend.spawn(cliAdapter.resolvedBin, args, {
     cwd: cfg.workingDir,
     cols: PTY_COLS,
     rows: PTY_ROWS,
-    env: {
-      ...process.env,
-      CLAUDECODE: undefined,
-      // Redact the bot's bare LARK_APP_ID / LARK_APP_SECRET from the child. The
-      // worker inherits them from the daemon (worker-pool.ts forkWorker) for
-      // its own Lark calls (lark-upload, etc.), and without this every spawned
-      // CLI would also see them via `...process.env`. Some CLIs ship a Lark SDK
-      // whose OAuth reads `process.env.LARK_APP_ID` as the app to authorize and
-      // get hijacked by the botmux IM app (no docs scopes → 403 loop). The
-      // child needs neither: `botmux send` resolves creds from bots.json on
-      // disk (im/lark/client.ts), `botmux ask` routes via the namespaced
-      // BOTMUX_LARK_APP_ID injected below — bare LARK_APP_* are never read
-      // child-side. `undefined` removes the inherited var (node-pty drops
-      // undefined keys; tmux's buildBotmuxEnvAssignments skips them).
-      LARK_APP_ID: undefined,
-      LARK_APP_SECRET: undefined,
-      // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find
-      // the daemon socket, route the card back to this thread, and resolve
-      // the approver allowlist against session.owner. Missing env → exit 2.
-      BOTMUX_SESSION_ID: cfg.sessionId,
-      BOTMUX_CHAT_ID: cfg.chatId,
-      BOTMUX_LARK_APP_ID: cfg.larkAppId,
-      BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId,
-      ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
-      ...(claudeResumeTokenThreshold ? { CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: claudeResumeTokenThreshold } : {}),
-    } as unknown as Record<string, string>,
+    env: childEnv as Record<string, string>,
   });
 
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)

@@ -131,8 +131,10 @@ export class TmuxBackend implements SessionBackend {
       //         a `cd ~/work` left in by mistake stays in opts.cwd).
       //       * `exec /usr/bin/env "$@"`: env(1) parses the leading KEY=VAL
       //         pairs in argv as overrides for the child process. This lands
-      //         AFTER rcfile load, so botmux's per-bot LARK_APP_ID wins over
-      //         a stale `export LARK_APP_ID=...` someone left in their .zshrc.
+      //         AFTER rcfile load, so botmux's per-session values (e.g.
+      //         BOTMUX_LARK_APP_ID, SESSION_DATA_DIR) win over same-named
+      //         exports left in the user's .zshrc. (Bare LARK_APP_* are NOT in
+      //         the inject list — the worker redacts them; see redactChildEnv.)
       //   - `_` is the $0 placeholder; the remaining argv items are seen as
       //     "$@" by the shell, so spaces / quotes / `$` / newlines in cwd,
       //     env values, or args never need shell-escaping.
@@ -425,9 +427,14 @@ export class TmuxBackend implements SessionBackend {
 
 /**
  * The minimal set of env vars that botmux must inject into the CLI process
- * itself — values that user rcfiles cannot derive on their own (per-bot
- * credentials, the daemon-assigned data directory, the BOTMUX marker, the
- * Claude root-mode escape hatch, the session owner's open_id).
+ * itself — values that user rcfiles cannot derive on their own (the namespaced
+ * Lark app id for `botmux ask`, the daemon-assigned data directory, the BOTMUX
+ * marker, the Claude root-mode escape hatch, the session owner's open_id).
+ *
+ * NOTE: the bot's bare `LARK_APP_ID` / `LARK_APP_SECRET` are deliberately NOT
+ * here — the child must not see them (a CLI's own Lark OAuth would be hijacked
+ * by the botmux IM app; see worker.ts redactChildEnv). The child resolves Lark
+ * via the namespaced `BOTMUX_LARK_APP_ID` below or via bots.json on disk.
  *
  * Anything outside this list (PATH, HOME, NVM_BIN, PNPM_HOME, LANG, …) is
  * deliberately NOT forwarded from the daemon — the wrapping `$SHELL -l -i`
@@ -437,11 +444,9 @@ export class TmuxBackend implements SessionBackend {
  *
  * These values are injected via `/usr/bin/env KEY=VAL ... cli args` (not tmux
  * `-e`) so they land *after* rcfile load and override any leftover same-named
- * exports in the user's rcfile (e.g. an old `LARK_APP_ID` from a previous bot).
+ * exports in the user's rcfile.
  */
 const BOTMUX_INJECTED_ENV_KEYS = [
-  'LARK_APP_ID',
-  'LARK_APP_SECRET',
   '__OWNER_OPEN_ID',
   'BOTMUX',
   'SESSION_DATA_DIR',
