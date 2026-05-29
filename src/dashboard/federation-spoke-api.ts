@@ -51,10 +51,11 @@ interface OwnerResolveDeps {
 
 /** Resolve this deployment's owner identity from bots.json `allowedUsers` using
  *  each bot's OWN app credentials (no /pair, no shared pairings.json — immune to
- *  the dataDir-split that broke /pair). Walks bots with allowedUsers in order;
- *  returns the first bot's distinct resolved {unionId,name} (skips bots that
- *  resolve to nothing, so one mis-config doesn't hide the rest). The UI auto-binds
- *  when there's exactly one, else lets the owner pick. */
+ *  the dataDir-split that broke /pair). Iterates ALL bots with non-empty
+ *  allowedUsers, resolves each independently, then aggregates and deduplicates by
+ *  union_id across all bots. The UI auto-binds when there's exactly one candidate,
+ *  else lets the owner pick. A bot failing (no scope / API error) is skipped so
+ *  one mis-config doesn't hide the rest. */
 export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps = {}): Promise<OwnerCandidate[]> {
   const loadConfigs = d.configs ?? loadBotConfigs;
   const ensureClient = d.ensureClient ?? ((cfg: BotConfig) => { try { getBot(cfg.larkAppId); } catch { registerBot(cfg); } });
@@ -62,21 +63,22 @@ export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps
   const resolveUnion = d.resolveUnion ?? resolveUserUnionId;
   let configs: BotConfig[] = [];
   try { configs = loadConfigs(); } catch { return []; }
+  const byUnion = new Map<string, OwnerCandidate>();
   for (const cfg of configs) {
     const allowed = cfg.allowedUsers ?? [];
     if (allowed.length === 0) continue;
     try { ensureClient(cfg); } catch { continue; }
     let openIds: string[] = [];
     try { openIds = await resolveAllowed(cfg.larkAppId, allowed); } catch { continue; } // one bot failing → try next
-    const byUnion = new Map<string, OwnerCandidate>();
     for (const oid of openIds) {
       if (!oid.startsWith('ou_')) continue;
       const u = await resolveUnion(cfg.larkAppId, oid);
-      if (u.unionId) byUnion.set(u.unionId, { unionId: u.unionId, name: u.name ?? '' });
+      if (u.unionId && !byUnion.has(u.unionId)) {
+        byUnion.set(u.unionId, { unionId: u.unionId, name: u.name ?? '' });
+      }
     }
-    if (byUnion.size > 0) return [...byUnion.values()];
   }
-  return [];
+  return [...byUnion.values()];
 }
 
 const MAX_ROLE_BYTES = 4 * 1024;
