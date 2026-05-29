@@ -1626,15 +1626,13 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     deterministic from cliSessionId. PID is the fallback when discovery
   //     missed (events.jsonl isn't held open continuously, so worker may need
   //     to re-probe via session.log / traces.jsonl fds).
-  //   - mtr: worker tails MTR's sqlite transcript, resolving by native sid
-  //     when discovery has one or by adopted cwd as a fallback.
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   const bridgeJsonlPath =
     adoptedCliId === 'claude-code' && adopted.sessionId
       ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd)
       : undefined;
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr';
+  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco';
 
   const initMsg: DaemonToWorker = {
     type: 'init',
