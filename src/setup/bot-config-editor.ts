@@ -39,12 +39,15 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
 const FULL_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
- * 合法的 allowedUsers 条目 = open_id（ou_*）或**完整邮箱**。
- * 裸邮箱前缀（如 "alice"）不合法：解析器只认 ou_ 或完整邮箱，前缀会被丢弃 → 配置无 owner。
+ * 合法的 allowedUsers 条目：
+ *   - on_xxx  union_id  — 跨应用稳定，推荐
+ *   - 完整邮箱          — 人类可读，推荐
+ *   - ou_xxx  open_id   — 仅对签发该 ID 的同一应用有效，不推荐跨 bot 复用
+ * 裸邮箱前缀（如 "alice"）不合法：解析器只认 ou_/on_ 或完整邮箱。
  */
 export function isValidAllowedUserEntry(entry: string): boolean {
   const s = entry.trim();
-  return s.startsWith('ou_') || FULL_EMAIL_RE.test(s);
+  return s.startsWith('ou_') || s.startsWith('on_') || FULL_EMAIL_RE.test(s);
 }
 
 /** 返回非法的 allowedUsers 条目（既不是 ou_ 也不是完整邮箱，典型是裸邮箱前缀）。 */
@@ -89,7 +92,7 @@ export function assertOwnerWhenChatGroups(
 ): void {
   if ((config.allowedChatGroups?.length ?? 0) > 0 && !hasOwnerEntry(config.allowedUsers)) {
     throw new Error(
-      '配置了 allowedChatGroups 时必须同时在 allowedUsers 配置至少一个 owner（完整邮箱或 open_id），' +
+      '配置了 allowedChatGroups 时必须同时在 allowedUsers 配置至少一个 owner（完整邮箱、union_id on_xxx 或 open_id ou_xxx），' +
       '否则群成员能对话但没人能执行 /restart、/close 等敏感操作，/grant 也不可用。',
     );
   }

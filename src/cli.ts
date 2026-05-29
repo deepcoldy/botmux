@@ -534,14 +534,31 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
 }
 
 /**
+ * 用指定应用凭证把 open_id (ou_) 解析成 union_id (on_，跨应用稳定)。
+ * 查询失败（无 contact 权限 / API 错误）则 fallback 返回原 open_id。
+ */
+async function resolveOpenIdToUnionId(appId: string, appSecret: string, openId: string): Promise<string> {
+  try {
+    const { Client } = await import('@larksuiteoapi/node-sdk');
+    const client = new Client({ appId, appSecret });
+    const res = await (client as any).contact.v3.user.get({
+      path: { user_id: openId },
+      params: { user_id_type: 'open_id' },
+    });
+    if (res.code === 0 && res.data?.user?.union_id) return res.data.user.union_id as string;
+  } catch { /* fallback */ }
+  return openId;
+}
+
+/**
  * 手动建 bot 时（没有扫码人 open_id）必须指定至少一个 owner.
- * 循环追问直到给出合法条目（完整邮箱或 ou_ open_id），拒绝裸邮箱前缀与空输入.
+ * 循环追问直到给出合法条目（邮箱、union_id on_xxx 或 open_id ou_xxx），拒绝裸邮箱前缀与空输入.
  * setup 不允许没有 owner —— 没 owner 的配置一旦叠加 allowedChatGroups 即成权限黑洞.
  */
 async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Promise<string[]> {
   printInputHelp('管理员 (owner)', [
-    '必填。至少一个能操作机器人的管理员，支持完整邮箱（如 alice@example.com）或 open_id（ou_xxx），多个值用逗号分隔。',
-    '第一个 open_id（或可解析的邮箱）将作为 owner —— /restart、/close、/grant 等敏感操作只对 allowedUsers 开放。',
+    '必填。至少一个能操作机器人的管理员，多个值用逗号分隔。',
+    '推荐格式（优先级高到低）：完整邮箱（alice@example.com）> union_id（on_xxx，跨应用稳定）> open_id（ou_xxx，仅限同一应用）。',
     '注意：必须是完整邮箱，邮箱前缀（如 alice）无法解析、不接受。',
   ]);
   for (;;) {
@@ -615,11 +632,12 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     bot.model = modelChoice;
   }
   // 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id), 天然就是 owner.
+  // 优先解析成 union_id (on_，跨应用稳定)；失败则 fallback 到 open_id (ou_)。
   // 手动 fallback 场景没 open_id —— 必须显式指定 owner, 否则配置无 owner:
   // allowedUsers 为空时虽然"全开放", 但一旦后续加了 allowedChatGroups 就会变成
   // "群成员能对话却没人能做敏感操作 / 用 /grant". setup 阶段强制收口, 不允许没 owner.
   if (creds.userOpenId) {
-    bot.allowedUsers = [creds.userOpenId];
+    bot.allowedUsers = [await resolveOpenIdToUnionId(creds.appId, creds.appSecret, creds.userOpenId)];
   } else {
     bot.allowedUsers = await promptRequiredOwner(rl);
   }
