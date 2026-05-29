@@ -18,7 +18,7 @@
  * in the user's rcfile doesn't drag the CLI's working directory away.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -335,6 +335,71 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       expect(lines).toContain('BOTMUX_LARK_APP_ID=fresh');
       expect(lines).toContain('SESSION_DATA_DIR=fresh-dir');
       expect(lines).not.toContain('BOTMUX_LARK_APP_ID=stale');
+    },
+  );
+
+  it.skipIf(!hasEnvBin)(
+    'wrapper unsets bare LARK_APP_* / CLAUDECODE inherited from the ambient env',
+    () => {
+      // The new tmux pane inherits the tmux *server* global env, which the
+      // redacted client env cannot override (Codex's 2nd blocker). The wrapper
+      // `unset`s the bare creds before exec so the CLI never sees them — here
+      // we feed them via the spawn env, exactly as an inherited value would
+      // appear. The OLD wrapper (no unset) would leak all three.
+      const cwd = tmpdir();
+      const result = spawnSync(
+        '/bin/sh',
+        ['-c', SCRIPT, '_', cwd, 'BOTMUX_LARK_APP_ID=ns', '/usr/bin/env'],
+        { encoding: 'utf-8', env: {
+          LARK_APP_ID: 'inherited_id',
+          LARK_APP_SECRET: 'inherited_secret',
+          CLAUDECODE: '1',
+          PATH: '/usr/bin:/bin',
+        } },
+      );
+      expect(result.status).toBe(0);
+      const lines = result.stdout.split('\n');
+      expect(lines.some(l => l.startsWith('LARK_APP_ID='))).toBe(false);
+      expect(lines.some(l => l.startsWith('LARK_APP_SECRET='))).toBe(false);
+      expect(lines.some(l => l.startsWith('CLAUDECODE='))).toBe(false);
+      expect(lines).toContain('BOTMUX_LARK_APP_ID=ns');
+    },
+  );
+
+  const hasTmux = !spawnSync('tmux', ['-V']).error;
+  it.skipIf(!hasEnvBin || !hasTmux)(
+    'tmux child does NOT inherit bare LARK_APP_* from a server started with them in scope (Codex repro)',
+    () => {
+      // End-to-end: start a tmux server that already has bare creds in its
+      // global env (the pre-upgrade / user-shell case), then create a new
+      // session through the real wrapper with a redacted client env. The pane
+      // must not see the server's bare creds.
+      const sock = `bmx-test-${process.pid}`;
+      const outFile = join(tmpdir(), `bmx-pane-env-${process.pid}.txt`);
+      // tmux refuses nested sessions when $TMUX is set — strip it.
+      const baseEnv = { ...process.env }; delete baseEnv.TMUX; delete baseEnv.TMUX_PANE;
+      try {
+        // 1) Server started WITH bare creds in scope.
+        spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', 'sleep 60'],
+          { env: { ...baseEnv, LARK_APP_ID: 'server_id', LARK_APP_SECRET: 'server_secret', CLAUDECODE: '1' } });
+        // 2) New session via the wrapper with a redacted client env; the "CLI"
+        //    dumps its env then signals completion so the test stays sync.
+        const clientEnv = { ...baseEnv };
+        delete clientEnv.LARK_APP_ID; delete clientEnv.LARK_APP_SECRET; delete clientEnv.CLAUDECODE;
+        spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'probe',
+          '/bin/sh', '-c', SCRIPT, '_', tmpdir(), 'BOTMUX_LARK_APP_ID=ns',
+          '/bin/sh', '-c', `env > ${outFile}; tmux -L ${sock} wait-for -S bmxdone`],
+          { env: clientEnv });
+        spawnSync('tmux', ['-L', sock, 'wait-for', 'bmxdone'], { timeout: 10_000 });
+        const paneEnv = readFileSync(outFile, 'utf-8').split('\n');
+        expect(paneEnv.some(l => l.startsWith('LARK_APP_ID='))).toBe(false);
+        expect(paneEnv.some(l => l.startsWith('LARK_APP_SECRET='))).toBe(false);
+        expect(paneEnv.some(l => l.startsWith('CLAUDECODE='))).toBe(false);
+        expect(paneEnv).toContain('BOTMUX_LARK_APP_ID=ns');
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server']);
+        rmSync(outFile, { force: true });
+      }
     },
   );
 
