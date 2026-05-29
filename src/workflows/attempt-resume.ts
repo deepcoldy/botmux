@@ -57,6 +57,7 @@ export type AttemptResumeSidecar = {
 export type AttemptResumeBot = {
   larkAppId: string;
   larkAppSecret: string;
+  exposeLarkEnvToChild?: boolean;
   cliId: string;
   cliPathOverride?: string;
   backendType?: 'pty' | 'tmux';
@@ -290,6 +291,7 @@ export class AttemptResumeManager {
       ...(terminal.terminal.cliSessionId ? { cliSessionId: terminal.terminal.cliSessionId } : {}),
       larkAppId: bot.larkAppId,
       larkAppSecret: bot.larkAppSecret,
+      exposeLarkEnvToChild: bot.exposeLarkEnvToChild,
       botName: bot.botName ?? terminal.terminal.botName,
       botOpenId: bot.botOpenId,
       locale: bot.locale ?? 'zh',

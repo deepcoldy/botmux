@@ -110,6 +110,31 @@ describe('buildBotmuxEnvAssignments()', () => {
     const out = buildBotmuxEnvAssignments(huge);
     expect(out).toEqual(['LARK_APP_ID=kept', 'BOTMUX=1']);
   });
+
+  it('drops LARK_APP_ID / LARK_APP_SECRET when worker set them to undefined (exposeLarkEnvToChild=false opt-out)', () => {
+    // Regression guard for the BotConfig.exposeLarkEnvToChild=false codepath.
+    // worker.ts spawns the CLI with `LARK_APP_ID: undefined, LARK_APP_SECRET: undefined`
+    // on top of `...process.env`, intending to redact the daemon's bot creds
+    // from the child. tmux-backend MUST honor that override and NOT smuggle
+    // them back into the `/usr/bin/env KEY=VAL` argv. BOTMUX_LARK_APP_ID is
+    // still injected (botmux subcommands need it).
+    const out = buildBotmuxEnvAssignments({
+      LARK_APP_ID: undefined,
+      LARK_APP_SECRET: undefined,
+      BOTMUX: '1',
+      BOTMUX_LARK_APP_ID: 'cli_bot_creds_for_botmux_subcommands',
+      BOTMUX_SESSION_ID: 'sess_xxx',
+      SESSION_DATA_DIR: '/d',
+    });
+    expect(out).not.toContain('LARK_APP_ID=undefined');
+    expect(out).not.toContain('LARK_APP_SECRET=undefined');
+    expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
+    expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
+    expect(out).toContain('BOTMUX=1');
+    expect(out).toContain('BOTMUX_LARK_APP_ID=cli_bot_creds_for_botmux_subcommands');
+    expect(out).toContain('BOTMUX_SESSION_ID=sess_xxx');
+    expect(out).toContain('SESSION_DATA_DIR=/d');
+  });
 });
 
 describe('resolveUserShell()', () => {

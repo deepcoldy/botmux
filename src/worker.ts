@@ -2909,6 +2909,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
   }
 
+  // Opt-out gate (BotConfig.exposeLarkEnvToChild === false): redact the bot's
+  // bare LARK_APP_ID / LARK_APP_SECRET from the child env. The worker process
+  // inherits them from the daemon (see worker-pool.ts forkWorker) for its own
+  // Lark API calls (lark-upload, etc.); without this redaction every CLI we
+  // spawn would also see them via `...process.env`. Some CLIs ship a Lark SDK
+  // whose OAuth flow reads `process.env.LARK_APP_ID` as the default app, and
+  // get hijacked by the botmux IM app id (which lacks docs scopes) — that's
+  // the regression this gate fixes. `BOTMUX_LARK_APP_ID` is still injected
+  // below so botmux's own agent subcommands (`botmux send`, `botmux ask`,
+  // etc.) keep working regardless. Default (unset / true): same as
+  // pre-existing behavior, no redaction.
+  const redactLarkEnv = cfg.exposeLarkEnvToChild === false;
+
   backend.spawn(cliAdapter.resolvedBin, args, {
     cwd: cfg.workingDir,
     cols: PTY_COLS,
@@ -2916,6 +2929,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     env: {
       ...process.env,
       CLAUDECODE: undefined,
+      ...(redactLarkEnv ? { LARK_APP_ID: undefined, LARK_APP_SECRET: undefined } : {}),
       // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find
       // the daemon socket, route the card back to this thread, and resolve
       // the approver allowlist against session.owner. Missing env → exit 2.

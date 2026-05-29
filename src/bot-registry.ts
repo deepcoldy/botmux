@@ -119,6 +119,27 @@ export interface BotConfig {
    * `/card` group-visible & live.
    */
   privateCard?: boolean;
+  /**
+   * When `false`, this bot's `LARK_APP_ID` / `LARK_APP_SECRET` are NOT exported
+   * into the PTY child process's environment. The `BOTMUX_LARK_APP_ID` env
+   * (used by `botmux send` / `botmux ask` agent subcommands) is still injected
+   * regardless of this setting — only the bare `LARK_APP_*` names are gated.
+   *
+   * Set to `false` when your CLI ships with its own Lark OAuth / SDK that
+   * reads `process.env.LARK_APP_ID` as the default app to authorize against,
+   * because botmux's per-bot value (a *bot* app, typically IM-only scopes)
+   * will silently override the CLI's intended *user-mode* app id and break
+   * the CLI's docs / wiki / sheets flows.
+   *
+   * Real-world example: `claude-code` with the `@byted/ttadk` wrapper bundles
+   * `@byted/mcp-lark-docs`, whose `process.env.LARK_APP_ID || DEFAULT_APP_ID`
+   * resolves to the botmux IM app, which lacks `docs:document.content:read` —
+   * the OAuth callback fires but every doc fetch then 403s, hanging the bot.
+   *
+   * Default (`true` / unset): inject `LARK_APP_ID` / `LARK_APP_SECRET` for
+   * backward compatibility (same as botmux <= 2.42.x).
+   */
+  exposeLarkEnvToChild?: boolean;
 }
 
 export interface BotState {
@@ -465,6 +486,16 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
+      // Distinguish three states: `false` (opt out — don't inject LARK_APP_*),
+      // `true` (explicit opt-in), and `undefined` (default = inject, same as
+      // pre-existing behavior). Non-booleans collapse to undefined; never
+      // crash on a hand-edited config typo.
+      exposeLarkEnvToChild:
+        entry.exposeLarkEnvToChild === false
+          ? false
+          : entry.exposeLarkEnvToChild === true
+            ? true
+            : undefined,
     });
   }
 
