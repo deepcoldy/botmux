@@ -111,9 +111,8 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).toEqual(['LARK_APP_ID=kept', 'BOTMUX=1']);
   });
 
-  it('drops LARK_APP_ID / LARK_APP_SECRET when worker set them to undefined (default redact)', () => {
-    // Regression guard for the default-redact codepath. worker.ts spawns the
-    // CLI with `...childLarkEnvOverride(...)` which, by default, yields
+  it('drops LARK_APP_ID / LARK_APP_SECRET when worker set them to undefined (child redact)', () => {
+    // Regression guard for the redact codepath. worker.ts spawns the CLI with
     // `LARK_APP_ID: undefined, LARK_APP_SECRET: undefined` on top of
     // `...process.env` — redacting the daemon's bot creds from the child.
     // tmux-backend MUST honor that override and NOT smuggle them back into the

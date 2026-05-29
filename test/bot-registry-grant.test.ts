@@ -51,26 +51,4 @@ describe('bot-registry grant additions', () => {
     registerBot({ larkAppId: 'a3', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com'] });
     expect(getOwnerOpenId('a3')).toBeUndefined();
   });
-
-  it('parseBotConfigsFromText preserves exposeLarkEnvToChild tri-state (false / true / undefined)', () => {
-    // Only `true` is load-bearing — worker.ts injects bare LARK_APP_* into the
-    // child iff `exposeLarkEnvToChild === true`:
-    //   - undefined / unset → default, DON'T expose (child uses BOTMUX_LARK_APP_ID)
-    //   - false             → same as default, but explicit + audit-visible
-    //   - true              → legacy opt-in, inject bare LARK_APP_* into child
-    // Non-booleans (string "false", number 0, etc.) collapse to undefined so a
-    // hand-edited typo can never accidentally flip the inject on.
-    const cfgs = parseBotConfigsFromText(JSON.stringify([
-      { larkAppId: 'e_unset', larkAppSecret: 's' },
-      { larkAppId: 'e_true', larkAppSecret: 's', exposeLarkEnvToChild: true },
-      { larkAppId: 'e_false', larkAppSecret: 's', exposeLarkEnvToChild: false },
-      { larkAppId: 'e_typo_string', larkAppSecret: 's', exposeLarkEnvToChild: 'false' },
-      { larkAppId: 'e_typo_zero', larkAppSecret: 's', exposeLarkEnvToChild: 0 },
-    ]));
-    expect(cfgs[0].exposeLarkEnvToChild).toBeUndefined();
-    expect(cfgs[1].exposeLarkEnvToChild).toBe(true);
-    expect(cfgs[2].exposeLarkEnvToChild).toBe(false);
-    expect(cfgs[3].exposeLarkEnvToChild).toBeUndefined();  // string "false" ≠ false
-    expect(cfgs[4].exposeLarkEnvToChild).toBeUndefined();  // 0 ≠ false
-  });
 });

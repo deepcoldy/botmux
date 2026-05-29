@@ -119,31 +119,6 @@ export interface BotConfig {
    * `/card` group-visible & live.
    */
   privateCard?: boolean;
-  /**
-   * Whether to export this bot's bare `LARK_APP_ID` / `LARK_APP_SECRET` into
-   * the spawned CLI's environment.
-   *
-   * **Default (`undefined` / `false`): NOT exported.** The child resolves Lark
-   * through the namespaced `BOTMUX_LARK_APP_ID` (used by `botmux send` /
-   * `botmux ask`, always injected) or through its own OAuth — never the bare
-   * names. This avoids a footgun: a CLI that ships its own Lark SDK / OAuth
-   * reads `process.env.LARK_APP_ID` as the default app to authorize against,
-   * so botmux's per-bot value (a *bot* app, typically IM-only scopes) would
-   * silently override the CLI's intended *user-mode* app id and break its
-   * docs / wiki / sheets flows.
-   *
-   * Real-world example: `claude-code` with the `@byted/ttadk` wrapper bundles
-   * `@byted/mcp-lark-docs`, whose `process.env.LARK_APP_ID || DEFAULT_APP_ID`
-   * resolved to the botmux IM app, which lacks `docs:document.content:read` —
-   * the OAuth callback fired but every doc fetch then 403'd, hanging the bot.
-   *
-   * Set to `true` to opt back into the legacy (botmux <= 2.x) behavior and
-   * inject the bare `LARK_APP_*` — only needed when an external skill / wrapper
-   * deliberately reads bare `LARK_APP_ID` as the *bot* app id. The worker
-   * process itself always keeps its own bare creds (for `lark-upload`); this
-   * field only governs what the *child CLI* sees.
-   */
-  exposeLarkEnvToChild?: boolean;
 }
 
 export interface BotState {
@@ -490,18 +465,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
-      // Only `true` is load-bearing (worker.ts injects bare LARK_APP_* into the
-      // child iff `=== true`); `false` and `undefined` both mean the default,
-      // don't-expose behavior. We still preserve `false` distinctly from
-      // `undefined` so an explicit, audit-visible opt-out round-trips. Non-
-      // booleans (string "false", number 0, …) collapse to undefined so a
-      // hand-edited config typo can never accidentally flip the inject on.
-      exposeLarkEnvToChild:
-        entry.exposeLarkEnvToChild === false
-          ? false
-          : entry.exposeLarkEnvToChild === true
-            ? true
-            : undefined,
     });
   }
 

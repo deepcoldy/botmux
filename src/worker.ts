@@ -63,7 +63,6 @@ import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
 import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
-import { childLarkEnvOverride } from './utils/child-lark-env.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
@@ -2917,17 +2916,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     env: {
       ...process.env,
       CLAUDECODE: undefined,
-      // By default redact the bot's bare LARK_APP_ID / LARK_APP_SECRET from the
-      // child: the worker inherits them from the daemon (worker-pool.ts
-      // forkWorker) for its own Lark calls (lark-upload, etc.), and without
-      // this every spawned CLI would also see them via `...process.env`. Some
-      // CLIs ship a Lark SDK whose OAuth reads `process.env.LARK_APP_ID` as the
-      // app to authorize and get hijacked by the botmux IM app (no docs scopes
-      // → 403 loop). The child resolves Lark via the namespaced
-      // BOTMUX_LARK_APP_ID (injected below, for `botmux send` / `botmux ask`)
-      // or its own OAuth. `BotConfig.exposeLarkEnvToChild: true` opts back into
-      // the legacy bare-name injection. See utils/child-lark-env.ts.
-      ...childLarkEnvOverride(cfg.exposeLarkEnvToChild),
+      // Redact the bot's bare LARK_APP_ID / LARK_APP_SECRET from the child. The
+      // worker inherits them from the daemon (worker-pool.ts forkWorker) for
+      // its own Lark calls (lark-upload, etc.), and without this every spawned
+      // CLI would also see them via `...process.env`. Some CLIs ship a Lark SDK
+      // whose OAuth reads `process.env.LARK_APP_ID` as the app to authorize and
+      // get hijacked by the botmux IM app (no docs scopes → 403 loop). The
+      // child needs neither: `botmux send` resolves creds from bots.json on
+      // disk (im/lark/client.ts), `botmux ask` routes via the namespaced
+      // BOTMUX_LARK_APP_ID injected below — bare LARK_APP_* are never read
+      // child-side. `undefined` removes the inherited var (node-pty drops
+      // undefined keys; tmux's buildBotmuxEnvAssignments skips them).
+      LARK_APP_ID: undefined,
+      LARK_APP_SECRET: undefined,
       // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find
       // the daemon socket, route the card back to this thread, and resolve
       // the approver allowlist against session.owner. Missing env → exit 2.
