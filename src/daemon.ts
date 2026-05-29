@@ -2497,8 +2497,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Resolve allowed users per bot
     if (bot.resolvedAllowedUsers.length > 0) {
-      const hasEmails = bot.resolvedAllowedUsers.some(u => u.includes('@'));
-      if (hasEmails) {
+      // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
+      // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
+      const needsResolve = bot.resolvedAllowedUsers.some(u => u.includes('@') || u.startsWith('on_'));
+      if (needsResolve) {
         try {
           // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。
           const { resolved, map } = await resolveAllowedUsersWithMap(cfg.larkAppId, bot.resolvedAllowedUsers);

@@ -636,17 +636,44 @@ export async function resolveAllowedUsersWithMap(
   const map = new Map<string, string>();
   const openIds: string[] = [];
   const emails: string[] = [];
+  const unionIds: string[] = [];
   for (const v of raw) {
     if (v.startsWith('ou_')) {
       openIds.push(v);
       map.set(v, v);
+    } else if (v.startsWith('on_')) {
+      // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
+      // 启动时用本 app 凭证把 on_ 翻成本 app 的 ou_，下游一律照旧用 open_id。
+      unionIds.push(v);
     } else {
       emails.push(v);
     }
   }
-  if (emails.length === 0) return { resolved: openIds, map };
+  if (emails.length === 0 && unionIds.length === 0) return { resolved: openIds, map };
 
   const c = getBotClient(larkAppId);
+
+  // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
+  for (const uid of unionIds) {
+    try {
+      const res = await (c as any).contact.v3.user.get({
+        path: { user_id: uid },
+        params: { user_id_type: 'union_id' },
+      });
+      const oid = res?.data?.user?.open_id as string | undefined;
+      if (res.code === 0 && oid) {
+        openIds.push(oid);
+        map.set(uid, oid);
+        logger.info(`Resolved ${uid} → ${oid}`);
+      } else {
+        logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
+      }
+    } catch (err: any) {
+      logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
+    }
+  }
+
+  if (emails.length === 0) return { resolved: openIds, map };
   try {
     const res = await (c as any).contact.v3.user.batchGetId({
       params: { user_id_type: 'open_id' },
