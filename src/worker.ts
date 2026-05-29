@@ -30,6 +30,7 @@ import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
+import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -48,6 +49,7 @@ import {
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
+import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -237,6 +239,9 @@ let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
+let mtrBridgeSource: MtrTranscriptSource | undefined;
+let mtrBridgeOffset = 0;
+let mtrBridgeBaselineDone = false;
 /** Codex sessionId we received via writeInput but haven't yet resolved a
  *  rollout file for. The poller keeps retrying — the file appears on
  *  Codex's first user submit, but with some race delay after our submit
@@ -1306,7 +1311,7 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
   // when the model forgets to call `botmux send`.
-  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes';
+  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes' || lastInitConfig?.cliId === 'mtr';
 }
 
 function structuredBridgeIsCodex(): boolean {
@@ -1315,6 +1320,10 @@ function structuredBridgeIsCodex(): boolean {
 
 function structuredBridgeIsHermes(): boolean {
   return lastInitConfig?.cliId === 'hermes';
+}
+
+function structuredBridgeIsMtr(): boolean {
+  return lastInitConfig?.cliId === 'mtr';
 }
 
 function structuredBridgeIngestPath(path: string, offset: number) {
@@ -1344,6 +1353,23 @@ function codexBridgeStartTimer(): void {
       if (structuredBridgeIsHermes()) {
         if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastInitConfig?.resume ? 'baseline-existing' : 'fresh-empty');
         hermesBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+        return;
+      }
+      if (structuredBridgeIsMtr()) {
+        if (!mtrBridgeSource) {
+          const source =
+            findMtrSessionById(codexBridgePendingSessionId)
+            ?? (lastInitConfig?.adoptMode
+              ? findLatestMtrSessionByDirectory(lastInitConfig.adoptCwd ?? lastInitConfig.workingDir)
+              : undefined);
+          if (source) {
+            codexBridgePendingSessionId = undefined;
+            codexAdoptPendingPid = undefined;
+            mtrBridgeAttach(source, lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty');
+          }
+        }
+        mtrBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -1406,6 +1432,40 @@ function hermesBridgeIngest(): void {
   if (!hermesBridgeBaselineDone) return;
   const result = drainHermesStateDb(hermesBridgeOffset);
   hermesBridgeOffset = result.newOffset;
+  codexBridgeQueue.ingest(result.events);
+  if (result.events.some(e => e.kind === 'assistant_final')) {
+    idleDetector?.fireIdle();
+  }
+}
+
+function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' | 'fresh-empty' | 'split-live'): void {
+  mtrBridgeSource = source;
+  if (mode === 'split-live') {
+    const result = drainMtrSession(source, 0);
+    const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
+    const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
+    codexBridgeQueue.absorb(history);
+    codexBridgeQueue.ingest(live);
+    mtrBridgeOffset = result.newOffset;
+    mtrBridgeBaselineDone = true;
+    log(`MTR bridge split-live: ${source.dbPath}#${source.sessionId} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${mtrBridgeOffset})`);
+    maybeEmitCodexAdoptPreamble(history);
+  } else if (mode === 'baseline-existing') {
+    mtrBridgeOffset = currentMtrSessionOffset(source);
+    mtrBridgeBaselineDone = true;
+    log(`MTR bridge baselined: ${source.dbPath}#${source.sessionId} (offset=${mtrBridgeOffset})`);
+  } else {
+    mtrBridgeOffset = 0;
+    mtrBridgeBaselineDone = true;
+    log(`MTR bridge fresh-empty: ${source.dbPath}#${source.sessionId}`);
+  }
+  codexBridgeStartTimer();
+}
+
+function mtrBridgeIngest(): void {
+  if (!mtrBridgeBaselineDone || !mtrBridgeSource) return;
+  const result = drainMtrSession(mtrBridgeSource, mtrBridgeOffset);
+  mtrBridgeOffset = result.newOffset;
   codexBridgeQueue.ingest(result.events);
   if (result.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
@@ -1485,6 +1545,17 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive() || codexBridgeRolloutPath) return;
+  if (structuredBridgeIsMtr()) {
+    const source = findMtrSessionById(cliSessionId);
+    if (source) {
+      codexBridgePendingSessionId = undefined;
+      mtrBridgeAttach(source, 'fresh-empty');
+    } else {
+      codexBridgePendingSessionId = cliSessionId;
+      codexBridgeStartTimer();
+    }
+    return;
+  }
   const path = findCodexRolloutBySessionId(cliSessionId);
   if (path) {
     codexBridgePendingSessionId = undefined;
@@ -1498,6 +1569,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
 function codexBridgeIngest(): void {
   if (structuredBridgeIsHermes()) {
     hermesBridgeIngest();
+    return;
+  }
+  if (structuredBridgeIsMtr()) {
+    mtrBridgeIngest();
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
@@ -1528,7 +1603,7 @@ function codexBridgeMarkPendingTurn(messageText: string): boolean {
 
 function codexBridgeDrainAndMaybeEmit(): void {
   if (!codexBridgeFallbackActive()) return;
-  if (structuredBridgeIsHermes() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
+  if (structuredBridgeIsHermes() || structuredBridgeIsMtr() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
     try { codexBridgeIngest(); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
   }
   emitReadyCodexTurns();
@@ -1598,6 +1673,9 @@ function stopCodexBridge(): void {
   codexBridgeBaselineDone = false;
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
+  mtrBridgeSource = undefined;
+  mtrBridgeOffset = 0;
+  mtrBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2687,6 +2765,20 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       // The 1s timer covers ingest + emit even when the watcher never armed,
       // and is idempotent (no-op if already started).
       codexBridgeStartTimer();
+    } else if (cfg.cliId === 'mtr') {
+      const adoptStartMs = Date.now();
+      codexAdoptStartMs = adoptStartMs;
+      codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+      const source =
+        findMtrSessionById(cfg.cliSessionId)
+        ?? findLatestMtrSessionByDirectory(cfg.adoptCwd ?? cfg.workingDir);
+      if (source) {
+        codexBridgePendingSessionId = undefined;
+        mtrBridgeAttach(source, 'split-live');
+      } else {
+        codexBridgeStartTimer();
+      }
     }
 
     // Idle detection. In bridge mode we use the adopted CLI's real
@@ -2695,7 +2787,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // minimal output-quiescence-only detector.
     const idleAdapter = cfg.bridgeJsonlPath
       ? createCliAdapterSync('claude-code', undefined)
-      : cfg.cliId === 'codex' || cfg.cliId === 'coco'
+      : cfg.cliId === 'codex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr'
         ? createCliAdapterSync(cfg.cliId, undefined)
         : ({ completionPattern: undefined, readyPattern: undefined } as any);
     idleDetector = new IdleDetector(idleAdapter);
@@ -2710,6 +2802,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // this failure mode and we don't want to risk regressing them.
     if (cfg.cliId === 'codex') {
       cliAdapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+    } else if (cfg.cliId === 'mtr') {
+      cliAdapter = createCliAdapterSync('mtr', cfg.cliPathOverride);
     }
     idleDetector.onIdle(() => {
       log('Prompt detected (idle) — adopt mode');
@@ -2885,8 +2979,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // calling `botmux send`, harvest the final answer from the CLI transcript
   // and post it to Lark. Codex needs late attach because its rollout id is
   // discovered after the first submit; CoCo's events path is deterministic
-  // from botmux sessionId. Hermes uses a global SQLite store, so baseline its
-  // row id at spawn and poll for rows after each queued prompt is flushed.
+  // from botmux sessionId. Hermes and MTR use SQLite stores, so baseline the
+  // relevant cursor at spawn and poll for rows after each queued prompt flushes.
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(cfg.resume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
@@ -2905,6 +2999,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     const eventsPath = cocoEventsPathForSession(cfg.sessionId);
     codexBridgeAttach(eventsPath, cfg.resume ? 'baseline-existing' : 'fresh-empty');
     codexBridgeStartTimer();
+  } else if (cfg.cliId === 'mtr') {
+    const mtrSessionId = cfg.cliSessionId ?? mtrSessionIdForBotmuxSession(cfg.sessionId);
+    codexBridgePendingSessionId = mtrSessionId;
+    const source = findMtrSessionById(mtrSessionId);
+    if (source) {
+      mtrBridgeAttach(source, cfg.resume ? 'baseline-existing' : 'fresh-empty');
+    } else {
+      codexBridgeStartTimer();
+    }
   }
 
   // Set up idle detection
