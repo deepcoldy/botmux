@@ -68,11 +68,6 @@ export async function bootstrap() {
       } catch { /* skip malformed */ }
     });
   }
-  es.onerror = () => {
-    store.setOnline(false);
-    // Probe an auth-required endpoint so the global fetch patch in app.ts can
-    // detect a rotated token (EventSource doesn't expose HTTP status codes).
-    fetch('/api/sessions').catch(() => {});
-  };
+  es.onerror = () => store.setOnline(false);
   es.onopen = () => store.setOnline(true);
 }
