@@ -11,6 +11,7 @@ import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
+import { mtrSessionIdFromCommand } from '../services/mtr-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
@@ -118,6 +119,28 @@ function readCwd(pid: number): string | undefined {
       if (line.startsWith('n')) return line.slice(1);
     }
     return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readCommand(pid: number): string | undefined {
+  if (IS_LINUX) {
+    try {
+      const raw = readFileSync(`/proc/${pid}/cmdline`);
+      const text = Buffer.isBuffer(raw) ? raw.toString('utf-8') : String(raw);
+      const args = text.split('\0').filter(Boolean);
+      if (args.length) return args.join(' ');
+    } catch {
+      // 落到下面的 ps 兜底
+    }
+  }
+  try {
+    const out = execSync(`ps -o command= -p ${pid}`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    return out || undefined;
   } catch {
     return undefined;
   }
@@ -302,6 +325,11 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       // re-probes too, so undefined here is acceptable.
       const cocoSession = findCocoSessionByPid(match.pid);
       if (cocoSession) sessionId = cocoSession.sessionId;
+    } else if (match.cliId === 'mtr') {
+      // MTR accepts explicit native session ids via --session / --set-session.
+      // Prefer that exact binding when present; the worker still has the DB/cwd
+      // fallback for adopted panes that were started without explicit args.
+      sessionId = mtrSessionIdFromCommand(readCommand(match.pid));
     }
 
     // 6. Get pane dimensions

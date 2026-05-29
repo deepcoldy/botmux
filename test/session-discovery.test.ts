@@ -12,6 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
+  spawnSync: vi.fn(),
 }));
 
 vi.mock('node:fs', () => ({
@@ -19,6 +20,7 @@ vi.mock('node:fs', () => ({
   readdirSync: vi.fn(() => []),
   readFileSync: vi.fn(),
   readlinkSync: vi.fn(),
+  statSync: vi.fn(() => ({ isFile: () => false })),
 }));
 
 vi.mock('node:os', () => ({
@@ -50,6 +52,7 @@ const mockReaddirSync = vi.mocked(readdirSync);
  * childMap: pid → child pids
  * dimsMap: tmuxTarget → "cols rows"
  * claudeMeta: pid → JSON string of session metadata
+ * cmdlineMap: pid → /proc/<pid>/cmdline content
  */
 function setupMocks(opts: {
   paneLines: string;
@@ -58,12 +61,13 @@ function setupMocks(opts: {
   childMap?: Record<number, number[]>;
   dimsMap?: Record<string, string>;
   claudeMeta?: Record<number, string>;
+  cmdlineMap?: Record<number, string>;
   /** pid → ordered list of /proc/<pid>/fd/<n> symlink target strings.
    *  Used to test CoCo session discovery (and any future fd-walking logic).
    *  Pass `'<path> (deleted)'` suffix to simulate procfs's deleted-inode marker. */
   procFdMap?: Record<number, string[]>;
 }) {
-  const { paneLines, commMap = {}, cwdMap = {}, childMap = {}, dimsMap = {}, claudeMeta = {}, procFdMap = {} } = opts;
+  const { paneLines, commMap = {}, cwdMap = {}, childMap = {}, dimsMap = {}, claudeMeta = {}, cmdlineMap = {}, procFdMap = {} } = opts;
 
   // Replace blanket existsSync / readdirSync mocks with procFdMap-aware ones.
   mockExistsSync.mockImplementation((path: unknown) => {
@@ -135,6 +139,14 @@ function setupMocks(opts: {
     if (commMatch) {
       const pid = Number(commMatch[1]);
       if (pid in commMap) return commMap[pid] + '\n';
+      throw new Error('ENOENT');
+    }
+
+    // /proc/<pid>/cmdline
+    const cmdlineMatch = pathStr.match(/\/proc\/(\d+)\/cmdline/);
+    if (cmdlineMatch) {
+      const pid = Number(cmdlineMatch[1]);
+      if (pid in cmdlineMap) return cmdlineMap[pid];
       throw new Error('ENOENT');
     }
 
@@ -319,6 +331,7 @@ describe('discoverAdoptableSessions', () => {
       paneLines: 'mtrsession:0.0 1000\n',
       commMap: { 1000: 'mtr' },
       cwdMap: { 1000: '/workspace/mtr' },
+      cmdlineMap: { 1000: 'mtr\0--session\0ses_direct123\0' },
       dimsMap: { 'mtrsession:0.0': '120 40' },
     });
 
@@ -326,6 +339,7 @@ describe('discoverAdoptableSessions', () => {
 
     expect(results).toHaveLength(1);
     expect(results[0]!.cliId).toBe('mtr');
+    expect(results[0]!.sessionId).toBe('ses_direct123');
     expect(results[0]!.cwd).toBe('/workspace/mtr');
   });
 
@@ -342,6 +356,24 @@ describe('discoverAdoptableSessions', () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.cliId).toBe('mtr');
     expect(results[0]!.cwd).toBe('/workspace/mtr');
+  });
+
+  it('should read MTR session id from set-session command args', () => {
+    setupMocks({
+      paneLines: 'mtrsession:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'node', 1002: '.opencode' },
+      childMap: { 1000: [1001], 1001: [1002] },
+      cwdMap: { 1002: '/workspace/mtr' },
+      cmdlineMap: { 1002: '/usr/local/bin/.opencode\0--set-session=ses_nested456\0' },
+      dimsMap: { 'mtrsession:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions('mtr');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('mtr');
+    expect(results[0]!.cliPid).toBe(1002);
+    expect(results[0]!.sessionId).toBe('ses_nested456');
   });
 
   it('should treat dot-prefixed OpenCode comm as MTR when the MTR bot filters adopt sessions', () => {
