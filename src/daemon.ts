@@ -2440,9 +2440,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     pid: process.pid,
     startedAt: Date.now(),
     lastHeartbeat: Date.now(),
-    // Strip email-form entries — the dashboard only needs resolved open_ids,
-    // and the email→open_id resolution below will rewrite this field.
-    resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => !u.includes('@')),
+    // Dashboard create-group only consumes app-scoped open_ids — publish ONLY
+    // ou_ entries. Before the resolution below runs, the list may still hold raw
+    // email/on_ forms; emitting only ou_ avoids a startup race where the dashboard
+    // briefly sees an unusable on_/email (the resolution below rewrites this field).
+    resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
   };
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
@@ -2515,7 +2517,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // dashboard's create-group flow can pick this bot as creator using the
       // operator's scope-correct open_id. Best-effort; the periodic heartbeat
       // will eventually catch up too.
-      desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => !u.includes('@'));
+      desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     }
 
