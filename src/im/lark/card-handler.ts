@@ -7,10 +7,11 @@ import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
-import { sendUserMessage, updateMessage, deleteMessage, replyMessage, sendMessage, sendEphemeralCard, getMessageDetail } from './client.js';
+import { sendUserMessage, updateMessage, deleteMessage, replyMessage, sendMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied } from './grant-pending.js';
+import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
   handleWorkflowApprovalAction,
   isWorkflowApprovalAction,
@@ -148,30 +149,69 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       logger.info(`Grant action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
       return { toast: { type: 'error', content: t('card.grant.toast_owner_only', undefined, loc) } };
     }
-    const target = value.target_open_id;
+    // 一次 /grant 可带多个目标（多人/多 bot），共用一张卡 + 同一 nonce。
+    // 兼容旧卡（重启前发出的单目标卡只带 target_open_id）：归一成数组。
+    const targets: string[] = Array.isArray(value.target_open_ids)
+      ? value.target_open_ids
+      : (value.target_open_id ? [value.target_open_id] : []);
     const grantChatId = value.chat_id;
     const nonce = value.nonce;
-    if (!target || !grantChatId || !nonce || !checkNonce(larkAppId, grantChatId, target, nonce)) {
+    // 全部 target 都得仍 pending 且 nonce 匹配，否则视为整卡失效。
+    if (!targets.length || !grantChatId || !nonce || !targets.every(tt => checkNonce(larkAppId, grantChatId, tt, nonce))) {
       return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
     }
-    // 拒绝：只把卡更新成「已拒绝」+ 进 deny 冷却，绝不触碰 grant-store。
+    // 拒绝：只把卡更新成「已拒绝」+ 全部目标进 deny 冷却，绝不触碰 grant-store。
     // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
-      markDenied(larkAppId, grantChatId, target);
+      for (const tt of targets) markDenied(larkAppId, grantChatId, tt);
       return JSON.parse(buildGrantResultCard('deny', loc));
     }
     // 授权（talk-only）：grant_chat 写本群 chatGrants，grant_global 写全局 globalGrants，
-    // 两者都绝不碰 allowedUsers（operate 只由 bots.json 配）。
-    // 落库失败不撤卡、保留 pending（owner 可重试），给 toast。
+    // 两者都绝不碰 allowedUsers（operate 只由 bots.json 配）。逐个落库，统计成功/失败。
     const kind = value.action === 'grant_global' ? 'global' as const : 'chat' as const;
-    const res = kind === 'global'
-      ? await addGlobalGrant(larkAppId, target)
-      : await addChatGrant(larkAppId, grantChatId, target);
-    if (!res.ok) {
-      logger.warn(`Grant action "${value.action}" store failed: ${res.reason}`);
-      return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: res.reason }, loc) } };
+    const names: string[] = Array.isArray(value.target_names) ? value.target_names : [];
+    const idToName = new Map<string, string>();
+    targets.forEach((tt, i) => idToName.set(tt, names[i] ?? ''));
+    const granted: string[] = [];
+    const failed: Array<{ openId: string; reason: string }> = [];
+    for (const tt of targets) {
+      const res = kind === 'global'
+        ? await addGlobalGrant(larkAppId, tt)
+        : await addChatGrant(larkAppId, grantChatId, tt);
+      if (res.ok) { clearPending(larkAppId, grantChatId, tt); granted.push(tt); }
+      else { failed.push({ openId: tt, reason: res.reason }); logger.warn(`Grant action "${value.action}" store failed for ${tt}: ${res.reason}`); }
     }
-    clearPending(larkAppId, grantChatId, target);
+    // 全部失败：保留 pending + 不撤卡（owner 可点原卡重试），toast 报错。
+    if (granted.length === 0) {
+      return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: failed[0]?.reason ?? 'unknown' }, loc) } };
+    }
+    // 部分成功：失败 target 的 pending 必须立刻清掉——卡马上要撤回（owner 无法再点原卡重试），
+    // 而 pending 无 TTL，isThrottled 会永久挡住失败 target 后续的自助申请直到 daemon 重启。
+    // 清掉后失败 target 可重新走 /grant 或自助申请；失败清单下面在原线程明确告知 owner，
+    // 不做「撤卡 + 静默失败 + pending 永久卡住」。
+    for (const f of failed) clearPending(larkAppId, grantChatId, f.openId);
+    const target = granted;
+    // /grant @bot 成功后顺带把「bot」目标登记进 observed 花名册（等价内部跑一次 /introduce），
+    // 授权 + 可点名一步到位。写的是 observed-bots-store（让本 daemon 能 @ 回对方），不影响
+    // isKnownPeerBot 接收闸（那查的是 cross-ref，两套独立存储），零额外路由权。best-effort。
+    // 真人**不**登记：查通讯录确认是真人就剔除，避免污染 <available_bots> 误导模型。
+    // 注意：grant 自动登记是新增路径，缺 contact 读权限/查询瞬时失败时真人会被当 bot 误登记
+    // （/introduce 同款过滤但本就登记全部，对它无回退损失）。该 scope 已是 critical 且启动自检
+    // 缺失即 DM 管理员，把这条污染面收敛到「管理员未按提示开权限」的窗口（见 isHumanOpenId）。
+    try {
+      const humanFlags = await Promise.all(granted.map(id => isHumanOpenId(larkAppId, id).catch(() => false)));
+      const botEntries = granted
+        .map((id, i) => ({ id, human: humanFlags[i] }))
+        .filter(x => !x.human)
+        .map(x => ({ openId: x.id, name: idToName.get(x.id) ?? '' }));
+      const skipped = granted.length - botEntries.length;
+      if (skipped > 0) logger.debug(`grant auto-introduce: skipped ${skipped} confirmed human target(s)`);
+      if (botEntries.length > 0) {
+        recordObservedBots(config.session.dataDir, larkAppId, grantChatId, botEntries, 'introduce');
+      }
+    } catch (err) {
+      logger.warn(`grant auto-introduce (observed) failed (grant still applied): ${err}`);
+    }
     // 授权成功后：在原线程 @ 被授权人发通知 + 撤回授权卡（用户要求）。
     // 这两步失败不回滚授权（已落库），仅记日志，并兜底用 in-place patch 让 owner 看到结果。
     if (cardMessageId) {
@@ -198,6 +238,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, target, loc), 'interactive', replyInThread);
       } catch (err) {
         logger.warn(`grant notify failed (grant still applied): ${err}`);
+      }
+      // 部分授权失败：在原线程明确告知 owner（绝不静默撤卡）。失败 target 的 pending 已清，
+      // owner 据此可重新 /grant 重试。
+      if (failed.length > 0) {
+        const failNames = failed.map(f => idToName.get(f.openId) || f.openId).join('、');
+        await replyMessage(larkAppId, cardMessageId, t('card.grant.partial_failed', { names: failNames }, loc), 'text', replyInThread)
+          .catch(err => logger.warn(`grant partial-failure notice failed: ${err}`));
       }
       // 撤回授权卡。deleteMessage 返回 boolean——只有确认撤回成功才不返回 patch；
       // 否则（SDK 吞错/非 0 code）落到 in-place patch，避免卡片留在原地无终态。

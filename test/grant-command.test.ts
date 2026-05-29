@@ -19,8 +19,9 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseGrantTarget, tryHandleGrantCommand } from '../src/im/lark/grant-command.js';
+import { parseGrantTarget, parseGrantTargets, tryHandleGrantCommand } from '../src/im/lark/grant-command.js';
 import { registerBot, getBot, loadBotConfigs } from '../src/bot-registry.js';
+import { addChatGrant } from '../src/services/grant-store.js';
 import * as pending from '../src/im/lark/grant-pending.js';
 
 describe('parseGrantTarget', () => {
@@ -43,6 +44,25 @@ describe('parseGrantTarget', () => {
 
   it('falls back to open_id as name when name missing', () => {
     expect(parseGrantTarget({ mentions: [{ id: { open_id: 'ou_x' } }] }, 'ou_bot')).toEqual({ openId: 'ou_x', name: 'ou_x' });
+  });
+});
+
+describe('parseGrantTargets (multi)', () => {
+  it('returns all non-bot mentions, in order, deduped by open_id', () => {
+    const msg = { mentions: [
+      { id: { open_id: 'ou_bot' }, name: 'Claude' },
+      { id: { open_id: 'ou_a' }, name: '张三' },
+      { id: { open_id: 'ou_b' }, name: '李四' },
+      { id: { open_id: 'ou_a' }, name: '张三再次' },   // dup → dropped
+    ] };
+    expect(parseGrantTargets(msg, 'ou_bot')).toEqual([
+      { openId: 'ou_a', name: '张三' },
+      { openId: 'ou_b', name: '李四' },
+    ]);
+  });
+
+  it('empty when only the bot is mentioned', () => {
+    expect(parseGrantTargets({ mentions: [{ id: { open_id: 'ou_bot' }, name: 'Claude' }] }, 'ou_bot')).toEqual([]);
   });
 });
 
@@ -89,6 +109,43 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
   it('unrelated message is not intercepted', async () => {
     const msg = { message_id: 'om_y', chat_id: 'oc_1', content: JSON.stringify({ text: '@_user_1 帮我看下代码' }), mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Claude' }] };
     expect(await tryHandleGrantCommand('b1', msg, 'ou_owner')).toBe(false);
+  });
+});
+
+describe('tryHandleGrantCommand multi-target (@bot /grant @a @b)', () => {
+  function multiGrantMsg() {
+    return {
+      message_id: 'om_m', chat_id: 'oc_1',
+      content: JSON.stringify({ text: '@_user_1 /grant @_user_2 @_user_3' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Claude' },
+        { key: '@_user_2', id: { open_id: 'ou_a' }, name: '张三' },
+        { key: '@_user_3', id: { open_id: 'ou_b' }, name: '李四' },
+      ],
+    };
+  }
+
+  beforeEach(() => {
+    replyMock.mockClear();
+    pending._resetForTest();
+    const bot = registerBot({ larkAppId: 'bm', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] });
+    bot.botOpenId = 'ou_bot';
+    bot.resolvedAllowedUsers = ['ou_owner'];
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('owner: pops ONE card listing both targets, both pending under one shared nonce', async () => {
+    const handled = await tryHandleGrantCommand('bm', multiGrantMsg(), 'ou_owner');
+    expect(handled).toBe(true);
+    const [, , content, msgType] = replyMock.mock.calls.at(-1)!;
+    expect(msgType).toBe('interactive');
+    expect(content).toContain('张三');
+    expect(content).toContain('李四');
+    const grantChat = JSON.parse(content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    expect(grantChat.target_open_ids).toEqual(['ou_a', 'ou_b']);
+    // one shared nonce validates every target
+    expect(pending.checkNonce('bm', 'oc_1', 'ou_a', grantChat.nonce)).toBe(true);
+    expect(pending.checkNonce('bm', 'oc_1', 'ou_b', grantChat.nonce)).toBe(true);
   });
 });
 
@@ -144,5 +201,32 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     const handled = await tryHandleGrantCommand('b2', bareMsg('/grant'), 'ou_intruder');
     expect(handled).toBe(true);
     expect(getBot('b2').config.allowedChatGroups ?? []).toEqual([]);
+  });
+
+  // /revoke @a @b：逐个撤销，合并成一条「撤销结果」清单回复（无卡片）。
+  const revokeMultiMsg = (chatId = 'oc_room') => ({
+    message_id: 'om_rv', chat_id: chatId,
+    content: JSON.stringify({ text: '@_user_1 /revoke @_user_2 @_user_3' }),
+    mentions: [
+      { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Claude' },
+      { key: '@_user_2', id: { open_id: 'ou_a' }, name: '张三' },
+      { key: '@_user_3', id: { open_id: 'ou_b' }, name: '李四' },
+    ],
+  });
+
+  it('owner: /revoke @a @b removes both chat grants + replies a combined list (no card)', async () => {
+    await addChatGrant('b2', 'oc_room', 'ou_a');
+    await addChatGrant('b2', 'oc_room', 'ou_b');
+    expect(getBot('b2').config.chatGrants).toEqual({ oc_room: ['ou_a', 'ou_b'] });
+
+    const handled = await tryHandleGrantCommand('b2', revokeMultiMsg(), 'ou_owner');
+    expect(handled).toBe(true);
+    expect(getBot('b2').config.chatGrants?.oc_room ?? []).toEqual([]);
+    const [, , content, msgType] = replyMock.mock.calls.at(-1)!;
+    expect(msgType ?? 'text').not.toBe('interactive');
+    // combined list mentions both names, header present, not raw JSON
+    expect(content).toContain('张三');
+    expect(content).toContain('李四');
+    expect(content).not.toContain('{"text"');
   });
 });

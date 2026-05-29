@@ -61,7 +61,10 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 报 code 99991672 Access denied → 跨部署拉群「机器人进了但人没进」。非 critical：
   // 核心收发消息不依赖它，只 /group 与跨部署 federation 拉群需要，缺失只 WARN。
   { name: 'im:chat.members:write_only', desc: '群成员写入（/group、跨部署拉群把人和机器人加进群）', critical: false },
-  { name: 'contact:user.base:readonly', desc: '用户基本信息', critical: true },
+  // 除用户基本信息外，/grant 自动登记 & /introduce 用它查通讯录区分真人/机器人
+  // （isHumanOpenId）：缺这权限时真人无法被剔除，会混进机器人协作名单 <available_bots>
+  // 误导模型。已是 critical，启动自检（checkRequiredScopes）缺失即 DM 管理员。
+  { name: 'contact:user.base:readonly', desc: '用户基本信息（也用于 /grant、/introduce 判定真人/机器人；缺失会让真人混入机器人协作名单）', critical: true },
   // event-dispatcher.checkRequiredScopes 历史上一直对这一项 DM 管理员（"多 bot
   // 协作收不到事件"），等价于 critical 处理；保留 critical 标记是为了让启动
   // 时的统一巡检循环也覆盖它。
