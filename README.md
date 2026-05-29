@@ -179,41 +179,40 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 
 ## 5 分钟快速接入
 
-> 💡 **TL;DR**：跑 `botmux setup` 选「扫码建应用」一步完成 Step 1+2（拿 AppID/AppSecret）。PersonalAgent 应用建出来时事件订阅和 bot 能力都已默认配好，只剩 Step 4 权限申请 + Step 5（按需）重定向 URL + Step 6 发版三步要在浏览器手动点；setup 完成后会自动写 JSON 文件 + 打印一键复制命令 + 各步骤的深链。
+> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup` 选「扫码建应用」一步拿到 AppID/AppSecret（Step 2）→ `botmux start`。PersonalAgent 应用建出来时事件订阅和 bot 能力都已默认配好，只剩 Step 4 权限申请 + Step 5（按需）重定向 URL + Step 6 发版三步要在浏览器手动点；setup 完成后会自动写 JSON 文件 + 打印一键复制命令 + 各步骤的深链。
 
-### Step 1: 创建飞书应用
+### Step 1: 安装 botmux
 
-**推荐路径**：`botmux setup` 选「1) 扫码建应用」，飞书扫码完成后自动落盘 AppID/AppSecret，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 的官方 device flow。
+```bash
+npm install -g botmux
+```
+
+> 要求 **Node.js ≥ 20**，且本地已装好并登录至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等在 PATH 中）。推荐顺手装 **tmux**（装了自动启用会话常驻）。
+
+### Step 2: 创建应用并配置（`botmux setup`）
+
+跑 `botmux setup`，按交互菜单一步步选：
+
+1. **新建配置**：输入 `1` 回车（已有配置时输入 `2` 添加机器人）。
+2. **创建机器人**：
+   - 输入 `1` → **扫码创建（推荐）**：飞书扫码完成后自动建出 PersonalAgent 应用并落盘 AppID/AppSecret，**事件订阅 + bot 能力默认已配好**，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 官方 device flow。
+   - 输入 `2` → **手动创建**：去 [飞书开放平台](https://open.larkoffice.com/app) 建「企业自建应用」，在「凭证与基础信息」复制 **App ID / App Secret** 回来粘贴。
+3. **选择 CLI**：选本次要接入的 CLI（如接 Claude Code 就选 `1`）。
+4. **默认工作目录**：通常填 git 项目的**父级目录**（如 `~/projects`），新话题会从该目录**向下**查找 git 仓库（最多 3 层）；尽量别填 `~`（要遍历太多文件夹）。
 
 > ⚠️ **目前仅支持飞书 (feishu.cn) 租户**。扫码检测到 Lark 国际版 (larksuite.com) 会中止 setup —— daemon runtime (Lark Client/WSClient/event-dispatcher 等) 需要一并接入 lark 域，会在单独 PR 跟进。
 
-**手动路径**：打开 [飞书开放平台](https://open.larkoffice.com/app)，点击「创建企业自建应用」。
+setup 末尾会用 `tenant_access_token` 校验凭证（通过才落盘 `bots.json`），并把完整权限 JSON 写到 `~/.botmux/lark-scopes.json` + 打印一键复制命令 + 各步骤深链。
 
-![创建应用](docs/setup/create-app.png)
+![扫码建应用](docs/setup/create-app.png)
 
-### Step 2: 获取凭证
-
-> 扫码路径自动完成此步，可直接跳到 Step 3。
-
-进入应用详情 →「凭证与基础信息」，复制 **App ID** 和 **App Secret**。
-
-![获取凭证](docs/setup/credentials.png)
-
-### Step 3: 安装 & 启动 botmux
+### Step 3: 启动
 
 ```bash
-# 安装
-npm install -g botmux
-
-# 交互式配置 — 选「1) 扫码建应用」或「2) 手动粘 AppID/Secret」
-# 凭证拿到后自动取一次 tenant_access_token 校验，通过才落盘 bots.json
-# setup 末尾会把完整权限 JSON 写到 ~/.botmux/lark-scopes.json 并打印一键复制命令
-botmux setup
-
-# 启动（如果之后需要确认事件订阅，飞书后台会要求 daemon 已在跑才能识别长连接）
-# start 前再校验一次凭证；权限未配齐不会阻塞 daemon，只 WARN
 botmux start
 ```
+
+> start 前再校验一次凭证；权限未配齐不会阻塞 daemon，只 WARN。如果之后需要确认事件订阅，飞书后台会要求 daemon 已在跑才能识别长连接。
 
 ### Step 4: 添加权限
 

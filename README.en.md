@@ -72,42 +72,40 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ## 5-Minute Setup
 
-> 💡 **TL;DR**: run `botmux setup` and pick "scan-to-create" to finish Steps 1+2 in one shot (the official `@larksuiteoapi/node-sdk` device flow gives you the AppID/AppSecret). PersonalAgent apps come with event subscriptions and bot capability pre-configured, so only Step 4 (permissions) + Step 5 (optional redirect URL) + Step 6 (publish) require browser clicks; the setup wizard writes a JSON file with a one-line clipboard copy command and prints deep-links to each remaining step.
+> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` and pick "scan-to-create" to get the AppID/AppSecret in one shot (Step 2) → `botmux start`. PersonalAgent apps come with event subscriptions and bot capability pre-configured, so only Step 4 (permissions) + Step 5 (optional redirect URL) + Step 6 (publish) require browser clicks; the setup wizard writes a JSON file with a one-line clipboard copy command and prints deep-links to each remaining step.
 
-### Step 1: Create a Lark App
+### Step 1: Install botmux
 
-**Recommended**: `botmux setup` → pick "1) Scan-to-create app". Scan with the Lark mobile app and the AppID/AppSecret are persisted automatically; no manual browser navigation. Falls back to manual paste on cancel/timeout/network error.
+```bash
+npm install -g botmux
+```
 
-> ⚠️ **Currently only Feishu (feishu.cn) tenants are supported.** If scan detects a Lark international (larksuite.com) tenant, setup aborts — the daemon runtime (Lark Client/WSClient/event-dispatcher) hasn't been wired up for the `larksuite.com` domain yet, so accepting Lark credentials would land users in a half-working state. A follow-up PR will add full Lark support.
+> Requires **Node.js ≥ 20**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 
-**Manual**: go to the [Lark Open Platform](https://open.larkoffice.com/app) and click "Create Custom App".
+### Step 2: Create the App & Configure (`botmux setup`)
+
+Run `botmux setup` and follow the interactive menu:
+
+1. **New config**: type `1` and press Enter (with an existing config, type `2` to add a bot).
+2. **Create the bot**:
+   - Type `1` → **Scan-to-create (recommended)**: scan with the Lark mobile app and a PersonalAgent app is created with AppID/AppSecret persisted automatically, **with event subscriptions + bot capability pre-configured** — no manual browser navigation. Uses the official `@larksuiteoapi/node-sdk` device flow.
+   - Type `2` → **Manual**: go to the [Lark Open Platform](https://open.larkoffice.com/app), create a "Custom App", copy **App ID / App Secret** from "Credentials & Basic Info", and paste them back.
+3. **Pick the CLI**: choose the CLI to bridge (e.g. type `1` for Claude Code).
+4. **Default working dir**: usually the **parent directory** of your git projects (e.g. `~/projects`); new topics scan **downward** for git repos (up to 3 levels). Avoid `~` (too many folders to traverse).
+
+> ⚠️ **Currently only Feishu (feishu.cn) tenants are supported.** If scan detects a Lark international (larksuite.com) tenant, setup aborts — the daemon runtime (Lark Client/WSClient/event-dispatcher) hasn't been wired up for the `larksuite.com` domain yet. A follow-up PR will add full Lark support.
+
+At the end, setup validates credentials with a `tenant_access_token` call (only writing `bots.json` on success), writes the full scope JSON to `~/.botmux/lark-scopes.json`, and prints a one-line clipboard copy command plus deep-links to each remaining step.
 
 ![Create App](docs/setup/create-app.png)
 
-### Step 2: Get Credentials
-
-> The scan-to-create path completes this step automatically; skip to Step 3.
-
-Open the app details page → "Credentials & Basic Info", and copy the **App ID** and **App Secret**.
-
-![Get Credentials](docs/setup/credentials.png)
-
-### Step 3: Install & Start botmux
+### Step 3: Start
 
 ```bash
-# Install
-npm install -g botmux
-
-# Interactive setup — pick "1) Scan-to-create app" or "2) Paste AppID/Secret manually".
-# Credentials are validated with a tenant_access_token call before bots.json is written.
-# At the end of setup the wizard writes the full scope JSON to ~/.botmux/lark-scopes.json
-# and prints a one-line clipboard copy command for your platform.
-botmux setup
-
-# Start (if you ever need to verify the event subscription, Lark requires the daemon to be running so it can detect the WebSocket connection)
-# Re-validates credentials before forking workers; missing scopes only WARN, do not block the daemon.
 botmux start
 ```
+
+> `start` re-validates credentials before forking workers; missing scopes only WARN, they don't block the daemon. If you later need to verify the event subscription, Lark requires the daemon to be running so it can detect the WebSocket connection.
 
 ### Step 4: Add Permissions
 
