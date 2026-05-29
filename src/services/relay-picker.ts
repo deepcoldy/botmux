@@ -40,6 +40,14 @@ export async function collectRelayPickerEntries(
     if (!isRelayableRealSession(c)) continue;
     candidates.push(c);
   }
+  // Sort most-recently-active first so the session the operator just used
+  // lands at the top of the picker (page 1) instead of wherever it happens
+  // to sit in the activeSessions Map iteration order (insertion order on a
+  // fresh daemon, on-disk order after a restart — neither useful to the
+  // user). `lastMessageAt` is the runtime DaemonSession field bumped on
+  // every inbound message; sessions missing it (shouldn't happen for real
+  // sessions, but be defensive) sort to the bottom.
+  candidates.sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
   // Skip the API call entirely for p2p chats. session.chatType is recorded
   // at session creation from the Lark event payload and is authoritative —
   // it doesn't drift. The earlier design used `info?.mode ?? fallbackMode`,
