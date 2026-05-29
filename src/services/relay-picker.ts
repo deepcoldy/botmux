@@ -65,6 +65,16 @@ export async function collectRelayPickerEntries(
   const chatInfo = new Map<string, { name: string | null; mode: 'group' | 'topic' | 'p2p' }>();
   for (const [cid, info] of resolved) chatInfo.set(cid, info);
   return candidates.map(c => {
+    // "Running" snapshot — same predicate transferSession uses to refuse a
+    // busy worker (worker-pool.ts): a live, non-killed worker whose last
+    // screen status is neither idle nor limited is mid-turn. Surfaced so the
+    // picker can disable the confirm button for a running session instead of
+    // letting the user click through to a worker_busy error (which would
+    // have already POSTed + deleted an M1). This is a snapshot at
+    // render/click time, not live — re-clicking the entry re-renders and
+    // recomputes it.
+    const running = !!c.worker && !c.worker.killed
+      && c.lastScreenStatus !== 'idle' && c.lastScreenStatus !== 'limited';
     if (c.chatType === 'p2p') {
       return {
         sessionId: c.session.sessionId,
@@ -77,6 +87,7 @@ export async function collectRelayPickerEntries(
         cliId: c.session.cliId,
         lastMessageAt: c.lastMessageAt,
         chatMode: 'p2p' as const,
+        running,
       };
     }
     const info = chatInfo.get(c.chatId);
@@ -88,6 +99,7 @@ export async function collectRelayPickerEntries(
       cliId: c.session.cliId,
       lastMessageAt: c.lastMessageAt,
       chatMode: info?.mode ?? 'group',
+      running,
     };
   });
 }

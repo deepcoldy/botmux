@@ -853,6 +853,34 @@ describe('buildRelayPickerCard', () => {
     expect(btn.behaviors[0].value.session_id).toBe('sess-2');
   });
 
+  it('renders a disabled "running" button (no confirm action) when the selected session is mid-turn', () => {
+    const entries = fixtureEntries(3);
+    entries[1] = { ...entries[1], running: true }; // sess-2 is mid-turn
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-2' }));
+
+    // No clickable confirm button (it carries no relay_confirm action).
+    expect(confirmButton(card)).toBeUndefined();
+
+    // Instead a disabled button with the "running" label exists.
+    let disabledBtn: any;
+    for (const e of card.body.elements) {
+      if (e.tag !== 'column_set') continue;
+      const btn = e.columns?.[0]?.elements?.[0];
+      if (btn?.tag === 'button' && btn?.disabled === true && !btn?.behaviors) { disabledBtn = btn; break; }
+    }
+    expect(disabledBtn).toBeDefined();
+    expect(disabledBtn.text.content).toMatch(/运行中|running/i);
+  });
+
+  it('renders the normal clickable confirm button when the selected session is NOT running', () => {
+    const entries = fixtureEntries(3);
+    entries[1] = { ...entries[1], running: false };
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-2' }));
+    const btn = confirmButton(card);
+    expect(btn).toBeDefined();
+    expect(btn.behaviors[0].value.session_id).toBe('sess-2');
+  });
+
   it('falls back to no-confirm state if selectedSessionId is filtered out', () => {
     const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-vanished' }));
     expect(confirmButton(card)).toBeUndefined();
@@ -861,18 +889,29 @@ describe('buildRelayPickerCard', () => {
     expect(allMd).toMatch(/点击上方|Tap any/);
   });
 
-  it('container markdown shows title / type / location / time on four labelled lines', () => {
+  it('container markdown shows title / status / type / location / time on five labelled lines', () => {
     const entries: RelayPickerEntry[] = [
       { sessionId: 'sess-1', chatLabel: 'Project Alpha 讨论群', title: 'fix the deadlock bug', chatMode: 'group', lastMessageAt: Date.now() - 60_000 },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test'));
     const md = containers(card)[0].elements[0].content;
     const lines = md.split('\n');
-    expect(lines).toHaveLength(4);
+    expect(lines).toHaveLength(5);
     expect(lines[0]).toMatch(/^\*\*fix the deadlock bug\*\*$/);
-    expect(lines[1]).toMatch(/^(类型|Type): (普通群|group chat)$/);
-    expect(lines[2]).toMatch(/(位置|Where): Project Alpha 讨论群/);
-    expect(lines[3]).toMatch(/(活跃|Active): /);
+    // Status line — idle by default (no `running` flag on the fixture).
+    expect(lines[1]).toMatch(/^(状态|Status): (⚪ 空闲|⚪ Idle)$/);
+    expect(lines[2]).toMatch(/^(类型|Type): (普通群|group chat)$/);
+    expect(lines[3]).toMatch(/(位置|Where): Project Alpha 讨论群/);
+    expect(lines[4]).toMatch(/(活跃|Active): /);
+  });
+
+  it('status line shows 运行中 / Running for a session flagged running', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-1', chatLabel: 'Chat', title: 'busy task', chatMode: 'group', running: true },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test'));
+    const md = containers(card)[0].elements[0].content;
+    expect(md).toMatch(/(状态|Status): 🟢 (运行中|Running)/);
   });
 
   it('uses "单聊" / "direct message" as the location for p2p, ignoring chatLabel', () => {

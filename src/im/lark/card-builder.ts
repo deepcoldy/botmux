@@ -868,6 +868,11 @@ export interface RelayPickerEntry {
    *  picker. Caller supplies based on getChatNameAndMode lookup + the
    *  session's own chatType for the p2p case. */
   chatMode?: 'group' | 'topic' | 'p2p';
+  /** Snapshot of whether the session's worker is mid-turn at render time.
+   *  When the selected entry is running, the picker disables the confirm
+   *  button (transferSession would refuse a busy worker anyway). Snapshot,
+   *  not live — re-selecting the entry recomputes it. */
+  running?: boolean;
 }
 
 function relayPickerTypeTag(mode: 'group' | 'topic' | 'p2p' | undefined, locale?: Locale): string {
@@ -1014,8 +1019,13 @@ export function buildRelayPickerCard(
   const labelType     = t('card.relay.field_type',     undefined, locale);
   const labelLocation = t('card.relay.field_location', undefined, locale);
   const labelTime     = t('card.relay.field_time',     undefined, locale);
+  const labelStatus   = t('card.relay.field_status',   undefined, locale);
   const selectedTag   = t('card.relay.selected_tag',   undefined, locale);
-  const hasValidSelection = !!selectedSessionId && filtered.some(e => e.sessionId === selectedSessionId);
+  const selectedEntry = selectedSessionId ? filtered.find(e => e.sessionId === selectedSessionId) : undefined;
+  const hasValidSelection = !!selectedEntry;
+  // Selected session is mid-turn — confirm must be disabled (transferSession
+  // would refuse a busy worker; catch it at the button so no M1 is sent).
+  const selectionRunning = !!selectedEntry?.running;
 
   visible.forEach((e) => {
     const isSelected = e.sessionId === selectedSessionId;
@@ -1024,8 +1034,12 @@ export function buildRelayPickerCard(
     const titleLine = isSelected
       ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\``
       : `**${escapeMd(e.title)}**`;
+    const statusTag = e.running
+      ? t('card.relay.status_running', undefined, locale)
+      : t('card.relay.status_idle', undefined, locale);
     const lines: string[] = [
       titleLine,
+      `${labelStatus}: ${statusTag}`,
       `${labelType}: ${typeTag}`,
       `${labelLocation}: ${escapeMd(locationLine)}`,
     ];
@@ -1116,7 +1130,31 @@ export function buildRelayPickerCard(
 
   // ─── Confirm button or hint ─────────────────────────────────────────
   elements.push({ tag: 'hr' });
-  if (hasValidSelection) {
+  if (hasValidSelection && selectionRunning) {
+    // Selected session is mid-turn: render a disabled (grey, non-clickable)
+    // button instead of the confirm action. Re-clicking the session entry
+    // re-renders and recomputes `running`, so once the turn finishes the
+    // user can click it again to get the live confirm button back.
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_confirm_running', undefined, locale) },
+              type: 'default',
+              disabled: true,
+            },
+          ],
+        },
+      ],
+    });
+  } else if (hasValidSelection) {
     elements.push({
       tag: 'column_set',
       flex_mode: 'none',
