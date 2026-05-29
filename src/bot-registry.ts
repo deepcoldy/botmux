@@ -120,24 +120,28 @@ export interface BotConfig {
    */
   privateCard?: boolean;
   /**
-   * When `false`, this bot's `LARK_APP_ID` / `LARK_APP_SECRET` are NOT exported
-   * into the PTY child process's environment. The `BOTMUX_LARK_APP_ID` env
-   * (used by `botmux send` / `botmux ask` agent subcommands) is still injected
-   * regardless of this setting — only the bare `LARK_APP_*` names are gated.
+   * Whether to export this bot's bare `LARK_APP_ID` / `LARK_APP_SECRET` into
+   * the spawned CLI's environment.
    *
-   * Set to `false` when your CLI ships with its own Lark OAuth / SDK that
+   * **Default (`undefined` / `false`): NOT exported.** The child resolves Lark
+   * through the namespaced `BOTMUX_LARK_APP_ID` (used by `botmux send` /
+   * `botmux ask`, always injected) or through its own OAuth — never the bare
+   * names. This avoids a footgun: a CLI that ships its own Lark SDK / OAuth
    * reads `process.env.LARK_APP_ID` as the default app to authorize against,
-   * because botmux's per-bot value (a *bot* app, typically IM-only scopes)
-   * will silently override the CLI's intended *user-mode* app id and break
-   * the CLI's docs / wiki / sheets flows.
+   * so botmux's per-bot value (a *bot* app, typically IM-only scopes) would
+   * silently override the CLI's intended *user-mode* app id and break its
+   * docs / wiki / sheets flows.
    *
    * Real-world example: `claude-code` with the `@byted/ttadk` wrapper bundles
    * `@byted/mcp-lark-docs`, whose `process.env.LARK_APP_ID || DEFAULT_APP_ID`
-   * resolves to the botmux IM app, which lacks `docs:document.content:read` —
-   * the OAuth callback fires but every doc fetch then 403s, hanging the bot.
+   * resolved to the botmux IM app, which lacks `docs:document.content:read` —
+   * the OAuth callback fired but every doc fetch then 403'd, hanging the bot.
    *
-   * Default (`true` / unset): inject `LARK_APP_ID` / `LARK_APP_SECRET` for
-   * backward compatibility (same as botmux <= 2.42.x).
+   * Set to `true` to opt back into the legacy (botmux <= 2.x) behavior and
+   * inject the bare `LARK_APP_*` — only needed when an external skill / wrapper
+   * deliberately reads bare `LARK_APP_ID` as the *bot* app id. The worker
+   * process itself always keeps its own bare creds (for `lark-upload`); this
+   * field only governs what the *child CLI* sees.
    */
   exposeLarkEnvToChild?: boolean;
 }
@@ -486,10 +490,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
-      // Distinguish three states: `false` (opt out — don't inject LARK_APP_*),
-      // `true` (explicit opt-in), and `undefined` (default = inject, same as
-      // pre-existing behavior). Non-booleans collapse to undefined; never
-      // crash on a hand-edited config typo.
+      // Only `true` is load-bearing (worker.ts injects bare LARK_APP_* into the
+      // child iff `=== true`); `false` and `undefined` both mean the default,
+      // don't-expose behavior. We still preserve `false` distinctly from
+      // `undefined` so an explicit, audit-visible opt-out round-trips. Non-
+      // booleans (string "false", number 0, …) collapse to undefined so a
+      // hand-edited config typo can never accidentally flip the inject on.
       exposeLarkEnvToChild:
         entry.exposeLarkEnvToChild === false
           ? false
