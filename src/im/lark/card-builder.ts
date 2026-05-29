@@ -628,20 +628,27 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
 
 export interface GrantCardOpts {
   ownerOpenId: string;
-  requesterOpenId: string;
-  requesterName: string;
+  /** 待授权目标，支持一次 /grant @a @b 多目标；owner 点一次范围对全部生效。 */
+  targets: Array<{ openId: string; name: string }>;
   chatId: string;
   nonce: string;
   /** 'request' = 无权限者自助申请；'owner' = owner 主动 /grant。仅文案不同。 */
   mode: 'request' | 'owner';
 }
 
-/** 授权卡片：正文 @owner，三枚按钮各带 action + 上下文 + nonce。 */
+/** 授权卡片：正文 @owner，三枚按钮各带 action + 上下文 + nonce。
+ *  多目标共用一张卡，按钮 value 带 target_open_ids 数组，owner 点一次范围套用到全部。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
+  const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
+  const single = o.targets[0];
   const body = o.mode === 'request'
-    ? t('card.grant.body_request', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale)
-    : t('card.grant.body_owner', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale);
-  const v = { target_open_id: o.requesterOpenId, chat_id: o.chatId, nonce: o.nonce };
+    ? t('card.grant.body_request', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale)
+    : o.targets.length > 1
+      ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
+      : t('card.grant.body_owner', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale);
+  // target_names 与 target_open_ids 同序：授权成功后据此把目标登记进 observed 花名册
+  // （/grant @bot 成功后顺带「认识」对方，等价内部跑一次 /introduce）。
+  const v = { target_open_ids: o.targets.map(t => t.openId), target_names: o.targets.map(t => t.name), chat_id: o.chatId, nonce: o.nonce };
   // 「全局授权对话」只在 owner 主动发卡时出现：owner 一眼明确要给全局；request 模式（成员
   // 自助申请）只提供「本群」，避免成员把自己申请到全局。两个授权按钮都是 talk-only。
   const grantButtons: any[] = [
@@ -664,9 +671,10 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   return JSON.stringify(card);
 }
 
-/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。 */
-export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string, locale?: Locale): string {
-  const at = `<at id=${targetOpenId}></at>`;
+/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。支持一次 @ 多个被授权人。 */
+export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string | string[], locale?: Locale): string {
+  const ids = Array.isArray(targetOpenId) ? targetOpenId : [targetOpenId];
+  const at = ids.map(id => `<at id=${id}></at>`).join(' ');
   const content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   const card = {
     config: { wide_screen_mode: true },

@@ -354,8 +354,8 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 
 | Command | Description |
 |---------|-------------|
-| `@bot /grant @someone` | Pop an authorization card to add the user to the "this chat" or "global" allowlist; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
-| `@bot /revoke @someone` | Revoke the user's this-chat + global access |
+| `@bot /grant @someone` | Pop an authorization card to add the user to the "this chat" or "global" allowlist; you can @ several people/bots at once (one card lists every target, one scope click applies to all); if a granted target is a bot, it's auto-registered into the roster on success (an implicit `/introduce`) for cross-bot collaboration; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
+| `@bot /revoke @someone` | Revoke the user's this-chat + global access; you can @ several people/bots at once |
 
 **🆕 One-shot session group**
 
@@ -368,7 +368,7 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 | Command | Description |
 |---------|-------------|
 | `@botA @botB /t <prompt>` | With multiple bots, each @-mentioned bot opens its own independent topic from the same message |
-| `@botA @botB /introduce` | Bots register each other's open_id so they can later explicitly @-mention one another across sessions (any @ order, extra text allowed) |
+| `@botA @botB /introduce` | Bots register each other's open_id so they can later explicitly @-mention one another across sessions (any @ order, extra text allowed; roster-only, grants no permission — **anyone in the chat can run it, no authorization needed**) |
 
 **❓ Help**
 

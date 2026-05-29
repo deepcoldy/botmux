@@ -15,8 +15,15 @@ const key = (a: string, c: string, t: string) => `${a}:${c}:${t}`;
 
 /** 开一张待处置的卡，返回 nonce。 */
 export function openPending(larkAppId: string, chatId: string, target: string): string {
+  return openPendingMulti(larkAppId, chatId, [target]);
+}
+
+/** owner 一次 /grant 多个目标：同一张卡 → 多个 target 共用同一 nonce，
+ *  owner 点一次范围即对全部目标生效。校验时每个 target 独立 checkNonce。 */
+export function openPendingMulti(larkAppId: string, chatId: string, targets: string[]): string {
   const nonce = randomUUID();
-  table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts: Date.now() });
+  const ts = Date.now();
+  for (const target of targets) table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts });
   return nonce;
 }
 
