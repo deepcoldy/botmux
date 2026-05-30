@@ -445,7 +445,6 @@ describe('loadBotConfigs', () => {
       docComments: {
         enabled: true,
         workingDir: ' ~/projects/repo ',
-        allowedRoots: ['~/projects', ' /srv/repos '],
       },
     }]));
 
@@ -453,7 +452,6 @@ describe('loadBotConfigs', () => {
     expect(configs[0].docComments).toEqual({
       enabled: true,
       workingDir: '~/projects/repo',
-      allowedRoots: ['~/projects', '/srv/repos'],
     });
   });
 

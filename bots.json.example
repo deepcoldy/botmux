@@ -9,7 +9,7 @@
     "workingDir": "~/projects",
     "docComments": {
       "enabled": false,
-      "allowedRoots": ["~/projects"]
+      "workingDir": "~/projects/example"
     }
   },
   {

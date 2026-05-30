@@ -125,7 +125,7 @@ describe('doc-comment session policy', () => {
     }
   });
 
-  it('rejects pinned working dirs outside allowed roots', () => {
+  it('rejects pinned working dirs outside bot workingDir roots', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-doc-root-'));
     const outside = mkdtempSync(join(tmpdir(), 'botmux-doc-outside-'));
     const result = resolveDocCommentSessionPolicy(

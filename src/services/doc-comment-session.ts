@@ -56,9 +56,8 @@ export function ensureDocCommentTempDir(dataDir: string, botId: string, document
   return dir;
 }
 
-export function docCommentAllowedRoots(bot: BotConfig): string[] {
+export function docCommentWorkingDirRoots(bot: BotConfig): string[] {
   const roots = [
-    ...(bot.docComments?.allowedRoots ?? []),
     ...configuredWorkingDirs({
       workingDir: [bot.workingDir, bot.defaultWorkingDir],
       workingDirs: bot.workingDirs,
@@ -100,8 +99,8 @@ export function resolveDocCommentSessionPolicy(
   let workingDir = docCommentTempDir(opts.dataDir, botId, documentId);
   let workingDirSource: 'temp' | 'config' = 'temp';
   if (cfg.workingDir) {
-    const allowedRoots = docCommentAllowedRoots(bot);
-    if (allowedRoots.length === 0 || !isPathWithinAnyDir(cfg.workingDir, allowedRoots)) {
+    const rootDirs = docCommentWorkingDirRoots(bot);
+    if (rootDirs.length === 0 || !isPathWithinAnyDir(cfg.workingDir, rootDirs)) {
       return { ok: false, reason: 'working_dir_outside_allowed_roots' };
     }
     workingDir = cfg.workingDir;

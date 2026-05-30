@@ -33,10 +33,8 @@ export interface BotDefaultOncall {
 export interface DocCommentsConfig {
   /** Feature switch for document comment sessions. */
   enabled: boolean;
-  /** Optional pinned project directory for document sessions. Must pass the allowedRoots guard. */
+  /** Optional pinned project directory for document sessions. Must stay under the bot workingDir roots. */
   workingDir?: string;
-  /** Directories a document session may pin into. Falls back to bot workingDir roots. */
-  allowedRoots?: string[];
 }
 
 export interface BotConfig {
@@ -465,12 +463,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       const workingDir = typeof rawDocComments.workingDir === 'string' && rawDocComments.workingDir.trim()
         ? rawDocComments.workingDir.trim()
         : undefined;
-      const allowedRoots = parseStringListField(rawDocComments.allowedRoots);
-      if (rawDocComments.enabled === true || workingDir || allowedRoots) {
+      if (rawDocComments.enabled === true || workingDir) {
         docComments = {
           enabled: rawDocComments.enabled === true,
           ...(workingDir ? { workingDir } : {}),
-          ...(allowedRoots ? { allowedRoots } : {}),
         };
       }
     }
