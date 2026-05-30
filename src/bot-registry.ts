@@ -33,13 +33,11 @@ export interface BotDefaultOncall {
 export type DocCommentFileType = 'doc' | 'docx' | 'sheet' | 'file';
 
 export interface DocCommentBinding {
-  /** Drive file token / doc token that may open a document-scoped botmux session. */
+  /** Drive file token / doc token for an optional per-document override. */
   fileToken: string;
-  /** Feishu Drive file_type used by comment APIs. Defaults at call sites when omitted. */
-  fileType?: DocCommentFileType;
   /** Optional pinned project directory. Must pass the docComments.allowedRoots guard. */
   workingDir?: string;
-  /** Additional open_id allowlist for comment authors. The bot owner is allowed by default. */
+  /** Additional open_id allowlist for comment authors on this document. */
   allowedAuthors?: string[];
   /** Per-file kill switch; omitted means enabled. */
   enabled?: boolean;
@@ -50,7 +48,7 @@ export interface DocCommentsConfig {
   enabled: boolean;
   /** Directories a document session may switch or pin into. Falls back to bot workingDir roots. */
   allowedRoots?: string[];
-  /** Explicitly enabled documents. */
+  /** Optional per-document overrides such as pinned workingDir, extra authors, or kill switch. */
   files: DocCommentBinding[];
 }
 
@@ -92,7 +90,7 @@ export interface BotConfig {
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
-   * Document-comment entrypoint. The bot owner and per-document allowedAuthors
+   * Document-comment entrypoint. Bot operators and per-document allowedAuthors
    * get talk-only access; state-changing operations continue to use allowedUsers.
    */
   docComments?: DocCommentsConfig;
@@ -407,12 +405,6 @@ function parseStringListField(value: unknown): string[] | undefined {
   return items.length > 0 ? items : undefined;
 }
 
-function parseDocCommentFileType(value: unknown): DocCommentFileType | undefined {
-  return value === 'doc' || value === 'docx' || value === 'sheet' || value === 'file'
-    ? value
-    : undefined;
-}
-
 /** Pure parser: bots.json text → BotConfig[]. Exported for testing & reuse. */
 export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   let parsed: unknown;
@@ -490,12 +482,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           const fileToken = typeof rawFile.fileToken === 'string' ? rawFile.fileToken.trim() : '';
           if (!fileToken) continue;
           const binding: DocCommentBinding = { fileToken };
-          const fileType = parseDocCommentFileType(rawFile.fileType);
           const workingDir = typeof rawFile.workingDir === 'string' && rawFile.workingDir.trim()
             ? rawFile.workingDir.trim()
             : undefined;
           const allowedAuthors = parseStringListField(rawFile.allowedAuthors);
-          if (fileType) binding.fileType = fileType;
           if (workingDir) binding.workingDir = workingDir;
           if (allowedAuthors) binding.allowedAuthors = allowedAuthors;
           if (rawFile.enabled === false) binding.enabled = false;

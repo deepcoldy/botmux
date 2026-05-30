@@ -430,14 +430,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
     "allowedChatGroups": ["oc_xxx_team"],
     "docComments": {
       "enabled": true,
-      "allowedRoots": ["~/projects"],
-      "files": [
-        {
-          "fileToken": "doccn_xxx",
-          "fileType": "docx",
-          "workingDir": "~/projects/example"
-        }
-      ]
+      "allowedRoots": ["~/projects"]
     }
   },
   {
@@ -465,7 +458,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `allowedChatGroups` | No | Talk-open chats (`chat_id`, for example `oc_xxx`). Any member talking **inside these chats** can use the bot (decided by the message's chat — new members work immediately, removed members lose access, no restart needed); grants `canTalk` only, sensitive ops still require `allowedUsers`. Equivalent to the owner running `/grant` (no target) in that chat. |
 | `globalGrants` | No | Global talk allowlist (`open_id` list, e.g. `ou_xxx`; humans or bots). Listed entries can talk to the bot in **any** chat; grants `canTalk` only, sensitive ops still require `allowedUsers`. Usually written via the owner's `/grant` card (the "grant talk globally" button); can also be set manually here. |
 | `oncallChats` | No | Oncall bindings (written by `/oncall bind`), e.g. `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`; any group member can @ the bot |
-| `docComments` | No | Document-comment entrypoint config. When `enabled` is true, only documents listed in `files[].fileToken` can create Doc Sessions; by default, only the bot owner (the first resolved open_id from `allowedUsers`) receives talk-only access, and `files[].allowedAuthors` can add extra comment authors. `/cd`, writable terminal links, restart, close, and other sensitive operations still use `allowedUsers`. Without `files[].workingDir`, sessions start in `~/.botmux/data/doc-sessions/<app>/<doc>/`; with `workingDir`, the path must stay under `docComments.allowedRoots` or the bot `workingDir(s)` |
+| `docComments` | No | Document-comment entrypoint config. When `enabled` is true, documents that include the bot can create Doc Sessions; the comment author must match an operator open_id resolved from `allowedUsers`, and `files[].allowedAuthors` can add per-document comment authors. `files[]` is only for per-document `workingDir`, `allowedAuthors`, or `enabled:false` overrides. `/cd`, writable terminal links, restart, close, and other sensitive operations still use `allowedUsers`. Without `files[].workingDir`, sessions start in `~/.botmux/data/doc-sessions/<app>/<doc>/`; with `workingDir`, the path must stay under `docComments.allowedRoots` or the bot `workingDir(s)` |
 
 **Config priority:** `BOTS_CONFIG` env var > `~/.botmux/bots.json`
 

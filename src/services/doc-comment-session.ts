@@ -18,7 +18,7 @@ export type DocCommentPolicyResult =
       anchor: string;
       workingDir: string;
       workingDirSource: 'temp' | 'binding';
-      binding: DocCommentBinding;
+      binding?: DocCommentBinding;
       canTalk: true;
       canOperate: false;
     }
@@ -28,9 +28,8 @@ export type DocCommentPolicyResult =
         | 'disabled'
         | 'missing_file_token'
         | 'missing_comment_id'
-        | 'file_not_allowed'
         | 'file_disabled'
-        | 'owner_not_configured'
+        | 'operator_not_configured'
         | 'author_not_allowed'
         | 'working_dir_outside_allowed_roots';
     };
@@ -81,7 +80,7 @@ export function resolveDocCommentSessionPolicy(
   larkAppId: string,
   bot: BotConfig,
   event: DocCommentEventRef,
-  opts: { dataDir: string; ownerOpenId?: string },
+  opts: { dataDir: string; operatorOpenIds?: string[]; ownerOpenId?: string },
 ): DocCommentPolicyResult {
   const cfg = bot.docComments;
   if (!cfg?.enabled) return { ok: false, reason: 'disabled' };
@@ -92,19 +91,21 @@ export function resolveDocCommentSessionPolicy(
   if (!commentId) return { ok: false, reason: 'missing_comment_id' };
 
   const binding = cfg.files.find(f => f.fileToken === fileToken);
-  if (!binding) return { ok: false, reason: 'file_not_allowed' };
-  if (binding.enabled === false) return { ok: false, reason: 'file_disabled' };
+  if (binding?.enabled === false) return { ok: false, reason: 'file_disabled' };
 
-  const allowedAuthors = new Set<string>(binding.allowedAuthors ?? []);
+  const allowedAuthors = new Set<string>(binding?.allowedAuthors ?? []);
+  for (const openId of opts.operatorOpenIds ?? []) {
+    if (openId) allowedAuthors.add(openId);
+  }
   if (opts.ownerOpenId) allowedAuthors.add(opts.ownerOpenId);
-  if (allowedAuthors.size === 0) return { ok: false, reason: 'owner_not_configured' };
+  if (allowedAuthors.size === 0) return { ok: false, reason: 'operator_not_configured' };
   if (!event.authorOpenId || !allowedAuthors.has(event.authorOpenId)) {
     return { ok: false, reason: 'author_not_allowed' };
   }
 
   let workingDir = docCommentTempDir(opts.dataDir, larkAppId, fileToken);
   let workingDirSource: 'temp' | 'binding' = 'temp';
-  if (binding.workingDir) {
+  if (binding?.workingDir) {
     const allowedRoots = docCommentAllowedRoots(bot);
     if (allowedRoots.length === 0 || !isPathWithinAnyDir(binding.workingDir, allowedRoots)) {
       return { ok: false, reason: 'working_dir_outside_allowed_roots' };
@@ -118,7 +119,7 @@ export function resolveDocCommentSessionPolicy(
     anchor: docCommentAnchor(larkAppId, fileToken),
     workingDir,
     workingDirSource,
-    binding,
+    ...(binding ? { binding } : {}),
     canTalk: true,
     canOperate: false,
   };

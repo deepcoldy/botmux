@@ -9,14 +9,7 @@
     "workingDir": "~/projects",
     "docComments": {
       "enabled": false,
-      "allowedRoots": ["~/projects"],
-      "files": [
-        {
-          "fileToken": "doccn_xxx",
-          "fileType": "docx",
-          "workingDir": "~/projects/example"
-        }
-      ]
+      "allowedRoots": ["~/projects"]
     }
   },
   {

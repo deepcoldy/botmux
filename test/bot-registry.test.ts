@@ -436,7 +436,7 @@ describe('loadBotConfigs', () => {
     expect(configs[5].defaultWorkingDir).toBe('/repos/bar');
   });
 
-  it('should parse docComments as an explicit document allowlist', () => {
+  it('should parse docComments with optional per-document overrides', () => {
     process.env.BOTS_CONFIG = '/tmp/doc_comments.json';
     fsMock.existsSync.mockReturnValue(true);
     fsMock.readFileSync.mockReturnValue(JSON.stringify([{
@@ -448,13 +448,11 @@ describe('loadBotConfigs', () => {
         files: [
           {
             fileToken: ' doccn_1 ',
-            fileType: 'docx',
             workingDir: ' ~/projects/repo ',
             allowedAuthors: [' ou_a ', '', 42, 'ou_b'],
           },
-          { fileToken: '', fileType: 'doc' },
+          { fileToken: '' },
           { fileToken: 'doccn_disabled', enabled: false },
-          { fileToken: 'doccn_bad_type', fileType: 'mindnote' },
         ],
       },
     }]));
@@ -466,12 +464,10 @@ describe('loadBotConfigs', () => {
       files: [
         {
           fileToken: 'doccn_1',
-          fileType: 'docx',
           workingDir: '~/projects/repo',
           allowedAuthors: ['ou_a', 'ou_b'],
         },
         { fileToken: 'doccn_disabled', enabled: false },
-        { fileToken: 'doccn_bad_type' },
       ],
     });
   });
