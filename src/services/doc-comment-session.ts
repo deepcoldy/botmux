@@ -30,6 +30,7 @@ export type DocCommentPolicyResult =
         | 'missing_comment_id'
         | 'file_not_allowed'
         | 'file_disabled'
+        | 'owner_not_configured'
         | 'author_not_allowed'
         | 'working_dir_outside_allowed_roots';
     };
@@ -80,7 +81,7 @@ export function resolveDocCommentSessionPolicy(
   larkAppId: string,
   bot: BotConfig,
   event: DocCommentEventRef,
-  opts: { dataDir: string },
+  opts: { dataDir: string; ownerOpenId?: string },
 ): DocCommentPolicyResult {
   const cfg = bot.docComments;
   if (!cfg?.enabled) return { ok: false, reason: 'disabled' };
@@ -93,7 +94,11 @@ export function resolveDocCommentSessionPolicy(
   const binding = cfg.files.find(f => f.fileToken === fileToken);
   if (!binding) return { ok: false, reason: 'file_not_allowed' };
   if (binding.enabled === false) return { ok: false, reason: 'file_disabled' };
-  if (binding.allowedAuthors?.length && (!event.authorOpenId || !binding.allowedAuthors.includes(event.authorOpenId))) {
+
+  const allowedAuthors = new Set<string>(binding.allowedAuthors ?? []);
+  if (opts.ownerOpenId) allowedAuthors.add(opts.ownerOpenId);
+  if (allowedAuthors.size === 0) return { ok: false, reason: 'owner_not_configured' };
+  if (!event.authorOpenId || !allowedAuthors.has(event.authorOpenId)) {
     return { ok: false, reason: 'author_not_allowed' };
   }
 

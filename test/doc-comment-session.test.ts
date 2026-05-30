@@ -55,12 +55,12 @@ describe('doc-comment session policy', () => {
     expect(result).toEqual({ ok: false, reason: 'file_not_allowed' });
   });
 
-  it('maps allowed document collaborators to talk-only temp sessions', () => {
+  it('maps the bot owner to a talk-only temp session by default', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
       bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1', fileType: 'docx' }] } }),
-      { fileToken: 'doc_1', fileType: 'docx', commentId: 'c_1', authorOpenId: 'ou_user' },
-      { dataDir: '/tmp/botmux' },
+      { fileToken: 'doc_1', fileType: 'docx', commentId: 'c_1', authorOpenId: 'ou_owner' },
+      { dataDir: '/tmp/botmux', ownerOpenId: 'ou_owner' },
     );
 
     expect(result.ok).toBe(true);
@@ -72,15 +72,37 @@ describe('doc-comment session policy', () => {
     }
   });
 
-  it('honors per-document author allowlists', () => {
+  it('rejects non-owner authors when a document has no additional author allowlist', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
-      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1', allowedAuthors: ['ou_owner'] }] } }),
+      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1' }] } }),
+      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_other' },
+      { dataDir: '/tmp/botmux', ownerOpenId: 'ou_owner' },
+    );
+
+    expect(result).toEqual({ ok: false, reason: 'author_not_allowed' });
+  });
+
+  it('allows per-document additional authors', () => {
+    const result = resolveDocCommentSessionPolicy(
+      'cli_test',
+      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1', allowedAuthors: ['ou_peer'] }] } }),
+      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_peer' },
+      { dataDir: '/tmp/botmux', ownerOpenId: 'ou_owner' },
+    );
+
+    expect(result.ok).toBe(true);
+  });
+
+  it('fails closed when no owner or explicit document authors are available', () => {
+    const result = resolveDocCommentSessionPolicy(
+      'cli_test',
+      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1' }] } }),
       { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_other' },
       { dataDir: '/tmp/botmux' },
     );
 
-    expect(result).toEqual({ ok: false, reason: 'author_not_allowed' });
+    expect(result).toEqual({ ok: false, reason: 'owner_not_configured' });
   });
 
   it('allows pinned working dirs inside configured roots', () => {
@@ -92,8 +114,8 @@ describe('doc-comment session policy', () => {
         workingDir: root,
         docComments: { enabled: true, files: [{ fileToken: 'doc_1', workingDir: repo }] },
       }),
-      { fileToken: 'doc_1', commentId: 'c_1' },
-      { dataDir: '/tmp/botmux' },
+      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_owner' },
+      { dataDir: '/tmp/botmux', ownerOpenId: 'ou_owner' },
     );
 
     expect(result.ok).toBe(true);
@@ -112,8 +134,8 @@ describe('doc-comment session policy', () => {
         workingDir: root,
         docComments: { enabled: true, files: [{ fileToken: 'doc_1', workingDir: outside }] },
       }),
-      { fileToken: 'doc_1', commentId: 'c_1' },
-      { dataDir: '/tmp/botmux' },
+      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_owner' },
+      { dataDir: '/tmp/botmux', ownerOpenId: 'ou_owner' },
     );
 
     expect(result).toEqual({ ok: false, reason: 'working_dir_outside_allowed_roots' });

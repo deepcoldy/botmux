@@ -39,7 +39,7 @@ export interface DocCommentBinding {
   fileType?: DocCommentFileType;
   /** Optional pinned project directory. Must pass the docComments.allowedRoots guard. */
   workingDir?: string;
-  /** Optional open_id allowlist for comment authors. Empty means every collaborator can talk. */
+  /** Additional open_id allowlist for comment authors. The bot owner is allowed by default. */
   allowedAuthors?: string[];
   /** Per-file kill switch; omitted means enabled. */
   enabled?: boolean;
@@ -92,8 +92,8 @@ export interface BotConfig {
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
-   * Document-comment entrypoint. Collaborators get talk-only access inside the
-   * document session; state-changing operations continue to use allowedUsers.
+   * Document-comment entrypoint. The bot owner and per-document allowedAuthors
+   * get talk-only access; state-changing operations continue to use allowedUsers.
    */
   docComments?: DocCommentsConfig;
   /**
