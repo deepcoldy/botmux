@@ -21,7 +21,7 @@ function bot(overrides: Partial<BotConfig> = {}): BotConfig {
 
 describe('doc-comment session policy', () => {
   it('uses one stable anchor per document', () => {
-    expect(docCommentAnchor('cli_a', 'doccn_xxx')).toBe('doc:cli_a:doccn_xxx');
+    expect(docCommentAnchor('cli_a', 'document_xxx')).toBe('doc:cli_a:document_xxx');
   });
 
   it('builds stable filesystem-safe temp directories', () => {
@@ -36,20 +36,20 @@ describe('doc-comment session policy', () => {
   it('rejects events while the entrypoint is disabled', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
-      bot({ docComments: { enabled: false, files: [{ fileToken: 'doc_1' }] } }),
-      { fileToken: 'doc_1', commentId: 'c_1' },
+      bot({ docComments: { enabled: false } }),
+      { documentId: 'doc_1', commentId: 'c_1' },
       { dataDir: '/tmp/botmux' },
     );
 
     expect(result).toEqual({ ok: false, reason: 'disabled' });
   });
 
-  it('allows any document token for bot operators', () => {
+  it('allows any document id for bot operators', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
-      bot({ docComments: { enabled: true, files: [] } }),
-      { fileToken: 'doc_2', commentId: 'c_1', authorOpenId: 'ou_operator' },
-      { dataDir: '/tmp/botmux', operatorOpenIds: ['ou_operator'] },
+      bot({ docComments: { enabled: true } }),
+      { documentId: 'doc_2', commentId: 'c_1', authorId: 'user_operator' },
+      { dataDir: '/tmp/botmux', operatorIds: ['user_operator'] },
     );
 
     expect(result.ok).toBe(true);
@@ -58,9 +58,9 @@ describe('doc-comment session policy', () => {
   it('maps bot operators to talk-only temp sessions by default', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
-      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1' }] } }),
-      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_operator' },
-      { dataDir: '/tmp/botmux', operatorOpenIds: ['ou_operator'] },
+      bot({ docComments: { enabled: true } }),
+      { documentId: 'doc_1', commentId: 'c_1', authorId: 'user_operator' },
+      { dataDir: '/tmp/botmux', operatorIds: ['user_operator'] },
     );
 
     expect(result.ok).toBe(true);
@@ -72,44 +72,33 @@ describe('doc-comment session policy', () => {
     }
   });
 
-  it('honors per-document kill switches', () => {
+  it('requires a document id from the adapter event', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
-      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1', enabled: false }] } }),
-      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_operator' },
-      { dataDir: '/tmp/botmux', operatorOpenIds: ['ou_operator'] },
+      bot({ docComments: { enabled: true } }),
+      { documentId: '', commentId: 'c_1', authorId: 'user_operator' },
+      { dataDir: '/tmp/botmux', operatorIds: ['user_operator'] },
     );
 
-    expect(result).toEqual({ ok: false, reason: 'file_disabled' });
+    expect(result).toEqual({ ok: false, reason: 'missing_document_id' });
   });
 
-  it('rejects authors without bot operation permission when a document has no additional author allowlist', () => {
+  it('rejects authors without bot operation permission', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
-      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1' }] } }),
-      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_other' },
-      { dataDir: '/tmp/botmux', operatorOpenIds: ['ou_operator'] },
+      bot({ docComments: { enabled: true } }),
+      { documentId: 'doc_1', commentId: 'c_1', authorId: 'user_other' },
+      { dataDir: '/tmp/botmux', operatorIds: ['user_operator'] },
     );
 
     expect(result).toEqual({ ok: false, reason: 'author_not_allowed' });
   });
 
-  it('allows per-document additional authors', () => {
+  it('fails closed when no operators are available', () => {
     const result = resolveDocCommentSessionPolicy(
       'cli_test',
-      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1', allowedAuthors: ['ou_peer'] }] } }),
-      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_peer' },
-      { dataDir: '/tmp/botmux', operatorOpenIds: ['ou_operator'] },
-    );
-
-    expect(result.ok).toBe(true);
-  });
-
-  it('fails closed when no operators or explicit document authors are available', () => {
-    const result = resolveDocCommentSessionPolicy(
-      'cli_test',
-      bot({ docComments: { enabled: true, files: [{ fileToken: 'doc_1' }] } }),
-      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_other' },
+      bot({ docComments: { enabled: true } }),
+      { documentId: 'doc_1', commentId: 'c_1', authorId: 'user_other' },
       { dataDir: '/tmp/botmux' },
     );
 
@@ -123,16 +112,16 @@ describe('doc-comment session policy', () => {
       'cli_test',
       bot({
         workingDir: root,
-        docComments: { enabled: true, files: [{ fileToken: 'doc_1', workingDir: repo }] },
+        docComments: { enabled: true, workingDir: repo },
       }),
-      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_operator' },
-      { dataDir: '/tmp/botmux', operatorOpenIds: ['ou_operator'] },
+      { documentId: 'doc_1', commentId: 'c_1', authorId: 'user_operator' },
+      { dataDir: '/tmp/botmux', operatorIds: ['user_operator'] },
     );
 
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.workingDir).toBe(repo);
-      expect(result.workingDirSource).toBe('binding');
+      expect(result.workingDirSource).toBe('config');
     }
   });
 
@@ -143,10 +132,10 @@ describe('doc-comment session policy', () => {
       'cli_test',
       bot({
         workingDir: root,
-        docComments: { enabled: true, files: [{ fileToken: 'doc_1', workingDir: outside }] },
+        docComments: { enabled: true, workingDir: outside },
       }),
-      { fileToken: 'doc_1', commentId: 'c_1', authorOpenId: 'ou_operator' },
-      { dataDir: '/tmp/botmux', operatorOpenIds: ['ou_operator'] },
+      { documentId: 'doc_1', commentId: 'c_1', authorId: 'user_operator' },
+      { dataDir: '/tmp/botmux', operatorIds: ['user_operator'] },
     );
 
     expect(result).toEqual({ ok: false, reason: 'working_dir_outside_allowed_roots' });

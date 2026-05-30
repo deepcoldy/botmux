@@ -436,7 +436,7 @@ describe('loadBotConfigs', () => {
     expect(configs[5].defaultWorkingDir).toBe('/repos/bar');
   });
 
-  it('should parse docComments with optional per-document overrides', () => {
+  it('should parse docComments without provider-specific identifiers', () => {
     process.env.BOTS_CONFIG = '/tmp/doc_comments.json';
     fsMock.existsSync.mockReturnValue(true);
     fsMock.readFileSync.mockReturnValue(JSON.stringify([{
@@ -444,31 +444,16 @@ describe('loadBotConfigs', () => {
       larkAppSecret: 'secret',
       docComments: {
         enabled: true,
+        workingDir: ' ~/projects/repo ',
         allowedRoots: ['~/projects', ' /srv/repos '],
-        files: [
-          {
-            fileToken: ' doccn_1 ',
-            workingDir: ' ~/projects/repo ',
-            allowedAuthors: [' ou_a ', '', 42, 'ou_b'],
-          },
-          { fileToken: '' },
-          { fileToken: 'doccn_disabled', enabled: false },
-        ],
       },
     }]));
 
     const configs = mod.loadBotConfigs();
     expect(configs[0].docComments).toEqual({
       enabled: true,
+      workingDir: '~/projects/repo',
       allowedRoots: ['~/projects', '/srv/repos'],
-      files: [
-        {
-          fileToken: 'doccn_1',
-          workingDir: '~/projects/repo',
-          allowedAuthors: ['ou_a', 'ou_b'],
-        },
-        { fileToken: 'doccn_disabled', enabled: false },
-      ],
     });
   });
 

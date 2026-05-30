@@ -30,11 +30,10 @@ export interface Session {
   workingDir?: string;
   /** Present for document-comment sessions; used by future document adapters to route replies. */
   docComment?: {
-    fileToken: string;
-    fileType?: 'doc' | 'docx' | 'sheet' | 'file';
+    documentId: string;
     commentId: string;
     replyId?: string;
-    authorOpenId?: string;
+    authorId?: string;
   };
   webPort?: number;
   larkAppId?: string;

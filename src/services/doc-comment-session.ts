@@ -1,15 +1,14 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import type { BotConfig, DocCommentBinding, DocCommentFileType } from '../bot-registry.js';
+import type { BotConfig } from '../bot-registry.js';
 import { configuredWorkingDirs, isPathWithinAnyDir } from '../utils/working-dir.js';
 
 export interface DocCommentEventRef {
-  fileToken: string;
-  fileType?: DocCommentFileType;
+  documentId: string;
   commentId: string;
   replyId?: string;
-  authorOpenId?: string;
+  authorId?: string;
 }
 
 export type DocCommentPolicyResult =
@@ -17,8 +16,7 @@ export type DocCommentPolicyResult =
       ok: true;
       anchor: string;
       workingDir: string;
-      workingDirSource: 'temp' | 'binding';
-      binding?: DocCommentBinding;
+      workingDirSource: 'temp' | 'config';
       canTalk: true;
       canOperate: false;
     }
@@ -26,16 +24,15 @@ export type DocCommentPolicyResult =
       ok: false;
       reason:
         | 'disabled'
-        | 'missing_file_token'
+        | 'missing_document_id'
         | 'missing_comment_id'
-        | 'file_disabled'
         | 'operator_not_configured'
         | 'author_not_allowed'
         | 'working_dir_outside_allowed_roots';
     };
 
-export function docCommentAnchor(larkAppId: string, fileToken: string): string {
-  return `doc:${larkAppId}:${fileToken}`;
+export function docCommentAnchor(botId: string, documentId: string): string {
+  return `doc:${botId}:${documentId}`;
 }
 
 export function safeDocSessionSegment(value: string): string {
@@ -44,17 +41,17 @@ export function safeDocSessionSegment(value: string): string {
   return `${label || 'doc'}-${hash}`;
 }
 
-export function docCommentTempDir(dataDir: string, larkAppId: string, fileToken: string): string {
+export function docCommentTempDir(dataDir: string, botId: string, documentId: string): string {
   return join(
     resolve(dataDir),
     'doc-sessions',
-    safeDocSessionSegment(larkAppId),
-    safeDocSessionSegment(fileToken),
+    safeDocSessionSegment(botId),
+    safeDocSessionSegment(documentId),
   );
 }
 
-export function ensureDocCommentTempDir(dataDir: string, larkAppId: string, fileToken: string): string {
-  const dir = docCommentTempDir(dataDir, larkAppId, fileToken);
+export function ensureDocCommentTempDir(dataDir: string, botId: string, documentId: string): string {
+  const dir = docCommentTempDir(dataDir, botId, documentId);
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -77,49 +74,45 @@ export function docCommentAllowedRoots(bot: BotConfig): string[] {
 }
 
 export function resolveDocCommentSessionPolicy(
-  larkAppId: string,
+  botId: string,
   bot: BotConfig,
   event: DocCommentEventRef,
-  opts: { dataDir: string; operatorOpenIds?: string[]; ownerOpenId?: string },
+  opts: { dataDir: string; operatorIds?: string[]; ownerId?: string },
 ): DocCommentPolicyResult {
   const cfg = bot.docComments;
   if (!cfg?.enabled) return { ok: false, reason: 'disabled' };
 
-  const fileToken = event.fileToken.trim();
+  const documentId = event.documentId.trim();
   const commentId = event.commentId.trim();
-  if (!fileToken) return { ok: false, reason: 'missing_file_token' };
+  if (!documentId) return { ok: false, reason: 'missing_document_id' };
   if (!commentId) return { ok: false, reason: 'missing_comment_id' };
 
-  const binding = cfg.files.find(f => f.fileToken === fileToken);
-  if (binding?.enabled === false) return { ok: false, reason: 'file_disabled' };
-
-  const allowedAuthors = new Set<string>(binding?.allowedAuthors ?? []);
-  for (const openId of opts.operatorOpenIds ?? []) {
-    if (openId) allowedAuthors.add(openId);
+  const allowedOperatorIds = new Set<string>();
+  for (const id of opts.operatorIds ?? []) {
+    if (id) allowedOperatorIds.add(id);
   }
-  if (opts.ownerOpenId) allowedAuthors.add(opts.ownerOpenId);
-  if (allowedAuthors.size === 0) return { ok: false, reason: 'operator_not_configured' };
-  if (!event.authorOpenId || !allowedAuthors.has(event.authorOpenId)) {
+  if (opts.ownerId) allowedOperatorIds.add(opts.ownerId);
+  if (allowedOperatorIds.size === 0) return { ok: false, reason: 'operator_not_configured' };
+  if (!event.authorId || !allowedOperatorIds.has(event.authorId)) {
     return { ok: false, reason: 'author_not_allowed' };
   }
 
-  let workingDir = docCommentTempDir(opts.dataDir, larkAppId, fileToken);
-  let workingDirSource: 'temp' | 'binding' = 'temp';
-  if (binding?.workingDir) {
+  let workingDir = docCommentTempDir(opts.dataDir, botId, documentId);
+  let workingDirSource: 'temp' | 'config' = 'temp';
+  if (cfg.workingDir) {
     const allowedRoots = docCommentAllowedRoots(bot);
-    if (allowedRoots.length === 0 || !isPathWithinAnyDir(binding.workingDir, allowedRoots)) {
+    if (allowedRoots.length === 0 || !isPathWithinAnyDir(cfg.workingDir, allowedRoots)) {
       return { ok: false, reason: 'working_dir_outside_allowed_roots' };
     }
-    workingDir = binding.workingDir;
-    workingDirSource = 'binding';
+    workingDir = cfg.workingDir;
+    workingDirSource = 'config';
   }
 
   return {
     ok: true,
-    anchor: docCommentAnchor(larkAppId, fileToken),
+    anchor: docCommentAnchor(botId, documentId),
     workingDir,
     workingDirSource,
-    ...(binding ? { binding } : {}),
     canTalk: true,
     canOperate: false,
   };

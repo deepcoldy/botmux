@@ -30,26 +30,13 @@ export interface BotDefaultOncall {
   since: number;
 }
 
-export type DocCommentFileType = 'doc' | 'docx' | 'sheet' | 'file';
-
-export interface DocCommentBinding {
-  /** Drive file token / doc token for an optional per-document override. */
-  fileToken: string;
-  /** Optional pinned project directory. Must pass the docComments.allowedRoots guard. */
-  workingDir?: string;
-  /** Additional open_id allowlist for comment authors on this document. */
-  allowedAuthors?: string[];
-  /** Per-file kill switch; omitted means enabled. */
-  enabled?: boolean;
-}
-
 export interface DocCommentsConfig {
   /** Feature switch for document comment sessions. */
   enabled: boolean;
-  /** Directories a document session may switch or pin into. Falls back to bot workingDir roots. */
+  /** Optional pinned project directory for document sessions. Must pass the allowedRoots guard. */
+  workingDir?: string;
+  /** Directories a document session may pin into. Falls back to bot workingDir roots. */
   allowedRoots?: string[];
-  /** Optional per-document overrides such as pinned workingDir, extra authors, or kill switch. */
-  files: DocCommentBinding[];
 }
 
 export interface BotConfig {
@@ -90,8 +77,8 @@ export interface BotConfig {
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
-   * Document-comment entrypoint. Bot operators and per-document allowedAuthors
-   * get talk-only access; state-changing operations continue to use allowedUsers.
+   * Document-comment entrypoint. Bot operators get talk-only access; state-changing
+   * operations continue to use allowedUsers.
    */
   docComments?: DocCommentsConfig;
   /**
@@ -475,28 +462,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     let docComments: DocCommentsConfig | undefined;
     const rawDocComments = entry.docComments;
     if (rawDocComments && typeof rawDocComments === 'object' && !Array.isArray(rawDocComments)) {
-      const files: DocCommentBinding[] = [];
-      if (Array.isArray(rawDocComments.files)) {
-        for (const rawFile of rawDocComments.files) {
-          if (!rawFile || typeof rawFile !== 'object' || Array.isArray(rawFile)) continue;
-          const fileToken = typeof rawFile.fileToken === 'string' ? rawFile.fileToken.trim() : '';
-          if (!fileToken) continue;
-          const binding: DocCommentBinding = { fileToken };
-          const workingDir = typeof rawFile.workingDir === 'string' && rawFile.workingDir.trim()
-            ? rawFile.workingDir.trim()
-            : undefined;
-          const allowedAuthors = parseStringListField(rawFile.allowedAuthors);
-          if (workingDir) binding.workingDir = workingDir;
-          if (allowedAuthors) binding.allowedAuthors = allowedAuthors;
-          if (rawFile.enabled === false) binding.enabled = false;
-          files.push(binding);
-        }
-      }
+      const workingDir = typeof rawDocComments.workingDir === 'string' && rawDocComments.workingDir.trim()
+        ? rawDocComments.workingDir.trim()
+        : undefined;
       const allowedRoots = parseStringListField(rawDocComments.allowedRoots);
-      if (rawDocComments.enabled === true || files.length > 0 || allowedRoots) {
+      if (rawDocComments.enabled === true || workingDir || allowedRoots) {
         docComments = {
           enabled: rawDocComments.enabled === true,
-          files,
+          ...(workingDir ? { workingDir } : {}),
           ...(allowedRoots ? { allowedRoots } : {}),
         };
       }
