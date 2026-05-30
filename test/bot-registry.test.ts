@@ -436,6 +436,46 @@ describe('loadBotConfigs', () => {
     expect(configs[5].defaultWorkingDir).toBe('/repos/bar');
   });
 
+  it('should parse docComments as an explicit document allowlist', () => {
+    process.env.BOTS_CONFIG = '/tmp/doc_comments.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'app_docs',
+      larkAppSecret: 'secret',
+      docComments: {
+        enabled: true,
+        allowedRoots: ['~/projects', ' /srv/repos '],
+        files: [
+          {
+            fileToken: ' doccn_1 ',
+            fileType: 'docx',
+            workingDir: ' ~/projects/repo ',
+            allowedAuthors: [' ou_a ', '', 42, 'ou_b'],
+          },
+          { fileToken: '', fileType: 'doc' },
+          { fileToken: 'doccn_disabled', enabled: false },
+          { fileToken: 'doccn_bad_type', fileType: 'mindnote' },
+        ],
+      },
+    }]));
+
+    const configs = mod.loadBotConfigs();
+    expect(configs[0].docComments).toEqual({
+      enabled: true,
+      allowedRoots: ['~/projects', '/srv/repos'],
+      files: [
+        {
+          fileToken: 'doccn_1',
+          fileType: 'docx',
+          workingDir: '~/projects/repo',
+          allowedAuthors: ['ou_a', 'ou_b'],
+        },
+        { fileToken: 'doccn_disabled', enabled: false },
+        { fileToken: 'doccn_bad_type' },
+      ],
+    });
+  });
+
   it('should handle empty workingDir string gracefully', () => {
     process.env.BOTS_CONFIG = '/tmp/empty_wd.json';
     fsMock.existsSync.mockReturnValue(true);

@@ -7,6 +7,8 @@ export type StreamStatus = ScreenStatus | 'starting';
 
 export interface Session {
   sessionId: string;
+  /** Source that created the session. Omitted legacy sessions are Lark IM sessions. */
+  source?: 'lark_im' | 'lark_doc_comment';
   chatId: string;
   chatType?: 'group' | 'p2p';
   /** Thread-scope: an actual root message id under which all replies thread.
@@ -26,6 +28,14 @@ export interface Session {
   closedAt?: string;
   pid?: number;
   workingDir?: string;
+  /** Present for document-comment sessions; used by future document adapters to route replies. */
+  docComment?: {
+    fileToken: string;
+    fileType?: 'doc' | 'docx' | 'sheet' | 'file';
+    commentId: string;
+    replyId?: string;
+    authorOpenId?: string;
+  };
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies

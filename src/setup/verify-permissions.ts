@@ -69,6 +69,9 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 协作收不到事件"），等价于 critical 处理；保留 critical 标记是为了让启动
   // 时的统一巡检循环也覆盖它。
   { name: 'im:message.group_at_msg.include_bot:readonly', desc: '跨 bot @ 事件', critical: true },
+  { name: 'docs:document.comment:read', desc: '读取云文档评论（Doc Session）', critical: false },
+  { name: 'docs:document.comment:create', desc: '回复云文档评论（Doc Session）', critical: false },
+  { name: 'docs:event:subscribe', desc: '订阅云文档事件（Doc Session）', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 

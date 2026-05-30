@@ -1,6 +1,6 @@
-import { statSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 
 export function expandHomePath(p: string): string {
   return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
@@ -41,4 +41,36 @@ export function invalidWorkingDirs(input: { workingDir?: unknown; workingDirs?: 
     }
   }
   return invalid;
+}
+
+export function canonicalWorkingDirPath(p: string): string {
+  const resolved = resolve(expandHomePath(p));
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function isSafeRelativePath(rel: string): boolean {
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel));
+}
+
+export function isPathWithinDir(candidate: string, root: string): boolean {
+  const rawTarget = resolve(expandHomePath(candidate));
+  const rawBase = resolve(expandHomePath(root));
+  const base = canonicalWorkingDirPath(root);
+  let target: string;
+  try {
+    target = realpathSync(rawTarget);
+  } catch {
+    const rawRel = relative(rawBase, rawTarget);
+    target = isSafeRelativePath(rawRel) ? resolve(base, rawRel) : rawTarget;
+  }
+  const rel = relative(base, target);
+  return isSafeRelativePath(rel);
+}
+
+export function isPathWithinAnyDir(candidate: string, roots: string[]): boolean {
+  return roots.some(root => isPathWithinDir(candidate, root));
 }

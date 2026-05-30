@@ -30,6 +30,30 @@ export interface BotDefaultOncall {
   since: number;
 }
 
+export type DocCommentFileType = 'doc' | 'docx' | 'sheet' | 'file';
+
+export interface DocCommentBinding {
+  /** Drive file token / doc token that may open a document-scoped botmux session. */
+  fileToken: string;
+  /** Feishu Drive file_type used by comment APIs. Defaults at call sites when omitted. */
+  fileType?: DocCommentFileType;
+  /** Optional pinned project directory. Must pass the docComments.allowedRoots guard. */
+  workingDir?: string;
+  /** Optional open_id allowlist for comment authors. Empty means every collaborator can talk. */
+  allowedAuthors?: string[];
+  /** Per-file kill switch; omitted means enabled. */
+  enabled?: boolean;
+}
+
+export interface DocCommentsConfig {
+  /** Feature switch for document comment sessions. */
+  enabled: boolean;
+  /** Directories a document session may switch or pin into. Falls back to bot workingDir roots. */
+  allowedRoots?: string[];
+  /** Explicitly enabled documents. */
+  files: DocCommentBinding[];
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -67,6 +91,11 @@ export interface BotConfig {
   defaultWorkingDir?: string;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
+  /**
+   * Document-comment entrypoint. Collaborators get talk-only access inside the
+   * document session; state-changing operations continue to use allowedUsers.
+   */
+  docComments?: DocCommentsConfig;
   /**
    * Chat IDs that have ever been auto-bound by `defaultOncall`. Append-only.
    * Once a chat appears here, the default is permanently "spent" for it — even
@@ -370,6 +399,20 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
   }
 }
 
+function parseStringListField(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value
+    .filter((x: unknown): x is string => typeof x === 'string' && x.trim().length > 0)
+    .map((x: string) => x.trim());
+  return items.length > 0 ? items : undefined;
+}
+
+function parseDocCommentFileType(value: unknown): DocCommentFileType | undefined {
+  return value === 'doc' || value === 'docx' || value === 'sheet' || value === 'file'
+    ? value
+    : undefined;
+}
+
 /** Pure parser: bots.json text → BotConfig[]. Exported for testing & reuse. */
 export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   let parsed: unknown;
@@ -437,6 +480,38 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .filter((x: any): x is string => typeof x === 'string');
     }
 
+    let docComments: DocCommentsConfig | undefined;
+    const rawDocComments = entry.docComments;
+    if (rawDocComments && typeof rawDocComments === 'object' && !Array.isArray(rawDocComments)) {
+      const files: DocCommentBinding[] = [];
+      if (Array.isArray(rawDocComments.files)) {
+        for (const rawFile of rawDocComments.files) {
+          if (!rawFile || typeof rawFile !== 'object' || Array.isArray(rawFile)) continue;
+          const fileToken = typeof rawFile.fileToken === 'string' ? rawFile.fileToken.trim() : '';
+          if (!fileToken) continue;
+          const binding: DocCommentBinding = { fileToken };
+          const fileType = parseDocCommentFileType(rawFile.fileType);
+          const workingDir = typeof rawFile.workingDir === 'string' && rawFile.workingDir.trim()
+            ? rawFile.workingDir.trim()
+            : undefined;
+          const allowedAuthors = parseStringListField(rawFile.allowedAuthors);
+          if (fileType) binding.fileType = fileType;
+          if (workingDir) binding.workingDir = workingDir;
+          if (allowedAuthors) binding.allowedAuthors = allowedAuthors;
+          if (rawFile.enabled === false) binding.enabled = false;
+          files.push(binding);
+        }
+      }
+      const allowedRoots = parseStringListField(rawDocComments.allowedRoots);
+      if (rawDocComments.enabled === true || files.length > 0 || allowedRoots) {
+        docComments = {
+          enabled: rawDocComments.enabled === true,
+          files,
+          ...(allowedRoots ? { allowedRoots } : {}),
+        };
+      }
+    }
+
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
     // 丢弃空列表。未配置或全部非法 → undefined。
     let chatGrants: { [chatId: string]: string[] } | undefined;
@@ -474,6 +549,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       allowedChatGroups,
       oncallChats,
       defaultOncall,
+      docComments,
       defaultOncallAutoboundChats,
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()

@@ -532,7 +532,18 @@ botmux setup
     "model": "sonnet",
     "workingDir": "~/projects",
     "allowedUsers": ["alice@company.com"],
-    "allowedChatGroups": ["oc_xxx_team"]
+    "allowedChatGroups": ["oc_xxx_team"],
+    "docComments": {
+      "enabled": true,
+      "allowedRoots": ["~/projects"],
+      "files": [
+        {
+          "fileToken": "doccn_xxx",
+          "fileType": "docx",
+          "workingDir": "~/projects/example"
+        }
+      ]
+    }
   },
   {
     "larkAppId": "cli_xxx_bot2",
@@ -559,6 +570,7 @@ botmux setup
 | `allowedChatGroups` | 否 | 可对话群列表（飞书 `chat_id`，如 `oc_xxx`）。**在这些群里**任何成员都能与机器人对话（按消息所在群判断，新人进群即生效、退群即失权，无需重启）；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。等价于 owner 在该群发 `/grant`（不带 @）。 |
 | `globalGrants` | 否 | 全局可对话名单（`open_id` 列表，如 `ou_xxx`；人或 bot 均可）。名单内的对象可在**任意群**与机器人对话；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。通常由 owner 在授权卡上点「全局授权对话」写入，也可在此手动配置。 |
 | `oncallChats` | 否 | oncall 绑定（`/oncall bind` 写入），形如 `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`，群内任何成员可 @ 提问 |
+| `docComments` | 否 | 文档评论入口配置。`enabled` 开关打开后，仅 `files[].fileToken` 白名单内的文档可创建 Doc Session；文档协作者获得 talk-only 权限，`/cd`、终端写链接、重启、关闭等敏感操作仍由 `allowedUsers` 控制。未配置 `files[].workingDir` 时使用 `~/.botmux/data/doc-sessions/<app>/<doc>/` 临时目录；配置 `workingDir` 时必须落在 `docComments.allowedRoots` 或机器人 `workingDir(s)` 下 |
 
 **配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`
 

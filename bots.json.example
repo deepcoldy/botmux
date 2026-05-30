@@ -6,7 +6,18 @@
     "model": "sonnet",
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],
-    "workingDir": "~/projects"
+    "workingDir": "~/projects",
+    "docComments": {
+      "enabled": false,
+      "allowedRoots": ["~/projects"],
+      "files": [
+        {
+          "fileToken": "doccn_xxx",
+          "fileType": "docx",
+          "workingDir": "~/projects/example"
+        }
+      ]
+    }
   },
   {
     "larkAppId": "cli_xxx_bot2",
