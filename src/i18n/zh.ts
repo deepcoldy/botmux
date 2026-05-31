@@ -71,10 +71,18 @@ export const messages: Record<string, string> = {
   'card.grant.result_deny': '🚫 已拒绝该申请',
   'card.grant.notify_chat': '✅ {at} 已获授权在本群使用我，发消息 @ 我即可。',
   'card.grant.notify_global': '✅ {at} 已获全局授权，在任意群发消息 @ 我即可。',
+  'card.grant.notify_quota_suffix': '（消息额度 {n} 条，用尽后自动收回授权）',
+
+  // 消息额度用尽
+  'quota.exhausted_notify': '⚠️ {at} 的消息额度已用尽（{limit}/{limit}），已收回与我的对话授权。如需继续，请联系 owner 重新 /grant。',
+
+  // 被授权人命令限制（restrictGrantCommands 开启时）
+  'cmd.grant_restricted': '⚠️ 当前授权仅允许普通对话，不能使用 {cmd} 等命令。如需放开请联系 owner。',
 
   // /grant、/revoke 命令回执
   'cmd.grant.owner_only': '仅 owner 可使用 /grant。',
-  'cmd.grant.usage': '用法：@机器人 /grant @某人（授权 ta 在本群与我对话）｜@机器人 /grant（授权本群所有成员对话）。仅授对话权，敏感操作仍由 allowedUsers 控制。',
+  'cmd.grant.usage': '用法：@机器人 /grant @某人 [条数]（授权 ta 在本群与我对话，可选给 N 条消息额度）｜@机器人 /grant（授权本群所有成员对话）。仅授对话权，敏感操作仍由 allowedUsers 控制。',
+  'cmd.grant.bad_quota': '⚠️ 额度格式不对。用法：@机器人 /grant @某人 5（给 5 条消息额度，须为正整数）；不带数字则按默认额度 / 无限。',
   'cmd.grant.chat_done': '✅ 已授权本群所有成员与我对话（@ 我即可）。敏感操作仍仅限 allowedUsers。',
   'cmd.grant.chat_already': 'ℹ️ 本群已是授权状态，无需重复授权。',
   'cmd.grant.chat_failed': '⚠️ 授权失败：{reason}',

@@ -358,7 +358,8 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 | Command | Description |
 |---------|-------------|
 | `@bot /grant @someone` | Pop an authorization card to add the user to the "this chat" or "global" allowlist; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
-| `@bot /revoke @someone` | Revoke the user's this-chat + global access |
+| `@bot /grant @someone 5` | Same, but with a **5-message quota**: after 5 conversational messages the grant is auto-revoked and they can no longer talk. Without a number it uses `messageQuota.defaultLimit` (unlimited if unset). Re-running `/grant @someone 3` refills/resets it. Only real CLI conversation counts — commands like `/help` don't. |
+| `@bot /revoke @someone` | Revoke the user's this-chat + global access (also clears their message-quota counters) |
 
 **🆕 One-shot session group**
 
@@ -456,6 +457,9 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `allowedUsers` | No | Allowed users (**full emails** like `alice@example.com`, or open_ids `ou_xxx`). Email prefixes can't be resolved and are dropped. Required (at least one entry, as owner) when `allowedChatGroups` is set |
 | `allowedChatGroups` | No | Talk-open chats (`chat_id`, for example `oc_xxx`). Any member talking **inside these chats** can use the bot (decided by the message's chat — new members work immediately, removed members lose access, no restart needed); grants `canTalk` only, sensitive ops still require `allowedUsers`. Equivalent to the owner running `/grant` (no target) in that chat. |
 | `globalGrants` | No | Global talk allowlist (`open_id` list, e.g. `ou_xxx`; humans or bots). Listed entries can talk to the bot in **any** chat; grants `canTalk` only, sensitive ops still require `allowedUsers`. Usually written via the owner's `/grant` card (the "grant talk globally" button); can also be set manually here. |
+| `messageQuota` | No | Message quota (off by default). Shape `{ "defaultLimit": 20 }`: setting a positive integer enables the **default quota** — a bare `/grant @someone` then applies it. An explicit `/grant @someone 5` **always** takes effect, regardless of this field. Only constrains per-user talk grants (`chatGrants`/`globalGrants`); owner / `allowedUsers` / whole-chat / oncall are never metered. |
+| `quotaState` | No | Message-quota counters (runtime state, auto-maintained; rarely hand-edited). Keys look like `chat:<chatId>:<openId>` / `global:<openId>`, value `{ "limit": N, "used": M }`. When `used` reaches `limit`, the matching-scope grant is auto-revoked and the record deleted. |
+| `restrictGrantCommands` | No | Default `false`. When on, **per-user grantees (`chatGrants`/`globalGrants`) are restricted to plain conversation** — all slash commands are blocked (botmux's own commands, passthrough commands, every `/workflow` subcommand, `/introduce`, `/t`). Owner / `allowedUsers` / oncall / whole-chat `allowedChatGroups` members are unaffected. Decided by slash-command invocation match (won't misfire on normal chat that merely discusses command usage). Recommended alongside quotas so grantees can't bypass the cap via commands. |
 | `oncallChats` | No | Oncall bindings (written by `/oncall bind`), e.g. `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`; any group member can @ the bot |
 
 **Config priority:** `BOTS_CONFIG` env var > `~/.botmux/bots.json`

@@ -68,10 +68,18 @@ export const messages: Record<string, string> = {
   'card.grant.result_deny': '🚫 Request denied',
   'card.grant.notify_chat': '✅ {at} can now use me in this chat — just @-mention me.',
   'card.grant.notify_global': '✅ {at} now has global access — @-mention me in any chat.',
+  'card.grant.notify_quota_suffix': ' (message quota: {n}; access is revoked once used up)',
+
+  // Message quota exhausted
+  'quota.exhausted_notify': '⚠️ {at} has used up their message quota ({limit}/{limit}); talk access has been revoked. Ask the owner to /grant again to continue.',
+
+  // Granted-user command restriction (when restrictGrantCommands is on)
+  'cmd.grant_restricted': '⚠️ This grant only allows plain conversation — commands like {cmd} are not permitted. Ask the owner to lift the restriction.',
 
   // /grant, /revoke command replies
   'cmd.grant.owner_only': 'Only the owner can use /grant.',
-  'cmd.grant.usage': 'Usage: @bot /grant @someone (let them talk to me in this chat) | @bot /grant (let every member of this chat talk). Talk-only; sensitive ops stay governed by allowedUsers.',
+  'cmd.grant.usage': 'Usage: @bot /grant @someone [N] (let them talk to me in this chat, optionally with an N-message quota) | @bot /grant (let every member of this chat talk). Talk-only; sensitive ops stay governed by allowedUsers.',
+  'cmd.grant.bad_quota': '⚠️ Bad quota. Usage: @bot /grant @someone 5 (grant a 5-message quota; must be a positive integer). Omit the number to use the default quota / unlimited.',
   'cmd.grant.chat_done': '✅ Everyone in this chat can now talk to me (just @-mention me). Sensitive ops still limited to allowedUsers.',
   'cmd.grant.chat_already': 'ℹ️ This chat is already open to talk; nothing to do.',
   'cmd.grant.chat_failed': '⚠️ Grant failed: {reason}',

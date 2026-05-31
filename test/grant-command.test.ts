@@ -19,7 +19,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseGrantTarget, tryHandleGrantCommand } from '../src/im/lark/grant-command.js';
+import { parseGrantTarget, parseGrantQuota, tryHandleGrantCommand } from '../src/im/lark/grant-command.js';
 import { registerBot, getBot, loadBotConfigs } from '../src/bot-registry.js';
 import * as pending from '../src/im/lark/grant-pending.js';
 
@@ -43,6 +43,26 @@ describe('parseGrantTarget', () => {
 
   it('falls back to open_id as name when name missing', () => {
     expect(parseGrantTarget({ mentions: [{ id: { open_id: 'ou_x' } }] }, 'ou_bot')).toEqual({ openId: 'ou_x', name: 'ou_x' });
+  });
+});
+
+describe('parseGrantQuota', () => {
+  const m = [{ name: '张三' }];
+  it('parses a trailing positive integer after stripping the @mention', () => {
+    expect(parseGrantQuota('/grant @张三 5', m)).toEqual({ ok: true, quota: 5 });
+  });
+  it('no number → ok with undefined quota', () => {
+    expect(parseGrantQuota('/grant @张三', m)).toEqual({ ok: true, quota: undefined });
+  });
+  it('handles mention names containing spaces', () => {
+    expect(parseGrantQuota('/grant @张 三 7', [{ name: '张 三' }])).toEqual({ ok: true, quota: 7 });
+  });
+  it('rejects 0 / negative / decimal / non-numeric / extra tail', () => {
+    expect(parseGrantQuota('/grant @张三 0', m)).toEqual({ ok: false });
+    expect(parseGrantQuota('/grant @张三 -1', m)).toEqual({ ok: false });
+    expect(parseGrantQuota('/grant @张三 2.5', m)).toEqual({ ok: false });
+    expect(parseGrantQuota('/grant @张三 abc', m)).toEqual({ ok: false });
+    expect(parseGrantQuota('/grant @张三 5 oops', m)).toEqual({ ok: false });
   });
 });
 
@@ -130,6 +150,20 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     const handled = await tryHandleGrantCommand('b2', bareMsg('/grant all'), 'ou_owner');
     expect(handled).toBe(true);
     expect(getBot('b2').config.allowedChatGroups).toEqual(['oc_room']);
+  });
+
+  it('owner: "/grant 5" (forgot to @ someone) does NOT open the whole chat', async () => {
+    const handled = await tryHandleGrantCommand('b2', bareMsg('/grant 5'), 'ou_owner');
+    expect(handled).toBe(true);
+    expect(getBot('b2').config.allowedChatGroups).toBeUndefined();  // 关键：绝不把"漏@的额度命令"误执行成整群开放
+    const [, , , msgType] = replyMock.mock.calls.at(-1)!;
+    expect(msgType ?? 'text').not.toBe('interactive');             // 文本回执（bad_quota），非授权卡
+  });
+
+  it('owner: "/grant random" (junk, no target) does NOT open the whole chat', async () => {
+    const handled = await tryHandleGrantCommand('b2', bareMsg('/grant random'), 'ou_owner');
+    expect(handled).toBe(true);
+    expect(getBot('b2').config.allowedChatGroups).toBeUndefined();
   });
 
   it('owner: bare /revoke removes the whole-chat grant', async () => {

@@ -10,7 +10,7 @@ import { canOperate } from './event-dispatcher.js';
 import { sendUserMessage, updateMessage, deleteMessage, replyMessage, sendEphemeralCard } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
-import { checkNonce, clearPending, markDenied } from './grant-pending.js';
+import { checkNonce, clearPending, markDenied, getPendingQuota } from './grant-pending.js';
 import {
   handleWorkflowApprovalAction,
   isWorkflowApprovalAction,
@@ -163,9 +163,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 两者都绝不碰 allowedUsers（operate 只由 bots.json 配）。
     // 落库失败不撤卡、保留 pending（owner 可重试），给 toast。
     const kind = value.action === 'grant_global' ? 'global' as const : 'chat' as const;
+    // 额度挂在 pending 上（/grant @x N 解析所得）；clearPending 前先读出来。
+    const quota = getPendingQuota(larkAppId, grantChatId, target);
     const res = kind === 'global'
-      ? await addGlobalGrant(larkAppId, target)
-      : await addChatGrant(larkAppId, grantChatId, target);
+      ? await addGlobalGrant(larkAppId, target, quota)
+      : await addChatGrant(larkAppId, grantChatId, target, quota);
     if (!res.ok) {
       logger.warn(`Grant action "${value.action}" store failed: ${res.reason}`);
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: res.reason }, loc) } };
@@ -176,7 +178,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (cardMessageId) {
       // 通知是 best-effort（@被授权人）；失败不影响主流程，只记日志。
       try {
-        await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, target, loc), 'interactive', true);
+        await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, target, loc, quota), 'interactive', true);
       } catch (err) {
         logger.warn(`grant notify failed (grant still applied): ${err}`);
       }

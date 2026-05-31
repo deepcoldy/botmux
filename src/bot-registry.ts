@@ -85,6 +85,29 @@ export interface BotConfig {
    */
   globalGrants?: string[];
   /**
+   * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：
+   *   • 未配置（undefined）→ 关闭：无显式数字的 /grant 仍是"无限授权"（当前行为）。
+   *   • 配置正整数 D    → 开启默认额度：`/grant @x`（不带数字）套用 D 条额度。
+   * 显式 `/grant @x N` 的 N **恒生效**，与本字段是否配置无关（见 {@link quotaState}）。
+   * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
+   */
+  messageQuota?: { defaultLimit?: number };
+  /**
+   * scope-aware 消息额度计数（运行时状态，随授权一起持久化进 bots.json）。
+   * key = `chat:${chatId}:${openId}` | `global:${openId}`，value = { limit, used }。
+   * 仅在 /grant 带额度（显式数字，或开启 default 时取 default）时建记录；
+   * used 达到 limit 后自动收回**对应 scope** 的授权并删除本记录。纯 talk-only。
+   */
+  quotaState?: { [quotaKey: string]: { limit: number; used: number } };
+  /**
+   * 开启后：仅靠 per-user 授权（chatGrants / globalGrants）放行的发送者，禁止使用**任何
+   * 斜杠命令**——botmux 自身的 DAEMON 命令、透传（PASSTHROUGH）命令、全部 `/workflow`
+   * 子命令、`/introduce`、`/t`/`/topic` —— 只能普通对话。owner / allowedUsers / oncall /
+   * allowedChatGroup 整群成员不受影响。判定以 slash-command invocation 命中为准（不是"凡以
+   * `/` 开头的文本"，避免误伤讨论命令用法的普通对话）。默认 false（保持现状：被授权人可用透传）。
+   */
+  restrictGrantCommands?: boolean;
+  /**
    * Custom footer brand label for cards this bot sends. Three states:
    *   • `undefined` (unset)  → default `[botmux](github)` link
    *   • `''` (empty)         → brand suppressed (footer shows only 发送给 if any)
@@ -436,6 +459,30 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (ids.length > 0) globalGrants = ids;
     }
 
+    // messageQuota.defaultLimit：仅保留正整数；非法/缺省 → undefined（= 默认额度关闭）。
+    let messageQuota: { defaultLimit?: number } | undefined;
+    const rawMq = entry.messageQuota;
+    if (rawMq && typeof rawMq === 'object' && !Array.isArray(rawMq)) {
+      const d = rawMq.defaultLimit;
+      if (typeof d === 'number' && Number.isInteger(d) && d > 0) messageQuota = { defaultLimit: d };
+    }
+
+    // quotaState：scope-aware 计数。逐项校验 key 形如 `chat:*:*` / `global:*`，
+    // value 为 { limit, used } 正整数（used 允许 0）。非法项丢弃；全空 → undefined。
+    let quotaState: { [k: string]: { limit: number; used: number } } | undefined;
+    if (entry.quotaState && typeof entry.quotaState === 'object' && !Array.isArray(entry.quotaState)) {
+      const out: { [k: string]: { limit: number; used: number } } = {};
+      for (const [k, v] of Object.entries(entry.quotaState)) {
+        if (!/^(chat:.+:.+|global:.+)$/.test(k)) continue;
+        if (!v || typeof v !== 'object') continue;
+        const limit = (v as any).limit, used = (v as any).used;
+        if (typeof limit !== 'number' || !Number.isInteger(limit) || limit <= 0) continue;
+        if (typeof used !== 'number' || !Number.isInteger(used) || used < 0) continue;
+        out[k] = { limit, used };
+      }
+      if (Object.keys(out).length > 0) quotaState = out;
+    }
+
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
@@ -458,6 +505,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       chatGrants,
       globalGrants,
+      messageQuota,
+      quotaState,
+      restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.

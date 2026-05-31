@@ -352,7 +352,8 @@ botmux autostart enable
 | 命令 | 说明 |
 |------|------|
 | `@机器人 /grant @某人` | 弹授权卡片，把对方加进「本群使用」或「全局」白名单；无权限者 @ 机器人时也会自动弹这张卡并 @owner |
-| `@机器人 /revoke @某人` | 撤销对方的本群 + 全局授权 |
+| `@机器人 /grant @某人 5` | 同上，但给对方 **5 条消息额度**：发满 5 条对话后自动收回授权、无法继续对话。不带数字时取 `messageQuota.defaultLimit`（未配置则无限）。重新 `/grant @某人 3` = 续杯/重置。仅计真正喂给 CLI 的对话，`/help` 等命令不耗额度。 |
+| `@机器人 /revoke @某人` | 撤销对方的本群 + 全局授权（连带清空其消息额度计数） |
 
 **🆕 一键新建会话群**
 
@@ -560,6 +561,9 @@ botmux setup
 | `allowedUsers` | 否 | 允许的用户列表（**完整邮箱**如 `alice@example.com`，或 open_id `ou_xxx`）。邮箱前缀无法解析、会被丢弃。配置了 `allowedChatGroups` 时此项必须至少有一个条目作为 owner |
 | `allowedChatGroups` | 否 | 可对话群列表（飞书 `chat_id`，如 `oc_xxx`）。**在这些群里**任何成员都能与机器人对话（按消息所在群判断，新人进群即生效、退群即失权，无需重启）；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。等价于 owner 在该群发 `/grant`（不带 @）。 |
 | `globalGrants` | 否 | 全局可对话名单（`open_id` 列表，如 `ou_xxx`；人或 bot 均可）。名单内的对象可在**任意群**与机器人对话；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。通常由 owner 在授权卡上点「全局授权对话」写入，也可在此手动配置。 |
+| `messageQuota` | 否 | 消息额度（默认关闭）。形如 `{ "defaultLimit": 20 }`：配置正整数即开启「默认额度」——`/grant @某人`（不带数字）授权时套用该额度；显式 `/grant @某人 5` 的数字**恒生效**，与本项是否配置无关。仅约束 `chatGrants`/`globalGrants` 这类 per-user 对话授权，owner / `allowedUsers` / 整群 / oncall 一律不计额度。 |
+| `quotaState` | 否 | 消息额度计数（运行时状态，自动维护，一般无需手配）。key 形如 `chat:<chatId>:<openId>` / `global:<openId>`，value `{ "limit": N, "used": M }`。`used` 达到 `limit` 后自动收回**对应 scope** 的授权并删记录。 |
+| `restrictGrantCommands` | 否 | 默认 `false`。开启后**被授权人（`chatGrants`/`globalGrants` per-user 授权）只能普通对话**，禁用一切斜杠命令（botmux 自身命令、透传命令、全部 `/workflow`、`/introduce`、`/t`）。owner / `allowedUsers` / oncall / 整群 `allowedChatGroups` 成员不受影响。判定以 slash-command 调用命中为准（不误伤讨论命令用法的普通对话）。配额场景建议顺手开启，避免被授权人用命令绕过额度。 |
 | `oncallChats` | 否 | oncall 绑定（`/oncall bind` 写入），形如 `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`，群内任何成员可 @ 提问 |
 
 **配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`

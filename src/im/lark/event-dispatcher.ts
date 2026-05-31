@@ -17,7 +17,8 @@ import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-p
 import { tryHandleGrantCommand } from './grant-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled } from './grant-pending.js';
-import { localeForBot } from '../../i18n/index.js';
+import { localeForBot, t } from '../../i18n/index.js';
+import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -404,6 +405,14 @@ export async function tryHandleIntroduceCommand(
     return true;
   }
 
+  if (grantCommandRestriction(larkAppId, message.chat_id, senderOpenId).blocked) {
+    const loc = localeForBot(larkAppId);
+    await replyMessage(larkAppId, message.message_id, JSON.stringify({
+      text: t('cmd.grant_restricted', { cmd: '/introduce' }, loc),
+    })).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
+    return true;
+  }
+
   const selfOpenId = getBot(larkAppId).botOpenId;
   const rawMentions: Array<{ name?: string; id?: { open_id?: string } }> = message.mentions ?? [];
   const all = rawMentions
@@ -488,6 +497,38 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
 // so an unbound sibling doesn't fall back to allowedUsers and reply
 // "⚠️ 无操作权限" when @-mentioned in a shared oncall workspace.
 
+export type TalkReason =
+  | 'allowedUser'
+  | 'oncall'
+  | 'peer'
+  | 'allowedChatGroup'
+  | 'open'
+  | 'chatGrant'
+  | 'globalGrant'
+  | 'none';
+
+export interface TalkEvaluation {
+  allowed: boolean;
+  reason: TalkReason;
+  quotaKey?: string;
+}
+
+export type GrantCommandRestrictionReason = 'chatGrant' | 'globalGrant';
+
+export function grantCommandRestriction(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+): { blocked: boolean; reason?: GrantCommandRestrictionReason } {
+  const bot = getBot(larkAppId);
+  if (bot.config.restrictGrantCommands !== true) return { blocked: false };
+  const ev = evaluateTalk(larkAppId, chatId, senderOpenId);
+  if (ev.reason === 'chatGrant' || ev.reason === 'globalGrant') {
+    return { blocked: true, reason: ev.reason };
+  }
+  return { blocked: false };
+}
+
 /** per-chat per-user 授权命中判断（仅用于 canTalk —— 不给管理命令权）。 */
 function hasChatGrant(larkAppId: string, chatId: string | undefined, openId: string | undefined): boolean {
   return !!chatId && !!openId && !!getBot(larkAppId).config.chatGrants?.[chatId]?.includes(openId);
@@ -499,24 +540,34 @@ function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean 
 }
 
 export function canTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined): boolean {
-  if (chatId && isChatOncallBoundForAnyBot(chatId)) return true;
-  if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return true;
-  if (hasChatGrant(larkAppId, chatId, senderOpenId)) return true;
-  // 全局对话授权（talk-only，人/bot 通用）：命中即在任意群放行，与 chatGrants 同级、不授 operate。
-  if (hasGlobalGrant(larkAppId, senderOpenId)) return true;
+  return evaluateTalk(larkAppId, chatId, senderOpenId).allowed;
+}
+
+export function evaluateTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined): TalkEvaluation {
   const bot = getBot(larkAppId);
   // allowedChatGroups 是"talk-open 的 chat_id 列表"：当前消息来自其中之一即放行（仅 canTalk）。
   // 成员关系隐含在"能在该 chat 发言"里 —— 退群者发不了言自动失权，新人进群即生效，无需成员快照。
-  if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return true;
   const allowedUsers = bot.resolvedAllowedUsers;
+  if (senderOpenId && allowedUsers.includes(senderOpenId)) return { allowed: true, reason: 'allowedUser' };
+  if (chatId && isChatOncallBoundForAnyBot(chatId)) return { allowed: true, reason: 'oncall' };
+  if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return { allowed: true, reason: 'peer' };
+  if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return { allowed: true, reason: 'allowedChatGroup' };
+
   // globalGrants 与 allowedChatGroups 同样确立"有白名单"语义：只配 globalGrants 也算限制态，
   // 不能 fall through 到"全开放"。
   const hasAllowlist = allowedUsers.length > 0
     || (bot.config.allowedChatGroups?.length ?? 0) > 0
     || (bot.config.globalGrants?.length ?? 0) > 0;
-  if (!hasAllowlist) return true;
-  if (!senderOpenId) return false;
-  return allowedUsers.includes(senderOpenId);
+  if (!hasAllowlist) return { allowed: true, reason: 'open' };
+
+  if (hasChatGrant(larkAppId, chatId, senderOpenId)) {
+    return { allowed: true, reason: 'chatGrant', quotaKey: chatQuotaKey(chatId!, senderOpenId!) };
+  }
+  // 全局对话授权（talk-only，人/bot 通用）：命中即在任意群放行，与 chatGrants 同级、不授 operate。
+  if (hasGlobalGrant(larkAppId, senderOpenId)) {
+    return { allowed: true, reason: 'globalGrant', quotaKey: globalQuotaKey(senderOpenId!) };
+  }
+  return { allowed: false, reason: 'none' };
 }
 
 export function canOperate(larkAppId: string, _chatId: string | undefined, senderOpenId: string | undefined): boolean {

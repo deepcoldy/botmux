@@ -606,10 +606,22 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   return JSON.stringify(card);
 }
 
-/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。 */
-export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string, locale?: Locale): string {
+/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。带额度时追加"（额度 N 条）"。 */
+export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string, locale?: Locale, quota?: number): string {
   const at = `<at id=${targetOpenId}></at>`;
-  const content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+  let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+  if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+  const card = {
+    config: { wide_screen_mode: true },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
+  };
+  return JSON.stringify(card);
+}
+
+/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。 */
+export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale): string {
+  const at = `<at id=${targetOpenId}></at>`;
+  const content = t('quota.exhausted_notify', { at, limit }, locale);
   const card = {
     config: { wide_screen_mode: true },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],

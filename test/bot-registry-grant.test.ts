@@ -51,4 +51,46 @@ describe('bot-registry grant additions', () => {
     registerBot({ larkAppId: 'a3', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com'] });
     expect(getOwnerOpenId('a3')).toBeUndefined();
   });
+
+  it('parses messageQuota.defaultLimit only when a positive integer', () => {
+    const ok = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mq1', larkAppSecret: 's', messageQuota: { defaultLimit: 20 } }]));
+    expect(ok[0].messageQuota).toEqual({ defaultLimit: 20 });
+    for (const bad of [0, -3, 2.5, '20', null]) {
+      const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mqb', larkAppSecret: 's', messageQuota: { defaultLimit: bad } }]));
+      expect(c[0].messageQuota).toBeUndefined();
+    }
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mq2', larkAppSecret: 's' }]))[0].messageQuota).toBeUndefined();
+  });
+
+  it('parses & sanitizes quotaState (scope-aware keys + positive int limit, used>=0)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'qs1', larkAppSecret: 's',
+      quotaState: {
+        'chat:oc_1:ou_a': { limit: 5, used: 2 },
+        'global:ou_b': { limit: 3, used: 0 },
+        'boguskey': { limit: 5, used: 0 },              // bad key shape
+        'chat:oc_2:ou_c': { limit: 0, used: 0 },        // non-positive limit
+        'global:ou_d': { limit: 4, used: -1 },          // negative used
+        'global:ou_e': { limit: 2.5, used: 0 },         // non-integer
+      },
+    }]));
+    expect(cfgs[0].quotaState).toEqual({
+      'chat:oc_1:ou_a': { limit: 5, used: 2 },
+      'global:ou_b': { limit: 3, used: 0 },
+    });
+  });
+
+  it('leaves quotaState undefined when absent / all-invalid', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'qs2', larkAppSecret: 's' }]))[0].quotaState).toBeUndefined();
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'qs3', larkAppSecret: 's', quotaState: { bad: 1 } }]))[0].quotaState).toBeUndefined();
+  });
+
+  it('parses restrictGrantCommands only as strict boolean true (else undefined)', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rc1', larkAppSecret: 's', restrictGrantCommands: true }]))[0].restrictGrantCommands).toBe(true);
+    for (const bad of [false, 'true', 1, undefined]) {
+      const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rc2', larkAppSecret: 's', restrictGrantCommands: bad }]));
+      expect(c[0].restrictGrantCommands).toBeUndefined();
+    }
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rc3', larkAppSecret: 's' }]))[0].restrictGrantCommands).toBeUndefined();
+  });
 });

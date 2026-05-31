@@ -90,9 +90,16 @@ const MY_OPEN_ID = 'ou_bot_a_open_id';
 const OTHER_BOT_OPEN_ID = 'ou_bot_b_open_id';
 const USER_OPEN_ID = 'ou_user_123';
 
-function setupBotState(opts?: { botOpenId?: string | undefined; chatGrants?: Record<string, string[]>; globalGrants?: string[]; allowedUsers?: string[] }) {
+function setupBotState(opts?: { botOpenId?: string | undefined; chatGrants?: Record<string, string[]>; globalGrants?: string[]; allowedUsers?: string[]; restrictGrantCommands?: boolean }) {
   mockGetBot.mockReturnValue({
-    config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', chatGrants: opts?.chatGrants, globalGrants: opts?.globalGrants },
+    config: {
+      larkAppId: MY_APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      chatGrants: opts?.chatGrants,
+      globalGrants: opts?.globalGrants,
+      restrictGrantCommands: opts?.restrictGrantCommands,
+    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
   });
@@ -236,10 +243,39 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
   beforeEach(() => {
     capturedHandlers = {};
+    mockReplyMessage.mockClear();
+    mockRecordObservedBots.mockClear();
     setupBotState();
     handlers = makeHandlers();
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('blocks /introduce for restricted chat-granted users before recording bots', async () => {
+    setupBotState({
+      chatGrants: { chat_restrict: [USER_OPEN_ID] },
+      allowedUsers: ['ou_owner'],
+      restrictGrantCommands: true,
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /introduce' }),
+      messageId: 'msg-intro-restricted',
+      chatId: 'chat_restrict',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-intro-restricted',
+      expect.stringContaining('/introduce'),
+    );
+    expect(mockRecordObservedBots).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('routes @mentioned bot message to handleThreadReply', async () => {
