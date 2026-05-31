@@ -12,10 +12,11 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
     id: 'hermes',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume }) {
+    buildArgs({ sessionId, resume, disableCliBypass }) {
       const args: string[] = [];
       if (resume) args.push('--resume', sessionId);
-      args.push('--yolo', '--accept-hooks', '--pass-session-id');
+      if (!disableCliBypass) args.push('--yolo', '--accept-hooks');
+      args.push('--pass-session-id');
       return args;
     },
 

@@ -133,11 +133,36 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             <button type="button" data-action="save">${t('botDefaults.save')}</button>
             <span class="oncall-status" data-status></span>
           </div>
+          ${renderAutoStartControls(b)}
         </section>
+        ${renderRoleSection(b)}
         ${renderBrandSection(b)}
         ${renderCardBehaviorSection(b)}
       </div>
     </article>`;
+  }
+
+  // Team-level role editor (one role per bot, cross-chat). This is the
+  // canonical place to EDIT the team role — the Team page only shows it
+  // read-only. The role isn't part of the /api/bots payload, so it's fetched
+  // once per bot via GET /api/team/local-bots/{app}/role and cached onto the
+  // bot snapshot (b.teamRole) — the page re-renders on every search keystroke,
+  // so caching avoids a fetch-per-keystroke storm. undefined = not loaded yet
+  // (render disabled + lazy-load); string = loaded (render it directly).
+  function renderRoleSection(b: any): string {
+    const loaded = typeof b.teamRole === 'string';
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionRole')}</h3>
+      <p class="bd-section-note">${t('botDefaults.roleHelp')}</p>
+      <textarea data-input="teamRole" rows="6"
+        placeholder="${escapeHtml(t('botDefaults.rolePlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px"${loaded ? '' : ' disabled'}>${loaded ? escapeHtml(b.teamRole) : ''}</textarea>
+      <div class="actions">
+        <button type="button" data-action="save-role"${loaded ? '' : ' disabled'}>${t('botDefaults.roleSave')}</button>
+        <button type="button" data-action="delete-role"${loaded ? '' : ' disabled'}>${t('botDefaults.roleDelete')}</button>
+        <span class="oncall-status" data-role-status></span>
+      </div>
+    </section>`;
   }
 
   // brandLabel is null when unset (→ default botmux), '' when off, else custom.
@@ -199,6 +224,42 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <span class="oncall-status" data-card-pref-status></span>
       </div>
     </section>`;
+  }
+
+  // 主动开工 — rendered as a sub-block INSIDE the 新群 Oncall section (it's part
+  // of the same "proactively engage" config family). The two checkboxes auto-save
+  // on change; the 场景① prompt has its own save button (a textarea shouldn't PUT
+  // per keystroke). Data-action hooks are unchanged → wireCardHandlers still finds them.
+  function renderAutoStartControls(b: any): string {
+    const onJoin = b.autoStartOnGroupJoin === true;
+    const onTopic = b.autoStartOnNewTopic === true;
+    const joinPrompt: string = typeof b.autoStartOnGroupJoinPrompt === 'string' ? b.autoStartOnGroupJoinPrompt : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionAutoStart')}</h4>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-auto-join" ${onJoin ? 'checked' : ''}>
+        <strong>${t('botDefaults.autoStartJoin')}</strong>
+        <small>${t('botDefaults.autoStartJoinHelp')}</small>
+      </label>
+      <div class="bd-row">
+        <label>
+          <span>${t('botDefaults.autoStartJoinPrompt')}</span>
+          <textarea data-input="autoJoinPrompt" rows="3"
+            placeholder="${escapeHtml(t('botDefaults.autoStartJoinPromptPlaceholder'))}">${escapeHtml(joinPrompt)}</textarea>
+        </label>
+        <div class="actions">
+          <button type="button" data-action="save-auto-join-prompt">${t('botDefaults.autoStartJoinPromptSave')}</button>
+        </div>
+      </div>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-auto-topic" ${onTopic ? 'checked' : ''}>
+        <strong>${t('botDefaults.autoStartTopic')}</strong>
+        <small>${t('botDefaults.autoStartTopicHelp')}</small>
+      </label>
+      <div class="actions">
+        <span class="oncall-status" data-auto-start-status></span>
+      </div>
+    </div>`;
   }
 
   function wireCardHandlers() {
@@ -319,13 +380,19 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       const cardPrefStatusEl = card.querySelector<HTMLSpanElement>('[data-card-pref-status]');
       const cardPrefMootEl = card.querySelector<HTMLElement>('[data-card-pref-moot]');
 
-      // PUT a partial card-prefs patch; `selfCb` is the checkbox that triggered
-      // it (disabled during the request to block double-submit).
-      async function putCardPref(patch: Record<string, boolean>, selfCb: HTMLInputElement) {
-        if (!cardPrefStatusEl) return;
-        cardPrefStatusEl.textContent = '';
-        cardPrefStatusEl.className = 'oncall-status';
-        selfCb.disabled = true;
+      // PUT a partial card-prefs patch (booleans and/or the auto-start prompt
+      // string). `selfEl` is the control that triggered it (disabled during the
+      // request to block double-submit); `statusEl` is where the result toast
+      // lands (defaults to the card-behaviour status line).
+      async function putCardPref(
+        patch: Record<string, boolean | string>,
+        selfEl: HTMLInputElement | HTMLButtonElement,
+        statusEl: HTMLElement | null = cardPrefStatusEl,
+      ) {
+        if (!statusEl) return;
+        statusEl.textContent = '';
+        statusEl.className = 'oncall-status';
+        selfEl.disabled = true;
         try {
           const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/card-prefs`, {
             method: 'PUT',
@@ -334,25 +401,28 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           });
           const body = await r.json().catch(() => ({}));
           if (r.ok && body.ok) {
-            cardPrefStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
-            cardPrefStatusEl.classList.add('hint-ok');
+            statusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+            statusEl.classList.add('hint-ok');
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
               cached.disableStreamingCard = body.disableStreamingCard;
               cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
               cached.privateCard = body.privateCard;
+              cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
+              cached.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
+              cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
             }
           } else {
-            cardPrefStatusEl.textContent = `✗ ${body.error ?? r.status}`;
-            cardPrefStatusEl.classList.add('hint-warn-inline');
+            statusEl.textContent = `✗ ${body.error ?? r.status}`;
+            statusEl.classList.add('hint-warn-inline');
           }
         } catch (e: any) {
-          cardPrefStatusEl.textContent = `✗ ${e?.message ?? e}`;
-          cardPrefStatusEl.classList.add('hint-warn-inline');
+          statusEl.textContent = `✗ ${e?.message ?? e}`;
+          statusEl.classList.add('hint-warn-inline');
         } finally {
           // The writable-link checkbox stays disabled while streaming is off.
-          if (selfCb === writableLinkCb) selfCb.disabled = !!disableStreamingCb?.checked;
-          else selfCb.disabled = false;
+          if (selfEl === writableLinkCb) selfEl.disabled = !!disableStreamingCb?.checked;
+          else selfEl.disabled = false;
         }
       }
 
@@ -373,6 +443,127 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (privateCardCb) {
         privateCardCb.addEventListener('change', () => {
           putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
+
+      // ── 主动开工 toggles + 场景① prompt ───────────────────────────────────
+      const autoJoinCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-join]');
+      const autoTopicCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-topic]');
+      const autoJoinPromptEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=autoJoinPrompt]');
+      const autoJoinPromptSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-auto-join-prompt]');
+      const autoStartStatusEl = card.querySelector<HTMLSpanElement>('[data-auto-start-status]');
+      if (autoJoinCb) {
+        autoJoinCb.addEventListener('change', () => {
+          putCardPref({ autoStartOnGroupJoin: autoJoinCb.checked }, autoJoinCb, autoStartStatusEl);
+        });
+      }
+      if (autoTopicCb) {
+        autoTopicCb.addEventListener('change', () => {
+          putCardPref({ autoStartOnNewTopic: autoTopicCb.checked }, autoTopicCb, autoStartStatusEl);
+        });
+      }
+      if (autoJoinPromptEl && autoJoinPromptSaveBtn) {
+        autoJoinPromptSaveBtn.addEventListener('click', () => {
+          putCardPref({ autoStartOnGroupJoinPrompt: autoJoinPromptEl.value }, autoJoinPromptSaveBtn, autoStartStatusEl);
+        });
+      }
+
+      // ── Team role (one role per bot, cross-chat) ──────────────────────────
+      const roleTextarea = card.querySelector<HTMLTextAreaElement>('textarea[data-input=teamRole]');
+      const roleSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-role]');
+      const roleDeleteBtn = card.querySelector<HTMLButtonElement>('button[data-action=delete-role]');
+      const roleStatusEl = card.querySelector<HTMLSpanElement>('[data-role-status]');
+
+      if (roleTextarea && roleSaveBtn && roleDeleteBtn && roleStatusEl) {
+        const roleUrl = `/api/team/local-bots/${encodeURIComponent(appId)}/role`;
+        const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+
+        // Until the role is loaded, the textarea AND both buttons render
+        // disabled. This is load-bearing: an empty not-yet-loaded textarea
+        // saved as "" is treated as a DELETE by the server (federation-spoke-api
+        // role PUT), so a mis-click during a slow load would silently wipe an
+        // existing role. We only enable the editor once GET has returned.
+        function enableLiveEditor(value: string) {
+          const live = listEl.querySelector<HTMLElement>(`.bd-card[data-appid="${CSS.escape(appId)}"]`);
+          if (!live) return; // filtered out by search — next render draws it enabled from cache
+          const ta = live.querySelector<HTMLTextAreaElement>('textarea[data-input=teamRole]');
+          const sv = live.querySelector<HTMLButtonElement>('button[data-action=save-role]');
+          const dl = live.querySelector<HTMLButtonElement>('button[data-action=delete-role]');
+          if (ta) { ta.value = value; ta.disabled = false; }
+          if (sv) sv.disabled = false;
+          if (dl) dl.disabled = false;
+        }
+
+        // Lazily load the role ONCE per bot, then stash it onto the snapshot
+        // (cached.teamRole) so later re-renders — one per search keystroke —
+        // render from cache instead of re-fetching. The teamRoleLoading sentinel
+        // guards against a re-render firing a second concurrent GET while the
+        // first is still in flight. enableLiveEditor re-queries the *current*
+        // DOM so a mid-load re-render doesn't leave a stale (detached) textarea
+        // stuck disabled.
+        if (cached && typeof cached.teamRole !== 'string' && !cached.teamRoleLoading) {
+          cached.teamRoleLoading = true;
+          (async () => {
+            try {
+              const r = await fetch(roleUrl);
+              const body = await r.json().catch(() => ({}));
+              if (r.ok && body.ok) {
+                cached.teamRole = body.role ?? '';
+                enableLiveEditor(cached.teamRole);
+              } else {
+                roleStatusEl.textContent = `✗ ${t('botDefaults.roleLoadErr')}: ${body.error ?? r.status}`;
+                roleStatusEl.classList.add('hint-warn-inline');
+              }
+            } catch (e: any) {
+              roleStatusEl.textContent = `✗ ${t('botDefaults.roleLoadErr')}: ${e?.message ?? e}`;
+              roleStatusEl.classList.add('hint-warn-inline');
+            } finally {
+              cached.teamRoleLoading = false;
+            }
+          })();
+        }
+
+        // PUT the role ('' = delete on the server). `deleted` picks the success
+        // toast; both buttons share this path. Server trims + deletes on empty,
+        // so we mirror the stored value into the cache for consistent re-renders.
+        async function putRole(role: string, btn: HTMLButtonElement, deleted: boolean) {
+          if (!roleStatusEl) return;
+          // Defense-in-depth: never PUT before the role is loaded (would risk a
+          // ""-as-delete). The buttons render disabled until then, but guard the
+          // entry too in case of a stale handler firing.
+          if (!cached || typeof cached.teamRole !== 'string') return;
+          roleStatusEl.textContent = '';
+          roleStatusEl.className = 'oncall-status';
+          roleSaveBtn!.disabled = true;
+          roleDeleteBtn!.disabled = true;
+          try {
+            const r = await fetch(roleUrl, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ role }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              if (cached) cached.teamRole = role.trim();
+              roleStatusEl.textContent = `✓ ${deleted ? t('botDefaults.roleDeleted') : t('botDefaults.roleSaved')}`;
+              roleStatusEl.classList.add('hint-ok');
+            } else {
+              roleStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              roleStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            roleStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            roleStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            roleSaveBtn!.disabled = false;
+            roleDeleteBtn!.disabled = false;
+          }
+        }
+
+        roleSaveBtn.addEventListener('click', () => putRole(roleTextarea.value, roleSaveBtn, false));
+        roleDeleteBtn.addEventListener('click', () => {
+          roleTextarea.value = '';
+          putRole('', roleDeleteBtn, true);
         });
       }
     });

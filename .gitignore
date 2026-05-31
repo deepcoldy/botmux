@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 .pnpm-store/
 dist/
 data/
@@ -8,6 +8,7 @@ log/
 .env
 .npmrc
 docs/superpowers/
+docs/specs/
 storageState.json
 midscene_run/
 .codex
@@ -15,3 +16,7 @@ midscene_run/
 .antigravitycli/
 .cjadk/
 .trae/
+# magic / 妙笔发布 token 与 app 映射（含密钥，绝不提交）
+.magic-token
+.magic-apps.json
+docs-site/.magic-token

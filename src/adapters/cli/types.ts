@@ -47,6 +47,8 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
+    disableCliBypass?: boolean;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
@@ -152,11 +154,12 @@ export interface CliAdapter {
    *  queued messages immediately instead of waiting for idle detection.
    *  Only set for CLIs whose input handling is known to tolerate this —
    *  Claude Code buffers input internally and processes it after the current
-   *  turn; CoCo (0.120.32+) parks it in its own TUI queue and dequeues it when
-   *  the current turn ends. NOTE: for the structured (codex/coco) bridge, the
-   *  worker additionally requires the CLI not be Codex — Codex's rollout
-   *  attribution hasn't been validated for type-ahead, so even an adapter that
-   *  set this flag would stay serial there. */
+   *  turn; CoCo (0.120.32+) parks it in its TUI queue and writes the transcript
+   *  user event only at dequeue time (transcript stays interleaved); Codex
+   *  (0.134.0+) parks it too but STEERS it into the active turn — a tool-running
+   *  turn can merge the queued input into one final (rollout: user1 → user2 →
+   *  assistant_final). CodexBridgeQueue's HOL-block-drop keeps attribution
+   *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
 
   /** Whether CLI uses alternate screen buffer */

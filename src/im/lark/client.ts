@@ -8,6 +8,8 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
+import { getBotCapability } from '../../services/bot-profile-store.js';
+import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -168,6 +170,67 @@ export async function removeReaction(larkAppId: string, messageId: string, react
   logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
 }
 
+/**
+ * Resolve a user's tenant-stable `union_id` from their app-scoped `open_id`.
+ * Used by cross-daemon owner checks (e.g. /relay --create peer migrate)
+ * to compare identities across bot namespaces — open_id alone is
+ * app-scoped, so two daemons looking at the same physical user see
+ * different open_ids.
+ *
+ * Best-effort: returns null on API failure / missing scope / empty
+ * response, so callers can fall back to other identity strategies
+ * instead of failing the whole flow.
+ */
+export async function resolveUnionIdFromOpenId(
+  larkAppId: string,
+  openId: string,
+): Promise<string | null> {
+  const c = getBotClient(larkAppId);
+  try {
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
+    });
+    if (res?.code !== 0) {
+      logger.debug(`[union_id] resolve failed for ${openId.substring(0, 12)}: code=${res?.code} msg=${res?.msg ?? ''}`);
+      return null;
+    }
+    const unionId: string | undefined = res?.data?.user?.union_id;
+    return unionId ?? null;
+  } catch (err) {
+    logger.debug(`[union_id] resolve threw for ${openId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+/**
+ * Best-effort 判断一个 open_id 是否为「真人」（通讯录里查得到 user）。
+ *
+ * - code 0 且返回 user 对象 → 确定是真人 → true
+ * - 查不到 / 报错 → false。这一类同时覆盖两种情况：①bot（应用不在通讯录，必然查不到）；
+ *   ②本 app 缺 `contact:user.base:readonly` 读权限（这时真人也会查不到）。
+ *
+ * 用途：花名册（observed-bots-store）只应收 bot，不收真人——真人混进去会污染
+ * `<available_bots>` 误导模型。调用方语义统一为「只在 NOT-confirmed-human 时登记」：
+ *   - 有 contact 读权限（常态）→ 真人被准确剔除，登记得干净；
+ *   - 缺权限 / 查询瞬时失败（降级）→ 一律按非真人放行登记。对 /introduce 这本就「全部登记」，
+ *     无回退损失；但对 /grant 自动登记这条**新增**路径，降级时真人会被误登记——这是个新增
+ *     的（窄）污染面，靠 `contact:user.base:readonly` 已是 critical scope、启动自检缺失即 DM
+ *     管理员来收敛，不是「与现状等价」。若要彻底消除需区分 permission/network 与 user-not-found
+ *     错误码（user-not-found 才判 bot），属后续增强。
+ */
+export async function isHumanOpenId(larkAppId: string, openId: string): Promise<boolean> {
+  const c = getBotClient(larkAppId);
+  try {
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
+    });
+    return res?.code === 0 && !!res?.data?.user;
+  } catch (err) {
+    logger.debug(`[isHuman] lookup threw for ${openId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
 export async function sendUserMessage(larkAppId: string, openId: string, content: string, msgType: string = 'text'): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
@@ -202,6 +265,107 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
     userCount: Number(res.data?.user_count ?? 0),
     botCount: Number(res.data?.bot_count ?? 0),
   };
+}
+
+/**
+ * List the open_ids of a chat's (user) members, paginating until exhausted.
+ * Used by the 主动开工 场景① gate to check whether any of the bot's allowedUsers
+ * is a member of a chat the bot was just added to. Open_ids are app-scoped, so
+ * the result is only comparable against the SAME bot's resolvedAllowedUsers.
+ *
+ * Throws on API failure (e.g. missing `im:chat`/member-read scope) so the
+ * caller can decide how to degrade — it does NOT swallow errors, because a
+ * silent empty list would look like "no allowedUser present" and wrongly
+ * suppress auto-start.
+ */
+export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
+  const c = getBotClient(larkAppId);
+  const openIds: string[] = [];
+  let pageToken: string | undefined;
+  // Hard page cap as a runaway guard (100 members/page × 20 = 2000 members).
+  for (let page = 0; page < 20; page++) {
+    const params: Record<string, string> = { member_id_type: 'open_id', page_size: '100' };
+    if (pageToken) params.page_token = pageToken;
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`, params);
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat members: ${res.msg} (code: ${res.code})`);
+    }
+    for (const it of (res.data?.items ?? [])) {
+      const id = it?.member_id;
+      if (typeof id === 'string' && id) openIds.push(id);
+    }
+    if (!res.data?.has_more || !res.data?.page_token) break;
+    pageToken = res.data.page_token;
+  }
+  return openIds;
+}
+
+/**
+ * Resolve a chat's display name (the user-facing group title). Returns `null`
+ * on any failure (chatId is unknown to this bot, network error, bot not in
+ * chat etc.) — callers should fall back to displaying the raw chatId so the
+ * UI degrades gracefully rather than rendering "undefined". For p2p chats the
+ * returned name may be an empty string; treat that as "no display name" and
+ * also fall back. */
+export async function getChatName(larkAppId: string, chatId: string): Promise<string | null> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0) return null;
+    const name = String(res.data?.name ?? '').trim();
+    return name.length > 0 ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One-shot fetch of both the chat's display name AND its mode (普通群 /
+ * 话题群 / p2p) — saves a duplicate API call when the caller wants both
+ * (the /relay picker needs name for display and mode for the type tag).
+ * Falls back to `{ name: null, mode: 'group' }` on any error, mirroring
+ * getChatMode's safer-default behaviour.
+ *
+ * Cached per (appId, chatId) for 5 minutes — the /relay picker re-renders
+ * on every select / paginate / search click, and without the cache each
+ * click would fire N parallel chat.get API calls (one per unique source
+ * chat) which the user perceives as a loading spinner. Mirrors the TTL
+ * cache `getChatMode` already has. */
+interface ChatInfoCacheEntry { name: string | null; mode: ChatMode; cachedAt: number }
+const chatInfoCache = new Map<string, ChatInfoCacheEntry>();
+const CHAT_INFO_TTL_MS = 5 * 60 * 1000;
+
+export async function getChatNameAndMode(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ name: string | null; mode: ChatMode }> {
+  const cacheKey = `${larkAppId}::${chatId}`;
+  const cached = chatInfoCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < CHAT_INFO_TTL_MS) {
+    return { name: cached.name, mode: cached.mode };
+  }
+
+  let name: string | null = null;
+  let mode: ChatMode = 'group';
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code === 0) {
+      const raw = String(res.data?.name ?? '').trim();
+      name = raw.length > 0 ? raw : null;
+      const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+      const rawType = String(res.data?.chat_type ?? '').toLowerCase();
+      const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
+      // Same classification as getChatMode — keep in sync.
+      if (rawType === 'p2p') mode = 'p2p';
+      else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
+      else mode = 'group';
+    }
+  } catch {
+    /* keep safe defaults */
+  }
+  chatInfoCache.set(cacheKey, { name, mode, cachedAt: Date.now() });
+  return { name, mode };
 }
 
 /** Lark chat-mode classification used by botmux to decide session scope:
@@ -534,17 +698,44 @@ export async function resolveAllowedUsersWithMap(
   const map = new Map<string, string>();
   const openIds: string[] = [];
   const emails: string[] = [];
+  const unionIds: string[] = [];
   for (const v of raw) {
     if (v.startsWith('ou_')) {
       openIds.push(v);
       map.set(v, v);
+    } else if (v.startsWith('on_')) {
+      // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
+      // 启动时用本 app 凭证把 on_ 翻成本 app 的 ou_，下游一律照旧用 open_id。
+      unionIds.push(v);
     } else {
       emails.push(v);
     }
   }
-  if (emails.length === 0) return { resolved: openIds, map };
+  if (emails.length === 0 && unionIds.length === 0) return { resolved: openIds, map };
 
   const c = getBotClient(larkAppId);
+
+  // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
+  for (const uid of unionIds) {
+    try {
+      const res = await (c as any).contact.v3.user.get({
+        path: { user_id: uid },
+        params: { user_id_type: 'union_id' },
+      });
+      const oid = res?.data?.user?.open_id as string | undefined;
+      if (res.code === 0 && oid) {
+        openIds.push(oid);
+        map.set(uid, oid);
+        logger.info(`Resolved ${uid} → ${oid}`);
+      } else {
+        logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
+      }
+    } catch (err: any) {
+      logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
+    }
+  }
+
+  if (emails.length === 0) return { resolved: openIds, map };
   try {
     const res = await (c as any).contact.v3.user.batchGetId({
       params: { user_id_type: 'open_id' },
@@ -574,6 +765,34 @@ export async function resolveAllowedUsersWithMap(
     logger.warn(`resolveAllowedUsers failed: ${err.message}`);
   }
   return { resolved: openIds, map };
+}
+
+/**
+ * Best-effort resolve a user's open_id → canonical union_id (+ display name)
+ * for pairing-login. Requires `contact:user.base:readonly` scope; on failure
+ * (no scope / API error) returns {} so callers degrade to open_id-only identity.
+ */
+export async function resolveUserUnionId(larkAppId: string, openId: string): Promise<{ unionId?: string; name?: string }> {
+  if (!openId) return {};
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).contact.v3.user.get({
+      path: { user_id: openId },
+      params: { user_id_type: 'open_id' },
+    });
+    if (res.code === 0 && res.data?.user) {
+      return { unionId: res.data.user.union_id ?? undefined, name: res.data.user.name ?? undefined };
+    }
+    if (res.code === 99992361) {
+      logger.warn(`resolveUserUnionId [${larkAppId}]: open_id ${openId} 属于其他应用（cross app）。` +
+        `请在 allowedUsers 中改用邮箱或 union_id（on_ 前缀）代替 open_id。`);
+    } else {
+      logger.debug(`resolveUserUnionId non-zero code: ${res.code} ${res.msg}`);
+    }
+  } catch (err: any) {
+    logger.debug(`resolveUserUnionId failed: ${err?.message ?? err}`);
+  }
+  return {};
 }
 
 export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Promise<string[]> {
@@ -791,6 +1010,18 @@ export type ChatBotMember = {
   name: string;
   displayName: string;
   source: 'configured' | 'introduce';
+  /** Short capability label (team-level), for roster discovery. Configured bots only. */
+  capability?: string;
+  /** Whether this bot has a team-level role registered. Configured bots only. */
+  hasTeamRole: boolean;
+  /**
+   * Whether the observing app (the `larkAppId` arg) can RELIABLY @-mention this
+   * member. Lark open_id is per-app scoped, so a bot's self-reported open_id is
+   * not usable by another app. Reliable only when learned via cross-ref (from
+   * @mention events) or via /introduce (observed, already observer-scoped).
+   */
+  mentionable: boolean;
+  mentionSource: 'cross-ref' | 'self' | 'observed' | 'fallback';
 };
 
 export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<ChatBotMember[]> {
@@ -829,15 +1060,26 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen
-          const openId = (info?.botName && crossRef.get(info.botName.toLowerCase()))
-            ?? info?.botOpenId
-            ?? appId;
+          const crossHit = info?.botName ? crossRef.get(info.botName.toLowerCase()) : undefined;
+          const openId = crossHit ?? info?.botOpenId ?? appId;
+          const isSelf = appId === larkAppId;
+          // Reliable @-mention only when the per-app open_id was learned via
+          // cross-ref; self-view open_id (info.botOpenId) is wrong for OTHER
+          // apps, and the appId fallback is no handle at all. Self is always fine.
+          const mentionSource: ChatBotMember['mentionSource'] = crossHit
+            ? 'cross-ref'
+            : (info?.botOpenId ? 'self' : 'fallback');
+          const mentionable = isSelf || mentionSource === 'cross-ref';
           return {
             larkAppId: appId,
             openId,
             name: cliId,
             displayName: info?.botName ?? cliId,
             source: 'configured',
+            capability: getBotCapability(config.session.dataDir, appId) ?? undefined,
+            hasTeamRole: resolveTeamRoleFile(appId) !== null,
+            mentionable,
+            mentionSource,
           };
         }
       } catch (err) {
@@ -848,25 +1090,53 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   );
   const configured: ChatBotMember[] = configuredResults.filter((r): r is ChatBotMember => r !== null);
 
-  // Merge in observed entries (from /introduce) — scoped to the caller's
-  // observer app so the open_ids match how THIS daemon should @-mention them
-  // (Lark open_id is per-app scoped). Dedup by openId (configured wins).
-  const seenOpenIds = new Set(configured.map(b => b.openId));
-  let observed: ChatBotMember[] = [];
+  // Merge observed entries (from /introduce), scoped to the caller's observer
+  // app so open_ids match how THIS daemon should @-mention them (open_id is
+  // per-app scoped). Two cases:
+  //   1) An observed entry uniquely matches a configured row by display name AND
+  //      that row isn't already a reliable cross-ref handle → UPGRADE it in
+  //      place: adopt the observed (observer-scoped) open_id and mark it
+  //      reliably mentionable, while keeping larkAppId/capability/hasTeamRole.
+  //      (A configured peer's own open_id is its self-view — wrong for us to @.)
+  //   2) Otherwise (no/ambiguous match) → append as an external bot.
   try {
     const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
-    observed = observedList
-      .filter(o => !seenOpenIds.has(o.openId))
-      .map(o => ({
+    const seenOpenIds = new Set(configured.map(b => b.openId));
+    const norm = (s: string) => s.trim().toLowerCase();
+    const byName = new Map<string, number[]>();
+    configured.forEach((b, i) => {
+      const k = norm(b.displayName);
+      const arr = byName.get(k);
+      if (arr) arr.push(i); else byName.set(k, [i]);
+    });
+
+    for (const o of observedList) {
+      if (seenOpenIds.has(o.openId)) continue;
+      const matches = byName.get(norm(o.name)) ?? [];
+      if (matches.length === 1) {
+        const row = configured[matches[0]];
+        // Upgrade only if not already a reliable cross-ref handle.
+        if (row.mentionSource !== 'cross-ref') {
+          configured[matches[0]] = { ...row, openId: o.openId, mentionable: true, mentionSource: 'observed' };
+          seenOpenIds.add(o.openId);
+        }
+        continue; // matched → never also append as an external duplicate
+      }
+      configured.push({
         larkAppId: '',
         openId: o.openId,
         name: o.name,
         displayName: o.name,
-        source: 'introduce' as const,
-      }));
+        source: 'introduce',
+        hasTeamRole: false,
+        mentionable: true,
+        mentionSource: 'observed',
+      });
+      seenOpenIds.add(o.openId);
+    }
   } catch (err) {
     logger.debug(`Failed to load observed bots for ${chatId}: ${err}`);
   }
 
-  return [...configured, ...observed];
+  return configured;
 }

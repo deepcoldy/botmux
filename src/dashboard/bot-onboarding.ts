@@ -3,6 +3,7 @@ import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js
 import { normalizeBotConfig } from '../setup/bot-config-editor.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import { validateCredentials, type CredentialValidation } from '../setup/verify-permissions.js';
+import * as Lark from '@larksuiteoapi/node-sdk';
 
 const require = createRequire(import.meta.url);
 const QRCode = require('qrcode-terminal/vendor/QRCode') as any;
@@ -173,8 +174,29 @@ export class BotOnboardingManager {
       cliId: 'claude-code',
       workingDir: '~',
     };
-    if (result.userOpenId) bot.allowedUsers = [result.userOpenId];
+    if (result.userOpenId) {
+      // 优先存 union_id（on_，跨应用稳定），避免 open_id 在其他 bot 下报 cross-app 错误。
+      // 用刚注册的应用自身凭证查询；若查询失败（无 contact 权限）则 fallback 到 open_id。
+      bot.allowedUsers = [await resolveToUnionId(result.appId, result.appSecret, result.userOpenId)];
+    }
     writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalizeBotConfig(bot)]);
     this.patch(id, { status: 'completed', addedBotIndex: bots.length });
   }
+}
+
+/**
+ * 用指定应用的凭证把 open_id (ou_) 解析成 union_id (on_)。
+ * union_id 跨应用稳定，适合写入 allowedUsers 供多个 bot 共用。
+ * 若查询失败（无 contact 权限 / API 错误）则 fallback 返回原 open_id。
+ */
+async function resolveToUnionId(appId: string, appSecret: string, openId: string): Promise<string> {
+  try {
+    const client = new Lark.Client({ appId, appSecret, disableTokenCache: false });
+    const res = await (client as any).contact.v3.user.get({
+      path: { user_id: openId },
+      params: { user_id_type: 'open_id' },
+    });
+    if (res.code === 0 && res.data?.user?.union_id) return res.data.user.union_id as string;
+  } catch { /* fallback */ }
+  return openId;
 }

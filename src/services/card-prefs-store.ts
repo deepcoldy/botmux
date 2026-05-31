@@ -20,9 +20,15 @@ export interface BotCardPrefs {
   disableStreamingCard: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
+  /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
+  autoStartOnGroupJoin: boolean;
+  /** 主动开工 — 场景① optional pre-configured first-turn prompt ('' = none). */
+  autoStartOnGroupJoinPrompt: string;
+  /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
+  autoStartOnNewTopic: boolean;
 }
 
-/** Current card prefs for a bot (all default false when unset). */
+/** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
 export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   try {
     const c = getBot(larkAppId).config;
@@ -30,9 +36,19 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: c.disableStreamingCard === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
+      autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
+      autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
+      autoStartOnNewTopic: c.autoStartOnNewTopic === true,
     };
   } catch {
-    return { disableStreamingCard: false, writableTerminalLinkInCard: false, privateCard: false };
+    return {
+      disableStreamingCard: false,
+      writableTerminalLinkInCard: false,
+      privateCard: false,
+      autoStartOnGroupJoin: false,
+      autoStartOnGroupJoinPrompt: '',
+      autoStartOnNewTopic: false,
+    };
   }
 }
 
@@ -53,23 +69,36 @@ export async function updateBotCardPrefs(
     if (val) entry[key] = true;
     else delete entry[key];
   };
+  // String prefs: store verbatim when non-blank, drop the key when blank/absent
+  // so bots.json stays tidy (absent === "no prompt").
+  const applyStr = (entry: any, key: keyof BotCardPrefs, val: string | undefined) => {
+    if (val === undefined) return;
+    if (val.trim()) entry[key] = val;
+    else delete entry[key];
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
+    applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
+    apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
     return {
       write: true,
       result: {
         disableStreamingCard: entry.disableStreamingCard === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
+        autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
+        autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
+        autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
       },
     };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
-  // Sync in-memory config so live card builders react without a restart.
+  // Sync in-memory config so live card builders / routing react without a restart.
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
   }
@@ -79,9 +108,20 @@ export async function updateBotCardPrefs(
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
   }
+  if (patch.autoStartOnGroupJoin !== undefined) {
+    bot.config.autoStartOnGroupJoin = patch.autoStartOnGroupJoin || undefined;
+  }
+  if (patch.autoStartOnGroupJoinPrompt !== undefined) {
+    bot.config.autoStartOnGroupJoinPrompt = patch.autoStartOnGroupJoinPrompt.trim() ? patch.autoStartOnGroupJoinPrompt : undefined;
+  }
+  if (patch.autoStartOnNewTopic !== undefined) {
+    bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
+  }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
-    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard}`,
+    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
+    `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
+    `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };
 }

@@ -4,7 +4,19 @@ import { accessSync, constants as fsConstants } from 'node:fs';
 import { basename } from 'node:path';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
+import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
 import { logger } from '../../utils/logger.js';
+
+/**
+ * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
+ * new tmux pane inherits the tmux *server's* global environment, which the
+ * (redacted) client env can't override — so if the server was ever started
+ * with bare LARK_APP_* in scope (pre-upgrade botmux, or the user's own tmux),
+ * those values reach the CLI despite redactChildEnv(). Unsetting them in the
+ * wrapper shell removes them for this pane only, without touching the server
+ * global env. Key names are fixed identifiers — no shell-escaping needed.
+ */
+const REDACTED_ENV_UNSET_CLAUSE = `unset ${REDACTED_CHILD_ENV_KEYS.join(' ')}`;
 
 /**
  * TmuxBackend — session backend using tmux for process persistence.
@@ -125,14 +137,20 @@ export class TmuxBackend implements SessionBackend {
       //     bash/zsh/sh-specific (bash needs `-i` for .bashrc; zsh needs
       //     `-l -i` for .zprofile + .zshrc). fish/csh/nu are remapped to a
       //     POSIX fallback because our SCRIPT is POSIX-syntax.
-      //   - SCRIPT = `cd -- "$1" && shift && exec /usr/bin/env "$@"`:
+      //   - SCRIPT = `cd -- "$1" && shift && unset <creds> && exec /usr/bin/env "$@"`:
       //       * `cd -- "$1"` returns to the session's intended cwd even if
       //         the rcfile changed directory mid-load (.zshrc/.bashrc with
       //         a `cd ~/work` left in by mistake stays in opts.cwd).
+      //       * `unset LARK_APP_ID LARK_APP_SECRET CLAUDECODE`: the new pane
+      //         inherits the tmux *server's* global env, which the redacted
+      //         client env can't override — so unset the bare creds for this
+      //         pane only (REDACTED_ENV_UNSET_CLAUSE; see redactChildEnv).
       //       * `exec /usr/bin/env "$@"`: env(1) parses the leading KEY=VAL
       //         pairs in argv as overrides for the child process. This lands
-      //         AFTER rcfile load, so botmux's per-bot LARK_APP_ID wins over
-      //         a stale `export LARK_APP_ID=...` someone left in their .zshrc.
+      //         AFTER rcfile load, so botmux's per-session values (e.g.
+      //         BOTMUX_LARK_APP_ID, SESSION_DATA_DIR) win over same-named
+      //         exports left in the user's .zshrc. Bare LARK_APP_* are NOT in
+      //         the inject list — they're unset above, never re-added.
       //   - `_` is the $0 placeholder; the remaining argv items are seen as
       //     "$@" by the shell, so spaces / quotes / `$` / newlines in cwd,
       //     env values, or args never need shell-escaping.
@@ -425,9 +443,14 @@ export class TmuxBackend implements SessionBackend {
 
 /**
  * The minimal set of env vars that botmux must inject into the CLI process
- * itself — values that user rcfiles cannot derive on their own (per-bot
- * credentials, the daemon-assigned data directory, the BOTMUX marker, the
- * Claude root-mode escape hatch, the session owner's open_id).
+ * itself — values that user rcfiles cannot derive on their own (the namespaced
+ * Lark app id for `botmux ask`, the daemon-assigned data directory, the BOTMUX
+ * marker, the Claude root-mode escape hatch, the session owner's open_id).
+ *
+ * NOTE: the bot's bare `LARK_APP_ID` / `LARK_APP_SECRET` are deliberately NOT
+ * here — the child must not see them (a CLI's own Lark OAuth would be hijacked
+ * by the botmux IM app; see worker.ts redactChildEnv). The child resolves Lark
+ * via the namespaced `BOTMUX_LARK_APP_ID` below or via bots.json on disk.
  *
  * Anything outside this list (PATH, HOME, NVM_BIN, PNPM_HOME, LANG, …) is
  * deliberately NOT forwarded from the daemon — the wrapping `$SHELL -l -i`
@@ -437,11 +460,9 @@ export class TmuxBackend implements SessionBackend {
  *
  * These values are injected via `/usr/bin/env KEY=VAL ... cli args` (not tmux
  * `-e`) so they land *after* rcfile load and override any leftover same-named
- * exports in the user's rcfile (e.g. an old `LARK_APP_ID` from a previous bot).
+ * exports in the user's rcfile.
  */
 const BOTMUX_INJECTED_ENV_KEYS = [
-  'LARK_APP_ID',
-  'LARK_APP_SECRET',
   '__OWNER_OPEN_ID',
   'BOTMUX',
   'SESSION_DATA_DIR',
@@ -481,13 +502,15 @@ export function buildBotmuxEnvAssignments(env: NodeJS.ProcessEnv | undefined): s
  *   $0 = '_' (placeholder), $1 = cwd, $2..N = KEY=VAL... bin args...
  *
  * The `cd` step makes the CLI's cwd survive a wayward `cd` in the user's
- * rcfile. The `exec /usr/bin/env` step injects botmux's per-bot/per-session
- * overrides AFTER rcfile load so they can't be shadowed by leftover exports.
+ * rcfile. The `unset` step removes bare creds the pane inherited from the tmux
+ * server's global env (REDACTED_ENV_UNSET_CLAUSE). The `exec /usr/bin/env` step
+ * injects botmux's per-bot/per-session overrides AFTER rcfile load so they
+ * can't be shadowed by leftover exports.
  *
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
-export const SHELL_WRAPPER_SCRIPT = 'cd -- "$1" && shift && exec /usr/bin/env "$@"';
+export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && exec /usr/bin/env "$@"`;
 
 /**
  * Debug variant of the wrapper script — same prelude, but the CLI runs as
@@ -506,6 +529,9 @@ export function buildDebugKeepShellScript(shellPath: string): string {
   const safeShell = shellPath.replace(/'/g, `'\\''`);
   return [
     'cd -- "$1" && shift',
+    // Same redaction as SHELL_WRAPPER_SCRIPT — so neither the CLI nor the
+    // interactive debug shell that follows sees server/rcfile-inherited creds.
+    REDACTED_ENV_UNSET_CLAUSE,
     '/usr/bin/env "$@"',
     `printf '\\n[botmux debug] CLI exited (status %d) — interactive shell active. Type exit to close the session.\\n' "$?" >&2`,
     `exec '${safeShell}' -i`,

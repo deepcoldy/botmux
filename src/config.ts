@@ -61,6 +61,10 @@ export const config = {
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
     get externalHost() { return getWebExternalHost(); },
+    // Single reverse-proxy port per daemon that fronts every session's web
+    // terminal under `/s/{sessionId}`. Lets dev-machine users forward one port
+    // (`proxyBasePort + botIndex`) instead of one per topic. See terminal-proxy.ts.
+    proxyBasePort: Number(process.env.BOTMUX_WEB_PROXY_BASE_PORT) || 8800,
   },
   dashboard: {
     host: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',

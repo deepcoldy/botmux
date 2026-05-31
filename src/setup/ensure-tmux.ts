@@ -72,9 +72,34 @@ function probeTmuxVersion(): string | undefined {
  * alone — it just changes the socket directory and is the user's deliberate
  * override if set.
  */
+const TMUX_PATH_EXTRAS = [
+  '/opt/homebrew/bin',
+  '/opt/homebrew/sbin',
+  '/usr/local/bin',
+  '/usr/local/sbin',
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+];
+
+function withTmuxSearchPath(pathValue: string | undefined): string {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const part of [...(pathValue?.split(':') ?? []), ...TMUX_PATH_EXTRAS]) {
+    if (!part || seen.has(part)) continue;
+    seen.add(part);
+    merged.push(part);
+  }
+  return merged.join(':');
+}
+
 export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const { TMUX: _tmux, TMUX_PANE: _pane, ...rest } = env;
-  return rest;
+  return {
+    ...rest,
+    PATH: withTmuxSearchPath(rest.PATH),
+  };
 }
 
 /**

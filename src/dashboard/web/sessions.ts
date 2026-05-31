@@ -203,7 +203,7 @@ export function renderSessionsPage(root: HTMLElement) {
       <p><b>${t('sessions.workingDir')}:</b> ${escapeHtml(s.workingDir ?? '-')}</p>
       <div class="actions">
         <button id="locate-btn" type="button">${t('sessions.locate')}</button>
-        ${s.webPort ? `<a class="btn-link primary" href="http://${escapeHtml(location.hostname)}:${s.webPort}" target="_blank" rel="noopener">${t('sessions.openTerminal')}</a>` : ''}
+        ${s.webPort ? `<a class="btn-link primary" href="http://${escapeHtml(location.hostname)}:${s.proxyPort ?? s.webPort}${s.proxyPort ? `/s/${encodeURIComponent(s.sessionId)}` : ''}" target="_blank" rel="noopener">${t('sessions.openTerminal')}</a>` : ''}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
       </div>

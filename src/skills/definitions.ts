@@ -414,10 +414,10 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 
 const BOTS_SKILL = `---
 name: botmux-bots
-description: 列出当前飞书群聊中的机器人及其 open_id。在需要 @mention 其他机器人协作时使用。
+description: 列出当前飞书群里可协作的机器人（协作花名册：含能力标签、是否有团队角色、以及你能否可靠 @ 到它）。在需要点名其他机器人协作、或交棒给队友前查看时使用。
 ---
 
-# botmux-bots — 查询可用机器人
+# botmux-bots — 群内协作花名册
 
 ## 用法
 
@@ -425,27 +425,81 @@ description: 列出当前飞书群聊中的机器人及其 open_id。在需要 @
 botmux bots list
 \`\`\`
 
-## 输出
+## 输出（JSON）
 
-JSON 格式：
+每个机器人一行，关键字段：
+- \`name\` / \`openId\` / \`isSelf\`
+- \`larkAppId\`：本机托管的机器人才有（可用作 workflow 的 bot id）
+- \`capability\`：团队能力标签（它擅长什么）——挑选交棒/协作对象的依据
+- \`hasTeamRole\`：是否配置了团队级角色
+- \`mentionable\`：**你能不能可靠地 @ 到它**（关键）
+- \`mentionSource\`：\`cross-ref\` | \`observed\` | \`self\` | \`fallback\`
+
 \`\`\`json
 {
   "sessionId": "...",
   "chatId": "...",
   "bots": [
-    { "name": "Claude", "openId": "ou_xxx", "isSelf": true },
-    { "name": "Aiden", "openId": "ou_yyy", "isSelf": false }
+    { "name": "后端Bot", "openId": "ou_yyy", "isSelf": false, "larkAppId": "cli_b",
+      "capability": "服务端排查，擅长日志", "hasTeamRole": true,
+      "mentionable": true, "mentionSource": "cross-ref" }
   ],
-  "total": 2
+  "total": 1
 }
 \`\`\`
 
-## 配合 botmux send 使用
+## 关键规则
+
+1. **只 @ \`mentionable=true\` 的机器人**。\`mentionable=false\` 表示"知道它在群里，但当前点不准"（飞书 open_id 按 app 隔离）——这种先让它 / 用户在群里 \`/introduce\` 一次，再点名。
+2. 按 \`capability\` 挑合适的队友，而不是乱点。
+3. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+
+## 要把任务交棒给别的机器人？
+
+见 **botmux-handoff** 技能（结构化交接）。
+`;
+
+const HANDOFF_SKILL = `---
+name: botmux-handoff
+description: 把当前任务交棒给团队里另一个机器人时使用（多机器人协作接力）。当你做完自己负责的部分、需要另一个机器人接手下一步，或用户说"交给X""让X接着做""@某bot继续""下一步谁谁来"时触发。先用 botmux-bots 查花名册挑对象，再用结构化交接发给对方。
+---
+
+# botmux-handoff — 机器人接力交棒
+
+多机器人协作里，一个机器人干完自己那段后把任务交给另一个机器人接手。**随意闲聊可以不拘格式**，但正式交棒要带最小结构，否则接手方拿不到足够上下文、交接质量不可控。
+
+## 步骤
+
+1. 用 \`botmux bots list\`（见 botmux-bots 技能）查群内协作花名册：
+   - 按 \`capability\` 挑**合适**的接手机器人；
+   - 确认它 \`mentionable: true\`（若为 false，先让它/用户 \`/introduce\` 一次再点名）。
+2. 用 \`botmux send --mention\` 发一条**结构化交接**给它。
+
+## 交接必须包含 5 要素
+
+- **交给谁**：@ 目标机器人
+- **当前结论**：你已经做完/查清了什么
+- **相关上下文**：链接、关键消息、文件路径、数据
+- **期望下一步**：希望它具体做什么
+- **完成标准**：怎样算这一步做完
+
+## 示例
 
 \`\`\`bash
-# 查到 Aiden 的 open_id 后
-botmux send --mention "ou_yyy:Aiden" "请 @Aiden 帮忙处理"
+botmux send --mention "ou_yyy:后端Bot" <<'EOF'
+@后端Bot 交接：
+- 当前结论：定位到支付回调超时，错误集中在 09:00–09:10，日志 https://...
+- 上下文：服务 pay-gateway，最近一次变更 PR #1234
+- 期望下一步：判断是否回滚 #1234，并给出修复方案
+- 完成标准：给出根因结论 + 可执行的修复/回滚决定
+EOF
 \`\`\`
+
+## 注意
+
+- 跨部署的外部机器人若 \`mentionable: false\`，**先 \`/introduce\` 一次**再交棒（飞书 open_id 按 app 隔离）。
+- 人主导的协作可以不走这套结构；本技能针对**机器人自主接力**。
+- 交棒后简短告知用户"已交给 @X 接手"，保持可见。
 `;
 
 const WORKFLOW_CREATE_SKILL = `---
@@ -922,6 +976,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-quoted', content: QUOTED_SKILL },
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
+  { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
 ];
 

@@ -12,9 +12,11 @@ import {
   buildStreamingCard,
   buildRepoSelectCard,
   buildSessionClosedCard,
+  buildRelayPickerCard,
   buildPrivateSnapshotCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
+import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -727,6 +729,230 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.value.session_id).toBe('sess-4');
     expect(resumeBtn.value.root_id).toBe('om_root_X');
     expect(resumeBtn.type).toBe('primary');
+  });
+});
+
+describe('buildRelayPickerCard', () => {
+  // Helpers that walk past the search-form prefix to find session
+  // interactive_containers regardless of how the picker layout evolves.
+  function containers(card: any): any[] {
+    return card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+  }
+  function searchInput(card: any): any | undefined {
+    return card.body.elements.find((e: any) => e.tag === 'input' && e.name === 'search');
+  }
+  function confirmButton(card: any): any | undefined {
+    for (const e of card.body.elements) {
+      if (e.tag !== 'column_set') continue;
+      const btn = e.columns?.[0]?.elements?.[0];
+      if (btn?.tag === 'button' && btn?.behaviors?.[0]?.value?.action === 'relay_confirm') return btn;
+    }
+    return undefined;
+  }
+
+  function fixtureEntries(n: number): RelayPickerEntry[] {
+    return Array.from({ length: n }, (_, i) => ({
+      sessionId: `sess-${i + 1}`,
+      chatLabel: `Chat ${i + 1}`,
+      title: `session ${i + 1}`,
+      chatMode: 'group' as const,
+      lastMessageAt: Date.now() - (i + 1) * 60_000,
+    }));
+  }
+
+  it('uses Lark v2 schema (schema: 2.0) with a body.elements array', () => {
+    const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root', 'ou_invoker_test'));
+    expect(card.schema).toBe('2.0');
+    expect(card.body.elements).toBeDefined();
+  });
+
+  it('always renders the search input at the top with auto-submit behavior, even when entry list is empty', () => {
+    const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root', 'ou_invoker_test'));
+    const input = searchInput(card);
+    expect(input).toBeDefined();
+    // v2 input.behaviors fires on Enter / submit icon click — no separate
+    // 搜索 button needed (used to render as "..." in cramped column).
+    expect(input.behaviors).toHaveLength(1);
+    expect(input.behaviors[0].type).toBe('callback');
+    expect(input.behaviors[0].value.action).toBe('relay_search');
+    expect(input.behaviors[0].value.target_chat_id).toBe('oc_target');
+  });
+
+  it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
+    const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root', 'ou_invoker_test'));
+    const md = card.body.elements.find((e: any) => e.tag === 'markdown');
+    expect(md.content).toMatch(/没有可接力|No relayable/);
+    expect(containers(card)).toHaveLength(0);
+  });
+
+  it('paginates: 12 entries renders only the first 5 by default + paginator row', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(12), 'oc_target', 'om_target_root', 'ou_invoker_test'));
+    expect(containers(card)).toHaveLength(5);
+    expect(containers(card)[0].behaviors[0].value.session_id).toBe('sess-1');
+    expect(containers(card)[4].behaviors[0].value.session_id).toBe('sess-5');
+
+    // Paginator column_set with prev/next buttons.
+    const paginator = card.body.elements.find((e: any) =>
+      e.tag === 'column_set'
+      && e.columns?.some((c: any) => c.elements?.[0]?.behaviors?.[0]?.value?.action === 'relay_page'));
+    expect(paginator).toBeDefined();
+    const prev = paginator.columns[0].elements[0];
+    const next = paginator.columns[2].elements[0];
+    expect(prev.disabled).toBe(true);  // on page 0
+    expect(next.disabled).toBe(false);
+    expect(next.behaviors[0].value.page).toBe(1);
+  });
+
+  it('jumping to page 2 (0-indexed) shows entries 11–12, next button disabled', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(12), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { page: 2 }));
+    const c = containers(card);
+    expect(c).toHaveLength(2); // 12 - 10 = 2 on the last page
+    expect(c[0].behaviors[0].value.session_id).toBe('sess-11');
+    const paginator = card.body.elements.find((e: any) =>
+      e.tag === 'column_set'
+      && e.columns?.some((cc: any) => cc.elements?.[0]?.behaviors?.[0]?.value?.action === 'relay_page'));
+    expect(paginator.columns[2].elements[0].disabled).toBe(true);
+  });
+
+  it('hides paginator when entries fit on a single page', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test'));
+    const hasPaginator = card.body.elements.some((e: any) =>
+      e.tag === 'column_set'
+      && e.columns?.some((c: any) => c.elements?.[0]?.behaviors?.[0]?.value?.action === 'relay_page'));
+    expect(hasPaginator).toBe(false);
+  });
+
+  it('filters by case-insensitive substring match on title / chatLabel / cwd / cliId', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 's1', chatLabel: 'Project Alpha', title: 'PR review',  chatMode: 'group', workingDir: '/work/api' },
+      { sessionId: 's2', chatLabel: 'Team docs',     title: 'docs sync',  chatMode: 'group', workingDir: '/work/docs' },
+      { sessionId: 's3', chatLabel: 'Marketing',     title: 'launch plan', chatMode: 'group', workingDir: '/work/marketing' },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'docs' }));
+    const c = containers(card);
+    expect(c).toHaveLength(1);
+    expect(c[0].behaviors[0].value.session_id).toBe('s2');
+  });
+
+  it('shows "no matches" notice when search filters everything out', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'xyz_no_match' }));
+    expect(containers(card)).toHaveLength(0);
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toMatch(/没有匹配|No sessions match/);
+  });
+
+  it('selection highlights the chosen card and appends a confirm button', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-2' }));
+    const c = containers(card);
+    expect(c[0].background_style).toBe('default');
+    expect(c[1].background_style).toBe('laser');
+    expect(c[2].background_style).toBe('default');
+
+    const btn = confirmButton(card);
+    expect(btn).toBeDefined();
+    expect(btn.behaviors[0].value.session_id).toBe('sess-2');
+  });
+
+  it('renders a disabled "running" button (no confirm action) when the selected session is mid-turn', () => {
+    const entries = fixtureEntries(3);
+    entries[1] = { ...entries[1], running: true }; // sess-2 is mid-turn
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-2' }));
+
+    // No clickable confirm button (it carries no relay_confirm action).
+    expect(confirmButton(card)).toBeUndefined();
+
+    // Instead a disabled button with the "running" label exists.
+    let disabledBtn: any;
+    for (const e of card.body.elements) {
+      if (e.tag !== 'column_set') continue;
+      const btn = e.columns?.[0]?.elements?.[0];
+      if (btn?.tag === 'button' && btn?.disabled === true && !btn?.behaviors) { disabledBtn = btn; break; }
+    }
+    expect(disabledBtn).toBeDefined();
+    expect(disabledBtn.text.content).toMatch(/运行中|running/i);
+  });
+
+  it('renders the normal clickable confirm button when the selected session is NOT running', () => {
+    const entries = fixtureEntries(3);
+    entries[1] = { ...entries[1], running: false };
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-2' }));
+    const btn = confirmButton(card);
+    expect(btn).toBeDefined();
+    expect(btn.behaviors[0].value.session_id).toBe('sess-2');
+  });
+
+  it('falls back to no-confirm state if selectedSessionId is filtered out', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-vanished' }));
+    expect(confirmButton(card)).toBeUndefined();
+    // Hint markdown should still be there.
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toMatch(/点击上方|Tap any/);
+  });
+
+  it('container markdown shows title / status / type / location / time on five labelled lines', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-1', chatLabel: 'Project Alpha 讨论群', title: 'fix the deadlock bug', chatMode: 'group', lastMessageAt: Date.now() - 60_000 },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test'));
+    const md = containers(card)[0].elements[0].content;
+    const lines = md.split('\n');
+    expect(lines).toHaveLength(5);
+    expect(lines[0]).toMatch(/^\*\*fix the deadlock bug\*\*$/);
+    // Status line — idle by default (no `running` flag on the fixture).
+    expect(lines[1]).toMatch(/^(状态|Status): (⚪ 空闲|⚪ Idle)$/);
+    expect(lines[2]).toMatch(/^(类型|Type): (普通群|group chat)$/);
+    expect(lines[3]).toMatch(/(位置|Where): Project Alpha 讨论群/);
+    expect(lines[4]).toMatch(/(活跃|Active): /);
+  });
+
+  it('status line shows 运行中 / Running for a session flagged running', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-1', chatLabel: 'Chat', title: 'busy task', chatMode: 'group', running: true },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test'));
+    const md = containers(card)[0].elements[0].content;
+    expect(md).toMatch(/(状态|Status): 🟢 (运行中|Running)/);
+  });
+
+  it('uses "单聊" / "direct message" as the location for p2p, ignoring chatLabel', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-p2p', chatLabel: 'some_p2p_chat_id', title: 'private chat', chatMode: 'p2p' },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test'));
+    const md = containers(card)[0].elements[0].content;
+    expect(md).toMatch(/(类型|Type): (单聊|direct message)/);
+    expect(md).toMatch(/(位置|Where): (单聊|direct message)/);
+    expect(md).not.toContain('some_p2p_chat_id');
+  });
+
+  it('embeds invoker_open_id into every interactive button value (owner-only guard)', () => {
+    // Card-handler refuses re-renders / confirms when the clicker's open_id
+    // disagrees with the invoker_open_id carried in the value. To make that
+    // work, every clickable element here must stamp the invoker into its
+    // callback `value` — search input, session containers, paginator
+    // buttons, confirm button. Skipping any one would leave a click path
+    // unprotected.
+    const card = parse(buildRelayPickerCard(
+      fixtureEntries(12), 'oc_t', 'om_r', 'ou_specific_invoker',
+      undefined, { selectedSessionId: 'sess-1' },
+    ));
+
+    // Collect every `value` object on any button/container/input by walking
+    // the card tree; verify each one carries invoker_open_id.
+    const values: any[] = [];
+    const walk = (node: any) => {
+      if (!node) return;
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (typeof node !== 'object') return;
+      if (node.behaviors) for (const b of node.behaviors) if (b.value) values.push(b.value);
+      if (node.value && typeof node.value === 'object' && (node.value as any).action) values.push(node.value);
+      for (const v of Object.values(node)) walk(v);
+    };
+    walk(card);
+    expect(values.length).toBeGreaterThan(0);
+    for (const v of values) {
+      expect(v.invoker_open_id).toBe('ou_specific_invoker');
+    }
   });
 });
 

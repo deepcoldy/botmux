@@ -66,6 +66,25 @@ jobs:
             exit 1
           fi
 
+      - name: Guard — stable release must contain the latest master
+        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
+        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
+        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
+        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+        # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
+        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
+        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        run: |
+          git fetch origin master --quiet
+          if ! git merge-base --is-ancestor origin/master HEAD; then
+            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
+            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
+            echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
+            exit 1
+          fi
+          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
+
       - run: pnpm build
 
       - name: Publish to npm
@@ -89,15 +108,16 @@ jobs:
           fi
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
 
-          # cliff.toml 渲染'本次合并'（PR 标题/链接由 GITHUB_TOKEN 拉 GitHub 元数据）。
-          # 用显式区间 PREV_TAG..本 tag，别用 --current：--current 在 HEAD 落在 tag 上时
-          # 会把范围撑到好几个历史 release，导致'本次合并'重复堆叠多段。PREV_TAG 上面已算好。
-          # git-cliff 会翻全仓 commit 做 PR 关联，偶发触发 GitHub 二级限流 → 401 panic。
-          # 故包成非致命：失败时降级为纯 commit 列表，保证 Release 一定能创建，不再被 changelog 卡死。
-          if ! CLIFF=$(npx --yes git-cliff "${PREV_TAG}..${GITHUB_REF_NAME}" 2>cliff.err); then
-            echo "::warning::git-cliff failed, falling back to plain commit list"
-            cat cliff.err || true
-            CLIFF=$(printf -- '---\n\n## 本次合并\n'; git log --no-merges --reverse --pretty='- %s' "${PREV_TAG}..${GITHUB_REF_NAME}")
+          # '本次合并'只列 PR 标题（合并/squash commit subject 形如 "xxx (#123)"），
+          # 不把 PR 内部的逐条 commit 全倒进 changelog——那会让区间含整条分支时长到吓人，
+          # 而且手写的 tag message 已经讲清本次发了什么。直接走 git log 过滤 (#N)，
+          # 不再用 git-cliff（它按区间内每个 tag 重复堆叠'本次合并'段、且翻全仓做 PR 关联
+          # 偶发触发 GitHub 二级限流 401）。
+          PRLIST=$(git log --no-merges --reverse --pretty='- %s' "${PREV_TAG}..${GITHUB_REF_NAME}" | grep -E '\(#[0-9]+\)' || true)
+          if [ -n "$PRLIST" ]; then
+            CLIFF=$(printf -- '---\n\n## 本次合并（PR）\n%s' "$PRLIST")
+          else
+            CLIFF=""
           fi
 
           # '感谢贡献者'独立用 gh 按区间内每个 commit 反查所属 PR 作者：有界调用（约等于区间 commit 数），
@@ -117,8 +137,10 @@ jobs:
 
           {
             echo 'body<<CHANGELOG_EOF'
-            [ -n "$TAG_MSG" ] && echo "$TAG_MSG"
-            echo "$CLIFF"
+            # TAG_MSG 后必须空一行再接 CLIFF：CLIFF 以 '---' 开头，紧贴正文末行会被
+            # markdown 当成 setext 标题（末行变 H2），空行后才渲染成分隔线。
+            if [ -n "$TAG_MSG" ]; then echo "$TAG_MSG"; echo ""; fi
+            [ -n "$CLIFF" ] && echo "$CLIFF"
             if [ -n "$THANKS" ]; then
               echo ""
               echo "## 感谢贡献者"

@@ -127,10 +127,11 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Codex, Gemini, OpenCode, MTR, Hermes. */
+ *  Gemini, OpenCode, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS: its
+ *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
+ *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
-  ['codex', createCodexAdapter('/bin/codex')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
   ['opencode', createOpenCodeAdapter('/bin/opencode')],
   ['mtr', createMtrAdapter('/bin/mtr')],
@@ -149,10 +150,13 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI. See coco.ts for the Trae 0.120.31 burst
- *  bug this works around. */
+ *  delayed Enter — CoCo / Trae CLI and Codex. See coco.ts for the Trae 0.120.31
+ *  burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
+ *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
+ *  bracketed paste" note was true only for a much earlier build). */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
+  ['codex', createCodexAdapter('/bin/codex')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
@@ -235,10 +239,11 @@ describe('writeInput: single-line, non-tmux mode', () => {
 
 // =========================================================================
 // 2. Multiline content
-//    - Claude Code: pasteText with the whole string
-//    - Others: sendText with the whole string (including \n) — tmux
-//      `send-keys -l` passes LF literally, and these CLIs treat LF as a
-//      newline (not submit). Only the trailing Enter submits.
+//    - Claude Code / CoCo / Codex: bracketed paste (pasteText) with the whole
+//      string — the embedded \n stay content, only the trailing Enter submits.
+//    - PLAIN adapters (Aiden/Gemini/OpenCode/MTR/Hermes): sendText with the
+//      whole string (including \n) — those CLIs treat literal LF as a newline,
+//      not a submit, so only the trailing Enter submits.
 // =========================================================================
 
 const MULTILINE = 'first line\n\nSession ID: abc-123';
@@ -461,7 +466,11 @@ describe('supportsTypeAhead flag', () => {
     expect(createCocoAdapter('/bin/coco').supportsTypeAhead).toBe(true);
   });
 
-  it.each(PLAIN_ADAPTERS)('%s: undefined (default behavior)', (_name, adapter) => {
+  it('codex: true (0.134.0+ parks submit-while-busy, writes rollout user event at dequeue time)', () => {
+    expect(createCodexAdapter('/bin/codex').supportsTypeAhead).toBe(true);
+  });
+
+  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
   });
 });
@@ -939,7 +948,8 @@ describe('codex writeInput submission confirmation', () => {
     const result = await adapter.writeInput(pty, MULTILINE);
 
     expect(result).toBeUndefined();
-    expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
@@ -965,7 +975,8 @@ describe('codex writeInput submission confirmation', () => {
     // before any append it must report the submit still missing.
     expect(typeof (result as any)?.recheck).toBe('function');
     expect((result as any).recheck()).toBe(false);
-    expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
   });
 });

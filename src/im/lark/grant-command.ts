@@ -8,17 +8,30 @@ import { getOwnerOpenId, getBotOpenId, getBot } from '../../bot-registry.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending } from './grant-pending.js';
+import { openPendingMulti } from './grant-pending.js';
 import { revokeGrant, addAllowedChatGroup, removeAllowedChatGroup } from '../../services/grant-store.js';
 import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 
-/** 从 mention 列表取第一个非本 bot 的对象（可以是真人，也可以是另一个 bot——
- *  授权 bot 走同一条路，命中后写本群 chatGrants，放行其在本群拉起 chat-scope 会话）。 */
+/** 从 mention 列表取所有非本 bot 的对象（可以是真人，也可以是另一个 bot——
+ *  授权 bot 走同一条路，命中后写本群 chatGrants，放行其在本群拉起 chat-scope 会话）。
+ *  按 open_id 去重、保持 @ 顺序，支持一次 /grant @a @b、/revoke @a @b 批量处置。 */
+export function parseGrantTargets(message: any, botOpenId: string | undefined): Array<{ openId: string; name: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ openId: string; name: string }> = [];
+  for (const x of (message?.mentions ?? [])) {
+    const oid = x?.id?.open_id;
+    if (!oid || oid === botOpenId || seen.has(oid)) continue;
+    seen.add(oid);
+    out.push({ openId: oid, name: x.name ?? oid });
+  }
+  return out;
+}
+
+/** 取第一个非本 bot 的目标（单目标场景的便捷封装）。 */
 export function parseGrantTarget(message: any, botOpenId: string | undefined): { openId: string; name: string } | undefined {
-  const m = (message?.mentions ?? []).find((x: any) => x?.id?.open_id && x.id.open_id !== botOpenId);
-  return m ? { openId: m.id.open_id, name: m.name ?? m.id.open_id } : undefined;
+  return parseGrantTargets(message, botOpenId)[0];
 }
 
 /** 把文本里所有 `@<name>` mention token 去掉（split/join，防正则注入），归一空白后 trim。 */
@@ -70,18 +83,18 @@ export async function tryHandleGrantCommand(
   // owner 强闸门
   const owner = getOwnerOpenId(larkAppId);
   if (!senderOpenId || senderOpenId !== owner) {
-    await replyMessage(larkAppId, messageId, JSON.stringify({ text: t(isGrant ? 'cmd.grant.owner_only' : 'cmd.revoke.owner_only', undefined, loc) }))
+    await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.owner_only' : 'cmd.revoke.owner_only', undefined, loc))
       .catch(err => logger.debug(`grant owner_only reply failed: ${err}`));
     return true;
   }
 
-  const target = parseGrantTarget(message, getBotOpenId(larkAppId));
+  const targets = parseGrantTargets(message, getBotOpenId(larkAppId));
 
   // 无 @目标（裸 `/grant`、`/grant all`、裸 `/revoke`）→ 整群 talk 授权：把当前 chat 加入/移出
   // allowedChatGroups（chatId 级 talk-open，仅 canTalk，不授 canOperate）。
-  if (!target) {
+  if (targets.length === 0) {
     if (!chatId) {
-      await replyMessage(larkAppId, messageId, JSON.stringify({ text: t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc) }))
+      await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
         .catch(err => logger.debug(`grant usage reply failed: ${err}`));
       return true;
     }
@@ -90,7 +103,7 @@ export async function tryHandleGrantCommand(
     // 避免把"给某人 5 条额度"误执行成"对全群开放对话"。
     const rest = stripAllMentions(text, message?.mentions ?? []).replace(/^\/(grant|revoke)\b/i, '').trim();
     if (rest !== '' && rest.toLowerCase() !== 'all') {
-      await replyMessage(larkAppId, messageId, JSON.stringify({ text: t(isGrant ? 'cmd.grant.bad_quota' : 'cmd.revoke.usage', undefined, loc) }))
+      await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.bad_quota' : 'cmd.revoke.usage', undefined, loc))
         .catch(err => logger.debug(`grant no-target guard reply failed: ${err}`));
       return true;
     }
@@ -106,46 +119,61 @@ export async function tryHandleGrantCommand(
         ? t('cmd.revoke.chat_failed', { reason: r.reason }, loc)
         : r.removed ? t('cmd.revoke.chat_done', undefined, loc) : t('cmd.revoke.chat_none', undefined, loc);
     }
-    await replyMessage(larkAppId, messageId, JSON.stringify({ text: txt }))
+    await replyMessage(larkAppId, messageId, txt)
       .catch(err => logger.debug(`grant whole-chat reply failed: ${err}`));
     logger.info(`[grant:${larkAppId}] ${isGrant ? 'grant' : 'revoke'} whole-chat ${chatId}`);
     return true;
   }
 
   if (isRevoke) {
-    const r = await revokeGrant(larkAppId, chatId, target.openId);
-    let txt: string;
-    if (!r.ok) {
-      txt = r.reason === 'would_open_bot'
-        ? t('cmd.revoke.would_open', undefined, loc)
-        : t('cmd.revoke.failed', { reason: r.reason }, loc);
-    } else {
+    // 逐个撤销，单目标沿用原文案，多目标合并成一条「撤销结果」清单。
+    const lines: string[] = [];
+    for (const tgt of targets) {
+      const r = await revokeGrant(larkAppId, chatId, tgt.openId);
+      if (!r.ok) {
+        if (targets.length === 1) {
+          lines.push(r.reason === 'would_open_bot'
+            ? t('cmd.revoke.would_open', undefined, loc)
+            : t('cmd.revoke.failed', { reason: r.reason }, loc));
+        } else {
+          lines.push(r.reason === 'would_open_bot'
+            ? t('cmd.revoke.multi_would_open', { name: tgt.name }, loc)
+            : t('cmd.revoke.multi_failed', { name: tgt.name, reason: r.reason }, loc));
+        }
+        continue;
+      }
       const scope = `${r.removed.chat ? t('cmd.revoke.scope_chat', undefined, loc) : ''}${r.removed.globalTalk ? t('cmd.revoke.scope_global_talk', undefined, loc) : ''}${r.removed.global ? t('cmd.revoke.scope_global', undefined, loc) : ''}`.trim()
         || t('cmd.revoke.scope_none', undefined, loc);
-      txt = t('cmd.revoke.done', { name: target.name, scope }, loc);
+      lines.push(targets.length === 1
+        ? t('cmd.revoke.done', { name: tgt.name, scope }, loc)
+        : t('cmd.revoke.multi_ok', { name: tgt.name, scope }, loc));
     }
-    await replyMessage(larkAppId, messageId, JSON.stringify({ text: txt }))
+    const txt = targets.length === 1
+      ? lines[0]
+      : `${t('cmd.revoke.multi_header', undefined, loc)}\n${lines.join('\n')}`;
+    await replyMessage(larkAppId, messageId, txt)
       .catch(err => logger.debug(`revoke reply failed: ${err}`));
+    logger.info(`[grant:${larkAppId}] revoke ${targets.length} target(s) in ${chatId}`);
     return true;
   }
 
-  // 解析可选额度：`/grant @x 5`。显式数字恒生效；无数字时取 messageQuota.defaultLimit（未配=无限）。
+  // 解析可选额度：`/grant @x 5`（多目标时对每人各 N 条）。显式数字恒生效；无数字取 messageQuota.defaultLimit（未配=无限）。
   const pq = parseGrantQuota(text, message?.mentions ?? []);
   if (!pq.ok) {
-    await replyMessage(larkAppId, messageId, JSON.stringify({ text: t('cmd.grant.bad_quota', undefined, loc) }))
+    await replyMessage(larkAppId, messageId, t('cmd.grant.bad_quota', undefined, loc))
       .catch(err => logger.debug(`grant bad_quota reply failed: ${err}`));
     return true;
   }
   const quota = pq.quota ?? getBot(larkAppId).config.messageQuota?.defaultLimit;
 
-  // /grant → 弹卡（owner 主动态），owner 点范围按钮完成授权。额度（若有）挂在 pending 上。
-  const nonce = openPending(larkAppId, chatId, target.openId, quota);
+  // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
+  const nonce = openPendingMulti(larkAppId, chatId, targets.map(tgt => tgt.openId), quota);
   const card = buildGrantCard(
-    { ownerOpenId: owner!, requesterOpenId: target.openId, requesterName: target.name, chatId, nonce, mode: 'owner' },
+    { ownerOpenId: owner!, targets, chatId, nonce, mode: 'owner' },
     loc,
   );
   await replyMessage(larkAppId, messageId, card, 'interactive')
     .catch(err => logger.debug(`grant card reply failed: ${err}`));
-  logger.info(`[grant:${larkAppId}] owner /grant card for ${target.openId} in ${chatId}`);
+  logger.info(`[grant:${larkAppId}] owner /grant card for ${targets.length} target(s) in ${chatId}`);
   return true;
 }

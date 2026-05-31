@@ -28,6 +28,7 @@ import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, TmuxBackend } from './tmux-backend.js';
@@ -49,6 +50,17 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly paneTarget: string;
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
+  /** Streaming UTF-8 decoder. The fifo read emits raw Buffer chunks at libuv's
+   *  64KB highWaterMark boundary, which can fall in the middle of a multi-byte
+   *  character (CJK = 3 bytes, box-drawing = 3 bytes, emoji = 4 bytes). Decoding
+   *  each chunk independently with `chunk.toString('utf8')` would split that
+   *  character into U+FFFD replacement chars on both halves — one wide glyph
+   *  becomes 2-3 garbage chars and every following column shifts right, which
+   *  is the intermittent "错位" seen in the web terminal during heavy CLI
+   *  re-renders (a full redraw is a big burst, far more likely to cross a 64KB
+   *  boundary). StringDecoder holds the incomplete trailing bytes and prepends
+   *  them to the next chunk, so a character split across reads is reassembled. */
+  private readonly decoder = new StringDecoder('utf8');
   private readonly dataCbs: Array<(d: string) => void> = [];
   /** Bounded tail of the decoded output tmux most recently replicated from the
    *  pane (kept to the last RECENT_OUTPUT_MAX UTF-16 code units, not an exact
@@ -134,7 +146,11 @@ export class TmuxPipeBackend implements SessionBackend {
     this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
 
     this.readStream.on('data', (chunk) => {
-      const data = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      // StringDecoder reassembles multi-byte chars split across chunk
+      // boundaries (see `decoder` field doc). A string chunk would only
+      // appear if the stream were created with an encoding — it isn't, but
+      // keep the guard so the decoder path stays the single source of truth.
+      const data = typeof chunk === 'string' ? chunk : this.decoder.write(chunk);
       if (data) {
         this.recentOutput = (this.recentOutput + data).slice(-TmuxPipeBackend.RECENT_OUTPUT_MAX);
       }

@@ -30,7 +30,8 @@ describe('tmuxEnv()', () => {
     });
     expect(stripped.TMUX).toBeUndefined();
     expect(stripped.TMUX_PANE).toBeUndefined();
-    expect(stripped.PATH).toBe('/usr/bin');
+    expect(stripped.PATH?.split(':')[0]).toBe('/usr/bin');
+    expect(stripped.PATH).toContain('/opt/homebrew/bin');
     expect(stripped.LANG).toBe('en_US.UTF-8');
   });
 
@@ -47,13 +48,21 @@ describe('tmuxEnv()', () => {
     const stripped = tmuxEnv();
     expect(stripped.TMUX).toBeUndefined();
     expect(stripped.TMUX_PANE).toBeUndefined();
-    expect(stripped.PATH).toBe(process.env.PATH);
+    expect(stripped.PATH).toContain('/opt/homebrew/bin');
+    if (process.env.PATH) {
+      expect(stripped.PATH?.startsWith(process.env.PATH.split(':')[0]!)).toBe(true);
+    }
   });
 
   it('does not mutate the input env', () => {
     const input: NodeJS.ProcessEnv = { TMUX: '/dead/socket,1,1', PATH: '/usr/bin' };
     tmuxEnv(input);
     expect(input.TMUX).toBe('/dead/socket,1,1');
+  });
+
+  it('adds common Homebrew tmux paths for daemon/pm2 environments with a sparse PATH', () => {
+    const stripped = tmuxEnv({ PATH: '/usr/bin' });
+    expect(stripped.PATH).toBe('/usr/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/bin:/usr/sbin:/sbin');
   });
 });
 

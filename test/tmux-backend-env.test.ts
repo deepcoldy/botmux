@@ -8,15 +8,17 @@
  * runs the CLI by hand" — PATH / NVM / PNPM / mise / etc. come from the
  * user's rcfile loaded by the chosen shell, not from daemon process.env
  * passthrough. The only env injected by botmux is the per-bot/per-session
- * minimum (LARK creds, BOTMUX marker, SESSION_DATA_DIR, IS_SANDBOX, owner
- * open_id), injected via `/usr/bin/env KEY=VAL` so the values land AFTER
- * rcfile load and override any same-named exports the user happens to have.
+ * minimum (the namespaced BOTMUX_LARK_APP_ID, BOTMUX marker, SESSION_DATA_DIR,
+ * IS_SANDBOX, owner open_id), injected via `/usr/bin/env KEY=VAL` so the values
+ * land AFTER rcfile load and override any same-named exports the user has.
+ * The bot's bare LARK_APP_* are deliberately NOT injected — the worker redacts
+ * them so a child CLI's own Lark OAuth isn't hijacked (see redactChildEnv).
  *
  * SCRIPT also `cd`s back to the requested cwd before exec, so a stray `cd`
  * in the user's rcfile doesn't drag the CLI's working directory away.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,14 +30,17 @@ import {
 } from '../src/adapters/backend/tmux-backend.js';
 
 describe('buildBotmuxEnvAssignments()', () => {
-  it('forwards only the daemon-side keys (user rcfile cannot derive these)', () => {
+  it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
     const out = buildBotmuxEnvAssignments({
+      // Bare creds must never reach the child — the worker redacts them
+      // (redactChildEnv) and they are not on the allowlist either.
       LARK_APP_ID: 'cli_abc',
       LARK_APP_SECRET: 'secret',
       __OWNER_OPEN_ID: 'ou_x',
       BOTMUX: '1',
       SESSION_DATA_DIR: '/home/u/.botmux/data',
       IS_SANDBOX: '1',
+      BOTMUX_LARK_APP_ID: 'cli_namespaced',
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -44,13 +49,14 @@ describe('buildBotmuxEnvAssignments()', () => {
       LANG: 'en_US.UTF-8',
     });
     expect(out).toEqual([
-      'LARK_APP_ID=cli_abc',
-      'LARK_APP_SECRET=secret',
       '__OWNER_OPEN_ID=ou_x',
       'BOTMUX=1',
       'SESSION_DATA_DIR=/home/u/.botmux/data',
       'IS_SANDBOX=1',
+      'BOTMUX_LARK_APP_ID=cli_namespaced',
     ]);
+    expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
+    expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
   });
 
   it('forwards CLAUDE_CODE_RESUME_TOKEN_THRESHOLD so the resume-summary bypass reaches the tmux pane (issue #62)', () => {
@@ -58,7 +64,7 @@ describe('buildBotmuxEnvAssignments()', () => {
     // blocking resume-summary menu. Under the tmux backend it ONLY reaches the
     // CLI if it's allowlisted here — `...process.env` passthrough is dead.
     const out = buildBotmuxEnvAssignments({
-      LARK_APP_ID: 'cli_abc',
+      BOTMUX: '1',
       CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '2147483647',
       PATH: '/usr/bin',
     });
@@ -68,10 +74,11 @@ describe('buildBotmuxEnvAssignments()', () => {
 
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {
     const out = buildBotmuxEnvAssignments({
-      LARK_APP_ID: 'cli_abc',
-      LARK_APP_SECRET: 'secret',
+      BOTMUX: '1',
+      BOTMUX_LARK_APP_ID: 'cli_x',
+      IS_SANDBOX: undefined,
     });
-    expect(out).toEqual(['LARK_APP_ID=cli_abc', 'LARK_APP_SECRET=secret']);
+    expect(out).toEqual(['BOTMUX=1', 'BOTMUX_LARK_APP_ID=cli_x']);
     expect(out.every(s => !s.endsWith('=undefined'))).toBe(true);
   });
 
@@ -80,20 +87,20 @@ describe('buildBotmuxEnvAssignments()', () => {
       PATH: '/should/not/leak',
       HTTP_PROXY: 'http://should/not/leak',
       LANG: 'should-not-leak',
-      LARK_APP_ID: 'kept',
+      BOTMUX: 'kept',
     });
-    expect(out).toEqual(['LARK_APP_ID=kept']);
+    expect(out).toEqual(['BOTMUX=kept']);
   });
 
   it('preserves values with spaces, quotes, equals, newlines (argv array, no shell parsing)', () => {
     const out = buildBotmuxEnvAssignments({
-      LARK_APP_ID: 'with space',
-      LARK_APP_SECRET: 'has=equals=in=value',
+      SESSION_DATA_DIR: 'with space',
+      BOTMUX_LARK_APP_ID: 'has=equals=in=value',
       __OWNER_OPEN_ID: `it's "tricky"`,
       BOTMUX: 'line1\nline2',
     });
-    expect(out).toContain('LARK_APP_ID=with space');
-    expect(out).toContain('LARK_APP_SECRET=has=equals=in=value');
+    expect(out).toContain('SESSION_DATA_DIR=with space');
+    expect(out).toContain('BOTMUX_LARK_APP_ID=has=equals=in=value');
     expect(out).toContain(`__OWNER_OPEN_ID=it's "tricky"`);
     expect(out).toContain('BOTMUX=line1\nline2');
   });
@@ -105,10 +112,31 @@ describe('buildBotmuxEnvAssignments()', () => {
   it('never emits massive argv even with a thousand-entry process.env (Codex check #4)', () => {
     const huge: NodeJS.ProcessEnv = {};
     for (let i = 0; i < 1000; i++) huge[`USER_VAR_${i}`] = 'x'.repeat(200);
-    huge.LARK_APP_ID = 'kept';
+    huge.SESSION_DATA_DIR = '/d';
     huge.BOTMUX = '1';
     const out = buildBotmuxEnvAssignments(huge);
-    expect(out).toEqual(['LARK_APP_ID=kept', 'BOTMUX=1']);
+    expect(out).toEqual(['BOTMUX=1', 'SESSION_DATA_DIR=/d']);
+  });
+
+  it('never forwards the bot bare LARK_APP_ID / LARK_APP_SECRET, even with real values', () => {
+    // Defense-in-depth: the bare creds are off the allowlist, so even if a real
+    // value somehow reaches opts.env the tmux wrapper won't inject it. (The
+    // worker also deletes them up front — see redactChildEnv.) The namespaced
+    // BOTMUX_LARK_APP_ID IS still injected — botmux subcommands need it.
+    const out = buildBotmuxEnvAssignments({
+      LARK_APP_ID: 'cli_real_bot_app',
+      LARK_APP_SECRET: 'real_secret',
+      BOTMUX: '1',
+      BOTMUX_LARK_APP_ID: 'cli_namespaced',
+      BOTMUX_SESSION_ID: 'sess_xxx',
+      SESSION_DATA_DIR: '/d',
+    });
+    expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
+    expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
+    expect(out).toContain('BOTMUX=1');
+    expect(out).toContain('BOTMUX_LARK_APP_ID=cli_namespaced');
+    expect(out).toContain('BOTMUX_SESSION_ID=sess_xxx');
+    expect(out).toContain('SESSION_DATA_DIR=/d');
   });
 });
 
@@ -296,17 +324,82 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
         '/bin/sh',
         ['-c', SCRIPT, '_',
           cwd,
-          'LARK_APP_ID=fresh',
-          'LARK_APP_SECRET=fresh-secret',
+          'BOTMUX_LARK_APP_ID=fresh',
+          'SESSION_DATA_DIR=fresh-dir',
           '/usr/bin/env',
         ],
-        { encoding: 'utf-8', env: { LARK_APP_ID: 'stale', LARK_APP_SECRET: 'stale-secret', PATH: '/usr/bin:/bin' } },
+        { encoding: 'utf-8', env: { BOTMUX_LARK_APP_ID: 'stale', SESSION_DATA_DIR: 'stale-dir', PATH: '/usr/bin:/bin' } },
       );
       expect(result.status).toBe(0);
       const lines = result.stdout.split('\n');
-      expect(lines).toContain('LARK_APP_ID=fresh');
-      expect(lines).toContain('LARK_APP_SECRET=fresh-secret');
-      expect(lines).not.toContain('LARK_APP_ID=stale');
+      expect(lines).toContain('BOTMUX_LARK_APP_ID=fresh');
+      expect(lines).toContain('SESSION_DATA_DIR=fresh-dir');
+      expect(lines).not.toContain('BOTMUX_LARK_APP_ID=stale');
+    },
+  );
+
+  it.skipIf(!hasEnvBin)(
+    'wrapper unsets bare LARK_APP_* / CLAUDECODE inherited from the ambient env',
+    () => {
+      // The new tmux pane inherits the tmux *server* global env, which the
+      // redacted client env cannot override (Codex's 2nd blocker). The wrapper
+      // `unset`s the bare creds before exec so the CLI never sees them — here
+      // we feed them via the spawn env, exactly as an inherited value would
+      // appear. The OLD wrapper (no unset) would leak all three.
+      const cwd = tmpdir();
+      const result = spawnSync(
+        '/bin/sh',
+        ['-c', SCRIPT, '_', cwd, 'BOTMUX_LARK_APP_ID=ns', '/usr/bin/env'],
+        { encoding: 'utf-8', env: {
+          LARK_APP_ID: 'inherited_id',
+          LARK_APP_SECRET: 'inherited_secret',
+          CLAUDECODE: '1',
+          PATH: '/usr/bin:/bin',
+        } },
+      );
+      expect(result.status).toBe(0);
+      const lines = result.stdout.split('\n');
+      expect(lines.some(l => l.startsWith('LARK_APP_ID='))).toBe(false);
+      expect(lines.some(l => l.startsWith('LARK_APP_SECRET='))).toBe(false);
+      expect(lines.some(l => l.startsWith('CLAUDECODE='))).toBe(false);
+      expect(lines).toContain('BOTMUX_LARK_APP_ID=ns');
+    },
+  );
+
+  const hasTmux = !spawnSync('tmux', ['-V']).error;
+  it.skipIf(!hasEnvBin || !hasTmux)(
+    'tmux child does NOT inherit bare LARK_APP_* from a server started with them in scope (Codex repro)',
+    () => {
+      // End-to-end: start a tmux server that already has bare creds in its
+      // global env (the pre-upgrade / user-shell case), then create a new
+      // session through the real wrapper with a redacted client env. The pane
+      // must not see the server's bare creds.
+      const sock = `bmx-test-${process.pid}`;
+      const outFile = join(tmpdir(), `bmx-pane-env-${process.pid}.txt`);
+      // tmux refuses nested sessions when $TMUX is set — strip it.
+      const baseEnv = { ...process.env }; delete baseEnv.TMUX; delete baseEnv.TMUX_PANE;
+      try {
+        // 1) Server started WITH bare creds in scope.
+        spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', 'sleep 60'],
+          { env: { ...baseEnv, LARK_APP_ID: 'server_id', LARK_APP_SECRET: 'server_secret', CLAUDECODE: '1' } });
+        // 2) New session via the wrapper with a redacted client env; the "CLI"
+        //    dumps its env then signals completion so the test stays sync.
+        const clientEnv = { ...baseEnv };
+        delete clientEnv.LARK_APP_ID; delete clientEnv.LARK_APP_SECRET; delete clientEnv.CLAUDECODE;
+        spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'probe',
+          '/bin/sh', '-c', SCRIPT, '_', tmpdir(), 'BOTMUX_LARK_APP_ID=ns',
+          '/bin/sh', '-c', `env > ${outFile}; tmux -L ${sock} wait-for -S bmxdone`],
+          { env: clientEnv });
+        spawnSync('tmux', ['-L', sock, 'wait-for', 'bmxdone'], { timeout: 10_000 });
+        const paneEnv = readFileSync(outFile, 'utf-8').split('\n');
+        expect(paneEnv.some(l => l.startsWith('LARK_APP_ID='))).toBe(false);
+        expect(paneEnv.some(l => l.startsWith('LARK_APP_SECRET='))).toBe(false);
+        expect(paneEnv.some(l => l.startsWith('CLAUDECODE='))).toBe(false);
+        expect(paneEnv).toContain('BOTMUX_LARK_APP_ID=ns');
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server']);
+        rmSync(outFile, { force: true });
+      }
     },
   );
 

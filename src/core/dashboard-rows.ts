@@ -8,6 +8,7 @@
 import type { DaemonSession } from './types.js';
 import type { Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { getTerminalProxyPort } from './terminal-url.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -26,6 +27,9 @@ export interface SessionRow {
   title?: string;
   ownerOpenId?: string;
   webPort: number | null;
+  /** Owning daemon's reverse-proxy port (0/undefined if the proxy isn't up).
+   *  When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}. */
+  proxyPort?: number;
   cliVersion?: string;
   hasHistory?: boolean;
   feishuChatLink: string;
@@ -74,6 +78,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     // both fresh and restored sessions.
     ownerOpenId: ds.session.ownerOpenId,
     webPort: ds.workerPort ?? null,
+    proxyPort: getTerminalProxyPort() || undefined,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
     feishuChatLink: feishuChatLink(ds.chatId),

@@ -162,6 +162,64 @@ export function buildSessionClosedCard(
 }
 
 /**
+ * Build a frozen-snapshot card to PATCH onto the source-chat streaming card
+ * after `/relay` moves the session elsewhere.
+ *
+ * Why this exists: a live streaming card carries action buttons (close /
+ * toggle display / get write link). Those buttons identify their session by
+ * `session_id` in the value payload, so clicking them after relay still
+ * reaches the now-relocated session — closing it, toggling its display
+ * mode, etc. — but the visible feedback all lands on the NEW card in the
+ * target chat, not this one. The source-chat card then looks like a "live
+ * console" while actually being a footgun. PATCH it to an inert snapshot
+ * so the user sees clearly it's historical.
+ *
+ * Last-frame rendering:
+ *   - imageKey present (session was in 'screenshot' / expanded mode at
+ *     relay time) → embed the same img element the live card had.
+ *     img_key is a Lark server resource independent of the card it lived
+ *     on, so the PATCHed card can still reference it.
+ *   - imageKey absent (hidden / collapsed mode) → render nothing extra.
+ *     The header + body notice already convey the state; raw tmux pane
+ *     text as a code-block is too long and noisy (王皓 caught this in
+ *     testing).
+ *
+ * No action buttons are rendered in either case.
+ */
+export function buildRelayedFrozenCard(
+  title: string,
+  cliId?: CliId,
+  imageKey?: string,
+  locale?: Locale,
+): string {
+  const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const body =
+    `**${escapeMd(title || cliName)}**\n` +
+    `${t('card.body.relay_frozen', undefined, locale)}`;
+  const elements: any[] = [
+    { tag: 'markdown', content: body },
+  ];
+  if (imageKey) {
+    elements.push({
+      tag: 'img',
+      img_key: imageKey,
+      alt: { tag: 'plain_text', content: '' },
+      mode: 'fit_horizontal',
+      preview: true,
+    });
+  }
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.status.relay_frozen', undefined, locale) },
+      template: 'grey',
+    },
+    elements,
+  };
+  return JSON.stringify(card);
+}
+
+/**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
  * Cap markdown content byte size with headroom for card JSON overhead.
  */
@@ -570,20 +628,27 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
 
 export interface GrantCardOpts {
   ownerOpenId: string;
-  requesterOpenId: string;
-  requesterName: string;
+  /** 待授权目标，支持一次 /grant @a @b 多目标；owner 点一次范围对全部生效。 */
+  targets: Array<{ openId: string; name: string }>;
   chatId: string;
   nonce: string;
   /** 'request' = 无权限者自助申请；'owner' = owner 主动 /grant。仅文案不同。 */
   mode: 'request' | 'owner';
 }
 
-/** 授权卡片：正文 @owner，三枚按钮各带 action + 上下文 + nonce。 */
+/** 授权卡片：正文 @owner，三枚按钮各带 action + 上下文 + nonce。
+ *  多目标共用一张卡，按钮 value 带 target_open_ids 数组，owner 点一次范围套用到全部。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
+  const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
+  const single = o.targets[0];
   const body = o.mode === 'request'
-    ? t('card.grant.body_request', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale)
-    : t('card.grant.body_owner', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale);
-  const v = { target_open_id: o.requesterOpenId, chat_id: o.chatId, nonce: o.nonce };
+    ? t('card.grant.body_request', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale)
+    : o.targets.length > 1
+      ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
+      : t('card.grant.body_owner', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale);
+  // target_names 与 target_open_ids 同序：授权成功后据此把目标登记进 observed 花名册
+  // （/grant @bot 成功后顺带「认识」对方，等价内部跑一次 /introduce）。
+  const v = { target_open_ids: o.targets.map(t => t.openId), target_names: o.targets.map(t => t.name), chat_id: o.chatId, nonce: o.nonce };
   // 「全局授权对话」只在 owner 主动发卡时出现：owner 一眼明确要给全局；request 模式（成员
   // 自助申请）只提供「本群」，避免成员把自己申请到全局。两个授权按钮都是 talk-only。
   const grantButtons: any[] = [
@@ -606,9 +671,10 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   return JSON.stringify(card);
 }
 
-/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。带额度时追加"（额度 N 条）"。 */
-export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string, locale?: Locale, quota?: number): string {
-  const at = `<at id=${targetOpenId}></at>`;
+/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。支持一次 @ 多个被授权人；带额度时追加"（额度 N 条）"。 */
+export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string | string[], locale?: Locale, quota?: number): string {
+  const ids = Array.isArray(targetOpenId) ? targetOpenId : [targetOpenId];
+  const at = ids.map(id => `<at id=${id}></at>`).join(' ');
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
   const card = {
@@ -802,6 +868,357 @@ function formatDuration(ms: number): string {
   if (h < 24) return `${h}h${m % 60}m`;
   const d = Math.floor(h / 24);
   return `${d}d${h % 24}h`;
+}
+
+// ─── /relay picker (pull mode) ──────────────────────────────────────────────
+
+export interface RelayPickerEntry {
+  sessionId: string;
+  /** Short human label for the source chat — chat name if resolvable, else chatId. */
+  chatLabel: string;
+  /** First-turn title or current-turn topic — already truncated by the caller. */
+  title: string;
+  /** Absolute working dir, displayed verbatim. */
+  workingDir?: string;
+  /** CLI identifier, used to render a friendly name. */
+  cliId?: CliId;
+  /** Last activity timestamp, used to render a relative duration. */
+  lastMessageAt?: number;
+  /** Source chat's conversational topology. Drives the type tag in the
+   *  picker. Caller supplies based on getChatNameAndMode lookup + the
+   *  session's own chatType for the p2p case. */
+  chatMode?: 'group' | 'topic' | 'p2p';
+  /** Snapshot of whether the session's worker is mid-turn at render time.
+   *  When the selected entry is running, the picker disables the confirm
+   *  button (transferSession would refuse a busy worker anyway). Snapshot,
+   *  not live — re-selecting the entry recomputes it. */
+  running?: boolean;
+}
+
+function relayPickerTypeTag(mode: 'group' | 'topic' | 'p2p' | undefined, locale?: Locale): string {
+  switch (mode) {
+    case 'p2p':   return t('card.relay.type_p2p',   undefined, locale);
+    case 'topic': return t('card.relay.type_topic', undefined, locale);
+    default:      return t('card.relay.type_group', undefined, locale); // 'group' or undefined
+  }
+}
+
+export interface RelayPickerState {
+  /** Currently selected sessionId, if any (drives the highlight + confirm button). */
+  selectedSessionId?: string;
+  /** Case-insensitive substring filter applied to title / chatLabel / workingDir. */
+  searchQuery?: string;
+  /** 0-indexed page within the filtered list. Clamped to valid range at render time. */
+  page?: number;
+}
+
+const RELAY_PICKER_PAGE_SIZE = 5;
+const RELAY_SEARCH_FIELD = 'search';
+
+/**
+ * Match against title / chatLabel / workingDir / cliId. Case-insensitive
+ * substring. Empty / whitespace query matches everything.
+ */
+function relayPickerFilter(entries: RelayPickerEntry[], query: string | undefined): RelayPickerEntry[] {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return entries;
+  return entries.filter((e) => {
+    const haystack = [e.title, e.chatLabel, e.workingDir, e.cliId]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    return haystack.includes(q);
+  });
+}
+
+/**
+ * Card listing the operator's relayable sessions, paginated 5 per page with
+ * a search box at the top and a confirm button at the bottom. Layout:
+ *
+ *   ┌──────────────────────────────────────┐
+ *   │ 📋 选择要接力的会话                   │  header
+ *   ├──────────────────────────────────────┤
+ *   │ 🔍 [______________] [搜索]            │  form: input + submit button
+ *   ├──────────────────────────────────────┤
+ *   │  [interactive_container 1]            │  current page (≤5 cards),
+ *   │  [interactive_container 2]            │  each clickable for selection
+ *   │   ...                                 │
+ *   ├──────────────────────────────────────┤
+ *   │  [← 上一页]  1 / 4  [下一页 →]        │  paginator row
+ *   ├──────────────────────────────────────┤
+ *   │   [确认接力到本群]                    │  primary button (only when
+ *   │                                       │   a selected session is on
+ *   │                                       │   the current filtered set)
+ *   └──────────────────────────────────────┘
+ *
+ * State (search / page / selected) is propagated entirely via the value
+ * objects on each button and container — Lark cards are stateless, so any
+ * server-side re-render must reconstruct from what the click sent us.
+ * That's why every interactive value here carries `search`, `page`,
+ * `target_chat_id`, `root_id`.
+ *
+ * Note: typing into the search box without clicking 搜索 does NOT update
+ * the in-callback state — container/paginator clicks use whatever search
+ * was applied at card-render time. To apply a new filter, click 搜索.
+ */
+export function buildRelayPickerCard(
+  entries: RelayPickerEntry[],
+  targetChatId: string,
+  targetRootMessageId: string,
+  invokerOpenId: string,
+  locale?: Locale,
+  state?: RelayPickerState,
+): string {
+  const searchQuery = state?.searchQuery ?? '';
+  const requestedPage = state?.page ?? 0;
+  const selectedSessionId = state?.selectedSessionId;
+  const elements: any[] = [];
+
+  // ─── Filter & paginate ───────────────────────────────────────────────
+  const filtered = relayPickerFilter(entries, searchQuery);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / RELAY_PICKER_PAGE_SIZE));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  const start = page * RELAY_PICKER_PAGE_SIZE;
+  const visible = filtered.slice(start, start + RELAY_PICKER_PAGE_SIZE);
+
+  // Common state object carried by every interactive value so re-renders
+  // can reconstruct what the user was looking at. `invoker_open_id` pins the
+  // card to the user who originally summoned it — card-handler refuses
+  // re-render / confirm clicks from anyone else, so the menu doesn't get
+  // silently swapped to a passer-by's session list.
+  const stateValue = {
+    target_chat_id: targetChatId,
+    root_id: targetRootMessageId,
+    invoker_open_id: invokerOpenId,
+    search: searchQuery,
+    page,
+    selected: selectedSessionId ?? '',
+  };
+
+  // ─── Search box ─────────────────────────────────────────────────────
+  // v2 input supports `behaviors` natively — pressing Enter or clicking
+  // the built-in submit icon inside the input fires the callback. No
+  // separate 搜索 button needed (王皓 reported that button rendered as
+  // "..." due to cramped column width; the auto-submit input avoids the
+  // problem entirely AND removes the manual click).
+  //
+  // On submit the callback delivers `action.input_value` (the typed
+  // string) and `action.value` (our state object). card-handler reads
+  // input_value to update search, resets page to 0 and clears selection.
+  elements.push({
+    tag: 'input',
+    name: RELAY_SEARCH_FIELD,
+    placeholder: { tag: 'plain_text', content: t('card.relay.search_placeholder', undefined, locale) },
+    default_value: searchQuery,
+    width: 'fill',
+    behaviors: [
+      {
+        type: 'callback',
+        value: { action: 'relay_search', ...stateValue, selected: '' /* new search → reset selection */ },
+      },
+    ],
+  });
+
+  elements.push({ tag: 'hr' });
+
+  // ─── Empty / no-match notice ────────────────────────────────────────
+  if (entries.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.relay.empty', undefined, locale) });
+    return JSON.stringify(wrapCard(elements, locale));
+  }
+  if (filtered.length === 0) {
+    elements.push({
+      tag: 'markdown',
+      content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
+    });
+    return JSON.stringify(wrapCard(elements, locale));
+  }
+
+  // ─── Session cards (current page) ───────────────────────────────────
+  const p2pLocationLabel = t('card.relay.type_p2p', undefined, locale);
+  const labelType     = t('card.relay.field_type',     undefined, locale);
+  const labelLocation = t('card.relay.field_location', undefined, locale);
+  const labelTime     = t('card.relay.field_time',     undefined, locale);
+  const labelStatus   = t('card.relay.field_status',   undefined, locale);
+  const selectedTag   = t('card.relay.selected_tag',   undefined, locale);
+  const selectedEntry = selectedSessionId ? filtered.find(e => e.sessionId === selectedSessionId) : undefined;
+  const hasValidSelection = !!selectedEntry;
+  // Selected session is mid-turn — confirm must be disabled (transferSession
+  // would refuse a busy worker; catch it at the button so no M1 is sent).
+  const selectionRunning = !!selectedEntry?.running;
+
+  visible.forEach((e) => {
+    const isSelected = e.sessionId === selectedSessionId;
+    const typeTag = relayPickerTypeTag(e.chatMode, locale);
+    const locationLine = e.chatMode === 'p2p' ? p2pLocationLabel : e.chatLabel;
+    const titleLine = isSelected
+      ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\``
+      : `**${escapeMd(e.title)}**`;
+    const statusTag = e.running
+      ? t('card.relay.status_running', undefined, locale)
+      : t('card.relay.status_idle', undefined, locale);
+    const lines: string[] = [
+      titleLine,
+      `${labelStatus}: ${statusTag}`,
+      `${labelType}: ${typeTag}`,
+      `${labelLocation}: ${escapeMd(locationLine)}`,
+    ];
+    if (e.lastMessageAt) {
+      lines.push(`${labelTime}: ${formatDuration(Date.now() - e.lastMessageAt)}`);
+    }
+    elements.push({
+      tag: 'interactive_container',
+      width: 'fill',
+      padding: '8px 12px',
+      background_style: isSelected ? 'laser' : 'default',
+      has_border: true,
+      border_color: isSelected ? 'blue-500' : 'grey-200',
+      corner_radius: '8px',
+      behaviors: [
+        {
+          type: 'callback',
+          value: { action: 'relay_select', session_id: e.sessionId, ...stateValue },
+        },
+      ],
+      elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    });
+  });
+
+  // ─── Paginator (only when more than one page) ───────────────────────
+  if (totalPages > 1) {
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'default',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'center',
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_prev_page', undefined, locale) },
+              type: 'default',
+              disabled: page === 0,
+              behaviors: [
+                {
+                  type: 'callback',
+                  value: { action: 'relay_page', ...stateValue, page: Math.max(0, page - 1) },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 2,
+          vertical_align: 'center',
+          elements: [
+            {
+              tag: 'markdown',
+              text_align: 'center',
+              content: t('card.relay.page_indicator', { current: page + 1, total: totalPages }, locale),
+            },
+          ],
+        },
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'center',
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_next_page', undefined, locale) },
+              type: 'default',
+              disabled: page === totalPages - 1,
+              behaviors: [
+                {
+                  type: 'callback',
+                  value: { action: 'relay_page', ...stateValue, page: Math.min(totalPages - 1, page + 1) },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  // ─── Confirm button or hint ─────────────────────────────────────────
+  elements.push({ tag: 'hr' });
+  if (hasValidSelection && selectionRunning) {
+    // Selected session is mid-turn: render a disabled (grey, non-clickable)
+    // button instead of the confirm action. Re-clicking the session entry
+    // re-renders and recomputes `running`, so once the turn finishes the
+    // user can click it again to get the live confirm button back.
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_confirm_running', undefined, locale) },
+              type: 'default',
+              disabled: true,
+            },
+          ],
+        },
+      ],
+    });
+  } else if (hasValidSelection) {
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.relay.btn_confirm', undefined, locale) },
+              type: 'primary',
+              behaviors: [
+                {
+                  type: 'callback',
+                  value: { action: 'relay_confirm', session_id: selectedSessionId, ...stateValue },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  } else {
+    elements.push({
+      tag: 'markdown',
+      content: `<font color='grey'>${t('card.relay.hint_pick_first', undefined, locale)}</font>`,
+    });
+  }
+
+  return JSON.stringify(wrapCard(elements, locale));
+}
+
+function wrapCard(elements: any[], locale?: Locale): any {
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.relay.title', undefined, locale) },
+      template: 'blue',
+    },
+    body: { direction: 'vertical', elements },
+  };
 }
 
 export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId?: string, locale?: Locale): string {

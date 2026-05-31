@@ -387,7 +387,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       return `claude --resume ${cliSessionId ?? sessionId}`;
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -397,15 +397,17 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
-      args.push('--dangerously-skip-permissions');
-      // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
-      // 注意：askUserQuestion hook 不在这里注入——它要写全局 settings.json（见下方
-      // hookInstall），这样 adopt 模式（botmux 接管的是别处已启动、拿不到本 --settings
-      // 的 claude 会话）才能让那条会话读到 hook。
-      args.push('--settings', JSON.stringify({
-        skipDangerousModePermissionPrompt: true,
-        permissions: { defaultMode: 'bypassPermissions' },
-      }));
+      if (!disableCliBypass) {
+        args.push('--dangerously-skip-permissions');
+        // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
+        // 注意：askUserQuestion hook 不在这里注入——它要写全局 settings.json（见下方
+        // hookInstall），这样 adopt 模式（botmux 接管的是别处已启动、拿不到本 --settings
+        // 的 claude 会话）才能让那条会话读到 hook。
+        args.push('--settings', JSON.stringify({
+          skipDangerousModePermissionPrompt: true,
+          permissions: { defaultMode: 'bypassPermissions' },
+        }));
+      }
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone

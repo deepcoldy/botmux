@@ -8,7 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from './im/lark/client.js';
+import { getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { chatHasAllowedUser, resolveGroupJoinPrompt } from './core/auto-start.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -26,6 +27,8 @@ import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import { sessionKey, sessionAnchorId } from './core/types.js';
+import { buildTerminalUrl, setTerminalProxyPort } from './core/terminal-url.js';
+import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
@@ -46,9 +49,9 @@ import {
   ensureCliEnv,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
+import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -1313,7 +1316,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
   if (ds.streamCardId && ds.workerPort) {
-    const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+    const readUrl = buildTerminalUrl(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
     const prevMode = ds.displayMode ?? 'hidden';
@@ -1484,6 +1487,32 @@ ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) =
   return jsonRes(res, 200, result);
 });
 
+/** Heavy deps for triggerWorkflowRun, shared by the catalog `…/run` route and
+ *  the `/api/trigger` (kind=workflow) thin layer. */
+function workflowTriggerDeps() {
+  return {
+    spawnSubagent: workflowSpawnFn(),
+    botResolver: resolveBotSnapshot,
+    makeRuntimeContext: (log: any, def: any, spawnSubagent: any) => ({
+      log,
+      def,
+      spawnSubagent,
+      hostExecutors: createDefaultHostExecutorRegistry(),
+      reconcilers: createDefaultProviderReconcilers(),
+      loadEffectInput: (activityId: any, attemptId: any) =>
+        loadEffectInputSidecar(log, activityId, attemptId),
+    }),
+    attachRuntime: (runId: string, ctx: any) => attachWorkflowEventWatcher(runId, ctx),
+    driveRun: (runId: string) => {
+      driveWorkflowRun(runId).catch((err) => {
+        logger.warn(
+          `[workflow:${runId}] trigger drive failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    },
+  };
+}
+
 ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) => {
   const workflowId = params.id;
   if (!isValidWorkflowId(workflowId)) {
@@ -1518,29 +1547,7 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
       chatBinding,
       initiator: 'dashboard',
     },
-    {
-      spawnSubagent: workflowSpawnFn(),
-      botResolver: resolveBotSnapshot,
-      makeRuntimeContext: (log, def, spawnSubagent) => ({
-        log,
-        def,
-        spawnSubagent,
-        hostExecutors: createDefaultHostExecutorRegistry(),
-        reconcilers: createDefaultProviderReconcilers(),
-        loadEffectInput: (activityId, attemptId) =>
-          loadEffectInputSidecar(log, activityId, attemptId),
-      }),
-      attachRuntime: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
-      driveRun: (runId) => {
-        driveWorkflowRun(runId).catch((err) => {
-          logger.warn(
-            `[workflow:${runId}] dashboard-trigger drive failed: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      },
-    },
+    workflowTriggerDeps(),
   );
   if (!result.ok) {
     const status =
@@ -1723,6 +1730,38 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Resolve the pinned working dir for a brand-new topic via the layered lookup:
+ *   1) an existing oncall binding (this bot or a sibling)
+ *   2) this bot's defaultOncall — auto-binds a brand-new chat when the flag is on
+ *      (this WRITES state, so it must run identically on every spawn path)
+ *   3) a sibling session's workingDir (cross-bot / chat-scope inheritance)
+ *   4) this bot's `defaultWorkingDir` (pure runtime fallback)
+ * Returns the dir plus the oncall / inherited source so callers can log the reason.
+ * Shared by the normal spawn path and the first-message `/repo` command branch so
+ * both honor the defaultOncall auto-bind the same way.
+ */
+async function resolvePinnedWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  larkAppId: string;
+}) {
+  let oncallEntry = findOncallChatForAnyBot(ctx.chatId);
+  if (!oncallEntry) {
+    oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
+  }
+  const inheritedFrom = !oncallEntry
+    ? findInheritablePeer({ scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType, selfAppId: ctx.larkAppId })
+    : null;
+  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
+    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
+    : undefined;
+  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  return { pinnedWorkingDir, oncallEntry, inheritedFrom };
+}
+
 async function replyInvalidWorkingDirs(
   anchor: string,
   larkAppId: string,
@@ -1799,6 +1838,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     logger.info(`[/t] Force-topic invocation: prompt="${forceTopic.prompt.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)})`);
   }
 
+  // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
+  const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
   const botCfg = getBot(larkAppId).config;
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
 
@@ -1834,6 +1875,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
+      // `/group` (`/g`) doesn't open a conversation — creating a sessionStore
+      // record for it would surface a phantom session in the dashboard. Run it
+      // without a session; pass chatId on the message so the handler can reach
+      // the chat roster (it normally reads it from the active session's ds).
+      if (SESSIONLESS_DAEMON_COMMANDS.has(cmd)) {
+        await handleCommand(cmd, anchor, { ...parsed, content: commandContent, chatId }, commandDeps, larkAppId);
+        return;
+      }
       // Same rootMessageId reasoning as below in the main spawn path:
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
       // disagree with activeSessions's key and downstream card buttons silently
@@ -1843,9 +1892,26 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       const now = Date.now();
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
+      session.ownerUnionId = senderUnionId;
       session.lastCallerOpenId = senderOpenId;
       session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
+
+      // First-message `/repo`: seed the same pending-repo state the card flow
+      // uses, so the `/repo` handler launches the CLI straight away —
+      // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
+      // instead of taking the mid-session close+recreate path or re-showing the
+      // card. Use the SAME pinned-dir resolver as the normal spawn path (incl.
+      // defaultOncall auto-bind) so a bound/auto-bound chat still launches in the
+      // right place when no arg is given.
+      let cmdPending: Partial<DaemonSession> | undefined;
+      if (cmd === '/repo') {
+        const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+        if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+        // pendingPrompt is empty (the message *is* the command), so the CLI just
+        // boots and waits for the user's next message; no sender tag needed.
+        cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+      }
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(anchor, larkAppId), {
         session,
@@ -1861,6 +1927,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         lastMessageAt: now,
         hasHistory: false,
         ownerOpenId: senderOpenId,
+        ...cmdPending,
       });
       // Pass mention-stripped content so /command argument parsing works.
       await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
@@ -1911,6 +1978,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
+  session.ownerUnionId = senderUnionId;
   session.lastCallerOpenId = senderOpenId;
   // First turn of a brand-new topic: seed quoteTarget* so the very first
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
@@ -1925,34 +1993,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
-  // Oncall group: pin working dir from the chat-level binding, even if a
-  // sibling bot (running in another daemon) is the one that persisted it.
-  // Layered lookup:
-  //   1) any existing binding (this bot or sibling)
-  //   2) this bot's defaultOncall — auto-binds the chat if it's brand new
-  //      and the flag is on. Once auto-bound, the chat appears in oncallChats
-  //      so the next handleNewTopic sees it via (1).
-  let oncallEntry = findOncallChatForAnyBot(chatId);
-  if (!oncallEntry) {
-    oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, chatId, chatType);
-  }
-
-  // Cross-bot / chat-scope inheritance: reuse a sibling session's workingDir
-  // and skip the repo card. Same block lives in handleThreadReply's auto-create
-  // branch — both handlers land unowned messages after the 4fec43c routing
-  // change. Helper is shared.
-  const inheritedFrom = !oncallEntry
-    ? findInheritablePeer({ scope, anchor, chatId, chatType, selfAppId: larkAppId })
-    : null;
-
-  // Last-resort fallback: this bot's `defaultWorkingDir`. Pure runtime — no
-  // oncall binding written, no permission-model change. Lets a single-repo
-  // bot skip the repo-select card without committing to oncall semantics.
-  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-    ? resolveBotDefaultWorkingDir(larkAppId)
-    : undefined;
-
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  // Pin the working dir via the layered oncall / inherit / default lookup
+  // (auto-binds a defaultOncall chat as a side effect). Shared with the
+  // first-message `/repo` command branch so both paths stay consistent.
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -2018,6 +2062,197 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
+  }
+}
+
+// 主动开工 — 场景①: in-flight lock so two near-simultaneous `bot.added` events
+// for the same chat (reconnect replay / double-delivery) can't both spawn —
+// claimed synchronously before the first await, released in `finally` (FR-13).
+const autoStartJoinInFlight = new Set<string>();
+// 主动开工 — 场景①: `${appId}:${chatId}` → the activeSessions key of the
+// auto-started join session. Needed because in a 话题群 the session is keyed at
+// the seed message id (not chatId), so a plain `activeSessions.has(chatId)`
+// can't catch a sequential duplicate `bot.added` and would seed a 2nd topic.
+// This map is self-healing: an entry whose target is no longer in
+// activeSessions (session `/close`d) is treated as stale, so a legitimate
+// re-add still re-triggers — no process-lifetime "already started" set.
+const groupJoinAnchorByChat = new Map<string, string>();
+// 主动开工 — 场景① FR-12: only nag the admin once per process when listing chat
+// members fails (most likely a missing `im:chat` member-read scope), so a bot
+// added to many chats doesn't spam DMs.
+const groupJoinScopeWarned = new Set<string>();
+
+async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promise<void> {
+  if (groupJoinScopeWarned.has(larkAppId)) return;
+  groupJoinScopeWarned.add(larkAppId);
+  const bot = getBot(larkAppId);
+  const adminOpenId = bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+  if (!adminOpenId) {
+    logger.warn(`[auto-start:入群] ${larkAppId} 缺权限提示无法私信（allowedUsers 无 open_id），仅记录日志`);
+    return;
+  }
+  const dm =
+    `⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n` +
+    `最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 \`im.chat.member.bot.added_v1\`。\n\n` +
+    `请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 \`botmux restart\`。\n\n错误详情：${detail}`;
+  try {
+    await sendUserMessage(larkAppId, adminOpenId, dm, 'text');
+    logger.info(`[auto-start:入群] ${larkAppId} 已私信 admin 提示补权限`);
+  } catch (err) {
+    logger.warn(`[auto-start:入群] ${larkAppId} 私信 admin 失败：${err}`);
+  }
+}
+
+/**
+ * 主动开工 — 场景①: the bot was added to a chat. Auto-start a session when
+ * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) at least one of its
+ * allowedUsers is a member of the chat (D7). Working dir per D6: the bot's
+ * default working dir, else degrade to the repo-selection card. The first-turn
+ * prompt is the configured prompt, or empty (the role/identity envelope still
+ * makes it a non-empty CLI turn — the bot reads the group context itself, D8).
+ *
+ * Scope is mode-aware: a 普通群 gets a chat-scope session anchored at chatId; a
+ * 话题群 (topic mode) has no thread to attach to yet, so we seed a fresh topic
+ * (a top-level message) and run a thread-scope session anchored at that seed —
+ * otherwise a chat-scope session in a 话题群 is the known stale-session bug
+ * (every reply would wrap into a new topic, and later messages route elsewhere).
+ */
+async function handleBotAdded(chatId: string, operatorOpenId: string | undefined, larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  const botCfg = bot.config;
+  if (botCfg.autoStartOnGroupJoin !== true) {
+    logger.debug(`[auto-start:入群] ${chatId.substring(0, 12)} 开关未开，忽略`);
+    return;
+  }
+
+  const lockKey = `${larkAppId}:join:${chatId}`;
+  const chatLiveKey = `${larkAppId}:${chatId}`;
+  // Dedup: in-flight (concurrent events) OR a still-live join session already
+  // exists for this chat. The map covers the 话题群 case where the session is
+  // keyed at the seed message id, not chatId. A stale map entry (target session
+  // closed) falls through so a re-add re-triggers.
+  const priorAnchorKey = groupJoinAnchorByChat.get(chatLiveKey);
+  if (autoStartJoinInFlight.has(lockKey) || (priorAnchorKey && activeSessions.has(priorAnchorKey))) {
+    logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 已在处理/已有会话，跳过（去重）`);
+    return;
+  }
+  if (priorAnchorKey) groupJoinAnchorByChat.delete(chatLiveKey); // stale entry, will re-register below
+  autoStartJoinInFlight.add(lockKey);
+  try {
+    // D7 gate: an allowedUser must be a member of the chat.
+    let memberOpenIds: string[];
+    try {
+      memberOpenIds = await listChatMemberOpenIds(larkAppId, chatId);
+    } catch (err: any) {
+      logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉群成员失败：${err?.message ?? err}`);
+      await warnGroupJoinScopeOnce(larkAppId, String(err?.message ?? err));
+      return;
+    }
+    if (!chatHasAllowedUser(memberOpenIds, bot.resolvedAllowedUsers)) {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 群内无 allowedUser 成员，忽略`);
+      return;
+    }
+
+    const chatType: 'group' = 'group';
+    // forceRefresh: the bot just joined; a 5-min-cached 'group' from before a
+    // conversion to 话题群 would wrongly pick chat-scope and reintroduce the
+    // oc_-id-as-reply-target bug (R1). Fetch fresh.
+    const mode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+    const promptBody = resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
+    const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
+
+    // Pick scope + anchor. 话题群 → seed a topic and anchor thread-scope there;
+    // 普通群 → chat-scope anchored at chatId.
+    let scope: 'thread' | 'chat';
+    let anchor: string;
+    if (mode === 'topic') {
+      const seedText = tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
+      anchor = await sendMessage(larkAppId, chatId, seedText, 'text');
+      scope = 'thread';
+    } else {
+      anchor = chatId;
+      scope = 'chat';
+    }
+    const dsKey = sessionKey(anchor, larkAppId);
+    if (activeSessions.has(dsKey)) {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
+      return;
+    }
+
+    const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+
+    const session = sessionStore.createSession(chatId, anchor, title, chatType);
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.ownerOpenId = operatorOpenId;
+    session.lastCallerOpenId = operatorOpenId;
+    session.lastMessageAt = new Date(now).toISOString();
+    session.scope = scope;
+    if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType,
+      scope,
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+      lastMessageAt: now,
+      hasHistory: false,
+      pendingRepo: !pinnedWorkingDir,
+      pendingPrompt: promptBody,
+      ownerOpenId: operatorOpenId,
+      currentTurnTitle: title,
+      workingDir: pinnedWorkingDir,
+    };
+    activeSessions.set(dsKey, ds);
+    // Register the anchor so a later duplicate bot.added for this chat is deduped
+    // even in 话题群 (where dsKey is the seed id, not chatId).
+    groupJoinAnchorByChat.set(chatLiveKey, dsKey);
+
+    const selfBot = getBot(larkAppId);
+    const buildPrompt = async () => buildNewTopicPrompt(
+      promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
+      undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
+      { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
+      { larkAppId, chatId },
+    );
+
+    // Pinned working dir → spawn immediately.
+    if (pinnedWorkingDir) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      const prompt = await buildPrompt();
+      rememberLastCliInput(ds, promptBody, prompt);
+      forkWorker(ds, prompt);
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
+      return;
+    }
+
+    // No default dir → degrade to repo-selection card (D6 / FR-4).
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
+    const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs) : [];
+    if (projects.length > 0) {
+      lastRepoScan.set(chatId, projects);
+      const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId));
+      ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
+    } else {
+      ds.pendingRepo = false;
+      const prompt = await buildPrompt();
+      rememberLastCliInput(ds, promptBody, prompt);
+      forkWorker(ds, prompt);
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
+    }
+  } finally {
+    autoStartJoinInFlight.delete(lockKey);
   }
 }
 
@@ -2206,7 +2441,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         return;
       }
       // Pass mention-stripped content so /command argument parsing works.
-      handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+      // chatId lets session-less handlers (e.g. /group) reach the chat roster.
+      handleCommand(cmd, anchor, { ...parsed, content: commandContent, chatId: threadChatId }, commandDeps, larkAppId);
       return;
     }
   }
@@ -2315,6 +2551,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     logger.info(`No active session for ${scope}-scope ${anchor}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const senderOId = data.sender?.sender_id?.open_id;
+    const senderUId = data.sender?.sender_id?.union_id;
     // For thread-scope: rootMessageId = anchor (real thread root).
     // For chat-scope:   rootMessageId = the message_id that triggered this auto-create
     //                   (used as audit trail; routing key is chatId).
@@ -2324,8 +2561,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // Bot-started handoff sessions have no human owner; keeping the bot as
     // owner makes daemon-generated footers wake that bot again.
     const ownerOpenId = isForeignBot ? undefined : senderOId;
+    const ownerUnionId = isForeignBot ? undefined : senderUId;
     session.larkAppId = larkAppId;
     session.ownerOpenId = ownerOpenId;
+    session.ownerUnionId = ownerUnionId;
     session.lastCallerOpenId = senderOId;
     session.quoteTargetId = parsed.messageId;
     session.quoteTargetSenderOpenId = senderOId;
@@ -2563,9 +2802,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     pid: process.pid,
     startedAt: Date.now(),
     lastHeartbeat: Date.now(),
-    // Strip email-form entries — the dashboard only needs resolved open_ids,
-    // and the email→open_id resolution below will rewrite this field.
-    resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => !u.includes('@')),
+    // Dashboard create-group only consumes app-scoped open_ids — publish ONLY
+    // ou_ entries. Before the resolution below runs, the list may still hold raw
+    // email/on_ forms; emitting only ou_ avoids a startup race where the dashboard
+    // briefly sees an unusable on_/email (the resolution below rewrites this field).
+    resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
   };
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
@@ -2583,6 +2824,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
+  // Wire the workflow runner for /api/trigger (kind=workflow): reuse the same
+  // heavy deps as the catalog run route.
+  setWorkflowRunner((input) => triggerWorkflowRun(input, workflowTriggerDeps()));
   // Seed dashboard IPC botName with the bot's config id; the friendly name from
   // /bot/v3/info is wired into the registry descriptor (below) but the IPC server
   // also needs its own copy for SessionRow.botName.
@@ -2596,6 +2840,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 127.0.0.1 only since the dashboard sibling runs on the same host.
   const ipcHandle = await startIpcServer({ port: ipcPort, host: '127.0.0.1' });
   logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
+
+  // Single reverse-proxy port that fronts every session's web terminal under
+  // /s/{sessionId}, so dev-machine users forward one port (proxyBasePort+idx)
+  // instead of one per topic. Bound on the public host so `ssh -L` can reach it.
+  const proxyPort = config.web.proxyBasePort + idx;
+  let terminalProxy: TerminalProxyHandle | null = null;
+  try {
+    terminalProxy = await startTerminalProxy({
+      port: proxyPort,
+      host: config.web.host,
+      resolvePort: (sessionId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
+        }
+        return undefined;
+      },
+    });
+    // Only mark the proxy live after a successful bind — buildTerminalUrl then
+    // falls back to the worker's own port so links stay reachable if the port
+    // was taken (e.g. EADDRINUSE).
+    setTerminalProxyPort(terminalProxy.port);
+    logger.info(`[terminal-proxy] listening on ${config.web.host}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
+  } catch (err) {
+    logger.error(`[terminal-proxy] failed to bind port ${proxyPort} — falling back to direct worker ports for terminal links: ${(err as Error).message}`);
+  }
 
   // Now that the IPC port is actually listening, publish the descriptor so
   // the dashboard can discover us and successfully fetch /api/sessions etc.
@@ -2617,8 +2886,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Resolve allowed users per bot
     if (bot.resolvedAllowedUsers.length > 0) {
-      const hasEmails = bot.resolvedAllowedUsers.some(u => u.includes('@'));
-      if (hasEmails) {
+      // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
+      // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
+      const needsResolve = bot.resolvedAllowedUsers.some(u => u.includes('@') || u.startsWith('on_'));
+      if (needsResolve) {
         try {
           // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。
           const { resolved, map } = await resolveAllowedUsersWithMap(cfg.larkAppId, bot.resolvedAllowedUsers);
@@ -2633,7 +2904,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // dashboard's create-group flow can pick this bot as creator using the
       // operator's scope-correct open_id. Best-effort; the periodic heartbeat
       // will eventually catch up too.
-      desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => !u.includes('@'));
+      desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     }
 
@@ -2662,11 +2933,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
     });
 
+    // 主动开工 — 场景①: the bot.added event can't be self-verified via API, and
+    // if it isn't subscribed the handler simply never fires (no runtime signal).
+    // Surface a startup breadcrumb whenever the toggle is on so a misconfigured
+    // event subscription is at least visible in the logs.
+    if (cfg.autoStartOnGroupJoin) {
+      logger.info(
+        `[auto-start:入群] ${cfg.larkAppId} autoStartOnGroupJoin 已开启 —— ` +
+        `请确认飞书开放平台已订阅事件 im.chat.member.bot.added_v1 且开通群成员读取权限，否则被拉群不会触发。`,
+      );
+    }
+
     // Start event dispatcher for this bot
     startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
       handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
+      handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Evict it from the routing map so subsequent inbound messages can land
@@ -2685,7 +2968,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   // Restore active sessions from previous run
-  restoreActiveSessions(activeSessions);
+  await restoreActiveSessions(activeSessions);
 
   await attachColdWorkflowRuns(cfg.larkAppId);
 
@@ -2719,6 +3002,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
+    if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
     const pendingExits: Array<Promise<void>> = [];
     const survivors: ChildProcess[] = [];

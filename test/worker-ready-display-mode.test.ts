@@ -244,4 +244,31 @@ describe('Worker ready: set_display_mode re-sync', () => {
       expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
     );
   });
+
+  // Regression: a re-fork that happens while streamCardPending is true (new turn
+  // + worker had exited, e.g. resume) used to POST the "starting" card via the
+  // ready path but leave streamCardPending=true. The next screen_update then took
+  // the new-card POST branch and emitted a SECOND card ("working"), orphaning the
+  // "starting" card (never frozen → recallFrozenCards can't withdraw it). The
+  // ready POST path must clear streamCardPending so subsequent screen_updates
+  // PATCH this card in place instead.
+  it('POST path clears streamCardPending so the next screen_update PATCHes (no duplicate card)', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      displayMode: 'hidden',
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    // POSTed exactly one card and committed its id.
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(ds.streamCardId).toBe('om_new_card');
+    // Flag cleared → a later screen_update will PATCH, not POST a 2nd card.
+    expect(ds.streamCardPending).toBe(false);
+  });
 });

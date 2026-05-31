@@ -535,18 +535,41 @@ describe('TmuxPipeBackend.kill', () => {
 });
 
 describe('TmuxPipeBackend.onData', () => {
-  it('forwards fifo bytes to registered listeners', () => {
+  function lastStream() {
+    return vi.mocked(createReadStream).mock.results.at(-1)!.value as any;
+  }
+
+  it('forwards a whole fifo chunk to registered listeners', () => {
     const be = new TmuxPipeBackend('0:2.0');
     be.spawn('', [], spawnOpts());
     const received: string[] = [];
     be.onData(d => received.push(d));
 
-    // Simulate the fifo emitting a chunk by reaching into the mock stream.
-    // We re-derive the createReadStream return by accessing private state
-    // through a fresh call — here we trust that the stream's 'data' handler
-    // was registered (verified separately by build & runtime).
-    // For coverage, a follow-up integration test in the e2e suite drives a
-    // real tmux pipe-pane.
-    expect(received).toEqual([]);
+    lastStream().emit('data', Buffer.from('hello 你好\n', 'utf8'));
+    expect(received).toEqual(['hello 你好\n']);
+  });
+
+  it('reassembles a multi-byte char split across two chunks (no U+FFFD)', () => {
+    // Regression: the fifo emits raw Buffers at libuv's 64KB highWaterMark,
+    // which can fall mid-character. Decoding each chunk independently with
+    // chunk.toString('utf8') split one wide glyph into replacement chars and
+    // shifted every following column — the intermittent web-terminal "错位"
+    // during CLI re-renders. StringDecoder must buffer the partial bytes.
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    const received: string[] = [];
+    be.onData(d => received.push(d));
+
+    // `┌`(0xE2 0x94 0x8C) and `─`(0xE2 0x94 0x80) are 3 bytes each. Cut one
+    // byte into `─` so that character straddles the chunk boundary, exactly
+    // like a 64KB split during a full-screen redraw.
+    const full = Buffer.from('┌─┐', 'utf8');
+    const stream = lastStream();
+    stream.emit('data', full.subarray(0, 4)); // `┌` + first byte of `─`
+    stream.emit('data', full.subarray(4));    // remaining bytes of `─` + `┐`
+
+    const joined = received.join('');
+    expect(joined).toBe('┌─┐');
+    expect(joined).not.toContain('�');
   });
 });

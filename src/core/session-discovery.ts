@@ -43,6 +43,16 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   hermes: 'hermes',
 };
 
+function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
+  const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
+  const direct = CLI_COMM_MAP[comm] ?? CLI_COMM_MAP[normalizedComm];
+  // MTR is an OpenCode fork and some installs still expose the underlying
+  // native process as "opencode". When an MTR bot asks to adopt, treat that
+  // process as MTR so the bot's filter does not hide its own sessions.
+  if (filterCliId === 'mtr' && direct === 'opencode') return 'mtr';
+  return direct;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Minimal shell-escape for tmux targets. */
@@ -155,6 +165,7 @@ function getChildPids(pid: number): number[] {
 function findCliProcess(
   rootPid: number,
   maxDepth: number,
+  filterCliId?: CliId,
 ): { pid: number; cliId: CliId } | undefined {
   // BFS through the process tree
   let current = [rootPid];
@@ -164,8 +175,9 @@ function findCliProcess(
 
     for (const pid of current) {
       const comm = readComm(pid);
-      if (comm && comm in CLI_COMM_MAP) {
-        return { pid, cliId: CLI_COMM_MAP[comm]! };
+      if (comm) {
+        const cliId = cliIdForComm(comm, filterCliId);
+        if (cliId) return { pid, cliId };
       }
       next.push(...getChildPids(pid));
     }
@@ -257,7 +269,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
     if (sessionName?.startsWith('bmx-')) continue;
 
     // 3. Recursively search process tree for known CLI binaries (up to 3 levels)
-    const match = findCliProcess(panePid, 3);
+    const match = findCliProcess(panePid, 3, filterCliId);
     if (!match) continue;
 
     // 3b. Filter by CLI type if requested

@@ -329,6 +329,68 @@ describe('discoverAdoptableSessions', () => {
     expect(results[0]!.cwd).toBe('/workspace/mtr');
   });
 
+  it('should treat OpenCode comm as MTR when the MTR bot filters adopt sessions', () => {
+    setupMocks({
+      paneLines: 'mtrsession:0.0 1000\n',
+      commMap: { 1000: 'opencode' },
+      cwdMap: { 1000: '/workspace/mtr' },
+      dimsMap: { 'mtrsession:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions('mtr');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('mtr');
+    expect(results[0]!.cwd).toBe('/workspace/mtr');
+  });
+
+  it('should treat dot-prefixed OpenCode comm as MTR when the MTR bot filters adopt sessions', () => {
+    setupMocks({
+      paneLines: 'mtrsession:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'node', 1002: '.opencode' },
+      childMap: { 1000: [1001], 1001: [1002] },
+      cwdMap: { 1002: '/workspace/mtr' },
+      dimsMap: { 'mtrsession:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions('mtr');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('mtr');
+    expect(results[0]!.cliPid).toBe(1002);
+    expect(results[0]!.cwd).toBe('/workspace/mtr');
+  });
+
+  it('should keep OpenCode comm as OpenCode when the OpenCode bot filters adopt sessions', () => {
+    setupMocks({
+      paneLines: 'opencode:0.0 1000\n',
+      commMap: { 1000: 'opencode' },
+      cwdMap: { 1000: '/workspace/opencode' },
+      dimsMap: { 'opencode:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions('opencode');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('opencode');
+    expect(results[0]!.cwd).toBe('/workspace/opencode');
+  });
+
+  it('should keep dot-prefixed OpenCode comm as OpenCode when the OpenCode bot filters adopt sessions', () => {
+    setupMocks({
+      paneLines: 'opencode:0.0 1000\n',
+      commMap: { 1000: '.opencode' },
+      cwdMap: { 1000: '/workspace/opencode' },
+      dimsMap: { 'opencode:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions('opencode');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('opencode');
+    expect(results[0]!.cwd).toBe('/workspace/opencode');
+  });
+
   it('should detect Hermes CLI process', () => {
     setupMocks({
       paneLines: 'hermessession:0.0 1000\n',

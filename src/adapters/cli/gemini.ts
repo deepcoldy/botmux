@@ -12,10 +12,10 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     id: 'gemini',
     resolvedBin: bin,
 
-    buildArgs({ initialPrompt, model }) {
+    buildArgs({ initialPrompt, model, disableCliBypass }) {
       // Gemini CLI manages sessions internally (--resume takes "latest" or
       // an index/UUID, not our daemon session IDs).  We always start fresh.
-      const args = ['--yolo'];
+      const args = disableCliBypass ? [] : ['--yolo'];
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }

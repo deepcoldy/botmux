@@ -8,9 +8,10 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getAllBots, isChatOncallBoundForAnyBot, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage } from './client.js';
+import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
+import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
@@ -378,8 +379,10 @@ const INTRODUCE_RE = /^\/introduce(?:\s|$)/i;
  * If `message` is a /introduce command, side-effect it (record observed bots
  * + send ack) and return `true` so the caller skips normal CLI routing.
  *
+ * /introduce 不需要任何授权：它只是把群里别的 bot 记进花名册（observed），不授予
+ * 任何对话/操作权，所以群里任何人都能用（与 /grant 的 owner 强闸门相反）。
+ *
  * Consumed without side effects (still returns true) when:
- * - sender is not in allowedUsers — silent drop, do not surface "无操作权限"
  * - mentions[] minus self is empty — nothing to learn, ignore quietly
  *
  * Writes ALL mentions including self to the store. Each receiving bot's
@@ -391,7 +394,6 @@ export async function tryHandleIntroduceCommand(
   larkAppId: string,
   message: any,
   senderOpenId: string | undefined,
-  isAllowed: boolean,
 ): Promise<boolean> {
   const text = extractMessageTextForRouting(message);
   if (!text) return false;
@@ -399,11 +401,7 @@ export async function tryHandleIntroduceCommand(
   // tolerate names with spaces) before checking the command position.
   const stripped = stripLeadingMentions(text.trim(), message?.mentions ?? []);
   if (!INTRODUCE_RE.test(stripped)) return false;
-
-  if (!isAllowed) {
-    logger.debug(`[${larkAppId}] /introduce from non-allowed user ${senderOpenId} — silent drop`);
-    return true;
-  }
+  logger.debug(`[${larkAppId}] /introduce from ${senderOpenId ?? 'unknown'} (no auth required)`);
 
   if (grantCommandRestriction(larkAppId, message.chat_id, senderOpenId).blocked) {
     const loc = localeForBot(larkAppId);
@@ -425,17 +423,26 @@ export async function tryHandleIntroduceCommand(
   }
 
   const chatId = message.chat_id as string;
+  // 查通讯录剔除真人：花名册只收 bot——真人混进去会污染 <available_bots> 误导模型，
+  // 且不必再「靠人自觉」只 @ bot。self 始终保留（它是本 app open_id 的权威自记录）。
+  // 缺 contact 读权限时 isHumanOpenId 一律返回 false → 退回「全部登记」旧行为（见其注释）。
+  const humanFlags = await Promise.all(
+    all.map(m => (m.openId === selfOpenId ? Promise.resolve(false) : isHumanOpenId(larkAppId, m.openId).catch(() => false))),
+  );
+  const bots = all.filter((_, i) => !humanFlags[i]);
   try {
     // Persist to the observer-scoped store: these open_ids are scoped to the
     // receiving app (larkAppId), so they're correct for THIS daemon to use
     // when @-mentioning back.
-    recordObservedBots(config.session.dataDir, larkAppId, chatId, all, 'introduce');
+    recordObservedBots(config.session.dataDir, larkAppId, chatId, bots, 'introduce');
   } catch (err) {
     logger.warn(`[${larkAppId}] /introduce: failed to persist observed bots: ${err}`);
   }
 
-  const items = all.map(m => `@${m.name}`).join(' ');
-  const ackText = `✅ 已认识本群 ${all.length} 个伙伴：${items}`;
+  const externalBots = bots.filter(m => m.openId !== selfOpenId);
+  const ackText = externalBots.length
+    ? `✅ 已认识本群 ${externalBots.length} 个伙伴：${externalBots.map(m => `@${m.name}`).join(' ')}`
+    : `ℹ️ 没有可登记的机器人（/introduce 只登记机器人，@ 的若是真人会被忽略）`;
   try {
     await replyMessage(larkAppId, message.message_id, ackText);
   } catch (err) {
@@ -597,7 +604,7 @@ async function maybeSendGrantRequestCard(
     ?? requesterOpenId;
   const nonce = openPending(larkAppId, chatId, requesterOpenId);
   const card = buildGrantCard(
-    { ownerOpenId: owner, requesterOpenId, requesterName: String(name), chatId, nonce, mode: 'request' },
+    { ownerOpenId: owner, targets: [{ openId: requesterOpenId, name: String(name) }], chatId, nonce, mode: 'request' },
     localeForBot(larkAppId),
   );
   await replyMessage(larkAppId, message.message_id, card, 'interactive')
@@ -663,6 +670,11 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** 主动开工 — 场景①: fired when this bot is added to a chat
+   *  (`im.chat.member.bot.added_v1`). The daemon decides whether to auto-start
+   *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
+   *  Best-effort fire-and-forget. `operatorOpenId` is who added the bot. */
+  handleBotAdded?: (chatId: string, operatorOpenId: string | undefined, larkAppId: string) => Promise<void>;
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
@@ -805,6 +817,20 @@ export async function decideRouting(
  */
 export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers): Lark.WSClient {
   const eventDispatcher = new Lark.EventDispatcher({}).register({
+    // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
+    // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
+    // Requires this event to be subscribed for the app in the Feishu console.
+    'im.chat.member.bot.added_v1': async (data: any) => {
+      try {
+        const chatId: string | undefined = data?.chat_id;
+        const operatorOpenId: string | undefined = data?.operator_id?.open_id;
+        if (!chatId) return;
+        logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
+        await handlers.handleBotAdded?.(chatId, operatorOpenId, larkAppId);
+      } catch (err) {
+        logger.error(`Error handling bot-added event: ${err}`);
+      }
+    },
     'card.action.trigger': async (data: any) => {
       try {
         const result = await handlers.handleCardAction(data, larkAppId);
@@ -907,8 +933,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
         // /introduce — collaboration handshake. Intercept before any routing
         // so the command never reaches a CLI session (each @ed bot's daemon
-        // independently records the mentions[] open_ids + names).
-        if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        // independently records the mentions[] open_ids + names). 无需授权：
+        // 任何人都能登记花名册（只记 observed，不授予任何权限）。
+        if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId)) {
           return;
         }
 
@@ -965,6 +992,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             routing.anchor = chatId;
           }
         }
+
+        // 主动开工 — 场景②: capture the genuine routing shape NOW, before the
+        // `/t` override below can mutate a 普通群 chat-scope into thread-scope.
+        // decideRouting only yields {thread, anchor=messageId} for a real
+        // 话题群 new-topic seed; a non-@ `/t …` in a 普通群 must NOT count as one
+        // (FR-7), so auto-topic eligibility keys off the pre-override values.
+        const autoTopicSeedScope = routing.scope;
+        const autoTopicSeedAnchor = routing.anchor;
 
         // /t / /topic in 普通群: flip routing to thread-scope so the bot's
         // first reply seeds a fresh Lark thread, even if a chat-scope session
@@ -1024,8 +1059,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               return;
             }
             if (access === 'ignore') {
-              logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
-              return;
+              // 主动开工 — 场景②: a non-@ message that seeds a brand-new topic in
+              // a 话题群 auto-starts a session when the bot opted in. Everything
+              // else (regular-group chatter, thread replies, disabled bots) keeps
+              // the original ignore. Sender is intentionally not gated (D4).
+              const autoTopic = shouldAutoStartOnNewTopic({
+                enabled: getBot(larkAppId).config.autoStartOnNewTopic === true,
+                scope: autoTopicSeedScope,
+                anchor: autoTopicSeedAnchor,
+                messageId,
+                chatType,
+                ownsSession,
+              });
+              if (!autoTopic) {
+                logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
+                return;
+              }
+              logger.info(`[auto-start:新话题] ${chatId.substring(0, 12)} 新话题免@自动开工 msg=${messageId.substring(0, 12)}`);
             }
           }
         } else if (!isAllowed) {

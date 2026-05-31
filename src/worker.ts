@@ -30,6 +30,7 @@ import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
+import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -48,6 +49,7 @@ import {
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
+import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -61,6 +63,7 @@ import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
 import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
+import { redactChildEnv } from './utils/child-env.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
@@ -237,6 +240,9 @@ let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
+let mtrBridgeSource: MtrTranscriptSource | undefined;
+let mtrBridgeOffset = 0;
+let mtrBridgeBaselineDone = false;
 /** Codex sessionId we received via writeInput but haven't yet resolved a
  *  rollout file for. The poller keeps retrying — the file appears on
  *  Codex's first user submit, but with some race delay after our submit
@@ -1306,7 +1312,7 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
   // when the model forgets to call `botmux send`.
-  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes';
+  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes' || lastInitConfig?.cliId === 'mtr';
 }
 
 function structuredBridgeIsCodex(): boolean {
@@ -1315,6 +1321,10 @@ function structuredBridgeIsCodex(): boolean {
 
 function structuredBridgeIsHermes(): boolean {
   return lastInitConfig?.cliId === 'hermes';
+}
+
+function structuredBridgeIsMtr(): boolean {
+  return lastInitConfig?.cliId === 'mtr';
 }
 
 function structuredBridgeIngestPath(path: string, offset: number) {
@@ -1344,6 +1354,23 @@ function codexBridgeStartTimer(): void {
       if (structuredBridgeIsHermes()) {
         if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastInitConfig?.resume ? 'baseline-existing' : 'fresh-empty');
         hermesBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+        return;
+      }
+      if (structuredBridgeIsMtr()) {
+        if (!mtrBridgeSource) {
+          const source =
+            findMtrSessionById(codexBridgePendingSessionId)
+            ?? (lastInitConfig?.adoptMode
+              ? findLatestMtrSessionByDirectory(lastInitConfig.adoptCwd ?? lastInitConfig.workingDir)
+              : undefined);
+          if (source) {
+            codexBridgePendingSessionId = undefined;
+            codexAdoptPendingPid = undefined;
+            mtrBridgeAttach(source, lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty');
+          }
+        }
+        mtrBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -1406,6 +1433,43 @@ function hermesBridgeIngest(): void {
   if (!hermesBridgeBaselineDone) return;
   const result = drainHermesStateDb(hermesBridgeOffset);
   hermesBridgeOffset = result.newOffset;
+  codexBridgeQueue.ingest(result.events);
+  if (result.events.some(e => e.kind === 'assistant_final')) {
+    idleDetector?.fireIdle();
+  }
+}
+
+function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' | 'fresh-empty' | 'split-live'): void {
+  mtrBridgeSource = source;
+  if (mode === 'split-live') {
+    const result = drainMtrSession(source, 0);
+    const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
+    const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
+    codexBridgeQueue.absorb(history);
+    codexBridgeQueue.ingest(live);
+    mtrBridgeOffset = result.newOffset;
+    mtrBridgeBaselineDone = true;
+    log(`MTR bridge split-live: ${source.dbPath}#${source.sessionId} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${mtrBridgeOffset})`);
+    maybeEmitCodexAdoptPreamble(history);
+  } else if (mode === 'baseline-existing') {
+    const baseline = currentMtrSessionOffset(source);
+    const result = drainMtrSession(source, baseline);
+    codexBridgeQueue.absorb(result.events);
+    mtrBridgeOffset = Math.max(baseline, result.newOffset);
+    mtrBridgeBaselineDone = true;
+    log(`MTR bridge baselined: ${source.dbPath}#${source.sessionId} (offset=${mtrBridgeOffset}, absorbed=${result.events.length})`);
+  } else {
+    mtrBridgeOffset = 0;
+    mtrBridgeBaselineDone = true;
+    log(`MTR bridge fresh-empty: ${source.dbPath}#${source.sessionId}`);
+  }
+  codexBridgeStartTimer();
+}
+
+function mtrBridgeIngest(): void {
+  if (!mtrBridgeBaselineDone || !mtrBridgeSource) return;
+  const result = drainMtrSession(mtrBridgeSource, mtrBridgeOffset);
+  mtrBridgeOffset = result.newOffset;
   codexBridgeQueue.ingest(result.events);
   if (result.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
@@ -1485,6 +1549,17 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive() || codexBridgeRolloutPath) return;
+  if (structuredBridgeIsMtr()) {
+    const source = findMtrSessionById(cliSessionId);
+    if (source) {
+      codexBridgePendingSessionId = undefined;
+      mtrBridgeAttach(source, 'fresh-empty');
+    } else {
+      codexBridgePendingSessionId = cliSessionId;
+      codexBridgeStartTimer();
+    }
+    return;
+  }
   const path = findCodexRolloutBySessionId(cliSessionId);
   if (path) {
     codexBridgePendingSessionId = undefined;
@@ -1498,6 +1573,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
 function codexBridgeIngest(): void {
   if (structuredBridgeIsHermes()) {
     hermesBridgeIngest();
+    return;
+  }
+  if (structuredBridgeIsMtr()) {
+    mtrBridgeIngest();
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
@@ -1528,7 +1607,7 @@ function codexBridgeMarkPendingTurn(messageText: string): boolean {
 
 function codexBridgeDrainAndMaybeEmit(): void {
   if (!codexBridgeFallbackActive()) return;
-  if (structuredBridgeIsHermes() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
+  if (structuredBridgeIsHermes() || structuredBridgeIsMtr() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
     try { codexBridgeIngest(); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
   }
   emitReadyCodexTurns();
@@ -1598,6 +1677,9 @@ function stopCodexBridge(): void {
   codexBridgeBaselineDone = false;
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
+  mtrBridgeSource = undefined;
+  mtrBridgeOffset = 0;
+  mtrBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2390,21 +2472,23 @@ async function flushPending(): Promise<void> {
   // so the gate window is correct), Claude bridge can run with type-ahead
   // again.
   //
-  // CoCo (0.120.32+) also tolerates type-ahead, but for a different reason
-  // than Claude: it parks a submit-while-busy message in its own TUI queue
-  // ("↑ Press up to edit queued messages") and only writes the user event to
-  // events.jsonl when it DEQUEUES and starts processing it — i.e. AFTER the
-  // previous turn's assistant_final. So the transcript stays strictly
-  // interleaved (user1 → asst1 → user2 → asst2) and CodexBridgeQueue's
-  // single-`collecting` attribution stays correct without the queued_command
-  // upgrade Claude needed. (The submit log history.jsonl, which the adapter's
-  // writeInput verification polls, IS written at submit time even for a queued
-  // message, so verification doesn't spuriously fail either.) Only the Codex
-  // rollout bridge stays serial — its queue hasn't been validated for the
-  // back-to-back user_message ordering that type-ahead can produce there.
+  // CoCo (0.120.32+) and Codex (0.134.0+) also tolerate type-ahead, but for a
+  // different reason than Claude: they park a submit-while-busy message in the
+  // TUI's own queue (CoCo: "↑ Press up to edit queued messages"; Codex:
+  // "Messages to be submitted after next tool call"). CoCo writes the queued
+  // user event only at DEQUEUE time, so its transcript stays strictly
+  // interleaved (user1 → asst1 → user2 → asst2). Codex is an active-turn STEER:
+  // a tool-running turn pulls the queued input into the SAME turn and emits one
+  // merged final (user1 → user2 → assistant_final). CodexBridgeQueue copes with
+  // both via HOL-block-drop (see codex-bridge-queue.ts) plus the markTimeMs
+  // dequeue-time override — no queued_command upgrade like Claude's. (The
+  // submit log history.jsonl, which the adapter's writeInput verification
+  // polls, IS written at submit time even for a parked message, so verification
+  // doesn't spuriously fail either.) All behaviours verified empirically —
+  // Codex on codex-cli 0.134.0.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !structuredBridgeIsCodex();
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead;
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
@@ -2471,18 +2555,14 @@ async function flushPending(): Promise<void> {
       if (result && result.submitted === false && backend) {
         scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, turnSeq);
       }
-      // Codex rollout bridge: stop after one writeInput per idle cycle.
-      // Codex's bridge queue doesn't yet attribute queued_command-equivalents,
-      // so type-ahead'd submits would have their assistant text dropped or
-      // mis-attributed. We resume on the next idle, by which point Codex
-      // has finished and the next message can be a normal user_message
-      // submit. Claude bridge and CoCo no longer take this break — Claude's
-      // BridgeTurnQueue handles `attachment(queued_command)` events
-      // identically to `role:user`, and CoCo parks queued submits in its own
-      // TUI queue (writing the events.jsonl user event only at dequeue time),
-      // so both keep the transcript interleaved and attribute correctly. We
-      // WANT CoCo to drain all pending here so they land in its TUI queue.
-      if (structuredBridgeIsCodex() && pendingMessages.length > 0) break;
+      // All structured bridges now drain every pending message in one flush:
+      // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
+      // identically to `role:user`; CoCo parks queued submits in its TUI queue
+      // and writes the user event at dequeue time (transcript stays interleaved);
+      // Codex parks them too but steers them into the active turn (which can
+      // merge into one final), and CodexBridgeQueue's HOL-block-drop attributes
+      // that correctly. We WANT them to drain all pending here so the extras
+      // land in the TUI queue rather than waiting for the next idle.
     }
   } finally {
     isFlushing = false;
@@ -2505,12 +2585,12 @@ function sendToPty(content: string): void {
     // Tear down the prompt card so the user doesn't see stale options.
     send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
   }
-  // See flushPending: only the Codex rollout bridge still serialises
-  // type-ahead. Claude attributes `attachment(queued_command)` events
-  // identically to `role:user`, and CoCo parks queued submits in its own TUI
-  // queue, so both land type-ahead'd submits in the right turn — only Codex
-  // needs the entry path gated.
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !structuredBridgeIsCodex();
+  // See flushPending: type-ahead adapters flush even while the CLI is busy.
+  // Claude attributes `attachment(queued_command)` identically to `role:user`;
+  // CoCo parks queued submits and writes the user event at dequeue time; Codex
+  // parks them but steers into the active turn — CodexBridgeQueue's
+  // HOL-block-drop attributes the (possibly merged) result correctly.
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead;
   if (isPromptReady || isFlushing || typeAheadAllowed) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
@@ -2689,6 +2769,20 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       // The 1s timer covers ingest + emit even when the watcher never armed,
       // and is idempotent (no-op if already started).
       codexBridgeStartTimer();
+    } else if (cfg.cliId === 'mtr') {
+      const adoptStartMs = Date.now();
+      codexAdoptStartMs = adoptStartMs;
+      codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+      const source =
+        findMtrSessionById(cfg.cliSessionId)
+        ?? findLatestMtrSessionByDirectory(cfg.adoptCwd ?? cfg.workingDir);
+      if (source) {
+        codexBridgePendingSessionId = undefined;
+        mtrBridgeAttach(source, 'split-live');
+      } else {
+        codexBridgeStartTimer();
+      }
     }
 
     // Idle detection. In bridge mode we use the adopted CLI's real
@@ -2697,7 +2791,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // minimal output-quiescence-only detector.
     const idleAdapter = cfg.bridgeJsonlPath
       ? createCliAdapterSync('claude-code', undefined)
-      : cfg.cliId === 'codex' || cfg.cliId === 'coco'
+      : cfg.cliId === 'codex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr'
         ? createCliAdapterSync(cfg.cliId, undefined)
         : ({ completionPattern: undefined, readyPattern: undefined } as any);
     idleDetector = new IdleDetector(idleAdapter);
@@ -2712,6 +2806,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // this failure mode and we don't want to risk regressing them.
     if (cfg.cliId === 'codex') {
       cliAdapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+    } else if (cfg.cliId === 'mtr') {
+      cliAdapter = createCliAdapterSync('mtr', cfg.cliPathOverride);
     }
     idleDetector.onIdle(() => {
       log('Prompt detected (idle) — adopt mode');
@@ -2774,6 +2870,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
     model: cfg.model,
+    disableCliBypass: cfg.disableCliBypass === true,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -2814,23 +2911,32 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
   }
 
+  // Build the child env. redactChildEnv() DELETES the keys that must not leak
+  // (the bot's bare LARK_APP_* creds + CLAUDECODE) rather than setting them to
+  // `undefined`: node-pty stringifies an `undefined` env value to the literal
+  // string "undefined" instead of omitting the key, so `{ ...env, LARK_APP_ID:
+  // undefined }` would leave LARK_APP_ID="undefined" visible to the child and
+  // any SDK probing `process.env.LARK_APP_ID` would still take the Lark path.
+  // The child needs neither bare cred: `botmux send` resolves creds from
+  // bots.json on disk (im/lark/client.ts), `botmux ask` routes via the
+  // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
+  // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
+  const childEnv = redactChildEnv(process.env);
+  // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
+  // daemon socket, route the card back to this thread, and resolve the
+  // approver allowlist against session.owner. Missing env → exit 2.
+  childEnv.BOTMUX_SESSION_ID = cfg.sessionId;
+  childEnv.BOTMUX_CHAT_ID = cfg.chatId;
+  childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
+  if (claudeResumeTokenThreshold) childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = claudeResumeTokenThreshold;
+
   backend.spawn(cliAdapter.resolvedBin, args, {
     cwd: cfg.workingDir,
     cols: PTY_COLS,
     rows: PTY_ROWS,
-    env: {
-      ...process.env,
-      CLAUDECODE: undefined,
-      // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find
-      // the daemon socket, route the card back to this thread, and resolve
-      // the approver allowlist against session.owner. Missing env → exit 2.
-      BOTMUX_SESSION_ID: cfg.sessionId,
-      BOTMUX_CHAT_ID: cfg.chatId,
-      BOTMUX_LARK_APP_ID: cfg.larkAppId,
-      BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId,
-      ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
-      ...(claudeResumeTokenThreshold ? { CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: claudeResumeTokenThreshold } : {}),
-    } as unknown as Record<string, string>,
+    env: childEnv as Record<string, string>,
   });
 
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)
@@ -2887,8 +2993,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // calling `botmux send`, harvest the final answer from the CLI transcript
   // and post it to Lark. Codex needs late attach because its rollout id is
   // discovered after the first submit; CoCo's events path is deterministic
-  // from botmux sessionId. Hermes uses a global SQLite store, so baseline its
-  // row id at spawn and poll for rows after each queued prompt is flushed.
+  // from botmux sessionId. Hermes and MTR use SQLite stores, so baseline the
+  // relevant cursor at spawn and poll for rows after each queued prompt flushes.
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(cfg.resume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
@@ -2907,6 +3013,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     const eventsPath = cocoEventsPathForSession(cfg.sessionId);
     codexBridgeAttach(eventsPath, cfg.resume ? 'baseline-existing' : 'fresh-empty');
     codexBridgeStartTimer();
+  } else if (cfg.cliId === 'mtr') {
+    const mtrSessionId = cfg.cliSessionId ?? mtrSessionIdForBotmuxSession(cfg.sessionId);
+    codexBridgePendingSessionId = mtrSessionId;
+    const source = findMtrSessionById(mtrSessionId);
+    if (source) {
+      mtrBridgeAttach(source, cfg.resume ? 'baseline-existing' : 'fresh-empty');
+    } else {
+      codexBridgeStartTimer();
+    }
   }
 
   // Set up idle detection
@@ -3155,6 +3270,18 @@ body{display:flex;flex-direction:column}
 #toolbar button:active{background:#7aa2f7;color:#1a1b26}
 #terminal{flex:1;min-height:0}
 #terminal .xterm{height:100%}
+/* Real scroll container is xterm's own viewport — kill iOS rubber-band bounce
+   and momentum here (not just on body), and reserve gestures for pinch-zoom so
+   single-finger drag is driven manually by the touch handler below. */
+#terminal .xterm-viewport{overscroll-behavior:none;-webkit-overflow-scrolling:auto;touch-action:pinch-zoom}
+/* On touch, glyph cells are selectable text — a finger-drag over text starts
+   native text selection (and the long-press callout) instead of scrolling,
+   which is why blank areas scroll fine but text areas stall/won't move.
+   Kill selection + callout on the rendered content so every drag is a clean
+   scroll.  Gated to .touch so desktop keeps mouse text-selection for copy. */
+body.touch #terminal .xterm-screen,
+body.touch #terminal .xterm-screen *{
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:pinch-zoom}
 #status{position:fixed;top:8px;right:12px;z-index:10;font:12px monospace;
   color:#565f89;background:#1a1b26cc;padding:2px 8px;border-radius:4px}
 #status.ok{color:#9ece6a}
@@ -3184,10 +3311,11 @@ body{display:flex;flex-direction:column}
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0/lib/addon-web-links.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0/lib/addon-unicode11.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0/lib/addon-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0/lib/addon-canvas.min.js"></script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
-if(isTouch)document.getElementById('vp').content='width=1100,viewport-fit=cover';
+if(isTouch){document.getElementById('vp').content='width=1100,viewport-fit=cover';document.body.classList.add('touch');}
 var hasToken=${hasWrite};
 if(!hasToken){var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
 
@@ -3205,6 +3333,17 @@ term.loadAddon(new WebLinksAddon.WebLinksAddon());
 term.loadAddon(new Unicode11Addon.Unicode11Addon());
 term.unicode.activeVersion='11';
 term.open(document.getElementById('terminal'));
+// GPU/canvas renderer.  The default DOM renderer repaints every text span on
+// each scroll frame, which is exactly what makes scrolling over text-heavy
+// areas janky/stuck on mobile (blank areas are cheap, so they stayed smooth).
+// Prefer WebGL, fall back to Canvas, then to the built-in DOM renderer.
+try{
+  var _webgl=new WebglAddon.WebglAddon();
+  _webgl.onContextLoss(function(){try{_webgl.dispose()}catch(_){}});
+  term.loadAddon(_webgl);
+}catch(_e){
+  try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
+}
 fit.fit();
 // ── OSC 52 clipboard ──
 var _clipBuf='';
@@ -3251,7 +3390,12 @@ function sendResize(){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'
 window.addEventListener('resize',function(){fit.fit();sendResize()});
 (function connect(){
   var t=new URLSearchParams(location.search).get('token')||'';
-  var ws=new WebSocket('ws://'+location.host+'/?token='+t);
+  // Derive base from the current path so the WS connects to the same prefix the
+  // page was served under — works both directly (path '/') and behind the
+  // per-daemon reverse proxy ('/s/{sessionId}'). See terminal-proxy.ts.
+  var base=location.pathname.replace(/\\/+$/,'');
+  var proto=location.protocol==='https:'?'wss':'ws';
+  var ws=new WebSocket(proto+'://'+location.host+base+'/?token='+t);
   ws_=ws;ws.binaryType='arraybuffer';
   ws.onopen=function(){el.textContent='connected';el.className='ok';sendResize()};
   ws.onmessage=function(e){
@@ -3271,18 +3415,6 @@ if(!hasToken&&!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
     e.preventDefault();term.scrollLines(e.deltaY>0?3:-3);
   },{passive:false});
-}
-
-// ── Scroll helper (shared by toolbar buttons & two-finger touch) ──
-function _sendScroll(up,n){
-  n=n||3;
-  if(${isTmuxMode && !isPipeMode}){
-    // SGR mouse wheel: 64=up 65=down — tmux enters copy-mode and scrolls
-    var seq='\\x1b[<'+(up?64:65)+';1;1M';
-    for(var i=0;i<n;i++){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:seq}))}
-  }else{
-    term.scrollLines(up?-n:n);
-  }
 }
 
 // ── Touch shortcut toolbar ──
@@ -3312,30 +3444,11 @@ if(isTouch&&hasToken){
   }
 }
 
-// ── Two-finger touch scroll via Hammer.js (mobile) ──
-// Hammer distinguishes Pan (parallel drag) from Pinch (spread/squeeze)
-// internally.  Pan with pointers:2 only fires for genuine two-finger scroll.
-if(isTouch&&typeof Hammer!=='undefined'){
-  var mc=new Hammer.Manager(document.getElementById('terminal'),{touchAction:'auto',inputClass:Hammer.TouchInput});
-  var pinch=new Hammer.Pinch();
-  var pan=new Hammer.Pan({pointers:2,direction:Hammer.DIRECTION_VERTICAL,threshold:4});
-  pinch.recognizeWith(pan);
-  mc.add([pinch,pan]);
-  var _panPrevY=0,_panAcc=0;
-  mc.on('panstart',function(ev){_panPrevY=ev.center.y;_panAcc=0});
-  mc.on('panmove',function(ev){
-    var d=ev.center.y-_panPrevY;
-    _panPrevY=ev.center.y;
-    // Accumulate sub-pixel deltas; fire 1 wheel event per ~85px
-    // (tmux scrolls ~5 lines per wheel, line height ~17px)
-    _panAcc+=d;
-    var step=85;
-    while(Math.abs(_panAcc)>=step){
-      _sendScroll(_panAcc>0,1);
-      _panAcc-=(_panAcc>0?step:-step);
-    }
-  });
-}
+// Single-finger touch scrolling is handled natively by xterm's own Viewport
+// (handleTouchMove → scrollTop), so no custom handler here — a parallel one
+// would double-drive scrollTop and fight xterm.  overscroll-behavior:none on
+// .xterm-viewport (see <style>) kills the iOS rubber-band; the WebGL/Canvas
+// renderer above is what actually makes scrolling over text smooth.
 </script>
 </body>
 </html>`;

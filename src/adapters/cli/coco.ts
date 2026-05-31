@@ -119,14 +119,14 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     id: 'coco',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume, model }) {
+    buildArgs({ sessionId, resume, model, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
-      args.push('--yolo');
+      if (!disableCliBypass) args.push('--yolo');
       if (model && model.trim()) {
         // CoCo expects nested key path for model override. `model=...` exits 1,
         // while `model.name=...` starts correctly.
@@ -267,9 +267,9 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // CodexBridgeQueue's single-`collecting` attribution stays correct without
     // the queued_command upgrade Claude needed. The submit log history.jsonl
     // IS written at submit time (even for a queued message), so writeInput's
-    // verification still confirms the submit. Worker only honours type-ahead
-    // for the non-Codex structured bridge, so this flag activates CoCo while
-    // leaving Codex serial.
+    // verification still confirms the submit. Codex (0.134.0+) also runs with
+    // type-ahead, but via an active-turn steer rather than CoCo's strict
+    // dequeue-deferral — see codex.ts and CodexBridgeQueue's HOL-block-drop.
     supportsTypeAhead: true,
     altScreen: false,
     modelChoices: [

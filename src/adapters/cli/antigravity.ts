@@ -131,8 +131,8 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     id: 'antigravity',
     resolvedBin: bin,
 
-    buildArgs({ resume, resumeSessionId }) {
-      const args = ['--dangerously-skip-permissions'];
+    buildArgs({ resume, resumeSessionId, disableCliBypass }) {
+      const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
       // spawn time and ignores any value we'd pass — `--conversation`

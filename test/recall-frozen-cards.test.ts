@@ -9,6 +9,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
+import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
@@ -146,6 +147,7 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReset();
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
+  setTerminalProxyPort(8800);
 });
 
 afterEach(() => {
@@ -325,7 +327,7 @@ describe('restoreUsageLimitRuntimeState', () => {
     expect(buildStreamingCard).toHaveBeenCalledWith(
       SESSION_ID,
       'om_root',
-      'http://localhost:8080',
+      `http://localhost:8800/s/${SESSION_ID}`,
       't',
       '',
       'limited',

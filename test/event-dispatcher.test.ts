@@ -41,11 +41,15 @@ const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; n
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
+// 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
+// 需要模拟真人的用例用 mockResolvedValueOnce(true)。
+const mockIsHumanOpenId = vi.fn(async () => false);
 vi.mock('../src/im/lark/client.js', () => ({
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
+  isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -1362,6 +1366,103 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
   });
 });
 
+describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  function setupAutoTopicBot(enabled: boolean) {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', autoStartOnNewTopic: enabled },
+      botOpenId: MY_OPEN_ID,
+      // A non-empty allowlist that does NOT include the sender → canTalk(sender)
+      // is false, so an un-@ message deterministically returns 'ignore' (the
+      // path auto-topic hooks). An EMPTY allowlist means "open mode" (canTalk
+      // true), which would route through the single-user relaxation instead and
+      // never exercise the branch under test.
+      resolvedAllowedUsers: ['ou_someone_else'],
+    });
+  }
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState();
+    handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(false);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('话题群新话题（未 @）开关开 → 自动开工 (FR-6)', async () => {
+    setupAutoTopicBot(true);
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '帮我看下 README' }),
+      messageId: 'msg-topic-seed',
+      chatId: 'chat-topic-1',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-topic-seed',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('话题群新话题（未 @）开关关 → 不触发 (FR-8)', async () => {
+    setupAutoTopicBot(false);
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '随便说一句' }),
+      messageId: 'msg-topic-off',
+      chatId: 'chat-topic-2',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('普通群普通消息（未 @）开关开 → 不触发 (FR-7)', async () => {
+    setupAutoTopicBot(true);
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '群里随便聊天' }),
+      messageId: 'msg-plain',
+      chatId: 'chat-plain-1',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('普通群 /t（未 @）开关开 → 不触发：/t override 不得被误判为话题群 seed (FR-7 回归)', async () => {
+    // 回归 P1a：`/t` 会把普通群 chat-scope routing 翻成 thread+anchor=messageId；
+    // 若 auto-topic 判定看 override 后的 routing，会在普通群误开工。必须看 override 前的 routing。
+    setupAutoTopicBot(true);
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/t 偷偷开工' }),
+      messageId: 'msg-plain-forcetopic',
+      chatId: 'chat-plain-2',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
 describe('im.message.receive_v1 — /introduce command', () => {
   let handlers: ReturnType<typeof makeHandlers>;
   const OTHER_BOT_OPEN_ID_2 = 'ou_bot_c_open_id';
@@ -1373,6 +1474,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockRecordObservedBots.mockReset();
     mockReplyMessage.mockReset().mockResolvedValue('ack-msg-id');
+    mockIsHumanOpenId.mockReset().mockResolvedValue(false);
     mockGetChatMode.mockResolvedValue('topic');
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
@@ -1414,6 +1516,27 @@ describe('im.message.receive_v1 — /introduce command', () => {
         { openId: MY_OPEN_ID, name: 'BotA' },
         { openId: OTHER_BOT_OPEN_ID, name: 'BotB' },
       ].sort((a, b) => a.openId.localeCompare(b.openId)));
+  });
+
+  it('drops confirmed humans from the roster (contact lookup), keeps bots + self', async () => {
+    mockIsHumanOpenId.mockImplementation(async (_app: string, openId: string) => openId === 'ou_human');
+    const event = makeIntroduceEvent({
+      mentions: [
+        { key: '@_a', name: 'BotA', id: { open_id: MY_OPEN_ID } },        // self → kept
+        { key: '@_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } },  // bot → kept
+        { key: '@_h', name: '张三', id: { open_id: 'ou_human' } },          // human → dropped
+      ],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockRecordObservedBots).toHaveBeenCalledTimes(1);
+    const [, , , botsArg] = mockRecordObservedBots.mock.calls[0];
+    expect((botsArg as Array<{ openId: string }>).map(b => b.openId).sort())
+      .toEqual([MY_OPEN_ID, OTHER_BOT_OPEN_ID].sort());   // 张三(ou_human) filtered out
+    const ack = mockReplyMessage.mock.calls[0][2] as string;
+    expect(ack).toContain('BotB');
+    expect(ack).not.toContain('张三');
   });
 
   it('sends ack reply when /introduce is consumed', async () => {
@@ -1533,7 +1656,8 @@ describe('im.message.receive_v1 — /introduce command', () => {
       .toEqual([MY_OPEN_ID, OTHER_BOT_OPEN_ID, OTHER_BOT_OPEN_ID_2].sort());
   });
 
-  it('ignores /introduce when sender is not in allowedUsers', async () => {
+  it('allows /introduce from any user (no auth gate): records + acks, never reaches CLI', async () => {
+    // sender NOT in allowedUsers — /introduce should STILL work（只记花名册、不授权）。
     mockGetBot.mockReturnValue({
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       botOpenId: MY_OPEN_ID,
@@ -1547,9 +1671,9 @@ describe('im.message.receive_v1 — /introduce command', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(mockRecordObservedBots).not.toHaveBeenCalled();
-    expect(mockReplyMessage).not.toHaveBeenCalled();
-    // Also should not fall through to CLI handlers
+    expect(mockRecordObservedBots).toHaveBeenCalled();   // 任何人都能登记
+    expect(mockReplyMessage).toHaveBeenCalled();          // 仍然回执 ack
+    // Still intercepted: never falls through to CLI handlers
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });

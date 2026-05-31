@@ -90,15 +90,18 @@ describe('CodexBridgeQueue', () => {
     expect(ready.map(t => t.turnId)).toEqual(['t2']);
   });
 
-  it('CoCo type-ahead: both turns marked upfront, interleaved events attribute in order', () => {
-    // Models the CoCo type-ahead path: the worker writes msg1 AND msg2 to the
-    // PTY back-to-back (type-ahead), so both turns are marked before either is
-    // processed. CoCo parks msg2 in its TUI queue and writes its events.jsonl
-    // user event only at dequeue time, so the transcript the bridge ingests is
-    // strictly interleaved (user1 → asst1 → user2 → asst2). This is exactly
-    // what keeps the single-`collecting` pointer correct. Marks land at t=100
-    // while the user events arrive much later (dequeue time) — the tooOld gate
-    // (ts < markTime - 5s) must NOT trip here because events come AFTER marks.
+  it('type-ahead, interleaved transcript (CoCo always; Codex when no tool_call): both turns marked upfront attribute in order', () => {
+    // The worker writes msg1 AND msg2 to the PTY back-to-back (type-ahead), so
+    // both turns are marked before either is processed. This models the
+    // INTERLEAVED transcript shape (user1 → asst1 → user2 → asst2): CoCo always
+    // produces it (parks msg2 and writes its events.jsonl user event only at
+    // dequeue time); Codex produces it only when msg1's turn runs no tool_call
+    // (its parked input is then submitted as a fresh next turn). The single
+    // `collecting` pointer stays correct here without any HOL drop. Marks land
+    // at t=100 while the user events arrive much later — the tooOld gate
+    // (ts < markTime - 5s) must NOT trip because events come AFTER marks. (The
+    // Codex steer-merge shape — user1 → user2 → final, when msg1 runs a tool —
+    // is covered by the dedicated steer-merge tests below.)
     const q = new CodexBridgeQueue();
     q.mark('t1', 'first prompt', 100);
     q.mark('t2', 'second prompt', 100);  // type-ahead: marked ~immediately
@@ -111,6 +114,115 @@ describe('CodexBridgeQueue', () => {
     const ready = q.drainEmittable();
     expect(ready.map(t => t.turnId)).toEqual(['t1', 't2']);
     expect(ready.map(t => t.finalText)).toEqual(['first reply', 'second reply']);
+  });
+
+  it('Codex steer-merge: user2 steered into active turn before any final → t1 dropped, t2 gets merged final, no wedge', () => {
+    // codex-cli 0.134.0 active-turn steer (verified empirically): when msg1's
+    // turn runs a tool_call, msg2 is steered into the SAME turn and codex emits
+    // ONE merged final answering both. Rollout: user1 → user2 → assistant_final
+    // (no final for t1 before user2). Without HOL-block-drop the single
+    // `collecting` pointer switches to t2, the merged final closes t2, and t1
+    // stays at the queue head with no finalText → drainEmittable() wedges
+    // forever. HOL-drop discards the textless collecting t1 when user2 arrives.
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first prompt', 100);
+    q.mark('t2', 'second prompt', 100);  // type-ahead: marked ~immediately
+    q.ingest([
+      userEv('first prompt', 'u1', 5_000),
+      userEv('second prompt', 'u2', 8_000),   // steered in BEFORE any assistant_final
+      asstEv('merged reply', 'a1', 12_000),   // single combined final
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready.map(t => t.turnId)).toEqual(['t2']);   // t1 dropped, t2 emits
+    expect(ready[0].finalText).toBe('merged reply');
+    expect(q.size()).toBe(0);                            // no wedge
+  });
+
+  it('Codex steer-merge with leading environment_context (real rollout shape): env event ignored, t1 dropped, t2 emits', () => {
+    // Real codex rollout opens with a role=user <environment_context> event
+    // before the first prompt. It matches no fingerprint and (collecting=null)
+    // must neither start a turn nor spuriously HOL-drop. Then user1 → user2 →
+    // merged final, same as the steer-merge case.
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first prompt', 100);
+    q.mark('t2', 'second prompt', 100);
+    q.ingest([
+      userEv('<environment_context>   <cwd>/tmp/x</cwd>', 'env', 4_000),  // not a real turn
+      userEv('first prompt', 'u1', 5_000),
+      userEv('second prompt', 'u2', 8_000),
+      asstEv('merged reply', 'a1', 12_000),
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready.map(t => t.turnId)).toEqual(['t2']);
+    expect(q.size()).toBe(0);
+  });
+
+  it('Codex steer-merge with N type-ahead messages: only the last steered turn emits the merged final', () => {
+    // Three messages typed-ahead into one tool-running turn; codex steers all
+    // into the active turn → user1 → user2 → user3 → one merged final. Each new
+    // user event HOL-drops the previous textless collecting turn.
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'prompt one', 100);
+    q.mark('t2', 'prompt two', 100);
+    q.mark('t3', 'prompt three', 100);
+    q.ingest([
+      userEv('prompt one', 'u1', 5_000),
+      userEv('prompt two', 'u2', 6_000),
+      userEv('prompt three', 'u3', 7_000),
+      asstEv('one combined reply', 'a1', 12_000),
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready.map(t => t.turnId)).toEqual(['t3']);   // t1, t2 dropped
+    expect(ready[0].finalText).toBe('one combined reply');
+    expect(q.size()).toBe(0);
+  });
+
+  it('Codex steer-merge with clock skew: live user events a few seconds BELOW the mark (within tooOld tolerance) still HOL-drop', () => {
+    // Regression for the freshness-gate P1 (Codex review v2): turn-start tolerates
+    // events up to 5s before the mark (tooOld = ts < mark - 5000) and markTimeMs
+    // never moves backwards (Math.max). So a legit live user1 a couple seconds
+    // before the mark starts t1 while collecting.markTimeMs stays at the mark; a
+    // subsequent live user2 also below the mark must STILL HOL-drop t1. Gating
+    // HOL-drop on "this event actually starts a turn" (reusing tooOld/fingerprint)
+    // keeps the two freshness rules consistent.
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first prompt', 10_000);
+    q.mark('t2', 'second prompt', 10_001);
+    q.ingest([
+      userEv('first prompt', 'u1', 8_000),    // 2s before mark — within tooOld tolerance, legit live start
+      userEv('second prompt', 'u2', 9_000),   // also below mark, real steer after user1
+      asstEv('merged reply', 'a1', 12_000),
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready.map(t => t.turnId)).toEqual(['t2']);   // t1 HOL-dropped despite ts < mark
+    expect(q.size()).toBe(0);                            // no wedge
+  });
+
+  it('HOL-drop only fires on a real turn-start: a fresh user event that matches no pending fingerprint (non-adopt) does NOT evict the collecting turn', () => {
+    // Hardening (Codex review v2): HOL-drop must not treat ANY fresh user event
+    // as a turn-start. A user event that neither matches a pending fingerprint
+    // nor synthesises a local turn (localTurns off) leaves the collecting turn
+    // intact so its in-flight final still lands.
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'real prompt', 100);
+    q.ingest([userEv('real prompt', 'u1', 5_000)]);          // t1 started, collecting
+    q.ingest([userEv('unrelated stray text', 'u-x', 6_000)]); // no fingerprint match, non-adopt → ignored
+    expect(q.peek().some(t => t.turnId === 't1')).toBe(true); // t1 NOT dropped
+    q.ingest([asstEv('t1 reply', 'a1', 7_000)]);
+    expect(q.drainEmittable().map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('HOL-drop is gated on freshness: a replayed historical user event does NOT evict a live collecting turn', () => {
+    // A late-attach / replay can feed an OLD user event after a turn is already
+    // collecting. The freshness gate (event ts >= collecting mark) prevents it
+    // from HOL-dropping the live turn, which would lose the in-flight reply.
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'live prompt', 10_000);
+    q.ingest([userEv('live prompt', 'u-live', 12_000)]);   // t1 started, markTimeMs→12_000
+    q.ingest([userEv('ancient history', 'u-old', 3_000)]); // stale; must NOT drop t1
+    expect(q.peek().some(t => t.turnId === 't1')).toBe(true);
+    q.ingest([asstEv('live reply', 'a-live', 13_000)]);
+    expect(q.drainEmittable().map(t => t.turnId)).toEqual(['t1']);
   });
 
   it('type-ahead: turn-start overrides markTimeMs to the dequeue-time event timestamp', () => {
@@ -343,5 +455,34 @@ describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression window
       { turnId: 't1', suppressed: true },
       { turnId: 't2', suppressed: true },
     ]);
+  });
+
+  it('steer-merge: HOL-dropped t1 leaves t2 a correct suppression window for the single merged send', () => {
+    // codex merged msg1+msg2 into one turn (user1 → user2 → merged final). HOL-
+    // drop discards t1; only t2 drains, its window anchored to user2's dequeue
+    // timestamp. The model's single botmux send for the combined reply lands in
+    // t2's window → suppressed, no duplicate fallback.
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first prompt', 1_000);
+    q.mark('t2', 'second prompt', 1_001);
+    q.ingest([
+      userEv('first prompt', 'u1', 5_000),
+      userEv('second prompt', 'u2', 8_000),
+      asstEv('merged reply', 'a1', 15_000),
+    ]);
+    const decisions = emitDecisions(q, [{ sentAtMs: 12_000 }]);
+    expect(decisions).toEqual([{ turnId: 't2', suppressed: true }]);
+  });
+
+  it('steer-merge: HOL-dropped t1, model forgot to send → merged fallback fires once on t2', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first prompt', 1_000);
+    q.mark('t2', 'second prompt', 1_001);
+    q.ingest([
+      userEv('first prompt', 'u1', 5_000),
+      userEv('second prompt', 'u2', 8_000),
+      asstEv('merged reply', 'a1', 15_000),
+    ]);
+    expect(emitDecisions(q, [])).toEqual([{ turnId: 't2', suppressed: false }]);
   });
 });

@@ -96,6 +96,13 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
+  it('omits dangerous permission flags/settings when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).not.toContain('--settings');
+    expect(args).toContain('--disallowed-tools');
+  });
+
   it('ignores initialPrompt (not passed via args)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, initialPrompt: 'hello' });
     expect(args).not.toContain('hello');
@@ -143,6 +150,12 @@ describe('aiden buildArgs', () => {
     expect(args).toContain('--resume');
     expect(args).toContain('sess-2');
   });
+
+  it('omits agentFull permission mode when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-2', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--permission-mode');
+    expect(args).not.toContain('agentFull');
+  });
 });
 
 describe('coco buildArgs', () => {
@@ -169,6 +182,12 @@ describe('coco buildArgs', () => {
     expect(indices.length).toBe(2);
     expect(args[indices[0] + 1]).toBe('EnterPlanMode');
     expect(args[indices[1] + 1]).toBe('ExitPlanMode');
+  });
+
+  it('omits --yolo when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-3', resume: false, disableCliBypass: true });
+    expect(args).toContain('--session-id');
+    expect(args).not.toContain('--yolo');
   });
 
   it('passes configured model through coco config override', () => {
@@ -203,6 +222,11 @@ describe('codex buildArgs', () => {
       '-C',
       '/repo/root',
     ]);
+  });
+
+  it('omits approval/sandbox bypass flag when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
+    expect(args).toEqual(['--no-alt-screen', '-C', '/repo/root']);
   });
 
   it('passes configured model with --model', () => {
@@ -270,6 +294,12 @@ describe('gemini buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false });
     expect(args).toContain('--yolo');
     expect(args).not.toContain('-i');
+  });
+
+  it('omits --yolo when disableCliBypass is true while preserving initial prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something', disableCliBypass: true });
+    expect(args).not.toContain('--yolo');
+    expect(args).toEqual(['-i', 'do something']);
   });
 
   it('passes initialPrompt via -i flag', () => {
@@ -377,6 +407,11 @@ describe('hermes buildArgs', () => {
     expect(args).toEqual(['--resume', 'bm-hermes-1', '--yolo', '--accept-hooks', '--pass-session-id']);
   });
 
+  it('omits yolo and hook acceptance when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-hermes-1', resume: false, disableCliBypass: true });
+    expect(args).toEqual(['--pass-session-id']);
+  });
+
   it('does not bake initialPrompt into args', () => {
     const args = adapter.buildArgs({ sessionId: 'bm-hermes-1', resume: false, initialPrompt: 'hello hermes' });
     expect(args).not.toContain('hello hermes');
@@ -390,6 +425,11 @@ describe('antigravity buildArgs', () => {
   it('fresh session passes --dangerously-skip-permissions only', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
     expect(args).toEqual(['--dangerously-skip-permissions']);
+  });
+
+  it('omits dangerous permission flag when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true });
+    expect(args).toEqual([]);
   });
 
   it('does NOT inject initialPrompt via -i (agy -i does not auto-submit)', () => {

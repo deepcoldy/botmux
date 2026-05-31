@@ -15,7 +15,7 @@ import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -30,6 +30,7 @@ import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
+import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -92,17 +93,41 @@ export function getActiveSessionsRegistry(): Map<string, DaemonSession> | undefi
   return activeSessionsRegistry;
 }
 
-// ─── Terminal URL helpers ──────────────────────────────────────────────────
-// config.web.externalHost is a live getter (re-resolves the LAN IP each read
-// when WEB_EXTERNAL_HOST is unset), so building the URL fresh at every card
-// render/patch is enough to keep links pointing at the current network.
+// ─── "Real relayable session" predicate ─────────────────────────────────────
 
-function terminalReadUrl(port: number): string {
-  return `http://${config.web.externalHost}:${port}`;
-}
-
-function terminalWriteUrl(port: number, token: string): string {
-  return `${terminalReadUrl(port)}?token=${encodeURIComponent(token)}`;
+/**
+ * True iff this DaemonSession represents a real CLI-backed conversation
+ * that's safe to migrate via /relay. Returns false for daemon-command
+ * scratch placeholders (the `worker:null + hasHistory:false` records that
+ * daemon.ts creates for /help, an unfinished picker /relay, etc.) — those
+ * have no CLI history, no tmux, and migrating them yields an empty shell
+ * in the target chat with a fake "已就绪" M1.
+ *
+ * Why not just `!!ds.worker || ds.hasHistory`:
+ *   - `ds.worker` is runtime-only; null after daemon restart until
+ *     forkWorker re-attaches.
+ *   - `ds.hasHistory` is a runtime field too — restoreActiveSessions sets
+ *     it `true` UNCONDITIONALLY for any persisted non-adopt session
+ *     (session-manager.ts:618). A scratch that survived a restart comes
+ *     back with hasHistory:true, defeating the guard.
+ *
+ * Use persisted markers instead: `ds.session.cliId` and
+ * `ds.session.lastCliInput` are written ONLY after a real worker started
+ * the CLI (worker-pool's fork path stamps cliId; rememberLastCliInput
+ * writes lastCliInput on every input). Daemon-command scratches never set
+ * either, so the predicate survives restart and is robust across paths.
+ *
+ * Apply at every relay surface that consumes a candidate `ds`:
+ *   - relay-picker.ts collectRelayPickerEntries (don't list scratches)
+ *   - card-handler.ts relay_confirm preflight (don't M1 + transferSession a scratch)
+ *   - this file's transferSession depth defense (catch any caller that bypassed both upstream guards)
+ *   - command-handler.ts /relay --create leader guard
+ */
+export function isRelayableRealSession(ds: DaemonSession): boolean {
+  if (ds.worker) return true;
+  if (ds.session.cliId) return true;
+  if (ds.session.lastCliInput) return true;
+  return false;
 }
 
 // Per-bot opt-out: when true, botmux never posts/patches the live streaming
@@ -123,7 +148,7 @@ export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
     if (getBot(ds.larkAppId).config.writableTerminalLinkInCard !== true) return undefined;
   } catch { return undefined; }
   if (!ds.workerPort || !ds.workerToken) return undefined;
-  return terminalWriteUrl(ds.workerPort, ds.workerToken);
+  return buildTerminalUrl(ds, { write: true });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -187,7 +212,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
 
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
-  const readUrl = terminalReadUrl(port);
+  const readUrl = buildTerminalUrl(ds);
   const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -360,7 +385,7 @@ export async function postFreshStreamingCard(
   if (!port) return false;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const readUrl = terminalReadUrl(port);
+  const readUrl = buildTerminalUrl(ds);
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const status = ds.lastScreenStatus ?? 'idle';
 
@@ -445,7 +470,7 @@ export async function postPrivateSnapshotCard(
 
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const readUrl = terminalReadUrl(port);
+  const readUrl = buildTerminalUrl(ds);
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const status = ds.lastScreenStatus ?? 'idle';
   const cardJson = buildPrivateSnapshotCard(
@@ -823,6 +848,263 @@ export async function closeSession(
   return { ok: true, alreadyClosed };
 }
 
+/**
+ * Set an entry on an active-sessions Map, but if the key is already occupied
+ * by a DIFFERENT DaemonSession, close that occupant first. Replaces bare
+ * `activeSessions.set(key, ds)` at sites where a silent overwrite would leak
+ * the prior entry's worker + leave its store row stuck in `status='active'`.
+ *
+ * The Map is passed explicitly so callers operate on the same instance they
+ * already hold (restoreActiveSessions takes the daemon's Map as a parameter;
+ * transferSession reaches it through `activeSessionsRegistry`). In production
+ * both refer to the same object — the daemon registers its Map at boot — but
+ * decoupling avoids module-state assumptions in tests.
+ *
+ * Canonical collision case: restoreActiveSessions at daemon boot iterating
+ * two on-disk active sessions that resolve to the same chat-scope key (e.g.
+ * a /relay command's scratch session + the real session that was transferred
+ * into the same chat by a prior daemon run). Without this helper the later
+ * iterated entry silently wins, the earlier one becomes a ghost-active.
+ *
+ * Setting the same `ds` at its own key is a no-op (no close).
+ */
+export async function setActiveSessionSafe(
+  map: Map<string, DaemonSession>,
+  key: string,
+  ds: DaemonSession,
+): Promise<void> {
+  const prev = map.get(key);
+  if (prev && prev !== ds) {
+    logger.warn(
+      `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
+      `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
+    );
+    await closeSession(prev.session.sessionId);
+  }
+  map.set(key, ds);
+}
+
+// ─── Session transfer (cross-chat relay) ────────────────────────────────────
+
+/**
+ * Transfer an active session from its current chat to a new chat. The CLI
+ * process keeps running inside its tmux session — only the routing fields
+ * (chatId, rootMessageId, scope) and activeSessions key are rewritten. After
+ * the rewrite, forkWorker spawns a new worker that re-attaches to the same
+ * `bmx-<sessionId>` tmux, so the AI's transcript continues without break.
+ *
+ * Visible side effects:
+ *   - Lark messages in the *source* chat remain where they were — we have no
+ *     API to move them. Only the worker's *routing* moves; the AI's memory
+ *     follows via the CLI's persistent jsonl on disk.
+ *   - Cards posted by the prior worker stay in the source chat. We clear
+ *     streamCardId/Nonce/imageKey so the new worker posts fresh cards in the
+ *     target chat instead of trying to PATCH unreachable old ones.
+ *
+ * Pre-conditions (entry guards, all checked synchronously up-front — no
+ * idle-wait loop; busy workers are refused immediately so the caller can
+ * report a deterministic outcome and the user retries when the worker
+ * quiets):
+ *   - Session must be currently active (live worker + activeSessions entry)
+ *   - Source must not be a pendingRepo placeholder (no CLI ever started)
+ *   - Source must not be an adopted external-tmux session
+ *   - Source worker must be in idle/limited (or already dead) — otherwise
+ *     refuse with `worker_busy`
+ *   - Target chat must not already host a real chat-scope session for the
+ *     same bot (`target_chat_has_session`). Scratch (worker:null) occupants
+ *     are NOT a conflict — they're command-time placeholders and we close
+ *     them in-line to free the slot before continuing.
+ *
+ * Idempotent for `same_chat`: returns error without side effects when the
+ * source chat equals the target chat.
+ */
+export async function transferSession(
+  sessionId: string,
+  targetChatId: string,
+  targetRootMessageId: string,
+  /**
+   * Target chat type — narrowed to `'group'` at the type level. The picker-
+   * mode entry guard in command-handler.ts refuses p2p and topic chats
+   * upfront; `/relay --create` builds the target by createGroupWithBots so
+   * it's a regular group by construction; the cross-daemon migrate-to-chat
+   * IPC inherits the same target. Every call site can vouch — TS prevents
+   * any non-'group' literal from reaching here, and the runtime check just
+   * below catches mock data / future bypasses.
+   */
+  targetChatType: 'group',
+  opts?: {
+    /** @internal Override for tests — the real implementation forks a child
+     *  process and tries to attach to tmux, neither of which is appropriate
+     *  in a unit test environment. Defaults to module-level forkWorker. */
+    forkWorkerImpl?: typeof forkWorker;
+    /** @internal Override for tests — mirror of forkWorkerImpl for killWorker. */
+    killWorkerImpl?: typeof killWorker;
+  },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  // Depth defense — unreachable per TS narrowing above, but guards against
+  // raw-string casting at module boundaries (mocks, HTTP body parses, etc.).
+  if ((targetChatType as string) !== 'group') {
+    return { ok: false, error: 'target_chat_type_unsupported' };
+  }
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds) return { ok: false, error: 'session_not_active' };
+  if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
+
+  // pendingRepo: the user created a session via M0 but hasn't picked a repo
+  // yet, so worker is null and the CLI has never run. Relaying produces an
+  // empty new-chat session with no AI memory — refuse so the user finishes
+  // setup in the original chat first.
+  if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
+
+  // Depth defense: daemon-command scratch (worker:null + no persisted CLI
+  // markers) must not be migrated. Upstream paths (picker filter, card-
+  // handler confirm preflight, /relay --create leader guard) should already
+  // refuse these — this catches any caller that bypassed all three (e.g.
+  // a future code path, a direct dashboard IPC, a test reaching in
+  // manually). Using `isRelayableRealSession` instead of `ds.hasHistory`
+  // makes the predicate survive restoreActiveSessions which currently sets
+  // hasHistory:true unconditionally (session-manager.ts:618).
+  if (!isRelayableRealSession(ds)) return { ok: false, error: 'not_started_yet' };
+
+  // Adopt sessions wrap a CLI process that botmux didn't spawn — the user
+  // owns it inside their own tmux pane, so moving routing here would be
+  // surprising and we don't control the tmux session's lifecycle. Refuse.
+  if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_relayable' };
+
+  // Busy worker: refuse immediately rather than waiting. An idle-wait loop
+  // (previously 60s) created an asymmetry with the peer-dispatch HTTP
+  // timeout (5s) — peer's transferSession was still polling while the
+  // leader had already abort+report 'busy', producing reports that
+  // disagreed with reality. Cleaner contract: refuse on first miss, let
+  // the user retry when the turn settles.
+  const st = ds.lastScreenStatus;
+  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
+    return { ok: false, error: 'worker_busy' };
+  }
+
+  // Existing-session guard: a chat-scope session at the target chatId would
+  // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
+  // Map.set would silently orphan the prior entry's worker. We split the
+  // collision predicate two ways:
+  //   - real session (worker !== null): refuse the transfer
+  //   - scratch session (worker === null): a daemon-command placeholder
+  //     (e.g. the /relay command itself created one when typed in this
+  //     chat); the slot is logically free, but the placeholder lingers in
+  //     the store with status='active'. Collect and close it so the post-
+  //     transfer Map.set doesn't silently overwrite it (which leaves the
+  //     scratch as a ghost-active on next daemon restart — exact bug we're
+  //     fixing).
+  // We only check chat-scope entries — thread-scope sessions in the same
+  // chat are keyed by rootMessageId, so they don't collide.
+  const scratchesToClose: string[] = [];
+  if (activeSessionsRegistry) {
+    for (const existing of activeSessionsRegistry.values()) {
+      if (existing === ds) continue;
+      if (existing.larkAppId !== ds.larkAppId) continue;
+      if (existing.chatId !== targetChatId) continue;
+      if (existing.scope !== 'chat') continue;
+      if (!existing.worker) {
+        scratchesToClose.push(existing.session.sessionId);
+        continue;
+      }
+      return { ok: false, error: 'target_chat_has_session' };
+    }
+  }
+  for (const sid of scratchesToClose) {
+    await closeSession(sid);
+  }
+
+  const fkw = opts?.forkWorkerImpl ?? forkWorker;
+  const kw = opts?.killWorkerImpl ?? killWorker;
+
+  const tagPrefix = sessionId.substring(0, 8);
+  const oldAnchor = sessionAnchorId(ds);
+  const oldChatId = ds.chatId;
+
+  // Freeze the source-chat streaming card BEFORE we kill the worker (and
+  // before we clear streamCardId below). The live card's action buttons
+  // (close / toggle / get write link) carry `session_id` in their value, so
+  // clicks AFTER relay still reach the now-relocated session — closing it,
+  // toggling its display mode, etc. — with feedback landing on the NEW
+  // card in the target chat. PATCH the source-chat card to an inert
+  // snapshot so the user sees clearly it's historical, and so the buttons
+  // are gone. Best-effort: on PATCH failure (card withdrawn, expired) we
+  // log and continue; the relay itself must not depend on this.
+  if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+    try {
+      const cliId = (ds.session.cliId as CliId | undefined)
+        ?? (() => { try { return getBot(ds.larkAppId).config.cliId; } catch { return undefined; } })();
+      const frozenJson = buildRelayedFrozenCard(
+        ds.currentTurnTitle || ds.session.title || '',
+        cliId,
+        ds.currentImageKey,
+        localeForBot(ds.larkAppId),
+      );
+      await updateMessage(ds.larkAppId, ds.streamCardId, frozenJson);
+    } catch (err) {
+      logger.warn(`[${tagPrefix}] freeze source-chat card failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // Detach worker — TmuxBackend.kill() does NOT destroy the tmux session, so
+  // the CLI process and its rolling jsonl continue running.
+  kw(ds);
+  activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
+
+  // Rewrite routing fields. Target chat is always chat-scope: leader posts a
+  // notification message (M1) used as `targetRootMessageId` for trace, but
+  // chat-scope routes by chatId anyway, so M1 is purely audit/UX.
+  ds.session.chatId = targetChatId;
+  ds.session.rootMessageId = targetRootMessageId;
+  ds.session.scope = 'chat';
+  ds.session.chatType = targetChatType;
+  ds.session.lastMessageAt = new Date().toISOString();
+  // Card state was pinned to the source chat — clear so the new worker posts
+  // a fresh card in the target chat instead of trying to PATCH a message that
+  // lives in another chat entirely (the source card was just frozen above).
+  ds.session.streamCardId = undefined;
+  ds.session.streamCardNonce = undefined;
+  ds.session.currentImageKey = undefined;
+
+  // Mirror onto runtime DaemonSession.
+  ds.chatId = targetChatId;
+  ds.chatType = targetChatType;
+  ds.scope = 'chat';
+  ds.streamCardId = undefined;
+  ds.streamCardNonce = undefined;
+  ds.currentImageKey = undefined;
+
+  sessionStore.updateSession(ds.session);
+
+  const newAnchor = sessionAnchorId(ds);
+  if (activeSessionsRegistry) {
+    await setActiveSessionSafe(activeSessionsRegistry, sessionKey(newAnchor, ds.larkAppId), ds);
+  }
+
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId,
+      patch: {
+        chatId: targetChatId,
+        rootMessageId: targetRootMessageId,
+        scope: 'chat',
+        chatType: targetChatType,
+      },
+    },
+  });
+
+  // forkWorker with resume=true — TmuxBackend.spawn detects the surviving
+  // `bmx-<sessionId>` session and re-attaches instead of creating a new one.
+  fkw(ds, '', /*resume*/true);
+
+  logger.info(
+    `[${tagPrefix}] transferred ${oldChatId} → ${targetChatId} ` +
+    `(anchor ${oldAnchor.substring(0, 8)} → ${newAnchor.substring(0, 8)})`,
+  );
+  return { ok: true };
+}
+
 // ─── Fork worker ────────────────────────────────────────────────────────────
 
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
@@ -896,6 +1178,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
     model: botCfg.model,
+    disableCliBypass: botCfg.disableCliBypass === true,
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
@@ -962,8 +1245,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // Persist port so it can be reused after daemon restart
         ds.session.webPort = msg.port;
         sessionStore.updateSession(ds.session);
-        const readOnlyUrl = terminalReadUrl(msg.port);
-        const writeUrl = terminalWriteUrl(msg.port, msg.token);
+        const readOnlyUrl = buildTerminalUrl(ds);
+        const writeUrl = buildTerminalUrl(ds, { write: true });
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
         if (ds.usageLimit) {
           ds.lastScreenStatus = 'limited';
@@ -1000,7 +1283,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
             if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
-            const initStatus = ds.usageLimit ? 'limited' : 'starting';
+            // Prefer the last-known screen status when we have one — for /relay
+            // resume the worker was idle/limited at transfer time and the
+            // CLI didn't actually stop, so showing "starting" right after
+            // the M1 "已接力" announcement is misleading. Fresh-spawn worker
+            // and post-daemon-restart paths still see lastScreenStatus
+            // undefined and fall back to 'starting' (unchanged behavior).
+            const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
@@ -1045,13 +1334,20 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
           const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
-          const initStatus = ds.usageLimit ? 'limited' : 'starting';
+          // See PATCH-branch comment above re: lastScreenStatus preference.
+          // For relay (kill+fork with surviving tmux/CLI), this avoids the
+          // jarring "启动中" right after the M1 "已接力" announcement.
+          const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
             readOnlyUrl,
             initTitle,
-            '',
+            // For /relay resume, ds.lastScreenContent is the cached pane
+            // from before the kill+fork — using it avoids a blank flash
+            // before the first screen_update lands. Fresh worker spawn
+            // has lastScreenContent undefined → '' (unchanged).
+            ds.lastScreenContent ?? '',
             initStatus,
             effectiveCliId,
             ds.displayMode ?? 'hidden',
@@ -1064,6 +1360,15 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             writableTerminalLinkFor(ds),
           );
           ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
+          // This card IS the current turn's live card — clear the new-turn flag
+          // so subsequent screen_updates PATCH it (starting → working) instead of
+          // POSTing a second card. Without this, a re-fork that happens while
+          // streamCardPending is true (new turn + worker had exited) leaves the
+          // flag set, the next screen_update takes the new-card POST branch, and
+          // this "starting" card is orphaned (never entered frozenCards, so
+          // recallFrozenCards can't withdraw it). Mirrors the screen_update POST
+          // branch which clears the flag after posting.
+          ds.streamCardPending = false;
           persistStreamCardState(ds);
           // Re-sync worker's display mode (it starts fresh in 'hidden')
           if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
@@ -1151,7 +1456,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // the status patch; just don't touch any Lark card.
         if (streamingCardDisabled(ds)) break;
 
-        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const readUrl = buildTerminalUrl(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
@@ -1246,7 +1551,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
-        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const readUrl = buildTerminalUrl(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -1332,7 +1637,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           logger.info(`[${t}] Adopted session ended`);
           // Freeze the streaming card
           if (ds.streamCardId && ds.workerPort) {
-            const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+            const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
@@ -1369,7 +1674,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           // Freeze the last streaming card so it doesn't stay at "working" forever
           if (ds.streamCardId && ds.workerPort) {
-            const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+            const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
@@ -1626,13 +1931,15 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     deterministic from cliSessionId. PID is the fallback when discovery
   //     missed (events.jsonl isn't held open continuously, so worker may need
   //     to re-probe via session.log / traces.jsonl fds).
+  //   - mtr: worker tails MTR's sqlite transcript, resolving by native sid
+  //     when discovery has one or by adopted cwd as a fallback.
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   const bridgeJsonlPath =
     adoptedCliId === 'claude-code' && adopted.sessionId
       ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd)
       : undefined;
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco';
+  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr';
 
   const initMsg: DaemonToWorker = {
     type: 'init',
@@ -1643,6 +1950,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliId: adoptedCliId,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: botCfg.model,
+    disableCliBypass: botCfg.disableCliBypass === true,
     backendType: 'tmux',
     prompt: '',
     resume: false,

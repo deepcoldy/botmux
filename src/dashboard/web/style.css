@@ -689,14 +689,25 @@ td code,
 
 .checkbox-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 4px 8px;
   padding: 7px 0;
   color: var(--fg);
 }
 
+/* Keep the checkbox and its title on one line (don't let flex shrink the title
+   into a vertical sliver), and drop the help text onto its own line, indented
+   under the title for readability. */
+.checkbox-row input[type=checkbox] { flex: 0 0 auto; margin: 0; }
+.checkbox-row strong { flex: 0 0 auto; }
+
 .checkbox-row small {
+  flex: 1 1 100%;
+  margin-left: 24px;
   color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .empty {
@@ -889,6 +900,35 @@ input.row-select,
   color: var(--muted);
 }
 .bd-section-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+
+/* A lighter sub-group inside a bd-section (e.g. 主动开工 lives under 新群 Oncall).
+   Separated by a soft top rule + indent so it reads as "part of this block". */
+.bd-subsection {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-soft);
+}
+.bd-subsection-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg);
+}
+/* 入群首轮 prompt textarea — themed to match the text inputs (dark surface,
+   bordered) rather than the unstyled browser default. */
+.bd-subsection textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  resize: vertical;
+}
 
 @media (max-width: 980px) {
   .app-shell {

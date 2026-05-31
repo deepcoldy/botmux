@@ -10,14 +10,26 @@ import * as brandStore from '../services/brand-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
-import { getChatMode, replyMessage, sendMessage } from '../im/lark/client.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
+import { listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import { resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import { triggerSessionTurn } from './trigger-session.js';
+import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
+import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
+import { validateTriggerRequest } from '../services/trigger-types.js';
+
+// Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
+// deps). Until set, workflow-targeted triggers report not-implemented.
+let workflowRunner: ((input: TriggerInput) => Promise<TriggerResult>) | null = null;
+export function setWorkflowRunner(fn: (input: TriggerInput) => Promise<TriggerResult>): void {
+  workflowRunner = fn;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -125,7 +137,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) =>
   const sessionId = params.sessionId;
   const reg = getActiveSessionsRegistry();
   if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
-  const result = resumeSession(sessionId, reg);
+  const result = await resumeSession(sessionId, reg);
   if (!result.ok) {
     const status = result.error === 'not_found' ? 404 : 409;
     return jsonRes(res, status, { ok: false, error: result.error, activeSessionId: result.activeSessionId });
@@ -173,6 +185,126 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) =>
     workingDir: ds.session.workingDir,
     cliId,
   });
+});
+
+/**
+ * Cross-daemon session transfer endpoint.
+ *
+ * Called by a *leader* daemon during `/relay --create` to instruct *peer*
+ * daemons to migrate their own session (located by `sourceAnchor`) into a
+ * newly-created chat. The peer daemon authenticates the request and runs its
+ * own `transferSession()` internally — the leader never touches another
+ * daemon's process / tmux / jsonl directly.
+ *
+ * Security:
+ *   - Only accepts requests from 127.0.0.1 (no remote daemon coordination).
+ *   - `requesterLarkAppId` must be a known bot in this machine's bots
+ *     registry. The threat model assumes a malicious bot daemon process is
+ *     already root-equivalent on the box; this check just prevents random
+ *     other 127.0.0.1 processes from forging migrations.
+ *   - `sourceAnchor` must match a session currently owned by *this* daemon
+ *     (peer can only move its own sessions — never anybody else's).
+ *   - Owner-only: only the original session owner may relocate the session.
+ *
+ * The leader passes `targetRootMessageId` — typically the leader's M1
+ * notification message — so the peer's session lands anchored on a real
+ * message in the new chat. Since the new chat is always chat-scope, the
+ * rootMessageId is only used for audit / display, not routing.
+ */
+ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
+  const remote = req.socket.remoteAddress;
+  // node may report '127.0.0.1' or '::ffff:127.0.0.1' (IPv4 mapped) or '::1'.
+  const localish = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  if (!localish) return jsonRes(res, 403, { ok: false, error: 'not_local' });
+
+  let body: {
+    sourceAnchor?: string;
+    targetChatId?: string;
+    targetRootMessageId?: string;
+    requesterLarkAppId?: string;
+    requestingUserOpenId?: string;
+    requestingUserUnionId?: string;
+  };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_json' });
+  }
+  const { sourceAnchor, targetChatId, targetRootMessageId, requesterLarkAppId, requestingUserOpenId, requestingUserUnionId } = body;
+  if (!sourceAnchor || !targetChatId || !targetRootMessageId || !requesterLarkAppId || !requestingUserOpenId) {
+    return jsonRes(res, 400, { ok: false, error: 'missing_field' });
+  }
+
+  // Requester must be a live botmux daemon — not a random localhost process
+  // pretending to be one. We check the cross-process daemon registry
+  // (~/.botmux/data/dashboard-daemons/<larkAppId>.json + heartbeat) rather
+  // than this process's local bot list: in production each bot has its own
+  // daemon process, and a per-process `getAllBots()` only sees its OWN bot
+  // (botmux is one-daemon-per-bot at boot, daemon.ts:2367). Using the
+  // registry lets the peer recognise the leader bot.
+  const requesterKnown = listOnlineDaemons().some(d => d.larkAppId === requesterLarkAppId);
+  if (!requesterKnown) return jsonRes(res, 403, { ok: false, error: 'unknown_requester' });
+
+  // Locate this daemon's own session at the given source anchor. We match
+  // by anchor (rootMessageId for thread-scope, chatId for chat-scope) AND
+  // larkAppId — multi-bot threads share a rootMessageId but each bot's
+  // session is uniquely keyed by (anchor, larkAppId).
+  const reg = getActiveSessionsRegistry();
+  if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+
+  let ds: ReturnType<typeof findActiveBySessionId> = undefined;
+  for (const candidate of reg.values()) {
+    const candAnchor = candidate.scope === 'chat' ? candidate.chatId : candidate.session.rootMessageId;
+    if (candAnchor === sourceAnchor && candidate.larkAppId === cachedLarkAppId) {
+      ds = candidate;
+      break;
+    }
+  }
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'no_session_at_anchor' });
+
+  // Owner-only: the user who triggered /relay --create must own this peer's
+  // session too. If a peer's session is owned by someone else, we refuse —
+  // the leader summarises this as "skipped: not your session" rather than
+  // forcing a transfer of someone else's work.
+  //
+  // Cross-app identity: Lark `open_id` is app-scoped — the same user has a
+  // different open_id in each bot's namespace, so leader's senderOpenId
+  // and peer's stored ownerOpenId cannot be compared directly. Prefer
+  // `union_id` (stable across apps within a tenant) when both sides have
+  // it. Sessions persisted before ownerUnionId existed fall through to a
+  // lazy backfill: resolve peer's stored open_id → union_id via Lark API
+  // (using PEER's bot client, so the open_id is in the right namespace),
+  // persist for next time, and compare.
+  if (ds.session.ownerOpenId) {
+    let peerOwnerUnionId = ds.session.ownerUnionId;
+    if (!peerOwnerUnionId && requestingUserUnionId) {
+      // Backfill: legacy session, look up the union_id via Lark API once
+      // and persist it so subsequent comparisons (and any other code path
+      // that grows to read it) are fast.
+      const looked = await resolveUnionIdFromOpenId(ds.larkAppId, ds.session.ownerOpenId);
+      if (looked) {
+        peerOwnerUnionId = looked;
+        ds.session.ownerUnionId = looked;
+        sessionStore.updateSession(ds.session);
+      }
+    }
+    const ownerMatch = (peerOwnerUnionId && requestingUserUnionId)
+      ? peerOwnerUnionId === requestingUserUnionId
+      // Same-bot fallback (no union_id on either side): open_id namespaces
+      // match, so direct compare works.
+      : ds.session.ownerOpenId === requestingUserOpenId;
+    if (!ownerMatch) {
+      return jsonRes(res, 403, { ok: false, error: 'not_session_owner' });
+    }
+  }
+
+  // Target chat was built by the leader's /relay --create — by
+  // construction a regular group. The peer inherits that guarantee.
+  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group');
+  if (!result.ok) {
+    return jsonRes(res, 500, { ok: false, error: result.error });
+  }
+  jsonRes(res, 200, { ok: true, sessionId: ds.session.sessionId });
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) => {
@@ -280,6 +412,43 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
+
+ipcRoute('POST', '/api/trigger', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: 'active session registry unavailable' });
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error: 'invalid JSON body' });
+  }
+  const valid = validateTriggerRequest(body);
+  if (!valid.ok) return jsonRes(res, valid.status, valid.body);
+  try {
+    let result;
+    if (valid.request.target.kind === 'workflow') {
+      if (!workflowRunner) {
+        return jsonRes(res, 501, { ok: false, errorCode: 'workflow_trigger_not_implemented', error: 'workflow runner not wired on this daemon' });
+      }
+      result = await triggerWorkflowFromEnvelope(valid.request, { larkAppId: cachedLarkAppId, runWorkflow: workflowRunner });
+    } else {
+      result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    }
+    const status = result.ok
+      ? 200
+      : result.errorCode === 'bot_not_in_chat'
+        ? 403
+        : result.errorCode === 'session_not_found'
+          ? 404
+        : result.errorCode === 'target_required' || result.errorCode === 'bad_request'
+          ? 400
+          : 500;
+    return jsonRes(res, status, result);
+  } catch (e: any) {
+    return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
+  }
+});
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
@@ -443,6 +612,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     disableStreamingCard: cardPrefs.disableStreamingCard,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
+    autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
+    autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
   });
 });
 
@@ -450,14 +622,23 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
 // present keys are applied. `{ disableStreamingCard?, writableTerminalLinkInCard?, privateCard? }`.
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown };
+  let body: {
+    disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
+  };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
-  const patch: { disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean } = {};
+  const patch: {
+    disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
+  } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
+  if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
+  if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
@@ -514,6 +695,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
     name?: unknown;
     larkAppIds?: unknown;
     userOpenIds?: unknown;
+    ownerUnionIds?: unknown;
     transferOwnerTo?: unknown;
     notifyOwnerOpenId?: unknown;
     bindWorkingDir?: unknown;
@@ -523,6 +705,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       name?: string;
       larkAppIds?: string[];
       userOpenIds?: string[];
+      ownerUnionIds?: string[];
       transferOwnerTo?: string;
       notifyOwnerOpenId?: string;
       bindWorkingDir?: string;
@@ -540,6 +723,10 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
   // dashboard/operator-selector.ts).
   const userIds = Array.isArray(body.userOpenIds) && body.userOpenIds.every(x => typeof x === 'string')
     ? (body.userOpenIds as string[])
+    : [];
+  // Owner union_ids (tenant-stable) to pull bot owners into a federated group.
+  const ownerUnionIds = Array.isArray(body.ownerUnionIds) && body.ownerUnionIds.every(x => typeof x === 'string')
+    ? (body.ownerUnionIds as string[])
     : [];
   const transferTo = typeof body.transferOwnerTo === 'string' && body.transferOwnerTo.trim()
     ? body.transferOwnerTo.trim()
@@ -560,6 +747,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       larkAppIds: body.larkAppIds as string[],
       name,
       userOpenIds: userIds,
+      ownerUnionIds,
       transferOwnerTo: transferTo ?? undefined,
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,

@@ -12,13 +12,13 @@ export function createAidenAdapter(pathOverride?: string): CliAdapter {
     id: 'aiden',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume }) {
+    buildArgs({ sessionId, resume, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
       }
       // Aiden auto-generates session id for new sessions
-      args.push('--permission-mode', 'agentFull');
+      if (!disableCliBypass) args.push('--permission-mode', 'agentFull');
       return args;
     },
 

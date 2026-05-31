@@ -18,12 +18,12 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     id: 'cursor',
     resolvedBin: bin,
 
-    buildArgs({ resume, resumeSessionId, model }) {
+    buildArgs({ resume, resumeSessionId, model, disableCliBypass }) {
       // --force skips approvals so the model can act inside the topic without
       // every shell/edit bouncing back to Lark for confirmation — same posture
       // as codex's --dangerously-bypass-approvals-and-sandbox and claude-code's
       // --dangerously-skip-permissions.
-      const base = ['--force'];
+      const base = disableCliBypass ? [] : ['--force'];
       if (model && model.trim()) {
         base.push('--model', model.trim());
       }
