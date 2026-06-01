@@ -1113,8 +1113,13 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const botCfg = bot.config;
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
-  const cwd = cb.getSessionWorkingDir(ds);
   const t = tag(ds);
+  // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
+  // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
+  // home so a stale session workingDir can never take the daemon down.
+  const rawCwd = cb.getSessionWorkingDir(ds);
+  const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
+  if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
 
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
@@ -1152,6 +1157,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
+  });
+
+  // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
+  // the unhandled event crashes the daemon. Log and move on.
+  worker.on('error', (err) => {
+    logger.error(`[${t}] Worker fork error: ${(err as Error)?.message ?? err}`);
   });
 
   // Pipe worker stdout/stderr to daemon logger.
@@ -1899,9 +1910,14 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
 
   // No ensureCliSkills — adopt mode attaches to an existing CLI session
 
+  // Fall back to home if the adopted cwd is gone — a missing fork cwd emits an
+  // unhandled 'error' (spawn ENOENT) that would crash the daemon.
+  const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
+  const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
+  if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
   const worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    cwd: adopted.cwd ?? ds.workingDir ?? process.cwd(),
+    cwd: adoptCwd,
     env: {
       ...process.env,
       CLAUDECODE: undefined,
@@ -1909,6 +1925,11 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
+  });
+
+  // A fork-level failure emits 'error'; without a handler it crashes the daemon.
+  worker.on('error', (err) => {
+    logger.error(`[${t}] Adopt worker fork error: ${(err as Error)?.message ?? err}`);
   });
 
   // Pipe worker stdout/stderr — both go through logger.info (→ daemon.log,
