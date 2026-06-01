@@ -54,6 +54,12 @@ export const config = {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
     cliPathOverride: process.env.CLI_PATH,
     backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as 'pty' | 'tmux',
+    /** Quiet restart (dev): skip the tmux backend's eager re-fork of restored
+     *  sessions on startup, so repeated local restarts don't re-push streaming
+     *  cards for unfinished sessions. Sessions resume lazily on the next
+     *  message. Set `BOTMUX_QUIET_RESTART=1` in the dev shell to default it on;
+     *  production leaves it unset (eager re-attach keeps live cards updating). */
+    quietRestart: ['1', 'true'].includes((process.env.BOTMUX_QUIET_RESTART ?? '').toLowerCase()),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),

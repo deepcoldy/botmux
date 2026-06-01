@@ -252,6 +252,12 @@ function ecosystemConfig(): string {
       // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
       // RSS regression — turned off in master so logs stay quiet.
       BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
+      // Quiet restart (dev): when set, restore registers sessions but skips the
+      // tmux eager re-fork so restarts don't re-push unfinished-session cards.
+      // Pass the shell value through explicitly (default '0') so it overrides
+      // any stale value carried by the long-lived pm2 god daemon — letting an
+      // unset shell var truly turn quiet-restart back off.
+      BOTMUX_QUIET_RESTART: process.env.BOTMUX_QUIET_RESTART ?? '0',
     },
   }));
 

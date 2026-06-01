@@ -527,6 +527,22 @@ export function rememberLastCliInput(ds: DaemonSession, userPrompt: string, cliI
 
 // ─── Session restore ─────────────────────────────────────────────────────────
 
+/**
+ * Whether daemon restore should eagerly re-fork workers to re-attach surviving
+ * tmux panes (which re-renders — or re-posts — each session's streaming card in
+ * its Lark thread). True only on the tmux backend, and suppressed by
+ * quiet-restart (`BOTMUX_QUIET_RESTART=1`) so local-dev restarts don't re-push
+ * cards for unfinished sessions. When suppressed, sessions are still registered
+ * and resume lazily — re-attaching the surviving tmux on the next real message
+ * via `selectSessionBackend` — exactly like the pty backend already does.
+ */
+export function shouldAutoForkOnRestore(
+  backendType: 'pty' | 'tmux',
+  quietRestart: boolean,
+): boolean {
+  return backendType === 'tmux' && !quietRestart;
+}
+
 export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
   const sessions = sessionStore.listSessions();
   const active = sessions.filter(s => s.status === 'active');
@@ -640,8 +656,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
   }
 
-  // Tmux mode: auto-fork workers for sessions with surviving tmux sessions
-  if (config.daemon.backendType === 'tmux') {
+  // Tmux mode: auto-fork workers for sessions with surviving tmux sessions.
+  // Skipped under quiet-restart (dev) — sessions resume lazily on the next
+  // message instead of re-pushing their cards on every restart.
+  if (shouldAutoForkOnRestore(config.daemon.backendType, config.daemon.quietRestart)) {
     for (const [, ds] of activeSessions) {
       const tmuxName = TmuxBackend.sessionName(ds.session.sessionId);
       if (!TmuxBackend.hasSession(tmuxName)) continue;
@@ -669,7 +687,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     }
   }
 
-  logger.info(`Restored ${active.length} session(s)${config.daemon.backendType === 'tmux' ? '' : ', waiting for messages to resume'}`);
+  logger.info(`Restored ${active.length} session(s)${shouldAutoForkOnRestore(config.daemon.backendType, config.daemon.quietRestart) ? '' : ', waiting for messages to resume'}`);
 }
 
 /**
