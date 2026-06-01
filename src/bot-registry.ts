@@ -51,7 +51,7 @@ export interface BotConfig {
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
    */
   disableCliBypass?: boolean;
-  backendType?: 'pty' | 'tmux';
+  backendType?: 'pty' | 'tmux' | 'zellij';
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];

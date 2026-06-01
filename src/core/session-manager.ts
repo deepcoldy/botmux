@@ -537,7 +537,7 @@ export function rememberLastCliInput(ds: DaemonSession, userPrompt: string, cliI
  * via `selectSessionBackend` — exactly like the pty backend already does.
  */
 export function shouldAutoForkOnRestore(
-  backendType: 'pty' | 'tmux',
+  backendType: 'pty' | 'tmux' | 'zellij',
   quietRestart: boolean,
 ): boolean {
   return backendType === 'tmux' && !quietRestart;

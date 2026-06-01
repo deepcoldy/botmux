@@ -59,7 +59,7 @@ export type AttemptResumeBot = {
   larkAppSecret: string;
   cliId: string;
   cliPathOverride?: string;
-  backendType?: 'pty' | 'tmux';
+  backendType?: 'pty' | 'tmux' | 'zellij';
   botName?: string;
   botOpenId?: string;
   locale?: Locale;

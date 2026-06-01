@@ -55,6 +55,7 @@ import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
+import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -82,6 +83,10 @@ let isTmuxMode = false;
  *  web-terminal updates flow through the shared scrollback fan-out instead
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
 let isPipeMode = false;
+/** pty-under-zellij backend (BACKEND_TYPE=zellij). Behaves like the non-tmux
+ *  pty path for the worker (renderer screenshots, relay web terminal) but owns
+ *  a persistent zellij session that survives daemon restart. */
+let isZellijMode = false;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
@@ -2843,14 +2848,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the worker re-probes here. If tmux can't start a server we silently
   // fall back to PTY rather than letting attach-session / new-session spam
   // the daemon error log every poll cycle.
-  let useTmux = cfg.backendType === 'tmux';
-  if (useTmux && !TmuxBackend.isAvailable()) {
+  let effectiveBackend = cfg.backendType;
+  if (effectiveBackend === 'tmux' && !TmuxBackend.isAvailable()) {
     log('tmux backend requested but functional probe failed — falling back to PTY backend');
-    useTmux = false;
+    effectiveBackend = 'pty';
   }
-  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, useTmux });
+  if (effectiveBackend === 'zellij' && !ZellijBackend.isAvailable()) {
+    log('zellij backend requested but functional probe failed (need zellij >= 0.44) — falling back to PTY backend');
+    effectiveBackend = 'pty';
+  }
+  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend });
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
+  isZellijMode = selectedBackend.isZellijMode;
   backend = selectedBackend.backend;
   const adapterSessionId = cfg.resume
     ? (cfg.originalSessionId ?? cfg.sessionId)
@@ -2862,7 +2872,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // Codex's adapter uses ~/.codex/history.jsonl (a fixed global path) directly,
   // so it needs no per-session wiring here.
   if (cfg.cliId === 'claude-code') {
-    (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
+    (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
       claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir);
   }
 
@@ -2911,8 +2921,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // is misleading and has cost real debugging time. (CliId-mismatch reattach
   // is now blocked upstream in restoreActiveSessions / killStalePids.)
   const willReattachTmux = isTmuxMode && TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
+  const willReattachZellij = isZellijMode && ZellijBackend.hasSession(ZellijBackend.sessionName(cfg.sessionId));
   if (willReattachTmux) {
     log(`Re-attaching to existing tmux session: ${TmuxBackend.sessionName(cfg.sessionId)} (requested CLI: ${cliAdapter.resolvedBin})`);
+  } else if (willReattachZellij) {
+    log(`Re-attaching to existing zellij session: ${ZellijBackend.sessionName(cfg.sessionId)} (requested CLI: ${cliAdapter.resolvedBin})`);
   } else {
     log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
   }
@@ -2970,8 +2983,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // initial guess; the resolver corrects it on first write when Claude was
   // started with `--resume`.
   if (cfg.cliId === 'claude-code' && cliPid) {
-    (backend as TmuxBackend | PtyBackend).cliPid = cliPid;
-    (backend as TmuxBackend | PtyBackend).cliCwd = cfg.workingDir;
+    (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = cliPid;
+    (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
   }
 
   // On tmux re-attach, keep awaitingFirstPrompt = true so screen updates are

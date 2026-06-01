@@ -53,7 +53,9 @@ export const config = {
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
     cliPathOverride: process.env.CLI_PATH,
-    backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as 'pty' | 'tmux',
+    // tmux stays the auto-detected default; 'zellij' is opt-in via
+    // BACKEND_TYPE=zellij (pty-under-zellij backend, see zellij-backend.ts).
+    backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as 'pty' | 'tmux' | 'zellij',
     /** Quiet restart (dev): skip the tmux backend's eager re-fork of restored
      *  sessions on startup, so repeated local restarts don't re-push streaming
      *  cards for unfinished sessions. Sessions resume lazily on the next
