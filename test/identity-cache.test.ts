@@ -64,4 +64,28 @@ describe('identity-cache resolveName — 41050 negative cache', () => {
     // brand-new open_id still gets one attempt.
     expect(state.larkGet).toHaveBeenCalledTimes(2);
   });
+
+  it('retries the contact API only after the 41050 negative cache TTL expires', async () => {
+    vi.useFakeTimers();
+    try {
+      state.larkGet = vi.fn(async () => ({ code: 41050, msg: 'no user authority error' }));
+      const { resolveName } = await import('../src/im/lark/identity-cache.js');
+      const app = freshApp();
+
+      await resolveName(app, 'ou_u');
+      expect(state.larkGet).toHaveBeenCalledTimes(1);
+
+      // Within TTL: still suppressed.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await resolveName(app, 'ou_u');
+      expect(state.larkGet).toHaveBeenCalledTimes(1);
+
+      // Past TTL (>24h): scope may have changed, so retry once more.
+      await vi.advanceTimersByTimeAsync(25 * 60 * 60 * 1000);
+      await resolveName(app, 'ou_u');
+      expect(state.larkGet).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

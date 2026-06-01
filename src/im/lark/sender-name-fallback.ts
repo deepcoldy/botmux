@@ -38,6 +38,38 @@ export interface SenderNameCtx {
   /** Probe text; MUST keep `/introduce` at command position so a misfired bot
    *  short-circuits. Defaults to `/introduce`. */
   probeText?: string;
+  /** Read budget (ms) for the probe's getMessageDetail. Injectable for tests;
+   *  defaults to {@link PROBE_READ_BUDGET_MS}. */
+  readBudgetMs?: number;
+}
+
+/** Budget for reading back the probe message. The Lark SDK has no built-in
+ *  request timeout, so a hung read would both leave the probe visible AND block
+ *  the (synchronous) inbound handler — bound it and recall regardless. */
+const PROBE_READ_BUDGET_MS = 1500;
+
+/** How long a (members + probe) miss suppresses retries for one user. Without
+ *  it, every inbound message from an unresolvable sender (no chat-member name,
+ *  no @ backfill, missing message-read scope) re-runs send→get→recall. */
+const FALLBACK_NEG_TTL_MS = 10 * 60_000;
+
+/** `${larkAppId}:${openId}` → expiry epoch ms. Process-local; cleared on restart. */
+const fallbackCooldown = new Map<string, number>();
+
+/** Resolve `p` within `ms`, else resolve `fallback` (never rejects — a slow or
+ *  failing best-effort read should degrade, not throw). The underlying promise
+ *  is left to settle on its own. */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; resolve(fallback); }
+    }, ms);
+    p.then(
+      (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } },
+      () => { if (!settled) { settled = true; clearTimeout(timer); resolve(fallback); } },
+    );
+  });
 }
 
 /**
@@ -68,6 +100,12 @@ export async function resolveSenderNameFallback(
 ): Promise<string | undefined> {
   if (!openId || !ctx?.chatId) return undefined;
 
+  // Recent (members + probe) miss for this user → skip the whole fallback so we
+  // don't re-burn an API + a visible @ probe on every message from them.
+  const cooldownKey = `${larkAppId}:${openId}`;
+  const until = fallbackCooldown.get(cooldownKey);
+  if (until !== undefined && until > Date.now()) return undefined;
+
   // ── Layer 3: chat members (one page) ──────────────────────────────────────
   const members = await listChatMembersWithNames(larkAppId, ctx.chatId, 1);
   for (const member of members) {
@@ -77,7 +115,9 @@ export async function resolveSenderNameFallback(
   if (fromMembers) return fromMembers;
 
   // ── Layer 4: proactive @ probe + recall ───────────────────────────────────
-  return probeNameViaMention(larkAppId, openId, ctx);
+  const probed = await probeNameViaMention(larkAppId, openId, ctx);
+  if (!probed) fallbackCooldown.set(cooldownKey, Date.now() + FALLBACK_NEG_TTL_MS);
+  return probed;
 }
 
 async function probeNameViaMention(
@@ -101,23 +141,25 @@ async function probeNameViaMention(
     return undefined;
   }
 
+  // Read back the message Lark backfilled with the display name. Bounded: a
+  // hung getMessageDetail must neither leave the probe visible nor block the
+  // inbound handler. userCardContent:false → plain GET (matching the verified
+  // text-message path).
+  const detail = await withTimeout(
+    getMessageDetail(larkAppId, messageId, { userCardContent: false }).catch(() => undefined),
+    ctx.readBudgetMs ?? PROBE_READ_BUDGET_MS,
+    undefined,
+  );
   let name: string | undefined;
-  try {
-    // userCardContent:false → plain GET (no card_msg_content_type param),
-    // matching the verified path for a text message; mentions[].name is what we read.
-    const detail = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
-    const msg = Array.isArray(detail?.items) ? detail.items[0] : detail;
-    const mention = (msg?.mentions ?? []).find((mt: any) => mt?.id === openId);
-    if (typeof mention?.name === 'string' && mention.name) {
-      name = mention.name;
-      recordIdentity(larkAppId, { openId, name, type: 'user', source: 'introduce_probe' });
-    }
-  } catch (err) {
-    logger.debug(`[identity] name probe read failed for ${openId.substring(0, 12)}: ${err}`);
-  } finally {
-    // Always recall — an un-recalled probe is exactly the visible noise we're
-    // trying to avoid. Best-effort: a failed recall just leaves a stray line.
-    await deleteMessage(larkAppId, messageId).catch(() => {});
+  const msg = Array.isArray(detail?.items) ? detail.items[0] : detail;
+  const mention = (msg?.mentions ?? []).find((mt: any) => mt?.id === openId);
+  if (typeof mention?.name === 'string' && mention.name) {
+    name = mention.name;
+    recordIdentity(larkAppId, { openId, name, type: 'user', source: 'introduce_probe' });
   }
+
+  // Fire-and-forget recall — an un-recalled probe is the visible noise we're
+  // avoiding, but we must not block the inbound handler on recall latency.
+  void deleteMessage(larkAppId, messageId).catch(() => {});
   return name;
 }

@@ -282,6 +282,24 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  it('silently consumes a bot-originated /introduce probe (no route, no ack)', async () => {
+    // Another bot's name-resolution probe @s us with `/introduce`. It must be
+    // short-circuited BEFORE foreign-bot routing so it never spawns a CLI turn,
+    // and silently (no ack) so it doesn't echo noise back into the chat.
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@_user_1 /introduce' }),
+      rootId: 'root-probe',
+      mentions: [{ key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled(); // silent — no /introduce ack
+  });
+
   it('routes @mentioned bot message to handleThreadReply', async () => {
     // Another bot sends a post message that @mentions this bot in a thread
     const postContent = JSON.stringify({
