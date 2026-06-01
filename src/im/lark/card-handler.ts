@@ -1151,15 +1151,25 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
     }
 
-    // Parse selected session info
-    let selected: { tmuxTarget: string; cliPid: number };
+    // Parse selected session info (tmux: tmuxTarget; zellij: zellijSession+zellijPaneId)
+    let selected: { tmuxTarget?: string; zellijSession?: string; zellijPaneId?: string; cliPid: number };
     try { selected = JSON.parse(option); } catch { return; }
 
-    // Re-discover to get full session info and validate
-    const { discoverAdoptableSessions } = await import('../../core/session-discovery.js');
-    const botCliId = getBot(ds.larkAppId).config.cliId;
-    const sessions = discoverAdoptableSessions(botCliId);
-    const target = sessions.find(s => s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
+    // Re-discover to get full session info and validate. Backend determines
+    // which discovery to run (re-confirms the pane + pid are still alive).
+    const botCfg = getBot(ds.larkAppId).config;
+    let target: Awaited<ReturnType<typeof resolveAdoptTarget>>;
+    async function resolveAdoptTarget() {
+      if (selected.zellijPaneId) {
+        const { discoverAdoptableZellijSessions } = await import('../../core/zellij-adopt-discovery.js');
+        return discoverAdoptableZellijSessions(botCfg.cliId)
+          .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId && s.cliPid === selected.cliPid);
+      }
+      const { discoverAdoptableSessions } = await import('../../core/session-discovery.js');
+      return discoverAdoptableSessions(botCfg.cliId)
+        .find(s => s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
+    }
+    target = await resolveAdoptTarget();
     if (!target) {
       await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);

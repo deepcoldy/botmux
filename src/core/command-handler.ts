@@ -20,6 +20,7 @@ import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFres
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
+import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
@@ -842,11 +843,20 @@ export async function handleCommand(
           const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
           const project = adopted.cwd ? (adopted.cwd.split('/').pop() || adopted.cwd) : '';
           const label = project ? `${cliName} · ${project}` : cliName;
-          await sessionReply(rootId, t('cmd.adopt.already_adopted', { label, pane: adopted.tmuxTarget }, loc));
+          const pane = adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`;
+          await sessionReply(rootId, t('cmd.adopt.already_adopted', { label, pane }, loc));
           break;
         }
         const botCliId = ds ? getBot(ds.larkAppId).config.cliId : undefined;
-        const sessions = discoverAdoptableSessions(botCliId);
+        const backendType = ds
+          ? (getBot(ds.larkAppId).config.backendType ?? config.daemon.backendType)
+          : config.daemon.backendType;
+        const useZellij = backendType === 'zellij';
+
+        // Discover via the backend the bot actually runs.
+        const sessions: Array<AdoptableSession | ZellijAdoptableSession> = useZellij
+          ? discoverAdoptableZellijSessions(botCliId)
+          : discoverAdoptableSessions(botCliId);
 
         if (sessions.length === 0) {
           await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
@@ -855,7 +865,14 @@ export async function handleCommand(
 
         const directTarget = adoptArgs;
         if (directTarget) {
-          const target = sessions.find(s => s.tmuxTarget === directTarget);
+          // zellij direct target: "session:paneId" or "session/paneId"; tmux:
+          // the "session:window.pane" tmux address.
+          const target = useZellij
+            ? (sessions as ZellijAdoptableSession[]).find(s => {
+                const sep = directTarget.replace('/', ':');
+                return `${s.zellijSession}:${s.zellijPaneId}` === sep;
+              })
+            : (sessions as AdoptableSession[]).find(s => s.tmuxTarget === directTarget);
           if (!target) {
             await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
             break;
@@ -1698,8 +1715,13 @@ export async function handleCommand(
 
 // ─── Adopt session helper ────────────────────────────────────────────────────
 
+/** Discriminate a zellij adopt candidate from a tmux one. */
+function isZellijTarget(t: AdoptableSession | ZellijAdoptableSession): t is ZellijAdoptableSession {
+  return 'zellijPaneId' in t;
+}
+
 export async function startAdoptSession(
-  target: AdoptableSession,
+  target: AdoptableSession | ZellijAdoptableSession,
   ds: DaemonSession,
   deps: CommandHandlerDeps,
   larkAppId?: string,
@@ -1708,18 +1730,25 @@ export async function startAdoptSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
 
-  if (!validateAdoptTarget(target.tmuxTarget, target.cliPid)) {
+  const zellij = isZellijTarget(target);
+  const valid = zellij
+    ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid)
+    : validateAdoptTarget(target.tmuxTarget, target.cliPid);
+  if (!valid) {
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
     return;
   }
 
   const project = target.cwd.split('/').pop() || target.cwd;
+  const pane = zellij ? `${target.zellijSession}/${target.zellijPaneId}` : target.tmuxTarget;
 
   ds.workingDir = target.cwd;
   ds.session.workingDir = target.cwd;
   ds.session.title = `Adopt: ${project}`;
   ds.adoptedFrom = {
-    tmuxTarget: target.tmuxTarget,
+    tmuxTarget: zellij ? undefined : target.tmuxTarget,
+    zellijSession: zellij ? target.zellijSession : undefined,
+    zellijPaneId: zellij ? target.zellijPaneId : undefined,
     originalCliPid: target.cliPid,
     sessionId: target.sessionId,
     cliId: target.cliId,
@@ -1733,5 +1762,5 @@ export async function startAdoptSession(
   forkAdoptWorker(ds);
 
   const cliName = getCliDisplayName(target.cliId);
-  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane: target.tmuxTarget }, loc));
+  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
 }

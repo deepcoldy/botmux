@@ -54,8 +54,17 @@ zellij 生产命脉对照 tmux：botmux 当前生产用 `TmuxPipeBackend`，靠 
 
 - ✅ **托管模式**全链路：`BACKEND_TYPE=zellij` → selector 选 `ZellijBackend`，worker 当非 tmux/pty 路径（截图走 headless renderer、web 终端走 relay），内部持有持久 zellij 会话。
 - ✅ **daemon 重启持久化**：shutdown detach + restore eager-reattach（含 mismatch guard），与 tmux 持平。
-- ⏳ **/adopt 守护进程流**未接：发现模块（基础件）已就绪+实测，但接进 `worker-pool` 扫描/`adopt-route`/各 CLI bridge watcher 是更大一块，留作下一步。
-- ⏳ 未跑整 daemon 出真实 Lark 卡片：渲染路径与现有 pty 后端一致（已被生产验证），端到端验证留作集成步。
+- ✅ **/adopt 全链路已接**（见下）。
+
+## /adopt（zellij）
+
+非侵入观测/驱动 + 全链路接进守护进程，对标 tmux pipe-pane adopt。
+
+- **观测后端** `ZellijObserveBackend`（对标 `TmuxPipeBackend`）：轮询 `dump-screen --ansi`（变化才 emit，前缀 clear+home 让 xterm 重绘当前屏）当 onData 流；`action write/write-chars/paste --pane-id` 定向驱动；`resize` no-op；`kill/destroySession` 只停轮询不碰用户会话；liveness 轮询 list-panes，pane 消失→onExit。实测：观测/驱动往返、liveness→onExit、非侵入全过。
+- **发现** `zellij-adopt-discovery.ts`：复用 session-discovery 的进程树 CLI 识别 + sessionId 解析（多路复用器无关），zellij 侧用 dump-layout 枚举 pane 的 command+cwd，**pane→pid 按 (cliId, cwd) 匹配 server 子进程树，歧义(>1)或无匹配则拒绝**（Codex 建议）。实测：claude/codex 各自 projA/projB 正确绑定 paneId+pid+cwd。
+- **抽象** `ObserveBackend` 接口 + `isObserveBackend()` duck-type guard 取代散落的 `instanceof TmuxPipeBackend`（worker web seed、transient-snapshot 截图）。
+- **接线**：`/adopt` 命令按 bot backend 分派 tmux/zellij 发现；select 卡片 + card-handler + `startAdoptSession` + `forkAdoptWorker` + worker adopt 分支 + `adoptedFrom` 持久化 + restore 全部加 zellij 分支。bridge watcher（claude/codex/coco/mtr transcript 回传）多路复用器无关，原样复用。
+- **tradeoff**：画面 ~700ms 级快照延迟（非字节级）；对话内容走 transcript bridge 即时权威。
 
 ## 已知 caveat / /adopt 接线前待办（供 review）
 

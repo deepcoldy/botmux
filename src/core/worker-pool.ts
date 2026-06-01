@@ -1951,7 +1951,6 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
-    backendType: 'tmux',
     prompt: '',
     resume: false,
     ownerOpenId: ds.ownerOpenId,
@@ -1961,8 +1960,14 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
+    // Zellij adopt targets carry zellijSession+zellijPaneId (observe via
+    // dump-screen / drive via action); tmux carries tmuxTarget (pipe-pane).
+    // The worker's adopt branch picks the backend from whichever is present.
+    backendType: adopted.zellijPaneId ? 'zellij' : 'tmux',
     adoptMode: true,
     adoptTmuxTarget: adopted.tmuxTarget,
+    adoptZellijSession: adopted.zellijSession,
+    adoptZellijPaneId: adopted.zellijPaneId,
     adoptPaneCols: adopted.paneCols,
     adoptPaneRows: adopted.paneRows,
     bridgeJsonlPath,
@@ -1997,7 +2002,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   ds.worker = worker;
   ds.spawnedAt = Date.now();
   ds.cliVersion = '';
-  logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget})`);
+  logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`})`);
 
   ds.exitEventEmitted = false;
   dashboardEventBus.publish({

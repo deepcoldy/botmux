@@ -56,6 +56,8 @@ import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
+import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
+import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -2671,19 +2673,22 @@ function stopScreenUpdates(): void {
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  // ── Adopt mode: pipe-pane the user's existing tmux pane (no attach) ──
-  if (cfg.adoptMode && cfg.adoptTmuxTarget) {
+  // ── Adopt mode: observe the user's existing pane (no attach / non-invasive) ──
+  // tmux: pipe-pane (raw stream). zellij: dump-screen poll + action drive.
+  if (cfg.adoptMode && (cfg.adoptTmuxTarget || cfg.adoptZellijPaneId)) {
     // We mark BOTH isTmuxMode and isPipeMode: the former keeps idle/spawn
-    // logic on the tmux track; the latter tells the WS handler to route
+    // logic on the observe track; the latter tells the WS handler to route
     // updates through the shared scrollback fan-out (because there is no
     // PTY-per-WS — we don't attach to anything).
     isTmuxMode = true;
     isPipeMode = true;
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
-    const pipeBe = new TmuxPipeBackend(cfg.adoptTmuxTarget);
-    backend = pipeBe;
-    pipeBe.spawn('', [], {
+    const observeBe: ObserveBackend = cfg.adoptZellijPaneId
+      ? new ZellijObserveBackend(cfg.adoptZellijSession ?? '', cfg.adoptZellijPaneId, { cliPid: cfg.adoptCliPid })
+      : new TmuxPipeBackend(cfg.adoptTmuxTarget!);
+    backend = observeBe;
+    observeBe.spawn('', [], {
       cwd: cfg.workingDir,
       cols,
       rows,
@@ -2692,9 +2697,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
     // Seed the shared scrollback with the pane's current screen so any
     // already-connected (or future) WS clients render meaningful content
-    // immediately, instead of waiting for the next byte tmux pipes through.
+    // immediately, instead of waiting for the next observe tick.
     try {
-      const initial = pipeBe.captureCurrentScreen();
+      const initial = observeBe.captureCurrentScreen();
       if (initial.length > 0) onPtyData(initial);
     } catch (err: any) {
       log(`captureCurrentScreen failed: ${err.message}`);
@@ -3258,8 +3263,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // at any size mismatch and produces the stacked-footer history garble.
         // See chooseWebTerminalSeed for the full rationale.
         const seed = chooseWebTerminalSeed({
-          canCapture: isPipeMode && backend instanceof TmuxPipeBackend,
-          capture: () => (backend as TmuxPipeBackend).captureCurrentScreen(),
+          canCapture: isPipeMode && isObserveBackend(backend),
+          capture: () => (backend as ObserveBackend).captureCurrentScreen(),
           scrollback,
           onError: log,
         });

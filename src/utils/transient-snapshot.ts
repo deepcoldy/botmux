@@ -22,7 +22,7 @@
  */
 import xtermHeadless from '@xterm/headless';
 const { Terminal } = xtermHeadless;
-import { TmuxPipeBackend } from '../adapters/backend/tmux-pipe-backend.js';
+import { isObserveBackend } from '../adapters/backend/types.js';
 import { readViewportText } from './terminal-renderer.js';
 import { captureToPng } from './screenshot-renderer.js';
 import { clamp, MIN_RENDER_COLS, MAX_RENDER_COLS, MIN_RENDER_ROWS, MAX_RENDER_ROWS } from './render-dimensions.js';
@@ -43,7 +43,7 @@ export function tryCapturePipeSnapshot(
   fallbackCols: number,
   fallbackRows: number,
 ): TransientSnapshot | null {
-  if (!(backend instanceof TmuxPipeBackend)) return null;
+  if (!isObserveBackend(backend)) return null;
   const live = backend.getPaneSize();
   const cols = clamp(live?.cols ?? fallbackCols, MIN_RENDER_COLS, MAX_RENDER_COLS);
   const rows = clamp(live?.rows ?? fallbackRows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);

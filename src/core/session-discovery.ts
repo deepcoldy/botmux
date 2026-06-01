@@ -43,7 +43,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   hermes: 'hermes',
 };
 
-function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
+export function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
   const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
   const direct = CLI_COMM_MAP[comm] ?? CLI_COMM_MAP[normalizedComm];
   // MTR is an OpenCode fork and some installs still expose the underlying
@@ -69,7 +69,7 @@ function shellescape(s: string): string {
  *
  * 返回 undefined 表示进程不存在或读不到。
  */
-function readComm(pid: number): string | undefined {
+export function readComm(pid: number): string | undefined {
   if (IS_LINUX) {
     try {
       return readFileSync(`/proc/${pid}/comm`, 'utf-8').trim();
@@ -101,7 +101,7 @@ function readComm(pid: number): string | undefined {
  *
  * 返回 undefined 表示读不到。
  */
-function readCwd(pid: number): string | undefined {
+export function readCwd(pid: number): string | undefined {
   if (IS_LINUX) {
     try {
       return readlinkSync(`/proc/${pid}/cwd`);
@@ -134,7 +134,7 @@ function readCwd(pid: number): string | undefined {
  * 的 ps 都接受这个写法。fork-exec 一次代价可接受，因为 discovery 本身是
  * 低频操作（只在用户 /adopt 时跑一遍）。
  */
-function getChildPids(pid: number): number[] {
+export function getChildPids(pid: number): number[] {
   try {
     const out = execSync('ps -A -o pid= -o ppid=', {
       encoding: 'utf-8',
@@ -192,7 +192,7 @@ function findCliProcess(
  * Try to read Claude Code session metadata from ~/.claude/sessions/<PID>.json.
  * Returns { sessionId, cwd, startedAt } or undefined.
  */
-function readClaudeSessionMeta(pid: number): { sessionId?: string; cwd?: string; startedAt?: number } | undefined {
+export function readClaudeSessionMeta(pid: number): { sessionId?: string; cwd?: string; startedAt?: number } | undefined {
   try {
     const metaPath = join(homedir(), '.claude', 'sessions', `${pid}.json`);
     const raw = readFileSync(metaPath, 'utf-8');

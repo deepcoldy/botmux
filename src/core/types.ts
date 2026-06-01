@@ -97,15 +97,18 @@ export interface DaemonSession {
    *  (closeSession) and the worker-process exit handler may try to publish;
    *  this guard prevents double-counting on the dashboard side. */
   exitEventEmitted?: boolean;
-  /** Present when this session was created via /adopt (shared observation mode). */
+  /** Present when this session was created via /adopt (shared observation mode).
+   *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
   adoptedFrom?: {
-    tmuxTarget: string;       // e.g. "0:2.0" — user's original tmux pane
+    tmuxTarget?: string;      // e.g. "0:2.0" — user's original tmux pane
+    zellijSession?: string;   // zellij session name (zellij backend)
+    zellijPaneId?: string;    // e.g. "terminal_1" — observe/drive target
     originalCliPid: number;   // CLI process PID in the user's pane
     sessionId?: string;       // CLI session ID (for takeover/resume)
     cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type
     cwd: string;              // CLI working directory
-    paneCols?: number;        // tmux pane width at adopt time
-    paneRows?: number;        // tmux pane height at adopt time
+    paneCols?: number;        // pane width at adopt time
+    paneRows?: number;        // pane height at adopt time
   };
 }
 

@@ -77,9 +77,13 @@ export interface Session {
   cliSessionId?: string;
   /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
   cliId?: import('./adapters/cli/types.js').CliId;
-  /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts. */
+  /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
+   *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
   adoptedFrom?: {
-    tmuxTarget: string;
+    tmuxTarget?: string;
+    /** zellij adopt target: session name + pane id (e.g. "terminal_1"). */
+    zellijSession?: string;
+    zellijPaneId?: string;
     originalCliPid: number;
     sessionId?: string;
     cliId?: string;
@@ -197,7 +201,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; model?: string; disableCliBypass?: boolean; backendType: 'pty' | 'tmux' | 'zellij'; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; model?: string; disableCliBypass?: boolean; backendType: 'pty' | 'tmux' | 'zellij'; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; adoptMode?: boolean; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string }
   | { type: 'raw_input'; content: string }
   | { type: 'close' }

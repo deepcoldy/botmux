@@ -19,6 +19,7 @@ import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
+import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
@@ -566,7 +567,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // Adopt sessions: restore if original CLI is still alive, otherwise close
     if (session.title?.startsWith('Adopt:') && session.adoptedFrom) {
       const adopted = session.adoptedFrom;
-      if (!validateAdoptTarget(adopted.tmuxTarget, adopted.originalCliPid)) {
+      const stillAlive = adopted.zellijPaneId
+        ? validateZellijAdoptTarget(adopted.zellijSession ?? '', adopted.zellijPaneId, adopted.originalCliPid)
+        : validateAdoptTarget(adopted.tmuxTarget ?? '', adopted.originalCliPid);
+      if (!stillAlive) {
         logger.info(`Closing adopt session ${session.sessionId} (original CLI exited)`);
         sessionStore.closeSession(session.sessionId);
         continue;
@@ -609,7 +613,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // rather than silently overwriting it.
       await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
       forkAdoptWorker(ds, { restoredFromMetadata: true });
-      logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adopted.tmuxTarget}, scope: ${scope})`);
+      logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`}, scope: ${scope})`);
       continue;
     }
     // Adopt sessions without persisted metadata — close (legacy)
