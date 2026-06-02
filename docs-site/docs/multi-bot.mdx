@@ -1,0 +1,30 @@
+# 多机器人协作
+
+同一台机器上可运行多个飞书机器人，每个机器人可绑不同的 CLI。把它们拉进同一个群，就能让不同模型"赛博斗蛐蛐"。
+
+<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419321554_multibot-video.web.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+## 路由规则
+
+- **群里只有一个机器人**：无需 @，自动响应。
+- **群里有多个机器人**：用 `@mention` 指定接收方。
+- `@botA @botB /t <prompt>`：让**每个被 @ 的机器人**在同一条消息上各自独立开新话题，各跑各的。
+
+## 让机器人互相认识
+
+机器人之间默认**收不到**对方在群里发的普通消息。要让它们接力协作：
+
+1. 先发一次 `@botA @botB /introduce` —— 它们互相登记 open_id（@ 顺序任意，可带额外文本）。
+2. 之后各 bot 就能在自己的会话里用 `botmux send --mention <对方 open_id>` 显式 @ 对方，触发对方接力。
+
+> 跨 bot 协作的硬性事实：**不 `--mention` 对方 bot，对方完全不会被触发**。对方的 open_id 从 `botmux bots list` 或消息里的 `<available_bots>` 块拿。
+
+## 典型场景
+
+- **代码 review**：让 Claude Code 和 Codex 一起看同一个 MR，观点不同时互相挑刺。
+- **方案评审**：两个 AI 分别出方案，互相找漏洞。
+- **写审分离**：一个写，一个审，迭代收敛。
+
+配置极简：每个机器人一个飞书应用，拉进同一个群即可，进程完全隔离。
+
+> 相关：用 [角色与团队](/roles) 给每个 bot 设人设和能力标签；用 [一键建会话群](/group) 一句话拉多个 bot 进新群；用 [会话接力](/relay) 把会话搬到协作群。

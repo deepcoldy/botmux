@@ -1,0 +1,20 @@
+# 会话接入（Adopt）
+
+把**已经在本地 tmux 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。
+
+<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419321260_adopt-video.web.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+```
+/adopt              # 扫描本机 tmux，弹出选择卡片
+/adopt 0:2.0        # 直接接入指定 tmux pane
+```
+
+## 三种动作
+
+- **共享模式**：接入后，本地终端（如 iTerm2）和飞书双向同步——流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端。本地的 tmux 全程保持连接。
+- **一键接管**：点流式卡片上的「🔄 接管」，botmux 以 `--resume` 重建会话，转为标准 botmux 会话。
+- **安全断开**：点「⏏ 断开」，botmux 退出观察，原 CLI 不受影响。
+
+## 典型用法
+
+在公司电脑 tmux 里跑 Claude Code，写到一半要走？手机飞书发 `/adopt` → 选会话 → 即刻同步。路上用手机继续，回到电脑点「断开」接着用。**不是远程控制，是真正的多设备共享。**
