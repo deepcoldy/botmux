@@ -417,6 +417,7 @@ export async function tryHandleIntroduceCommand(
   larkAppId: string,
   message: any,
   senderOpenId: string | undefined,
+  opts: { silent?: boolean } = {},
 ): Promise<boolean> {
   const text = extractMessageTextForRouting(message);
   if (!text) return false;
@@ -427,10 +428,12 @@ export async function tryHandleIntroduceCommand(
   logger.debug(`[${larkAppId}] /introduce from ${senderOpenId ?? 'unknown'} (no auth required)`);
 
   if (grantCommandRestriction(larkAppId, message.chat_id, senderOpenId).blocked) {
-    const loc = localeForBot(larkAppId);
-    await replyMessage(larkAppId, message.message_id, JSON.stringify({
-      text: t('cmd.grant_restricted', { cmd: '/introduce' }, loc),
-    })).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
+    if (!opts.silent) {
+      const loc = localeForBot(larkAppId);
+      await replyMessage(larkAppId, message.message_id, JSON.stringify({
+        text: t('cmd.grant_restricted', { cmd: '/introduce' }, loc),
+      })).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
+    }
     return true;
   }
 
@@ -461,6 +464,9 @@ export async function tryHandleIntroduceCommand(
   } catch (err) {
     logger.warn(`[${larkAppId}] /introduce: failed to persist observed bots: ${err}`);
   }
+
+  // Silent mode (bot-originated probe): record but never echo an ack.
+  if (opts.silent) return true;
 
   const externalBots = bots.filter(m => m.openId !== selfOpenId);
   const ackText = externalBots.length
@@ -929,6 +935,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             serializeByAnchor(ctx.anchor, () =>
               handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId }))
               .catch(err => logger.error(`Error handling message event: ${err}`));
+            return;
+          }
+          // A bot-originated /introduce (e.g. a peer bot's name-resolution probe
+          // @ing us) must be consumed HERE — before foreign-bot routing — so it
+          // never spawns a CLI turn, and silently so it doesn't echo an ack.
+          // (Human-typed /introduce is a user-sender message, handled in the
+          // user branch below with its ack.) This is the receiver-side backstop
+          // for a sender-name probe that misfires onto a bot.
+          if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId, { silent: true })) {
             return;
           }
           // Foreign bot: only route on @mention of us.

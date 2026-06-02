@@ -301,6 +301,53 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
 }
 
 /**
+ * List chat members as (open_id, name) pairs — the name source that does NOT
+ * require 通讯录可见范围 (contact:user.base:readonly). Used as a sender-name
+ * fallback when contact.v3.user.get returns 41050 for an out-of-scope user:
+ * the sender is by definition a member of the chat it just posted in, so a
+ * single members page usually resolves it.
+ *
+ * Best-effort by design (UNLIKE `listChatMemberOpenIds`, which throws): a
+ * failure here just means "couldn't learn the name this way", and the caller
+ * falls through to the next resolution layer. So we swallow errors → [].
+ *
+ * `maxPages` defaults to 1: members pages are 100 max and pagination is serial
+ * (~0.4s/page), so walking a 5000-member group would blow the sender-resolve
+ * budget. One page covers typical topic/project groups; larger groups fall
+ * through to the proactive-@ probe.
+ */
+export async function listChatMembersWithNames(
+  larkAppId: string,
+  chatId: string,
+  maxPages = 1,
+): Promise<Array<{ openId: string; name: string }>> {
+  try {
+    const c = getBotClient(larkAppId);
+    const out: Array<{ openId: string; name: string }> = [];
+    let pageToken: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const params: Record<string, string> = { member_id_type: 'open_id', page_size: '100' };
+      if (pageToken) params.page_token = pageToken;
+      const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`, params);
+      if (res.code !== 0) break;
+      for (const it of (res.data?.items ?? [])) {
+        const openId = it?.member_id;
+        const name = it?.name;
+        if (typeof openId === 'string' && openId && typeof name === 'string' && name) {
+          out.push({ openId, name });
+        }
+      }
+      if (!res.data?.has_more || !res.data?.page_token) break;
+      pageToken = res.data.page_token;
+    }
+    return out;
+  } catch (err) {
+    logger.debug(`listChatMembersWithNames(${chatId}) failed: ${err}`);
+    return [];
+  }
+}
+
+/**
  * Resolve a chat's display name (the user-facing group title). Returns `null`
  * on any failure (chatId is unknown to this bot, network error, bot not in
  * chat etc.) — callers should fall back to displaying the raw chatId so the

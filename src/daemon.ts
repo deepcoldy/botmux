@@ -94,6 +94,7 @@ import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation } from './im/lark/event-dispatcher.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import { enrichSenderName } from './im/lark/sender-name-fallback.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
@@ -2018,7 +2019,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
-  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
+  // enrichSenderName adds the chat-members + proactive-@ fallbacks (blocking)
+  // so a first-turn from an out-of-scope user still carries a name; it no-ops
+  // for bots and already-named senders.
+  const newTopicSender = await enrichSenderName(
+    larkAppId,
+    await resolveSender(larkAppId, senderOpenId, parsed.senderType),
+    { chatId, scope, anchor },
+  );
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
@@ -2407,12 +2415,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const getThreadSender = async (): Promise<typeof threadSenderCached> => {
     if (threadSenderResolved) return threadSenderCached;
     threadSenderResolved = true;
-    threadSenderCached = await resolveSender(
+    const resolved = await resolveSender(
       larkAppId,
       senderOpenIdForPrefix,
       parsed.senderType,
       isForeignBot ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined } : undefined,
     );
+    const probeChatId = ctxChatId ?? data?.message?.chat_id;
+    threadSenderCached = probeChatId
+      ? await enrichSenderName(larkAppId, resolved, { chatId: probeChatId, scope, anchor })
+      : resolved;
     return threadSenderCached;
   };
 
