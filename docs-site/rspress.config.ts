@@ -7,7 +7,7 @@ export default defineConfig({
   title: 'botmux 文档',
   description: '飞书话题群 ↔ AI 编程 CLI 桥接',
   builderConfig: {
-    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v4/" },
+    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v5/" },
   },
   themeConfig: {
     socialLinks: [
