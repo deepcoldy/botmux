@@ -61,7 +61,7 @@ import {
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
-import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
+import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
@@ -593,10 +593,11 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
  * 用指定应用凭证把 open_id (ou_) 解析成 union_id (on_，跨应用稳定)。
  * 查询失败（无 contact 权限 / API 错误）则 fallback 返回原 open_id。
  */
-async function resolveOpenIdToUnionId(appId: string, appSecret: string, openId: string): Promise<string> {
+async function resolveOpenIdToUnionId(appId: string, appSecret: string, openId: string, brand: Brand = 'feishu'): Promise<string> {
   try {
     const { Client } = await import('@larksuiteoapi/node-sdk');
-    const client = new Client({ appId, appSecret });
+    // brand → 域名。Lark 扫码人 ou_→on_ 必须打 larksuite.com，否则失败丢掉 cross-app 稳定性。
+    const client = new Client({ appId, appSecret, domain: sdkDomain(brand) });
     const res = await (client as any).contact.v3.user.get({
       path: { user_id: openId },
       params: { user_id_type: 'open_id' },
@@ -695,7 +696,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   // allowedUsers 为空时虽然"全开放", 但一旦后续加了 allowedChatGroups 就会变成
   // "群成员能对话却没人能做敏感操作 / 用 /grant". setup 阶段强制收口, 不允许没 owner.
   if (creds.userOpenId) {
-    bot.allowedUsers = [await resolveOpenIdToUnionId(creds.appId, creds.appSecret, creds.userOpenId)];
+    bot.allowedUsers = [await resolveOpenIdToUnionId(creds.appId, creds.appSecret, creds.userOpenId, creds.brand)];
   } else {
     bot.allowedUsers = await promptRequiredOwner(rl);
   }

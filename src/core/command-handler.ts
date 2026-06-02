@@ -818,13 +818,14 @@ export async function handleCommand(
 
       case '/login': {
         const subCmd = message.content.replace(/^\/login\s*/, '').trim();
-        if (subCmd === 'status' || subCmd === '状态') {
-          await sessionReply(rootId, getTokenStatus());
-          break;
-        }
+        // 先定位本 bot 配置——token 状态与 OAuth URL 都按 per-bot appId/brand 走。
         const botCfg2 = ds ? getBot(ds.larkAppId).config : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
         if (!botCfg2?.larkAppId || !botCfg2?.larkAppSecret) {
           await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+          break;
+        }
+        if (subCmd === 'status' || subCmd === '状态') {
+          await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand)));
           break;
         }
         const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));

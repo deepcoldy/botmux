@@ -25,6 +25,7 @@ import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
+import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
@@ -1280,6 +1281,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
+    brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
@@ -2097,6 +2099,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
+    brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
