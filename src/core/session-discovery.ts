@@ -37,6 +37,11 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   codex: 'codex',
   aiden: 'aiden',
   coco: 'coco',
+  // CoCo 的某些发行版（如 trae 集成）安装的可执行实际叫 `traecli`，
+  // tmux pane_current_command 仍显示 "coco" 是因为进程标题被改写过；
+  // macOS 下 `ps -o comm=` 拿到的是真实 argv[0]，因此这里需要兜底把
+  // traecli 也识别成 coco，否则 /adopt 扫不到这种会话。
+  traecli: 'coco',
   gemini: 'gemini',
   opencode: 'opencode',
   mtr: 'mtr',
