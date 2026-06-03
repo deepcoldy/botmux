@@ -130,6 +130,8 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** chat_id list: chats where the live streaming card is suppressed (status falls back to master's pending-card morph). Written by `/card off|on`. */
+  noCardChats?: string[];
   /**
    * When true, the streaming card embeds a directly-usable WRITABLE terminal
    * link in its body (token included → anyone who can see the card can drive
@@ -570,6 +572,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      noCardChats: Array.isArray(entry.noCardChats)
+        ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
+        : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,

@@ -159,6 +159,11 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
+  'cmd.card.owner_only': '⚠️ Only the bot owner can use /card.',
+  'cmd.card.off_ok': '🔕 Streaming cards turned off for this chat; status now shows via the in-place pending card (no withdrawal). /card on to restore; /card summons a live card.',
+  'cmd.card.on_ok': '🔔 Streaming cards restored for this chat. The next status update posts a live card again.',
+  'cmd.card.fail': '⚠️ Operation failed: {reason}',
+  'cmd.card.usage': 'Usage: /card (summon) | /card off (suppress for this chat) | /card on (restore)',
   'cmd.card.not_ready': 'Terminal not ready yet — the streaming card will appear once the session is up.',
   'cmd.card.private_not_ready': '🔒 Terminal not ready yet — send /card again once the session is up.',
   'cmd.card.private_not_group': '🔒 Private cards only work in regular group chats — topic groups / DMs are unsupported (Feishu limitation).',

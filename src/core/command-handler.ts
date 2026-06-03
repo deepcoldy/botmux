@@ -6,7 +6,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -24,6 +24,7 @@ import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type Zellij
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
+import { setCardMode } from '../services/card-mode-store.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
 import { writeRoleFile, deleteRoleFile, resolveRole, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
 import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
@@ -487,6 +488,86 @@ async function handleScheduleCommand(
 }
 
 // ─── Main command handler ────────────────────────────────────────────────────
+
+/**
+ * Handle `/card` (owner-only). Resolves the active session itself, so off/on
+ * work WITHOUT one -- they only toggle the per-chat `noCardChats` config. A
+ * summon (show/bare) needs a live session.
+ *
+ * off  -> suppress the live streaming card for this chat (add to noCardChats);
+ *         status falls back to master's pending-card morph.
+ * on   -> restore cards for this chat (remove from noCardChats).
+ * ''/show -> summon a live card. privateCard -> private ephemeral snapshot
+ *         (fail closed on non-group); otherwise a group-visible live card.
+ * off/on also clear `streamingCardForced` so a prior summon does not
+ * short-circuit `streamingCardDisabled()`.
+ */
+export async function handleCardCommand(
+  rootId: string,
+  larkAppId: string,
+  chatId: string,
+  senderOpenId: string | undefined,
+  content: string,
+  deps: CommandHandlerDeps,
+): Promise<void> {
+  const loc = localeForBot(larkAppId);
+  const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
+
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (!ownerOpenId || !senderOpenId || senderOpenId !== ownerOpenId) {
+    await reply(t('cmd.card.owner_only', undefined, loc));
+    return;
+  }
+
+  const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+  const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
+
+  if (sub === 'off') {
+    const r = await setCardMode(larkAppId, chatId, true);
+    if (ds) ds.streamingCardForced = undefined;
+    await reply(r.ok ? t('cmd.card.off_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === 'on') {
+    const r = await setCardMode(larkAppId, chatId, false);
+    if (ds) ds.streamingCardForced = undefined;
+    await reply(r.ok ? t('cmd.card.on_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === '' || sub === 'show') {
+    if (!ds) {
+      await reply(t('cmd.no_active_session', undefined, loc));
+      return;
+    }
+    if (getBot(ds.larkAppId).config.privateCard) {
+      const mode = await getChatModeStrict(ds.larkAppId, ds.chatId);
+      if (mode !== 'group') {
+        await reply(t('cmd.card.private_not_group', undefined, loc));
+        return;
+      }
+      const audience = resolvePrivateCardAudience(ds);
+      if (audience.length === 0) {
+        await reply(t('cmd.card.private_no_audience', undefined, loc));
+        return;
+      }
+      const r = await postPrivateSnapshotCard(ds, audience);
+      if (r.notReady) {
+        await reply(t('cmd.card.private_not_ready', undefined, loc));
+      } else if (r.sent === 0) {
+        await reply(t('cmd.card.private_failed', undefined, loc));
+      } else if (r.sent < r.total) {
+        await reply(t('cmd.card.private_partial', { sent: r.sent, total: r.total }, loc));
+      }
+      return;
+    }
+    ds.streamingCardForced = true;
+    const posted = await postFreshStreamingCard(ds, deps.sessionReply);
+    if (!posted) await reply(t('cmd.card.not_ready', undefined, loc));
+    return;
+  }
+
+  await reply(t('cmd.card.usage', undefined, loc));
+}
 
 export async function handleCommand(
   cmd: string,
@@ -1622,53 +1703,16 @@ export async function handleCommand(
       }
 
       case '/card': {
-        if (!ds) {
+        // Existing-session path. New topics route /card via handleCardCommand at
+        // the router (so no phantom session is created). off/on work without a
+        // live worker; show/bare summons a card.
+        const appId = ds?.larkAppId ?? larkAppId;
+        const cardChatId = ds?.chatId;
+        if (!appId || !cardChatId) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
         }
-        // Private mode (`privateCard`): send a one-shot snapshot only to the
-        // explicit talk-grant audience via the ephemeral API, instead of the
-        // group-visible live card. Ephemeral cards only work in plain `group`
-        // chats and can't be patched — so no live updates, and we fail closed
-        // (never fall back to a group-visible card) since not leaking is the
-        // entire point of this mode.
-        if (getBot(ds.larkAppId).config.privateCard) {
-          // Strict gate: only a *confirmed* plain group is safe — getChatModeStrict
-          // returns 'unknown' on API error instead of guessing 'group', so we fail
-          // closed (no leak) when we can't verify the chat type.
-          const mode = await getChatModeStrict(ds.larkAppId, ds.chatId);
-          if (mode !== 'group') {
-            await sessionReply(rootId, t('cmd.card.private_not_group', undefined, loc));
-            break;
-          }
-          const audience = resolvePrivateCardAudience(ds);
-          if (audience.length === 0) {
-            await sessionReply(rootId, t('cmd.card.private_no_audience', undefined, loc));
-            break;
-          }
-          const r = await postPrivateSnapshotCard(ds, audience);
-          if (r.notReady) {
-            await sessionReply(rootId, t('cmd.card.private_not_ready', undefined, loc));
-          } else if (r.sent === 0) {
-            // Total failure — surface a non-sensitive error (no terminal content,
-            // no open_id list). Most likely cause: missing send permission / bot
-            // not in chat / topic-thread chat.
-            await sessionReply(rootId, t('cmd.card.private_failed', undefined, loc));
-          } else if (r.sent < r.total) {
-            // Partial — report counts only, never the audience identities.
-            await sessionReply(rootId, t('cmd.card.private_partial', { sent: r.sent, total: r.total }, loc));
-          }
-          break;
-        }
-        // Manual summon. Force the live card on for the rest of this session —
-        // even when the bot has `disableStreamingCard` set — then post a fresh
-        // card. If the worker terminal isn't up yet, the force flag still sticks
-        // so the card appears (and live-updates) as soon as the worker is ready.
-        ds.streamingCardForced = true;
-        const posted = await postFreshStreamingCard(ds, deps.sessionReply);
-        if (!posted) {
-          await sessionReply(rootId, t('cmd.card.not_ready', undefined, loc));
-        }
+        await handleCardCommand(rootId, appId, cardChatId, message.senderId, message.content, deps);
         break;
       }
 

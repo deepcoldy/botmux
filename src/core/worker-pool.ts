@@ -140,7 +140,11 @@ export function isRelayableRealSession(ds: DaemonSession): boolean {
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession): boolean {
   if (ds.streamingCardForced) return false;
-  try { return getBot(ds.larkAppId).config.disableStreamingCard === true; } catch { return false; }
+  try {
+    const cfg = getBot(ds.larkAppId).config;
+    return cfg.disableStreamingCard === true
+      || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId));
+  } catch { return false; }
 }
 
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming

@@ -162,6 +162,11 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.card.owner_only': '⚠️ 仅 bot 主人可以使用 /card。',
+  'cmd.card.off_ok': '🔕 已关闭本群流式卡片，状态改用「处理中卡片」原地更新（不撤回）。/card on 恢复出卡；/card 可临时召唤一张实时卡。',
+  'cmd.card.on_ok': '🔔 已恢复本群流式卡片。下条状态起重新出实时卡。',
+  'cmd.card.fail': '⚠️ 操作失败：{reason}',
+  'cmd.card.usage': '用法：/card（召唤实时卡）| /card off（本群关流式卡）| /card on（恢复出卡）',
   'cmd.card.not_ready': '终端尚未就绪，等会话起好后流式卡片会自动出现。',
   'cmd.card.private_not_ready': '🔒 终端尚未就绪，等会话起好后再发一次 /card。',
   'cmd.card.private_not_group': '🔒 私密卡片仅支持普通群聊，话题群 / 单聊无法发送（飞书限制）。',

@@ -53,7 +53,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, handleCardCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -287,7 +287,11 @@ const pendingResponseQueue = createPendingResponseQueue();
 
 function streamingCardDisabledFor(ds: DaemonSession): boolean {
   if (ds.streamingCardForced) return false;
-  try { return getBot(ds.larkAppId).config.disableStreamingCard === true; } catch { return false; }
+  try {
+    const cfg = getBot(ds.larkAppId).config;
+    return cfg.disableStreamingCard === true
+      || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId));
+  } catch { return false; }
 }
 
 function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
@@ -1372,6 +1376,10 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string): void {
+  // `/card` summon is one-shot: it forces a live card only for the turn it ran
+  // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
+  // Use `/card on` to persistently restore cards for the chat.
+  ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
   if (ds.streamCardId && ds.workerPort) {
@@ -1949,6 +1957,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
     if (restrictedText) {
       await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
+    // /card needs no fresh session: off/on only toggle per-chat config, and a
+    // summon has nothing to show in a brand-new topic. Route here so the generic
+    // daemon-command block below does not pre-create a worker=null session.
+    if (cmd === '/card') {
+      await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
       return;
     }
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
