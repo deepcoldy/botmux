@@ -1480,6 +1480,13 @@ interface SessionData {
   pendingResponseCardId?: string;
   pendingResponseCardState?: 'open' | 'patched';
   lastPatchedResponseCardId?: string;
+  // Markers that a real CLI ever ran in this session (vs a daemon-command
+  // scratch placeholder). Persisted by the daemon; only presence is checked
+  // here, so they're typed loosely. Used by cmdList to avoid reporting an
+  // unconfirmed /adopt scratch as a crashed CLI session.
+  cliId?: string;
+  lastCliInput?: string;
+  adoptedFrom?: unknown;
 }
 
 /**
@@ -2032,24 +2039,38 @@ async function cmdList(): Promise<void> {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
 
-  // Auto-prune unrecoverable sessions: process dead and no tmux session
+  // Auto-prune unrecoverable sessions: process dead and no tmux session.
+  // Split into two buckets so a never-activated daemon-command scratch (e.g. an
+  // unconfirmed /adopt that only posted a picker card, /help, an abandoned
+  // /relay picker) isn't reported as a crashed CLI. Such a scratch never forked
+  // a worker, so it has no cliId / lastCliInput / adoptedFrom — the same "was it
+  // ever a real CLI session" markers isRelayableRealSession uses. Closing it is
+  // fine, but the "进程已死且无 tmux session" notice wrongly implies a CLI ran
+  // and crashed, which is exactly the confusing output users hit after /adopt.
   const pruned: SessionData[] = [];
+  const prunedScratch: SessionData[] = [];
   const live: SessionData[] = [];
   for (const s of active) {
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
     const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
     if (!hasPid && !hasTmux) {
-      pruned.push(s);
+      const everReal = !!(s.cliId || s.lastCliInput || s.adoptedFrom);
+      (everReal ? pruned : prunedScratch).push(s);
     } else {
       live.push(s);
     }
   }
-  if (pruned.length > 0) {
-    for (const s of pruned) {
+  const closeNow = (arr: SessionData[]) => {
+    for (const s of arr) {
       s.status = 'closed';
       s.closedAt = new Date().toISOString();
       saveSession(s);
     }
+  };
+  // Scratches: close silently — they were placeholders, not dead sessions.
+  closeNow(prunedScratch);
+  if (pruned.length > 0) {
+    closeNow(pruned);
     console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已死且无 tmux session）`);
   }
 
