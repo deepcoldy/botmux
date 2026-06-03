@@ -111,8 +111,11 @@ class AppServerClient {
   private lastStderr = '';
   private fatalError?: Error;
 
-  constructor(private readonly codexBin: string, private readonly cwd: string) {
-    this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
+  constructor(private readonly codexBin: string, private readonly cwd: string, private readonly mode: 'proxy' | 'standalone') {
+    const appServerArgs = mode === 'proxy'
+      ? ['app-server', 'proxy']
+      : ['app-server', '--listen', 'stdio://'];
+    this.child = spawn(codexBin, appServerArgs, {
       cwd,
       env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -129,10 +132,10 @@ class AppServerClient {
       const hint = (err as NodeJS.ErrnoException).code === 'ENOENT'
         ? '\nHint: install the Codex CLI, or set cliPathOverride to the Codex App bundled binary, for example /Applications/Codex.app/Contents/Resources/codex.'
         : '';
-      this.failAll(new Error(`Failed to start Codex app-server with "${codexBin}": ${err.message}${hint}`));
+      this.failAll(new Error(`Failed to start Codex app-server ${mode} with "${codexBin}": ${err.message}${hint}`));
     });
     this.child.on('exit', (code, signal) => {
-      const err = this.fatalError ?? new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
+      const err = this.fatalError ?? new Error(`Codex app-server ${mode} exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
       this.failAll(err);
     });
   }
@@ -242,7 +245,7 @@ try {
   process.exit(2);
 }
 
-const client = new AppServerClient(args.codexBin, args.cwd);
+let client: AppServerClient;
 let threadId = args.threadId;
 let threadReady = false;
 let activeTurn: ActiveTurn | null = null;
@@ -363,10 +366,6 @@ async function ensureThread(): Promise<string> {
         sandbox: 'danger-full-access',
         config: { shell_environment_policy: { inherit: 'all' } },
         developerInstructions: appDeveloperInstructions(args),
-        excludeTurns: true,
-        // Keep Codex App's rich history in sync with turns created by this
-        // external runner so the desktop UI can render follow-up messages.
-        persistExtendedHistory: true,
       });
       const resumedThreadId = String(resumed.thread.id);
       threadId = resumedThreadId;
@@ -388,10 +387,6 @@ async function ensureThread(): Promise<string> {
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,
-    experimentalRawEvents: false,
-    // Keep Codex App's rich history in sync with turns created by this
-    // external runner so the desktop UI can render follow-up messages.
-    persistExtendedHistory: true,
   });
   const startedThreadId = String(started.thread.id);
   threadId = startedThreadId;
@@ -502,9 +497,28 @@ function handleInput(data: Buffer): void {
 }
 
 async function main(): Promise<void> {
-  client.onRequest(handleServerRequest);
-  client.onNotification(handleNotification);
-  await client.initialize();
+  const preferStandalone = process.env.BOTMUX_CODEX_APP_STANDALONE === '1';
+  const modes: Array<'proxy' | 'standalone'> = preferStandalone ? ['standalone'] : ['proxy', 'standalone'];
+  let lastErr: unknown;
+  for (const mode of modes) {
+    client = new AppServerClient(args.codexBin, args.cwd, mode);
+    client.onRequest(handleServerRequest);
+    client.onNotification(handleNotification);
+    try {
+      await client.initialize();
+      if (mode === 'proxy') writeLine('[codex-app] connected through running app-server daemon.');
+      break;
+    } catch (err) {
+      lastErr = err;
+      client.close();
+      if (mode === 'proxy') {
+        writeLine(`[codex-app] app-server proxy unavailable; falling back to standalone app-server: ${asError(err).message}`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (!client) throw asError(lastErr ?? new Error('failed to start Codex app-server'));
   await ensureThread();
   writeLine('Codex App connected.');
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
