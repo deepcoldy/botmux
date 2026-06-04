@@ -68,9 +68,6 @@ describe('getCliDisplayName', () => {
     expect(getCliDisplayName('pi')).toBe('Pi');
   });
 
-  it('should return "Pi RPC" for pi-rpc', () => {
-    expect(getCliDisplayName('pi-rpc')).toBe('Pi RPC');
-  });
 });
 
 // ─── buildSessionCard ─────────────────────────────────────────────────────

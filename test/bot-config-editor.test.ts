@@ -203,7 +203,6 @@ describe('resolveCliId', () => {
     expect(resolveCliId('7')).toBe('opencode');
     expect(resolveCliId('9')).toBe('mtr');
     expect(resolveCliId('10')).toBe('pi');
-    expect(resolveCliId('11')).toBe('pi-rpc');
   });
 
   it('passes through literal cliIds unchanged', () => {
@@ -211,7 +210,6 @@ describe('resolveCliId', () => {
     expect(resolveCliId('opencode')).toBe('opencode');
     expect(resolveCliId('mtr')).toBe('mtr');
     expect(resolveCliId('pi')).toBe('pi');
-    expect(resolveCliId('pi-rpc')).toBe('pi-rpc');
   });
 
   it('throws on typos so they do not leak into bots.json', () => {

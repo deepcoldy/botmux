@@ -11,7 +11,6 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '8': 'antigravity',
   '9': 'mtr',
   '10': 'pi',
-  '11': 'pi-rpc',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -30,7 +29,7 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
   throw new Error(
-    `Unknown CLI 适配器 "${raw}"。请输入序号 1-11 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-10 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
 }
 

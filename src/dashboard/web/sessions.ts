@@ -14,7 +14,6 @@ const CLI_FILTER_OPTIONS = [
   'opencode',
   'mtr',
   'pi',
-  'pi-rpc',
   'aiden',
   'coco',
   'unknown',

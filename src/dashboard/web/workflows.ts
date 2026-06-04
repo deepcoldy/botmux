@@ -1456,7 +1456,7 @@ function terminalOpenInTabLabel(kind: TerminalSurface['kind']): string {
  *    server-side.
  */
 const RESUME_REQUIRES_CLI_SESSION_ID = new Set<string>(['antigravity', 'cursor']);
-const RESUME_USES_SESSION_ID = new Set<string>(['aiden', 'coco', 'claude-code', 'codex', 'mtr', 'pi', 'pi-rpc']);
+const RESUME_USES_SESSION_ID = new Set<string>(['aiden', 'coco', 'claude-code', 'codex', 'mtr', 'pi']);
 function isResumeCapableCli(cliId: string | undefined): boolean {
   return !!cliId && (RESUME_USES_SESSION_ID.has(cliId) || RESUME_REQUIRES_CLI_SESSION_ID.has(cliId));
 }

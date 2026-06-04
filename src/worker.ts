@@ -64,8 +64,6 @@ import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
 import { createHash } from 'node:crypto';
-import { decodePiRunnerOutput } from './pi-runner-protocol.js';
-import { PiLineEditor } from './pi-line-editor.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -88,7 +86,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', pi: 'Pi', 'pi-rpc': 'Pi RPC' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', pi: 'Pi' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -332,16 +330,6 @@ function clearSendMarkers(): void {
   const path = bridgeMarkerPath();
   if (!path) return;
   try { unlinkSync(path); } catch { /* already gone or fs.unavailable; not fatal */ }
-}
-
-function shouldSuppressFinalOutputBySendMarker(turnStartMs: number | undefined, nextTurnStartMs: number | undefined): boolean {
-  if (turnStartMs === undefined) return false;
-  return shouldSuppressBridgeEmit(
-    { markTimeMs: turnStartMs, isLocal: false },
-    nextTurnStartMs,
-    readSendMarkers(),
-    false,
-  );
 }
 
 function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
@@ -2080,88 +2068,7 @@ let trustHandled = false;
 
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
-let piRunnerBuffer = '';
-const piTurnAckMs = new Map<string, number>();
-let piPreviousFinalAtMs = 0;
-
-function appendSharedTerminalOutput(data: string): void {
-  scrollback += data;
-  if (scrollback.length > MAX_SCROLLBACK) {
-    scrollback = '\x1bc' + scrollback.slice(scrollback.length - MAX_SCROLLBACK);
-  }
-  for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-  }
-}
-
-function normalizePiTerminalText(text: string): string {
-  return text.replace(/\r?\n/g, '\r\n');
-}
-
-function appendPiTerminalLine(text: string, color = '36'): void {
-  appendSharedTerminalOutput(`\r\n\x1b[${color}m[Pi RPC]\x1b[0m ${normalizePiTerminalText(text)}\r\n`);
-}
-
-function handlePiRunnerData(data: string): void {
-  piRunnerBuffer += data;
-  let newline = piRunnerBuffer.indexOf('\n');
-  while (newline !== -1) {
-    const line = piRunnerBuffer.slice(0, newline);
-    piRunnerBuffer = piRunnerBuffer.slice(newline + 1);
-    const msg = decodePiRunnerOutput(line);
-    if (msg) {
-      switch (msg.type) {
-        case 'ready':
-          appendPiTerminalLine('runner ready. Pi runs headless through RPC; type a line and press Enter to send it.');
-          markPromptReady();
-          break;
-        case 'ack':
-          if (!piTurnAckMs.has(msg.id)) piTurnAckMs.set(msg.id, Date.now());
-          appendPiTerminalLine(`accepted ${msg.id}`);
-          log(`Pi runner accepted prompt ${msg.id}`);
-          break;
-        case 'final_output': {
-          const finalAtMs = Date.now();
-          const ackMs = piTurnAckMs.get(msg.turnId);
-          const turnStartMs = ackMs === undefined ? undefined : Math.max(ackMs, piPreviousFinalAtMs);
-          piTurnAckMs.delete(msg.turnId);
-          if (shouldSuppressFinalOutputBySendMarker(turnStartMs, finalAtMs)) {
-            log(`Pi final_output suppressed for ${msg.turnId} (model called botmux send)`);
-            appendPiTerminalLine(`turn ${msg.turnId} completed; reply was already sent via botmux send`, '2');
-          } else {
-            send({
-              type: 'final_output',
-              content: msg.content,
-              lastUuid: msg.turnId,
-              turnId: msg.turnId,
-            });
-            appendSharedTerminalOutput(
-              `\r\n\x1b[1;32m[Pi final ${msg.turnId}]\x1b[0m\r\n${normalizePiTerminalText(msg.content)}\r\n`,
-            );
-          }
-          piPreviousFinalAtMs = Math.max(piPreviousFinalAtMs, finalAtMs);
-          markPromptReady();
-          break;
-        }
-        case 'error':
-          appendPiTerminalLine(`error${msg.id ? ` ${msg.id}` : ''}: ${msg.message}`, '31');
-          log(`Pi runner error${msg.id ? ` (${msg.id})` : ''}: ${msg.message}`);
-          send({ type: 'user_notify', message: `Pi 运行错误：${msg.message}` });
-          markPromptReady();
-          break;
-      }
-    } else if (line.trim()) {
-      process.stdout.write(`[pi-runner] ${line}\n`);
-    }
-    newline = piRunnerBuffer.indexOf('\n');
-  }
-}
-
 function onPtyData(data: string): void {
-  if (lastInitConfig?.cliId === 'pi-rpc') {
-    handlePiRunnerData(data);
-    return;
-  }
   captureWorkflowTranscript(data);
   renderer?.write(data);
 
@@ -2827,9 +2734,6 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     codexBridgeStartTimer();
   }
 
-  if (cfg.cliId === 'pi-rpc') {
-    awaitingFirstPrompt = false;
-  }
 
   // Set up idle detection
   idleDetector = new IdleDetector(cliAdapter);
@@ -3015,7 +2919,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               backend?.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return; // read-only
-              rawPtyWrite(msg.data);
+              backend?.write(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -3276,28 +3180,6 @@ function log(msg: string): void {
   process.stdout.write(`[${ts}] [worker:${sessionId.substring(0, 8) || '??'}] ${msg}\n`);
 }
 
-const piLineEditor = new PiLineEditor();
-
-function submitPiWebInput(content: string): void {
-  if (!backend || !cliAdapter) return;
-  appendPiTerminalLine(`> ${content}`);
-  void cliAdapter.writeInput(backend, content);
-}
-
-function handlePiWebTerminalInput(data: string): void {
-  for (const event of piLineEditor.feed(data)) {
-    if (event.type === 'submit') submitPiWebInput(event.content);
-  }
-}
-
-function rawPtyWrite(data: string): void {
-  if (lastInitConfig?.cliId === 'pi-rpc') {
-    handlePiWebTerminalInput(data);
-    return;
-  }
-  backend?.write(data);
-}
-
 // ─── IPC Message Handler ─────────────────────────────────────────────────────
 
 process.on('message', async (raw: unknown) => {
@@ -3461,10 +3343,7 @@ process.on('message', async (raw: unknown) => {
       usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       if (backend) {
-        if (lastInitConfig?.cliId === 'pi-rpc') {
-          const { sendPiRunnerMessage } = await import('./adapters/cli/pi-rpc.js');
-          sendPiRunnerMessage(backend, msg.content, 'raw_command');
-        } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
+        if ('sendText' in backend && 'sendSpecialKeys' in backend) {
           (backend as any).sendText(msg.content);
           // Beat between text and Enter so the CLI's slash-command picker has
           // time to register the match before submit. Without this, Codex

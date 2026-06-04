@@ -25,14 +25,13 @@ import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
-import { createPiRpcAdapter, nextPiRunnerTurnId } from '../src/adapters/cli/pi-rpc.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode', 'antigravity', 'mtr', 'pi', 'pi-rpc'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode', 'antigravity', 'mtr', 'pi'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -49,16 +48,11 @@ describe('createCliAdapterSync factory', () => {
     expect(() => createCliAdapterSync('unknown-cli' as CliId)).toThrow(/Unknown CLI adapter/);
   });
 
-  it.each(ALL_CLI_IDS.filter(id => id !== 'pi-rpc'))('adapter for "%s" has resolvedBin set', (id) => {
+  it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
     expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 
-  it('pi-rpc adapter resolves to the Node runner while using pathOverride for the Pi binary', () => {
-    const adapter = createCliAdapterSync('pi-rpc', '/opt/pi');
-    expect(adapter.resolvedBin).toBe(process.execPath);
-    expect(adapter.buildArgs({ sessionId: 's', resume: false })).toContain('/opt/pi');
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -240,50 +234,6 @@ describe('opencode buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: true });
     expect(args).not.toContain('sess-6');
     expect(args).not.toContain('--resume');
-  });
-});
-
-describe('pi-rpc buildArgs', () => {
-  const adapter = createPiRpcAdapter('/usr/bin/pi');
-
-  it('launches the botmux Pi runner with RPC session args', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false });
-    expect(adapter.resolvedBin).toBe(process.execPath);
-    expect(args[0]).toMatch(/pi-runner\.js$/);
-    expect(args).toContain('--pi-bin');
-    expect(args[args.indexOf('--pi-bin') + 1]).toBe('/usr/bin/pi');
-    expect(adapter.versionCommand?.()).toEqual({ bin: '/usr/bin/pi', args: ['--version'] });
-    expect(args).toContain('--');
-    expect(args).toContain('--session-id');
-    expect(args[args.indexOf('--session-id') + 1]).toBe('sess-pi');
-    expect(args).toContain('--session-dir');
-    expect(args[args.indexOf('--session-dir') + 1]).toMatch(/\.botmux[/\\]data[/\\]pi-sessions$/);
-    expect(args).toContain('--tools');
-    expect(args[args.indexOf('--tools') + 1]).toBe('read,bash,edit,write,grep,find,ls');
-    expect(args).toContain('--append-system-prompt');
-    expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('botmux send');
-    expect(args).toContain('--no-skills');
-    expect(args).toContain('--skill');
-    expect(args[args.indexOf('--skill') + 1]).toMatch(/\.botmux[/\\]data[/\\]pi-skills$/);
-  });
-
-  it('does not pass initialPrompt via args because runner receives it over line protocol', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false, initialPrompt: 'hello pi' });
-    expect(args).not.toContain('hello pi');
-    expect(adapter.passesInitialPromptViaArgs).toBe(false);
-  });
-
-  it('injects session context and supports type-ahead through Pi follow_up RPC', () => {
-    expect(adapter.injectsSessionContext).toBe(true);
-    expect(adapter.supportsTypeAhead).toBe(true);
-  });
-
-  it('generates unique monotonically increasing runner turn ids in one tick', () => {
-    const a = nextPiRunnerTurnId();
-    const b = nextPiRunnerTurnId();
-    expect(a).not.toBe(b);
-    expect(a).toMatch(/^pi-\d+-\d+$/);
-    expect(b).toMatch(/^pi-\d+-\d+$/);
   });
 });
 
@@ -520,6 +470,7 @@ describe('systemHints', () => {
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
+    ['pi', () => createPiAdapter('/bin/pi')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -544,7 +495,6 @@ describe('id property', () => {
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
     ['pi', () => createPiAdapter('/bin/pi')],
-    ['pi-rpc', () => createPiRpcAdapter('/bin/pi')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -593,9 +543,6 @@ describe('altScreen property', () => {
     expect(createPiAdapter('/bin/pi').altScreen).toBe(true);
   });
 
-  it('pi-rpc runner does not use alt screen', () => {
-    expect(createPiRpcAdapter('/bin/pi').altScreen).toBe(false);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -669,9 +616,4 @@ describe('buildResumeCommand', () => {
       .toBe('pi --session-id bm-pi');
   });
 
-  it('pi-rpc emits `pi --session-id <sessionId> --session-dir <botmux-dir>`', () => {
-    const a = createPiRpcAdapter('/bin/pi');
-    expect(a.buildResumeCommand?.({ sessionId: 'bm-pi', cliSessionId: 'ignored' }))
-      .toMatch(/^pi --session-id bm-pi --session-dir .*\.botmux[/\\]data[/\\]pi-sessions$/);
-  });
 });
