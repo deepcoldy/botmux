@@ -29,6 +29,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
+import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
@@ -115,7 +116,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -1397,11 +1398,13 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
   // when the model forgets to call `botmux send`.
-  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes' || lastInitConfig?.cliId === 'mtr';
+  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes' || lastInitConfig?.cliId === 'mtr';
 }
 
+// Both Codex and TRAE share the same rollout JSONL layout (response_item
+// messages), so drainCodexRollout works for both.
 function structuredBridgeIsCodex(): boolean {
-  return lastInitConfig?.cliId === 'codex';
+  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex';
 }
 
 function structuredBridgeIsHermes(): boolean {
@@ -1470,17 +1473,25 @@ function codexBridgeStartTimer(): void {
         // by sid suffix; CoCo's events.jsonl path is deterministic from
         // sid, so the lookup is just a path computation + existence check.
         const isCoco = lastInitConfig?.cliId === 'coco';
+        const isTraex = lastInitConfig?.cliId === 'traex';
         let path: string | undefined;
         if (codexBridgePendingSessionId) {
-          path = isCoco
-            ? cocoEventsPathForSession(codexBridgePendingSessionId)
-            : findCodexRolloutBySessionId(codexBridgePendingSessionId);
-          if (path && isCoco && !existsSync(path)) path = undefined;
+          if (isCoco) {
+            path = cocoEventsPathForSession(codexBridgePendingSessionId);
+            if (path && !existsSync(path)) path = undefined;
+          } else if (isTraex) {
+            path = findTraexRolloutBySessionId(codexBridgePendingSessionId);
+          } else {
+            path = findCodexRolloutBySessionId(codexBridgePendingSessionId);
+          }
         }
         if (!path && codexAdoptPendingPid) {
           if (isCoco) {
             const probed = findCocoSessionByPid(codexAdoptPendingPid);
             if (probed && existsSync(probed.eventsPath)) path = probed.eventsPath;
+          } else if (isTraex) {
+            const probed = findTraexRolloutByPid(codexAdoptPendingPid);
+            if (probed) path = probed.path;
           } else {
             const probed = findCodexRolloutByPid(codexAdoptPendingPid);
             if (probed) path = probed.path;
@@ -1647,7 +1658,9 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  const path = findCodexRolloutBySessionId(cliSessionId);
+  const path = lastInitConfig?.cliId === 'traex'
+    ? findTraexRolloutBySessionId(cliSessionId)
+    : findCodexRolloutBySessionId(cliSessionId);
   if (path) {
     codexBridgePendingSessionId = undefined;
     codexBridgeAttach(path, 'fresh-empty');
@@ -2811,6 +2824,25 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       codexAdoptPendingPid = cfg.adoptCliPid;
       codexBridgeStartTimer();
     }
+  } else if (cfg.cliId === 'traex') {
+    // TRAE rollout format is byte-identical to Codex; only the directory
+    // layout (and therefore the finder functions) differ.
+    const adoptStartMs = Date.now();
+    codexAdoptStartMs = adoptStartMs;
+    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+    let rolloutPath: string | undefined;
+    if (cfg.cliSessionId) rolloutPath = findTraexRolloutBySessionId(cfg.cliSessionId);
+    if (!rolloutPath && cfg.adoptCliPid) {
+      const probed = findTraexRolloutByPid(cfg.adoptCliPid);
+      if (probed) rolloutPath = probed.path;
+    }
+    if (rolloutPath) {
+      codexBridgeAttach(rolloutPath, 'split-live');
+    } else {
+      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+      codexAdoptPendingPid = cfg.adoptCliPid;
+      codexBridgeStartTimer();
+    }
   } else if (cfg.cliId === 'coco') {
     const adoptStartMs = Date.now();
     codexAdoptStartMs = adoptStartMs;
@@ -2858,14 +2890,14 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
 function adoptIdleAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): CliAdapter {
   return cfg.bridgeJsonlPath
     ? createCliAdapterSync('claude-code', undefined)
-    : cfg.cliId === 'codex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr'
+    : cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr'
       ? createCliAdapterSync(cfg.cliId, undefined)
       : ({ completionPattern: undefined, readyPattern: undefined } as CliAdapter);
 }
 
 function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (cfg.cliId === 'codex') {
-    cliAdapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+  if (cfg.cliId === 'codex' || cfg.cliId === 'traex') {
+    cliAdapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
   } else if (cfg.cliId === 'mtr') {
     cliAdapter = createCliAdapterSync('mtr', cfg.cliPathOverride);
   }
@@ -3256,6 +3288,22 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     } else {
       codexBridgeStartTimer();
     }
+  } else if (cfg.cliId === 'traex') {
+    // TRAE: same rollout shape as Codex, different finder path. For a fresh
+    // spawn (no cliSessionId yet) we just arm the poller; writeInput will
+    // surface the cliSessionId on the first successful submit and trigger
+    // codexBridgeNotifyCliSessionId → rollout attach.
+    if (cfg.cliSessionId) {
+      const rolloutPath = findTraexRolloutBySessionId(cfg.cliSessionId);
+      if (rolloutPath) {
+        codexBridgeAttach(rolloutPath, 'baseline-existing');
+      } else {
+        codexBridgePendingSessionId = cfg.cliSessionId;
+        codexBridgeStartTimer();
+      }
+    } else {
+      codexBridgeStartTimer();
+    }
   } else if (cfg.cliId === 'coco') {
     const eventsPath = cocoEventsPathForSession(cfg.sessionId);
     codexBridgeAttach(eventsPath, cfg.resume ? 'baseline-existing' : 'fresh-empty');
@@ -3302,15 +3350,22 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   }
 
   // Fallback: if the CLI takes too long to show its prompt (e.g. slow
-  // plugin init), unblock screen updates so the card doesn't stay at
-  // "启动中" forever.  markNewTurn() sets a clean baseline at the current
-  // cursor position so only content written *after* this point appears in
-  // the card.
+  // plugin init, or a spinner blocks the idle detector), unblock screen
+  // updates AND deliver any queued prompts so the first user message
+  // isn't stranded until the second message arrives. markNewTurn() sets a
+  // clean baseline at the current cursor position so only content written
+  // *after* this point appears in the card.
   setTimeout(() => {
     if (awaitingFirstPrompt) {
       awaitingFirstPrompt = false;
       renderer?.markNewTurn();
-      log('First prompt timeout — enabling screen updates');
+      log('First prompt timeout — enabling screen updates and flushing queued messages');
+      // For type-ahead adapters (Codex/CoCo/TRAE/Claude) the TUI is booted
+      // enough to park input even if the idle detector hasn't fired yet.
+      // Directly invoking markPromptReady() would claim the CLI is idle
+      // while it's still mid-boot, so flushPending() alone is safer — it
+      // respects typeAheadAllowed and drains pendingMessages now.
+      if (cliAdapter?.supportsTypeAhead) flushPending();
     }
   }, 15_000);
 }
@@ -3940,7 +3995,7 @@ process.on('message', async (raw: unknown) => {
         //     path, and the other CLIs' adopt flows haven't surfaced
         //     this submit-detection issue.
         if (backend) {
-          if (lastInitConfig?.cliId === 'codex' && cliAdapter) {
+          if ((lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex') && cliAdapter) {
             // writeInput is async but we're already inside an async
             // message handler. Errors are best-effort logged; the bridge
             // ingest path is unaffected because mark already happened
