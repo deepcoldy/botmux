@@ -62,6 +62,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
+    expect(prefs.regularGroupReplyInThread).toBe(false);
   });
 
   it('persists toggles + prompt to bots.json and syncs in-memory config (FR-9)', async () => {
@@ -73,6 +74,7 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: true,
       autoStartOnGroupJoinPrompt: '  先做代码审查再回答 ',
       autoStartOnNewTopic: true,
+      regularGroupReplyInThread: true,
     });
 
     expect(r.ok).toBe(true);
@@ -80,6 +82,7 @@ describe('card-prefs store — 主动开工 fields', () => {
       expect(r.prefs.autoStartOnGroupJoin).toBe(true);
       expect(r.prefs.autoStartOnNewTopic).toBe(true);
       expect(r.prefs.autoStartOnGroupJoinPrompt).toBe('  先做代码审查再回答 ');
+      expect(r.prefs.regularGroupReplyInThread).toBe(true);
     }
 
     // On disk
@@ -87,12 +90,14 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(disk.autoStartOnGroupJoin).toBe(true);
     expect(disk.autoStartOnNewTopic).toBe(true);
     expect(disk.autoStartOnGroupJoinPrompt).toBe('  先做代码审查再回答 ');
+    expect(disk.regularGroupReplyInThread).toBe(true);
 
     // In-memory registry synced (routing reads bot.config directly, no restart)
     const cfg = registry.getBot('app_default').config;
     expect(cfg.autoStartOnGroupJoin).toBe(true);
     expect(cfg.autoStartOnNewTopic).toBe(true);
     expect(cfg.autoStartOnGroupJoinPrompt).toBe('  先做代码审查再回答 ');
+    expect(cfg.regularGroupReplyInThread).toBe(true);
   });
 
   it('removes keys when toggled off / prompt blanked (keeps bots.json tidy)', async () => {
@@ -100,6 +105,7 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: true,
       autoStartOnGroupJoinPrompt: '旧的 prompt',
       autoStartOnNewTopic: true,
+      regularGroupReplyInThread: true,
     });
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
@@ -108,21 +114,24 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '   ',
       autoStartOnNewTopic: false,
+      regularGroupReplyInThread: false,
     });
 
     const disk = readConfig();
     expect(disk.autoStartOnGroupJoin).toBeUndefined();
     expect(disk.autoStartOnNewTopic).toBeUndefined();
     expect(disk.autoStartOnGroupJoinPrompt).toBeUndefined();
+    expect(disk.regularGroupReplyInThread).toBeUndefined();
 
     const cfg = registry.getBot('app_default').config;
     expect(cfg.autoStartOnGroupJoin).toBeUndefined();
     expect(cfg.autoStartOnNewTopic).toBeUndefined();
     expect(cfg.autoStartOnGroupJoinPrompt).toBeUndefined();
+    expect(cfg.regularGroupReplyInThread).toBeUndefined();
   });
 
   it('partial patch leaves untouched fields intact', async () => {
-    writeConfig({ autoStartOnNewTopic: true });
+    writeConfig({ autoStartOnNewTopic: true, regularGroupReplyInThread: true });
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
 
@@ -132,5 +141,6 @@ describe('card-prefs store — 主动开工 fields', () => {
     const disk = readConfig();
     expect(disk.autoStartOnGroupJoin).toBe(true);
     expect(disk.autoStartOnNewTopic).toBe(true);
+    expect(disk.regularGroupReplyInThread).toBe(true);
   });
 });

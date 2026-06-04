@@ -11,6 +11,8 @@
  *   • privateCard               — `/card` sends a private ephemeral snapshot
  *                                  (visible to the talk-grant audience) instead
  *                                  of the group-visible live card
+ *   • regularGroupReplyInThread — top-level @mentions in regular groups open
+ *                                  focused thread replies under the trigger
  */
 import { rmwBotEntry } from './config-store.js';
 import { getBot } from '../bot-registry.js';
@@ -26,6 +28,8 @@ export interface BotCardPrefs {
   autoStartOnGroupJoinPrompt: string;
   /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
   autoStartOnNewTopic: boolean;
+  /** In regular groups, reply to top-level @mentions by opening a thread. */
+  regularGroupReplyInThread: boolean;
 }
 
 /** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
@@ -39,6 +43,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
+      regularGroupReplyInThread: c.regularGroupReplyInThread === true,
     };
   } catch {
     return {
@@ -48,6 +53,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
       autoStartOnNewTopic: false,
+      regularGroupReplyInThread: false,
     };
   }
 }
@@ -84,6 +90,7 @@ export async function updateBotCardPrefs(
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
+    apply(entry, 'regularGroupReplyInThread', patch.regularGroupReplyInThread);
     return {
       write: true,
       result: {
@@ -93,6 +100,7 @@ export async function updateBotCardPrefs(
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
+        regularGroupReplyInThread: entry.regularGroupReplyInThread === true,
       },
     };
   });
@@ -117,10 +125,14 @@ export async function updateBotCardPrefs(
   if (patch.autoStartOnNewTopic !== undefined) {
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
   }
+  if (patch.regularGroupReplyInThread !== undefined) {
+    bot.config.regularGroupReplyInThread = patch.regularGroupReplyInThread || undefined;
+  }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
+    `regularGroupReplyInThread=${r.result.regularGroupReplyInThread} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };

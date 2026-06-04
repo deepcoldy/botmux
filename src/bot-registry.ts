@@ -174,6 +174,12 @@ export interface BotConfig {
    */
   autoStartOnNewTopic?: boolean;
   /**
+   * When true, a top-level @mention in a regular Lark group opens a topic-style
+   * thread reply under that original message. Default undefined keeps legacy
+   * chat-scope regular-group behavior.
+   */
+  regularGroupReplyInThread?: boolean;
+  /**
    * Per-bot voice-engine override for the voice-summary feature. Merged OVER
    * the global `voice` block in ~/.botmux/config.json (per-bot wins field by
    * field). When this bot has usable voice creds (here or globally), its reply
@@ -584,6 +590,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      regularGroupReplyInThread: entry.regularGroupReplyInThread === true || undefined,
       voice,
     });
   }

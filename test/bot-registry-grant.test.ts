@@ -93,4 +93,13 @@ describe('bot-registry grant additions', () => {
     }
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rc3', larkAppSecret: 's' }]))[0].restrictGrantCommands).toBeUndefined();
   });
+
+  it('parses regularGroupReplyInThread only as strict boolean true (else undefined)', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyInThread: true }]))[0].regularGroupReplyInThread).toBe(true);
+    for (const bad of [false, 'true', 1, undefined]) {
+      const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg2', larkAppSecret: 's', regularGroupReplyInThread: bad }]));
+      expect(c[0].regularGroupReplyInThread).toBeUndefined();
+    }
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg3', larkAppSecret: 's' }]))[0].regularGroupReplyInThread).toBeUndefined();
+  });
 });
