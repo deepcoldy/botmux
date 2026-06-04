@@ -8,23 +8,60 @@ import { randomUUID } from 'node:crypto';
 
 const DENY_COOLDOWN_MS = 10 * 60 * 1000;
 
-type Entry = { state: 'pending' | 'denied'; nonce?: string; ts: number; quota?: number };
+export type PendingGrantReplay = {
+  data: unknown;
+  ctx: {
+    chatId: string;
+    messageId: string;
+    chatType: 'group' | 'p2p';
+    scope: 'thread' | 'chat';
+    anchor: string;
+    larkAppId: string;
+    /** Snapshot from the original dispatch: whether the target anchor already owned a session. */
+    ownsSession: boolean;
+  };
+};
+
+type Entry = {
+  state: 'pending' | 'denied';
+  nonce?: string;
+  ts: number;
+  quota?: number;
+  /** Original message to replay after owner approval. In-memory like nonce state. */
+  replay?: PendingGrantReplay;
+};
 const table = new Map<string, Entry>();
 
 const key = (a: string, c: string, t: string) => `${a}:${c}:${t}`;
 
-/** 开一张待处置的卡，返回 nonce。`quota` 为可选的消息额度（已解析），落授权时透传给 grant-store。 */
-export function openPending(larkAppId: string, chatId: string, target: string, quota?: number): string {
-  return openPendingMulti(larkAppId, chatId, [target], quota);
+/**
+ * 开一张待处置的卡，返回 nonce。
+ * `quota` 为可选的消息额度（已解析），落授权时透传给 grant-store。
+ * `replay` 仅入口 A（无权限者 @bot）使用：owner 通过后自动继续执行原消息。
+ */
+export function openPending(
+  larkAppId: string,
+  chatId: string,
+  target: string,
+  quota?: number,
+  replay?: PendingGrantReplay,
+): string {
+  return openPendingMulti(larkAppId, chatId, [target], quota, replay);
 }
 
 /** owner 一次 /grant 多个目标：同一张卡 → 多个 target 共用同一 nonce，
  *  owner 点一次范围即对全部目标生效。校验时每个 target 独立 checkNonce。
  *  `quota`（若有）对每个 target 各自生效（每人 N 条额度）。 */
-export function openPendingMulti(larkAppId: string, chatId: string, targets: string[], quota?: number): string {
+export function openPendingMulti(
+  larkAppId: string,
+  chatId: string,
+  targets: string[],
+  quota?: number,
+  replay?: PendingGrantReplay,
+): string {
   const nonce = randomUUID();
   const ts = Date.now();
-  for (const target of targets) table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts, quota });
+  for (const target of targets) table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts, quota, replay });
   return nonce;
 }
 
@@ -32,6 +69,12 @@ export function openPendingMulti(larkAppId: string, chatId: string, targets: str
 export function getPendingQuota(larkAppId: string, chatId: string, target: string): number | undefined {
   const e = table.get(key(larkAppId, chatId, target));
   return e && e.state === 'pending' ? e.quota : undefined;
+}
+
+/** 回读 pending 上挂的原消息重放信息。无 / 非 pending → undefined。 */
+export function getPendingReplay(larkAppId: string, chatId: string, target: string): PendingGrantReplay | undefined {
+  const e = table.get(key(larkAppId, chatId, target));
+  return e && e.state === 'pending' ? e.replay : undefined;
 }
 
 /** 卡片处置前校验：必须仍 pending 且 nonce 匹配。 */

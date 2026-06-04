@@ -94,7 +94,9 @@ import {
 import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation } from './im/lark/event-dispatcher.js';
+import type { PendingGrantReplay } from './im/lark/grant-pending.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import { serializeByAnchor } from './utils/anchor-serializer.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
@@ -1464,6 +1466,16 @@ const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
+  continueGrantReplay: async (replay: PendingGrantReplay) => {
+    const { ownsSession, ...ctx } = replay.ctx;
+    logger.info(
+      `[grant] auto-continuing approved message ${ctx.messageId.substring(0, 12)} ` +
+      `on anchor=${ctx.anchor.substring(0, 12)} ownsSession=${ownsSession}`,
+    );
+    await serializeByAnchor(ctx.anchor, () => ownsSession
+      ? handleThreadReply(replay.data, ctx)
+      : handleNewTopic(replay.data, ctx));
+  },
   workflowApprovalResolved: (runId) => {
     driveWorkflowRun(runId).catch((err) => {
       logger.warn(`[workflow:${runId}] re-entry after approval failed: ${err instanceof Error ? err.message : String(err)}`);

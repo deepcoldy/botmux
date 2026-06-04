@@ -3,7 +3,7 @@
  * Run: pnpm vitest run test/grant-pending.test.ts
  */
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { openPending, checkNonce, clearPending, markDenied, isThrottled, _resetForTest } from '../src/im/lark/grant-pending.js';
+import { openPending, checkNonce, clearPending, markDenied, isThrottled, getPendingReplay, _resetForTest } from '../src/im/lark/grant-pending.js';
 
 beforeEach(() => { _resetForTest(); vi.useFakeTimers(); });
 afterEach(() => vi.useRealTimers());
@@ -26,6 +26,25 @@ describe('grant-pending', () => {
     openPending('a1', 'oc_1', 'ou_g');
     clearPending('a1', 'oc_1', 'ou_g');
     expect(isThrottled('a1', 'oc_1', 'ou_g')).toBe(false);
+  });
+
+  it('stores replay only while pending', () => {
+    const replay = {
+      data: { message: { message_id: 'om_1', content: '{"text":"hi"}' } },
+      ctx: {
+        chatId: 'oc_1',
+        messageId: 'om_1',
+        chatType: 'group' as const,
+        scope: 'thread' as const,
+        anchor: 'om_1',
+        larkAppId: 'a1',
+        ownsSession: false,
+      },
+    };
+    openPending('a1', 'oc_1', 'ou_g', undefined, replay);
+    expect(getPendingReplay('a1', 'oc_1', 'ou_g')).toBe(replay);
+    clearPending('a1', 'oc_1', 'ou_g');
+    expect(getPendingReplay('a1', 'oc_1', 'ou_g')).toBeUndefined();
   });
 
   it('markDenied invalidates nonce and keeps 10min cooldown', () => {

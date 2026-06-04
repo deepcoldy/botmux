@@ -10,7 +10,7 @@ import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
-import { checkNonce, clearPending, markDenied, getPendingQuota } from './grant-pending.js';
+import { checkNonce, clearPending, markDenied, getPendingQuota, getPendingReplay, type PendingGrantReplay } from './grant-pending.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
   handleWorkflowApprovalAction,
@@ -39,6 +39,8 @@ export interface CardHandlerDeps {
   lastRepoScan: Map<string, ProjectInfo[]>;
   workflowApprovalDeps?: WorkflowApprovalHandlerDeps;
   workflowApprovalResolved?: (runId: string) => void | Promise<void>;
+  /** Continue the original message after owner approves an entry-A grant request. */
+  continueGrantReplay?: (replay: PendingGrantReplay) => void | Promise<void>;
 }
 
 interface CardActionData {
@@ -193,12 +195,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const quota = getPendingQuota(larkAppId, grantChatId, targets[0]);
     const granted: string[] = [];
     const failed: Array<{ openId: string; reason: string }> = [];
+    const replaysByTarget = new Map(targets.map(tt => [tt, getPendingReplay(larkAppId, grantChatId, tt)] as const));
     for (const tt of targets) {
       const res = kind === 'global'
         ? await addGlobalGrant(larkAppId, tt, quota)
         : await addChatGrant(larkAppId, grantChatId, tt, quota);
       if (res.ok) { clearPending(larkAppId, grantChatId, tt); granted.push(tt); }
       else { failed.push({ openId: tt, reason: res.reason }); logger.warn(`Grant action "${value.action}" store failed for ${tt}: ${res.reason}`); }
+    }
+    // Owner approval should resume the original @bot message automatically.
+    // Best-effort and detached: grant persistence/card response must not be
+    // rolled back or delayed if the resumed turn fails.
+    const seenReplayKeys = new Set<string>();
+    for (const tt of granted) {
+      const replay = replaysByTarget.get(tt);
+      if (!replay) continue;
+      const replayKey = `${replay.ctx.larkAppId}:${replay.ctx.messageId}:${replay.ctx.anchor}`;
+      if (seenReplayKeys.has(replayKey)) continue;
+      seenReplayKeys.add(replayKey);
+      void Promise.resolve().then(() => deps.continueGrantReplay?.(replay))
+        .catch(err => logger.warn(`grant auto-continue failed (grant still applied): ${err}`));
     }
     // 全部失败：保留 pending + 不撤卡（owner 可点原卡重试），toast 报错。
     if (granted.length === 0) {

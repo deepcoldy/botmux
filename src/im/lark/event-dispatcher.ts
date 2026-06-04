@@ -18,7 +18,7 @@ import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled } from './grant-pending.js';
+import { openPending, isThrottled, type PendingGrantReplay } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 
@@ -624,20 +624,26 @@ export function canOperate(larkAppId: string, _chatId: string | undefined, sende
  * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
  */
 async function maybeSendGrantRequestCard(
-  larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined,
+  larkAppId: string,
+  message: any,
+  chatId: string,
+  requesterOpenId: string | undefined,
+  replay?: PendingGrantReplay,
 ): Promise<void> {
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
   const name = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name
     ?? requesterOpenId;
-  const nonce = openPending(larkAppId, chatId, requesterOpenId);
+  const nonce = openPending(larkAppId, chatId, requesterOpenId, undefined, replay);
   const card = buildGrantCard(
     { ownerOpenId: owner, targets: [{ openId: requesterOpenId, name: String(name) }], chatId, nonce, mode: 'request' },
     localeForBot(larkAppId),
   );
   await replyMessage(larkAppId, message.message_id, card, 'interactive')
     .catch(err => logger.debug(`grant request card send failed: ${err}`));
+  await replyMessage(larkAppId, message.message_id, t('card.grant.requester_notice', undefined, localeForBot(larkAppId)), 'text')
+    .catch(err => logger.debug(`grant requester notice send failed: ${err}`));
 }
 
 // ─── Group message access check ──────────────────────────────────────────
@@ -1152,6 +1158,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
         }
 
+        const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing };
+
         // Permission gating — same shape as before, just keyed on
         // `ownsSession` (anchor-aware) instead of "rootId presence":
         //
@@ -1168,7 +1176,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             if (access === 'not_allowed') {
               // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
               // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
-              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId);
+              const replay: PendingGrantReplay = {
+                data: JSON.parse(JSON.stringify(data)),
+                ctx: { ...ctx, ownsSession },
+              };
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, replay);
               logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
               return;
             }
@@ -1198,7 +1210,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           return;
         }
 
-        const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing };
         // Serialize per anchor so two messages to the same thread/chat are
         // processed in arrival order — never concurrently. Without this a fast
         // second message interleaves with the first's async session-spawn and is

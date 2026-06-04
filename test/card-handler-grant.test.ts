@@ -93,6 +93,27 @@ describe('card-handler grant actions', () => {
     expect(pending.checkNonce('h1', 'oc_1', 'ou_g', nonce)).toBe(false);
   });
 
+  it('owner grant_chat with stored replay → auto-continues original message once', async () => {
+    const { pending, handler } = await fresh();
+    const continueGrantReplay = vi.fn(async () => undefined);
+    const replay = {
+      data: { message: { message_id: 'om_original', content: '{"text":"@bot do it"}' } },
+      ctx: {
+        chatId: 'oc_1',
+        messageId: 'om_original',
+        chatType: 'group' as const,
+        scope: 'thread' as const,
+        anchor: 'om_original',
+        larkAppId: 'h1',
+        ownsSession: false,
+      },
+    };
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g', undefined, replay);
+    await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), { ...deps, continueGrantReplay }, 'h1');
+    await vi.waitFor(() => expect(continueGrantReplay).toHaveBeenCalledWith(replay));
+    expect(continueGrantReplay).toHaveBeenCalledTimes(1);
+  });
+
   it('卡片在话题里（有 thread_id）→ 线程化回复（reply_in_thread=true）', async () => {
     const { pending, handler } = await fresh();
     getMessageDetailMock.mockResolvedValueOnce({ items: [{ thread_id: 'omt_topic' }] });

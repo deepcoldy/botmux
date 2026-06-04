@@ -30,11 +30,13 @@ vi.mock('node:fs', async (importOriginal) => {
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
+const mockGetOwnerOpenId = vi.fn(() => mockGetBot()?.resolvedAllowedUsers?.find((u: string) => u.startsWith('ou_')));
 const mockIsChatOncallBoundForAnyBot = vi.fn<(chatId: string) => boolean>(() => false);
 const mockFindOncallChat = vi.fn<(larkAppId: string, chatId: string) => { chatId: string; workingDir: string } | undefined>(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
   getAllBots: () => mockGetAllBots(),
+  getOwnerOpenId: (...args: any[]) => mockGetOwnerOpenId(...args),
   findOncallChat: (...args: any[]) => mockFindOncallChat(...(args as [string, string])),
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
 }));
@@ -1406,6 +1408,42 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('notifies requester after sending owner-only grant request card', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      botOpenId: MY_OPEN_ID,
+      resolvedAllowedUsers: ['ou_owner'],
+    });
+    mockReplyMessage.mockClear();
+    const event = makeUserMessageEvent({
+      senderOpenId: 'ou_guest_needs_grant',
+      content: JSON.stringify({ text: '@BotA hello' }),
+      messageId: 'msg-grant-request-notice',
+      chatId: 'chat-grant-request-notice',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockReturnValue(false);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    expect(mockReplyMessage.mock.calls[0]).toEqual([
+      MY_APP_ID,
+      'msg-grant-request-notice',
+      expect.stringContaining('grant_chat'),
+      'interactive',
+    ]);
+    expect(mockReplyMessage.mock.calls[1]).toEqual([
+      MY_APP_ID,
+      'msg-grant-request-notice',
+      expect.stringContaining('管理员'),
+      'text',
+    ]);
   });
 });
 

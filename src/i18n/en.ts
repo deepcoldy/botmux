@@ -61,6 +61,7 @@ export const messages: Record<string, string> = {
   // In-group authorization card
   'card.grant.title': '🔑 Access Request',
   'card.grant.body_request': 'User **{name}** is requesting to use me in this chat. <at id={owner}></at> allow them to talk to me here?',
+  'card.grant.requester_notice': '🔐 I have asked an admin to review your access request. Please wait for the admin to act on the admin-only card. Once approved, I will automatically continue processing this message; if denied, contact the admin.',
   'card.grant.body_owner': 'Grant **{name}** permission to talk to me in this chat? (<at id={owner}></at>)',
   'card.grant.body_owner_multi': 'Grant {names} permission to talk to me in this chat? (<at id={owner}></at>)',
   'card.grant.btn_chat': 'Grant talk in this chat',

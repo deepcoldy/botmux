@@ -64,6 +64,7 @@ export const messages: Record<string, string> = {
   // 群内授权卡片
   'card.grant.title': '🔑 使用授权',
   'card.grant.body_request': '用户 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
+  'card.grant.requester_notice': '🔐 已向管理员申请授权，请等待管理员在仅管理员可见的卡片中审核。审核通过后，我会自动继续处理你刚才这条消息；如果被拒绝，请联系管理员。',
   'card.grant.body_owner': '是否授权 **{name}** 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.body_owner_multi': '是否授权 {names} 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.btn_chat': '授权本群对话',
