@@ -174,6 +174,13 @@ export interface BotConfig {
    */
   autoStartOnNewTopic?: boolean;
   /**
+   * 主动开工 — 场景②扩展. When true, bot-originated top-level messages in a
+   * topic group may also trigger {@link autoStartOnNewTopic}. Default false:
+   * only human-sent new topic seeds auto-start, preserving the safer legacy
+   * behavior and avoiding unexpected bot loops.
+   */
+  autoStartOnNewTopicFromBots?: boolean;
+  /**
    * Per-bot voice-engine override for the voice-summary feature. Merged OVER
    * the global `voice` block in ~/.botmux/config.json (per-bot wins field by
    * field). When this bot has usable voice creds (here or globally), its reply
@@ -584,6 +591,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      autoStartOnNewTopicFromBots: entry.autoStartOnNewTopicFromBots === true || undefined,
       voice,
     });
   }

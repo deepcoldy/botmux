@@ -793,6 +793,7 @@ const server = createServer(async (req, res) => {
             autoStartOnGroupJoin: j.autoStartOnGroupJoin === true,
             autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
             autoStartOnNewTopic: j.autoStartOnNewTopic === true,
+            autoStartOnNewTopicFromBots: j.autoStartOnNewTopicFromBots === true,
             restrictGrantCommands: j.restrictGrantCommands === true,
             messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
           };

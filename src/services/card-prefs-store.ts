@@ -26,6 +26,8 @@ export interface BotCardPrefs {
   autoStartOnGroupJoinPrompt: string;
   /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
   autoStartOnNewTopic: boolean;
+  /** 主动开工 — 场景②: also listen to new-topic seeds sent by other bots. */
+  autoStartOnNewTopicFromBots: boolean;
 }
 
 /** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
@@ -39,6 +41,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
+      autoStartOnNewTopicFromBots: c.autoStartOnNewTopicFromBots === true,
     };
   } catch {
     return {
@@ -48,6 +51,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
       autoStartOnNewTopic: false,
+      autoStartOnNewTopicFromBots: false,
     };
   }
 }
@@ -84,6 +88,7 @@ export async function updateBotCardPrefs(
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
+    apply(entry, 'autoStartOnNewTopicFromBots', patch.autoStartOnNewTopicFromBots);
     return {
       write: true,
       result: {
@@ -93,6 +98,7 @@ export async function updateBotCardPrefs(
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
+        autoStartOnNewTopicFromBots: entry.autoStartOnNewTopicFromBots === true,
       },
     };
   });
@@ -117,10 +123,14 @@ export async function updateBotCardPrefs(
   if (patch.autoStartOnNewTopic !== undefined) {
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
   }
+  if (patch.autoStartOnNewTopicFromBots !== undefined) {
+    bot.config.autoStartOnNewTopicFromBots = patch.autoStartOnNewTopicFromBots || undefined;
+  }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
+    `autoStartOnNewTopicFromBots=${r.result.autoStartOnNewTopicFromBots} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };

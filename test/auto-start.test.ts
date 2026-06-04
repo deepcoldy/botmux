@@ -20,8 +20,13 @@ describe('shouldAutoStartOnNewTopic (场景②)', () => {
     expect(shouldAutoStartOnNewTopic(base)).toBe(true);
   });
 
+  it('does not fire for bot-sent topic seeds unless explicitly enabled', () => {
+    expect(shouldAutoStartOnNewTopic({ ...base, fromBot: true })).toBe(false);
+    expect(shouldAutoStartOnNewTopic({ ...base, fromBot: true, includeBotMessages: true })).toBe(true);
+  });
+
   it('FR-8: does not fire when disabled', () => {
-    expect(shouldAutoStartOnNewTopic({ ...base, enabled: false })).toBe(false);
+    expect(shouldAutoStartOnNewTopic({ ...base, enabled: false, fromBot: true, includeBotMessages: true })).toBe(false);
   });
 
   it('FR-7: does not fire for a regular group (chat-scope, anchor = chatId)', () => {

@@ -1412,9 +1412,15 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
 describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
-  function setupAutoTopicBot(enabled: boolean) {
+  function setupAutoTopicBot(enabled: boolean, opts?: { fromBots?: boolean }) {
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', autoStartOnNewTopic: enabled },
+      config: {
+        larkAppId: MY_APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        autoStartOnNewTopic: enabled,
+        autoStartOnNewTopicFromBots: opts?.fromBots,
+      },
       botOpenId: MY_OPEN_ID,
       // A non-empty allowlist that does NOT include the sender → canTalk(sender)
       // is false, so an un-@ message deterministically returns 'ignore' (the
@@ -1501,6 +1507,54 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
       chatId: 'chat-plain-2',
       chatType: 'group',
     });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('话题群新话题由其他机器人发送，扩展开关开 → 自动开工', async () => {
+    setupAutoTopicBot(true, { fromBots: true });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '机器人创建的新话题' }),
+      messageId: 'msg-bot-topic-seed',
+      chatId: 'chat-topic-bot-1',
+      chatType: 'group',
+      rootId: undefined,
+      threadId: null,
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-topic-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('话题群新话题由其他机器人发送，扩展开关关 → 不触发', async () => {
+    setupAutoTopicBot(true, { fromBots: false });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '机器人创建的新话题' }),
+      messageId: 'msg-bot-topic-off',
+      chatId: 'chat-topic-bot-2',
+      chatType: 'group',
+      rootId: undefined,
+      threadId: null,
+    });
+    event.message.root_id = undefined as any;
 
     await capturedHandlers['im.message.receive_v1'](event);
     await new Promise(r => setTimeout(r, 0));

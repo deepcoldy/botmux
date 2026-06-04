@@ -19,6 +19,8 @@ export interface AutoStartPrefs {
   autoStartOnGroupJoinPrompt: string;
   /** 场景②: auto-start on every new topic in a topic group (no @ required). */
   autoStartOnNewTopic: boolean;
+  /** 场景②: also auto-start when the new topic seed was sent by another bot. */
+  autoStartOnNewTopicFromBots: boolean;
 }
 
 /**
@@ -37,6 +39,10 @@ export interface AutoStartPrefs {
  */
 export function shouldAutoStartOnNewTopic(opts: {
   enabled: boolean;
+  /** Whether bot-originated topic seeds are allowed to trigger auto-start. */
+  includeBotMessages?: boolean;
+  /** True when the inbound message was sent by another bot/app. */
+  fromBot?: boolean;
   scope: 'thread' | 'chat';
   anchor: string;
   messageId: string;
@@ -45,6 +51,7 @@ export function shouldAutoStartOnNewTopic(opts: {
 }): boolean {
   return (
     opts.enabled &&
+    (!opts.fromBot || opts.includeBotMessages === true) &&
     opts.chatType === 'group' &&
     opts.scope === 'thread' &&
     opts.anchor === opts.messageId &&

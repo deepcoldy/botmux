@@ -899,6 +899,49 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
         const messageId = message.message_id;
 
+        const maybeAutoStartNewTopic = async (opts: { fromBot: boolean }): Promise<boolean> => {
+          const routing = await decideRouting(larkAppId, message);
+
+          // Same stale-cache correction as the human-message branch: if the
+          // cached chat_mode says topic but Lark now reports group, this is not
+          // a topic-group seed and must not auto-start.
+          if (
+            routing.scope === 'thread' &&
+            routing.anchor === messageId &&
+            !message.thread_id &&
+            chatType === 'group'
+          ) {
+            const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+            if (freshMode === 'group') {
+              routing.scope = 'chat';
+              routing.anchor = chatId;
+            }
+          }
+
+          const ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+          const botCfg = getBot(larkAppId).config;
+          const autoTopic = shouldAutoStartOnNewTopic({
+            enabled: botCfg.autoStartOnNewTopic === true,
+            includeBotMessages: botCfg.autoStartOnNewTopicFromBots === true,
+            fromBot: opts.fromBot,
+            scope: routing.scope,
+            anchor: routing.anchor,
+            messageId,
+            chatType,
+            ownsSession,
+          });
+          if (!autoTopic) return false;
+
+          logger.info(
+            `[auto-start:新话题] ${chatId.substring(0, 12)} 新话题免@自动开工` +
+            `${opts.fromBot ? '(bot sender)' : ''} msg=${messageId.substring(0, 12)}`,
+          );
+          const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing };
+          await serializeByAnchor(ctx.anchor, () => handlers.handleNewTopic(data, ctx))
+            .catch(err => logger.error(`Error handling auto-start new topic: ${err}`));
+          return true;
+        };
+
         // Bot-originated messages — bots historically only post inside threads
         // (their own thread replies). With chat-scope sessions a bot can also
         // post top-level (its first reply in a chat-scope group), so we still
@@ -931,8 +974,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               .catch(err => logger.error(`Error handling message event: ${err}`));
             return;
           }
-          // Foreign bot: only route on @mention of us.
-          if (!isBotMentioned(larkAppId, message, undefined)) return;
+          // Foreign bot: normally only route on @mention of us. Optionally,
+          // let a bot-sent top-level message seed a new topic-group session
+          // when the receiving bot explicitly opted in.
+          if (!isBotMentioned(larkAppId, message, undefined)) {
+            await maybeAutoStartNewTopic({ fromBot: true });
+            return;
+          }
           const ctx = await decideRouting(larkAppId, message);
           // Chat-scope foreign-bot @mention without an existing session: gate to
           // vetted botmux peers (registered in our bot-openids cross-ref). This
@@ -1111,6 +1159,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               // the original ignore. Sender is intentionally not gated (D4).
               const autoTopic = shouldAutoStartOnNewTopic({
                 enabled: getBot(larkAppId).config.autoStartOnNewTopic === true,
+                fromBot: false,
                 scope: autoTopicSeedScope,
                 anchor: autoTopicSeedAnchor,
                 messageId,
