@@ -110,14 +110,14 @@ botmux schedule add "每日11:00" "
 
 const HISTORY_SKILL = `---
 name: botmux-history
-description: 需要查看当前飞书会话历史消息时触发。话题群/话题会话默认拉话题内消息，普通群默认拉整群最近 N 条（默认 50，用 --limit 调节）。在 thread 内如果需要 thread 外的群聊上下文，用 --scope ambient。适合"看看之前聊了什么"、"最近的消息"、"上下文"类请求。在 CLI 会话内自动推断 session-id。
+description: 需要查看当前飞书会话历史消息时触发。话题/thread 会话默认拉话题内消息；普通群 chat-scope 会话拉整群最近 N 条（默认 50，用 --limit 调节）。普通群通过 /t 或 per-bot 配置开出的 thread 会话也按话题内读取。在 thread 内如果需要 thread 外的群聊上下文，用 --scope ambient。适合"看看之前聊了什么"、"最近的消息"、"上下文"类请求。在 CLI 会话内自动推断 session-id。
 ---
 
 # botmux-history — 读取会话消息历史
 
-想回顾当前飞书会话里用户之前发过什么、别的机器人说了什么时使用。**话题群和普通群都支持**：默认按当前 session 范围读取；话题/thread 会话只返回当前话题内消息，普通群 chat-scope 会话返回整群最近 N 条（默认 50，按时间倒序取尾部、再按时间正序返回）。觉得历史太多就把 \`--limit\` 调小，需要更多上下文就调大。
+想回顾当前飞书会话里用户之前发过什么、别的机器人说了什么时使用。**话题群和普通群都支持**：默认按当前 session 范围读取；话题/thread 会话只返回当前话题内消息，普通群 chat-scope 会话返回整群最近 N 条（默认 50，按时间倒序取尾部、再按时间正序返回）。普通群通过 \`/t\` 或 per-bot 的普通群开话题回复配置启动时，也会是 thread 会话。觉得历史太多就把 \`--limit\` 调小，需要更多上下文就调大。
 
-如果你在 thread 里需要读取 thread 外的群聊上下文（典型场景：用户在普通群讨论后用 \`/t\` 单开话题叫你处理），使用 \`botmux history --scope ambient --limit 20\`。它会读取当前 thread 所在群里、thread root 之前的最近消息，并排除当前 thread 本身，适合作为环境上下文。注意隐私边界：ambient 会读取 thread 外群聊消息，仅在用户明确需要群聊背景时使用，并优先使用较小的 limit。
+如果你在 thread 里需要读取 thread 外的群聊上下文（典型场景：用户在普通群讨论后用 \`/t\` 或普通群开话题回复单开话题叫你处理），使用 \`botmux history --scope ambient --limit 20\`。它会读取当前 thread 所在群里、thread root 之前的最近消息，并排除当前 thread 本身，适合作为环境上下文。注意隐私边界：ambient 会读取 thread 外群聊消息，仅在用户明确需要群聊背景时使用，并优先使用较小的 limit。
 
 ## 用法
 

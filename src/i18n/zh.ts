@@ -347,7 +347,7 @@ export const messages: Record<string, string> = {
   'ai.shell.how_to_send': '把消息发给用户（唯一方式）：用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`。',
   'ai.shell.multiline_heredoc': '多行消息必须用 heredoc，禁止写成 `botmux send "第一行\\n第二行"`；否则 `\\n` 可能按字面量显示在飞书里。',
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
-  'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史，话题群拉话题内、普通群拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
+  'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，让别的 bot 接力必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 

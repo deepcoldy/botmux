@@ -793,6 +793,7 @@ const server = createServer(async (req, res) => {
             autoStartOnGroupJoin: j.autoStartOnGroupJoin === true,
             autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
             autoStartOnNewTopic: j.autoStartOnNewTopic === true,
+            regularGroupReplyInThread: j.regularGroupReplyInThread === true,
             restrictGrantCommands: j.restrictGrantCommands === true,
             messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
           };
@@ -838,7 +839,7 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/card-prefs — proxy to that bot's daemon. Body carries
-    // either/both `{ disableStreamingCard?, writableTerminalLinkInCard? }` booleans.
+    // any subset of per-bot behavior booleans / prompt strings.
     let mBotCardPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotCardPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/card-prefs$/))) {
       const appId = decodeURIComponent(mBotCardPrefs[1]);

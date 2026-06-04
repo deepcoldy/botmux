@@ -270,6 +270,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
   function renderAutoStartControls(b: any): string {
     const onJoin = b.autoStartOnGroupJoin === true;
     const onTopic = b.autoStartOnNewTopic === true;
+    const regularGroupThread = b.regularGroupReplyInThread === true;
     const joinPrompt: string = typeof b.autoStartOnGroupJoinPrompt === 'string' ? b.autoStartOnGroupJoinPrompt : '';
     return `<div class="bd-subsection">
       <h4 class="bd-subsection-title">${t('botDefaults.sectionAutoStart')}</h4>
@@ -292,6 +293,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <input type="checkbox" data-action="toggle-auto-topic" ${onTopic ? 'checked' : ''}>
         <strong>${t('botDefaults.autoStartTopic')}</strong>
         <small>${t('botDefaults.autoStartTopicHelp')}</small>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-regular-group-thread" ${regularGroupThread ? 'checked' : ''}>
+        <strong>${t('botDefaults.regularGroupThread')}</strong>
+        <small>${t('botDefaults.regularGroupThreadHelp')}</small>
       </label>
       <div class="actions">
         <span class="oncall-status" data-auto-start-status></span>
@@ -448,6 +454,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
               cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
               cached.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
               cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
+              cached.regularGroupReplyInThread = body.regularGroupReplyInThread;
             }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
@@ -486,6 +493,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       // ── 主动开工 toggles + 场景① prompt ───────────────────────────────────
       const autoJoinCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-join]');
       const autoTopicCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-topic]');
+      const regularGroupThreadCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-regular-group-thread]');
       const autoJoinPromptEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=autoJoinPrompt]');
       const autoJoinPromptSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-auto-join-prompt]');
       const autoStartStatusEl = card.querySelector<HTMLSpanElement>('[data-auto-start-status]');
@@ -497,6 +505,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (autoTopicCb) {
         autoTopicCb.addEventListener('change', () => {
           putCardPref({ autoStartOnNewTopic: autoTopicCb.checked }, autoTopicCb, autoStartStatusEl);
+        });
+      }
+      if (regularGroupThreadCb) {
+        regularGroupThreadCb.addEventListener('change', () => {
+          putCardPref({ regularGroupReplyInThread: regularGroupThreadCb.checked }, regularGroupThreadCb, autoStartStatusEl);
         });
       }
       if (autoJoinPromptEl && autoJoinPromptSaveBtn) {
