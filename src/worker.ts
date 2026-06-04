@@ -115,7 +115,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', copilot: 'Copilot' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -678,9 +678,9 @@ function maybeSwitchBridgeJsonl(): boolean {
     findExact: (acceptCandidate) =>
       candidate.contentNormalized
         ? findJsonlsContainingExactContent(bridgeJsonlDir!, candidate.contentNormalized, {
-            ...fingerprintScanOptions,
-            acceptCandidate,
-          })
+          ...fingerprintScanOptions,
+          acceptCandidate,
+        })
         : [],
   });
   if (decision.action === 'switch') {
@@ -2059,7 +2059,7 @@ async function captureAndUpload(): Promise<void> {
   // gate on it). Logging here exists to surface the unexpected case — e.g. a
   // stray scheduleOneShotAfterAction firing after user toggled back to hidden.
   if (displayMode !== 'screenshot') { logScreenshotSkip(`displayMode=${displayMode}`); return; }
-  if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
+  if (awaitingFirstPrompt) { logScreenshotSkip('awaitingFirstPrompt'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   let png: Buffer;
@@ -2344,7 +2344,7 @@ function splitCodexAppControl(data: string): string {
 
   let out = '';
   let cursor = 0;
-  for (;;) {
+  for (; ;) {
     const start = input.indexOf(CODEX_APP_OSC_PREFIX, cursor);
     if (start < 0) {
       let tailStart = input.length;
@@ -2391,10 +2391,10 @@ function onPtyData(data: string): void {
     let lastToggleActive = altBufferActive;
     ALT_ENTER_RE.lastIndex = 0;
     ALT_EXIT_RE.lastIndex = 0;
-    for (let m: RegExpExecArray | null; (m = ALT_ENTER_RE.exec(data)); ) {
+    for (let m: RegExpExecArray | null; (m = ALT_ENTER_RE.exec(data));) {
       if (m.index > lastToggleIdx) { lastToggleIdx = m.index; lastToggleActive = true; }
     }
-    for (let m: RegExpExecArray | null; (m = ALT_EXIT_RE.exec(data)); ) {
+    for (let m: RegExpExecArray | null; (m = ALT_EXIT_RE.exec(data));) {
       if (m.index > lastToggleIdx) { lastToggleIdx = m.index; lastToggleActive = false; }
     }
     altBufferActive = lastToggleActive;

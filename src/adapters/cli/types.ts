@@ -197,4 +197,4 @@ export interface CliAdapter {
   readonly spawnEnv?: Readonly<Record<string, string>>;
 }
 
-export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira';
+export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'copilot';

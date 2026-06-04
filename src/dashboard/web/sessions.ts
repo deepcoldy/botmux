@@ -17,6 +17,7 @@ const CLI_FILTER_OPTIONS = [
   'mtr',
   'hermes',
   'mira',
+  'copilot',
   'aiden',
   'coco',
   'unknown',

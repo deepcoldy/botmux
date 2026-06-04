@@ -30,13 +30,14 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'copilot'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -70,7 +71,7 @@ describe('createCliAdapterSync factory', () => {
 describe('lazy binary resolution', () => {
   // Adapters whose resolvedBin is the resolved CLI (codex-app/mira use
   // process.execPath and never probe, so they're excluded).
-  const PROBING_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes'];
+  const PROBING_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'copilot'];
 
   it.each(PROBING_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -331,6 +332,53 @@ describe('mira buildArgs', () => {
     });
     expect(args).toContain('--mira-session-id');
     expect(args).toContain('mira-session-123');
+  });
+});
+
+describe('copilot buildArgs', () => {
+  const adapter = createCopilotAdapter('/usr/bin/copilot');
+
+  it('fresh session passes --allow-all-tools without resume flags', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: false });
+    expect(args).toContain('--allow-all-tools');
+    expect(args).not.toContain('--resume');
+    expect(args).not.toContain('--continue');
+    expect(args).not.toContain('sess-cp');
+  });
+
+  it('resume with cliSessionId passes --resume <id>', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cp',
+      resume: true,
+      resumeSessionId: 'copilot-sess-abc',
+    });
+    expect(args).toContain('--resume');
+    const idx = args.indexOf('--resume');
+    expect(args[idx + 1]).toBe('copilot-sess-abc');
+  });
+
+  it('resume without cliSessionId falls back to --continue', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: true });
+    expect(args).toContain('--continue');
+    expect(args).not.toContain('--resume');
+  });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: false, model: 'gpt-5' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('gpt-5');
+  });
+
+  it('does not bake initialPrompt into args', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: false, initialPrompt: 'hello copilot' });
+    expect(args).not.toContain('hello copilot');
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
+  });
+
+  it('surfaces curated model choices for setup', () => {
+    expect(adapter.modelChoices).toContain('claude-sonnet-4');
+    expect(adapter.modelChoices).toContain('gpt-5');
   });
 });
 
@@ -607,6 +655,10 @@ describe('completionPattern', () => {
   it('hermes has no completionPattern', () => {
     expect(createHermesAdapter('/bin/hermes').completionPattern).toBeUndefined();
   });
+
+  it('copilot has no completionPattern', () => {
+    expect(createCopilotAdapter('/bin/copilot').completionPattern).toBeUndefined();
+  });
 });
 
 describe('readyPattern', () => {
@@ -666,6 +718,10 @@ describe('readyPattern', () => {
   it('hermes has no readyPattern', () => {
     expect(createHermesAdapter('/bin/hermes').readyPattern).toBeUndefined();
   });
+
+  it('copilot has no readyPattern', () => {
+    expect(createCopilotAdapter('/bin/copilot').readyPattern).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -697,6 +753,7 @@ describe('systemHints', () => {
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
     ['hermes', () => createHermesAdapter('/bin/hermes')],
+    ['copilot', () => createCopilotAdapter('/bin/copilot')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -723,6 +780,7 @@ describe('id property', () => {
     ['mtr', () => createMtrAdapter('/bin/mtr')],
     ['hermes', () => createHermesAdapter('/bin/hermes')],
     ['mira', () => createMiraAdapter()],
+    ['copilot', () => createCopilotAdapter('/bin/copilot')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -777,6 +835,10 @@ describe('altScreen property', () => {
 
   it('mira does not use alt screen', () => {
     expect(createMiraAdapter().altScreen).toBe(false);
+  });
+
+  it('copilot uses alt screen (Ink TUI)', () => {
+    expect(createCopilotAdapter('/bin/copilot').altScreen).toBe(true);
   });
 });
 
@@ -859,5 +921,12 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: 'bm-ag', cliSessionId: 'cid-uuid' }))
       .toBe('agy --conversation cid-uuid');
     expect(a.buildResumeCommand?.({ sessionId: 'bm-ag' })).toBeNull();
+  });
+
+  it('copilot emits `copilot --resume <cliSessionId>` when known, null otherwise', () => {
+    const a = createCopilotAdapter('/bin/copilot');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-cp', cliSessionId: 'copilot-sess-1' }))
+      .toBe('copilot --resume copilot-sess-1');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-cp' })).toBeNull();
   });
 });

@@ -623,7 +623,7 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
     '推荐格式（优先级高到低）：完整邮箱（alice@example.com）> union_id（on_xxx，跨应用稳定）> open_id（ou_xxx，仅限同一应用）。',
     '注意：必须是完整邮箱，邮箱前缀（如 alice）无法解析、不接受。',
   ]);
-  for (;;) {
+  for (; ;) {
     const raw = (await ask(rl, '管理员 (owner): ')).trim();
     const entries = raw.split(',').map(s => s.trim()).filter(Boolean);
     if (entries.length === 0) {
@@ -664,7 +664,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) copilot');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   let cliId: CliId;
   try {
@@ -842,7 +842,7 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) copilot');
   printInputHelp('CLI 适配器', [
     '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
     'coco 的别名 traecli 走同一适配器；二进制名是 traecli 也选 coco 即可。',
@@ -2792,9 +2792,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
       ? await listChatMessages(appId, s.chatId, limit)
       : effectiveScope === 'ambient'
         ? await listAmbientChatMessages(appId, s.chatId, limit, {
-            beforeCreateTime: ambientBeforeCreateTime,
-            excludeRootMessageId: s.rootMessageId,
-          })
+          beforeCreateTime: ambientBeforeCreateTime,
+          excludeRootMessageId: s.rootMessageId,
+        })
         : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
     // path in daemon.ts. Each merge_forward gets its own numberer (we don't
@@ -3070,7 +3070,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // (open_id from the session — model needn't know it). Bare-name form so it
   // renders as a trailing <at>.
   if (mentionBack && s.quoteTargetSenderOpenId
-      && !mentions.some(m => m.open_id === s.quoteTargetSenderOpenId)) {
+    && !mentions.some(m => m.open_id === s.quoteTargetSenderOpenId)) {
     mentions.push({ open_id: s.quoteTargetSenderOpenId, name: '' });
   }
 
@@ -3274,69 +3274,69 @@ async function cmdSend(rest: string[]): Promise<void> {
       // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
       if (!noMention) {
-      const alreadyMentioned = new Set(mentions.map(m => m.open_id));
-      // Sort by name length desc so longer names ("Claude分身") win over their
-      // prefix ("Claude") when both could match — break-on-first-hit otherwise
-      // routes "@Claude分身" to Claude.
-      const sortedEntries = [...botEntries].sort(
-        (a, b) => (b.botName?.length ?? 0) - (a.botName?.length ?? 0),
-      );
-      const selfAliases = new Set(
-        botEntries
-          .filter(entry => entry.larkAppId === appId)
-          .flatMap(entry => [entry.botName, entry.cliId])
-          .filter((name): name is string => !!name)
-          .map(name => name.toLowerCase()),
-      );
-      // Bots actively in THIS conversation (thread root for thread-scope, chat for
-      // chat-scope). Used to gate the type-generic `cliId` alias so prose "@codex"
-      // resolves to the codex bot collaborating HERE, not every same-type bot
-      // (the fan-out that pulled all Codex-named bots into a topic). See
-      // eligibleAutoMentionAliases.
-      const convoBotAppIds = new Set<string>();
-      for (const sess of loadSessions().values()) {
-        if (sess.status !== 'active' || !sess.larkAppId) continue;
-        const here = isChatScope
-          ? sess.chatId === s.chatId
-          : (!!s.rootMessageId && sess.rootMessageId === s.rootMessageId);
-        if (here) convoBotAppIds.add(sess.larkAppId);
-      }
-      for (const entry of sortedEntries) {
-        if (!entry.botName || entry.larkAppId === appId) continue;
-        const names = eligibleAutoMentionAliases({
-          botName: entry.botName,
-          cliId: entry.cliId ?? undefined,
-          larkAppId: entry.larkAppId ?? undefined,
-          selfAliases,
-          convoBotAppIds,
-        });
-        for (const name of names) {
-          const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          // Boundary: lookbehind blocks only ASCII word chars (so `user@Claude`
-          // is rejected but `看看@CoCo` is accepted — CJK prefix is normal in
-          // Chinese text). Lookahead blocks any Unicode letter/digit so
-          // `@Claude2` doesn't match name "Claude" and `@Claude分身好的` doesn't
-          // either-half-match.
-          const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
-          if (!re.test(text)) continue;
-          // Lark open_id is per-app scoped. Use sender-scoped id from cross-ref
-          // only — falling back to entry.botOpenId would feed Lark a wrong-scope
-          // id (target's self-scoped) and the API would reject it. Skip + warn
-          // so the missing cross-ref is observable instead of silently dropped.
-          const senderScopedId = crossRef[entry.botName];
-          if (!senderScopedId) {
-            console.error(`[botmux send] no cross-ref entry for "${entry.botName}" in app ${appId}, skipping auto-mention (cross-ref populates after the sender app first sees the target bot)`);
+        const alreadyMentioned = new Set(mentions.map(m => m.open_id));
+        // Sort by name length desc so longer names ("Claude分身") win over their
+        // prefix ("Claude") when both could match — break-on-first-hit otherwise
+        // routes "@Claude分身" to Claude.
+        const sortedEntries = [...botEntries].sort(
+          (a, b) => (b.botName?.length ?? 0) - (a.botName?.length ?? 0),
+        );
+        const selfAliases = new Set(
+          botEntries
+            .filter(entry => entry.larkAppId === appId)
+            .flatMap(entry => [entry.botName, entry.cliId])
+            .filter((name): name is string => !!name)
+            .map(name => name.toLowerCase()),
+        );
+        // Bots actively in THIS conversation (thread root for thread-scope, chat for
+        // chat-scope). Used to gate the type-generic `cliId` alias so prose "@codex"
+        // resolves to the codex bot collaborating HERE, not every same-type bot
+        // (the fan-out that pulled all Codex-named bots into a topic). See
+        // eligibleAutoMentionAliases.
+        const convoBotAppIds = new Set<string>();
+        for (const sess of loadSessions().values()) {
+          if (sess.status !== 'active' || !sess.larkAppId) continue;
+          const here = isChatScope
+            ? sess.chatId === s.chatId
+            : (!!s.rootMessageId && sess.rootMessageId === s.rootMessageId);
+          if (here) convoBotAppIds.add(sess.larkAppId);
+        }
+        for (const entry of sortedEntries) {
+          if (!entry.botName || entry.larkAppId === appId) continue;
+          const names = eligibleAutoMentionAliases({
+            botName: entry.botName,
+            cliId: entry.cliId ?? undefined,
+            larkAppId: entry.larkAppId ?? undefined,
+            selfAliases,
+            convoBotAppIds,
+          });
+          for (const name of names) {
+            const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            // Boundary: lookbehind blocks only ASCII word chars (so `user@Claude`
+            // is rejected but `看看@CoCo` is accepted — CJK prefix is normal in
+            // Chinese text). Lookahead blocks any Unicode letter/digit so
+            // `@Claude2` doesn't match name "Claude" and `@Claude分身好的` doesn't
+            // either-half-match.
+            const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
+            if (!re.test(text)) continue;
+            // Lark open_id is per-app scoped. Use sender-scoped id from cross-ref
+            // only — falling back to entry.botOpenId would feed Lark a wrong-scope
+            // id (target's self-scoped) and the API would reject it. Skip + warn
+            // so the missing cross-ref is observable instead of silently dropped.
+            const senderScopedId = crossRef[entry.botName];
+            if (!senderScopedId) {
+              console.error(`[botmux send] no cross-ref entry for "${entry.botName}" in app ${appId}, skipping auto-mention (cross-ref populates after the sender app first sees the target bot)`);
+              break;
+            }
+            if (alreadyMentioned.has(senderScopedId)) break;
+            // Prose `@OtherBot` auto-injection: inject normally. (The off-topic
+            // sub-bot guard used to DROP this; we now let the model @ freely and
+            // pick the destination with --into instead of being silently dropped.)
+            mentions.push({ open_id: senderScopedId, name: entry.botName });
+            alreadyMentioned.add(senderScopedId);
             break;
           }
-          if (alreadyMentioned.has(senderScopedId)) break;
-          // Prose `@OtherBot` auto-injection: inject normally. (The off-topic
-          // sub-bot guard used to DROP this; we now let the model @ freely and
-          // pick the destination with --into instead of being silently dropped.)
-          mentions.push({ open_id: senderScopedId, name: entry.botName });
-          alreadyMentioned.add(senderScopedId);
-          break;
         }
-      }
       }
     } catch { /* best-effort */ }
 
@@ -3349,10 +3349,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
       : buildFooterAddressing(s, {
-          isOncall: !!oncallEntry,
-          hasExplicitBotMention: explicitKnownBotMention,
-          knownBotOpenIds,
-        });
+        isOncall: !!oncallEntry,
+        hasExplicitBotMention: explicitKnownBotMention,
+        knownBotOpenIds,
+      });
 
     const mentionMap = new Map<string, string>();
     for (const m of mentions) if (m.name) mentionMap.set(m.name.toLowerCase(), m.open_id);
@@ -4094,8 +4094,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
     console.error(
       `botmux ask refused inside workflow subagent (run=${runId} node=${nodeId}).\n` +
-        `Workflow subagents must surface approvals via humanGate / decision nodes\n` +
-        `so the resolution is recorded in the run's event log; ask would bypass it.`,
+      `Workflow subagents must surface approvals via humanGate / decision nodes\n` +
+      `so the resolution is recorded in the run's event log; ask would bypass it.`,
     );
     process.exit(2);
   }
@@ -4119,7 +4119,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   if (missing) {
     console.error(
       `botmux ask: 缺少必需环境变量 ${missing}。` +
-        ` 请在 botmux daemon spawn 的 CLI 会话内运行。`,
+      ` 请在 botmux daemon spawn 的 CLI 会话内运行。`,
     );
     process.exit(2);
   }
@@ -4818,21 +4818,21 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
 
 switch (command) {
   case '--version':
-  case '-v':      console.log(getVersion()); break;
-  case 'setup':   await cmdSetup(); break;
-  case 'start':   await cmdStart(); break;
-  case 'stop':    cmdStop(); break;
+  case '-v': console.log(getVersion()); break;
+  case 'setup': await cmdSetup(); break;
+  case 'start': await cmdStart(); break;
+  case 'stop': cmdStop(); break;
   case 'restart': await cmdRestart(); break;
-  case 'logs':    cmdLogs(); break;
-  case 'status':  cmdStatus(); break;
+  case 'logs': cmdLogs(); break;
+  case 'status': cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(); break;
   case 'list':
-  case 'ls':      await cmdList(); break;
+  case 'ls': await cmdList(); break;
   case 'delete':
   case 'del':
-  case 'rm':      cmdDelete(); break;
-  case 'resume':  await cmdResume(); break;
+  case 'rm': cmdDelete(); break;
+  case 'resume': await cmdResume(); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
@@ -4885,5 +4885,5 @@ switch (command) {
     else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
     break;
   }
-  default:        showHelp(); break;
+  default: showHelp(); break;
 }

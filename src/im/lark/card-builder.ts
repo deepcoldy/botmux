@@ -21,6 +21,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'mtr': 'MTR',
   'hermes': 'Hermes',
   'mira': 'Mira',
+  'copilot': 'Copilot',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
