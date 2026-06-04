@@ -804,8 +804,10 @@ export function maybeApplyForceTopicOverride(
  *                               top-level message starts a fresh topic; a
  *                               reply inside an existing thread carries
  *                               root_id+thread_id and threads into its session)
- *   - 普通群 + no real thread  → chat-scope, anchor = chat_id (entire group
- *                               is one session)
+ *   - 普通群 + no real thread  → per-bot default:
+ *                               regularGroupReplyInThread=true uses
+ *                               thread-scope anchored at message_id; otherwise
+ *                               chat-scope anchored at chat_id.
  *
  *  Why we gate on thread_id (not root_id alone): Lark 客户端的引用气泡 / 快速
  *  回复 UI 有时会给"用户视角的顶层消息"塞 root_id 但**不会**塞 thread_id。
@@ -814,13 +816,28 @@ export function maybeApplyForceTopicOverride(
  *  权威信号。只看 root_id 会把 quote-bubble 错认为话题回复，把用户从 chat-scope
  *  会话里拽走、又起一个孤立的 thread session。
  *  Exported for unit tests. */
-export async function decideRouting(
+type RoutingSource = 'real-thread' | 'p2p' | 'topic-chat' | 'regular-group-thread' | 'regular-group-chat';
+
+type RoutingDecision = {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  source: RoutingSource;
+};
+
+function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
+  if (getBot(larkAppId).config.regularGroupReplyInThread === true) {
+    return { scope: 'thread', anchor: messageId, source: 'regular-group-thread' };
+  }
+  return { scope: 'chat', anchor: chatId, source: 'regular-group-chat' };
+}
+
+async function decideRoutingWithSource(
   larkAppId: string,
   message: any,
-): Promise<{ scope: 'thread' | 'chat'; anchor: string }> {
+): Promise<RoutingDecision> {
   const rootId: string | undefined = message.root_id;
   const threadId: string | undefined = message.thread_id;
-  if (rootId && threadId) return { scope: 'thread', anchor: rootId };
+  if (rootId && threadId) return { scope: 'thread', anchor: rootId, source: 'real-thread' };
 
   const chatType: string = message.chat_type ?? 'group';
   const messageId: string = message.message_id;
@@ -829,15 +846,23 @@ export async function decideRouting(
   // 私聊：每条 top-level DM 都视为新话题 — 跟话题群同款，匹配 Lark DM 的话题
   // 化默认行为，避免无限把 1:1 对话塞进同一个 CLI 进程里。
   if (chatType === 'p2p') {
-    return { scope: 'thread', anchor: messageId };
+    return { scope: 'thread', anchor: messageId, source: 'p2p' };
   }
 
   // Group chat — fetch chat_mode (cached) to disambiguate 话题群 from 普通群.
   const mode = await getChatMode(larkAppId, chatId);
   if (mode === 'topic') {
-    return { scope: 'thread', anchor: messageId };
+    return { scope: 'thread', anchor: messageId, source: 'topic-chat' };
   }
-  return { scope: 'chat', anchor: chatId };
+  return regularGroupRouting(larkAppId, messageId, chatId);
+}
+
+export async function decideRouting(
+  larkAppId: string,
+  message: any,
+): Promise<{ scope: 'thread' | 'chat'; anchor: string }> {
+  const { scope, anchor } = await decideRoutingWithSource(larkAppId, message);
+  return { scope, anchor };
 }
 
 /**
@@ -933,12 +958,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
           // Foreign bot: only route on @mention of us.
           if (!isBotMentioned(larkAppId, message, undefined)) return;
-          const ctx = await decideRouting(larkAppId, message);
-          // Chat-scope foreign-bot @mention without an existing session: gate to
-          // vetted botmux peers (registered in our bot-openids cross-ref). This
-          // keeps random Lark bots from silently spawning chat-scope sessions
-          // in 普通群/p2p, while letting Bot A → Bot B handoffs in 普通群 work
-          // (handleThreadReply auto-create + chat-scope inheritance below).
+          const decision = await decideRoutingWithSource(larkAppId, message);
+          const ctx = { scope: decision.scope, anchor: decision.anchor };
+          // Regular-group foreign-bot @mention without an existing session:
+          // gate to vetted botmux peers (registered in our bot-openids cross-ref).
+          // This applies both to legacy chat-scope routing and to the
+          // regularGroupReplyInThread send-shape, so random Lark bots cannot
+          // silently spawn sessions in 普通群 just because this bot replies in
+          // threads. Known Bot A → Bot B handoffs in 普通群 still work.
           //
           // 注意 isKnownPeerBot 查的是 cross-ref（bot-openids-<appId>.json），它只
           // 收录 bots-info.json 里有名字的 bot，即本机 daemon 自己配置的 bot
@@ -956,7 +983,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // 同一存储、同一 per-chat 语义）。命中 chatGrants 的 bot 即便不在 cross-ref，
           // 也与已注册 peer 同等放行——这是「授权外部 bot 在本群协作」的入口。
           // 全局授权（globalGrants）同理：命中即在任意群放行，是上面的全局版。
-          if (ctx.scope === 'chat' && !findOncallChat(larkAppId, chatId)) {
+          if ((ctx.scope === 'chat' || decision.source === 'regular-group-thread') && !findOncallChat(larkAppId, chatId)) {
             const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
             if (!ownsSession
                 && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
@@ -1007,7 +1034,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           );
         }
 
-        const routing = await decideRouting(larkAppId, message);
+        const decision = await decideRoutingWithSource(larkAppId, message);
+        const routing: { scope: 'thread' | 'chat'; anchor: string } = {
+          scope: decision.scope,
+          anchor: decision.anchor,
+        };
+        let routingSource = decision.source;
 
         // 话题群 → 普通群 (reverse conversion). Symmetric to the forward check
         // below: when decideRouting lands on thread-scope purely because the
@@ -1030,22 +1062,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         ) {
           const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
           if (freshMode === 'group') {
+            const rerouted = regularGroupRouting(larkAppId, messageId, chatId);
             logger.info(
               `[chat-mode-converted] ${chatId.substring(0, 12)} chat_mode flipped 'topic' → 'group'; ` +
-              `rerouting msg=${messageId.substring(0, 12)} as chat-scope`,
+              `rerouting msg=${messageId.substring(0, 12)} as ${rerouted.scope}-scope`,
             );
-            routing.scope = 'chat';
-            routing.anchor = chatId;
+            routing.scope = rerouted.scope;
+            routing.anchor = rerouted.anchor;
+            routingSource = rerouted.source;
           }
         }
 
-        // 主动开工 — 场景②: capture the genuine routing shape NOW, before the
-        // `/t` override below can mutate a 普通群 chat-scope into thread-scope.
-        // decideRouting only yields {thread, anchor=messageId} for a real
-        // 话题群 new-topic seed; a non-@ `/t …` in a 普通群 must NOT count as one
-        // (FR-7), so auto-topic eligibility keys off the pre-override values.
-        const autoTopicSeedScope = routing.scope;
-        const autoTopicSeedAnchor = routing.anchor;
+        // 主动开工 — 场景②: capture only genuine topic-group seeds NOW, before
+        // `/t` or the regularGroupReplyInThread preference can create the same
+        // {thread, anchor=messageId} shape in a regular group. autoStartOnNewTopic
+        // is deliberately limited to 话题群.
+        const autoTopicSeedScope = routingSource === 'topic-chat' ? routing.scope : 'chat';
+        const autoTopicSeedAnchor = routingSource === 'topic-chat' ? routing.anchor : chatId;
 
         // /t / /topic in 普通群: flip routing to thread-scope so the bot's
         // first reply seeds a fresh Lark thread, even if a chat-scope session

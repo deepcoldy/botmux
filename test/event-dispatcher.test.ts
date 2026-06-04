@@ -96,7 +96,15 @@ const MY_OPEN_ID = 'ou_bot_a_open_id';
 const OTHER_BOT_OPEN_ID = 'ou_bot_b_open_id';
 const USER_OPEN_ID = 'ou_user_123';
 
-function setupBotState(opts?: { botOpenId?: string | undefined; chatGrants?: Record<string, string[]>; globalGrants?: string[]; allowedUsers?: string[]; restrictGrantCommands?: boolean }) {
+function setupBotState(opts?: {
+  botOpenId?: string | undefined;
+  chatGrants?: Record<string, string[]>;
+  globalGrants?: string[];
+  allowedUsers?: string[];
+  restrictGrantCommands?: boolean;
+  regularGroupReplyInThread?: boolean;
+  autoStartOnNewTopic?: boolean;
+}) {
   mockGetBot.mockReturnValue({
     config: {
       larkAppId: MY_APP_ID,
@@ -105,6 +113,8 @@ function setupBotState(opts?: { botOpenId?: string | undefined; chatGrants?: Rec
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
       restrictGrantCommands: opts?.restrictGrantCommands,
+      regularGroupReplyInThread: opts?.regularGroupReplyInThread,
+      autoStartOnNewTopic: opts?.autoStartOnNewTopic,
     },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
@@ -912,6 +922,64 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   });
 });
 
+describe('im.message.receive_v1 — regular group thread replies preference', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState({ regularGroupReplyInThread: true });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('routes a top-level @mention in a regular group to thread-scope when enabled', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA handle this' }),
+      messageId: 'msg-regular-thread',
+      chatId: 'chat-regular-thread',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-regular-thread',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('does not route into an existing chat-scope session when the new preference is enabled', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA make a focused topic' }),
+      messageId: 'msg-regular-existing-chat',
+      chatId: 'chat-regular-existing-chat',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-regular-existing-chat');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-regular-existing-chat',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
 describe('globalGrants — global talk-only authorization (canTalk / canOperate)', () => {
   beforeEach(() => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
@@ -1097,6 +1165,33 @@ describe('im.message.receive_v1 — stale topic detection (topic → group conve
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-flipback',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('keeps thread-scope on topic-cache flip-back when regular group thread replies are enabled', async () => {
+    setupBotState({ regularGroupReplyInThread: true });
+    mockGetChatMode.mockImplementation(async (_appId: string, _chatId: string, options?: { forceRefresh?: boolean }) => {
+      return options?.forceRefresh ? 'group' : 'topic';
+    });
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA top-level after flip-back' }),
+      messageId: 'msg-flipback-pref-thread',
+      chatId: 'chat-flipback-pref-thread',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-flipback-pref-thread',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
@@ -1412,9 +1507,15 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
 describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
-  function setupAutoTopicBot(enabled: boolean) {
+  function setupAutoTopicBot(enabled: boolean, regularGroupReplyInThread = false) {
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', autoStartOnNewTopic: enabled },
+      config: {
+        larkAppId: MY_APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        autoStartOnNewTopic: enabled,
+        regularGroupReplyInThread: regularGroupReplyInThread || undefined,
+      },
       botOpenId: MY_OPEN_ID,
       // A non-empty allowlist that does NOT include the sender → canTalk(sender)
       // is false, so an un-@ message deterministically returns 'ignore' (the
@@ -1487,6 +1588,24 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     await new Promise(r => setTimeout(r, 0));
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('普通群开话题回复开启且未 @ 时仍不触发 autoStartOnNewTopic', async () => {
+    setupAutoTopicBot(true, true);
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '普通群里随便聊一句' }),
+      messageId: 'msg-regular-no-at-thread-pref',
+      chatId: 'chat-regular-no-at-thread-pref',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('普通群 /t（未 @）开关开 → 不触发：/t override 不得被误判为话题群 seed (FR-7 回归)', async () => {
