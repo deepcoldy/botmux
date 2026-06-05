@@ -26,7 +26,7 @@ import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type Zellij
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
-import { setCardMode } from '../services/card-mode-store.js';
+import { setCardMode, setP2PMode } from '../services/card-mode-store.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
 import { writeRoleFile, deleteRoleFile, resolveRole, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
 import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
@@ -37,7 +37,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/p2pmode', '/list-slash-command', '/slash']);
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -591,6 +591,49 @@ export async function handleCardCommand(
   }
 
   await reply(t('cmd.card.usage', undefined, loc));
+}
+
+/**
+ * Handle `/p2pmode` (owner-only).
+ * Sets the private message mode (p2pMode) to 'chat' or 'thread'.
+ */
+export async function handleP2PModeCommand(
+  rootId: string,
+  larkAppId: string,
+  senderOpenId: string | undefined,
+  content: string,
+  deps: CommandHandlerDeps,
+): Promise<void> {
+  const loc = localeForBot(larkAppId);
+  const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
+
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (!ownerOpenId || !senderOpenId || senderOpenId !== ownerOpenId) {
+    await reply(t('cmd.p2pmode.owner_only', undefined, loc));
+    return;
+  }
+
+  const sub = content.replace(/^\/p2pmode\s*/i, '').trim().toLowerCase();
+
+  if (sub === 'chat') {
+    const r = await setP2PMode(larkAppId, 'chat');
+    await reply(r.ok ? t('cmd.p2pmode.chat_ok', undefined, loc) : t('cmd.p2pmode.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === 'thread') {
+    const r = await setP2PMode(larkAppId, 'thread');
+    await reply(r.ok ? t('cmd.p2pmode.thread_ok', undefined, loc) : t('cmd.p2pmode.fail', { reason: r.reason }, loc));
+    return;
+  }
+
+  if (sub === '') {
+    const bot = getBot(larkAppId);
+    const mode = bot.config.p2pMode === 'chat' ? 'chat' : 'thread';
+    await reply(`${t('cmd.p2pmode.current', { mode }, loc)}\n\n${t('cmd.p2pmode.usage', undefined, loc)}`);
+    return;
+  }
+
+  await reply(t('cmd.p2pmode.usage', undefined, loc));
 }
 
 export async function handleCommand(
@@ -1772,6 +1815,16 @@ export async function handleCommand(
         break;
       }
 
+      case '/p2pmode': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        await handleP2PModeCommand(rootId, appId, message.senderId, message.content, deps);
+        break;
+      }
+
       case '/list-slash-command':
       case '/slash': {
         // 列出本 bot 当前可用的 slash 命令，分三段：
@@ -1811,6 +1864,7 @@ export async function handleCommand(
           t('help.repo_path', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
+          t('help.p2pmode', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移

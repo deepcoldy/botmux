@@ -49,3 +49,32 @@ export async function setCardMode(
   logger.info(`[card-mode:${larkAppId}] chat=${chatId} off=${off} changed=${r.result.changed}`);
   return { ok: true, changed: r.result.changed };
 }
+
+/**
+ * Set the p2p mode ('chat' | 'thread') for a bot.
+ */
+export async function setP2PMode(
+  larkAppId: string,
+  mode: 'chat' | 'thread',
+): Promise<{ ok: true; changed: boolean } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const r = await rmwBotEntry<{ changed: boolean }>(larkAppId, (entry) => {
+    const currentMode = entry.p2pMode === 'chat' ? 'chat' : 'thread';
+    const changed = currentMode !== mode;
+    if (mode === 'chat') {
+      entry.p2pMode = 'chat';
+    } else {
+      delete entry.p2pMode;
+    }
+    return { write: changed, result: { changed } };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  // Keep in-memory config in sync.
+  bot.config.p2pMode = mode === 'chat' ? 'chat' : undefined;
+
+  logger.info(`[p2p-mode:${larkAppId}] mode=${mode} changed=${r.result.changed}`);
+  return { ok: true, changed: r.result.changed };
+}
