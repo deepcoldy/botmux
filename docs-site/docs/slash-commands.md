@@ -20,6 +20,18 @@
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` —— 字面送达底层 CLI，交给它的内置命令处理。
 
+想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/goal", "/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。
+
+## 🧩 查看可用命令
+
+`/list-slash-command`（别名 `/slash`）：在卡片里分三段列出当前可用的 slash 命令——
+
+1. botmux 固定放行的透传白名单；
+2. 本 bot 在 bots.json 用 `customPassthroughCommands` 自定义放行的命令；
+3. 从 `.claude` 目录（项目级 + `~/.claude` + 插件缓存）自动发现的自定义命令 / skill / 插件，以「命令 ｜ 说明」分页表格展示，并提示检测到的 MCP server 名。
+
+权限同 `/help`，不占用会话槽位。
+
 ## 📡 会话接入
 
 | 命令 | 说明 |
