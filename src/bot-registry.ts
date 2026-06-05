@@ -149,6 +149,8 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** Conversation mode for 1:1 private chats with the bot: 'thread' (default, starts a new thread-scoped session for every message) or 'chat' (flat, continuous chat-scoped session). */
+  p2pMode?: 'thread' | 'chat';
   /** chat_id list: chats where the live streaming card is suppressed (status falls back to master's pending-card morph). Written by `/card off|on`. */
   noCardChats?: string[];
   /**
@@ -621,6 +623,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,

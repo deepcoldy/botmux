@@ -1031,8 +1031,13 @@ export async function decideRouting(
   const chatId: string = message.chat_id;
 
   // 私聊：每条 top-level DM 都视为新话题 — 跟话题群同款，匹配 Lark DM 的话题
-  // 化默认行为，避免无限把 1:1 对话塞进同一个 CLI 进程里。
+  // 化默认行为，避免无限把 1:1 对话塞进同一个 CLI 进程里。如果显式配置了 p2pMode === 'chat'，
+  // 则作为长期单聊会话，不使用 thread，从而支持扁平直接对话。
   if (chatType === 'p2p') {
+    const config = getBot(larkAppId)?.config;
+    if (config?.p2pMode === 'chat') {
+      return { scope: 'chat', anchor: chatId };
+    }
     return { scope: 'thread', anchor: messageId };
   }
 
