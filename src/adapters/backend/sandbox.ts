@@ -15,7 +15,7 @@
  * Anthropic's sandbox-exec approach and is handled elsewhere.
  */
 import { homedir } from 'node:os';
-import { cpSync, mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, realpathSync } from 'node:fs';
+import { cpSync, mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
@@ -271,43 +271,27 @@ export interface RelayRequest {
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
 const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
 
+export interface ValidatedRelay { contentName: string; attachmentNames: string[]; flags: string[]; }
+
 /**
- * Validate an outbox relay request and build the argv for a host-side `send`,
- * or reject it. PURE + exported for testing. Security guarantees:
- *  - contentFile/attachments must be plain basenames whose realpath sits
- *    directly inside `outbox` (defends against `../` and symlink-in-outbox
- *    escapes — the sandbox can create symlinks in the bound outbox).
- *  - only allowlisted presentation flags pass; any other flag → reject.
- *  - --session-id is forced to the worker-supplied `sessionId`.
+ * PURE validation of an outbox relay request (schema + flag allowlist only — no
+ * filesystem access, so it's deterministically testable):
+ *  - contentFile/attachments must be plain basenames (no `/`, `\`, `..`).
+ *  - only allowlisted presentation flags pass; any other flag → reject (this
+ *    rejects raw `--content-file`/`--session-id`/path flags etc.).
+ * The TOCTOU-safe filesystem read is handled separately by materializeOutboxFile,
+ * NOT here — this function deliberately resolves no paths.
  */
-export function buildRelayHostArgs(
-  req: RelayRequest,
-  outbox: string,
-  sessionId: string,
-): { ok: true; hostArgs: string[] } | { ok: false; error: string } {
-  let outboxReal: string;
-  try { outboxReal = realpathSync(outbox); } catch { outboxReal = outbox; }
-  const safe = (name: unknown): string | null => {
-    if (typeof name !== 'string' || !name || name.includes('/') || name.includes('\\') || name.includes('..')) return null;
-    const p = join(outbox, name);
-    if (!existsSync(p)) return null;
-    let real: string;
-    try { real = realpathSync(p); } catch { return null; }
-    if (real !== outboxReal && !real.startsWith(outboxReal + '/')) return null;  // escaped outbox
-    return p;
-  };
+export function validateRelayRequest(req: RelayRequest): { ok: true; value: ValidatedRelay } | { ok: false; error: string } {
+  const safeName = (n: unknown): n is string =>
+    typeof n === 'string' && !!n && !n.includes('/') && !n.includes('\\') && !n.includes('..');
 
-  const contentPath = safe(req.contentFile);
-  if (!contentPath) return { ok: false, error: 'contentFile must be a file inside the outbox' };
-
-  const atts: string[] = [];
-  const rawAtts = Array.isArray(req.attachments) ? req.attachments : [];
-  for (const a of rawAtts) {
-    const ap = safe(a);
-    if (!ap) return { ok: false, error: 'attachment must be a file inside the outbox' };
-    atts.push(ap);
+  if (!safeName(req.contentFile)) return { ok: false, error: 'contentFile must be a plain outbox basename' };
+  const attachmentNames: string[] = [];
+  for (const a of Array.isArray(req.attachments) ? req.attachments : []) {
+    if (!safeName(a)) return { ok: false, error: 'attachment must be a plain outbox basename' };
+    attachmentNames.push(a);
   }
-
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
   for (let i = 0; i < rawFlags.length; i++) {
@@ -319,37 +303,58 @@ export function buildRelayHostArgs(
       if (typeof v !== 'string') return { ok: false, error: `flag ${f} needs a string value` };
       flags.push(f, v); i++; continue;
     }
-    return { ok: false, error: `flag not allowed: ${f}` };  // incl. raw hostArgs / path flags
+    return { ok: false, error: `flag not allowed: ${f}` };
   }
+  return { ok: true, value: { contentName: req.contentFile, attachmentNames, flags } };
+}
 
-  const hostArgs = [
-    ...flags,
-    '--content-file', contentPath,
-    ...atts.flatMap(a => ['--files', a]),
-    '--session-id', sessionId,  // forced — sandbox cannot target another session
-  ];
-  return { ok: true, hostArgs };
+/**
+ * TOCTOU-safe copy of an outbox file (`outbox/<name>`, name already validated as
+ * a plain basename) into a host-private `dest`. Opens with O_NOFOLLOW so a
+ * symlink swapped in by the sandbox AFTER validation is rejected at open time;
+ * reads from the fd (not the path), so the inode can't be swapped under us.
+ * Returns false (reject) on symlink / non-regular / any error.
+ */
+export function materializeOutboxFile(outbox: string, name: string, dest: string): boolean {
+  let fd: number;
+  try { fd = openSync(join(outbox, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); }
+  catch { return false; }  // symlink (ELOOP) or missing
+  let outFd: number | null = null;
+  try {
+    if (!fstatSync(fd).isFile()) return false;  // reject dir/fifo/device/etc.
+    outFd = openSync(dest, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const buf = Buffer.alloc(64 * 1024);
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      writeSync(outFd, buf, 0, n);
+    }
+    return true;
+  } catch { return false; }
+  finally { closeSync(fd); if (outFd !== null) closeSync(outFd); }
 }
 
 /**
  * Daemon/worker-side outbox watcher. The sandboxed `botmux send` (relay mode)
- * drops `<id>.req.json` here; we VALIDATE it (buildRelayHostArgs) and re-exec
- * THIS build's `send` OUTSIDE the sandbox (full env + creds + bots.json), then
- * write `<id>.res.json` back. Validation is what keeps creds out of the sandbox:
- * the sandbox can only send outbox-resident files to its own session.
- *
- * `baseEnv` is the worker's env (has creds); we strip BOTMUX_SEND_RELAY so the
- * re-exec delivers directly. `sessionId` is forced onto every relayed send.
+ * drops `<id>.req.json`; we validate (validateRelayRequest) and then MATERIALIZE
+ * the content/attachments into a host-private staging dir that is NOT bound into
+ * the sandbox — closing the TOCTOU window where the sandbox could swap an outbox
+ * file for a symlink between check and the host-side read. We then re-exec THIS
+ * build's `send` OUTSIDE the sandbox (full creds) against the private copies,
+ * with the session-id FORCED. This keeps every Lark credential out of the sandbox.
  */
 export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, sessionId: string): () => void {
   const cli = distCliJs();
   const env = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
   const inFlight = new Set<string>();
+  // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
+  const staging = join(dirname(outbox), 'relay-staging');
 
-  const finish = (id: string, reqPath: string, name: string, code: number, stdout: string, stderr: string) => {
+  const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string) => {
     try { writeFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
     try { rmSync(reqPath, { force: true }); } catch { /* */ }
+    for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
   };
 
@@ -361,18 +366,43 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
       inFlight.add(name);
       const reqPath = join(outbox, name);
       const id = name.slice(0, -'.req.json'.length);
+      const staged: string[] = [];
       let req: RelayRequest;
       try { req = JSON.parse(readFileSync(reqPath, 'utf8')); }
-      catch { finish(id, reqPath, name, 1, '', 'relay: bad json'); continue; }
+      catch { finish(id, reqPath, name, staged, 1, '', 'relay: bad json'); continue; }
 
-      const built = buildRelayHostArgs(req, outbox, sessionId);
-      if (!built.ok) { finish(id, reqPath, name, 1, '', `relay rejected: ${built.error}`); continue; }
+      const v = validateRelayRequest(req);
+      if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
 
-      const child = spawn(process.execPath, [cli, 'send', ...built.hostArgs], { env });
+      try { mkdirSync(staging, { recursive: true }); } catch { /* */ }
+      // Materialize content (TOCTOU-safe) into the private staging dir.
+      const contentDest = join(staging, `${id}.content`);
+      if (!materializeOutboxFile(outbox, v.value.contentName, contentDest)) {
+        finish(id, reqPath, name, staged, 1, '', 'relay rejected: content not a regular file in outbox');
+        continue;
+      }
+      staged.push(contentDest);
+      let attBad = false;
+      const attPaths: string[] = [];
+      v.value.attachmentNames.forEach((an, i) => {
+        if (attBad) return;
+        const dest = join(staging, `${id}-att${i}-${an}`);
+        if (!materializeOutboxFile(outbox, an, dest)) { attBad = true; return; }
+        staged.push(dest); attPaths.push(dest);
+      });
+      if (attBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: attachment not a regular file in outbox'); continue; }
+
+      const hostArgs = [
+        ...v.value.flags,
+        '--content-file', contentDest,
+        ...attPaths.flatMap(a => ['--files', a]),
+        '--session-id', sessionId,  // forced — sandbox cannot target another session
+      ];
+      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });
-      child.on('close', (code) => finish(id, reqPath, name, code ?? 1, out, err));
+      child.on('close', (code) => finish(id, reqPath, name, staged, code ?? 1, out, err));
     }
   };
 

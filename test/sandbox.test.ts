@@ -8,8 +8,8 @@
 import { describe, it, expect } from 'vitest';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, symlinkSync } from 'node:fs';
-import { buildSandboxArgs, seedScopedConfig, buildRelayHostArgs, prepareSandbox, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync } from 'node:fs';
+import { buildSandboxArgs, seedScopedConfig, validateRelayRequest, materializeOutboxFile, prepareSandbox, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -81,64 +81,65 @@ describe('seedScopedConfig', () => {
   });
 });
 
-// ── buildRelayHostArgs: the security boundary for the outbox send relay ──────
+// ── validateRelayRequest: pure schema + flag-allowlist boundary ─────────────
 // Regression for the "sandbox makes host read an arbitrary path" confused-deputy
-// blocker: the watcher must NEVER honor raw argv or paths outside the outbox.
-describe('buildRelayHostArgs', () => {
-  const SID = 'sess-123';
-
-  it('accepts an outbox-resident content file + attachment + allowlisted flags, and forces session-id', () => {
-    const outbox = tmp();
-    writeFileSync(join(outbox, 'c.content'), 'hi');
-    writeFileSync(join(outbox, 'a.png'), 'png');
-    const r = buildRelayHostArgs(
-      { contentFile: 'c.content', attachments: ['a.png'], flags: ['--mention-back', '--mention', 'ou:X'] },
-      outbox, SID,
-    );
+// blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
+// path flags / sandbox-chosen session-id are rejected.
+describe('validateRelayRequest', () => {
+  it('accepts plain basenames + allowlisted presentation flags', () => {
+    const r = validateRelayRequest({ contentFile: 'c.content', attachments: ['a.png'], flags: ['--mention-back', '--mention', 'ou:X', '--voice'] });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.hostArgs).toContain('--mention-back');
-    expect(r.hostArgs).toEqual(expect.arrayContaining(['--mention', 'ou:X']));
-    expect(r.hostArgs).toEqual(expect.arrayContaining(['--content-file', join(outbox, 'c.content')]));
-    expect(r.hostArgs).toEqual(expect.arrayContaining(['--files', join(outbox, 'a.png')]));
-    // session-id is FORCED to the worker's value, last
-    expect(r.hostArgs.slice(-2)).toEqual(['--session-id', SID]);
+    expect(r.value.contentName).toBe('c.content');
+    expect(r.value.attachmentNames).toEqual(['a.png']);
+    expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
   });
 
-  it('rejects the raw-hostArgs exploit (path-bearing flag is not allowlisted)', () => {
-    const outbox = tmp();
-    writeFileSync(join(outbox, 'c.content'), 'x');
-    // the old exploit: try to make the host read bots.json
-    const r = buildRelayHostArgs(
-      { contentFile: 'c.content', flags: ['--content-file', '/root/.botmux/bots.json'] },
-      outbox, SID,
-    );
-    expect(r.ok).toBe(false);
+  it('rejects the raw-hostArgs exploit (path-bearing flag not allowlisted)', () => {
+    expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--content-file', '/root/.botmux/bots.json'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--files', '/root/.ssh/id_rsa'] }).ok).toBe(false);
   });
 
   it('rejects a sandbox-supplied --session-id (cannot target another session)', () => {
-    const outbox = tmp();
-    writeFileSync(join(outbox, 'c.content'), 'x');
-    const r = buildRelayHostArgs({ contentFile: 'c.content', flags: ['--session-id', 'other'] }, outbox, SID);
-    expect(r.ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--session-id', 'other'] }).ok).toBe(false);
   });
 
-  it('rejects contentFile / attachment paths that escape the outbox', () => {
-    const outbox = tmp();
-    writeFileSync(join(outbox, 'c.content'), 'x');
-    expect(buildRelayHostArgs({ contentFile: '../../etc/passwd' }, outbox, SID).ok).toBe(false);
-    expect(buildRelayHostArgs({ contentFile: 'c.content', attachments: ['../secret'] }, outbox, SID).ok).toBe(false);
-    expect(buildRelayHostArgs({ contentFile: 'missing' }, outbox, SID).ok).toBe(false);
+  it('rejects non-basename content / attachment names (../ traversal)', () => {
+    expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
+    expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
+  });
+});
+
+// ── materializeOutboxFile: TOCTOU-safe read of an outbox file ───────────────
+// Regression for the post-validation symlink-swap (TOCTOU): the read itself
+// refuses symlinks (O_NOFOLLOW) and reads from the fd, so a swap can't redirect
+// it to a host file. There is no separate check-then-use window any more.
+describe('materializeOutboxFile (TOCTOU)', () => {
+  it('copies a regular outbox file into the private dest', () => {
+    const outbox = tmp(); const stage = tmp();
+    writeFileSync(join(outbox, 'c.content'), 'hello');
+    const dest = join(stage, 'out');
+    expect(materializeOutboxFile(outbox, 'c.content', dest)).toBe(true);
+    expect(readFileSync(dest, 'utf8')).toBe('hello');
   });
 
-  it('rejects a symlink inside the outbox that points outside it', () => {
-    const outbox = tmp();
-    const secretDir = tmp();
-    const secret = join(secretDir, 'secret');
-    writeFileSync(secret, 'TOP SECRET');
-    symlinkSync(secret, join(outbox, 'link.content'));  // sandbox can create symlinks in the bound outbox
-    const r = buildRelayHostArgs({ contentFile: 'link.content' }, outbox, SID);
-    expect(r.ok).toBe(false);
+  it('refuses a symlink swapped into the outbox pointing at a host file (no exfil)', () => {
+    const outbox = tmp(); const stage = tmp(); const secretDir = tmp();
+    const secret = join(secretDir, 'bots.json');
+    writeFileSync(secret, 'SECRET_FROM_HOST');
+    // simulate the sandbox swapping the validated name for a symlink-to-secret
+    symlinkSync(secret, join(outbox, 'c.content'));
+    const dest = join(stage, 'out');
+    expect(materializeOutboxFile(outbox, 'c.content', dest)).toBe(false);  // O_NOFOLLOW rejects
+    expect(existsSync(dest)).toBe(false);  // nothing materialized → nothing to exfil
+  });
+
+  it('refuses a missing or non-regular file', () => {
+    const outbox = tmp(); const stage = tmp();
+    expect(materializeOutboxFile(outbox, 'nope', join(stage, 'o'))).toBe(false);
+    rmSync(join(stage, 'sub'), { recursive: true, force: true });
   });
 });
 
