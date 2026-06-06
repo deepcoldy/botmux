@@ -260,6 +260,7 @@ function ecosystemConfig(): string {
       // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
       // RSS regression — turned off in master so logs stay quiet.
       BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
+      ...(process.env.WEB_TERMINAL_PASSWORD ? { WEB_TERMINAL_PASSWORD: process.env.WEB_TERMINAL_PASSWORD } : {}),
     },
   }));
 
@@ -2811,6 +2812,7 @@ function argValues(args: string[], ...flags: string[]): string[] {
 // keeps using `buildCardBodyElements` from there.
 import { buildMentionedPendingResponseCard } from './im/lark/card-builder.js';
 import { buildCardBodyElements, brandFooterSegment } from './im/lark/md-card.js';
+import { storeReplyContent } from './im/lark/reply-content-cache.js';
 import { COMPLETED_REACTION_EMOJI_TYPE, claimPendingResponseCard, isPendingResponseCardOpen, markPendingResponseCardPatchedIfCurrent, mergePendingResponseState, shouldMarkPendingAsMentionedSend, shouldPatchPendingOnExplicitSend } from './core/pending-response.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
@@ -3397,6 +3399,30 @@ async function cmdSend(rest: string[]): Promise<void> {
           });
         }
       }
+
+      // Reply action buttons: export to Feishu doc + send raw markdown
+      const contentKey = storeReplyContent(text);
+      const actionRootId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
+      elements.push({ tag: 'hr' });
+      const rpcButton = (label: string, action: string) => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: label },
+        type: 'default',
+        width: 'fill',
+        behaviors: [{
+          type: 'callback',
+          value: { action, content_key: contentKey, root_id: actionRootId, session_id: sid },
+        }],
+      });
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'default',
+        columns: [
+          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [rpcButton('📄 导出飞书文档', 'export_to_doc')] },
+          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [rpcButton('📝 原始 Markdown', 'send_raw_md')] },
+        ],
+      });
 
       const cardJson = JSON.stringify({
         schema: '2.0',

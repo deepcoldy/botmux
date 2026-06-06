@@ -62,10 +62,29 @@ export function resetTerminalProxy(): void {
   externalPort = 0;
 }
 
+/**
+ * Returns true when the externalHost looks like an IP address (IPv4 or IPv6)
+ * that needs a port appended. Domain names behind reverse-proxies or tunnels
+ * (e.g. cpolar, nginx) serve on standard ports (80/443) so the port is omitted.
+ */
+function hostLooksLikeIp(host: string): boolean {
+  // IPv4: 1.2.3.4
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  // IPv6: [::1], [fe80::1], etc.
+  if (host.startsWith('[') && host.endsWith(']')) return true;
+  // Bare IPv6 (uncommon but valid in some contexts)
+  if (/^[0-9a-fA-F:]+$/.test(host) && host.includes(':')) return true;
+  return false;
+}
+
 export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
+  const host = config.web.externalHost;
+  const hostAndPort = hostLooksLikeIp(host)
+    ? `${host}:${getTerminalAdvertisedPort()}`
+    : host;
   const base = proxyReady
-    ? `http://${config.web.externalHost}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
-    : `http://${config.web.externalHost}:${ds.workerPort ?? ds.session.webPort}`;
+    ? `http://${hostAndPort}/s/${ds.session.sessionId}`
+    : `http://${host}:${ds.workerPort ?? ds.session.webPort}`;
   if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
   return base;
 }

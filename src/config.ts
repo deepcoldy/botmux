@@ -18,7 +18,7 @@ const configuredDashboardExternalHost =
   process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST ?? process.env.WEB_EXTERNAL_HOST;
 
 export function getWebExternalHost(): string {
-  return configuredWebExternalHost ?? getLocalIp();
+  return configuredWebExternalHost || getLocalIp();
 }
 
 export function getDashboardExternalHost(): string {

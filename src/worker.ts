@@ -3808,14 +3808,14 @@ body{display:flex;flex-direction:column}
    and momentum here (not just on body), and reserve gestures for pinch-zoom so
    single-finger drag is driven manually by the touch handler below. */
 #terminal .xterm-viewport{overscroll-behavior:none;-webkit-overflow-scrolling:auto;touch-action:pinch-zoom}
-/* On touch, glyph cells are selectable text — a finger-drag over text starts
-   native text selection (and the long-press callout) instead of scrolling,
-   which is why blank areas scroll fine but text areas stall/won't move.
-   Kill selection + callout on the rendered content so every drag is a clean
-   scroll.  Gated to .touch so desktop keeps mouse text-selection for copy. */
-body.touch #terminal .xterm-screen,
-body.touch #terminal .xterm-screen *{
-  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:pinch-zoom}
+	/* On touch: kill text-selection (browser drag-to-select fights xterm.js
+	   scroll) so single-finger drag stays a clean scroll. Long-press callout
+	   is left at browser default — users can long-press for the native Copy /
+	   Select All menu. Pinch-zoom via browser (touch-action + preventDefault
+	   patch). */
+	body.touch #terminal .xterm-screen,
+	body.touch #terminal .xterm-screen *{
+	  -webkit-user-select:none;user-select:none;touch-action:pinch-zoom}
 #status{position:fixed;top:8px;right:12px;z-index:10;font:12px monospace;
   color:#565f89;background:#1a1b26cc;padding:2px 8px;border-radius:4px}
 #status.ok{color:#9ece6a}
@@ -3839,6 +3839,7 @@ body.touch #terminal .xterm-screen *{
   <button data-k="left">\u2190</button>
   <button data-k="right">\u2192</button>
   <button data-k="enter">\u21B5</button>
+	  <button data-k="copy" style="background:#33467c">\uD83D\uDCCB</button>
 </div>
 <div id="status" class="err">connecting...</div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
@@ -3849,7 +3850,12 @@ body.touch #terminal .xterm-screen *{
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0/lib/addon-canvas.min.js"></script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
-if(isTouch){document.getElementById('vp').content='width=1100,viewport-fit=cover';document.body.classList.add('touch');}
+if(isTouch){var scrW=Math.max(screen.width||375,screen.height||667);var vpW=scrW<500?800:scrW<900?1000:1100;document.getElementById('vp').content='width='+vpW+',minimum-scale=0.3,maximum-scale=5,viewport-fit=cover';document.body.classList.add('touch');}
+// Allow browser native pinch-zoom. xterm.js calls preventDefault() on ALL touch
+// events (including multi-touch) for its own JS scroll handling, but this also
+// cancels the browser's pinch-zoom gesture. Skip preventDefault when >=2 fingers
+// are down so the browser can handle pinch-zoom natively.
+if(isTouch){(function(){var _pd=Event.prototype.preventDefault;Event.prototype.preventDefault=function(){if(this.type&&/^touch/.test(this.type)&&this.touches&&this.touches.length>=2)return;_pd.call(this)}})();}
 var hasToken=${hasWrite};
 if(!hasToken){var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
 
@@ -3858,7 +3864,7 @@ var term=new Terminal({
     selectionBackground:'#33467c',black:'#15161e',red:'#f7768e',
     green:'#9ece6a',yellow:'#e0af68',blue:'#7aa2f7',magenta:'#bb9af7',
     cyan:'#7dcfff',white:'#a9b1d6'},
-  fontSize:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
+  fontSize:isTouch?15:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
   cursorBlink:!isTouch,scrollback:50000,allowProposedApi:true
 });
 var fit=new FitAddon.FitAddon();
@@ -4003,13 +4009,48 @@ if(isTouch&&hasToken){
     window.visualViewport.addEventListener('resize',posToolbar);
     window.visualViewport.addEventListener('scroll',posToolbar);
   }
+  // Copy button: copy visible terminal text to clipboard (self-contained,
+  // placed before OSC 52 helpers so cannot reference _doCopy / _showCopied).
+  var _copyBtn=document.querySelector('[data-k=copy]');
+  function _doCopyVis(){
+    var buf=term.buffer.active,text='';
+    var start=buf.viewportY,rows=term.rows;
+    var end=Math.min(start+rows,buf.length);
+    for(var i=start;i<end;i++){var ln=buf.getLine(i);if(ln)text+=ln.translateToString()+'\\n';}
+    var ta=document.createElement('textarea');ta.value=text;
+    ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy')}catch(ex){}
+    document.body.removeChild(ta);
+  }
+  function _copyToast(){
+    var d=document.createElement('div');
+    d.textContent='Copied!';d.style.cssText='position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:999;background:#9ece6a;color:#1a1b26;padding:4px 16px;border-radius:4px;font:13px monospace;pointer-events:none;opacity:1;transition:opacity .4s';
+    document.body.appendChild(d);
+    setTimeout(function(){d.style.opacity='0'},800);
+    setTimeout(function(){document.body.removeChild(d)},1200);
+  }
+  _copyBtn.addEventListener('touchend',function(e){e.preventDefault();e.stopPropagation();_doCopyVis();_copyToast();});
+  _copyBtn.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();_doCopyVis();_copyToast();});
 }
 
-// Single-finger touch scrolling is handled natively by xterm's own Viewport
-// (handleTouchMove → scrollTop), so no custom handler here — a parallel one
-// would double-drive scrollTop and fight xterm.  overscroll-behavior:none on
-// .xterm-viewport (see <style>) kills the iOS rubber-band; the WebGL/Canvas
-// renderer above is what actually makes scrolling over text smooth.
+// Custom single-finger scroll — drives .xterm-viewport scrollTop directly
+// because xterm.js's built-in touch handler doesn't reliably receive events
+// when the WebGL canvas is active on some mobile browsers.
+if(isTouch){(function(){
+  var _sy=0,_ss=0,_on=false,_vp=null;
+  document.addEventListener('touchstart',function(e){
+    if(e.touches.length===1){
+      _sy=e.touches[0].clientY;
+      if(!_vp)_vp=document.querySelector('#terminal .xterm-viewport');
+      _ss=_vp?_vp.scrollTop:0;_on=true;
+    }else{_on=false;}
+  },{passive:true});
+  document.addEventListener('touchmove',function(e){
+    if(!_on||e.touches.length!==1)return;
+    if(_vp)_vp.scrollTop=_ss+(_sy-e.touches[0].clientY);
+  },{passive:true});
+  document.addEventListener('touchend',function(){_on=false},{passive:true});
+})();}
 </script>
 </body>
 </html>`;
