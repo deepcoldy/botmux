@@ -105,6 +105,7 @@ import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/l
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { markSessionActivity, announcePendingRepoSession } from './core/session-activity.js';
+import { startIdleSuspender, forgetSuspendState } from './core/idle-suspender.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from './workflows/runtime.js';
 import { runLoop } from './workflows/loop.js';
@@ -3352,6 +3353,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     }, 5_000).unref?.();
   }
+
+  // Start idle session auto-suspender — after 30 min of inactivity, kill the
+  // worker (which also destroys the tmux session via the close handler).
+  // After 4 h, the session is already in deep sleep — nothing extra to kill.
+  // Both tiers resume transparently on the next user message via
+  // handleThreadReply's ds.worker===null → forkWorker(resume:true) path.
+  const idleSuspender = startIdleSuspender(activeSessions, (ds, tier) => {
+    const anchor = ds.session.rootMessageId ?? ds.chatId;
+    const label = tier === 'deep' ? '深睡眠（超过 4 小时未活动）' : '休眠（超过 30 分钟未活动）';
+    sessionReply(anchor, `💤 会话已进入${label}。回复任意消息即可恢复对话。`, 'text', ds.larkAppId).catch(() => {});
+  });
 
   // Graceful shutdown. Sends SIGTERM (or `{type:'close'}` IPC via killWorker)
   // to every worker, then waits up to SHUTDOWN_GRACE_MS for them to exit

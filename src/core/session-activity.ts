@@ -7,6 +7,7 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import type { DaemonSession } from './types.js';
+import { markSessionActive } from './idle-suspender.js';
 
 export function markSessionActivity(ds: DaemonSession, at: number = Date.now()): void {
   ds.lastMessageAt = at;
@@ -15,6 +16,8 @@ export function markSessionActivity(ds: DaemonSession, at: number = Date.now()):
     ds.session.lastMessageAt = iso;
     sessionStore.updateSession(ds.session);
   }
+  // Reset idle-suspender state — session just received a message
+  markSessionActive(ds.session.sessionId);
   dashboardEventBus.publish({
     type: 'session.update',
     body: { sessionId: ds.session.sessionId, patch: { lastMessageAt: at } },
