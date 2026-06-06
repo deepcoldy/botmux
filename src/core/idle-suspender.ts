@@ -36,8 +36,18 @@ export function startIdleSuspender(
   activeSessions: Map<string, DaemonSession>,
   sendNotification: (ds: DaemonSession, tier: 'light' | 'deep') => void,
 ): ReturnType<typeof setInterval> {
+  logger.info(
+    `[idle-suspender] started (light=${LIGHT_SLEEP_MS / 60000}m, ` +
+    `deep=${DEEP_SLEEP_MS / 3600000}h, scan=${SCAN_INTERVAL_MS / 1000}s)`,
+  );
+
+  let scanCount = 0;
   const timer = setInterval(() => {
     const now = Date.now();
+    scanCount++;
+
+    let totalWithWorker = 0;
+    let idleCandidates = 0;
 
     for (const ds of activeSessions.values()) {
       const sid = ds.session.sessionId;
@@ -60,6 +70,9 @@ export function startIdleSuspender(
       let targetTier: 'none' | 'light' | 'deep' = 'none';
       if (idleMs > DEEP_SLEEP_MS) targetTier = 'deep';
       else if (idleMs > LIGHT_SLEEP_MS) targetTier = 'light';
+
+      if (targetTier !== 'none') idleCandidates++;
+      if (ds.worker && !ds.worker.killed) totalWithWorker++;
 
       // Transition back to active — user came back
       if (targetTier === 'none') {
@@ -96,6 +109,15 @@ export function startIdleSuspender(
         // still mark tier so we notify if needed
         st.tier = targetTier;
       }
+    }
+    // Heartbeat every 10 scans (~10 min) so we can verify the loop is alive
+    // without spamming the log every minute.
+    if (scanCount % 10 === 0) {
+      logger.info(
+        `[idle-suspender] heartbeat #${scanCount}: ` +
+        `${activeSessions.size} total, ${totalWithWorker} with worker, ` +
+        `${idleCandidates} idle, ${stateMap.size} tracked`,
+      );
     }
   }, SCAN_INTERVAL_MS);
 

@@ -11,6 +11,10 @@ pnpm daemon:logs          # 查看日志
 ```
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
+- 本项目通过 npm link 将全局 `botmux` 指向本地 dist/，build 后直接生效
+- **每次改动后必须在线上验证功能正常**，验证通过后再清理测试残留（测试话题、测试消息等）
+- 验证方式：查看 daemon 日志 `pnpm daemon:logs` | 在飞书测试群里发送消息触发功能 | 检查 pm2 进程状态
+- daemon 日志位于 `~/.botmux/logs/daemon-0-out.log`，也可通过 `./node_modules/.bin/pm2 logs botmux-0 --nostream --lines 50` 查看
 
 ## 模块结构
 
