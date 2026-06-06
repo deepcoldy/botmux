@@ -3542,7 +3542,10 @@ function killCli(): void {
 
 function startWebServer(host: string, preferredPort?: number): Promise<number> {
   return new Promise((resolve, reject) => {
-    httpServer = createHttpServer((req, res) => {
+    const password = config.web.terminalPassword;
+    const authEnabled = !!password;
+
+    httpServer = createHttpServer(async (req, res) => {
       const url = parseWorkerRequestUrl(req);
       if (!url) {
         log(`Bad worker HTTP URL rejected: ${JSON.stringify(req.url ?? '')}`);
@@ -3550,6 +3553,33 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Bad Request');
         return;
       }
+
+      // ── Password gate ──
+      if (authEnabled) {
+        const cookies = parseCookies(req.headers.cookie);
+        if (cookies[AUTH_COOKIE] !== password) {
+          if (req.method === 'POST') {
+            const body = await readRequestBody(req);
+            const params = new URLSearchParams(body);
+            if (params.get('pwd') === password) {
+              res.writeHead(302, {
+                'Content-Type': 'text/html; charset=utf-8',
+                'Set-Cookie': `${AUTH_COOKIE}=${password}; Path=/s/; Max-Age=${AUTH_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax`,
+                Location: url.pathname + url.search,
+              });
+              res.end();
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(getLoginPage(true));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(getLoginPage(false));
+          return;
+        }
+      }
+
       const hasWrite = url.searchParams.get('token') === writeToken;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(getTerminalHtml(hasWrite));
@@ -3559,6 +3589,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
     wss.on('connection', (ws, req: IncomingMessage) => {
       wsClients.add(ws);
+
+      // Auth check for WebSocket (same cookie as the HTML page)
+      if (authEnabled) {
+        const cookies = parseCookies(req.headers.cookie);
+        if (cookies[AUTH_COOKIE] !== password) {
+          wsClients.delete(ws);
+          ws.close(4001, 'Authentication required');
+          return;
+        }
+      }
 
       // Check token from query string for write access
       const url = parseWorkerRequestUrl(req);
@@ -4052,6 +4092,64 @@ if(isTouch){(function(){
   document.addEventListener('touchend',function(){_on=false},{passive:true});
 })();}
 </script>
+</body>
+</html>`;
+}
+
+// ─── IPC Communication ───────────────────────────────────────────────────────
+
+/** Simple cookie parser: "k1=v1; k2=v2" → {k1:"v1", k2:"v2"} */
+function parseCookies(header?: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    out[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+  }
+  return out;
+}
+
+/** Stream a small request body into a string. */
+function readRequestBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk: Buffer) => (body += chunk.toString()));
+    req.on('end', () => resolve(body));
+  });
+}
+
+const AUTH_COOKIE = 'bmx_auth';
+const AUTH_COOKIE_MAX_AGE = 2_592_000; // 30 days
+
+function getLoginPage(error: boolean): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>botmux · login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;background:#1a1b26;display:flex;align-items:center;justify-content:center;font-family:monospace}
+form{display:flex;flex-direction:column;gap:14px;padding:28px 24px;background:#24283b;border-radius:10px;border:1px solid #33467c;min-width:280px}
+h1{color:#a9b1d6;font-size:16px;text-align:center;margin-bottom:4px}
+label{color:#565f89;font-size:12px;text-align:center}
+input{background:#1a1b26;color:#a9b1d6;border:1px solid #33467c;border-radius:6px;padding:12px 14px;font-size:16px;font-family:monospace;outline:none}
+input:focus{border-color:#7aa2f7}
+button{background:#7aa2f7;color:#1a1b26;border:none;border-radius:6px;padding:12px;font-size:16px;font-family:monospace;cursor:pointer;font-weight:bold}
+button:active{opacity:0.85}
+.error{color:#f7768e;font-size:13px;text-align:center${error ? '' : ';display:none'}}
+</style>
+</head>
+<body>
+<form method="post">
+  <h1>terminal</h1>
+  <label>enter password to continue</label>
+  <input type="password" name="pwd" placeholder="password" autofocus>
+  <button type="submit">login</button>
+  <p class="error">wrong password, try again</p>
+</form>
 </body>
 </html>`;
 }

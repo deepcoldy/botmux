@@ -386,6 +386,10 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   // prefix fallback covers the close-button race: card-handler deletes ds
   // from activeSessions BEFORE sending the close-confirmation reply, so by
   // the time we run, ds is gone — but the anchor (chatId, oc_xxx) is enough
+  // Reset idle timer on every bot message so the suspend clock starts
+  // from the LAST bot output, not from the user's original message.
+  if (ds) ds.lastMessageAt = Date.now();
+
   // to know we should sendMessage, not reply_in_thread to a non-message-id.
   if (ds?.scope === 'chat' || anchor.startsWith('oc_')) {
     const chatId = ds?.chatId ?? anchor;

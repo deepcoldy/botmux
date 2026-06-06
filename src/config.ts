@@ -97,6 +97,11 @@ export const config = {
     // shares this env and differs only by BOTMUX_BOT_INDEX. 0 = unset → links use
     // the local proxy port (relay must forward the same port number).
     externalPort: Number(process.env.WEB_EXTERNAL_PORT) || 0,
+    /** If set, all web terminal access requires this password. A browser
+     *  cookie (`bmx_auth`) is set on first successful login so the user
+     *  only enters it once per browser. Unset (default) = no auth — the
+     *  terminal URL alone grants access (legacy behaviour). */
+    terminalPassword: process.env.WEB_TERMINAL_PASSWORD,
   },
   dashboard: {
     host: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
