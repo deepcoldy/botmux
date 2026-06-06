@@ -18,6 +18,11 @@ import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
 
+export interface WorkerConfig {
+  maxLiveWorkers?: number;
+  idleSuspendMs?: number;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide dashboard settings. These are intentionally global rather
@@ -28,6 +33,9 @@ export interface GlobalConfig {
    *  services/voice/types.ts. Presence (with usable creds) gates the
    *  "🔊 语音总结" button. */
   voice?: VoiceConfig;
+  /** Machine-wide worker resource policy. Daemon falls back to an
+   *  auto-derived live-worker budget when this block is absent. */
+  worker?: WorkerConfig;
 }
 
 export interface DashboardGlobalConfig {
@@ -58,6 +66,22 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.publicReadOnly === 'boolean') out.publicReadOnly = d.publicReadOnly;
   if (typeof d.openTerminalInFeishu === 'boolean') out.openTerminalInFeishu = d.openTerminalInFeishu;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readPositiveInteger(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) return undefined;
+  return raw;
+}
+
+function readWorker(raw: unknown): WorkerConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const v = raw as Record<string, unknown>;
+  const worker: WorkerConfig = {};
+  const maxLiveWorkers = readPositiveInteger(v.maxLiveWorkers);
+  const idleSuspendMs = readPositiveInteger(v.idleSuspendMs);
+  if (maxLiveWorkers !== undefined) worker.maxLiveWorkers = maxLiveWorkers;
+  if (idleSuspendMs !== undefined) worker.idleSuspendMs = idleSuspendMs;
+  return Object.keys(worker).length > 0 ? worker : undefined;
 }
 
 export function globalConfigPath(): string {
@@ -108,6 +132,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
   if (voice) out.voice = voice;
+  const worker = readWorker(raw.worker);
+  if (worker) out.worker = worker;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }

@@ -47,7 +47,7 @@ export interface DaemonSession {
   lastMessageAt: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
-  initConfig?: DaemonToWorker;   // stored for restart
+  initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   pendingPrompt?: string;        // original user message to send after repo is selected

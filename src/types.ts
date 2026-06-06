@@ -218,6 +218,7 @@ export type DaemonToWorker =
   | { type: 'message'; content: string }
   | { type: 'raw_input'; content: string }
   | { type: 'close' }
+  | { type: 'suspend' }
   | { type: 'restart' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
   | { type: 'tui_text_input'; keys: string[]; text: string }

@@ -33,6 +33,7 @@ import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import type { CliId } from '../adapters/cli/types.js';
+import type { BackendType } from '../adapters/backend/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
@@ -861,6 +862,40 @@ export function killWorker(ds: DaemonSession): void {
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+}
+
+export function isSuspendableBackendType(backendType: BackendType | undefined): boolean {
+  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij';
+}
+
+export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
+  if (!ds.worker || ds.worker.killed) return false;
+  if (!isSuspendableBackendType(ds.initConfig?.backendType)) return false;
+
+  const w = ds.worker;
+  try {
+    w.send({ type: 'suspend' } as DaemonToWorker);
+  } catch {
+    try { w.kill('SIGTERM'); } catch { /* already gone */ }
+  }
+  armWorkerKillBackstop(w, tag(ds));
+
+  ds.worker = null;
+  ds.workerPort = null;
+  ds.workerToken = null;
+  ds.session.webPort = undefined;
+  sessionStore.updateSessionPid(ds.session.sessionId, null);
+  sessionStore.updateSession(ds.session);
+
+  if (!ds.exitEventEmitted) {
+    ds.exitEventEmitted = true;
+    dashboardEventBus.publish({
+      type: 'session.exited',
+      body: { sessionId: ds.session.sessionId, reason },
+    });
+  }
+  logger.info(`[${tag(ds)}] Worker suspended (${reason}); session remains active`);
+  return true;
 }
 
 function armWorkerKillBackstop(w: ChildProcess, label: string): void {

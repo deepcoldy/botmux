@@ -4291,6 +4291,17 @@ process.on('message', async (raw: unknown) => {
       cleanup();
       process.exit(0);
     }
+
+    case 'suspend': {
+      log('Suspend requested');
+      stopScreenshotLoop();
+      stopBridgeWatcher();
+      try { backend?.kill(); } catch { /* detach best-effort */ }
+      backend = null;
+      isPromptReady = false;
+      cleanup();
+      process.exit(0);
+    }
   }
 });
 

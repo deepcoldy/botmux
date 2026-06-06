@@ -123,6 +123,19 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
+describe('built-in botmux-worker-budget skill', () => {
+  it('teaches agents to use the CLI command instead of hand-editing JSON', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux worker-budget status');
+    expect(skill!.content).toContain('botmux worker-budget set --max-live-workers');
+    expect(skill!.content).toContain('botmux worker-budget unset');
+    expect(skill!.content).toContain('不要直接编辑 `~/.botmux/config.json`');
+    expect(skill!.content).toContain('maxLiveWorkers');
+    expect(skill!.content).toContain('idleSuspendMs');
+  });
+});
+
 describe('botmux-ask skill 条件兜底（hook 优先 + 非 hook CLI 保留）', () => {
   it('不在 BUILTIN_SKILLS（不再无条件装到所有 CLI）', () => {
     expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-ask')).toBeUndefined();
