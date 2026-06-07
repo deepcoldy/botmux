@@ -6,7 +6,7 @@
 |------|------|------|
 | `BOTS_CONFIG` | _(未设置)_ | 指定 bots.json 路径（覆盖默认位置） |
 | `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
-| `WEB_EXTERNAL_HOST` | _(自动探测局域网 IP)_ | 终端链接中的外部主机名/IP |
+| `WEB_EXTERNAL_HOST` | _(自动探测局域网 IP)_ | 终端链接中的外部主机名/IP（公网/内网域名访问见 [Web 终端](/web-terminal)） |
 | `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列存储目录 |
 | `BACKEND_TYPE` | _(自动检测)_ | `pty` 强制降级到纯 pty 模式 |
 | `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
