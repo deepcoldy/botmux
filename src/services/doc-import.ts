@@ -22,6 +22,20 @@ interface ImportResult {
   error?: string;
 }
 
+/** Check whether `lark-cli` is available in PATH. Cached so we only probe once. */
+let larkCliAvailable: boolean | null = null;
+function checkLarkCli(): boolean {
+  if (larkCliAvailable !== null) return larkCliAvailable;
+  try {
+    const { execSync } = require('node:child_process');
+    execSync('lark-cli --version', { stdio: 'ignore', timeout: 5000 });
+    larkCliAvailable = true;
+  } catch {
+    larkCliAvailable = false;
+  }
+  return larkCliAvailable;
+}
+
 /** Run lark-cli asynchronously so the event loop stays unblocked. */
 function execLarkCli(cmd: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -44,6 +58,10 @@ export async function importMarkdownAsDoc(
   markdown: string,
   title: string,
 ): Promise<ImportResult> {
+  if (!checkLarkCli()) {
+    return { ok: false, error: 'lark-cli 未安装，无法导入飞书文档。请运行 npm i -g @anthropic/lark-cli' };
+  }
+
   const buf = Buffer.from(markdown, 'utf-8');
   if (buf.length > MAX_FILE_BYTES) {
     return { ok: false, error: '内容超过 20 MB，无法导入为飞书文档' };
