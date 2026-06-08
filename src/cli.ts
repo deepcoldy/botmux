@@ -261,6 +261,7 @@ function ecosystemConfig(): string {
       // RSS regression — turned off in master so logs stay quiet.
       BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
       ...(process.env.WEB_TERMINAL_PASSWORD ? { WEB_TERMINAL_PASSWORD: process.env.WEB_TERMINAL_PASSWORD } : {}),
+      ...(process.env.BOTMUX_CARD_EXPORT_ENABLED ? { BOTMUX_CARD_EXPORT_ENABLED: process.env.BOTMUX_CARD_EXPORT_ENABLED } : {}),
     },
   }));
 
