@@ -52,7 +52,7 @@ import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
-import { dispatchPrimaryMessage } from './cli/send-dispatch.js';
+import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
 import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
@@ -2842,6 +2842,19 @@ async function cmdSend(rest: string[]): Promise<void> {
   const sessionIdArg = argValue(rest, '--session-id');
   const images = argValues(rest, '--image', '--images');
   const files = argValues(rest, '--file', '--files');
+  // stdin can't be both the message body (which `botmux send` reads from it) and
+  // a `--file`/`--image` attachment — the second read sees EOF and the upload
+  // fails *after* the message is already sent, leaving the caller to resend.
+  // Reject up front so exit≠0 reliably means "nothing was sent".
+  const stdinAlias = findStdinAliasAttachment([...images, ...files]);
+  if (stdinAlias) {
+    console.error(
+      `不能把 stdin（${stdinAlias}）当作 --file/--image 附件：botmux send 已从 stdin 读取消息正文，\n` +
+      `同一个 stdin 没法既当正文又当附件（第二次读到的是 EOF）。\n` +
+      `要发送管道内容，先落到临时文件：  数据来源 > /tmp/x && botmux send --files /tmp/x …`,
+    );
+    process.exit(1);
+  }
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
   const contentFile = argValue(rest, '--content-file');
   // 回复一律走交互卡片。`--card` / `--text` 是隐藏的旧脚本兼容 no-op：纯文本
@@ -3434,12 +3447,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     // closed a pending response card for this turn.
     if (shouldRecordBridgeMarker) recordBridgeSendMarker(sentAtMs, messageId, text);
 
-    // Send file attachments as separate messages
-    const fileIds: string[] = [];
-    for (const fp of files) {
-      const fileKey = await uploadFile(appId, fp);
-      const fid = await dispatch(JSON.stringify({ file_key: fileKey }), 'file');
-      fileIds.push(fid);
+    // Send file attachments as separate messages — best-effort. The primary
+    // message is already delivered above; a failing attachment must not throw
+    // out to the catch below (which would report total failure / exit 1 for an
+    // already-sent message and make the caller resend). Warn instead, and list
+    // the failures in the success JSON.
+    const { failed: failedAttachments } = await sendFileAttachments(
+      { uploadFile, dispatch }, appId, files,
+    );
+    for (const f of failedAttachments) {
+      console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);
     }
 
     // Bot-to-bot 转发依赖飞书"获取群组中其他机器人和用户@当前机器人的消息"权限：
@@ -3485,6 +3502,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       quotedMessageId: primaryQuotedId,
       mentioned: mentions.map(m => ({ open_id: m.open_id, name: m.name })),
       ...(attention.requested ? { attentionRaised, attentionError } : {}),
+      ...(failedAttachments.length > 0
+        ? { failedAttachments: failedAttachments.map(f => f.path) }
+        : {}),
     }));
   } catch (err: any) {
     console.error(`发送失败: ${err.message}`);
