@@ -701,6 +701,26 @@ describe('buildRepoSelectCard', () => {
     });
   });
 
+  // ── Manual directory form ──────────────────────────────────────────────
+
+  describe('manual directory form', () => {
+    it('should include an input and submit button for arbitrary working dirs', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const formEl = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_manual_form');
+      expect(formEl).toBeDefined();
+
+      const input = formEl.elements.find((e: any) => e.tag === 'input' && e.name === 'repo_manual_path');
+      expect(input).toBeDefined();
+      expect(input.placeholder.content).toContain('/path');
+
+      const submit = formEl.elements.find((e: any) => e.tag === 'button' && e.value?.action === 'repo_manual_submit');
+      expect(submit).toBeDefined();
+      expect(submit.name).toBe('repo_manual_submit');
+      expect(submit.action_type).toBe('form_submit');
+      expect(submit.value.root_id).toBe('om_root');
+    });
+  });
+
   // ── Note element ──────────────────────────────────────────────────────
 
   describe('note element', () => {
@@ -716,13 +736,14 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('should have 4 top-level elements: div, hr, action, note', () => {
+    it('should have 5 top-level elements: div, hr, action, form, note', () => {
       const card = parse(buildRepoSelectCard(projects));
-      expect(card.elements).toHaveLength(4);
+      expect(card.elements).toHaveLength(5);
       expect(card.elements[0].tag).toBe('div');
       expect(card.elements[1].tag).toBe('hr');
       expect(card.elements[2].tag).toBe('action');
-      expect(card.elements[3].tag).toBe('note');
+      expect(card.elements[3].tag).toBe('form');
+      expect(card.elements[4].tag).toBe('note');
     });
   });
 

@@ -975,6 +975,25 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
         ],
       },
       {
+        tag: 'form',
+        name: 'repo_manual_form',
+        elements: [
+          {
+            tag: 'input',
+            name: 'repo_manual_path',
+            placeholder: { tag: 'plain_text', content: t('card.repo.manual_placeholder', undefined, locale) },
+          },
+          {
+            tag: 'button',
+            name: 'repo_manual_submit',
+            text: { tag: 'plain_text', content: t('card.btn.manual_repo', undefined, locale) },
+            type: 'default',
+            action_type: 'form_submit',
+            value: { action: 'repo_manual_submit', root_id: rootMessageId ?? '' },
+          },
+        ],
+      },
+      {
         tag: 'note',
         elements: [
           {

@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync } from 'node:child_process';
+import { basename } from 'node:path';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
@@ -28,6 +29,7 @@ import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-sto
 import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
 import { publishAttentionPatch } from '../../core/session-activity.js';
+import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -572,7 +574,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -596,7 +598,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo 起会话——
     // 与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
     const pendingRepoOwnerException =
-      value.action === 'skip_repo' && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_manual_submit') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -1269,6 +1271,75 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
       ds.repoCardMessageId = undefined;
+    }
+
+    if (actionType === 'repo_manual_submit' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const rawPath = String(action?.form_value?.repo_manual_path ?? '').trim();
+      if (!rawPath) {
+        return { toast: { type: 'error', content: t('cmd.cd.usage', undefined, locDs) } };
+      }
+
+      const validation = validateWorkingDir(rawPath, locDs);
+      if (!validation.ok) {
+        return { toast: { type: 'error', content: validation.error } };
+      }
+
+      const selectedPath = validation.resolvedPath;
+      const displayName = basename(selectedPath) || selectedPath;
+      ds.workingDir = selectedPath;
+      ds.session.workingDir = selectedPath;
+      sessionStore.updateSession(ds.session);
+
+      if (ds.pendingRepo) {
+        const selfBot = getBot(ds.larkAppId);
+        const botCfg = selfBot.config;
+        const effectiveCliId = sessionCliId(ds);
+        ds.pendingRepo = false;
+        publishAttentionPatch(ds);
+        const pendingPrompt = ds.pendingPrompt ?? '';
+        const prompt = buildNewTopicPrompt(
+          pendingPrompt,
+          ds.session.sessionId,
+          effectiveCliId,
+          botCfg.cliPathOverride,
+          ds.pendingAttachments,
+          ds.pendingMentions,
+          await getAvailableBots(ds.larkAppId, ds.chatId),
+          ds.pendingFollowUps,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
+          locDs,
+          ds.pendingSender,
+          { larkAppId: ds.larkAppId, chatId: ds.chatId },
+        );
+        rememberLastCliInput(ds, pendingPrompt, prompt);
+        ds.pendingPrompt = undefined;
+        ds.pendingAttachments = undefined;
+        ds.pendingMentions = undefined;
+        ds.pendingSender = undefined;
+        ds.pendingFollowUps = undefined;
+        forkWorker(ds, prompt);
+        await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, locDs));
+        logger.info(`[${tag(ds)}] Manual repo path selected, spawning CLI in ${selectedPath}`);
+      } else {
+        killWorker(ds);
+        sessionStore.closeSession(ds.session.sessionId);
+        const session = sessionStore.createSession(ds.chatId, rootId, displayName, ds.chatType);
+        ds.session = session;
+        ds.lastUserPrompt = undefined;
+        ds.lastCliInput = undefined;
+        ds.session.workingDir = selectedPath;
+        ds.session.larkAppId = ds.larkAppId;
+        sessionStore.updateSession(ds.session);
+        ds.hasHistory = false;
+        forkWorker(ds, '', false);
+        await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, locDs));
+        logger.info(`[${tag(ds)}] Manual repo path switched to ${selectedPath}`);
+      }
+
+      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+      ds.repoCardMessageId = undefined;
+      return;
     }
     return;
   }
