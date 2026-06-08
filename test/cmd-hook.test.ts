@@ -296,7 +296,7 @@ describe('runHook', () => {
         new URL('../src/cli.ts', import.meta.url),
         'utf-8',
       );
-      // 独立 `botmux attention` 命令已删除——举手并入 `botmux send --attention`。
+      // 旧的独立举手入口已删除——举手并入 `botmux send --attention`。
       expect(src.includes('async function cmdAttention(')).toBe(false);
       // send 顶部已有 workflow-subagent gate（subagent 里 send 直接 refused），
       // --attention 是 send 的一个 flag，因此天然被同一道 gate 覆盖。

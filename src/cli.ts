@@ -2844,8 +2844,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   const files = argValues(rest, '--file', '--files');
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
   const contentFile = argValue(rest, '--content-file');
-  // 回复一律走交互卡片。`--card` / `--text` 仅为向后兼容被容忍并忽略：纯文本 post
-  // 路径已删除——只有卡片能承载「🔊 语音总结」按钮，且守护进程兜底也一直只发卡片。
+  // 回复一律走交互卡片。`--card` / `--text` 是隐藏的旧脚本兼容 no-op：纯文本
+  // post 路径已删除，只有卡片能承载「🔊 语音总结」按钮，且守护进程兜底也一直只发卡片。
   // Publish-mode flags: post a fresh top-level message in a chat instead of
   // replying into the bound thread. Lets a session "publish" to a different
   // chat (e.g. a public release-notes group) while keeping its own thread

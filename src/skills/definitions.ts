@@ -1104,7 +1104,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
  *  in the CLI's skills directory. */
 export const RETIRED_SKILL_NAMES: string[] = [
   'botmux-thread-messages',
-  // Folded into botmux-send as the `--attention` flag (was a standalone skill +
-  // a standalone `botmux attention` command). Installer prunes the old dir.
+  // Folded into botmux-send as the `--attention` flag. Installer prunes the old
+  // standalone skill dir.
   'botmux-needs-help',
 ];

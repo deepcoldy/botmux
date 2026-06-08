@@ -48,7 +48,7 @@ export interface SessionRow {
   /** A TUI prompt card is open and waiting for the user's choice.
    *  Feeds the board view's needs-you column. */
   tuiPromptActive?: boolean;
-  /** The agent raised a hand (`botmux attention raise`) — it hit a blocker
+  /** The agent raised a hand (`botmux send --attention`) — it hit a blocker
    *  needing human intervention. Carries the human-readable reason so the
    *  board/overview can show *why* at a glance, plus `at` (epoch ms when it
    *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
