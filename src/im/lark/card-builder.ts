@@ -1333,6 +1333,11 @@ export function buildRelayPickerCard(
   invokerOpenId: string,
   locale?: Locale,
   state?: RelayPickerState,
+  /** Target routing scope baked into every button value so the confirm /
+   *  re-render handlers know whether to land the relayed session as a 话题
+   *  (thread, reply_in_thread to `root_id`) or flat chat-scope. Default 'chat'
+   *  preserves the legacy普通群-flat behavior. */
+  targetScope: 'thread' | 'chat' = 'chat',
 ): string {
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
@@ -1354,6 +1359,7 @@ export function buildRelayPickerCard(
   const stateValue = {
     target_chat_id: targetChatId,
     root_id: targetRootMessageId,
+    target_scope: targetScope,
     invoker_open_id: invokerOpenId,
     search: searchQuery,
     page,

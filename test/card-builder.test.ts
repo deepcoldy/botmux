@@ -838,6 +838,18 @@ describe('buildRelayPickerCard', () => {
     expect(input.behaviors[0].value.target_chat_id).toBe('oc_target');
   });
 
+  it('carries target_scope in interactive values (defaults to chat, thread when passed)', () => {
+    // Default → chat-scope (legacy普通群-flat behavior).
+    const flat = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(flat).behaviors[0].value.target_scope).toBe('chat');
+    expect(containers(flat)[0].behaviors[0].value.target_scope).toBe('chat');
+    // Explicit thread → carried through so the confirm handler routes 话题.
+    const topic = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'om_topic_root', 'ou_invoker_test', undefined, undefined, 'thread'));
+    expect(searchInput(topic).behaviors[0].value.target_scope).toBe('thread');
+    expect(containers(topic)[0].behaviors[0].value.target_scope).toBe('thread');
+    expect(containers(topic)[0].behaviors[0].value.root_id).toBe('om_topic_root');
+  });
+
   it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
     const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root', 'ou_invoker_test'));
     const md = card.body.elements.find((e: any) => e.tag === 'markdown');
