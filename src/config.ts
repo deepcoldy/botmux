@@ -64,6 +64,11 @@ export const config = {
      *  BOTMUX_REQUIRE_MENTION_DECISION=false to disable (kill-switch if the
      *  gate misfires in production). */
     requireMentionDecision: (process.env.BOTMUX_REQUIRE_MENTION_DECISION ?? 'true').toLowerCase() !== 'false',
+    /** Show "Export to Doc" / "Raw Markdown" buttons on send cards.
+     *  Requires lark-cli to be installed on the host. Off by default so
+     *  users without lark-cli don't see buttons that would always fail.
+     *  Set BOTMUX_CARD_EXPORT_ENABLED=true to enable. */
+    cardExportEnabled: (process.env.BOTMUX_CARD_EXPORT_ENABLED ?? '').toLowerCase() === 'true',
   },
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,

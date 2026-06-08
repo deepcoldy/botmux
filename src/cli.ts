@@ -3401,28 +3401,31 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
 
       // Reply action buttons: export to Feishu doc + send raw markdown
-      const contentKey = storeReplyContent(text);
-      const actionRootId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
-      elements.push({ tag: 'hr' });
-      const rpcButton = (label: string, action: string) => ({
-        tag: 'button',
-        text: { tag: 'plain_text', content: label },
-        type: 'default',
-        width: 'fill',
-        behaviors: [{
-          type: 'callback',
-          value: { action, content_key: contentKey, root_id: actionRootId, session_id: sid },
-        }],
-      });
-      elements.push({
-        tag: 'column_set',
-        flex_mode: 'none',
-        horizontal_spacing: 'default',
-        columns: [
-          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [rpcButton('📄 导出飞书文档', 'export_to_doc')] },
-          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [rpcButton('📝 原始 Markdown', 'send_raw_md')] },
-        ],
-      });
+      // Controlled by BOTMUX_CARD_EXPORT_ENABLED (default off) — requires lark-cli.
+      if (config.send.cardExportEnabled) {
+        const contentKey = storeReplyContent(text);
+        const actionRootId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
+        elements.push({ tag: 'hr' });
+        const rpcButton = (label: string, action: string) => ({
+          tag: 'button',
+          text: { tag: 'plain_text', content: label },
+          type: 'default',
+          width: 'fill',
+          behaviors: [{
+            type: 'callback',
+            value: { action, content_key: contentKey, root_id: actionRootId, session_id: sid },
+          }],
+        });
+        elements.push({
+          tag: 'column_set',
+          flex_mode: 'none',
+          horizontal_spacing: 'default',
+          columns: [
+            { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [rpcButton('📄 导出飞书文档', 'export_to_doc')] },
+            { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [rpcButton('📝 原始 Markdown', 'send_raw_md')] },
+          ],
+        });
+      }
 
       const cardJson = JSON.stringify({
         schema: '2.0',

@@ -59,7 +59,7 @@ export async function importMarkdownAsDoc(
   title: string,
 ): Promise<ImportResult> {
   if (!checkLarkCli()) {
-    return { ok: false, error: 'lark-cli 未安装，无法导入飞书文档。请运行 npm i -g @anthropic/lark-cli' };
+    return { ok: false, error: 'lark-cli 未安装，无法导入飞书文档。请运行 npx @larksuite/cli@latest install' };
   }
 
   const buf = Buffer.from(markdown, 'utf-8');
