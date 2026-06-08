@@ -572,7 +572,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'export_to_doc', 'send_raw_md'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1151,6 +1151,51 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const body = content.trim() ? truncateContent(content, locDs) : t('card.action.no_output', undefined, locDs);
       await sessionReply(sessionAnchorId(ds), body);
       logger.info(`[${tag(ds)}] Exported terminal text (${body.length} chars)`);
+      return;
+    }
+
+    // Export AI reply as a Feishu Docx document. Runs async in background so
+    // the Feishu callback doesn't time out (lark-cli takes ~3-6s).
+    if (actionType === 'export_to_doc' && value?.content_key) {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      const appId = larkAppId;
+      if (!appId) {
+        return { toast: { type: 'error', content: '无法确定 Lark 应用' } };
+      }
+      const { getReplyContent, deriveTitleFromMarkdown } = await import('../../im/lark/reply-content-cache.js');
+      const md = getReplyContent(value.content_key);
+      if (!md) {
+        return { toast: { type: 'error', content: t('card.action.content_expired', undefined, locDs) } };
+      }
+      const title = deriveTitleFromMarkdown(md);
+      // Fire-and-forget: return toast immediately so Feishu doesn't time out,
+      // then do the import asynchronously in the background.
+      const replyRootId = rootId;
+      Promise.resolve().then(async () => {
+        const { importMarkdownAsDoc } = await import('../../services/doc-import.js');
+        const result = await importMarkdownAsDoc(appId, md, title);
+        if (result.ok && result.docUrl) {
+          await sessionReply(replyRootId, `📄 已导出飞书文档：[${result.docTitle ?? title}](${result.docUrl})`);
+        } else {
+          await sessionReply(replyRootId, `❌ 导出失败：${result.error ?? '未知错误'}`);
+        }
+        logger.info(`[${tag(ds ?? { session: { sessionId: value.session_id } } as any)}] export_to_doc: ${result.ok ? 'ok' : 'failed'} (${md.length} chars)`);
+      }).catch((err: any) => {
+        logger.error(`[export_to_doc] background import failed: ${err?.message ?? err}`);
+      });
+      return { toast: { type: 'info', content: '正在导出飞书文档…' } };
+    }
+
+    // Send the raw markdown content as a plain text reply.
+    if (actionType === 'send_raw_md' && value?.content_key) {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      const { getReplyContent } = await import('../../im/lark/reply-content-cache.js');
+      const md = getReplyContent(value.content_key);
+      if (!md) {
+        return { toast: { type: 'error', content: t('card.action.content_expired', undefined, locDs) } };
+      }
+      await sessionReply(rootId, md);
+      logger.info(`[${tag(ds ?? { session: { sessionId: value.session_id } } as any)}] send_raw_md: ${md.length} chars`);
       return;
     }
 
