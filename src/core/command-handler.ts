@@ -11,7 +11,8 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
+import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -43,7 +44,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/land']);
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -851,6 +852,24 @@ export async function handleCommand(
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
+        break;
+      }
+
+      case '/land': {
+        // 把沙盒会话副本里 agent 的改动落回真实仓库。owner 审阅 diff 卡后点「应用到磁盘」。
+        // agent 在沙盒里无感（以为改的就是真文件），所以只能由 owner 在此手动触发。
+        if (!ds) { await sessionReply(rootId, t('cmd.no_active_session', undefined, loc)); break; }
+        const sid = ds.session.sessionId;
+        const wd = ds.session.workingDir;
+        if (!wd) { await sessionReply(rootId, '会话没有 workingDir，无法确定落盘目标。'); break; }
+        const d = computeSandboxDiff(config.session.dataDir, sid);
+        if (!d.ok) { await sessionReply(rootId, `无法落盘：${d.error}`); break; }
+        if (d.empty) { await sessionReply(rootId, '沙盒副本没有改动，无需落盘。'); break; }
+        const lines = d.patch.split('\n');
+        const preview = lines.slice(0, 40).join('\n') + (lines.length > 40 ? '\n…（diff 太长已截断，完整 diff 见 dashboard）' : '');
+        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview });
+        await sessionReply(rootId, card, 'interactive');
+        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → review card`);
         break;
       }
 

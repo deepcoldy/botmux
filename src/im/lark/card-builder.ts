@@ -1690,3 +1690,49 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
   };
   return JSON.stringify(card);
 }
+
+// ── Sandbox landing card (owner reviews the sandbox clone's diff, then applies
+//    it back to the real repo). Owner-gated apply; the agent never sees this. ──
+export interface LandCardOpts {
+  sessionId: string;
+  workingDir: string;
+  statText: string;
+  files: number;
+  insertions: number;
+  deletions: number;
+  preview: string;   // truncated patch text
+}
+
+export function buildLandCard(o: LandCardOpts): string {
+  const v = { sessionId: o.sessionId, workingDir: o.workingDir };
+  const body =
+    `沙盒会话产生了 **${o.files}** 个文件改动（**+${o.insertions} / -${o.deletions}**）。\n` +
+    `落盘目标：\`${escapeMd(o.workingDir)}\`\n\n` +
+    '审阅下方 diff，确认后「应用到磁盘」会把这些改动 `git apply` 回真实仓库。';
+  const elements: any[] = [{ tag: 'div', text: { tag: 'lark_md', content: body } }];
+  if (o.statText) elements.push({ tag: 'div', text: { tag: 'lark_md', content: '**改动文件**\n```\n' + o.statText.slice(0, 1500) + '\n```' } });
+  if (o.preview) elements.push({ tag: 'div', text: { tag: 'lark_md', content: '**diff 预览**\n```diff\n' + o.preview + '\n```' } });
+  elements.push(
+    { tag: 'hr' },
+    { tag: 'action', actions: [
+      { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '应用到磁盘' }, value: { action: 'land_apply', ...v } },
+      { tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '丢弃' }, value: { action: 'land_discard', ...v } },
+    ] },
+    { tag: 'note', elements: [{ tag: 'lark_md', content: '仅 owner 可应用；改动来自隔离副本，应用前真实仓库不受影响。' }] },
+  );
+  return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'turquoise', title: { tag: 'plain_text', content: '🧳 沙盒改动落盘' } }, elements });
+}
+
+export function buildLandResultCard(kind: 'applied' | 'discarded' | 'failed', detail: string): string {
+  const map = {
+    applied: { template: 'green', title: '✅ 已落盘' },
+    discarded: { template: 'grey', title: '🗑 已丢弃沙盒改动' },
+    failed: { template: 'red', title: '❌ 落盘失败' },
+  }[kind];
+  const body = detail || (kind === 'discarded' ? '改动未应用，沙盒副本保持原样。' : '');
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: map.template, title: { tag: 'plain_text', content: map.title } },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content: body } }],
+  });
+}
