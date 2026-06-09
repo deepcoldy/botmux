@@ -237,6 +237,12 @@ export type DaemonToWorker =
   | { type: 'restart' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
   | { type: 'tui_text_input'; keys: string[]; text: string }
+  // CoCo AskUserQuestion 作答：daemon 在 ask 结算后下发，worker 等原生 picker 渲染后
+  // 用 navKeys 驱动它选择+导航。needsReviewSubmit=true（多题）时 navKeys 停在 Review
+  // 屏，worker 再补一记 Enter 提交；单题 navKeys 直接提交（无 Review）。comment 非空
+  // 表示用户用自由文本作答：navKeys 把光标移到第一题 "Type something"，worker 输入
+  // 文本后补一记 Enter 提交（多题自由文本不完整支持）。
+  | { type: 'coco_drive_picker'; navKeys: string[]; needsReviewSubmit: boolean; comment?: string | null }
   | { type: 'set_display_mode'; mode: DisplayMode }
   | { type: 'term_action'; key: TermActionKey }
   | { type: 'refresh_screen' };

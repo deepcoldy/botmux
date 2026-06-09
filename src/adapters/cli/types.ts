@@ -132,8 +132,15 @@ export interface CliAdapter {
   };
 
   /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
-   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件）。 */
+   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件、
+   *  CoCo 走 ensureAskHook 装插件）。 */
   readonly asksViaHook?: boolean;
+
+  /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
+   *  （CoCo 需要 `coco plugin install`）。声明式写文件的 CLI 用 `hookInstall`；本方法
+   *  与 `hookInstall` 互斥。每个 daemon 生命周期由 ensureCliSkills 调用一次。
+   *  实现内部自行 try/catch，失败只 warn 不抛。 */
+  ensureAskHook?(): void;
 
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;

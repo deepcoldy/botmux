@@ -681,6 +681,12 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
     catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
+  // 命令式 hook 安装（CoCo 走 `coco plugin install`，纯写文件搞不定）。内部自带
+  // try/catch，失败只 warn；与 hookInstall 互斥。
+  if (adapter.ensureAskHook) {
+    try { adapter.ensureAskHook(); }
+    catch (err) { logger.warn(`[hook] ensureAskHook failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
   // botmux-ask 落在与其它 skill 同一目录：plugin 模式下是 {pluginDir}/skills。
   const askSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
   ensureAskSkill(cliId, askSkillsDir, !adapter.asksViaHook);

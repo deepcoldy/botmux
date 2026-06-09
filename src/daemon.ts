@@ -141,6 +141,7 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { parseAskBody, resolveAskApprovers } from './core/ask-api.js';
+import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -1749,6 +1750,37 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     questions: parsed.questions,
     timeoutMs: parsed.timeoutMs,
   });
+
+  // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
+  // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话
+  // 的 worker，由 worker 等 picker 渲染后驱动它自动作答。其它 CLI（claude/opencode）
+  // 仍走 hook directive，不进此分支。
+  if (result.kind === 'answered') {
+    let cocoDs: DaemonSession | undefined;
+    for (const ds of activeSessions.values()) {
+      if (ds.session.sessionId === parsed.sessionId) { cocoDs = ds; break; }
+    }
+    if (cocoDs?.session.cliId === 'coco' && cocoDs.worker) {
+      try {
+        // 单题：picker 选完直接提交（无 Review）；多题：最后一题之后才出 Review，需补提交。
+        const needsReviewSubmit = parsed.questions.length > 1;
+        const comment = result.comment;
+        let navKeys: string[];
+        if (comment && comment.trim()) {
+          // 自由文本：把光标移到第一题 "Type something" 行（= 选项数个 Down）。
+          const optionCount = parsed.questions[0]?.options.length ?? 0;
+          navKeys = Array<string>(optionCount).fill('Down');
+        } else {
+          navKeys = computeCocoPickerKeys(parsed.questions, result.answers).navKeys;
+        }
+        cocoDs.worker.send({ type: 'coco_drive_picker', navKeys, needsReviewSubmit, comment } as DaemonToWorker);
+        logger.info(`[${cocoDs.session.sessionId.slice(0, 8)}] CoCo picker drive: ${navKeys.length} keys, review=${needsReviewSubmit}, comment=${comment ? 'yes' : 'no'}`);
+      } catch (err) {
+        logger.warn(`CoCo picker drive failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
   return jsonRes(res, 200, result);
 });
 

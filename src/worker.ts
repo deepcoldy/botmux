@@ -2400,6 +2400,74 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
   }
 }
 
+/**
+ * Drive CoCo's native AskUserQuestion picker to enter the answer the user picked
+ * on the Lark card. CoCo's PreToolUse hook can't inject answers via a directive
+ * (verified), so the daemon sends this after the ask settles and the hook
+ * returned passthrough — meaning CoCo is about to (or just did) render the
+ * picker. We wait for the picker to appear, then play the key sequence.
+ *
+ * Verified behaviour (CoCo 0.120.38):
+ *   - Single question: the per-question final key (Enter / "Next"→Enter / typed
+ *     text→Enter) submits the whole ask DIRECTLY — there is no Review screen, so
+ *     NO extra Enter (sending one would hit the idle prompt).
+ *   - Multiple questions: after the last question advances, a "Review your
+ *     answers / Submit answers" screen appears; needsReviewSubmit drives the
+ *     extra Enter there.
+ *   - Free-text (comment): navKeys move the cursor to the first question's
+ *     "Type something" row; typing a char auto-switches that row to input mode,
+ *     then a single Enter submits. We type via the backend + one Enter (NOT the
+ *     adapter's writeInput, whose submit-verification retries would fire stray
+ *     Enters into the idle prompt). Multi-question free-text isn't fully
+ *     supported (one text can't answer several structured questions).
+ * Key names ('Down'/'Space'/'Enter') match what the manual probe confirmed.
+ */
+async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, comment?: string | null): Promise<void> {
+  if (!backend) return;
+  const snap = () => (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+  const waitFor = async (re: RegExp, timeoutMs: number): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (re.test(snap())) return true;
+      await new Promise(r => setTimeout(r, 200));
+    }
+    return false;
+  };
+
+  // The hook returns passthrough → CoCo renders the picker; only then send keys.
+  const appeared = await waitFor(/Enter to select|Tab\/Arrow keys|Review your answers/, 30_000);
+  if (!appeared) { log('coco_drive_picker: picker not detected within 30s — aborting drive'); return; }
+  tuiPromptBlocking = true;
+
+  if (comment && comment.trim()) {
+    // Free-text reply: navigate to the first question's "Type something" row,
+    // type the text, then a single Enter. Single-question submits directly; for
+    // multi-question this only fills the first question (logged limitation).
+    log(`coco_drive_picker: free-text answer (${navKeys.length} nav keys)${needsReviewSubmit ? ' [multi-question — partial]' : ''}`);
+    const b = backend as any;
+    if ('sendSpecialKeys' in backend) {
+      for (const key of navKeys) { b.sendSpecialKeys(key); await new Promise(r => setTimeout(r, 100)); }
+    } else {
+      for (const key of navKeys) { backend.write(KEY_TO_ANSI[key] ?? key); await new Promise(r => setTimeout(r, 100)); }
+    }
+    await new Promise(r => setTimeout(r, 150));
+    if ('sendText' in backend && b.sendText) b.sendText(comment); else backend.write(comment);
+    await new Promise(r => setTimeout(r, 200));
+    await handleTuiKeys(['Enter'], true); // single Enter submits + clears blocking state
+    return;
+  }
+
+  // Button selection. Single question: navKeys submit directly (isFinal=true).
+  // Multi question: navKeys land on Review, then one Enter on "Submit answers".
+  log(`coco_drive_picker: selection answer (${navKeys.length} keys, review=${needsReviewSubmit})`);
+  await handleTuiKeys(navKeys, !needsReviewSubmit);
+  if (needsReviewSubmit) {
+    const review = await waitFor(/Review your answers|Submit answers/, 8_000);
+    if (!review) log('coco_drive_picker: Review screen not detected — submitting anyway');
+    await handleTuiKeys(['Enter'], true); // cursor defaults to "Submit answers"
+  }
+}
+
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
 // Claude Code: "Yes, I trust this folder"
@@ -4333,6 +4401,11 @@ process.on('message', async (raw: unknown) => {
 
     case 'tui_text_input': {
       handleTuiTextInput(msg.keys, msg.text);
+      break;
+    }
+
+    case 'coco_drive_picker': {
+      void driveCocoPicker(msg.navKeys, msg.needsReviewSubmit, msg.comment);
       break;
     }
 
