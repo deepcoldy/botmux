@@ -584,6 +584,10 @@ export const messages: Record<string, string> = {
     '• `help`       — 本帮助\n\n' +
     '不带子命令时默认 `overview`。整个命令组仅 Bot Owner 可用。',
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',
+  'card.dashboard.dm_sent': '📬 Dashboard 响应已私信给 Bot Owner。',
+  'card.dashboard.dm_failed': '⚠️ 给 Bot Owner 发私聊失败：{reason}',
+  'card.dashboard.settings.dm_sent': '📬 Dashboard settings 卡片已私信给 Bot Owner。',
+  'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送 settings 卡片失败：{reason}',
 
   // settings card (PR3 C4)
   'card.dashboard.settings.title': '⚙️ Dashboard 全局设置',

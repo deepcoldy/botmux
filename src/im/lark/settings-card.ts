@@ -24,16 +24,13 @@
  * is `operator.open_id` (NOT `senderUnionId`).
  */
 
-import { isAuthorizedForGlobalSettings } from '../../dashboard/settings-owner-resolver.js';
+import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
 import type { SettingsCardDTO } from '../../dashboard/settings-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
 
-import {
-  resolveCardOperatorUnionId,
-  type CardActionData,
-  type ResolveCardOperatorUnionIdDeps,
-} from './card-handler.js';
+import { resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import type { CardActionData } from './card-handler.js';
 
 export const SETTINGS_ACTION_TOGGLE = 'dash_settings_toggle' as const;
 export const SETTINGS_ACTION_SET_TIME = 'dash_settings_set_time' as const;
@@ -195,9 +192,11 @@ function buildToggleRow(
 
 /** ─── Handler ─────────────────────────────────────────────────────────── */
 
-export interface SettingsCardHandlerDeps extends ResolveCardOperatorUnionIdDeps {
-  /** Override for the global owner check. Production wires `isAuthorizedForGlobalSettings`. */
-  isAuthorized?: (check: { senderUnionId: string }) => Promise<boolean>;
+export interface SettingsCardHandlerDeps {
+  /** Override the per-bot owner lookup. Production omits and uses `bot-registry.getOwnerOpenId`. */
+  getOwnerOpenId?: (larkAppId: string) => string | undefined;
+  /** Override the union_id resolver. Production omits; tests skip Lark contact API. */
+  resolveUserUnionId?: (larkAppId: string, openId: string) => Promise<{ unionId?: string }>;
   /** Factory returning a Route B client for the given larkAppId. */
   createClient: (larkAppId: string) => DaemonClient;
   /** Card patch callback for ACK-then-patch — receives the post-write snapshot. */
@@ -304,18 +303,13 @@ export async function handleSettingsCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // ─── 2) Verified union_id via C2 helper ─────────────────────────────
-  const identity = await resolveCardOperatorUnionId(data, larkAppId, {
-    resolveUserUnionId: deps.resolveUserUnionId,
-  });
-  if (!identity.unionId) {
-    return ackToast('card.dashboard.settings.owner_only', locale);
-  }
-
-  // ─── 3) Global owner gate ───────────────────────────────────────────
-  const authoriser = deps.isAuthorized ?? isAuthorizedForGlobalSettings;
-  const allowed = await authoriser({ senderUnionId: identity.unionId });
-  if (!allowed) {
+  // ─── 2) Per-bot owner gate (PR3 revision) ────────────────────────────
+  // We no longer consult the global union_id owner set. Each callback is
+  // scoped to the bot that received it: only THAT bot's owner can act.
+  // `action.value.*` identity fields are still ignored (red line).
+  const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
+  const expectedOwner = getOwnerOpenId(larkAppId);
+  if (!expectedOwner || operatorOpenId !== expectedOwner) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -337,13 +331,27 @@ export async function handleSettingsCardAction(
     return ackToast(`card.dashboard.settings.${patch.error}`, locale);
   }
 
+  // PR2 Route B's `PUT /__daemon/settings-write` still expects `ownerUnionId`
+  // in the body for global-owner verification on the server side. The local
+  // per-bot owner gate above already accepted this caller; we just need to
+  // surface their union_id. Resolve via `resolveUserUnionId(larkAppId, openId)`.
+  const resolveUnion = deps.resolveUserUnionId ?? defaultResolveUserUnionId;
   schedule(async () => {
+    let ownerUnionId: string | undefined;
+    try {
+      const r = await resolveUnion(larkAppId, expectedOwner);
+      ownerUnionId = r.unionId;
+    } catch { /* fail-closed: leave undefined → server 403 */ }
+    if (!ownerUnionId || !ownerUnionId.startsWith('on_')) {
+      // Server will 403; surface via patchCard so the user sees the error toast.
+      await deps.patchCard?.(data, larkAppId, { status: 403, body: { ok: false, error: 'owner_only' }, raw: '' });
+      return;
+    }
     const client = deps.createClient(larkAppId);
-    // PR2 client default does NOT retry non-GET; do NOT opt in via retryUnsafeWrites.
     const r = await client.request({
       method: 'PUT',
       path: '/__daemon/settings-write',
-      body: { patch: patch.value, ownerUnionId: identity.unionId },
+      body: { patch: patch.value, ownerUnionId },
     });
     await deps.patchCard?.(data, larkAppId, r);
   });

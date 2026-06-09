@@ -376,6 +376,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const { handleSettingsCardAction, buildSettingsCard } = await import('./settings-card.js');
     const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
     const { composeSections } = await import('../../dashboard/settings-card-model.js');
+    const { getOwnerOpenId } = await import('../../bot-registry.js');
     const settingsLocale = localeForBot(larkAppId);
     return handleSettingsCardAction(data, larkAppId, {
       createClient: (appId: string) => createDaemonClientFor(appId),
@@ -404,7 +405,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           logger.warn('[dash_settings patch] no open_message_id; skipping in-place update');
           return;
         }
-        const invokerOpenId = ctx.action?.value?.invoker_open_id ?? ctx.operator?.open_id ?? '';
+        // PR3 revision: rebuild the card with `invokerOpenId = owner` so that
+        // any subsequent click also passes the invoker lock. Fall back to the
+        // operator (== owner here, since we passed the per-bot owner gate)
+        // when the registry is somehow missing.
+        const invokerOpenId = getOwnerOpenId(appId) ?? ctx.operator?.open_id ?? '';
         const dto = composeSections(settings, { canWrite: true });
         const cardJson = buildSettingsCard(dto, {
           invokerOpenId,

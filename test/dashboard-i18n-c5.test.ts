@@ -26,6 +26,8 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.settings.not_implemented_yet',  // still referenced if C4 dispatch ever falls back
   'card.dashboard.help.body',
   'card.dashboard.help.unknown_module',
+  'card.dashboard.dm_sent',
+  'card.dashboard.dm_failed',
 
   // ─── settings card (C4) ─────────────────────────────────────────────
   'card.dashboard.settings.title',
@@ -43,6 +45,8 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.settings.invalid_time',
   'card.dashboard.settings.invalid_action',
   'card.dashboard.settings.snapshot_failed',
+  'card.dashboard.settings.dm_sent',
+  'card.dashboard.settings.dm_failed',
 
   // ─── PR1 model DTO labelKey/hintKey/sectionTitle (consumed at card build) ─
   'settings.readOnlyVisitor',

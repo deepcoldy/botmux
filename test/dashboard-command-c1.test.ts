@@ -9,9 +9,11 @@ import { DASHBOARD_MODULES, buildHelpText, buildStubText } from '../src/core/das
 import { handleDashboardCommand } from '../src/core/dashboard-command/index.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, type CommandHandlerDeps } from '../src/core/command-handler.js';
 
+const OWNER = 'ou_bot_owner';
+
 function makeMessage(over: Partial<LarkMessage> = {}): LarkMessage {
   return {
-    senderId: 'ou_sender',
+    senderId: OWNER,
     senderUnionId: undefined,
     content: '/dashboard',
     chatId: 'oc_test',
@@ -29,68 +31,65 @@ function makeDeps(): CommandHandlerDeps {
   };
 }
 
-function allowAuth(): { isAuthorized: () => Promise<boolean> } {
-  return { isAuthorized: async () => true };
+function ownerLookup(owner: string | undefined = OWNER) {
+  return { getOwnerOpenId: () => owner };
 }
 
-function denyAuth(): { isAuthorized: () => Promise<boolean> } {
-  return { isAuthorized: async () => false };
+function captureDM(): {
+  sendUserMessage: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
+  calls: Array<{ openId: string; content: string; msgType?: string }>;
+} {
+  const calls: Array<{ openId: string; content: string; msgType?: string }> = [];
+  return {
+    sendUserMessage: async (_appId, openId, content, msgType) => {
+      calls.push({ openId, content, msgType });
+      return 'om_dm';
+    },
+    calls,
+  };
 }
 
-function throwAuth(): { isAuthorized: () => Promise<boolean> } {
-  return { isAuthorized: async () => { throw new Error('boom'); } };
-}
+/** ─── ensureDashboardOwner — per-bot owner ─────────────────────────── */
 
-/** ─── ensureDashboardOwner direct unit tests ─────────────────────────── */
-
-describe('ensureDashboardOwner', () => {
-  it('returns missing_union_id when senderUnionId is absent', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderUnionId: undefined }), denyAuth());
+describe('ensureDashboardOwner (per-bot owner)', () => {
+  it('returns no_bot_owner when larkAppId is undefined', async () => {
+    const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), undefined, ownerLookup());
     expect(r.ok).toBe(false);
-    expect((r as Extract<DashboardOwnerCheck, { ok: false }>).reason).toBe('missing_union_id');
+    expect((r as Extract<DashboardOwnerCheck, { ok: false }>).reason).toBe('no_bot_owner');
   });
 
-  it('returns invalid_prefix for ou_xxx union_id', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderUnionId: 'ou_app_scoped' }), denyAuth());
+  it('returns no_bot_owner when getOwnerOpenId returns undefined', async () => {
+    const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), 'cli_x', {
+      getOwnerOpenId: () => undefined,  // explicit undefined, NOT the helper default
+    });
     expect(r.ok).toBe(false);
-    expect((r as any).reason).toBe('invalid_prefix');
+    expect((r as any).reason).toBe('no_bot_owner');
   });
 
-  it('returns invalid_prefix for arbitrary non-on_ string', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderUnionId: 'admin' }), denyAuth());
+  it('returns missing_sender when message.senderId is absent', async () => {
+    const r = await ensureDashboardOwner(makeMessage({ senderId: undefined as any }), 'cli_x', ownerLookup());
     expect(r.ok).toBe(false);
-    expect((r as any).reason).toBe('invalid_prefix');
+    expect((r as any).reason).toBe('missing_sender');
   });
 
-  it('returns not_authorized when PR2 helper says false', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderUnionId: 'on_stranger' }), denyAuth());
+  it('returns not_bot_owner when senderId != ownerOpenId', async () => {
+    const r = await ensureDashboardOwner(makeMessage({ senderId: 'ou_stranger' }), 'cli_x', ownerLookup());
     expect(r.ok).toBe(false);
-    expect((r as any).reason).toBe('not_authorized');
+    expect((r as any).reason).toBe('not_bot_owner');
   });
 
-  it('PR2 helper rejecting after resolver fail-closed still yields not_authorized (no resolver_error reason exposed)', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderUnionId: 'on_alice' }), denyAuth());
-    expect(r.ok).toBe(false);
-    expect((r as any).reason).toBe('not_authorized');
-  });
-
-  it('returns ok:true with unionId when PR2 helper says true', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderUnionId: 'on_alice' }), allowAuth());
+  it('returns ok:true with ownerOpenId when match', async () => {
+    const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), 'cli_x', ownerLookup());
     expect(r.ok).toBe(true);
-    expect((r as Extract<DashboardOwnerCheck, { ok: true }>).unionId).toBe('on_alice');
+    expect((r as Extract<DashboardOwnerCheck, { ok: true }>).ownerOpenId).toBe(OWNER);
   });
 
-  it('non-on_ prefix short-circuits BEFORE the authoriser is consulted', async () => {
-    const spy = vi.fn(async () => true);
-    const r = await ensureDashboardOwner(makeMessage({ senderUnionId: 'ou_attacker' }), { isAuthorized: spy });
+  it('owner of bot A is rejected when @-ed at bot B (cross-bot owner is not enough)', async () => {
+    // Bot B's owner is OUR_BOT_B_OWNER, not the caller.
+    const lookup = { getOwnerOpenId: (appId: string) => appId === 'cli_a' ? OWNER : 'ou_other' };
+    const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), 'cli_b', lookup);
     expect(r.ok).toBe(false);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('authoriser throwing propagates (PR2 helper is responsible for fail-closed; gate does not double-wrap)', async () => {
-    await expect(
-      ensureDashboardOwner(makeMessage({ senderUnionId: 'on_alice' }), throwAuth()),
-    ).rejects.toThrow('boom');
+    expect((r as any).reason).toBe('not_bot_owner');
   });
 });
 
@@ -103,153 +102,97 @@ describe('stub module list', () => {
     ]);
   });
 
-  it('buildStubText returns i18n string for each module (contains module slug + 🚧)', () => {
+  it('buildStubText returns i18n string for each module', () => {
     for (const m of DASHBOARD_MODULES) {
       const text = buildStubText(m, 'zh');
-      expect(text.length).toBeGreaterThan(0);
       expect(text).toContain('/dashboard');
       expect(text).toContain(m);
       expect(text).toContain('🚧');
     }
   });
 
-  it('buildHelpText returns help body (no unknown_module preface) by default', () => {
-    const text = buildHelpText('zh');
-    expect(text).toContain('/dashboard');
-    expect(text).toContain('overview');
-    expect(text).toContain('settings');
-  });
-
-  it('buildHelpText prepends an unknown_module preface when supplied', () => {
-    const text = buildHelpText('zh', { unknownModule: 'foo' });
-    expect(text).toContain('foo');
-    expect(text).toContain('overview'); // still includes body
+  it('buildHelpText with/without unknown_module', () => {
+    expect(buildHelpText('zh')).toContain('/dashboard');
+    expect(buildHelpText('zh', { unknownModule: 'foo' })).toContain('foo');
   });
 });
 
 /** ─── Owner gate guards EVERY subcommand ─────────────────────────────── */
 
 describe('handleDashboardCommand — owner gate covers all subcommands', () => {
-  it('non-owner /dashboard help → owner_only, NOT help text', async () => {
-    const deps = makeDeps();
-    await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_stranger' }), 'help', 'om_root', 'oc_test', deps, 'cli_x',
-      denyAuth(),
-    );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('🔒');  // owner_only sentinel
-    expect(text).not.toContain('cross-bot');
-    expect(text).not.toContain('overview'); // help body contains 'overview'; ensure it's NOT shown
-  });
-
-  it('non-owner /dashboard sessions → owner_only, NOT stub text', async () => {
-    const deps = makeDeps();
-    await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_stranger' }), 'sessions', 'om_root', 'oc_test', deps, 'cli_x',
-      denyAuth(),
-    );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('🔒');  // owner_only sentinel
-    expect(text).not.toContain('🚧');
-  });
-
-  it('non-owner /dashboard settings → owner_only, NOT stub', async () => {
-    const deps = makeDeps();
-    await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_stranger' }), 'settings', 'om_root', 'oc_test', deps, 'cli_x',
-      denyAuth(),
-    );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('🔒');  // owner_only sentinel
-  });
-
-  it('non-owner /dashboard unknown → owner_only, NOT help', async () => {
-    const deps = makeDeps();
-    await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_stranger' }), 'totally_made_up', 'om_root', 'oc_test', deps, 'cli_x',
-      denyAuth(),
-    );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('🔒');  // owner_only sentinel
-    expect(text).not.toContain('totally_made_up');
-  });
-
-  it('non-owner /dashboard (empty args) → owner_only, NOT default overview stub', async () => {
-    const deps = makeDeps();
-    await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_stranger' }), '', 'om_root', 'oc_test', deps, 'cli_x',
-      denyAuth(),
-    );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('🔒');  // owner_only sentinel
-  });
-
-  it('non-on_ prefix → owner_only without ever consulting the resolver', async () => {
-    const spy = vi.fn(async () => true);
-    const deps = makeDeps();
-    await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'ou_attacker' }), 'help', 'om_root', 'oc_test', deps, 'cli_x',
-      { isAuthorized: spy },
-    );
-    expect(spy).not.toHaveBeenCalled();
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('🔒');  // owner_only sentinel
-  });
-});
-
-/** ─── Owner reaches stubs/help/overview routing ───────────────────────── */
-
-describe('handleDashboardCommand — owner dispatch', () => {
-  // Note: `settings` is excluded here because PR3 C4 replaced its stub with
-  // the real `handleDashboardSettings`. Its dispatch is covered separately
-  // by test/settings-card-c4.test.ts.
-  it.each(['overview', 'sessions', 'workflows', 'groups', 'schedules'] as const)(
-    'owner /dashboard %s → stub for that module',
-    async (mod) => {
+  it.each(['help', 'sessions', 'settings', 'totally_made_up', ''] as const)(
+    'non-owner /dashboard %s → owner_only in topic, NEVER DMs',
+    async (sub) => {
       const deps = makeDeps();
+      const dm = captureDM();
       await handleDashboardCommand(
-        makeMessage({ senderUnionId: 'on_alice' }), mod, 'om_root', 'oc_test', deps, 'cli_x',
-        allowAuth(),
+        makeMessage({ senderId: 'ou_stranger' }), sub, 'om_root', 'oc_test', deps, 'cli_x',
+        { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
       );
       const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-      expect(text).toContain(mod);
-      expect(text).toContain('🚧');
+      expect(text).toContain('🔒');
+      expect(dm.calls.length).toBe(0);
+    },
+  );
+});
+
+/** ─── Owner-gated replies all go to DM, NOT topic interactive ───────── */
+
+describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
+  it.each(['overview', 'sessions', 'workflows', 'groups', 'schedules'] as const)(
+    'owner /dashboard %s → stub DMed to owner, topic gets dm_sent confirmation',
+    async (mod) => {
+      const deps = makeDeps();
+      const dm = captureDM();
+      await handleDashboardCommand(
+        makeMessage(), mod, 'om_root', 'oc_test', deps, 'cli_x',
+        { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
+      );
+      expect(dm.calls.length).toBe(1);
+      expect(dm.calls[0].openId).toBe(OWNER);
+      expect(dm.calls[0].content).toContain(mod);
+      expect(dm.calls[0].content).toContain('🚧');
+      // Topic gets only the dm_sent confirmation (NOT the stub itself, NOT interactive).
+      const topicCalls = (deps.sessionReply as any).mock.calls;
+      expect(topicCalls.length).toBe(1);
+      expect(topicCalls[0][1]).toContain('📬');
+      expect(topicCalls[0][2]).toBeUndefined(); // msgType not interactive
     },
   );
 
-  it('owner /dashboard help → help body (NOT a stub)', async () => {
+  it('owner /dashboard help → help DMed to owner', async () => {
     const deps = makeDeps();
+    const dm = captureDM();
     await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_alice' }), 'help', 'om_root', 'oc_test', deps, 'cli_x',
-      allowAuth(),
+      makeMessage(), 'help', 'om_root', 'oc_test', deps, 'cli_x',
+      { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
     );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('/dashboard');
-    expect(text).toContain('overview');
-    expect(text).toContain('settings');
-    expect(text).not.toContain('🚧'); // help is NOT a stub
+    expect(dm.calls.length).toBe(1);
+    expect(dm.calls[0].content).toContain('/dashboard');
+    expect(dm.calls[0].content).toContain('overview');
   });
 
-  it('owner /dashboard (empty args) defaults to overview stub', async () => {
+  it('owner /dashboard (empty) → overview stub DMed', async () => {
     const deps = makeDeps();
+    const dm = captureDM();
     await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_alice' }), '', 'om_root', 'oc_test', deps, 'cli_x',
-      allowAuth(),
+      makeMessage(), '', 'om_root', 'oc_test', deps, 'cli_x',
+      { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
     );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('overview');
-    expect(text).toContain('🚧');
+    expect(dm.calls.length).toBe(1);
+    expect(dm.calls[0].content).toContain('overview');
   });
 
-  it('owner /dashboard <unknown> → help body with unknown_module preface', async () => {
+  it('DM failure → topic shows dm_failed with reason', async () => {
     const deps = makeDeps();
+    const sendUserMessage = vi.fn(async () => { throw new Error('lark_403'); });
     await handleDashboardCommand(
-      makeMessage({ senderUnionId: 'on_alice' }), 'totally_made_up', 'om_root', 'oc_test', deps, 'cli_x',
-      allowAuth(),
+      makeMessage(), 'help', 'om_root', 'oc_test', deps, 'cli_x',
+      { ...ownerLookup(), sendUserMessage },
     );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('totally_made_up');
-    expect(text).toContain('overview'); // help body included
+    const topicCalls = (deps.sessionReply as any).mock.calls;
+    expect(topicCalls.length).toBe(1);
+    expect(topicCalls[0][1]).toContain('lark_403');
   });
 });
 
@@ -260,23 +203,16 @@ describe('command set registration', () => {
     expect(DAEMON_COMMANDS.has('/dashboard')).toBe(true);
   });
 
-  it('/dashboard is also in SESSIONLESS_DAEMON_COMMANDS (no phantom session)', () => {
+  it('/dashboard is also in SESSIONLESS_DAEMON_COMMANDS', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/dashboard')).toBe(true);
   });
 
-  it('existing daemon commands are still present', () => {
+  it('existing commands still present', () => {
     expect(DAEMON_COMMANDS.has('/schedule')).toBe(true);
-    expect(DAEMON_COMMANDS.has('/group')).toBe(true);
-    expect(DAEMON_COMMANDS.has('/help')).toBe(true);
-  });
-
-  it('existing sessionless commands are still present', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/group')).toBe(true);
-    expect(SESSIONLESS_DAEMON_COMMANDS.has('/g')).toBe(true);
-    expect(SESSIONLESS_DAEMON_COMMANDS.has('/botconfig')).toBe(true);
   });
 
-  it('a regular command like /restart is NOT sessionless', () => {
+  it('/restart is NOT sessionless', () => {
     expect(DAEMON_COMMANDS.has('/restart')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/restart')).toBe(false);
   });

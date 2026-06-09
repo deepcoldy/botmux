@@ -581,6 +581,10 @@ export const messages: Record<string, string> = {
     '• `help`       — this help\n\n' +
     'Without a subcommand, defaults to `overview`. The entire group is owner-only.',
   'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',
+  'card.dashboard.dm_sent': '📬 The dashboard reply was DMed to the Bot Owner.',
+  'card.dashboard.dm_failed': '⚠️ Failed to DM Bot Owner: {reason}',
+  'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to the Bot Owner.',
+  'card.dashboard.settings.dm_failed': '⚠️ Failed to DM the settings card to Bot Owner: {reason}',
 
   // settings card (PR3 C4)
   'card.dashboard.settings.title': '⚙️ Dashboard Global Settings',

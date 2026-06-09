@@ -27,14 +27,21 @@ vi.mock('../src/daemon-internal-client-wrapper.js', () => ({
   createDaemonClientFor: vi.fn(),
 }));
 
-// Mock the global owner gate so we don't need real bots.json.
-vi.mock('../src/dashboard/settings-owner-resolver.js', () => ({
-  isAuthorizedForGlobalSettings: vi.fn(async () => true),
-}));
+// Mock per-bot owner lookup so dispatch reaches the write path.
+vi.mock('../src/bot-registry.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/bot-registry.js')>('../src/bot-registry.js');
+  return {
+    ...actual,
+    getOwnerOpenId: vi.fn(() => 'ou_alice'),
+  };
+});
 
-import { updateMessage } from '../src/im/lark/client.js';
+import { updateMessage, resolveUserUnionId } from '../src/im/lark/client.js';
 import { createDaemonClientFor } from '../src/daemon-internal-client-wrapper.js';
 import { handleCardAction, type CardActionData } from '../src/im/lark/card-handler.js';
+
+// Make resolveUserUnionId return a valid on_ unionId so write path proceeds.
+vi.mocked(resolveUserUnionId).mockResolvedValue({ unionId: 'on_alice' });
 
 const mockedUpdateMessage = vi.mocked(updateMessage);
 const mockedCreateClient = vi.mocked(createDaemonClientFor);

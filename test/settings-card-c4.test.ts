@@ -18,6 +18,7 @@ import type { LarkMessage } from '../src/types.js';
 const LARK_APP_ID = 'cli_test';
 const OWNER_UNION = 'on_alice';
 const INVOKER = 'ou_alice';
+const BOT_OWNER = INVOKER;  // PR3 revision: invoker_open_id = bot owner open_id
 
 function makeDTO(over: Partial<SettingsCardDTO['sections'][0]['toggles'][0]> = {}): SettingsCardDTO {
   const baseToggle = {
@@ -46,12 +47,14 @@ function ackToastText(result: { toast: { content: string } }): string {
   return result.toast?.content ?? '';
 }
 
-const allowAuth = (): SettingsCardHandlerDeps['isAuthorized'] => async () => true;
-const denyAuth = (): SettingsCardHandlerDeps['isAuthorized'] => async () => false;
-
+let lastScheduled: Promise<void> | undefined;
 function syncSchedule(fn: () => Promise<void>): void {
-  // Run the async write synchronously so tests can assert client calls.
-  void fn();
+  // Capture the async write so tests can `await lastScheduled` to flush it.
+  lastScheduled = fn();
+}
+async function flushScheduled(): Promise<void> {
+  await lastScheduled;
+  lastScheduled = undefined;
 }
 
 /** ─── buildPatchFromAction — pure ─────────────────────────────────────── */
@@ -192,7 +195,8 @@ describe('handleSettingsCardAction', () => {
       createClient: createClientSpy,
       patchCard: patchSpy,
       scheduleAsync: syncSchedule,
-      isAuthorized: allowAuth(),
+      getOwnerOpenId: () => BOT_OWNER,
+      resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       locale: 'zh',
       createClientSpy,
       patchSpy,
@@ -243,10 +247,8 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('missing verified union_id and fallback denies → owner_only, no client call', async () => {
-    const deps = makeDeps({
-      resolveUserUnionId: async () => ({}),
-    });
+  it('per-bot owner gate denies non-owner → owner_only, no client call (PR3 revision)', async () => {
+    const deps = makeDeps({ getOwnerOpenId: () => 'ou_other_owner' });
     const data: CardActionData = {
       operator: { open_id: INVOKER },
       action: { value: { action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' } },
@@ -256,8 +258,8 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('global owner gate denies → owner_only, no client call', async () => {
-    const deps = makeDeps({ isAuthorized: denyAuth() });
+  it('getOwnerOpenId returns undefined → owner_only, no client call', async () => {
+    const deps = makeDeps({ getOwnerOpenId: () => undefined });
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
     expect(ackToastText(r)).toContain('🔒');
@@ -269,6 +271,7 @@ describe('handleSettingsCardAction', () => {
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
     expect(ackToastText(r)).toContain('⏳');
+    await flushScheduled();
     expect(deps.createClientSpy).toHaveBeenCalledOnce();
     const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
     expect(reqSpy).toHaveBeenCalledWith({
@@ -288,6 +291,7 @@ describe('handleSettingsCardAction', () => {
       },
     };
     await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    await flushScheduled();
     const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
     expect(reqSpy).toHaveBeenCalledWith({
       method: 'PUT',
@@ -323,6 +327,7 @@ describe('handleSettingsCardAction', () => {
     const data = makeAction({ action: SETTINGS_ACTION_REFRESH, invoker_open_id: INVOKER });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
     expect(ackToastText(r)).toContain('⏳');
+    await flushScheduled();
     const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
     expect(reqSpy).toHaveBeenCalledOnce();
     const call = (reqSpy as any).mock.calls[0]![0];
@@ -344,6 +349,7 @@ describe('handleSettingsCardAction', () => {
     });
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    await flushScheduled();
     expect(patchSpy).toHaveBeenCalledOnce();
     expect(patchSpy.mock.calls[0]![2]).toBe((await requestSpy.mock.results[0]!.value)); // payload IS the route-B response
   });
@@ -358,6 +364,7 @@ describe('handleSettingsCardAction', () => {
     });
     const data = makeAction({ action: SETTINGS_ACTION_REFRESH, invoker_open_id: INVOKER });
     await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    await flushScheduled();
     expect(patchSpy).toHaveBeenCalledOnce();
     expect(patchSpy.mock.calls[0]![2]).toBe(snapshotResponse);
   });
@@ -380,6 +387,7 @@ describe('handleSettingsCardAction', () => {
       },
     };
     await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    await flushScheduled();
     const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
     const putCall = (reqSpy as any).mock.calls.find((c: any) => c[0].method === 'PUT');
     // ownerUnionId in the body MUST be the verified union, not the action.value one.
@@ -390,26 +398,27 @@ describe('handleSettingsCardAction', () => {
 /** ─── dashboard-command/index.ts dispatches settings to real handler ── */
 
 describe('handleDashboardCommand dispatches settings to real handler', () => {
-  it('owner /dashboard settings now triggers a snapshot fetch (replaces C1 stub)', async () => {
+  it('owner /dashboard settings → DM card to owner (PR3 revision)', async () => {
     const requestSpy = vi.fn(async () => ({
       status: 200,
       body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
       raw: '',
     }));
     const createClient = vi.fn(() => ({ request: requestSpy } as any));
-    const replyAcc: string[] = [];
+    const dmCalls: Array<{ openId: string; content: string; msgType?: string }> = [];
+    const sendUserMessage = async (_a: string, openId: string, content: string, msgType?: string) => {
+      dmCalls.push({ openId, content, msgType });
+      return 'om_dm';
+    };
     const deps: CommandHandlerDeps = {
       activeSessions: new Map() as any,
-      sessionReply: vi.fn(async (_rid: string, content: string) => {
-        replyAcc.push(content);
-        return 'om_reply';
-      }),
+      sessionReply: vi.fn(async () => 'om_reply'),
       getActiveCount: () => 0,
       lastRepoScan: new Map() as any,
     };
     const message = {
-      senderId: 'ou_alice',
-      senderUnionId: 'on_alice',
+      senderId: INVOKER,  // == bot owner (per-bot gate)
+      senderUnionId: undefined,
       content: '/dashboard settings',
       chatId: 'oc_test',
       rootMessageId: 'om_root',
@@ -422,18 +431,25 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
       'oc_test',
       deps,
       LARK_APP_ID,
-      { isAuthorized: async () => true, settings: { createClient } },
+      {
+        getOwnerOpenId: () => INVOKER,
+        sendUserMessage,
+        settings: { createClient, sendUserMessage },
+      },
     );
 
-    // The card (interactive JSON) is what gets sent — not the stub text.
     expect(requestSpy).toHaveBeenCalledWith({ method: 'GET', path: '/__daemon/settings-snapshot' });
-    expect(replyAcc[0]).toContain('Dashboard'); // card title
-    expect(replyAcc[0]).not.toContain('🚧');     // not the stub text
-    expect((deps.sessionReply as any).mock.calls[0][2]).toBe('interactive');
+    expect(dmCalls.length).toBe(1);
+    expect(dmCalls[0].openId).toBe(INVOKER);
+    expect(dmCalls[0].content).toContain('Dashboard');
+    expect(dmCalls[0].msgType).toBe('interactive');
+    // Topic only gets dm_sent confirmation — NOT the interactive card.
+    expect((deps.sessionReply as any).mock.calls[0][1]).toContain('📬');
   });
 
-  it('non-owner /dashboard settings → owner_only, never calls client', async () => {
+  it('non-owner /dashboard settings → owner_only in topic, never calls client', async () => {
     const createClient = vi.fn(() => ({ request: vi.fn() } as any));
+    const sendUserMessage = vi.fn(async () => 'om_dm');
     const deps: CommandHandlerDeps = {
       activeSessions: new Map() as any,
       sessionReply: vi.fn(async () => 'om_reply'),
@@ -441,21 +457,22 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
       lastRepoScan: new Map() as any,
     };
     await handleDashboardCommand(
-      { senderId: 'ou_a', senderUnionId: 'on_stranger', content: '/dashboard settings', chatId: 'oc', rootMessageId: 'om' } as LarkMessage,
+      { senderId: 'ou_stranger', content: '/dashboard settings', chatId: 'oc', rootMessageId: 'om' } as LarkMessage,
       'settings',
       'om_root',
       'oc_test',
       deps,
       LARK_APP_ID,
-      { isAuthorized: async () => false, settings: { createClient } },
+      { getOwnerOpenId: () => INVOKER, sendUserMessage, settings: { createClient, sendUserMessage } },
     );
     expect(createClient).not.toHaveBeenCalled();
+    expect(sendUserMessage).not.toHaveBeenCalled();
     const text = (deps.sessionReply as any).mock.calls[0][1] as string;
     expect(text).toContain('🔒');
   });
 
-  it('owner /dashboard sessions still returns the stub (other 5 modules unchanged)', async () => {
-    const createClient = vi.fn(() => ({ request: vi.fn() } as any));
+  it('owner /dashboard sessions still returns stub via DM (other 5 modules unchanged)', async () => {
+    const sendUserMessage = vi.fn(async () => 'om_dm');
     const deps: CommandHandlerDeps = {
       activeSessions: new Map() as any,
       sessionReply: vi.fn(async () => 'om_reply'),
@@ -463,17 +480,17 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
       lastRepoScan: new Map() as any,
     };
     await handleDashboardCommand(
-      { senderId: 'ou_a', senderUnionId: 'on_alice', content: '/dashboard sessions', chatId: 'oc', rootMessageId: 'om' } as LarkMessage,
+      { senderId: INVOKER, content: '/dashboard sessions', chatId: 'oc', rootMessageId: 'om' } as LarkMessage,
       'sessions',
       'om_root',
       'oc_test',
       deps,
       LARK_APP_ID,
-      { isAuthorized: async () => true, settings: { createClient } },
+      { getOwnerOpenId: () => INVOKER, sendUserMessage },
     );
-    const text = (deps.sessionReply as any).mock.calls[0][1] as string;
-    expect(text).toContain('🚧');
-    expect(text).toContain('sessions');
-    expect(createClient).not.toHaveBeenCalled();
+    expect(sendUserMessage).toHaveBeenCalledOnce();
+    const dmText = (sendUserMessage as any).mock.calls[0][2] as string;
+    expect(dmText).toContain('🚧');
+    expect(dmText).toContain('sessions');
   });
 });

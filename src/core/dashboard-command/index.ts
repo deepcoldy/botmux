@@ -17,6 +17,8 @@ import type { LarkMessage } from '../../types.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import type { CommandHandlerDeps } from '../command-handler.js';
 
+import { sendUserMessage as defaultSendUserMessage } from '../../im/lark/client.js';
+
 import { ensureDashboardOwner, type EnsureDashboardOwnerDeps } from './owner-gate.js';
 import {
   DASHBOARD_MODULES,
@@ -28,6 +30,8 @@ import { handleDashboardSettings, type DashboardSettingsCommandDeps } from './se
 
 /** Optional test seam — production omits and uses the real PR2 helper. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
+  /** Override for `sendUserMessage` (DM to owner). Production omits. */
+  sendUserMessage?: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
   settings?: DashboardSettingsCommandDeps;
 }
 
@@ -41,16 +45,37 @@ export async function handleDashboardCommand(
   testDeps: DashboardCommandDeps = {},
 ): Promise<void> {
   const loc = localeForBot(larkAppId);
-  const reply = async (text: string): Promise<void> => {
-    await deps.sessionReply(rootId, text, undefined, larkAppId);
-  };
-
   // ─── B1 (v2): integral owner gate — applies to ALL subcommands ───
-  const gate = await ensureDashboardOwner(message, testDeps);
+  // PR3 revision: per-bot owner — only the owner of the @-ed bot can use
+  // `/dashboard *`, regardless of whether they're an owner of some other
+  // bot in this deployment.
+  const gate = await ensureDashboardOwner(message, larkAppId, testDeps);
   if (!gate.ok) {
-    await reply(t('card.dashboard.owner_only', undefined, loc));
+    // Owner gate failure: reply in the topic (we don't have an owner DM target).
+    await deps.sessionReply(rootId, t('card.dashboard.owner_only', undefined, loc), undefined, larkAppId);
     return;
   }
+
+  // PR3 revision: every owner-gated response goes to the owner's DM. The
+  // topic receives only a short confirmation, sharing the `/card` idiom
+  // (cmd.config.card_dmd: "configuration card sent to your DM").
+  const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
+  const reply = async (text: string, msgType: 'text' | 'interactive' = 'text'): Promise<void> => {
+    if (!larkAppId) {
+      await deps.sessionReply(rootId, text, msgType === 'interactive' ? 'interactive' : undefined, larkAppId);
+      return;
+    }
+    try {
+      await sendUserMessage(larkAppId, gate.ownerOpenId, text, msgType);
+      await deps.sessionReply(rootId, t('card.dashboard.dm_sent', undefined, loc), undefined, larkAppId);
+    } catch (e: any) {
+      await deps.sessionReply(
+        rootId,
+        t('card.dashboard.dm_failed', { reason: e?.message ?? String(e) }, loc),
+        undefined, larkAppId,
+      );
+    }
+  };
 
   // ─── Dispatch (owner-only zone) ───
   const sub = args.trim().split(/\s+/)[0] || 'overview';
@@ -64,7 +89,7 @@ export async function handleDashboardCommand(
   // remain stubs until their own PR.
   if (sub === 'settings') {
     const settingsArgs = args.replace(/^settings\s*/, '');
-    return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, testDeps.settings);
+    return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.settings);
   }
 
   if (DASHBOARD_MODULES.includes(sub as DashboardModule)) {

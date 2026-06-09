@@ -147,19 +147,31 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     const createClient = () =>
       createDaemonClient({ dashboardUrl: fx.baseUrl, appId: LARK_APP_ID, secret: SECRET, retries: 0 });
 
+    const dmCalls: Array<{ openId: string; content: string; msgType?: string }> = [];
+    const sendUserMessage = async (_a: string, openId: string, content: string, msgType?: string) => {
+      dmCalls.push({ openId, content, msgType });
+      return 'om_dm';
+    };
+
     await handleDashboardSettings(
-      message, '', 'om_root', 'oc_smoke', deps, LARK_APP_ID,
-      { createClient, locale: 'en' },
+      message, '', 'om_root', 'oc_smoke', deps, LARK_APP_ID, INVOKER,
+      { createClient, sendUserMessage, locale: 'en' },
     );
+
+    expect(dmCalls.length).toBe(1);
+    expect(dmCalls[0].openId).toBe(INVOKER);
+    expect(dmCalls[0].msgType).toBe('interactive');
 
     expect(fx.hits.GET).toBe(1);
     expect(fx.hits.PUT).toBe(0);
-    expect(replyCalls).toHaveLength(1);
-    expect(replyCalls[0].msgType).toBe('interactive');
-    expect(replyCalls[0].content).toContain('Dashboard');
-    // Identity red line — verified union_id and senderId never leak into the card.
-    expect(replyCalls[0].content).not.toContain('"union_id"');
-    expect(replyCalls[0].content).not.toContain('on_smoke_owner');
+    // Topic only gets confirmation; the card itself was DMed.
+    expect(replyCalls.length).toBe(1);
+    expect(replyCalls[0].content).toContain('📬');
+    expect(replyCalls[0].msgType).toBeUndefined();
+    // DM card contains the dashboard title; no identity leak.
+    expect(dmCalls[0].content).toContain('Dashboard');
+    expect(dmCalls[0].content).not.toContain('"union_id"');
+    expect(dmCalls[0].content).not.toContain('on_smoke_owner');
   });
 
   it('callback path: toggle publicReadOnly true → real PUT → server state updated → patchCard receives merged settings', async () => {
@@ -185,7 +197,9 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     let pending: Promise<void> | undefined;
     const result = await handleSettingsCardAction(data, LARK_APP_ID, {
       createClient,
-      isAuthorized: async ({ senderUnionId }) => senderUnionId === OWNER_UNION,
+      getOwnerOpenId: () => INVOKER,
+      // Server PUT requires ownerUnionId; tests skip the real Lark contact API.
+      resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       patchCard: patchSpy,
       // Capture the in-flight write so the test can await it.
       scheduleAsync: (fn) => { pending = fn(); },
@@ -219,7 +233,8 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     let pending: Promise<void> | undefined;
     await handleSettingsCardAction(data, LARK_APP_ID, {
       createClient,
-      isAuthorized: async () => true,
+      getOwnerOpenId: () => INVOKER,
+      resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       patchCard: patchSpy,
       scheduleAsync: (fn) => { pending = fn(); },
       locale: 'en',
@@ -234,11 +249,14 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
   it('callback path: non-owner gate locally denies before any HTTP call', async () => {
     const patchSpy = vi.fn(async () => {});
     const data: CardActionData = {
-      operator: { open_id: INVOKER, union_id: 'on_stranger' },
+      // Stranger is the actor (operator) AND matches the invoker_open_id
+      // so the invoker-lock passes. The per-bot owner gate is what must
+      // reject — bot's owner is INVOKER, not the stranger.
+      operator: { open_id: 'ou_stranger' },
       action: {
         value: {
           action: SETTINGS_ACTION_TOGGLE,
-          invoker_open_id: INVOKER,
+          invoker_open_id: 'ou_stranger',
           field: 'publicReadOnly',
           next_value: 'true',
         },
@@ -251,7 +269,7 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
 
     const r = await handleSettingsCardAction(data, LARK_APP_ID, {
       createClient,
-      isAuthorized: async ({ senderUnionId }) => senderUnionId === OWNER_UNION,  // stranger denied
+      getOwnerOpenId: () => INVOKER,  // owner is INVOKER, stranger denied
       patchCard: patchSpy,
       scheduleAsync: (fn) => { void fn(); },
       locale: 'en',
