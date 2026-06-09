@@ -28,8 +28,12 @@ import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { CLI_OPTIONS, resolveCliId } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeDashboardConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, type DashboardGlobalConfig, type MaintenanceConfig } from './global-config.js';
+import { readGlobalConfig, type MaintenanceConfig } from './global-config.js';
 import { isLocalDevInstall } from './utils/install-info.js';
+import {
+  applySettingsWrite,
+  defaultSettingsWriteApplierDeps,
+} from './dashboard/settings-write-applier.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 
@@ -88,6 +92,11 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     localDevInstall: isLocalDevInstall(),
   };
 }
+
+// Single shared deps object for `applySettingsWrite` — both the browser
+// `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
+// route call through this so error codes / merge semantics stay identical.
+const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings);
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -464,38 +473,9 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const body = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
-      const patch: DashboardGlobalConfig = {};
-      if ('publicReadOnly' in body) {
-        if (typeof body.publicReadOnly !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_publicReadOnly' });
-        patch.publicReadOnly = body.publicReadOnly;
-      }
-      if ('openTerminalInFeishu' in body) {
-        if (typeof body.openTerminalInFeishu !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_openTerminalInFeishu' });
-        patch.openTerminalInFeishu = body.openTerminalInFeishu;
-      }
-      let touched = false;
-      if (Object.keys(patch).length > 0) { mergeDashboardConfig(patch); touched = true; }
-      if ('maintenance' in body) {
-        const r = parseMaintenancePatch(body.maintenance);
-        if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.error });
-        // Auto-update is npm-global only; refuse enabling it on a source checkout.
-        if (r.patch.autoUpdate?.enabled && isLocalDevInstall()) {
-          return jsonRes(res, 400, { ok: false, error: 'local_dev_no_autoupdate' });
-        }
-        // Auto-restart only applies an auto-update — it's meaningless without it.
-        // Refuse enabling auto-restart unless auto-update is (or is being) on.
-        if (r.patch.autoRestart?.enabled) {
-          const autoUpdateOn = r.patch.autoUpdate?.enabled
-            ?? readGlobalConfig().maintenance?.autoUpdate?.enabled
-            ?? false;
-          if (!autoUpdateOn) return jsonRes(res, 400, { ok: false, error: 'autoupdate_required' });
-        }
-        mergeMaintenanceConfig(r.patch);
-        touched = true;
-      }
-      if (!touched) return jsonRes(res, 400, { ok: false, error: 'empty_patch' });
-      return jsonRes(res, 200, { ok: true, settings: resolveDashboardSettings() });
+      const result = applySettingsWrite(parsed, settingsWriteApplierDeps);
+      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.error });
+      return jsonRes(res, 200, { ok: true, settings: result.settings });
     }
 
     if (await handleConnectorApi(req, res, url)) {
