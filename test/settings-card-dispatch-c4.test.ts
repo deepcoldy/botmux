@@ -1,16 +1,23 @@
 /**
- * Production dispatch path test (PR3 C4 B2):
+ * Production dispatch path test (PR3 C4 B2 — UI revision pass 2).
  *
- * Codex blocker: the card-handler dispatch arm must wire a `patchCard` that
- * issues a real Lark `updateMessage` after the write/refresh resolves. This
- * file exercises the public `handleCardAction(...)` entry and verifies that
- * `updateMessage` is invoked with the post-write rebuilt card JSON — NOT
- * with the raw route-B response.
+ * The card-handler dispatch arm now invokes `handleSettingsCardAction` with
+ * NO `patchCard`. The settings handler returns `{toast, card}` directly so
+ * the event-dispatcher passes the rebuilt card body back to Lark in the
+ * SAME callback response. This eliminates the stale-render flash that the
+ * earlier `patchCard → updateMessage` pattern caused (spinner → old card →
+ * push arrives → new card).
+ *
+ * Slow fallback: if the handler exceeds the event-dispatcher 2.5s ACK-safe
+ * cutoff, `patchTimedOutCardActionResult` will call `updateMessage` on the
+ * eventually-resolved `{card}`. That path is owned by the dispatcher and
+ * tested in `event-dispatcher.test.ts`; here we only assert the fast path
+ * does NOT call `updateMessage`.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// ─── Mock the entire Lark client module BEFORE importing card-handler ────
+// Mock the Lark client module so we can assert updateMessage is NOT called.
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<typeof import('../src/im/lark/client.js')>(
     '../src/im/lark/client.js',
@@ -40,7 +47,6 @@ import { updateMessage, resolveUserUnionId } from '../src/im/lark/client.js';
 import { createDaemonClientFor } from '../src/daemon-internal-client-wrapper.js';
 import { handleCardAction, type CardActionData } from '../src/im/lark/card-handler.js';
 
-// Make resolveUserUnionId return a valid on_ unionId so write path proceeds.
 vi.mocked(resolveUserUnionId).mockResolvedValue({ unionId: 'on_alice' });
 
 const mockedUpdateMessage = vi.mocked(updateMessage);
@@ -75,9 +81,8 @@ function makeDeps(): any {
   };
 }
 
-describe('handleCardAction → settings dispatch wires patchCard → updateMessage (B2)', () => {
-  it('happy toggle: updateMessage called with rebuilt card JSON (not raw response)', async () => {
-    // PUT response carries the merged settings; patchCard rebuilds the card.
+describe('handleCardAction → settings dispatch returns {toast, card} (PR3 pass 2)', () => {
+  it('happy toggle: result.card carries the rebuilt card; updateMessage NOT called on the fast path', async () => {
     const requestSpy = vi.fn(async (req: any) => {
       if (req.method === 'PUT' && req.path === '/__daemon/settings-write') {
         return {
@@ -103,28 +108,23 @@ describe('handleCardAction → settings dispatch wires patchCard → updateMessa
     };
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
 
-    // Synchronous ACK shape.
+    // Toast + card in the same response. Lark's client renders both atomically.
     expect(result.toast).toBeDefined();
-    expect(result.ack).toBeUndefined();
-
-    // Give the async patchCard a microtask to flush. The handler's default
-    // scheduler is `setImmediate`; in vitest a `setImmediate` task settles
-    // after we await a Promise.
-    await new Promise(resolve => setImmediate(resolve));
-
-    expect(mockedUpdateMessage).toHaveBeenCalledOnce();
-    const [appId, messageId, cardJson] = mockedUpdateMessage.mock.calls[0]!;
-    expect(appId).toBe(LARK_APP_ID);
-    expect(messageId).toBe(ORIGINAL_MESSAGE_ID);
-    // The cardJson must be the REBUILT card, NOT the raw response object.
-    expect(typeof cardJson).toBe('string');
+    expect(result.card).toBeDefined();
+    expect(result.card?.type).toBe('raw');
+    const cardJson = JSON.stringify(result.card?.data);
     expect(cardJson).toContain('Dashboard');
-    // No identity beyond invoker_open_id ever leaks into the rebuilt card.
+    // Identity hardening still holds — no raw union_id leaks into the rebuilt card.
     expect(cardJson).not.toContain('"union_id"');
     expect(cardJson).not.toContain('"senderUnionId"');
+
+    // Settle any pending microtasks just in case some background path exists.
+    await new Promise(resolve => setImmediate(resolve));
+    // Fast path MUST NOT touch updateMessage — that's the stale-render bug.
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
 
-  it('refresh: updateMessage called with rebuilt card from GET snapshot (no PUT)', async () => {
+  it('refresh: result.card carries the snapshot card; no PUT, no updateMessage on the fast path', async () => {
     const requestSpy = vi.fn(async (req: any) => {
       if (req.method === 'GET' && req.path === '/__daemon/settings-snapshot') {
         return {
@@ -141,21 +141,21 @@ describe('handleCardAction → settings dispatch wires patchCard → updateMessa
       action: { value: { action: 'dash_settings_refresh', invoker_open_id: INVOKER } },
       context: { open_message_id: ORIGINAL_MESSAGE_ID },
     };
-    await handleCardAction(data, makeDeps(), LARK_APP_ID);
-    await new Promise(resolve => setImmediate(resolve));
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
 
-    // GET — never PUT during refresh.
     expect(requestSpy).toHaveBeenCalled();
     const putCall = requestSpy.mock.calls.find(c => (c[0] as any).method === 'PUT');
     expect(putCall).toBeUndefined();
 
-    expect(mockedUpdateMessage).toHaveBeenCalledOnce();
-    const [, , cardJson] = mockedUpdateMessage.mock.calls[0]!;
-    expect(typeof cardJson).toBe('string');
+    expect(result.card).toBeDefined();
+    const cardJson = JSON.stringify(result.card?.data);
     expect(cardJson).toContain('Dashboard');
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
 
-  it('missing open_message_id: handler logs but does not throw, no updateMessage', async () => {
+  it('missing open_message_id: handler does not throw — fast-path response is still valid', async () => {
     const requestSpy = vi.fn(async () => ({
       status: 200, raw: '',
       body: { ok: true, settings: buildSettings() },
@@ -172,12 +172,13 @@ describe('handleCardAction → settings dispatch wires patchCard → updateMessa
           next_value: 'true',
         },
       },
-      // No context, no open_message_id at the envelope.
+      // No context, no open_message_id — fast path doesn't need it.
     };
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
     await new Promise(resolve => setImmediate(resolve));
 
     expect(result.toast).toBeDefined();
+    // The fast path doesn't depend on open_message_id; updateMessage stays untouched.
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
 });

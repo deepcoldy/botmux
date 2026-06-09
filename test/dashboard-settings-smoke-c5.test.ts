@@ -174,10 +174,9 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     expect(dmCalls[0].content).not.toContain('on_smoke_owner');
   });
 
-  it('callback path: toggle publicReadOnly true → real PUT → server state updated → patchCard receives merged settings', async () => {
+  it('callback path: toggle publicReadOnly true → real PUT → result.card carries the post-write card (PR3 pass 2)', async () => {
     expect((fx.state.settings as any).publicReadOnly).toBe(false);
 
-    const patchSpy = vi.fn(async () => {});
     const data: CardActionData = {
       operator: { open_id: INVOKER, union_id: OWNER_UNION },
       action: {
@@ -199,28 +198,31 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
       getOwnerOpenId: () => INVOKER,
       // Server PUT requires ownerUnionId; tests skip the real Lark contact API.
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
-      patchCard: patchSpy,
       locale: 'en',
     });
 
-    // PR3 UI revision: handler awaits the PUT inline, so by the time the
-    // promise resolves, the server state is already updated and patchCard
-    // has received the merged settings. Toast reports the FINAL outcome
-    // (Saved), not the legacy mid-flight "Saving…".
+    // Result envelope: toast + card together, no out-of-band updateMessage.
     expect(result.toast).toBeDefined();
     expect(result.toast.content).toContain('Saved');
     expect(result.toast.type).toBe('success');
+    expect(result.card).toBeDefined();
+    expect(result.card?.type).toBe('raw');
 
+    // Server-side state really changed (real Route B PUT hit the server).
     expect(fx.hits.PUT).toBe(1);
     expect((fx.state.settings as any).publicReadOnly).toBe(true);
-    expect(patchSpy).toHaveBeenCalled();
-    const payload = patchSpy.mock.calls[0]![2] as any;
-    expect(payload.status).toBe(200);
-    expect(payload.body?.settings?.publicReadOnly).toBe(true);
+
+    // The card body carries the post-write rendering — it reflects the new
+    // publicReadOnly=true state (current value primary disabled = "✓ On").
+    const cardJson = JSON.stringify(result.card?.data);
+    expect(cardJson).toContain('Dashboard');
+    expect(cardJson).toContain('✓ On');
+    // Identity hardening still holds in the smoke pipeline.
+    expect(cardJson).not.toContain('"union_id"');
+    expect(cardJson).not.toContain('on_smoke_owner');
   });
 
   it('callback path: refresh action only GETs the snapshot, never PUTs', async () => {
-    const patchSpy = vi.fn(async () => {});
     const data: CardActionData = {
       operator: { open_id: INVOKER, union_id: OWNER_UNION },
       action: { value: { action: SETTINGS_ACTION_REFRESH, invoker_open_id: INVOKER } },
@@ -230,21 +232,19 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     const createClient = () =>
       createDaemonClient({ dashboardUrl: fx.baseUrl, appId: LARK_APP_ID, secret: SECRET, retries: 0 });
 
-    await handleSettingsCardAction(data, LARK_APP_ID, {
+    const result = await handleSettingsCardAction(data, LARK_APP_ID, {
       createClient,
       getOwnerOpenId: () => INVOKER,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
-      patchCard: patchSpy,
       locale: 'en',
     });
 
     expect(fx.hits.GET).toBe(1);
     expect(fx.hits.PUT).toBe(0);
-    expect(patchSpy).toHaveBeenCalledOnce();
+    expect(result.card).toBeDefined();
   });
 
   it('callback path: non-owner gate locally denies before any HTTP call', async () => {
-    const patchSpy = vi.fn(async () => {});
     const data: CardActionData = {
       // Stranger is the actor (operator) AND matches the invoker_open_id
       // so the invoker-lock passes. The per-bot owner gate is what must
@@ -267,7 +267,6 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     const r = await handleSettingsCardAction(data, LARK_APP_ID, {
       createClient,
       getOwnerOpenId: () => INVOKER,  // owner is INVOKER, stranger denied
-      patchCard: patchSpy,
       locale: 'en',
     });
 
@@ -275,7 +274,8 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     // Server NEVER reached for this caller — local gate caught them first.
     expect(fx.hits.GET).toBe(0);
     expect(fx.hits.PUT).toBe(0);
-    expect(patchSpy).not.toHaveBeenCalled();
+    // No card returned on the deny path — toast-only is the right shape.
+    expect(r.card).toBeUndefined();
     expect((fx.state.settings as any).publicReadOnly).toBe(false);
   });
 });

@@ -225,7 +225,6 @@ describe('PR3 UI revision (codex C4) — segmented control schema', () => {
         createClient: createClient as any,
         getOwnerOpenId: () => INVOKER,
         resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
-        patchCard: async () => {},
         locale: 'zh',
       },
     );

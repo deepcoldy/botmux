@@ -31,7 +31,7 @@
  */
 
 import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
-import type { SettingsCardDTO } from '../../dashboard/settings-card-model.js';
+import { composeSections, type SettingsCardDTO } from '../../dashboard/settings-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
 
@@ -291,9 +291,6 @@ export interface SettingsCardHandlerDeps {
   resolveUserUnionId?: (larkAppId: string, openId: string) => Promise<{ unionId?: string }>;
   /** Factory returning a Route B client for the given larkAppId. */
   createClient: (larkAppId: string) => DaemonClient;
-  /** Card-rebuild callback — receives the Route B response after the inline
-   *  await and runs `composeSections + buildSettingsCard + updateMessage`. */
-  patchCard?: (data: CardActionData, larkAppId: string, payload: unknown) => Promise<void>;
   /** Override locale resolution; production uses the caller-supplied locale. */
   locale?: Locale;
 }
@@ -302,18 +299,21 @@ export interface SettingsCardHandlerDeps {
  * Lark card-callback result envelope. event-dispatcher pass-through expects
  * either `{ toast }`, `{ card }`, or both — see `event-dispatcher.ts:390-395`.
  *
- * PR3 UI revision (user feedback 2026-06-09): the handler awaits the GET/PUT
- * and `patchCard` inline before returning, so Lark's client renders its
- * built-in loading spinner on the clicked button. `/card 关闭会话` works the
- * same way: spinner is purely a function of "callback hasn't returned yet".
- * event-dispatcher caps the awaitable handler at 2.5s
- * (`event-dispatcher.ts:365`); if Route B slips past that, the dispatcher
- * ACKs with a generic toast and runs `patchCard` in the background, so the
- * card still updates — we just lose the spinner UX for that one slow call.
- * Local Route B HMAC RTT is ~30-80ms in practice.
+ * PR3 UI revision pass 2 (user feedback 2026-06-09): the handler awaits the
+ * GET/PUT inline and returns BOTH `{ toast }` AND `{ card }` in the same
+ * response so Lark's client renders them atomically. Why both:
+ *  - `toast` → Lark client hides the button spinner and pops the toast.
+ *  - `card` → Lark client patches the original card in-place to the post-
+ *    write state at the same instant.
+ * Returning only `{toast}` and patching out-of-band via `updateMessage`
+ * produces a visible stale-render flash (a few frames where the OLD card
+ * shows after the spinner dies, then the push arrives and re-renders).
+ * Round-trip Route B PUT + card rebuild fits in ~30-80ms; well inside the
+ * `event-dispatcher` 2.5s handler timeout (`event-dispatcher.ts:365`).
  */
 export interface SettingsCardHandlerResult {
   toast: { type: 'info' | 'success' | 'error'; content: string };
+  card?: { type: 'raw'; data: Record<string, unknown> };
 }
 
 export type PatchBuildResult =
@@ -368,12 +368,36 @@ function ackToast(textKey: string, locale: Locale): SettingsCardHandlerResult {
   return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
 }
 
-function successToast(textKey: string, locale: Locale): SettingsCardHandlerResult {
-  return { toast: { type: 'success', content: t(textKey, undefined, locale) } };
-}
-
 function errorToast(textKey: string, params: Record<string, string> | undefined, locale: Locale): SettingsCardHandlerResult {
   return { toast: { type: 'error', content: t(textKey, params, locale) } };
+}
+
+/**
+ * Build a `{ toast: success, card }` envelope from a Route B settings response.
+ *  - `card` is the post-write rebuilt card body shipped in the SAME callback
+ *    response so Lark's client patches the card atomically with the toast
+ *    (no out-of-band `updateMessage`, no stale-render flash).
+ *  - Falls back to a toast-only result if the response carries no settings
+ *    payload — caller can still surface the toast, and event-dispatcher's
+ *    slow-fallback will not have a card to patch but that's the rare path.
+ */
+function successResult(
+  payload: unknown,
+  invokerOpenId: string,
+  locale: Locale,
+  toastKey: string,
+): SettingsCardHandlerResult {
+  const settings = (payload as any)?.body?.settings ?? (payload as any)?.settings;
+  const toast = { type: 'success' as const, content: t(toastKey, undefined, locale) };
+  if (!settings || typeof settings !== 'object') {
+    return { toast };
+  }
+  const dto = composeSections(settings, { canWrite: true });
+  const cardJson = buildSettingsCard(dto, { invokerOpenId, locale, canWrite: true });
+  return {
+    toast,
+    card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
+  };
 }
 
 /**
@@ -427,14 +451,13 @@ export async function handleSettingsCardAction(
   }
 
   // ─── 4a) Refresh — read-only path (NO PUT) ───────────────────────────
-  // Inline await: handler doesn't return until GET + patchCard are done,
-  // so Lark's client keeps the loading spinner up until the card is fresh.
+  // Inline await + return rebuilt card in the SAME response so Lark's
+  // client patches the card atomically with the toast (no stale flash).
   if (action === SETTINGS_ACTION_REFRESH) {
     try {
       const client = deps.createClient(larkAppId);
       const snap = await client.request({ method: 'GET', path: '/__daemon/settings-snapshot' });
-      await deps.patchCard?.(data, larkAppId, snap);
-      return successToast('card.dashboard.settings.refreshed', locale);
+      return successResult(snap, expectedOwner, locale, 'card.dashboard.settings.refreshed');
     } catch (e) {
       return errorToast('card.dashboard.settings.snapshot_failed', { reason: (e as Error).message }, locale);
     }
@@ -467,7 +490,6 @@ export async function handleSettingsCardAction(
       path: '/__daemon/settings-write',
       body: { patch: patch.value, ownerUnionId },
     });
-    await deps.patchCard?.(data, larkAppId, r);
     if ((r as any)?.status >= 400) {
       return errorToast(
         'card.dashboard.settings.save_failed',
@@ -475,7 +497,7 @@ export async function handleSettingsCardAction(
         locale,
       );
     }
-    return successToast('card.dashboard.settings.saved', locale);
+    return successResult(r, expectedOwner, locale, 'card.dashboard.settings.saved');
   } catch (e) {
     return errorToast('card.dashboard.settings.save_failed', { reason: (e as Error).message }, locale);
   }

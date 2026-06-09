@@ -181,19 +181,16 @@ describe('buildSettingsCard', () => {
 
 describe('handleSettingsCardAction', () => {
   function makeDeps(over: Partial<SettingsCardHandlerDeps> = {}): SettingsCardHandlerDeps & {
-    createClientSpy: any; patchSpy: any;
+    createClientSpy: any;
   } {
     const requestSpy = vi.fn(async () => ({ status: 200, body: { ok: true, settings: {} }, raw: '' }));
     const createClientSpy = vi.fn(() => ({ request: requestSpy } as any));
-    const patchSpy = vi.fn(async () => {});
     return {
       createClient: createClientSpy,
-      patchCard: patchSpy,
       getOwnerOpenId: () => BOT_OWNER,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       locale: 'zh',
       createClientSpy,
-      patchSpy,
       ...over,
     } as any;
   }
@@ -336,36 +333,41 @@ describe('handleSettingsCardAction', () => {
     expect((r as any).toast.type).toBe('success');
   });
 
-  it('happy toggle: PUT response triggers patchCard so the original card is updated (B2)', async () => {
+  it('happy toggle: PUT response yields a {toast, card} result so Lark patches atomically (B2 — PR3 pass 2)', async () => {
     const requestSpy = vi.fn(async () => ({
       status: 200, raw: '',
       body: { ok: true, settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
     }));
-    const patchSpy = vi.fn(async () => {});
     const deps = makeDeps({
       createClient: vi.fn(() => ({ request: requestSpy } as any)),
-      patchCard: patchSpy,
     });
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
-    await handleSettingsCardAction(data, LARK_APP_ID, deps);
-    await flushScheduled();
-    expect(patchSpy).toHaveBeenCalledOnce();
-    expect(patchSpy.mock.calls[0]![2]).toBe((await requestSpy.mock.results[0]!.value)); // payload IS the route-B response
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    // PR3 UI revision pass 2: card is shipped IN the response so the client
+    // patches the card atomically with the toast — no out-of-band updateMessage,
+    // no stale-render flash.
+    expect(r.card).toBeDefined();
+    expect(r.card?.type).toBe('raw');
+    expect(r.card?.data).toBeDefined();
+    // The rebuilt card reflects the post-write state (publicReadOnly=true).
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('Dashboard');
+    expect(cardJson).toContain('✓ 已开启');  // current value indicator for the now-ON toggle
   });
 
-  it('refresh: patchCard receives the GET snapshot response (B2)', async () => {
-    const snapshotResponse = { status: 200, raw: '', body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } } };
+  it('refresh: GET snapshot yields a {toast, card} result with the snapshot card (B2 — PR3 pass 2)', async () => {
+    const snapshotResponse = { status: 200, raw: '', body: { settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } } };
     const requestSpy = vi.fn(async () => snapshotResponse);
-    const patchSpy = vi.fn(async () => {});
     const deps = makeDeps({
       createClient: vi.fn(() => ({ request: requestSpy } as any)),
-      patchCard: patchSpy,
     });
     const data = makeAction({ action: SETTINGS_ACTION_REFRESH, invoker_open_id: INVOKER });
-    await handleSettingsCardAction(data, LARK_APP_ID, deps);
-    await flushScheduled();
-    expect(patchSpy).toHaveBeenCalledOnce();
-    expect(patchSpy.mock.calls[0]![2]).toBe(snapshotResponse);
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect(r.card).toBeDefined();
+    expect(r.card?.type).toBe('raw');
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('Dashboard');
+    expect(cardJson).toContain('✓ 已开启');  // matches the snapshot.publicReadOnly=true
   });
 
   it('action.value.union_id is ignored — uses verified operator.union_id only', async () => {
