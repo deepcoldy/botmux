@@ -13,13 +13,14 @@
  *   3. noop short-circuit: `dash_settings_noop` (current-value button in the
  *      segmented control) returns a toast WITHOUT calling the Route B client.
  *      Fail-safe for clients that don't suppress `disabled` callbacks.
- *   4. ACK-then-patch:
- *        - sync toast payload (top-level `{ toast }`; event-dispatcher passes
- *          this through to Lark as the click acknowledgement),
- *        - async write via PR2 Route B client (resolves the owner's union_id
- *          via `resolveUserUnionId` first, since the server-side write API
+ *   4. Sync handler (PR3 UI revision pass 2):
+ *        - await the Route B PUT/GET (resolves the owner's union_id via
+ *          `resolveUserUnionId` first, since the server-side write API
  *          still requires `ownerUnionId` in the body),
- *        - async refresh card schema with the post-write snapshot.
+ *        - return `{ toast, card }` together so the event-dispatcher
+ *          ships both back to Lark in the SAME callback response.
+ *          Lark's client renders them atomically (no stale-render flash),
+ *          and the spinner shows for the full network roundtrip.
  *
  * Write actions are NEVER retried — the C7 client retry policy already
  * disables non-GET retries, and toggling a setting twice is a real-world
@@ -401,8 +402,10 @@ function successResult(
 }
 
 /**
- * Dispatch a `dash_settings_*` action callback. Returns the synchronous ACK
- * payload; the network write happens asynchronously via `deps.scheduleAsync`.
+ * Dispatch a `dash_settings_*` action callback. Awaits the Route B
+ * GET/PUT inline and returns the final `{toast, card}` envelope so Lark
+ * patches the card atomically with the toast — see the module docstring
+ * for why this matters (spinner UX + no stale-render flash).
  */
 export async function handleSettingsCardAction(
   data: CardActionData,

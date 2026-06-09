@@ -8,8 +8,10 @@
  *      `composeSections` → `buildSettingsCard` → emitted as `interactive`
  *      via `sessionReply`.
  *   2. `handleSettingsCardAction` (callback path) → real client → real PUT
- *      `/__daemon/settings-write` (with verified `ownerUnionId`) → patchCard
- *      rebuilds the card from the post-write settings.
+ *      `/__daemon/settings-write` (with verified `ownerUnionId`). The
+ *      handler returns `{toast, card}` from the post-write settings so
+ *      the Lark callback response carries the rebuilt card body itself
+ *      (no out-of-band `updateMessage`).
  *
  * No real dashboard or daemon is started. No restart needed.
  */
