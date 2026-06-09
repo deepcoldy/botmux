@@ -5,10 +5,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { SessionRow } from '../src/core/dashboard-rows.js';
+import { composeDetail } from '../src/dashboard/session-card-model.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildSessionsCard,
+  buildSessionsDetailCard,
   handleSessionsCardAction,
+  SESSIONS_ACTION_BACK_TO_LIST,
+  SESSIONS_ACTION_CLOSE,
+  SESSIONS_ACTION_DETAIL,
   SESSIONS_ACTION_PAGE,
   SESSIONS_ACTION_REFRESH,
 } from '../src/im/lark/sessions-card.js';
@@ -100,10 +105,13 @@ describe('buildSessionsCard', () => {
     const rows: SessionRow[] = Array.from({ length: 15 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
     const findPagerButtons = (json: string): { prev: any; next: any } => {
       const parsed = JSON.parse(json);
-      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
-      const actions = actionRow.actions as any[];
-      const prev = actions.find((a: any) => String(a.text?.content ?? '').includes('上一页'));
-      const next = actions.find((a: any) => String(a.text?.content ?? '').includes('下一页'));
+      // Slice 2a introduced per-row `📂 详情` action elements before the
+      // pagination row, so we can't grab the first action; flatten across
+      // all action elements and pick by button label instead.
+      const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+      const allActions = actionRows.flatMap((r: any) => (r.actions as any[]) ?? []);
+      const prev = allActions.find((a: any) => String(a.text?.content ?? '').includes('上一页'));
+      const next = allActions.find((a: any) => String(a.text?.content ?? '').includes('下一页'));
       return { prev, next };
     };
     const page1 = buildSessionsCard(rows, { ...baseOpts, page: 1 }, NOW);
@@ -182,10 +190,144 @@ describe('buildSessionsCard', () => {
     const json = buildSessionsCard(rows, baseOpts, NOW);
     const parsed = JSON.parse(json);
     const elements = parsed.elements as any[];
-    const actionRow = elements.find((e: any) => e.tag === 'action');
-    expect(actionRow).toBeDefined();
-    for (const btn of actionRow.actions) {
-      expect(btn.value?.invoker_open_id).toBe(INVOKER);
+    // Slice 2a injects per-row detail action elements before the pagination
+    // action row. Walk EVERY action element + button to assert the lock.
+    const actionRows = elements.filter((e: any) => e.tag === 'action');
+    expect(actionRows.length).toBeGreaterThanOrEqual(2); // at least 1 row detail + 1 pager
+    for (const ar of actionRows) {
+      for (const btn of ar.actions) {
+        expect(btn.value?.invoker_open_id).toBe(INVOKER);
+      }
+    }
+  });
+
+  // ─── Slice 2a per-row detail button ─────────────────────────────────
+  it('every list row carries an inline `📂 详情` button whose value.session_id matches that row', () => {
+    const rows: SessionRow[] = [
+      row({ sessionId: 'sess_a', status: 'working', title: 'a' }),
+      row({ sessionId: 'sess_b', status: 'idle', title: 'b' }),
+      row({ sessionId: 'sess_c', status: 'closed', title: 'c' }),
+    ];
+    const json = buildSessionsCard(rows, baseOpts, NOW);
+    const parsed = JSON.parse(json);
+    const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+    // Every per-row action element has exactly one button with action=DETAIL.
+    const detailButtons = actionRows
+      .flatMap((ar: any) => ar.actions ?? [])
+      .filter((b: any) => b.value?.action === SESSIONS_ACTION_DETAIL);
+    // Exactly one detail button per row.
+    expect(detailButtons.length).toBe(rows.length);
+    const seenIds = new Set(detailButtons.map((b: any) => b.value.session_id));
+    // Both ids must show up (sorted order — working/idle/closed).
+    expect(seenIds.has('sess_a')).toBe(true);
+    expect(seenIds.has('sess_b')).toBe(true);
+    expect(seenIds.has('sess_c')).toBe(true);
+    // Every detail button text matches the i18n label.
+    for (const b of detailButtons) {
+      expect(String(b.text?.content ?? '')).toContain('📂');
+    }
+  });
+});
+
+describe('buildSessionsDetailCard (slice 2a)', () => {
+  const NOW = 2_000_000;
+  function detailFor(over: Partial<SessionRow> = {}) {
+    return composeDetail(row(over), NOW);
+  }
+  const baseOpts = { invokerOpenId: INVOKER, locale: 'zh' as const, nowMs: NOW };
+
+  it('renders a title section that shows the sessionId verbatim', () => {
+    const detail = detailFor({ sessionId: 'sess_detail_123', title: 'my session', status: 'idle' });
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    expect(json).toContain('Dashboard 会话'.replace('Dashboard 会话', '会话')); // detail.title header includes "会话详情"
+    expect(json).toContain('会话详情');
+    expect(json).toContain('sess_detail_123');
+  });
+
+  it('renders the close button with action=dash_sessions_close + session_id', () => {
+    const detail = detailFor({ sessionId: 'sess_close_me', status: 'idle' });
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const closeBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_CLOSE,
+    );
+    expect(closeBtn).toBeDefined();
+    expect(closeBtn.value.session_id).toBe('sess_close_me');
+    expect(closeBtn.value.invoker_open_id).toBe(INVOKER);
+  });
+
+  it('renders the back button with action=dash_sessions_back_to_list', () => {
+    const detail = detailFor({ sessionId: 'sess_back', status: 'idle' });
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const backBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_BACK_TO_LIST,
+    );
+    expect(backBtn).toBeDefined();
+    expect(backBtn.value.invoker_open_id).toBe(INVOKER);
+  });
+
+  it('enabled close button carries a confirm dialog with non-empty title + text', () => {
+    const detail = detailFor({ sessionId: 'sess_confirm', title: 'confirm me', status: 'idle' });
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const closeBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_CLOSE,
+    );
+    expect(closeBtn.confirm).toBeDefined();
+    expect(String(closeBtn.confirm.title?.content ?? '').length).toBeGreaterThan(0);
+    expect(String(closeBtn.confirm.text?.content ?? '').length).toBeGreaterThan(0);
+    expect(closeBtn.disabled).not.toBe(true); // enabled, must not be marked disabled
+  });
+
+  it('disabled close (closed status) → button disabled + reason note rendered', () => {
+    const detail = detailFor({ sessionId: 'sess_already_closed', status: 'closed' });
+    expect(detail.actions.close.enabled).toBe(false);
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const closeBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_CLOSE,
+    );
+    expect(closeBtn.disabled).toBe(true);
+    // No confirm attached on a disabled button.
+    expect(closeBtn.confirm).toBeUndefined();
+    // The reasonKey note for alreadyClosed should render somewhere on the card.
+    expect(json).toContain('会话已关闭');
+  });
+
+  it('disabled close (starting status) → reason note renders the starting copy', () => {
+    const detail = detailFor({ sessionId: 'sess_starting', status: 'starting' });
+    expect(detail.actions.close.enabled).toBe(false);
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    expect(json).toContain('会话启动中');
+  });
+
+  it('escapes title against <at> / <font> injection so user-supplied chars cannot break the wrapper', () => {
+    const detail = detailFor({
+      sessionId: 'sess_inject',
+      // user-supplied chat title with HTML-shaped chars
+      title: '</font><at id=ou_evil></at> evil',
+      workingDir: '~/normal',
+      status: 'idle',
+    });
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    // Find any div whose content references the (escaped) "evil" suffix.
+    const evilDivs = (parsed.elements as any[]).filter(
+      (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
+        && (e.text.content as string).includes('evil'),
+    );
+    expect(evilDivs.length).toBeGreaterThan(0);
+    for (const d of evilDivs) {
+      const content = d.text.content as string;
+      // Raw `<at` must NOT appear anywhere (escaped form `&lt;at` is fine).
+      expect(content).not.toMatch(/<at\b/);
+      // `&lt;` must appear (escape took effect).
+      expect(content).toContain('&lt;');
     }
   });
 });
@@ -335,5 +477,352 @@ describe('handleSessionsCardAction', () => {
     );
     expect(r.toast?.content).toContain('⚠️');
     expect(deps.createClient).not.toHaveBeenCalled();
+  });
+
+  // ─── Slice 2a: DETAIL ────────────────────────────────────────────────
+  describe('action=dash_sessions_detail', () => {
+    function makeDetailDeps(sessionId = 'sess_a') {
+      const sessions = [
+        row({ sessionId, status: 'idle', title: 'visible row' }),
+        row({ sessionId: 'sess_other', status: 'working', title: 'other' }),
+      ];
+      const requestSpy = vi.fn(async () => ({ status: 200, body: { sessions }, raw: '' }));
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh',
+        nowMs: () => 2_000_000,
+        requestSpy,
+      };
+    }
+
+    it('happy: GET sessions-list and returns { card } containing the detail (with close button)', async () => {
+      const deps = makeDetailDeps('sess_a');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(deps.requestSpy).toHaveBeenCalledOnce();
+      expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list' });
+      expect(r.toast).toBeUndefined();
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      // Detail card header rendered + close button present.
+      expect(cardJson).toContain('会话详情');
+      expect(cardJson).toContain(SESSIONS_ACTION_CLOSE);
+      expect(cardJson).toContain('sess_a');
+    });
+
+    it('session_id not in list → toast session_not_found, no card', async () => {
+      const deps = makeDetailDeps('sess_a');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_does_not_exist' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('会话不存在');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('non-owner → toast, no GET', async () => {
+      const deps = { ...makeDetailDeps('sess_a'), getOwnerOpenId: () => 'ou_other' };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('missing invoker_open_id → toast, no GET', async () => {
+      const deps = makeDetailDeps('sess_a');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('invoker mismatch → toast, no GET', async () => {
+      const deps = makeDetailDeps('sess_a');
+      const r = await handleSessionsCardAction(
+        makeAction(
+          { action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' },
+          'ou_stranger',
+        ),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('Route B GET throws → toast list_failed (boom), no card', async () => {
+      const deps = {
+        createClient: vi.fn(() => ({ request: async () => { throw new Error('boom'); } } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('拉取会话列表失败');
+      expect(r.toast?.content).toContain('boom');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('Route B GET 500 → toast list_failed http_500, no card', async () => {
+      const deps = {
+        createClient: vi.fn(() => ({
+          request: async () => ({ status: 500, body: {}, raw: '' }),
+        } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('http_500');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('Route B GET 401 → toast list_failed (uses body.error verbatim), no card', async () => {
+      const deps = {
+        createClient: vi.fn(() => ({
+          request: async () => ({ status: 401, body: { error: 'bad_signature' }, raw: '' }),
+        } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('bad_signature');
+      expect(r.card).toBeUndefined();
+    });
+  });
+
+  // ─── Slice 2a: CLOSE ─────────────────────────────────────────────────
+  describe('action=dash_sessions_close', () => {
+    function makeCloseDeps(sessionId = 'sess_a', closePostResp?: { status: number; body?: any }) {
+      const sessions = [
+        row({ sessionId, status: 'idle', title: 'close me' }),
+        row({ sessionId: 'sess_other', status: 'working', title: 'other' }),
+      ];
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+          return { status: 200, body: { sessions }, raw: '' };
+        }
+        if (req.method === 'POST' && req.path.startsWith('/__daemon/sessions/')) {
+          return closePostResp ?? { status: 200, body: { ok: true, alreadyClosed: false }, raw: '' };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh',
+        nowMs: () => 2_000_000,
+        requestSpy,
+      };
+    }
+
+    it('happy: GET once + POST once + synthesizes closed detail (no 2nd GET, no toast)', async () => {
+      const deps = makeCloseDeps('sess_a');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      // Verify call shape: GET (pre-POST snapshot) then POST. NO third call.
+      expect(deps.requestSpy).toHaveBeenCalledTimes(2);
+      expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list' });
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ method: 'POST', path: '/__daemon/sessions/sess_a/close' }),
+      );
+      // No toast on success.
+      expect(r.toast).toBeUndefined();
+      // Detail card returned, with close button DISABLED (status overlay → 'closed').
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('会话详情');
+      expect(cardJson).toContain('"disabled":true');
+      expect(cardJson).toContain('会话已关闭');
+    });
+
+    it('POST 404 → toast close_failed, NO card (state preserved)', async () => {
+      const deps = makeCloseDeps('sess_a', { status: 404, body: { error: 'unknown_session' } });
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('关闭失败');
+      // body.error is preferred over http_404
+      expect(r.toast?.content).toContain('unknown_session');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST 500 (no body.error) → toast close_failed http_500, NO card', async () => {
+      const deps = makeCloseDeps('sess_a', { status: 500, body: {} });
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('关闭失败');
+      expect(r.toast?.content).toContain('http_500');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST throws → toast close_failed (err.message), NO card', async () => {
+      // Custom client where GET works but POST throws.
+      const sessions = [row({ sessionId: 'sess_a', status: 'idle', title: 'x' })];
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+          return { status: 200, body: { sessions }, raw: '' };
+        }
+        throw new Error('network down');
+      });
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('关闭失败');
+      expect(r.toast?.content).toContain('network down');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('non-owner → toast, no POST issued', async () => {
+      const deps = { ...makeCloseDeps('sess_a'), getOwnerOpenId: () => 'ou_other' };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      // No client was even created.
+      expect(deps.createClient).not.toHaveBeenCalled();
+      // Spy was untouched.
+      expect(deps.requestSpy).not.toHaveBeenCalled();
+    });
+
+    it('invoker mismatch → toast, no POST issued', async () => {
+      const deps = makeCloseDeps('sess_a');
+      const r = await handleSessionsCardAction(
+        makeAction(
+          { action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' },
+          'ou_stranger',
+        ),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('pre-POST GET cannot find sessionId → toast session_not_found, NO POST issued', async () => {
+      const deps = makeCloseDeps('sess_a');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_GHOST' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('会话不存在');
+      expect(r.card).toBeUndefined();
+      // Only the GET was issued; NO POST call ever happened.
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+  });
+
+  // ─── Slice 2a: BACK TO LIST ─────────────────────────────────────────
+  describe('action=dash_sessions_back_to_list', () => {
+    it('GET sessions-list → returns { card } with list card body at page 1', async () => {
+      const sessions = Array.from({ length: 25 }, (_, i) =>
+        row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }),
+      );
+      const requestSpy = vi.fn(async () => ({ status: 200, body: { sessions }, raw: '' }));
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(requestSpy).toHaveBeenCalledOnce();
+      expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list' });
+      expect(r.toast).toBeUndefined();
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      // Renders the list card title + lands on page 1 of the 3-page set.
+      expect(cardJson).toContain('Dashboard 会话');
+      expect(cardJson).toContain('第 1/3 页');
+    });
+
+    it('non-owner → toast, no GET', async () => {
+      const requestSpy = vi.fn();
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => 'ou_other',
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('invoker mismatch → toast, no GET', async () => {
+      const requestSpy = vi.fn();
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER }, 'ou_stranger'),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
   });
 });

@@ -40,6 +40,23 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.sessions.dm_failed',
   'card.dashboard.sessions.list_failed',
 
+  // ─── sessions card (PR3 slice 2a) — detail card + close action ──────
+  'card.dashboard.sessions.row_detail',
+  'card.dashboard.sessions.detail.title',
+  'card.dashboard.sessions.detail.status_label',
+  'card.dashboard.sessions.detail.cli_label',
+  'card.dashboard.sessions.detail.workingdir_label',
+  'card.dashboard.sessions.detail.chat_label',
+  'card.dashboard.sessions.detail.last_message_label',
+  'card.dashboard.sessions.btn.close',
+  'card.dashboard.sessions.btn.back',
+  'card.dashboard.sessions.confirm.close.title',
+  'card.dashboard.sessions.confirm.close.text',
+  'card.dashboard.sessions.close_failed',
+  'card.dashboard.sessions.session_not_found',
+  'card.dashboard.sessions.close.disabled.alreadyClosed',
+  'card.dashboard.sessions.close.disabled.starting',
+
   // ─── schedules card (PR3 slice 1) ───────────────────────────────────
   'card.dashboard.schedules.title',
   'card.dashboard.schedules.count_summary',

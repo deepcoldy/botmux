@@ -114,4 +114,107 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
+
+  // ─── Slice 2a: detail / close dispatch ──────────────────────────────
+  it('detail: fast path returns { card } with detail body; updateMessage NOT called', async () => {
+    const sessions = [
+      { sessionId: 'sess_a', rootMessageId: 'om', chatId: 'oc', chatType: 'group',
+        title: 'visible', cliId: 'claude-code', workingDir: '~/x', status: 'idle',
+        lastMessageAt: 1_000_000, cliVersion: 'v', webPort: 7891, scope: 'thread',
+        spawnedAt: 0, larkAppId: LARK_APP_ID, isOncall: false, hasHistory: true },
+    ];
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+        return { status: 200, raw: '', body: { sessions } };
+      }
+      throw new Error('unexpected: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: { value: { action: 'dash_sessions_detail', invoker_open_id: INVOKER, session_id: 'sess_a' } },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast).toBeUndefined();
+    expect(result.card).toBeDefined();
+    const cardJson = JSON.stringify(result.card?.data);
+    // Detail card header rendered + close button action embedded.
+    expect(cardJson).toContain('会话详情');
+    expect(cardJson).toContain('dash_sessions_close');
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('close (happy): returns { card } with closed-state detail; updateMessage NOT called', async () => {
+    const sessions = [
+      { sessionId: 'sess_close', rootMessageId: 'om', chatId: 'oc', chatType: 'group',
+        title: 'close me', cliId: 'claude-code', workingDir: '~/x', status: 'idle',
+        lastMessageAt: 1_000_000, cliVersion: 'v', webPort: 7891, scope: 'thread',
+        spawnedAt: 0, larkAppId: LARK_APP_ID, isOncall: false, hasHistory: true },
+    ];
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+        return { status: 200, raw: '', body: { sessions } };
+      }
+      if (req.method === 'POST' && req.path === '/__daemon/sessions/sess_close/close') {
+        return { status: 200, raw: '', body: { ok: true, alreadyClosed: false } };
+      }
+      throw new Error('unexpected: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: { value: { action: 'dash_sessions_close', invoker_open_id: INVOKER, session_id: 'sess_close' } },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    // Single-pass: card returned, NO toast (per the slice 2a contract).
+    expect(result.toast).toBeUndefined();
+    expect(result.card).toBeDefined();
+    const cardJson = JSON.stringify(result.card?.data);
+    // Closed-state synth: detail card renders the disabled-close note.
+    expect(cardJson).toContain('会话已关闭');
+    expect(cardJson).toContain('"disabled":true');
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('close (non-200): toast close_failed only; NO card returned', async () => {
+    const sessions = [
+      { sessionId: 'sess_close', rootMessageId: 'om', chatId: 'oc', chatType: 'group',
+        title: 'close me', cliId: 'claude-code', workingDir: '~/x', status: 'idle',
+        lastMessageAt: 1_000_000, cliVersion: 'v', webPort: 7891, scope: 'thread',
+        spawnedAt: 0, larkAppId: LARK_APP_ID, isOncall: false, hasHistory: true },
+    ];
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+        return { status: 200, raw: '', body: { sessions } };
+      }
+      if (req.method === 'POST' && req.path === '/__daemon/sessions/sess_close/close') {
+        return { status: 500, raw: '', body: { error: 'internal' } };
+      }
+      throw new Error('unexpected: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: { value: { action: 'dash_sessions_close', invoker_open_id: INVOKER, session_id: 'sess_close' } },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast?.content).toContain('关闭失败');
+    expect(result.card).toBeUndefined();
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
 });

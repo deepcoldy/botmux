@@ -2744,6 +2744,59 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     release2();
     await Promise.all([a, b]);
   });
+
+  // PR3 sessions slice 2a — per-row 📂 详情 buttons share `action: dash_sessions_detail`,
+  // only `value.session_id` distinguishes them. The cardActionKey already includes
+  // `sessionId`, but pin it down so a future key refactor can't silently drop it.
+  it('concurrent `dash_sessions_detail` clicks on DIFFERENT session_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'detail_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'detail_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (sessionId: string) => ({
+      action: { value: { action: 'dash_sessions_detail', invoker_open_id: USER_OPEN_ID, session_id: sessionId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_detail_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('sess_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('sess_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing session_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion test: same session_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent slice-2a
+  // actions (e.g. close) can't double-fire mid-flight.
+  it('concurrent `dash_sessions_detail` clicks on the SAME session_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'detail_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_sessions_detail', invoker_open_id: USER_OPEN_ID, session_id: 'sess_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_detail_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    // Second click hits the in-flight guard and returns a toast.
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
 });
 
 describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {

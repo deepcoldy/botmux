@@ -596,6 +596,22 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.dm_sent': '📬 Dashboard 会话列表已私信给 Bot Owner。',
   'card.dashboard.sessions.dm_failed': '⚠️ 给 Bot Owner 发送会话列表失败：{reason}',
   'card.dashboard.sessions.list_failed': '⚠️ 拉取会话列表失败：{reason}',
+  // sessions card (PR3 slice 2a) — detail card + close action
+  'card.dashboard.sessions.row_detail': '📂 详情',
+  'card.dashboard.sessions.detail.title': '🖥️ 会话详情',
+  'card.dashboard.sessions.detail.status_label': '状态：{status}',
+  'card.dashboard.sessions.detail.cli_label': 'CLI：{cli}',
+  'card.dashboard.sessions.detail.workingdir_label': '工作目录：{dir}',
+  'card.dashboard.sessions.detail.chat_label': '群：{chat}',
+  'card.dashboard.sessions.detail.last_message_label': '最近活跃：{rel}',
+  'card.dashboard.sessions.btn.close': '⏏ 关闭',
+  'card.dashboard.sessions.btn.back': '🔙 返回',
+  'card.dashboard.sessions.confirm.close.title': '确认关闭会话？',
+  'card.dashboard.sessions.confirm.close.text': '关闭后会话将无法继续，已有进度可能丢失。会话：{title}',
+  'card.dashboard.sessions.close_failed': '⚠️ 关闭失败：{reason}',
+  'card.dashboard.sessions.session_not_found': '⚠️ 会话不存在或已被清理。',
+  'card.dashboard.sessions.close.disabled.alreadyClosed': '会话已关闭',
+  'card.dashboard.sessions.close.disabled.starting': '会话启动中，暂不可关闭',
 
   // schedules card (PR3 slice 1)
   'card.dashboard.schedules.title': '⏰ Dashboard 定时任务',

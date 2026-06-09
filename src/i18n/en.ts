@@ -593,6 +593,22 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.dm_sent': '📬 The dashboard sessions list was DMed to the Bot Owner.',
   'card.dashboard.sessions.dm_failed': '⚠️ Failed to DM the sessions list to Bot Owner: {reason}',
   'card.dashboard.sessions.list_failed': '⚠️ Failed to fetch sessions list: {reason}',
+  // sessions card (PR3 slice 2a) — detail card + close action
+  'card.dashboard.sessions.row_detail': '📂 Detail',
+  'card.dashboard.sessions.detail.title': '🖥️ Session Detail',
+  'card.dashboard.sessions.detail.status_label': 'status: {status}',
+  'card.dashboard.sessions.detail.cli_label': 'CLI: {cli}',
+  'card.dashboard.sessions.detail.workingdir_label': 'workingDir: {dir}',
+  'card.dashboard.sessions.detail.chat_label': 'chat: {chat}',
+  'card.dashboard.sessions.detail.last_message_label': 'last active: {rel}',
+  'card.dashboard.sessions.btn.close': '⏏ Close',
+  'card.dashboard.sessions.btn.back': '🔙 Back',
+  'card.dashboard.sessions.confirm.close.title': 'Close this session?',
+  'card.dashboard.sessions.confirm.close.text': 'Once closed the session cannot continue and any in-flight progress may be lost. Session: {title}',
+  'card.dashboard.sessions.close_failed': '⚠️ Close failed: {reason}',
+  'card.dashboard.sessions.session_not_found': '⚠️ Session not found or already cleaned up.',
+  'card.dashboard.sessions.close.disabled.alreadyClosed': 'Session already closed',
+  'card.dashboard.sessions.close.disabled.starting': 'Session is starting; close disabled',
 
   // schedules card (PR3 slice 1)
   'card.dashboard.schedules.title': '⏰ Dashboard Schedules',
