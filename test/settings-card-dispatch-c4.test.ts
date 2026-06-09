@@ -1,12 +1,12 @@
 /**
- * Production dispatch path test (PR3 C4 B2 — UI revision pass 2).
+ * Production dispatch path test (PR3 C4 B2 — UI revision pass 3, codex A/B).
  *
- * The card-handler dispatch arm now invokes `handleSettingsCardAction` with
- * NO `patchCard`. The settings handler returns `{toast, card}` directly so
- * the event-dispatcher passes the rebuilt card body back to Lark in the
- * SAME callback response. This eliminates the stale-render flash that the
- * earlier `patchCard → updateMessage` pattern caused (spinner → old card →
- * push arrives → new card).
+ * The card-handler dispatch arm invokes `handleSettingsCardAction` with NO
+ * `patchCard`. On the success path the settings handler returns ONLY
+ * `{ card }` (no toast) so the event-dispatcher passes the rebuilt card
+ * body back to Lark in the SAME callback response. Returning a toast
+ * alongside the card makes the Lark client render in two separate passes,
+ * flashing the OLD card state in the gap (the bug pass 2 hit).
  *
  * Slow fallback: if the handler exceeds the event-dispatcher 2.5s ACK-safe
  * cutoff, `patchTimedOutCardActionResult` will call `updateMessage` on the
@@ -81,7 +81,7 @@ function makeDeps(): any {
   };
 }
 
-describe('handleCardAction → settings dispatch returns {toast, card} (PR3 pass 2)', () => {
+describe('handleCardAction → settings dispatch returns { card } only on success (PR3 pass 3)', () => {
   it('happy toggle: result.card carries the rebuilt card; updateMessage NOT called on the fast path', async () => {
     const requestSpy = vi.fn(async (req: any) => {
       if (req.method === 'PUT' && req.path === '/__daemon/settings-write') {

@@ -376,9 +376,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const { handleSettingsCardAction } = await import('./settings-card.js');
     const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
     const settingsLocale = localeForBot(larkAppId);
-    // PR3 UI revision pass 2: handler returns `{toast, card}` so the
-    // event-dispatcher passes the rebuilt card body straight back to Lark
-    // in the SAME callback response, eliminating the stale-render flash.
+    // PR3 UI revision pass 3 (codex A/B): handler returns ONLY `{ card }`
+    // on the success path so the event-dispatcher passes the rebuilt card
+    // body straight back to Lark in the SAME callback response. Returning
+    // a toast alongside the card makes the client render in two passes,
+    // flashing the OLD card state in the gap (the bug user hit on pass 2).
     // No `patchCard` callback is needed; the slow-fallback path is handled
     // by `event-dispatcher.patchTimedOutCardActionResult` (it sees the
     // shaped `{card}` and calls `updateMessage` only when the handler

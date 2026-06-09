@@ -332,7 +332,7 @@ describe('handleSettingsCardAction', () => {
     expect((r as any).card).toBeDefined();
   });
 
-  it('happy toggle: PUT response yields a {toast, card} result so Lark patches atomically (B2 — PR3 pass 2)', async () => {
+  it('happy toggle: PUT response yields a card-only result so Lark patches in a single pass (B2 — PR3 pass 3)', async () => {
     const requestSpy = vi.fn(async () => ({
       status: 200, raw: '',
       body: { ok: true, settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
@@ -342,9 +342,9 @@ describe('handleSettingsCardAction', () => {
     });
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
-    // PR3 UI revision pass 2: card is shipped IN the response so the client
-    // patches the card atomically with the toast — no out-of-band updateMessage,
-    // no stale-render flash.
+    // PR3 UI revision pass 3 (codex A/B): card-only response. Returning
+    // a toast alongside the card makes the Lark client render in two
+    // passes, flashing the OLD card state in the gap — pass 2 hit that.
     expect(r.card).toBeDefined();
     expect(r.card?.type).toBe('raw');
     expect(r.card?.data).toBeDefined();
@@ -354,7 +354,7 @@ describe('handleSettingsCardAction', () => {
     expect(cardJson).toContain('✓ 已开启');  // current value indicator for the now-ON toggle
   });
 
-  it('refresh: GET snapshot yields a {toast, card} result with the snapshot card (B2 — PR3 pass 2)', async () => {
+  it('refresh: GET snapshot yields a card-only result with the snapshot card (B2 — PR3 pass 3)', async () => {
     const snapshotResponse = { status: 200, raw: '', body: { settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } } };
     const requestSpy = vi.fn(async () => snapshotResponse);
     const deps = makeDeps({

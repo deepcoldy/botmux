@@ -17,10 +17,13 @@
  *        - await the Route B PUT/GET (resolves the owner's union_id via
  *          `resolveUserUnionId` first, since the server-side write API
  *          still requires `ownerUnionId` in the body),
- *        - return `{ toast, card }` together so the event-dispatcher
- *          ships both back to Lark in the SAME callback response.
- *          Lark's client renders them atomically (no stale-render flash),
- *          and the spinner shows for the full network roundtrip.
+ *        - return ONLY `{ card }` (no toast) on the success path so the
+ *          event-dispatcher passes the rebuilt card body back to Lark in
+ *          the SAME callback response. Toast + card together makes the
+ *          Lark client render the toast and the card replacement in two
+ *          separate passes, flashing the OLD card state during the gap;
+ *          card-only avoids that. Errors/permission denials/noop still
+ *          return a plain toast (they have no card to render).
  *
  * Write actions are NEVER retried — the C7 client retry policy already
  * disables non-GET retries, and toggling a setting twice is a real-world
@@ -412,9 +415,9 @@ function successResult(
 
 /**
  * Dispatch a `dash_settings_*` action callback. Awaits the Route B
- * GET/PUT inline and returns the final `{toast, card}` envelope so Lark
- * patches the card atomically with the toast — see the module docstring
- * for why this matters (spinner UX + no stale-render flash).
+ * GET/PUT inline. Success path returns `{ card }` (card-only — see the
+ * module docstring for why we drop the toast). Errors / permission
+ * denials / noop return a plain `{ toast }`.
  */
 export async function handleSettingsCardAction(
   data: CardActionData,
@@ -463,8 +466,8 @@ export async function handleSettingsCardAction(
   }
 
   // ─── 4a) Refresh — read-only path (NO PUT) ───────────────────────────
-  // Inline await + return rebuilt card in the SAME response so Lark's
-  // client patches the card atomically with the toast (no stale flash).
+  // Inline await + return rebuilt card in the SAME response (card-only,
+  // see successResult docstring for why we don't return a toast here).
   if (action === SETTINGS_ACTION_REFRESH) {
     try {
       const client = deps.createClient(larkAppId);
