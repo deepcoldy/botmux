@@ -7,9 +7,11 @@
 //     no worker yet, so the normal spawn-time announce never fires) and
 //     no-ops for non-pending sessions
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'fs';
 import { composeRowFromActive } from '../src/core/dashboard-rows.js';
-import { publishAttentionPatch, announcePendingRepoSession } from '../src/core/session-activity.js';
+import { publishAttentionPatch, announcePendingRepoSession, clearAgentAttention } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import { attentionWaitSince } from '../src/dashboard/web/ui.js';
 import {
   setTerminalProxyPort,
   setTerminalExternalPort,
@@ -66,6 +68,17 @@ describe('attention signals', () => {
     expect(quiet.tuiPromptActive).toBe(false);
   });
 
+  it('composeRowFromActive carries the agent raise-hand signal with its reason', () => {
+    const raised = composeRowFromActive(makeDs({
+      agentAttention: { kind: 'authz', reason: '需要 prod 部署授权', at: 1234 },
+    }));
+    // `at` (raise time) is exposed so the UI shows a true "waiting since" time
+    expect(raised.agentAttention).toEqual({ kind: 'authz', reason: '需要 prod 部署授权', at: 1234 });
+
+    // quiet sessions omit the field entirely (not a needs-you row)
+    expect(composeRowFromActive(makeDs()).agentAttention).toBeUndefined();
+  });
+
   it('composeRowFromActive carries the session scope (locate vs open-chat)', () => {
     const chatScoped = makeDs();
     chatScoped.session.scope = 'chat';
@@ -87,9 +100,31 @@ describe('attention signals', () => {
       type: 'session.update',
       body: {
         sessionId: 'sess-1',
-        patch: { pendingRepo: false, tuiPromptActive: true },
+        patch: { pendingRepo: false, tuiPromptActive: true, agentAttention: null },
       },
     });
+  });
+
+  it('publishAttentionPatch carries agentAttention (object when raised, null to clear)', () => {
+    const seen = collectEvents();
+    const ds = makeDs({ agentAttention: { kind: 'decision', reason: '要删 old_users 表', at: 5 } });
+    publishAttentionPatch(ds);
+    ds.agentAttention = undefined;
+    publishAttentionPatch(ds);
+    expect(seen.map(e => (e as any).body.patch.agentAttention)).toEqual([
+      { kind: 'decision', reason: '要删 old_users 表', at: 5 },
+      null,
+    ]);
+  });
+
+  it('clearAgentAttention clears once and publishes the null patch', () => {
+    const seen = collectEvents();
+    const ds = makeDs({ agentAttention: { kind: 'blocked', reason: '缺权限', at: 5 } });
+
+    expect(clearAgentAttention(ds)).toBe(true);
+    expect(ds.agentAttention).toBeUndefined();
+    expect(clearAgentAttention(ds)).toBe(false);
+    expect(seen.map(e => (e as any).body.patch.agentAttention)).toEqual([null]);
   });
 
   it('publishAttentionPatch reflects cleared signals (idempotent re-derive)', () => {
@@ -117,6 +152,32 @@ describe('attention signals', () => {
     announcePendingRepoSession(makeDs({ pendingRepo: false }));
     announcePendingRepoSession(makeDs());
     expect(seen).toHaveLength(0);
+  });
+
+  it('handleThreadReply clears agent attention before early-return intercepts', () => {
+    const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
+    const start = src.indexOf('async function handleThreadReply(');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = src.slice(start, start + 12000);
+    const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    for (const marker of [
+      'isCallbackUrl(content)',
+      'handleWorkflowCommandIfAny',
+      'parseSlashCommandInvocation',
+      'findPendingAskByAnchor',
+    ]) {
+      const markerIdx = region.indexOf(marker);
+      expect(markerIdx).toBeGreaterThanOrEqual(0);
+      expect(clearIdx).toBeLessThan(markerIdx);
+    }
+  });
+
+  it('attentionWaitSince prefers agent raise time and falls back safely', () => {
+    expect(attentionWaitSince({ agentAttention: { at: 1234 }, lastMessageAt: 9999 })).toBe(1234);
+    expect(attentionWaitSince({ pendingRepo: true, lastMessageAt: 9999 })).toBe(9999);
+    expect(attentionWaitSince({ agentAttention: { at: 'bad' }, lastMessageAt: 9999 })).toBe(9999);
+    expect(attentionWaitSince({})).toBe(0);
   });
 });
 

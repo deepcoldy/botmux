@@ -54,6 +54,40 @@ export function tryCapturePipeSnapshot(
   return { cols, rows, ansi };
 }
 
+/**
+ * True when the backend's screen can change WITHOUT bumping the worker's
+ * onPtyData activity watermark — i.e. an observe backend that has paused its
+ * change-emission poller for a live web-attach (ZellijObserveBackend). In that
+ * window the watermark is not a sound snapshot-invalidation source.
+ */
+export function isScreenSelfDriven(backend: unknown): boolean {
+  return (
+    isObserveBackend(backend) &&
+    typeof backend.isLiveAttachActive === 'function' &&
+    backend.isLiveAttachActive()
+  );
+}
+
+/**
+ * Whether startScreenUpdates must (re)capture the pane this tick.
+ *
+ * Steady state: the screen is reconstructed only when `lastPtyActivityAtMs`
+ * advances — onPtyData is the single point that both bumps it and feeds the
+ * renderer, so an unchanged watermark means a byte-identical screen and a
+ * capture would be pure waste. That invariant fails when `screenSelfDriven` is
+ * true (observe backend with emission paused for a live attach): the pane keeps
+ * changing but the watermark is frozen, so we must capture unconditionally —
+ * the pre-optimization behaviour — until the attach drops and the poller (hence
+ * the watermark) resumes.
+ */
+export function shouldCaptureScreen(opts: {
+  ptyActivity: number;
+  lastCapturedPtyActivity: number;
+  screenSelfDriven: boolean;
+}): boolean {
+  return opts.screenSelfDriven || opts.ptyActivity !== opts.lastCapturedPtyActivity;
+}
+
 /** Feed an ANSI snapshot into a transient xterm-headless and yield the
  *  terminal once tmux's bytes have been consumed by the parser. Caller MUST
  *  dispose() the terminal when done. */

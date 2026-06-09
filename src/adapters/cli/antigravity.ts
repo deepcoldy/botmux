@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 /**
@@ -53,10 +54,6 @@ import type { CliAdapter, PtyHandle } from './types.js';
  */
 
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
@@ -117,7 +114,7 @@ function historyDeltaContains(path: string, fromByte: number, marker: string): b
 async function waitForHistoryAppend(
   path: string, fromByte: number, marker: string, timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     if (historyDeltaContains(path, fromByte, marker)) return true;
     await delay(100);

@@ -48,6 +48,12 @@ export interface SessionRow {
   /** A TUI prompt card is open and waiting for the user's choice.
    *  Feeds the board view's needs-you column. */
   tuiPromptActive?: boolean;
+  /** The agent raised a hand (`botmux send --attention`) — it hit a blocker
+   *  needing human intervention. Carries the human-readable reason so the
+   *  board/overview can show *why* at a glance, plus `at` (epoch ms when it
+   *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
+   *  which a silent raise never bumps. Feeds the needs-you column. */
+  agentAttention?: { kind: string; reason: string; at: number };
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -100,6 +106,9 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     feishuChatLink: feishuChatLink(ds.chatId, getBotBrand(ds.larkAppId)),
     pendingRepo: !!ds.pendingRepo,
     tuiPromptActive: !!ds.tuiPromptCardId,
+    agentAttention: ds.agentAttention
+      ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+      : undefined,
   };
 }
 

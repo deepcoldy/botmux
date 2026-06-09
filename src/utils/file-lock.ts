@@ -36,7 +36,20 @@ async function isPidAlive(pid: number): Promise<boolean> {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-export async function withFileLock<T>(targetPath: string, fn: () => Promise<T>): Promise<T> {
+export interface FileLockOptions {
+  /** Max time to wait for the lock before throwing (default MAX_WAIT_MS). */
+  maxWaitMs?: number;
+  /** Min lock age before a dead-PID lock is stale-breakable (default MIN_STALE_AGE_MS). */
+  minStaleAgeMs?: number;
+}
+
+export async function withFileLock<T>(
+  targetPath: string,
+  fn: () => Promise<T>,
+  opts: FileLockOptions = {},
+): Promise<T> {
+  const maxWaitMs = opts.maxWaitMs ?? MAX_WAIT_MS;
+  const minStaleAgeMs = opts.minStaleAgeMs ?? MIN_STALE_AGE_MS;
   const lockPath = targetPath + '.lock';
   const start = Date.now();
   while (true) {
@@ -70,7 +83,7 @@ export async function withFileLock<T>(targetPath: string, fn: () => Promise<T>):
       }
 
       const breakable = holder
-        && lockAgeMs >= MIN_STALE_AGE_MS
+        && lockAgeMs >= minStaleAgeMs
         && !(await isPidAlive(holder));
       if (breakable) {
         // Atomic rename: only ONE caller wins. The winner is responsible
@@ -88,7 +101,7 @@ export async function withFileLock<T>(targetPath: string, fn: () => Promise<T>):
         }
       }
 
-      if (Date.now() - start > MAX_WAIT_MS) {
+      if (Date.now() - start > maxWaitMs) {
         throw new Error(
           `file-lock timeout waiting for ${lockPath} ` +
           `(held by pid ${holder || '?'}, age ${Math.round(lockAgeMs)}ms)`,

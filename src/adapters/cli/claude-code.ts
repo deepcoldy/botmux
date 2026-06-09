@@ -6,6 +6,7 @@ import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { t } from '../../i18n/index.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -79,10 +80,10 @@ function deltaHasSubmit(path: string, fromByte: number): boolean {
 }
 
 async function waitForSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     if (deltaHasSubmit(path, baseByte)) return true;
-    await new Promise(r => setTimeout(r, 100));
+    await delay(100);
   }
   return false;
 }
@@ -551,11 +552,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       const isFirstWrite = !claudeFirstWriteSeen.has(pty);
       if (isFirstWrite) {
         claudeFirstWriteSeen.add(pty);
-        await new Promise(r => setTimeout(r, 200));
+        await delay(200);
       }
       const TYPING_THROTTLE_MS = isFirstWrite ? 80 : 30;
 
-      const tick = () => new Promise<void>(r => setTimeout(r, TYPING_THROTTLE_MS));
+      const tick = () => delay(TYPING_THROTTLE_MS);
       const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
 
       const sendSubmit = (): boolean => {
@@ -632,7 +633,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // we control the markers directly.
         pty.write('\x1b[200~' + content + '\x1b[201~');
       }
-      await new Promise(r => setTimeout(r, submitDelay));
+      await delay(submitDelay);
       if (!sendSubmit()) {
         return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
       }

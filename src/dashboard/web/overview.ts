@@ -3,6 +3,7 @@
 import { store } from './store.js';
 import {
   attentionReason,
+  attentionWaitSince,
   botAvatarHtml,
   botDisplayName,
   chatDisplayTitle,
@@ -94,7 +95,7 @@ function mateCardHtml(card: BotCard): string {
   const dotClass = needsYou ? 'warn' : busy ? 'busy' : offline ? 'off' : 'ok';
   let taskHtml: string;
   if (needsYou) {
-    const a = card.attention[0];
+    const a = [...card.attention].sort((x, y) => attentionWaitSince(x) - attentionWaitSince(y))[0];
     taskHtml = `<b>${escapeHtml((stripMentionPrefix(a.title) || a.sessionId).slice(0, 60))}</b> · ${escapeHtml(attentionReason(a) ?? '')}`;
   } else if (busy) {
     const w = [...card.busy].sort((x, y) => Number(y.lastMessageAt ?? 0) - Number(x.lastMessageAt ?? 0))[0];
@@ -133,7 +134,7 @@ function attentionCardHtml(s: any): string {
     ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
     <div class="qcard-tx">
       <b>${escapeHtml(botName)} · ${escapeHtml((stripMentionPrefix(s.title) || s.sessionId).slice(0, 56))}</b>
-      <span>${escapeHtml(attentionReason(s) ?? '')} · ${relTime(s.lastMessageAt)}</span>
+      <span>${escapeHtml(attentionReason(s) ?? '')} · ${relTime(attentionWaitSince(s))}</span>
     </div>
     <a class="qcard-go" href="#/sessions">${escapeHtml(t('strip.handle'))}</a>
   </article>`;
@@ -246,7 +247,7 @@ export async function renderOverviewPage(root: HTMLElement) {
     const active = sessions.filter(s => s.status !== 'closed');
     const attention = active
       .filter(s => attentionReason(s))
-      .sort((a, b) => Number(a.lastMessageAt ?? 0) - Number(b.lastMessageAt ?? 0));
+      .sort((a, b) => attentionWaitSince(a) - attentionWaitSince(b));
     const busy = active.filter(s => BUSY_STATUSES.has(s.status) && !attentionReason(s));
     const idle = active.length - attention.length - busy.length;
 

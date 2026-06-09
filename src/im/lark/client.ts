@@ -7,6 +7,7 @@ import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
+import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
@@ -368,7 +369,9 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
  * chat) which the user perceives as a loading spinner. Mirrors the TTL
  * cache `getChatMode` already has. */
 interface ChatInfoCacheEntry { name: string | null; mode: ChatMode; cachedAt: number }
-const chatInfoCache = new Map<string, ChatInfoCacheEntry>();
+// Bounded: keyed per (appId, chatId); TTL handles freshness on read, the cap
+// stops the entry count growing with every distinct chat the bot ever touches.
+const chatInfoCache = new BoundedMap<string, ChatInfoCacheEntry>(1000);
 const CHAT_INFO_TTL_MS = 5 * 60 * 1000;
 
 export async function getChatNameAndMode(
@@ -420,7 +423,7 @@ export async function getChatNameAndMode(
  *                perspective (chat-scope by default) */
 export type ChatMode = 'group' | 'topic' | 'p2p';
 
-const chatModeCache = new Map<string, { mode: ChatMode; cachedAt: number }>();
+const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number }>(1000);
 const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a group is converted to topic mode
 
 /** Resolve the conversational topology of a chat (话题群 vs 普通群 vs p2p).

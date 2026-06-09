@@ -1036,15 +1036,18 @@ button.primary {
 .session-signal {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
+  justify-self: start;
+  max-width: 100%;
   min-height: 22px;
-  padding: 0 8px;
+  padding: 3px 8px;
   color: var(--danger);
   font-family: var(--mono);
   font-weight: 700;
   font-size: 11px;
-  line-height: 1;
+  line-height: 1.35;
   letter-spacing: 0.04em;
+  text-align: left;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--danger) 9%, transparent);
   border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);

@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { join, dirname } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 
 // resolveCommand() shells out to probe for the binary; mock it so an absolute
@@ -26,7 +26,10 @@ import { createSeedAdapter, deriveSeedDataDir } from '../src/adapters/cli/seed.j
 describe('deriveSeedDataDir', () => {
   it('derives <pkg>/.claude-runtime from a binary realpath (symlink shim → dist/cli.js)', () => {
     // Mirror the real install layout: <pkg>/dist/cli.js, reached via a shim symlink.
-    const root = mkdtempSync(join(tmpdir(), 'seed-pkg-'));
+    // realpathSync: on macOS os.tmpdir() is itself a symlink (/var → /private/var),
+    // and deriveSeedDataDir realpath-resolves the binary — compare against the
+    // resolved root so the expected path isn't missing the /private prefix.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'seed-pkg-')));
     const pkg = join(root, 'node_modules', '@bytedance-seed', 'claude-code');
     mkdirSync(join(pkg, 'dist'), { recursive: true });
     writeFileSync(join(pkg, 'dist', 'cli.js'), '// seed');
@@ -45,7 +48,9 @@ describe('deriveSeedDataDir', () => {
 
 describe('createSeedAdapter', () => {
   // Use a real on-disk layout so dataDir is the package's .claude-runtime.
-  const root = mkdtempSync(join(tmpdir(), 'seed-adapter-'));
+  // realpathSync resolves the macOS /var → /private/var tmpdir symlink so the
+  // expected paths match what the adapter (which realpaths the binary) returns.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'seed-adapter-')));
   const pkg = join(root, 'pkg', 'claude-code');
   mkdirSync(join(pkg, 'dist'), { recursive: true });
   writeFileSync(join(pkg, 'dist', 'cli.js'), '// seed');

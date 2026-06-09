@@ -1,15 +1,19 @@
 /**
  * Slash-command discovery — enumerate the user-installed / project-local slash
- * commands, skills and plugins that the underlying CLI (Claude Code family)
- * would surface, purely by scanning the filesystem. Powers part ③ of the
- * `/list-slash-command` daemon command.
+ * commands, skills and plugins that the underlying CLI would surface, purely
+ * by scanning the filesystem. Powers part ③ of the `/list-slash-command`
+ * daemon command.
  *
- * Scope (v1): the Claude `.claude/` layout —
+ * Claude-family scope: the Claude `.claude/` layout —
  *   • custom commands:  <root>/.claude/commands/**\/*.md  → /name (subdir → ns:name)
  *   • skills:           <root>/.claude/skills/*\/SKILL.md  → /name
  *   • plugins:          <claudeHome>/plugins/cache/<mp>/<plugin>/[<ver>/]{commands,skills}
  * where <root> ∈ { workingDir (project), claudeHome (personal) } and
  * <claudeHome> = $CLAUDE_CONFIG_DIR || ~/.claude.
+ *
+ * Other CLIs are driven by their adapter's `skillsDir` / `pluginDir` fields
+ * (e.g. Codex `~/.codex/skills`, CoCo/Trae `~/.trae/skills`, OpenCode
+ * `~/.config/opencode/skills`).
  *
  * Intentionally dependency-free (no YAML / glob libs): a tiny frontmatter reader
  * and a bounded recursive walker keep this importable from the leaf-ish command
@@ -23,6 +27,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { join, basename, relative, sep } from 'node:path';
 import { homedir } from 'node:os';
+import type { CliAdapter } from '../adapters/cli/types.js';
 
 export type DiscoveredSource =
   | 'project-command'
@@ -40,6 +45,14 @@ export interface DiscoveredCommand {
   source: DiscoveredSource;
   /** Human-friendly origin (relative-ish path or plugin id) for display. */
   origin: string;
+}
+
+export type CommandDiscoveryAdapter = Pick<CliAdapter, 'claudeDataDir' | 'skillsDir' | 'pluginDir'>;
+
+function expandHome(p: string): string {
+  if (p === '~') return homedir();
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+  return p;
 }
 
 /** Resolve the Claude config/data root the CLI reads commands & skills from.
@@ -167,6 +180,30 @@ function scanPlugins(claudeRoot: string): DiscoveredCommand[] {
   return out;
 }
 
+function pluginName(pluginDir: string): string {
+  const manifest = join(pluginDir, '.claude-plugin', 'plugin.json');
+  try {
+    const parsed = JSON.parse(readFileSync(manifest, 'utf-8'));
+    if (typeof parsed?.name === 'string' && parsed.name.trim()) return parsed.name.trim();
+  } catch {
+    /* no plugin manifest — fall back to dirname */
+  }
+  return basename(pluginDir);
+}
+
+function dedupeAndSort(found: DiscoveredCommand[]): DiscoveredCommand[] {
+  const seen = new Set<string>();
+  const deduped: DiscoveredCommand[] = [];
+  for (const c of found) {
+    const key = c.name; // dedupe by name across sources (fixes duplicate cmds)
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(c);
+  }
+  deduped.sort((a, b) => a.name.localeCompare(b.name));
+  return deduped;
+}
+
 /**
  * Discover all filesystem-visible slash commands for a session's working dir.
  * Personal (`~/.claude`) + project (`<workingDir>/.claude`) + plugins, deduped
@@ -189,16 +226,51 @@ export function discoverSlashCommands(workingDir: string): DiscoveredCommand[] {
     found.push(...scanSkillsDir(join(proj, 'skills'), 'project-skill', '.claude/skills'));
   }
 
-  const seen = new Set<string>();
-  const deduped: DiscoveredCommand[] = [];
-  for (const c of found) {
-    const key = c.name; // dedupe by name across sources (fixes duplicate cmds)
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(c);
+  return dedupeAndSort(found);
+}
+
+export function supportsFilesystemCommandDiscovery(adapter: CommandDiscoveryAdapter | undefined): boolean {
+  return !!(adapter?.claudeDataDir || adapter?.skillsDir || adapter?.pluginDir);
+}
+
+/**
+ * Discover filesystem-visible commands for the concrete CLI adapter.
+ * Claude-family adapters scan their data root plus project `.claude`; all
+ * other adapters scan only the roots they explicitly advertise.
+ */
+export function discoverSlashCommandsForAdapter(
+  workingDir: string,
+  adapter: CommandDiscoveryAdapter,
+): DiscoveredCommand[] {
+  const found: DiscoveredCommand[] = [];
+
+  if (adapter.claudeDataDir) {
+    const rawHome = adapter.claudeDataDir;
+    const home = expandHome(rawHome);
+    found.push(...scanCommandsDir(join(home, 'commands'), 'user-command', `${rawHome}/commands`));
+    found.push(...scanSkillsDir(join(home, 'skills'), 'user-skill', `${rawHome}/skills`));
+    found.push(...scanPlugins(home));
+
+    if (workingDir) {
+      const proj = join(workingDir, '.claude');
+      found.push(...scanCommandsDir(join(proj, 'commands'), 'project-command', '.claude/commands'));
+      found.push(...scanSkillsDir(join(proj, 'skills'), 'project-skill', '.claude/skills'));
+    }
   }
-  deduped.sort((a, b) => a.name.localeCompare(b.name));
-  return deduped;
+
+  if (adapter.skillsDir) {
+    found.push(...scanSkillsDir(expandHome(adapter.skillsDir), 'user-skill', adapter.skillsDir));
+  }
+
+  if (adapter.pluginDir) {
+    const root = expandHome(adapter.pluginDir);
+    found.push(...scanSkillsDir(join(root, 'skills'), 'plugin-skill', `${adapter.pluginDir}/skills`, pluginName(root)));
+    for (const c of scanCommandsDir(join(root, 'commands'), 'plugin-command', `${adapter.pluginDir}/commands`)) {
+      found.push({ ...c, name: c.name.replace(/^\//, `/${pluginName(root)}:`) });
+    }
+  }
+
+  return dedupeAndSort(found);
 }
 
 /**

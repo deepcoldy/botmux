@@ -2,9 +2,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
 
 export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static

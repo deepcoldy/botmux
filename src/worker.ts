@@ -64,12 +64,13 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
+import { prepareSandbox, startOutboxWatcher, sandboxEnabled } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
-import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
+import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
@@ -86,6 +87,7 @@ import { createHash } from 'node:crypto';
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
+let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
@@ -119,7 +121,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -2866,36 +2868,61 @@ function startScreenUpdates(): void {
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
   let lastTextSnapshotHash = '';
+  let lastContent = '';
+  // PTY-activity watermark of the last tick that actually captured. The screen
+  // normally reaches us only through onPtyData (it updates lastPtyActivityAtMs
+  // and feeds the renderer in the same place), so when this hasn't advanced the
+  // screen is byte-identical to lastContent and a capture is pure waste.
+  // Exception: an observe backend that paused its emission poller for a live
+  // web-attach (isScreenSelfDriven) keeps changing without bumping the
+  // watermark — there we must capture every tick (see shouldCaptureScreen).
+  let lastSnapshotPtyActivity = -1;
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) return;
     let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
     if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
 
     void (async () => {
-      let content: string;
-      let changed: boolean;
+      let content = lastContent;
+      let changed = false;
 
-      // Preferred path: pipe-pane backends pull a fresh viewport snapshot
-      // from tmux every tick. This eliminates the accumulated-buffer drift
-      // that produced duplicated/staircase text in 'text' display mode.
-      const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true });
-      if (pipeText) {
-        content = pipeText.content;
-        const hash = pipeText.ansi;
-        changed = hash !== lastTextSnapshotHash;
-        lastTextSnapshotHash = hash;
-        // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
-        // tmux call would otherwise need to fire twice per tick.
-        if (changed) {
-          const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
-          if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
+      // Capture only when the pane has emitted output since our last snapshot.
+      // During idle (the steady state for a parked session) this skips a tmux
+      // capture-pane + a throwaway xterm-headless instantiation every tick —
+      // the dominant per-session background cost — while the status-transition
+      // send below still fires off the cached content. The exception is a
+      // self-driven screen (observe backend with a live web-attach): the
+      // watermark can't be trusted there, so capture every tick.
+      const ptyActivity = lastPtyActivityAtMs;
+      if (shouldCaptureScreen({
+        ptyActivity,
+        lastCapturedPtyActivity: lastSnapshotPtyActivity,
+        screenSelfDriven: isScreenSelfDriven(backend),
+      })) {
+        lastSnapshotPtyActivity = ptyActivity;
+        // Preferred path: pipe-pane backends pull a fresh viewport snapshot
+        // from tmux every tick. This eliminates the accumulated-buffer drift
+        // that produced duplicated/staircase text in 'text' display mode.
+        const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true });
+        if (pipeText) {
+          content = pipeText.content;
+          const hash = pipeText.ansi;
+          changed = hash !== lastTextSnapshotHash;
+          lastTextSnapshotHash = hash;
+          // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
+          // tmux call would otherwise need to fire twice per tick.
+          if (changed) {
+            const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
+            if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
+          }
+        } else if (renderer) {
+          const snap = renderer.snapshot();
+          content = snap.content;
+          changed = snap.changed;
+        } else {
+          return;
         }
-      } else if (renderer) {
-        const snap = renderer.snapshot();
-        content = snap.content;
-        changed = snap.changed;
-      } else {
-        return;
+        lastContent = content;
       }
 
       const usageAware = usageLimitTracker.classify(content, status);
@@ -3318,8 +3345,45 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // them past the server's global env.
   if (cliAdapter.spawnEnv) Object.assign(childEnv, cliAdapter.spawnEnv);
 
-  backend.spawn(cliAdapter.resolvedBin, args, {
-    cwd: cfg.workingDir,
+  // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
+  // per-session project copy + de-identified config. The agent's `botmux send`
+  // routes through a daemon-side outbox watcher (creds never enter the sandbox).
+  // PTY backend only for the spike; falls back to direct spawn on any failure.
+  let spawnBin = cliAdapter.resolvedBin;
+  let spawnArgs = args;
+  let spawnCwd = cfg.workingDir;
+  // Sandbox wraps the spawned binary in bwrap. Works for pty (PtyBackend runs
+  // bwrap directly) and tmux (the tmux pane's command becomes `bwrap … -- cli`);
+  // env is carried via bwrap --setenv (see prepareSandbox), not the backend.
+  const sandboxOn = cfg.sandbox === true || sandboxEnabled();
+  if (sandboxOn && (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux') && process.env.SESSION_DATA_DIR) {
+    try {
+      const sbx = prepareSandbox({
+        enabled: sandboxOn,
+        cliId: cfg.cliId,
+        sessionId: cfg.sessionId,
+        sourceWorkingDir: cfg.workingDir,
+        dataDir: process.env.SESSION_DATA_DIR,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+      });
+      if (sbx) {
+        spawnBin = sbx.bin;
+        spawnArgs = sbx.args;
+        spawnCwd = sbx.workDir;
+        Object.assign(childEnv, sbx.env);
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        // session-id is FORCED here so a relayed send can't target another session.
+        sandboxStopWatcher = startOutboxWatcher(sbx.outbox, childEnv, cfg.sessionId);
+        log(`Sandbox ON (${cfg.cliId}): work=${sbx.workDir} outbox=${sbx.outbox}`);
+      }
+    } catch (err: any) {
+      log(`Sandbox prepare failed (${err.message}) — falling back to direct spawn`);
+    }
+  }
+
+  backend.spawn(spawnBin, spawnArgs, {
+    cwd: spawnCwd,
     cols: PTY_COLS,
     rows: PTY_ROWS,
     env: childEnv as Record<string, string>,
@@ -3529,6 +3593,12 @@ function killCli(): void {
   if (cliPidMarker) {
     try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
     cliPidMarker = null;
+  }
+  // Stop the sandbox outbox watcher (the per-session sandbox tree is left in
+  // place so a same-topic resume reuses the same clone + scoped config).
+  if (sandboxStopWatcher) {
+    try { sandboxStopWatcher(); } catch { /* */ }
+    sandboxStopWatcher = null;
   }
   isPromptReady = false;
   pendingMessages.length = 0;

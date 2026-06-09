@@ -934,6 +934,9 @@ export async function closeSession(
 ): Promise<{ ok: true; alreadyClosed: boolean }> {
   const ds = findActiveBySessionId(sessionId);
   let killedLive = false;
+  // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
+  // 生命周期内永久占位（restartCounts 此前无任何 delete）。
+  restartCounts.delete(sessionId);
   if (ds) {
     killWorker(ds);
     activeSessionsRegistry?.delete(sessionKey(sessionAnchorId(ds), ds.larkAppId));
@@ -1047,14 +1050,24 @@ export async function transferSession(
   targetRootMessageId: string,
   /**
    * Target chat type — narrowed to `'group'` at the type level. The picker-
-   * mode entry guard in command-handler.ts refuses p2p and topic chats
-   * upfront; `/relay --create` builds the target by createGroupWithBots so
-   * it's a regular group by construction; the cross-daemon migrate-to-chat
-   * IPC inherits the same target. Every call site can vouch — TS prevents
-   * any non-'group' literal from reaching here, and the runtime check just
-   * below catches mock data / future bypasses.
+   * mode entry guard in command-handler.ts refuses p2p chats upfront; topic
+   * groups are supported via `targetScope: 'thread'`. `/relay --create` builds
+   * the target by createGroupWithBots so it's a regular group by construction;
+   * the cross-daemon migrate-to-chat IPC inherits the same target. Every call
+   * site can vouch — TS prevents any non-'group' literal from reaching here,
+   * and the runtime check just below catches mock data / future bypasses.
    */
   targetChatType: 'group',
+  /**
+   * Target routing scope for the relayed session.
+   *   'chat'   → anchor = chatId (flat top-level; `/relay --create`, migrate
+   *              IPC, and普通群 flat-mode picker all use this — current behavior).
+   *   'thread' → anchor = `targetRootMessageId` (a Lark 话题/thread); replies
+   *              go reply_in_thread. Picker computes this via
+   *              resolveRelayTargetRouting for 话题群 / new-topic / shared /
+   *              线程内回复.
+   */
+  targetScope: 'thread' | 'chat',
   opts?: {
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
@@ -1071,7 +1084,14 @@ export async function transferSession(
   }
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
-  if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
+  // Anchor-based identity. A thread-scope session in the SAME chat (different
+  // root) is a legitimate cross-topic move, so we refuse only when the target
+  // anchor equals the source anchor (relaying a session onto itself). Replaces
+  // the old `targetChatId === ds.chatId → same_chat` check, which would have
+  // blocked同群话题间搬运.
+  const sourceAnchor = sessionAnchorId(ds);
+  const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
+  if (targetAnchor === sourceAnchor) return { ok: false, error: 'same_anchor' };
 
   // pendingRepo: the user created a session via M0 but hasn't picked a repo
   // yet, so worker is null and the CLI has never run. Relaying produces an
@@ -1105,8 +1125,8 @@ export async function transferSession(
     return { ok: false, error: 'worker_busy' };
   }
 
-  // Existing-session guard: a chat-scope session at the target chatId would
-  // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
+  // Existing-session guard: a session sharing the *target anchor* would
+  // collide on sessionKey(targetAnchor, larkAppId) after the rewrite, and
   // Map.set would silently orphan the prior entry's worker. We split the
   // collision predicate two ways:
   //   - real session (worker !== null): refuse the transfer
@@ -1117,15 +1137,15 @@ export async function transferSession(
   //     transfer Map.set doesn't silently overwrite it (which leaves the
   //     scratch as a ghost-active on next daemon restart — exact bug we're
   //     fixing).
-  // We only check chat-scope entries — thread-scope sessions in the same
-  // chat are keyed by rootMessageId, so they don't collide.
+  // Anchor-based: chat-scope anchors on chatId, thread-scope on rootMessageId.
+  // Only a session at the target anchor collides — same-chat other-topic
+  // sessions have a different anchor and are fine (enables同群话题间搬运).
   const scratchesToClose: string[] = [];
   if (activeSessionsRegistry) {
     for (const existing of activeSessionsRegistry.values()) {
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
-      if (existing.chatId !== targetChatId) continue;
-      if (existing.scope !== 'chat') continue;
+      if (sessionAnchorId(existing) !== targetAnchor) continue;
       if (!existing.worker) {
         scratchesToClose.push(existing.session.sessionId);
         continue;
@@ -1174,12 +1194,16 @@ export async function transferSession(
   kw(ds);
   activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
 
-  // Rewrite routing fields. Target chat is always chat-scope: leader posts a
-  // notification message (M1) used as `targetRootMessageId` for trace, but
-  // chat-scope routes by chatId anyway, so M1 is purely audit/UX.
+  // Rewrite routing fields per the requested target scope.
+  //   chat-scope:   routes by chatId; `targetRootMessageId` (e.g. an M1 id) is
+  //                 stored on rootMessageId but is purely audit/UX.
+  //   thread-scope: routes by rootMessageId; `targetRootMessageId` IS the
+  //                 routing anchor (the Lark 话题 root) — replies reply_in_thread
+  //                 to it, and future inbound messages in that 话题 resolve to
+  //                 the same anchor.
   ds.session.chatId = targetChatId;
   ds.session.rootMessageId = targetRootMessageId;
-  ds.session.scope = 'chat';
+  ds.session.scope = targetScope;
   ds.session.chatType = targetChatType;
   ds.session.lastMessageAt = new Date().toISOString();
   // Card state was pinned to the source chat — clear so the new worker posts
@@ -1192,7 +1216,7 @@ export async function transferSession(
   // Mirror onto runtime DaemonSession.
   ds.chatId = targetChatId;
   ds.chatType = targetChatType;
-  ds.scope = 'chat';
+  ds.scope = targetScope;
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.currentImageKey = undefined;
@@ -1211,7 +1235,7 @@ export async function transferSession(
       patch: {
         chatId: targetChatId,
         rootMessageId: targetRootMessageId,
-        scope: 'chat',
+        scope: targetScope,
         chatType: targetChatType,
       },
     },
@@ -1317,6 +1341,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliPathOverride: botCfg.cliPathOverride,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    sandbox: botCfg.sandbox === true,
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,

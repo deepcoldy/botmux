@@ -56,6 +56,14 @@ export interface ObserveBackend extends SessionBackend {
   getPaneSize(): { cols: number; rows: number } | null;
   /** Cheap liveness probe. */
   isPaneAlive(): boolean;
+  /**
+   * True while a live web-attach client is connected and this backend has
+   * paused its change-emission poller (ZellijObserveBackend does this to avoid
+   * attach flicker — see setLiveAttach). During that window the pane can keep
+   * changing without ever reaching onData, so a snapshot watermark fed by
+   * onData/onPtyData goes stale. Backends that never pause emission omit this.
+   */
+  isLiveAttachActive?(): boolean;
 }
 
 /** Duck-typed guard — true for any backend exposing the ObserveBackend surface. */

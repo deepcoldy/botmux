@@ -13,7 +13,7 @@ import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { renderV3RunsPage } from './v3.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
-import { attentionReason, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
+import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
 import type { DashboardLocale } from './i18n.js';
 
@@ -120,7 +120,7 @@ function paintAttentionStrip(): void {
   const pending = [...store.sessions.values()]
     .map(s => ({ s, reason: attentionReason(s) }))
     .filter((x): x is { s: any; reason: string } => !!x.reason)
-    .sort((a, b) => Number(a.s.lastMessageAt ?? 0) - Number(b.s.lastMessageAt ?? 0));
+    .sort((a, b) => attentionWaitSince(a.s) - attentionWaitSince(b.s));
   if (pending.length === 0) {
     el.hidden = true;
     el.innerHTML = '';
@@ -132,7 +132,7 @@ function paintAttentionStrip(): void {
     <span class="attention-strip-ic" aria-hidden="true">!</span>
     <b>${escapeHtml(t('strip.pending', { count: pending.length }))}</b>
     <span class="attention-strip-longest">${escapeHtml(t('strip.longest', {
-      time: relTime(longest.s.lastMessageAt),
+      time: relTime(attentionWaitSince(longest.s)),
       bot: botDisplayName(longest.s),
       reason: longest.reason,
     }))}</span>
@@ -179,7 +179,7 @@ function renderAuthRequiredPage(host: HTMLElement): void {
     'padding:40px 36px;box-shadow:0 8px 28px rgba(0,0,0,.12)">' +
     '<h2 style="margin:0 0 12px;font-size:20px;color:var(--fg)">此页需要授权链接</h2>' +
     '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted);font-size:14px">' +
-    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / 接入点）需要授权链接。' +
+    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / Webhook）需要授权链接。' +
     '运行 <code>botmux dashboard</code> 获取最新链接后即可管理。</p>' +
     '<a href="#/" style="display:inline-block;padding:8px 22px;background:var(--accent);' +
     'color:var(--on-accent);border-radius:8px;text-decoration:none;font-size:14px">返回总览</a>' +

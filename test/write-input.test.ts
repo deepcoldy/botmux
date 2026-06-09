@@ -52,6 +52,25 @@ import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { codexHistoryPath } from '../src/services/codex-paths.js';
 
+// ── Speed: collapse the adapters' real-time submit waits ───────────────────
+// writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
+// history/transcript with real wall-clock budgets — ~0.5–3s per case across
+// 90+ tests, which made this the single slowest file in the whole suite.
+// BOTMUX_TIME_SCALE (read lazily by src/utils/timing.ts) shrinks every
+// delay/poll budget by this factor WITHOUT changing which branch the code
+// takes: memfs writes are synchronous, so the submit marker is already present
+// the instant the poll starts. The few tests that choreograph their OWN
+// real-time events (a transcript append fired on a timer) scale those delays by
+// TIME_SCALE as well, so the relative ordering against the (now shrunken) poll
+// budget is preserved.
+// Default to 0.1, but honor an externally-set BOTMUX_TIME_SCALE so the
+// benchmark (scripts/bench-tests.ts) can measure the un-scaled "before" timing
+// by exporting BOTMUX_TIME_SCALE=1. TIME_SCALE always reflects the *effective*
+// scale, so the choreographed delay below stays consistent with the adapter's
+// (equally scaled) confirm budget.
+process.env.BOTMUX_TIME_SCALE ??= '0.05';
+const TIME_SCALE = Number(process.env.BOTMUX_TIME_SCALE);
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -791,12 +810,15 @@ describe('claude-code writeInput submission confirmation', () => {
         if (key !== 'Enter' || scheduledAppend) return;
         scheduledAppend = true;
         writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
+        // Scaled to match the adapter's (now BOTMUX_TIME_SCALE-shrunken) confirm
+        // budget — the append must still land WITHIN the poll window, as it does
+        // in production where the real 850ms < the real 4×800ms budget.
         setTimeout(() => {
           appendFileSync(
             rotatedPath,
             JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
           );
-        }, 850);
+        }, 850 * TIME_SCALE);
       }),
     };
 

@@ -3,6 +3,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { traeStateDbPath } from '../../services/traex-paths.js';
+import { delay } from '../../utils/timing.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -19,10 +20,6 @@ import { traeStateDbPath } from '../../services/traex-paths.js';
  *     column is written synchronously when the CLI commits a user submit.
  *   - Skills are installed into ~/.trae/skills.
  */
-
-function delay(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
-}
 
 function normaliseHistoryText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');

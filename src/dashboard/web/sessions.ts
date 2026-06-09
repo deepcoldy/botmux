@@ -11,6 +11,7 @@ import {
   botDisplayName,
   botAvatarHtml,
   chatDisplayTitle,
+  attentionWaitSince,
   escapeHtml,
   loadNameMaps,
   relTime,
@@ -37,6 +38,7 @@ const CLI_FILTER_OPTIONS = [
   'copilot',
   'aiden',
   'coco',
+  'oh-my-pi',
   'unknown',
 ];
 
@@ -69,7 +71,7 @@ function terminalHref(s: any): string | null {
 
 function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.status === 'closed') return null;
-  if (s.pendingRepo || s.tuiPromptActive || s.status === 'limited') return 'needs-you';
+  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'needs-you';
   if (s.status === 'starting') return 'starting';
   if (s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
   return 'idle';
@@ -227,6 +229,10 @@ export function renderSessionsPage(root: HTMLElement) {
   }
 
   function boardSignalLabel(s: any): string {
+    // Agent-raised reason is the most informative — show it verbatim so the
+    // human sees *why* the task is stuck, not a generic label.
+    if (s.agentAttention?.reason) return s.agentAttention.reason;
+    if (s.agentAttention) return t('sessions.board.signalAgent');
     if (s.pendingRepo) return t('sessions.board.signalRepo');
     if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
     if (s.status === 'limited') return t('sessions.board.signalLimited');
@@ -242,6 +248,7 @@ export function renderSessionsPage(root: HTMLElement) {
     const chatTitle = chatDisplayTitle(s);
     const terminal = terminalHref(s);
     const signal = boardSignalLabel(s);
+    const repo = repoBasename(s.workingDir);
     return `<article class="session-card${isSelected ? ' selected' : ''}" data-id="${escapeHtml(s.sessionId)}" aria-pressed="${isSelected}">
       <div class="session-card-top">
         ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
@@ -251,14 +258,16 @@ export function renderSessionsPage(root: HTMLElement) {
         </div>
         <span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span>
       </div>
-      <div class="session-card-meta">
-        <span title="${escapeHtml(s.workingDir ?? '')}">${escapeHtml(repoBasename(s.workingDir))}</span>
+      ${repo !== '-' || s.adopt ? `<div class="session-card-meta">
+        ${repo !== '-' ? `<span title="${escapeHtml(s.workingDir ?? '')}">${escapeHtml(repo)}</span>` : ''}
         ${s.adopt ? '<span class="badge">adopt</span>' : ''}
-      </div>
+      </div>` : ''}
       <div class="session-card-time">
-        <span>${escapeHtml(t('sessions.last'))}: ${relTime(s.lastMessageAt)}</span>
-        ${signal ? `<span class="session-signal">${escapeHtml(signal)} · ${relTime(s.lastMessageAt)}</span>` : ''}
+        <span>${s.agentAttention?.at
+          ? `${escapeHtml(t('sessions.board.waiting'))} ${relTime(attentionWaitSince(s))}`
+          : `${escapeHtml(t('sessions.last'))}: ${relTime(s.lastMessageAt)}`}</span>
       </div>
+      ${signal ? `<div class="session-signal" title="${escapeHtml(signal)}">${escapeHtml(signal)}</div>` : ''}
       <div class="session-card-actions">
         ${chatScopeLink(s) ?? `<button type="button" data-action="locate">${t('sessions.locate')}</button>`}
         <button type="button" data-action="details">${t('sessions.details')}</button>
@@ -269,8 +278,8 @@ export function renderSessionsPage(root: HTMLElement) {
   }
 
   function compareBoardRows(a: any, b: any, column: BoardColumnId): number {
-    const av = Number(a.lastMessageAt ?? 0);
-    const bv = Number(b.lastMessageAt ?? 0);
+    const av = column === 'needs-you' ? attentionWaitSince(a) : Number(a.lastMessageAt ?? 0);
+    const bv = column === 'needs-you' ? attentionWaitSince(b) : Number(b.lastMessageAt ?? 0);
     if (av !== bv) return column === 'needs-you' ? av - bv : bv - av;
     return String(a.title ?? a.sessionId).localeCompare(String(b.title ?? b.sessionId));
   }
@@ -502,7 +511,9 @@ export function renderSessionsPage(root: HTMLElement) {
         ${terminal ? `<a class="btn-link primary" href="${escapeHtml(terminal)}" target="_blank" rel="noopener">${t('sessions.openTerminal')}</a>` : ''}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
+        <button id="land-btn" type="button">${t('sessions.land')}</button>
       </div>
+      <div id="land-area"></div>
       <form method="dialog"><button>${t('sessions.dismiss')}</button></form>
     </article>`;
 
@@ -543,6 +554,48 @@ export function renderSessionsPage(root: HTMLElement) {
     if (closeBtn) {
       closeBtn.onclick = async () => {
         if (await closeSession(s, closeBtn)) drawer.close();
+      };
+    }
+
+    // Sandbox landing: fetch the clone's diff, show it, then apply/discard.
+    const landBtn = drawer.querySelector<HTMLButtonElement>('#land-btn');
+    const landArea = drawer.querySelector<HTMLDivElement>('#land-area');
+    if (landBtn && landArea) {
+      landBtn.onclick = async () => {
+        landBtn.disabled = true;
+        landArea.innerHTML = `<p>${t('sessions.landLoading')}</p>`;
+        try {
+          const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/sandbox-diff`);
+          const d = await r.json().catch(() => ({}));
+          if (!d.ok) { landArea.innerHTML = `<p>${t('sessions.landUnavailable')}: ${escapeHtml(d.error ?? String(r.status))}</p>`; landBtn.disabled = false; return; }
+          if (d.empty) { landArea.innerHTML = `<p>${t('sessions.landEmpty')}</p>`; landBtn.disabled = false; return; }
+          const full = String(d.patch ?? '');
+          const patch = full.slice(0, 20000) + (full.length > 20000 ? '\n…(truncated)' : '');
+          landArea.innerHTML = `
+            <p><b>${d.files}</b> files (+${d.insertions}/-${d.deletions}) → <code>${escapeHtml(String(d.workingDir ?? ''))}</code></p>
+            <pre style="max-height:320px;overflow:auto;white-space:pre-wrap">${escapeHtml(patch)}</pre>
+            <div class="actions">
+              <button id="land-apply" type="button" class="primary">${t('sessions.landApply')}</button>
+              <button id="land-discard" type="button" class="contrast">${t('sessions.landDiscard')}</button>
+            </div>`;
+          const applyBtn = landArea.querySelector<HTMLButtonElement>('#land-apply')!;
+          const discardBtn = landArea.querySelector<HTMLButtonElement>('#land-discard')!;
+          applyBtn.onclick = async () => {
+            applyBtn.disabled = true; discardBtn.disabled = true;
+            const rr = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/sandbox-land/apply`, { method: 'POST' });
+            const res = await rr.json().catch(() => ({}));
+            landArea.innerHTML = res.ok
+              ? `<p>✅ ${t('sessions.landApplied')}: ${res.files} files (+${res.insertions}/-${res.deletions}) → <code>${escapeHtml(String(res.workingDir ?? ''))}</code></p>`
+              : `<p>❌ ${t('sessions.landFailed')}: ${escapeHtml(res.error ?? String(rr.status))}</p>`;
+          };
+          discardBtn.onclick = async () => {
+            await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/sandbox-land/discard`, { method: 'POST' });
+            landArea.innerHTML = `<p>🗑 ${t('sessions.landDiscarded')}</p>`;
+          };
+        } catch (e) {
+          landArea.innerHTML = `<p>${t('sessions.landUnavailable')}: ${escapeHtml(String(e))}</p>`;
+          landBtn.disabled = false;
+        }
       };
     }
 

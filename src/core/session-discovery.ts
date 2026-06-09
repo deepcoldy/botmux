@@ -54,6 +54,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   mtr: 'mtr',
   hermes: 'hermes',
   pi: 'pi',
+  omp: 'oh-my-pi',
 };
 
 /** Interpreters and native launchers that may hide the CLI identity in argv.

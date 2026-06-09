@@ -5,9 +5,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
 
 function isMtrSessionId(value: string | undefined): value is string {
   return typeof value === 'string' && /^ses_[0-9A-Za-z]+$/.test(value);

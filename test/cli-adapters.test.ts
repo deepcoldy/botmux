@@ -31,15 +31,16 @@ import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
-import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'pi', 'copilot'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'pi', 'copilot', 'oh-my-pi'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -253,6 +254,10 @@ describe('coco buildArgs', () => {
     const idx = args.indexOf('--config');
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toBe('model.name=Doubao-Seed-2.0-Code');
+  });
+
+  it('uses Trae skill root for filesystem skill discovery', () => {
+    expect(adapter.skillsDir).toBe('~/.trae/skills');
   });
 });
 
@@ -485,6 +490,58 @@ describe('pi buildArgs', () => {
     expect(args.at(-1)).toBe('hello pi');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
     expect(adapter.altScreen).toBe(true);
+  });
+});
+
+describe('oh-my-pi buildArgs', () => {
+  const adapter = createOhMyPiAdapter('/usr/bin/omp');
+
+  it('launches omp TUI with tools, approval-mode, and no-title', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, initialPrompt: 'hello omp' });
+    expect(adapter.resolvedBin).toBe('/usr/bin/omp');
+    expect(args).toContain('--tools');
+    expect(args).toContain('read,bash,edit,write,browser,web_search,ast_grep,ast_edit,lsp,debug,find,eval,search,task,ask');
+    expect(args).toContain('--approval-mode');
+    expect(args[args.indexOf('--approval-mode') + 1]).toBe('yolo');
+    expect(args).toContain('--no-title');
+    expect(args.at(-1)).toBe('hello omp');
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.altScreen).toBe(true);
+  });
+
+  it('does not include --session-id (oh-my-pi has none)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false });
+    expect(args).not.toContain('--session-id');
+    expect(args).not.toContain('sess-omp');
+  });
+
+  it('omits --approval-mode yolo when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--approval-mode');
+    expect(args).not.toContain('yolo');
+    expect(args).toContain('--no-title');
+  });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, model: 'opus' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('opus');
+  });
+
+  it('passes working directory with --cwd', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, workingDir: '/repo/root' });
+    const idx = args.indexOf('--cwd');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('/repo/root');
+  });
+
+  it('skillsDir points to ~/.omp/agent/skills', () => {
+    expect(adapter.skillsDir).toBe('~/.omp/agent/skills');
+  });
+
+  it('has no modelChoices (setup skips model prompt)', () => {
+    expect(adapter.modelChoices).toBeUndefined();
   });
 });
 
@@ -975,6 +1032,12 @@ describe('buildResumeCommand', () => {
     const a = createPiAdapter('/bin/pi');
     expect(a.buildResumeCommand?.({ sessionId: 'bm-pi', cliSessionId: 'ignored' }))
       .toBe('pi --session-id bm-pi');
+  });
+
+  it('oh-my-pi emits `omp --continue` (best-effort, ignores sessionId)', () => {
+    const a = createOhMyPiAdapter('/bin/omp');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-omp', cliSessionId: 'ignored' }))
+      .toBe('omp --continue');
   });
 
   it('copilot emits `copilot --resume <cliSessionId>` when known, null otherwise', () => {

@@ -11,7 +11,8 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
+import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -19,7 +20,7 @@ import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
-import { discoverSlashCommands, listMcpServerNames } from './command-discovery.js';
+import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
@@ -43,7 +44,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/land']);
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -854,6 +855,24 @@ export async function handleCommand(
         break;
       }
 
+      case '/land': {
+        // 把沙盒会话副本里 agent 的改动落回真实仓库。owner 审阅 diff 卡后点「应用到磁盘」。
+        // agent 在沙盒里无感（以为改的就是真文件），所以只能由 owner 在此手动触发。
+        if (!ds) { await sessionReply(rootId, t('cmd.no_active_session', undefined, loc)); break; }
+        const sid = ds.session.sessionId;
+        const wd = ds.session.workingDir;
+        if (!wd) { await sessionReply(rootId, t('cmd.land.no_workingdir', undefined, loc)); break; }
+        const d = computeSandboxDiff(config.session.dataDir, sid);
+        if (!d.ok) { await sessionReply(rootId, t('cmd.land.cannot', { error: d.error }, loc)); break; }
+        if (d.empty) { await sessionReply(rootId, t('cmd.land.empty', undefined, loc)); break; }
+        const lines = d.patch.split('\n');
+        const preview = lines.slice(0, 40).join('\n') + (lines.length > 40 ? '\n…' : '');
+        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview }, loc);
+        await sessionReply(rootId, card, 'interactive');
+        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → review card`);
+        break;
+      }
+
       case '/detach':
       case '/disconnect': {
         // 文字版的"⏏ 断开"按钮：仅 adopt 会话适用——botmux 只是观察用户原本在
@@ -1567,57 +1586,45 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
             break;
           }
-          // ── Chat-type guard ───────────────────────────────────────────────
-          // Picker mode only makes sense in regular group chats. p2p (1:1 with
-          // bot) has no relay concept — there's no other participant to
-          // collaborate with — and topic chats route per-thread, so a chat-
-          // scope session pulled in would have no thread anchor.
-          //
-          // p2p is detectable from `ds.chatType` locally (cheap). Topic vs
-          // regular group is NOT captured in chatType — both record 'group'
-          // — so we hit the Lark API (getChatNameAndMode) to resolve the
-          // mode. One API call per /relay invocation; picker is user-
-          // triggered so latency is acceptable.
+          // ── Chat-type guard + target-routing resolution ───────────────────
+          // p2p (1:1 with bot) has no relay target — there's no other
+          // participant. For group chats we resolve the chat mode (话题群 vs
+          // 普通群) once, then compute WHERE the relayed session should land via
+          // resolveRelayTargetRouting (mirrors decideRouting; 话题群 / 线程内 /
+          // 普通群 new-topic·shared → thread-scope, 普通群 flat → chat-scope).
+          // p2p is also detectable from `ds.chatType` locally (cheap); the API
+          // resolves topic-vs-regular (both record chatType 'group').
           if (ds?.chatType === 'p2p') {
             await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
             break;
           }
-          {
-            const { getChatNameAndMode } = await import('../im/lark/client.js');
-            const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
-            if (info?.mode === 'p2p') {
-              await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
-              break;
-            }
-            if (info?.mode === 'topic') {
-              await sessionReply(rootId, t('cmd.relay.picker_topic_unsupported', undefined, loc));
-              break;
-            }
+          const { getChatNameAndMode } = await import('../im/lark/client.js');
+          const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
+          const { resolveRelayTargetRouting } = await import('../im/lark/relay-target-routing.js');
+          const targetRouting = resolveRelayTargetRouting({
+            larkAppId: myAppId,
+            chatId: targetChatId,
+            message: { messageId: message.messageId, rootId: message.rootId || undefined, threadId: message.threadId },
+            chatMode: info?.mode ?? 'group',
+          });
+          if ('reject' in targetRouting) {
+            await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
+            break;
           }
-          // ── Existing-session guard ────────────────────────────────────────
-          // If this bot already runs a real session in the target chat, pulling
-          // another session in would collide on sessionKey(targetChatId, larkAppId)
-          // — Map.set would silently overwrite, orphaning the existing worker.
-          // Refuse upfront with an actionable message.
-          //
-          // Scratch sessions (the placeholder a `/relay` typed in a fresh chat
-          // gets routed through) are filtered by `!!c.worker` — they have no
-          // worker process. We do NOT exclude `ds` by sessionId: when `/relay`
-          // rides an EXISTING real session (daemon.ts:2034's "existing-session
-          // DAEMON_COMMANDS" path skips the scratch and binds `ds` to the
-          // chat's real session), `ds` itself IS the conflict — excluding it
-          // would let the picker render and the user pick a remote session
-          // that the eventual transferSession would have to refuse anyway.
+          const targetScope = targetRouting.scope;
+          const targetAnchor = targetRouting.anchor;
+          // ── Existing-session guard (anchor-based) ─────────────────────────
+          // A real session already sitting AT the target anchor would collide
+          // on sessionKey(targetAnchor, larkAppId) after transfer — Map.set
+          // would orphan its worker. Scratch placeholders (worker:null, e.g.
+          // the /relay command's own record at this anchor) are NOT a conflict;
+          // transferSession closes them inline. We do NOT exclude `ds`: if
+          // /relay rides an existing real session at the anchor, `ds` itself IS
+          // the conflict. Anchor-based so同群 other-topic sessions (different
+          // anchor) don't false-positive — that's what enables 同群话题间搬运.
           const conflict = [...activeSessions.values()].find(c =>
             c.larkAppId === myAppId
-            && c.chatId === targetChatId
-            // chat-scope only: thread-scope sessions (e.g. a `/t` force-topic
-            // session in a regular group) live at a different sessionKey
-            // anchor (rootMessageId), so they don't collide on transfer.
-            // transferSession's own pre-flight (worker-pool.ts) and card-
-            // handler's confirm both filter the same way; align here so the
-            // picker doesn't false-positive a thread-scope live session.
-            && c.scope === 'chat'
+            && sessionAnchorId(c) === targetAnchor
             && !!c.worker   // real running session, not a placeholder
           );
           if (conflict) {
@@ -1627,12 +1634,12 @@ export async function handleCommand(
           // Shared candidate-collection logic — used here at initial render
           // and again in card-handler when the user clicks a card to switch
           // selection (the card re-render needs the same filtered list).
-          // Filters out: other bots / current chat / non-owned / adopt
-          // sessions. Resolves friendly chat names + modes in parallel.
+          // Excludes (by anchor) the target itself; keeps cross-group + 同群
+          // other-topic sessions. Resolves friendly chat names + modes.
           const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
-          const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetChatId, operatorOpenId);
+          const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetAnchor, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
-          const card = buildRelayPickerCard(entries, targetChatId, rootId, operatorOpenId, loc);
+          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope);
           await sessionReply(rootId, card, 'interactive');
           break;
         }
@@ -1837,8 +1844,8 @@ export async function handleCommand(
         if (leaderHasRealSession) {
           const { transferSession } = await import('./worker-pool.js');
           // Target chat was just built by createGroupWithBots — by
-          // construction a regular group.
-          const leaderResult = await transferSession(ds.session.sessionId, newChatId, placeholderRootMessageId, 'group');
+          // construction a regular group, chat-scope.
+          const leaderResult = await transferSession(ds.session.sessionId, newChatId, placeholderRootMessageId, 'group', 'chat');
           if (!leaderResult.ok) {
             // Real session, real failure (worker busy / unsupported target
             // / tmux issue). Abort the entire --create flow — the new chat
@@ -1988,20 +1995,30 @@ export async function handleCommand(
         // 列出本 bot 当前可用的 slash 命令，分三段：
         //   ① botmux 固定放行的透传白名单（PASSTHROUGH_COMMANDS）
         //   ② 用户在 bots.json 自定义配置的额外透传命令（customPassthroughCommands）
-        //   ③ 文件系统自动发现的 .claude 自定义命令 / skill / 插件（discoverSlashCommands）
+        //   ③ 文件系统自动发现的 CLI 自定义命令 / skill / 插件
         // MCP 的 /mcp__<server>__<prompt> 需运行时握手才能枚举，这里仅按 .mcp.json 提示 server 名。
         const botCfg = ds
           ? getBot(ds.larkAppId).config
           : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
-        const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
+        const cliId = botCfg?.cliId ?? 'claude-code';
+        const cliName = getCliDisplayName(cliId);
         const workingDir = getSessionWorkingDir(ds);
         const builtin = [...PASSTHROUGH_COMMANDS];
         const custom = botCfg?.customPassthroughCommands ?? [];
-        const discovered = discoverSlashCommands(workingDir);
+        let cliAdapter;
+        try {
+          cliAdapter = createCliAdapterSync(cliId, botCfg?.cliPathOverride);
+        } catch (err) {
+          logger.warn(`[${logTag}] /list-slash-command could not create adapter for ${cliId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        const discoverySupported = supportsFilesystemCommandDiscovery(cliAdapter);
+        const discovered = cliAdapter && discoverySupported
+          ? discoverSlashCommandsForAdapter(workingDir, cliAdapter)
+          : [];
         const mcpServers = listMcpServerNames(workingDir);
 
         const card = buildSlashListCard(
-          { cliName, builtin, custom, discovered, workingDir, mcpServers },
+          { cliName, builtin, custom, discovered, workingDir, mcpServers, discoverySupported },
           loc,
         );
         await sessionReply(rootId, card, 'interactive');

@@ -9,7 +9,12 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { discoverSlashCommands, listMcpServerNames } from '../src/core/command-discovery.js';
+import {
+  discoverSlashCommands,
+  discoverSlashCommandsForAdapter,
+  listMcpServerNames,
+  supportsFilesystemCommandDiscovery,
+} from '../src/core/command-discovery.js';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 
 function write(file: string, content: string): void {
@@ -72,6 +77,51 @@ describe('discoverSlashCommands', () => {
 
   it('returns empty when nothing is installed', () => {
     expect(discoverSlashCommands(join(root, 'empty'))).toEqual([]);
+  });
+});
+
+describe('discoverSlashCommandsForAdapter', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'botmux-adapter-disc-'));
+  });
+
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('scans generic CLI skillsDir roots such as Codex ~/.codex/skills', () => {
+    const skillsDir = join(root, 'codex', 'skills');
+    write(join(skillsDir, 'botmux-send', 'SKILL.md'), '---\ndescription: Send to Lark\n---');
+
+    const found = discoverSlashCommandsForAdapter(join(root, 'proj'), { skillsDir });
+
+    expect(found).toEqual([
+      expect.objectContaining({
+        name: '/botmux-send',
+        source: 'user-skill',
+        description: 'Send to Lark',
+      }),
+    ]);
+  });
+
+  it('uses adapter claudeDataDir for Claude-family personal discovery and still includes project .claude', () => {
+    const dataDir = join(root, 'seed-runtime');
+    const proj = join(root, 'proj');
+    write(join(dataDir, 'skills', 'global-skill', 'SKILL.md'), '---\ndescription: Global\n---');
+    write(join(proj, '.claude', 'commands', 'deploy.md'), '---\ndescription: Deploy\n---');
+
+    const found = discoverSlashCommandsForAdapter(proj, { claudeDataDir: dataDir });
+
+    expect(found.map((c) => c.name).sort()).toEqual(['/deploy', '/global-skill']);
+    expect(found.find((c) => c.name === '/deploy')?.source).toBe('project-command');
+    expect(found.find((c) => c.name === '/global-skill')?.source).toBe('user-skill');
+  });
+
+  it('reports support only when an adapter declares filesystem roots', () => {
+    expect(supportsFilesystemCommandDiscovery({ skillsDir: join(root, 'skills') })).toBe(true);
+    expect(supportsFilesystemCommandDiscovery({ claudeDataDir: join(root, '.claude') })).toBe(true);
+    expect(supportsFilesystemCommandDiscovery({ pluginDir: join(root, 'plugin') })).toBe(true);
+    expect(supportsFilesystemCommandDiscovery({})).toBe(false);
   });
 });
 

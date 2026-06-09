@@ -10,6 +10,7 @@ import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } fro
 import { config } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
+import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
@@ -281,7 +282,9 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
 // groups (oncall chats often have 3rd-party oncall/form/AI-search bots).
 
 export const CHAT_CACHE_TTL = 5 * 60_000; // 5 minutes
-const chatStatsCache = new Map<string, { userCount: number; botCount: number; fetchedAt: number }>();
+// Bounded: keyed per chat; TTL gates freshness on read, the cap stops the
+// entry count growing with every distinct chat the bot ever serves.
+const chatStatsCache = new BoundedMap<string, { userCount: number; botCount: number; fetchedAt: number }>(1000);
 
 // ─── Event callback ACK safety ──────────────────────────────────────────────
 //

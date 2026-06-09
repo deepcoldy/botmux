@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/session-store.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -285,6 +285,29 @@ describe('updateSession()', () => {
     init();
     const reloaded = getSession(session.sessionId);
     expect(reloaded!.webPort).toBe(9999);
+  });
+
+  it('skips the disk write when an update produces byte-identical content', () => {
+    // save() does writeFile(tmp) + rename(tmp → fp), so every REAL write
+    // replaces the file's inode. A skipped write leaves the inode untouched.
+    const fp = join(tempDir, 'sessions.json');
+    const session = createSession('chat1', 'root1', 'NoChange');
+    const inodeAfterCreate = statSync(fp).ino;
+
+    // A redundant update with no field change → must be skipped (inode stable).
+    updateSession(session);
+    expect(statSync(fp).ino).toBe(inodeAfterCreate);
+    updateSession(session); // and again — still no write
+    expect(statSync(fp).ino).toBe(inodeAfterCreate);
+
+    // A real change → the file is rewritten (inode changes).
+    session.title = 'Changed';
+    updateSession(session);
+    expect(statSync(fp).ino).not.toBe(inodeAfterCreate);
+
+    // Content is still correct after the skip/write sequence.
+    init();
+    expect(getSession(session.sessionId)!.title).toBe('Changed');
   });
 
   it('should allow adding a new session via updateSession', () => {

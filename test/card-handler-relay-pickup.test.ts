@@ -22,6 +22,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {} }));
 const sendMessageMock = vi.fn(async () => 'om_M1');
 const deleteMessageMock = vi.fn(async () => true);
 const getChatNameMock = vi.fn(async (): Promise<string | null> => 'Friendly Source Chat Name');
+const replyMessageMock = vi.fn(async () => 'om_M1_thread');
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
@@ -29,7 +30,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
     sendMessage: (...a: any[]) => sendMessageMock(...a),
     deleteMessage: (...a: any[]) => deleteMessageMock(...a),
     getChatName: (...a: any[]) => getChatNameMock(...a),
-    replyMessage: vi.fn(),
+    replyMessage: (...a: any[]) => replyMessageMock(...a),
     sendUserMessage: vi.fn(),
     updateMessage: vi.fn(),
   };
@@ -88,7 +89,7 @@ function makeDs(overrides: Partial<Session> & { chatId?: string } = {}): DaemonS
 }
 
 // Confirm button click shape — value carries full context after selection.
-function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id?: string; operator?: string } = {}) {
+function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id?: string; operator?: string; target_scope?: 'thread' | 'chat' } = {}) {
   return {
     operator: { open_id: opts.operator ?? OWNER },
     action: {
@@ -97,6 +98,7 @@ function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id
         session_id: opts.sessionId ?? 'sess-source-1',
         target_chat_id: opts.target_chat_id ?? 'oc_target',
         root_id: opts.root_id ?? 'om_target_root',
+        ...(opts.target_scope ? { target_scope: opts.target_scope } : {}),
       },
     },
   };
@@ -115,6 +117,8 @@ beforeEach(() => {
   deleteMessageMock.mockClear();
   getChatNameMock.mockClear();
   getChatNameMock.mockResolvedValue('Friendly Source Chat Name');
+  replyMessageMock.mockClear();
+  replyMessageMock.mockResolvedValue('om_M1_thread');
   transferSessionMock.mockClear();
   transferSessionMock.mockResolvedValue({ ok: true });
 });
@@ -173,12 +177,19 @@ describe('relay_confirm button click', () => {
     expect(transferSessionMock).not.toHaveBeenCalled();
   });
 
-  it('refuses to relay into the same chat the session is already in', async () => {
-    const ds = makeDs({ chatId: 'oc_target' });
+  it('refuses to relay a session onto its own anchor (same_anchor)', async () => {
+    // Thread-scope source anchored at om_source_root; targeting that same 话题
+    // root → same anchor → refuse (relaying onto itself). A different chat /
+    // different 话题 would be allowed (anchor-based, enables 同群话题间搬运).
+    const ds = makeDs();  // scope 'thread', anchor om_source_root
     const map = new Map<string, DaemonSession>();
     map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
 
-    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+    const r = await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_source', root_id: 'om_source_root', target_scope: 'thread' }),
+      deps(map),
+      LARK_APP_ID,
+    );
 
     expect(r?.toast?.type).toBe('error');
     expect(transferSessionMock).not.toHaveBeenCalled();
@@ -205,8 +216,28 @@ describe('relay_confirm button click', () => {
     expect(m1Payload).toContain('Friendly Source Chat Name');
     expect(m1Payload).not.toContain('oc_source');
 
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1', 'group');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1', 'group', 'chat');
     expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_picker_card');
+    expect(r?.toast?.type).toBe('success');
+  });
+
+  it('thread-scope target: M1 sent reply_in_thread to the 话题 root, transferSession gets (group, thread) anchored at root_id', async () => {
+    const ds = makeDs();  // source in oc_source, thread anchor om_source_root
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    const r = await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_topic_root', target_scope: 'thread' }),
+      deps(map),
+      LARK_APP_ID,
+    );
+
+    // M1 goes via replyMessage(reply_in_thread=true) into the 话题 root, NOT
+    // sendMessage; sendMessage must not be used for the announcement.
+    expect(replyMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_topic_root', expect.any(String), 'text', true);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    // Session anchors on the 话题 root (NOT the M1 id), scope 'thread'.
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_topic_root', 'group', 'thread');
     expect(r?.toast?.type).toBe('success');
   });
 

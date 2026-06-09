@@ -8,7 +8,8 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard } from './card-builder.js';
+import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
@@ -192,6 +193,30 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+  // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
+  // 不绑 session（sessionId + workingDir 都在 value 里）。owner 强闸门：只有 owner 能把
+  // 隔离副本的改动应用回真实磁盘。agent 在沙盒里无感，不参与。
+  if (value?.action && (value.action === 'land_apply' || value.action === 'land_discard') && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    const owner = getOwnerOpenId(larkAppId);
+    if (!operatorOpenId || operatorOpenId !== owner) {
+      logger.info(`Land action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
+      return { toast: { type: 'error', content: t('card.land.toast_owner_only', undefined, loc) } };
+    }
+    if (value.action === 'land_discard') {
+      return JSON.parse(buildLandResultCard('discarded', '', loc));
+    }
+    const sid: string = value.sessionId;
+    const wd: string = value.workingDir;
+    if (!sid || !wd) return JSON.parse(buildLandResultCard('failed', t('card.land.stale', undefined, loc), loc));
+    const d = computeSandboxDiff(config.session.dataDir, sid);
+    if (!d.ok) return JSON.parse(buildLandResultCard('failed', d.error, loc));
+    if (d.empty) return JSON.parse(buildLandResultCard('discarded', '', loc));
+    const a = applySandboxDiff(wd, d.patch);
+    if (!a.ok) return JSON.parse(buildLandResultCard('failed', a.error, loc));
+    logger.info(`Land applied: ${d.files} files (+${d.insertions}/-${d.deletions}) → ${wd}`);
+    return JSON.parse(buildLandResultCard('applied', t('card.land.applied_body', { files: d.files, ins: d.insertions, del: d.deletions, dir: wd }, loc), loc));
+  }
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
   if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {
@@ -326,6 +351,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const loc = localeForBot(larkAppId);
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
+    // root_id IS the relay target anchor (chatId for chat-scope, 话题 root for
+    // thread-scope). target_scope tells the confirm/re-render which it is.
+    const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -365,8 +393,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       nextSelected = value.session_id;
     }
 
+    // Exclude by the target ANCHOR (root_id), not chatId — keeps 同群 other-
+    // topic sessions in the candidate list on re-render, matching初次渲染.
     const { collectRelayPickerEntries } = await import('../../services/relay-picker.js');
-    const entries = await collectRelayPickerEntries(activeSessions, larkAppId, targetChatId, operatorOpenId);
+    const entries = await collectRelayPickerEntries(activeSessions, larkAppId, targetRootId, operatorOpenId);
     const { buildRelayPickerCard } = await import('./card-builder.js');
     const cardJson = buildRelayPickerCard(
       entries,
@@ -384,6 +414,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         searchQuery: nextSearch,
         page: nextPage,
       },
+      targetScope,
     );
     // Return an updated card body — event-dispatcher wraps this as
     // { card: { type: 'raw', data: <body> } } so Lark patches the picker
@@ -486,6 +517,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sourceSessionId = value.session_id;
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
+    // root_id IS the target anchor for thread-scope (the 话题 root); for chat-
+    // scope the anchor is chatId and root_id is unused for routing.
+    const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
+    const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootId;
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -515,7 +550,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (sourceDs.session.ownerOpenId && sourceDs.session.ownerOpenId !== operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_not_owner', undefined, loc) } };
     }
-    if (sourceDs.chatId === targetChatId) {
+    // Anchor-based self-relay guard: a thread-scope source in the SAME chat
+    // (different 话题) is a legitimate cross-topic move, so refuse only when the
+    // source and target anchors are identical.
+    if (sessionAnchorId(sourceDs) === targetAnchor) {
       return { toast: { type: 'error', content: t('card.relay.toast_same_chat', undefined, loc) } };
     }
     // Real-session preflight — done BEFORE M1 send so a refusal doesn't
@@ -538,8 +576,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const targetConflict = [...activeSessions.values()].find(c =>
       c !== sourceDs
       && c.larkAppId === larkAppId
-      && c.chatId === targetChatId
-      && c.scope === 'chat'
+      && sessionAnchorId(c) === targetAnchor
       && !!c.worker
     );
     if (targetConflict) {
@@ -559,21 +596,27 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // back to the raw chatId if Lark can't return a name.
     const { getChatName } = await import('./client.js');
     const sourceLabel = (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
-    // Send the M1 announcement — its message_id becomes the new
-    // rootMessageId after the transfer (mirrors /relay --create's flow).
+    // Send the M1 announcement.
+    //   chat-scope: a plain top-level message; its id becomes the (audit-only)
+    //               rootMessageId after the transfer (mirrors /relay --create).
+    //   thread-scope: reply_in_thread INTO the target 话题 (anchor) so the
+    //               announcement lands in the 话题; the session anchors on the
+    //               话题 root (targetAnchor), NOT the M1 id.
     let m1MessageId: string;
     try {
       const m1Text = t('cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
-      m1MessageId = await sendMessage(larkAppId, targetChatId, m1Text, 'text');
+      m1MessageId = targetScope === 'thread'
+        ? await replyMessage(larkAppId, targetAnchor, m1Text, 'text', /*replyInThread*/ true)
+        : await sendMessage(larkAppId, targetChatId, m1Text, 'text');
     } catch (err: any) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: err?.message ?? 'send_m1_failed' }, loc) } };
     }
     const { transferSession } = await import('../../core/worker-pool.js');
-    // Target is always a regular group in the picker path — picker-mode's
-    // entry guard in command-handler.ts refused p2p / topic before the card
-    // even rendered. Passing literal 'group' here makes that contract
-    // explicit at the call site.
-    const r = await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, 'group');
+    // chat-scope → anchor on the M1 id (audit-only); thread-scope → anchor on
+    // the 话题 root (targetAnchor) so future replies in the 话题 route here.
+    const r = targetScope === 'thread'
+      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, 'group', 'thread')
+      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, 'group', 'chat');
     if (!r.ok) {
       // Best-effort: orphan M1 cleanup so a failed transfer doesn't leave a
       // misleading "已接力" message in the target chat (王皓's "明明失败了

@@ -454,6 +454,7 @@ describe('Card integration: full event flow', () => {
 
   describe('Scenario 4: restart and close button actions', () => {
     it('restart with live worker should send restart IPC message', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const workerSend = vi.fn();
       const ds = makeDaemonSession({
         worker: { killed: false, send: workerSend } as any,
@@ -465,12 +466,12 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
       expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('重启'),
-        undefined,
-        APP_ID,
+      // The confirmation is delivered ephemeral to the clicker (group chat + an
+      // operator open_id), not as a visible group reply.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('重启'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('restart without worker should re-fork', async () => {
@@ -485,6 +486,7 @@ describe('Card integration: full event flow', () => {
     });
 
     it('close should kill worker and remove session', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession();
       const sessions = new Map<string, DaemonSession>();
       const sKey = sessionKey(ROOT_ID, APP_ID);
@@ -495,14 +497,13 @@ describe('Card integration: full event flow', () => {
 
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessions.has(sKey)).toBe(false);
-      // Closed reply is now an interactive card with a Resume button; the
-      // mocked builder embeds the type marker so we assert on that shape.
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('"type":"closed"'),
-        'interactive',
-        APP_ID,
+      // Closed reply is an interactive card with a Resume button, delivered
+      // ephemeral to the clicker (group chat + operator open_id); the mocked
+      // builder embeds the type marker so we assert on that shape.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('"type":"closed"'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {
@@ -585,6 +586,7 @@ describe('Card integration: full event flow', () => {
     });
 
     it('resume should call resumeSession and reply with success notice', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const sessionId = 'closed-uuid-1';
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
@@ -602,18 +604,19 @@ describe('Card integration: full event flow', () => {
       const fakeDs: any = {
         session: { sessionId, cliId: 'claude-code' },
         larkAppId: APP_ID,
+        chatId: 'oc_chat',
+        chatType: 'group',
       };
       vi.mocked(sm.resumeSession).mockReturnValue({ ok: true, ds: fakeDs } as any);
 
       await handleCardAction(makeResumeEvent(ROOT_ID, sessionId), deps, APP_ID);
 
       expect(sm.resumeSession).toHaveBeenCalledWith(sessionId, sessions);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('已恢复'),
-        undefined,
-        APP_ID,
+      // Success notice is delivered ephemeral to the clicker (group + operator).
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, 'oc_chat', 'ou_user', expect.stringContaining('已恢复'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('resume should surface anchor_occupied error from resumeSession', async () => {
@@ -777,6 +780,7 @@ describe('Card integration: full event flow', () => {
     });
 
     it('should reply with warning when terminal not ready', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({
         workerPort: null,
         workerToken: null,
@@ -788,12 +792,12 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
 
       expect(fakeLark.dms).toHaveLength(0);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('尚未就绪'),
-        undefined,
-        APP_ID,
+      // The "not ready" warning is delivered ephemeral to the clicker (group +
+      // operator), not as a visible group reply.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('尚未就绪'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
   });
 

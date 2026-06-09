@@ -200,4 +200,4 @@ export interface CliAdapter {
   versionCommand?(): { bin: string; args: string[] };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'traex' | 'pi' | 'copilot';
+export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi';

@@ -8,9 +8,12 @@ import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
+import * as sandboxStore from '../services/sandbox-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField } from '../services/bot-config-store.js';
+import { config } from '../config.js';
+import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
 import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
@@ -130,6 +133,34 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+// ─── Sandbox landing (owner reviews the clone's diff then applies it back) ───
+function workingDirForSession(sessionId: string): string | undefined {
+  const ds = findActiveBySessionId(sessionId);
+  if (ds) return ds.session.workingDir;
+  return sessionStore.listSessions().find(s => s.sessionId === sessionId)?.workingDir;
+}
+
+ipcRoute('GET', '/api/sessions/:sessionId/sandbox-diff', (_req, res, params) => {
+  const d = computeSandboxDiff(config.session.dataDir, params.sessionId);
+  if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
+  jsonRes(res, 200, {
+    ok: true, empty: d.empty, files: d.files, insertions: d.insertions, deletions: d.deletions,
+    statText: d.statText, patch: d.patch, workingDir: workingDirForSession(params.sessionId) ?? null,
+  });
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/sandbox-land/:action', (_req, res, params) => {
+  if (params.action === 'discard') return jsonRes(res, 200, { ok: true, discarded: true });
+  if (params.action !== 'apply') return jsonRes(res, 400, { ok: false, error: 'unknown action' });
+  const wd = workingDirForSession(params.sessionId);
+  if (!wd) return jsonRes(res, 404, { ok: false, error: '找不到会话 workingDir' });
+  const d = computeSandboxDiff(config.session.dataDir, params.sessionId);
+  if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
+  if (d.empty) return jsonRes(res, 200, { ok: false, error: '沙盒副本已无改动' });
+  const a = applySandboxDiff(wd, d.patch);
+  jsonRes(res, 200, a.ok ? { ok: true, files: d.files, insertions: d.insertions, deletions: d.deletions, workingDir: wd } : { ok: false, error: a.error });
 });
 
 /**
@@ -304,8 +335,8 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   }
 
   // Target chat was built by the leader's /relay --create — by
-  // construction a regular group. The peer inherits that guarantee.
-  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group');
+  // construction a regular group, chat-scope (M1 is the audit anchor).
+  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group', 'chat');
   if (!result.ok) {
     return jsonRes(res, 500, { ok: false, error: result.error });
   }
@@ -617,6 +648,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
+    sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
@@ -726,6 +758,19 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, p2pMode: value ?? 'thread' });
+});
+
+// Per-bot file-sandbox toggle. Body `{ enabled: boolean }`. When on, this bot's
+// CLI sessions run inside a per-session bwrap file sandbox (Linux). For oncall
+// bots shared with semi-trusted users.
+ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { enabled?: unknown };
+  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
 });
 
 ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {

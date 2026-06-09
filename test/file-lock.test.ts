@@ -68,7 +68,11 @@ describe('withFileLock', () => {
 
     let threw: Error | null = null;
     try {
-      await withFileLock(target, async () => 'unreachable');
+      // The behavior under test (refuse to steal a live lock, then time out)
+      // is independent of the timeout length, so use a short maxWaitMs instead
+      // of waiting the full 5s default — keeps this from being the slowest
+      // unit-test in the suite.
+      await withFileLock(target, async () => 'unreachable', { maxWaitMs: 500 });
     } catch (e: any) {
       threw = e;
     }

@@ -202,6 +202,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             </div>
             ${renderAutoStartControls(b)}
           </section>
+          ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
         <section class="bd-tile">${renderSessionModeSection(b)}</section>
@@ -356,6 +357,24 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <div class="actions">
           <span class="oncall-status" data-mention-mode-status></span>
         </div>
+      </div>
+    </section>`;
+  }
+
+  // File sandbox (oncall): a per-bot toggle. ON → this bot's sessions run inside
+  // a per-session bwrap file sandbox (Linux). Auto-saves on change.
+  function renderSandboxSection(b: any): string {
+    const on = b.sandbox === true;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionSandbox')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-sandbox" ${on ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.sandboxToggle')}</strong>
+        <small>${t('botDefaults.sandboxHelp')}</small></span>
+      </label>
+      <div class="actions">
+        <span class="oncall-status" data-sandbox-status></span>
       </div>
     </section>`;
   }
@@ -618,6 +637,38 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (privateCardCb) {
         privateCardCb.addEventListener('change', () => {
           putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
+
+      // ── File sandbox toggle (auto-save on change) ─────────────────────────
+      const sandboxCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-sandbox]');
+      const sandboxStatusEl = card.querySelector<HTMLSpanElement>('[data-sandbox-status]');
+      if (sandboxCb) {
+        sandboxCb.addEventListener('change', async () => {
+          const enabled = sandboxCb.checked;
+          if (sandboxStatusEl) { sandboxStatusEl.textContent = ''; sandboxStatusEl.className = 'oncall-status'; }
+          sandboxCb.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/sandbox`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ enabled }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              if (sandboxStatusEl) { sandboxStatusEl.textContent = `✓ ${t('botDefaults.sandboxSaved')}`; sandboxStatusEl.classList.add('hint-ok'); }
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.sandbox = body.sandbox === true;
+            } else {
+              if (sandboxStatusEl) { sandboxStatusEl.textContent = `✗ ${body.error ?? r.status}`; sandboxStatusEl.classList.add('hint-warn-inline'); }
+              sandboxCb.checked = !enabled;  // revert on failure
+            }
+          } catch (e: any) {
+            if (sandboxStatusEl) { sandboxStatusEl.textContent = `✗ ${e?.message ?? e}`; sandboxStatusEl.classList.add('hint-warn-inline'); }
+            sandboxCb.checked = !enabled;
+          } finally {
+            sandboxCb.disabled = false;
+          }
         });
       }
 

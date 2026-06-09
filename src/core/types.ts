@@ -99,6 +99,15 @@ export interface DaemonSession {
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
   tuiToggledIndices?: number[];  // tracks toggled options for multi-select card PATCH
+  /** Agent-raised "needs human" signal (`botmux send --attention`). Non-blocking:
+   *  the agent flags it hit a blocker only a human can clear (authorization,
+   *  an irreversible decision, missing access) and goes on to end its turn.
+   *  Feeds the dashboard needs-you column with the human-readable `reason`.
+   *  Cleared when the user next replies to the session or when the session
+   *  closes. Distinct from tuiPromptCardId (which is a
+   *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
+   *  agent-initiated, and carries no rendered options. */
+  agentAttention?: { kind: string; reason: string; at: number };
   /** Last assistant uuid emitted via the adopt bridge final_output pipeline.
    *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
    *  the worker re-drains the transcript after a noisy idle). */

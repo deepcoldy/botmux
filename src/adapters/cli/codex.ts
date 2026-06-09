@@ -3,15 +3,12 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath } from '../../services/codex-paths.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
  *  file, which Codex creates lazily at the first submit (chicken-and-egg:
  *  you can't use it to verify the *first* submit that we're trying to fix). */
-function delay(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
@@ -68,7 +65,7 @@ function matchHistoryDelta(path: string, fromByte: number, expectedText: string)
 async function waitForHistoryAppend(
   path: string, fromByte: number, expectedText: string, timeoutMs: number,
 ): Promise<HistoryMatch> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     const match = matchHistoryDelta(path, fromByte, expectedText);
     if (match.found) return match;

@@ -120,6 +120,14 @@ export class ZellijObserveBackend implements ObserveBackend {
     }
   }
 
+  /** True while ≥1 live web-attach client is up — the dump-screen poller is
+   *  paused (see setLiveAttach), so screen changes flow only to the attach PTY
+   *  and never bump the worker's onData/onPtyData activity watermark. Consumers
+   *  that gate on that watermark must capture unconditionally in this window. */
+  isLiveAttachActive(): boolean {
+    return this.liveAttachCount > 0;
+  }
+
   /** Whether the adopted CLI process is still running. Unknown pid → defer to
    *  pane liveness only. EPERM (exists, not ours) counts as alive; ESRCH = gone. */
   private isCliPidAlive(): boolean {

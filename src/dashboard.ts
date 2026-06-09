@@ -567,6 +567,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Sandbox landing: review the clone's diff (GET) then apply/discard (POST).
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/sandbox-diff$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/sandbox-diff`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/sandbox-land\/(apply|discard)$/))) {
+      const sid = decodeURIComponent(m[1]); const action = m[2];
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/sandbox-land/${action}`, { method: 'POST' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/(run|pause|resume)$/))) {
       const id = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.scheduleOwnerOf(id);
@@ -881,6 +901,7 @@ const server = createServer(async (req, res) => {
             defaultOncall: j.defaultOncall,
             autoboundChatCount: j.autoboundChatCount ?? 0,
             brandLabel: j.brandLabel ?? null,
+            sandbox: j.sandbox === true,
             disableStreamingCard: j.disableStreamingCard === true,
             writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
             privateCard: j.privateCard === true,
@@ -929,6 +950,23 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-brand-label`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/sandbox — proxy to that bot's daemon. Body `{ enabled: boolean }`.
+    let mBotSandbox: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSandbox = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox$/))) {
+      const appId = decodeURIComponent(mBotSandbox[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-sandbox`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
