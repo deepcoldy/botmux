@@ -313,7 +313,10 @@ export interface SettingsCardHandlerDeps {
  * `event-dispatcher` 2.5s handler timeout (`event-dispatcher.ts:365`).
  */
 export interface SettingsCardHandlerResult {
-  toast: { type: 'info' | 'success' | 'error'; content: string };
+  /** Optional — success path now returns ONLY a `card` to avoid the
+   *  toast + card two-pass render that flashes the OLD state. Errors,
+   *  permission denials, and noop still return a toast. */
+  toast?: { type: 'info' | 'success' | 'error'; content: string };
   card?: { type: 'raw'; data: Record<string, unknown> };
 }
 
@@ -374,29 +377,35 @@ function errorToast(textKey: string, params: Record<string, string> | undefined,
 }
 
 /**
- * Build a `{ toast: success, card }` envelope from a Route B settings response.
- *  - `card` is the post-write rebuilt card body shipped in the SAME callback
- *    response so Lark's client patches the card atomically with the toast
- *    (no out-of-band `updateMessage`, no stale-render flash).
- *  - Falls back to a toast-only result if the response carries no settings
- *    payload — caller can still surface the toast, and event-dispatcher's
- *    slow-fallback will not have a card to patch but that's the rare path.
+ * Build a `{ card }` envelope from a Route B settings response.
+ *
+ * Per codex 2026-06-09: returning toast + card together makes Lark's client
+ * render the toast/spinner-removal and the card-replacement as two separate
+ * passes — that's the stale-flash users see between the two passes. Drop
+ * the toast and return ONLY the card; the card body itself carries the
+ * "✓ 已开启 / ✓ 已关闭" signal so the user knows the write succeeded.
+ *
+ * If the payload carries no settings (malformed response), fall back to a
+ * generic success toast so the user gets *some* feedback. Error paths still
+ * use error toasts — those don't have a card to render anyway.
  */
 function successResult(
   payload: unknown,
   invokerOpenId: string,
   locale: Locale,
-  toastKey: string,
+  fallbackToastKey: string,
 ): SettingsCardHandlerResult {
   const settings = (payload as any)?.body?.settings ?? (payload as any)?.settings;
-  const toast = { type: 'success' as const, content: t(toastKey, undefined, locale) };
   if (!settings || typeof settings !== 'object') {
-    return { toast };
+    return { toast: { type: 'success', content: t(fallbackToastKey, undefined, locale) } };
   }
   const dto = composeSections(settings, { canWrite: true });
   const cardJson = buildSettingsCard(dto, { invokerOpenId, locale, canWrite: true });
+  // No `toast` on the success path — the card body itself ("✓ 已开启" /
+  // "✓ 已关闭") is the feedback. Returning toast + card together triggers
+  // two separate render passes on the Lark client and flashes the OLD card
+  // state during the gap.
   return {
-    toast,
     card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
   };
 }

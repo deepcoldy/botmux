@@ -203,10 +203,9 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
       locale: 'en',
     });
 
-    // Result envelope: toast + card together, no out-of-band updateMessage.
-    expect(result.toast).toBeDefined();
-    expect(result.toast.content).toContain('Saved');
-    expect(result.toast.type).toBe('success');
+    // codex pass 3: success path is CARD-ONLY (no toast). No out-of-band
+    // updateMessage; the card body itself shows the post-write state.
+    expect(result.toast).toBeUndefined();
     expect(result.card).toBeDefined();
     expect(result.card?.type).toBe('raw');
 
@@ -272,7 +271,7 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
       locale: 'en',
     });
 
-    expect(r.toast.content).toContain('Owner only');
+    expect(r.toast?.content).toContain('Owner only');
     // Server NEVER reached for this caller — local gate caught them first.
     expect(fx.hits.GET).toBe(0);
     expect(fx.hits.PUT).toBe(0);

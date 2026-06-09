@@ -195,17 +195,18 @@ describe('handleSettingsCardAction', () => {
     } as any;
   }
 
-  it('ACK shape: returns { toast } at the top level — NOT { ack: { toast } } (B1)', async () => {
+  it('result shape: success path returns ONLY { card } (no toast) to avoid stale-render flash', async () => {
     const deps = makeDeps();
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
     expect((r as any).ack).toBeUndefined();
-    expect((r as any).toast).toBeDefined();
-    // PR3 UI revision: handler now awaits the write inline so Lark's button
-    // spinner shows; the toast reports the FINAL outcome (success), not
-    // the legacy mid-flight "⏳ Saving…".
-    expect((r as any).toast.content).toContain('✅');
-    expect((r as any).toast.type).toBe('success');
+    // PR3 UI revision pass 3 (codex): success path is card-only. The card
+    // body itself ("✓ 已开启" / "✓ 已关闭") is the feedback. Returning toast
+    // + card together makes Lark's client render the toast and card in
+    // two separate passes, flashing the OLD card state in the gap.
+    expect((r as any).toast).toBeUndefined();
+    expect((r as any).card).toBeDefined();
+    expect((r as any).card.type).toBe('raw');
   });
 
   it('invoker lock fail-closed: missing invoker_open_id → not_invoker, no client (B3)', async () => {
@@ -260,13 +261,10 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('happy toggle → sync PUT /__daemon/settings-write with patch + ownerUnionId, final toast = saved', async () => {
+  it('happy toggle → sync PUT /__daemon/settings-write with patch + ownerUnionId; success path is card-only', async () => {
     const deps = makeDeps();
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
-    // PR3 UI revision: handler awaits the PUT before returning, so by the
-    // time we're here the spy has already seen the request — no scheduler
-    // flush needed.
     expect(deps.createClientSpy).toHaveBeenCalledOnce();
     const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
     expect(reqSpy).toHaveBeenCalledWith({
@@ -274,8 +272,9 @@ describe('handleSettingsCardAction', () => {
       path: '/__daemon/settings-write',
       body: { patch: { publicReadOnly: true }, ownerUnionId: OWNER_UNION },
     });
-    expect(ackToastText(r)).toContain('✅');
-    expect((r as any).toast.type).toBe('success');
+    // codex: success returns card only (no toast) — see ACK shape test above.
+    expect((r as any).toast).toBeUndefined();
+    expect((r as any).card).toBeDefined();
   });
 
   it('happy set_time → ACK + async PUT with maintenance.autoUpdate.time', async () => {
@@ -319,7 +318,7 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('refresh action → sync GET /__daemon/settings-snapshot, NO PUT, final toast = refreshed', async () => {
+  it('refresh action → sync GET /__daemon/settings-snapshot, NO PUT; success path is card-only', async () => {
     const deps = makeDeps();
     const data = makeAction({ action: SETTINGS_ACTION_REFRESH, invoker_open_id: INVOKER });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
@@ -329,8 +328,8 @@ describe('handleSettingsCardAction', () => {
     expect(call.method).toBe('GET');
     expect(call.path).toBe('/__daemon/settings-snapshot');
     expect(reqSpy.mock.calls.find((c: any) => c[0].method === 'PUT')).toBeUndefined();
-    expect(ackToastText(r)).toContain('✅');
-    expect((r as any).toast.type).toBe('success');
+    expect((r as any).toast).toBeUndefined();
+    expect((r as any).card).toBeDefined();
   });
 
   it('happy toggle: PUT response yields a {toast, card} result so Lark patches atomically (B2 — PR3 pass 2)', async () => {

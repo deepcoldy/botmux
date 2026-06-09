@@ -108,13 +108,14 @@ describe('handleCardAction → settings dispatch returns {toast, card} (PR3 pass
     };
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
 
-    // Toast + card in the same response. Lark's client renders both atomically.
-    expect(result.toast).toBeDefined();
+    // codex pass 3: success path is CARD-ONLY (no toast). Returning toast +
+    // card together makes Lark render in two passes — flashing the old card
+    // state in the gap.
+    expect(result.toast).toBeUndefined();
     expect(result.card).toBeDefined();
     expect(result.card?.type).toBe('raw');
     const cardJson = JSON.stringify(result.card?.data);
     expect(cardJson).toContain('Dashboard');
-    // Identity hardening still holds — no raw union_id leaks into the rebuilt card.
     expect(cardJson).not.toContain('"union_id"');
     expect(cardJson).not.toContain('"senderUnionId"');
 
@@ -177,7 +178,9 @@ describe('handleCardAction → settings dispatch returns {toast, card} (PR3 pass
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
     await new Promise(resolve => setImmediate(resolve));
 
-    expect(result.toast).toBeDefined();
+    // Success path returns card only; either toast OR card is enough to
+    // confirm the handler resolved cleanly (we picked card-only above).
+    expect(result.card).toBeDefined();
     // The fast path doesn't depend on open_message_id; updateMessage stays untouched.
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
