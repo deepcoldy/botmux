@@ -19,7 +19,16 @@ import {
   attemptPtyLogPath,
   scrubSnapshotForUnauthed,
   TERMINAL_RUN_STATUSES,
+  type RunSnapshotDTO,
 } from '../workflows/ops-projection.js';
+import {
+  getRunSnapshot as getRunSnapshotHelper,
+  listWorkflowRuns,
+  runApproveReject,
+  runCancel,
+  type HandlerResult,
+  type WorkflowsActionDeps,
+} from './workflows-action-helpers.js';
 
 export type WorkflowApiDeps = {
   runsDir: string;
@@ -40,6 +49,19 @@ export type WorkflowApiDeps = {
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+/** Render a HandlerResult through res. Tolerates string bodies (helper may return raw upstream text). */
+function writeHandlerResult(res: ServerResponse, result: HandlerResult): void {
+  const headers = { 'content-type': 'application/json', ...(result.headers ?? {}) };
+  res.writeHead(result.status, headers);
+  res.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body));
+}
+
+async function readBodyString(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
@@ -181,34 +203,34 @@ export async function handleWorkflowApi(
     return true;
   }
 
+  // Shared deps for the workflow-runs action helpers — these handlers and the
+  // PR2 C6 HMAC-gated `/__daemon/workflows-runs/*` route both go through the
+  // same helpers so response shapes / error codes stay identical.
+  const wfActionDeps: WorkflowsActionDeps<RunSnapshotDTO> = {
+    runsDir: deps.runsDir,
+    proxyToDaemon: deps.proxyToDaemon,
+    listRuns,
+    readRunSnapshot,
+    scrubSnapshotForUnauthed,
+    TERMINAL_RUN_STATUSES,
+    isValidRunId,
+  };
+
   if (req.method === 'GET' && url.pathname === '/api/workflows/runs') {
     const all = url.searchParams.get('all') === '1';
     const statusParam = url.searchParams.get('status');
     const statuses = statusParam
       ? new Set(statusParam.split(',').map(s => s.trim()).filter(Boolean))
       : undefined;
-    try {
-      const rows = await listRuns(deps.runsDir, {
-        all,
-        statuses,
-        includeBinding: true,
-      });
-      jsonRes(res, 200, { runs: rows });
-    } catch (e: any) {
-      jsonRes(res, 500, { error: 'listRuns_failed', message: e?.message ?? String(e) });
-    }
+    const result = await listWorkflowRuns({ all, statuses }, wfActionDeps);
+    writeHandlerResult(res, result);
     return true;
   }
 
   if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/snapshot$/))) {
     const runId = decodeURIComponent(m[1]);
-    const snap = await readRunSnapshot(deps.runsDir, runId);
-    if (!snap) jsonRes(res, 404, { error: 'unknown_run' });
-    // Public-read endpoint — but `io.log.text` carries the last 64 KiB of
-    // `terminal.log` (subagent worker stdout/stderr), which can contain
-    // env-var dumps, API key error responses, etc.  Strip when unauth'd;
-    // a logged-in dashboard still gets the full view.
-    else jsonRes(res, 200, authed ? snap : scrubSnapshotForUnauthed(snap));
+    const result = await getRunSnapshotHelper(runId, authed, wfActionDeps);
+    writeHandlerResult(res, result);
     return true;
   }
 
@@ -287,68 +309,16 @@ export async function handleWorkflowApi(
   }
 
   // approve / reject share the same shape: { comment? } body, route to the
-  // owner daemon via chat-binding, daemon picks the unique dangling
-  // human-gate wait and calls resolveWait().  See `resolveDashboardWait` in
-  // daemon.ts for the error matrix.
+  // owner daemon via chat-binding. See
+  // `dashboard/workflows-action-helpers.ts:runApproveReject` for the
+  // alreadyTerminal / needs_lark_or_cli / proxy branches.
   m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/(approve|reject)$/);
   if (req.method === 'POST' && m) {
     const runId = decodeURIComponent(m[1]);
     const action = m[2] as 'approve' | 'reject';
-    if (!isValidRunId(runId)) {
-      jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
-      return true;
-    }
-    let body: { comment?: unknown };
-    try {
-      body = await readJsonBody<{ comment?: unknown }>(req);
-    } catch {
-      jsonRes(res, 400, { ok: false, error: 'bad_json' });
-      return true;
-    }
-    const comment =
-      typeof body.comment === 'string' && body.comment.trim()
-        ? body.comment.trim()
-        : undefined;
-    const snap = await readRunSnapshot(deps.runsDir, runId);
-    if (!snap) {
-      jsonRes(res, 404, { ok: false, error: 'unknown_run' });
-      return true;
-    }
-    if (TERMINAL_RUN_STATUSES.has(snap.run.status)) {
-      jsonRes(res, 200, {
-        ok: true,
-        runId,
-        resolution: action === 'approve' ? 'approved' : 'rejected',
-        activityId: '',
-        attemptId: '',
-        resolvedAt: snap.updatedAt,
-        lastSeq: snap.lastSeq,
-        alreadyTerminal: true,
-      });
-      return true;
-    }
-    const owner = snap.chatBinding?.larkAppId;
-    if (!owner) {
-      jsonRes(res, 409, {
-        ok: false,
-        error: 'needs_lark_or_cli',
-        hint:
-          `This run has no chat-binding owner; dashboard approval requires ` +
-          `the owning daemon. Use the Lark approval card for now.`,
-      });
-      return true;
-    }
-    const upstream = await deps.proxyToDaemon(
-      owner,
-      `/api/workflows/runs/${encodeURIComponent(runId)}/${action}`,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ comment }),
-      },
-    );
-    res.writeHead(upstream.status, { 'content-type': 'application/json' });
-    res.end(await upstream.text());
+    const bodyRaw = await readBodyString(req);
+    const result = await runApproveReject(runId, action, bodyRaw, wfActionDeps);
+    writeHandlerResult(res, result);
     return true;
   }
 
@@ -412,56 +382,9 @@ export async function handleWorkflowApi(
 
   if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/cancel$/))) {
     const runId = decodeURIComponent(m[1]);
-    if (!isValidRunId(runId)) {
-      jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
-      return true;
-    }
-    let body: { reason?: unknown };
-    try {
-      body = await readJsonBody<{ reason?: string }>(req);
-    } catch {
-      jsonRes(res, 400, { ok: false, error: 'bad_json' });
-      return true;
-    }
-    const reason =
-      typeof body.reason === 'string' && body.reason.trim()
-        ? body.reason.trim()
-        : 'cancelled via dashboard';
-    const snap = await readRunSnapshot(deps.runsDir, runId);
-    if (!snap) {
-      jsonRes(res, 404, { ok: false, error: 'unknown_run' });
-      return true;
-    }
-    if (TERMINAL_RUN_STATUSES.has(snap.run.status)) {
-      jsonRes(res, 200, {
-        ok: true,
-        runId,
-        status: snap.run.status,
-        alreadyTerminal: true,
-        lastSeq: snap.lastSeq,
-      });
-      return true;
-    }
-    const owner = snap.chatBinding?.larkAppId;
-    if (!owner) {
-      jsonRes(res, 409, {
-        ok: false,
-        error: 'needs_cli_cancel',
-        hint: `This run has no chat-binding owner; use 'botmux workflow cancel ${runId}' instead.`,
-      });
-      return true;
-    }
-    const upstream = await deps.proxyToDaemon(
-      owner,
-      `/api/workflows/runs/${encodeURIComponent(runId)}/cancel`,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ reason }),
-      },
-    );
-    res.writeHead(upstream.status, { 'content-type': 'application/json' });
-    res.end(await upstream.text());
+    const bodyRaw = await readBodyString(req);
+    const result = await runCancel(runId, bodyRaw, wfActionDeps);
+    writeHandlerResult(res, result);
     return true;
   }
 
