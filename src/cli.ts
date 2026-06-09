@@ -994,7 +994,12 @@ async function cmdCollabPoolRegister(): Promise<void> {
       cliId,
     });
     console.log(`✅ pool store 已登记：id=${pooled.id} chat=${pooled.chatId}${pooled.topicId !== pooled.chatId ? ` topic=${pooled.topicId}` : ''}`);
-    console.log(`\n下一步: botmux restart（control-plane 重启时会自动把该 worker app 注册进 registry）\n`);
+    // worker 虽不收 inbound，但 outbound 发消息/卡片仍依赖应用能力与 scopes，
+    // 所以和普通 setup 一样跑一遍开放平台自动配置（导入权限/配 redirect/发版本），
+    // 失败会自动回退到手动步骤提示，不影响已写入的 bots.json / pool。
+    // 复用 --no-open-platform-auto flag 语义。
+    await finishOpenPlatformSetup(creds.appId, creds.brand);
+    console.log(`下一步: botmux restart（control-plane 重启时会自动把该 worker app 注册进 registry）\n`);
   } catch (err: any) {
     console.log(`\n❌ 注册失败: ${err?.message ?? String(err)}`);
   } finally {
