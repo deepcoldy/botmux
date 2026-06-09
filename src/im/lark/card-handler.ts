@@ -391,6 +391,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
+  // ─── PR3 `/dashboard sessions` slice 1: refresh + page callbacks ──────
+  // Same response shape as dash_settings_*: success returns `{ card }` only,
+  // no toast, so Lark renders the new list in a single pass.
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_sessions_') &&
+    larkAppId
+  ) {
+    const { handleSessionsCardAction } = await import('./sessions-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const sessionsLocale = localeForBot(larkAppId);
+    return handleSessionsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: sessionsLocale,
+    });
+  }
+
   // ─── /relay picker: state-changing actions (select / page / search) ────
   // These three actions all re-render the picker card with updated state:
   //   • relay_select — user clicked a session card → set as selectedSessionId

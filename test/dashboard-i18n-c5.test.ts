@@ -29,6 +29,17 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.dm_sent',
   'card.dashboard.dm_failed',
 
+  // ─── sessions card (PR3 slice 1) ────────────────────────────────────
+  'card.dashboard.sessions.title',
+  'card.dashboard.sessions.count_summary',
+  'card.dashboard.sessions.empty',
+  'card.dashboard.sessions.refresh',
+  'card.dashboard.sessions.prev',
+  'card.dashboard.sessions.next',
+  'card.dashboard.sessions.dm_sent',
+  'card.dashboard.sessions.dm_failed',
+  'card.dashboard.sessions.list_failed',
+
   // ─── settings card (C4) ─────────────────────────────────────────────
   'card.dashboard.settings.title',
   'card.dashboard.settings.refresh',

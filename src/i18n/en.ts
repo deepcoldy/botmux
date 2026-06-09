@@ -583,6 +583,17 @@ export const messages: Record<string, string> = {
   'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',
   'card.dashboard.dm_sent': '📬 The dashboard reply was DMed to the Bot Owner.',
   'card.dashboard.dm_failed': '⚠️ Failed to DM Bot Owner: {reason}',
+  // sessions card (PR3 slice 1)
+  'card.dashboard.sessions.title': '🖥️ Dashboard Sessions',
+  'card.dashboard.sessions.count_summary': 'Active {active} · Closed {closed} · Page {page}/{totalPages}',
+  'card.dashboard.sessions.empty': '_No sessions yet_',
+  'card.dashboard.sessions.refresh': '🔄 Refresh',
+  'card.dashboard.sessions.prev': '← Prev',
+  'card.dashboard.sessions.next': 'Next →',
+  'card.dashboard.sessions.dm_sent': '📬 The dashboard sessions list was DMed to the Bot Owner.',
+  'card.dashboard.sessions.dm_failed': '⚠️ Failed to DM the sessions list to Bot Owner: {reason}',
+  'card.dashboard.sessions.list_failed': '⚠️ Failed to fetch sessions list: {reason}',
+
   'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to the Bot Owner.',
   'card.dashboard.settings.dm_failed': '⚠️ Failed to DM the settings card to Bot Owner: {reason}',
 

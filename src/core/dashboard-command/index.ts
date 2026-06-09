@@ -27,12 +27,14 @@ import {
   type DashboardModule,
 } from './stub.js';
 import { handleDashboardSettings, type DashboardSettingsCommandDeps } from './settings.js';
+import { handleDashboardSessions, type DashboardSessionsCommandDeps } from './sessions.js';
 
 /** Optional test seam — production omits and uses the real PR2 helper. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   /** Override for `sendUserMessage` (DM to owner). Production omits. */
   sendUserMessage?: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
   settings?: DashboardSettingsCommandDeps;
+  sessions?: DashboardSessionsCommandDeps;
 }
 
 export async function handleDashboardCommand(
@@ -85,11 +87,16 @@ export async function handleDashboardCommand(
     return;
   }
 
-  // PR3 C4: settings dispatched to the real handler; the other 5 modules
-  // remain stubs until their own PR.
+  // PR3 C4: settings dispatched to the real handler.
   if (sub === 'settings') {
     const settingsArgs = args.replace(/^settings\s*/, '');
     return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.settings);
+  }
+
+  // PR3 sessions slice 1: read-only list + pagination + refresh.
+  if (sub === 'sessions') {
+    const sessionsArgs = args.replace(/^sessions\s*/, '');
+    return handleDashboardSessions(message, sessionsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.sessions);
   }
 
   if (DASHBOARD_MODULES.includes(sub as DashboardModule)) {

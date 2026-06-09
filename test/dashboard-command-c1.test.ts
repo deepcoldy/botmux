@@ -139,7 +139,10 @@ describe('handleDashboardCommand — owner gate covers all subcommands', () => {
 /** ─── Owner-gated replies all go to DM, NOT topic interactive ───────── */
 
 describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
-  it.each(['overview', 'sessions', 'workflows', 'groups', 'schedules'] as const)(
+  // `sessions` has its own real handler in slice 1 (see
+  // dashboard-sessions-command.test.ts); the rest are stubs until each slice
+  // lands.
+  it.each(['overview', 'workflows', 'groups', 'schedules'] as const)(
     'owner /dashboard %s → stub DMed to owner, topic gets dm_sent confirmation',
     async (mod) => {
       const deps = makeDeps();

@@ -586,6 +586,17 @@ export const messages: Record<string, string> = {
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',
   'card.dashboard.dm_sent': '📬 Dashboard 响应已私信给 Bot Owner。',
   'card.dashboard.dm_failed': '⚠️ 给 Bot Owner 发私聊失败：{reason}',
+  // sessions card (PR3 slice 1)
+  'card.dashboard.sessions.title': '🖥️ Dashboard 会话',
+  'card.dashboard.sessions.count_summary': '活跃 {active} · 已关闭 {closed} · 第 {page}/{totalPages} 页',
+  'card.dashboard.sessions.empty': '_当前没有会话_',
+  'card.dashboard.sessions.refresh': '🔄 刷新',
+  'card.dashboard.sessions.prev': '← 上一页',
+  'card.dashboard.sessions.next': '下一页 →',
+  'card.dashboard.sessions.dm_sent': '📬 Dashboard 会话列表已私信给 Bot Owner。',
+  'card.dashboard.sessions.dm_failed': '⚠️ 给 Bot Owner 发送会话列表失败：{reason}',
+  'card.dashboard.sessions.list_failed': '⚠️ 拉取会话列表失败：{reason}',
+
   'card.dashboard.settings.dm_sent': '📬 Dashboard settings 卡片已私信给 Bot Owner。',
   'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送 settings 卡片失败：{reason}',
 
