@@ -1,16 +1,22 @@
 /**
- * PR3 `/dashboard schedules` slice 1 — card builder + callback handler tests.
+ * PR3 `/dashboard schedules` slice 1 + 2a — card builder + callback handler tests.
  */
 
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ScheduleCardTaskInput } from '../src/dashboard/schedule-card-model.js';
+import { toScheduleDetailDto } from '../src/dashboard/schedule-card-model.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildSchedulesCard,
+  buildSchedulesDetailCard,
   handleSchedulesCardAction,
+  SCHEDULES_ACTION_BACK_TO_LIST,
+  SCHEDULES_ACTION_DETAIL,
   SCHEDULES_ACTION_PAGE,
+  SCHEDULES_ACTION_PAUSE,
   SCHEDULES_ACTION_REFRESH,
+  SCHEDULES_ACTION_RESUME,
 } from '../src/im/lark/schedules-card.js';
 
 const INVOKER = 'ou_owner';
@@ -106,11 +112,14 @@ describe('buildSchedulesCard', () => {
     const tasks = Array.from({ length: 15 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
     const findPager = (json: string): { prev: any; next: any } => {
       const parsed = JSON.parse(json);
-      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
-      const actions = actionRow.actions as any[];
+      // Slice 2a introduced per-row `📂 详情` action elements before the
+      // pagination row, so we can't grab the first action; flatten across
+      // all action elements and pick by button label instead.
+      const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+      const allActions = actionRows.flatMap((r: any) => (r.actions as any[]) ?? []);
       return {
-        prev: actions.find((a: any) => String(a.text?.content ?? '').includes('上一页')),
-        next: actions.find((a: any) => String(a.text?.content ?? '').includes('下一页')),
+        prev: allActions.find((a: any) => String(a.text?.content ?? '').includes('上一页')),
+        next: allActions.find((a: any) => String(a.text?.content ?? '').includes('下一页')),
       };
     };
     const p1 = findPager(buildSchedulesCard(tasks, { ...baseOpts, page: 1 }, NOW));
@@ -181,6 +190,126 @@ describe('buildSchedulesCard', () => {
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
     for (const btn of actionRow.actions) {
       expect(btn.value?.invoker_open_id).toBe(INVOKER);
+    }
+  });
+
+  // ─── Slice 2a per-row 📂 详情 button ─────────────────────────────────
+  it('every list row carries an inline `📂 详情` button whose value.schedule_id matches that row', () => {
+    const tasks: ScheduleCardTaskInput[] = [
+      task({ id: 'sch_a', name: 'a', enabled: true }),
+      task({ id: 'sch_b', name: 'b', enabled: true }),
+      task({ id: 'sch_c', name: 'c', enabled: false }),
+    ];
+    const json = buildSchedulesCard(tasks, baseOpts, NOW);
+    const parsed = JSON.parse(json);
+    const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+    const detailButtons = actionRows
+      .flatMap((ar: any) => ar.actions ?? [])
+      .filter((b: any) => b.value?.action === SCHEDULES_ACTION_DETAIL);
+    expect(detailButtons.length).toBe(tasks.length);
+    const seenIds = new Set(detailButtons.map((b: any) => b.value.schedule_id));
+    expect(seenIds.has('sch_a')).toBe(true);
+    expect(seenIds.has('sch_b')).toBe(true);
+    expect(seenIds.has('sch_c')).toBe(true);
+    for (const b of detailButtons) {
+      expect(String(b.text?.content ?? '')).toContain('📂');
+      expect(b.value.invoker_open_id).toBe(INVOKER);
+    }
+  });
+});
+
+describe('buildSchedulesDetailCard (slice 2a)', () => {
+  const NOW = Date.parse('2026-06-09T12:00:00.000Z');
+  const baseOpts = { invokerOpenId: INVOKER, locale: 'zh' as const };
+
+  function detailFor(over: Partial<ScheduleCardTaskInput> = {}) {
+    return toScheduleDetailDto(task(over), { nowMs: NOW });
+  }
+
+  it('renders the name (escaped) and id verbatim in the title', () => {
+    const detail = detailFor({ id: 'sch_detail_123', name: 'my schedule', enabled: true });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    expect(json).toContain('定时任务详情');
+    expect(json).toContain('my schedule');
+    expect(json).toContain('sch_detail_123');
+  });
+
+  it('renders pause + resume + back buttons (all 3 present, invoker_open_id bound)', () => {
+    const detail = detailFor({ id: 'sch_btns', enabled: true });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const acts = actionRow.actions as any[];
+    const pause = acts.find(a => a.value?.action === SCHEDULES_ACTION_PAUSE);
+    const resume = acts.find(a => a.value?.action === SCHEDULES_ACTION_RESUME);
+    const back = acts.find(a => a.value?.action === SCHEDULES_ACTION_BACK_TO_LIST);
+    expect(pause).toBeDefined();
+    expect(resume).toBeDefined();
+    expect(back).toBeDefined();
+    expect(pause.value.schedule_id).toBe('sch_btns');
+    expect(resume.value.schedule_id).toBe('sch_btns');
+    expect(pause.value.invoker_open_id).toBe(INVOKER);
+    expect(resume.value.invoker_open_id).toBe(INVOKER);
+    expect(back.value.invoker_open_id).toBe(INVOKER);
+  });
+
+  it('enabled=true → pause enabled / resume disabled with alreadyEnabled note', () => {
+    const detail = detailFor({ id: 'sch_enabled', enabled: true });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const pause = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_PAUSE,
+    );
+    const resume = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_RESUME,
+    );
+    // pause clickable (no disabled flag); resume disabled.
+    expect(pause.disabled).not.toBe(true);
+    expect(resume.disabled).toBe(true);
+    // Reason note for resume disabled (mapped via mapResumeDisabledReason →
+    // card.dashboard.schedules.resume.disabled.alreadyEnabled = '任务已启用').
+    expect(json).toContain('任务已启用');
+  });
+
+  it('enabled=false → resume enabled / pause disabled with alreadyPaused note', () => {
+    const detail = detailFor({ id: 'sch_paused', enabled: false });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const pause = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_PAUSE,
+    );
+    const resume = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_RESUME,
+    );
+    expect(pause.disabled).toBe(true);
+    expect(resume.disabled).not.toBe(true);
+    // Reason note for pause disabled (mapped via mapPauseDisabledReason →
+    // card.dashboard.schedules.pause.disabled.alreadyPaused = '任务已暂停').
+    expect(json).toContain('任务已暂停');
+  });
+
+  it('escapes <at> / <font> injection in name so user-supplied chars cannot break the wrapper', () => {
+    const detail = detailFor({
+      id: 'sch_inject',
+      name: '</font><at id=ou_evil></at> evil',
+      enabled: true,
+    });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    // Find any div whose content references the (escaped) "evil" suffix.
+    const evilDivs = (parsed.elements as any[]).filter(
+      (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
+        && (e.text.content as string).includes('evil'),
+    );
+    expect(evilDivs.length).toBeGreaterThan(0);
+    for (const d of evilDivs) {
+      const content = d.text.content as string;
+      // Raw `<at` must NOT appear anywhere (escaped form `&lt;at` is fine).
+      expect(content).not.toMatch(/<at\b/);
+      // `&lt;` must appear (escape took effect).
+      expect(content).toContain('&lt;');
     }
   });
 });
@@ -295,5 +424,457 @@ describe('handleSchedulesCardAction', () => {
     );
     expect(r.toast?.content).toContain('⚠️');
     expect(deps.createClient).not.toHaveBeenCalled();
+  });
+
+  // ─── Slice 2a: DETAIL ────────────────────────────────────────────────
+  describe('action=dash_schedules_detail', () => {
+    function makeDetailDeps(scheduleId = 'sch_a') {
+      const tasks = [
+        task({ id: scheduleId, name: 'visible schedule', enabled: true }),
+        task({ id: 'sch_other', name: 'other', enabled: true }),
+      ];
+      const requestSpy = vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' }));
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+        requestSpy,
+      };
+    }
+
+    it('happy: GET schedules-list and returns { card } detail body; no toast', async () => {
+      const deps = makeDetailDeps('sch_a');
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_DETAIL, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(deps.requestSpy).toHaveBeenCalledOnce();
+      expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
+      expect(r.toast).toBeUndefined();
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('定时任务详情');
+      // pause + resume + back action labels embedded
+      expect(cardJson).toContain(SCHEDULES_ACTION_PAUSE);
+      expect(cardJson).toContain(SCHEDULES_ACTION_RESUME);
+      expect(cardJson).toContain(SCHEDULES_ACTION_BACK_TO_LIST);
+      expect(cardJson).toContain('sch_a');
+    });
+
+    it('schedule_id not in list → toast schedule_not_found, no card', async () => {
+      const deps = makeDetailDeps('sch_a');
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_DETAIL, invoker_open_id: INVOKER, schedule_id: 'sch_ghost' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('定时任务不存在');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('non-owner → owner_only toast, no GET', async () => {
+      const deps = { ...makeDetailDeps('sch_a'), getOwnerOpenId: () => 'ou_other' };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_DETAIL, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('missing invoker_open_id → not_invoker toast, no GET', async () => {
+      const deps = makeDetailDeps('sch_a');
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_DETAIL, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('invoker mismatch → toast, no GET', async () => {
+      const deps = makeDetailDeps('sch_a');
+      const r = await handleSchedulesCardAction(
+        makeAction(
+          { action: SCHEDULES_ACTION_DETAIL, invoker_open_id: INVOKER, schedule_id: 'sch_a' },
+          'ou_stranger',
+        ),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('Route B GET throws → toast list_failed (boom), no card', async () => {
+      const deps = {
+        createClient: vi.fn(() => ({ request: async () => { throw new Error('boom'); } } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+      };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_DETAIL, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps as any,
+      );
+      expect(r.toast?.content).toContain('拉取定时任务列表失败');
+      expect(r.toast?.content).toContain('boom');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('Route B GET 500 → toast list_failed http_500, no card', async () => {
+      const deps = {
+        createClient: vi.fn(() => ({ request: async () => ({ status: 500, body: {}, raw: '' }) } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+      };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_DETAIL, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps as any,
+      );
+      expect(r.toast?.content).toContain('http_500');
+      expect(r.card).toBeUndefined();
+    });
+  });
+
+  // ─── Slice 2a: PAUSE ─────────────────────────────────────────────────
+  describe('action=dash_schedules_pause', () => {
+    function makePauseDeps(
+      scheduleId = 'sch_a',
+      enabled = true,
+      postResp?: { status: number; body?: any },
+    ) {
+      const tasks = [task({ id: scheduleId, name: 'pause me', enabled })];
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+          return { status: 200, body: { schedules: tasks }, raw: '' };
+        }
+        if (req.method === 'POST' && req.path.startsWith('/__daemon/schedules/')) {
+          return postResp ?? { status: 200, body: { ok: true }, raw: '' };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+        requestSpy,
+      };
+    }
+
+    it('happy: GET once + POST once + synth-detail (enabled=false), NO 3rd request, no toast', async () => {
+      const deps = makePauseDeps('sch_a', true);
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      // GET then POST — exactly 2 requests total (no second GET).
+      expect(deps.requestSpy).toHaveBeenCalledTimes(2);
+      expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ method: 'POST', path: '/__daemon/schedules/sch_a/pause' }),
+      );
+      expect(r.toast).toBeUndefined();
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      // synth-detail renders the paused state — paused icon + resume reason
+      // note absent (because we just paused); the disabled pause button is
+      // now rendered (with the alreadyPaused note string).
+      expect(cardJson).toContain('定时任务详情');
+      // disabled pause btn flag in rendered JSON
+      expect(cardJson).toContain('"disabled":true');
+      // alreadyPaused reason note copy.
+      expect(cardJson).toContain('任务已暂停');
+    });
+
+    it('SECURITY: snapshot enabled=false → toast alreadyPaused, POST 0 times', async () => {
+      const deps = makePauseDeps('sch_a', false);
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('任务已暂停');
+      expect(r.card).toBeUndefined();
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+
+    it('POST 404 → toast pause_failed, no card', async () => {
+      const deps = makePauseDeps('sch_a', true, { status: 404, body: { error: 'unknown_schedule' } });
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('暂停失败');
+      expect(r.toast?.content).toContain('unknown_schedule');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST 500 (no body.error) → toast pause_failed http_500, no card', async () => {
+      const deps = makePauseDeps('sch_a', true, { status: 500, body: {} });
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('暂停失败');
+      expect(r.toast?.content).toContain('http_500');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST throws → toast pause_failed (err.message), no card', async () => {
+      const tasks = [task({ id: 'sch_a', enabled: true })];
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+          return { status: 200, body: { schedules: tasks }, raw: '' };
+        }
+        throw new Error('network down');
+      });
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+      };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps as any,
+      );
+      expect(r.toast?.content).toContain('暂停失败');
+      expect(r.toast?.content).toContain('network down');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('non-owner → owner_only toast, no POST', async () => {
+      const deps = { ...makePauseDeps('sch_a', true), getOwnerOpenId: () => 'ou_other' };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+      expect(deps.requestSpy).not.toHaveBeenCalled();
+    });
+
+    it('invoker mismatch → toast, no POST', async () => {
+      const deps = makePauseDeps('sch_a', true);
+      const r = await handleSchedulesCardAction(
+        makeAction(
+          { action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' },
+          'ou_stranger',
+        ),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('pre-POST GET cannot find schedule → toast schedule_not_found, NO POST issued', async () => {
+      const deps = makePauseDeps('sch_a', true);
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_GHOST' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('定时任务不存在');
+      expect(r.card).toBeUndefined();
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+  });
+
+  // ─── Slice 2a: RESUME (mirror of pause) ──────────────────────────────
+  describe('action=dash_schedules_resume', () => {
+    function makeResumeDeps(
+      scheduleId = 'sch_a',
+      enabled = false,
+      postResp?: { status: number; body?: any },
+      postRefetchTasks?: ScheduleCardTaskInput[],
+    ) {
+      const initial = [task({ id: scheduleId, name: 'resume me', enabled })];
+      let getCalls = 0;
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+          getCalls += 1;
+          // First GET = pre-POST snapshot, second GET = refresh after resume.
+          if (getCalls === 1) return { status: 200, body: { schedules: initial }, raw: '' };
+          return { status: 200, body: { schedules: postRefetchTasks ?? initial.map(t => ({ ...t, enabled: true })) }, raw: '' };
+        }
+        if (req.method === 'POST' && req.path.startsWith('/__daemon/schedules/')) {
+          return postResp ?? { status: 200, body: { ok: true }, raw: '' };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+        requestSpy,
+      };
+    }
+
+    it('happy: GET + POST + refetch GET, enabled=true detail returned, no toast', async () => {
+      const deps = makeResumeDeps('sch_a', false);
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      // For resume, the handler does an extra GET to pick up the fresh
+      // nextRunAt computed by the scheduler. Order: GET → POST → GET.
+      expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ method: 'POST', path: '/__daemon/schedules/sch_a/resume' }),
+      );
+      expect(r.toast).toBeUndefined();
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('定时任务详情');
+      // resume disabled note → 已启用 (because we just resumed)
+      expect(cardJson).toContain('任务已启用');
+    });
+
+    it('SECURITY: snapshot enabled=true → toast alreadyEnabled, POST 0 times', async () => {
+      const deps = makeResumeDeps('sch_a', true);
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('任务已启用');
+      expect(r.card).toBeUndefined();
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+
+    it('POST 404 → toast resume_failed, no card', async () => {
+      const deps = makeResumeDeps('sch_a', false, { status: 404, body: { error: 'unknown_schedule' } });
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('恢复失败');
+      expect(r.toast?.content).toContain('unknown_schedule');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST 500 → toast resume_failed http_500, no card', async () => {
+      const deps = makeResumeDeps('sch_a', false, { status: 500, body: {} });
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('恢复失败');
+      expect(r.toast?.content).toContain('http_500');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST throws → toast resume_failed (err.message), no card', async () => {
+      const tasks = [task({ id: 'sch_a', enabled: false })];
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+          return { status: 200, body: { schedules: tasks }, raw: '' };
+        }
+        throw new Error('network down');
+      });
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+      };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps as any,
+      );
+      expect(r.toast?.content).toContain('恢复失败');
+      expect(r.toast?.content).toContain('network down');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('non-owner → toast, no POST issued', async () => {
+      const deps = { ...makeResumeDeps('sch_a', false), getOwnerOpenId: () => 'ou_other' };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('invoker mismatch → toast, no POST', async () => {
+      const deps = makeResumeDeps('sch_a', false);
+      const r = await handleSchedulesCardAction(
+        makeAction(
+          { action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' },
+          'ou_stranger',
+        ),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
+
+    it('pre-POST GET cannot find schedule → toast schedule_not_found, NO POST issued', async () => {
+      const deps = makeResumeDeps('sch_a', false);
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_GHOST' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('定时任务不存在');
+      expect(r.card).toBeUndefined();
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+  });
+
+  // ─── Slice 2a: BACK TO LIST ─────────────────────────────────────────
+  describe('action=dash_schedules_back_to_list', () => {
+    it('GET schedules-list → returns { card } with list card body at page 1', async () => {
+      const tasks = Array.from({ length: 25 }, (_, i) =>
+        task({ id: `t_${i}`, name: `task-${i}`, enabled: true }),
+      );
+      const requestSpy = vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' }));
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+      };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER }),
+        LARK_APP_ID, deps as any,
+      );
+      expect(requestSpy).toHaveBeenCalledOnce();
+      expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
+      expect(r.toast).toBeUndefined();
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('Dashboard 定时任务');
+      // page 1 of 3 pages (25 / 10)
+      expect(cardJson).toContain('第 1/3 页');
+    });
+
+    it('non-owner → toast, no GET', async () => {
+      const requestSpy = vi.fn();
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => 'ou_other',
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+      };
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER }),
+        LARK_APP_ID, deps as any,
+      );
+      expect(r.toast?.content).toContain('🔒');
+      expect(r.card).toBeUndefined();
+      expect(deps.createClient).not.toHaveBeenCalled();
+    });
   });
 });

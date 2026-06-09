@@ -1,27 +1,56 @@
 /**
- * Schedules list card (PR3 `/dashboard schedules` slice 1).
+ * Schedules list card (PR3 `/dashboard schedules` slice 1 + slice 2a).
  *
- * Read-only list + pagination + refresh. NO run-now / pause / resume / delete
- * / edit / create / search / filter in this slice. Codex scope-cut on
- * 2026-06-09: those need an action-state pattern (optimistic-state +
- * rollback) which we'll design once and reuse across modules.
+ * Slice 1 — read-only list + pagination + refresh.
+ * Slice 2a — per-row "📂 详情" button opens a detail card; detail card has
+ *           "⏸ 暂停" / "▶ 恢复" (mutually exclusive) + "🔙 返回" actions.
  *
- * Identity / security mirrors sessions-card.ts (slice 1):
- *  - `invokerOpenId` is the owner's `ou_*` (invoker-lock anchor).
+ * Detail-card pattern (codex 2026-06-10 scope-cut):
+ *  - List card stays read-only beyond the "📂 详情" inline button.
+ *  - All action buttons live on the detail card.
+ *  - Pause/Resume are the ONLY actions this slice. Run-now lands in slice 2b.
+ *
+ * Sync pause/resume (NOT optimistic state):
+ *  - The pause/resume callback awaits the Route B POST inline.
+ *  - On 200 → synthesize the new-state row in-process (snapshot from the
+ *    pre-POST GET overlaid with `enabled: !before.enabled`), then rebuild the
+ *    detail card. NO toast on success — single-pass card render.
+ *    Asymmetry: pause makes nextRunAt irrelevant (scheduler stops emitting),
+ *    so synth is fine. Resume needs a fresh nextRunAt (computeNextRun cron /
+ *    interval logic lives in scheduler.ts, NOT here), so we do a 2nd GET and
+ *    fall back to synth+log if the GET fails (the row stays functional, just
+ *    with a possibly-stale nextRunAt for one render cycle).
+ *  - On non-200 / network throw → return ONLY a toast. We do NOT redraw the
+ *    card so the user keeps their current state for retry.
+ *
+ * Identity / security:
+ *  - `invokerOpenId` is the owner's `ou_*` and is the invoker-lock anchor.
+ *  - sender union_id NEVER lands on `action.value` (red line).
  *  - Owner gate runs at the command entry AND on every callback.
- *  - sender union_id NEVER lands on action.value.
+ *  - `value.schedule_id` is read but NEVER trusted for identity — only used
+ *    as the routing key. The owner gate is the only authority. The Route B
+ *    upstream further enforces `ownerOf(schedule_id)` scope (and as of
+ *    2026-06-10 also gates cross-bot pause/resume by `callerAppId`).
+ *  - Before any POST we re-run the PR1 `computeButtonAvailability` matrix
+ *    against the fresh snapshot and fail-closed if the chosen action is
+ *    disabled — client-side `disabled` is UX only and a replayed event or an
+ *    old card could otherwise drive a state-violating POST.
  *
- * Response: success returns `{ card }` only (no toast) — single-pass render,
- * no stale-frame flash. Errors / permission denials return `{ toast }`.
+ * Response shape mirrors `/dashboard settings` slice 3: success path returns
+ * ONLY `{ card }` (no toast) so Lark renders the card in a single pass
+ * (toast + card would trigger a two-pass render and flash the stale list).
  */
 
 import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
 import type {
   ScheduleCardTaskInput,
+  ScheduleDetailDto,
   ScheduleRowDto,
 } from '../../dashboard/schedule-card-model.js';
 import {
+  computeButtonAvailability,
   paginateSchedules,
+  toScheduleDetailDto,
   toScheduleRowDto,
 } from '../../dashboard/schedule-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
@@ -31,6 +60,10 @@ import type { CardActionData } from './card-handler.js';
 
 export const SCHEDULES_ACTION_REFRESH = 'dash_schedules_refresh' as const;
 export const SCHEDULES_ACTION_PAGE = 'dash_schedules_page' as const;
+export const SCHEDULES_ACTION_DETAIL = 'dash_schedules_detail' as const;
+export const SCHEDULES_ACTION_PAUSE = 'dash_schedules_pause' as const;
+export const SCHEDULES_ACTION_RESUME = 'dash_schedules_resume' as const;
+export const SCHEDULES_ACTION_BACK_TO_LIST = 'dash_schedules_back_to_list' as const;
 
 const PAGE_SIZE = 10;
 
@@ -115,7 +148,28 @@ export function buildSchedulesCard(
   } else {
     for (const task of items) {
       const dto = toScheduleRowDto(task, { nowMs });
+      // Row text element.
       elements.push(renderRow(dto, opts.locale));
+      // Per-row action element holding ONLY the "📂 详情" button (slice 2a).
+      // Keeping each row's actions in its own `action` element (rather than
+      // one shared element for the whole page) makes the visual layout
+      // align with the row above and lets us pass the row's schedule id
+      // through `value.schedule_id` as the routing key.
+      elements.push({
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.dashboard.schedules.row_detail', undefined, opts.locale) },
+            type: 'default',
+            value: {
+              action: SCHEDULES_ACTION_DETAIL,
+              invoker_open_id: opts.invokerOpenId,
+              schedule_id: dto.id,
+            },
+          },
+        ],
+      });
     }
   }
 
@@ -211,6 +265,242 @@ function renderRow(row: ScheduleRowDto, locale: Locale): unknown {
   };
 }
 
+/** Slice-2a options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
+export interface BuildSchedulesDetailCardOpts {
+  invokerOpenId: string;
+  locale: Locale;
+}
+
+/**
+ * Build the detail card (slice 2a). Status icon + bold title + id monospace;
+ * key/value block for name/enabled/kind/displayExpr/nextRunAt/lastRunAt/
+ * lastStatus/repeat/prompt; next-N runs list; action row with pause/resume +
+ * back.
+ *
+ * Pause and resume are MUTUALLY EXCLUSIVE per the PR1 matrix:
+ *   enabled === true → pause clickable, resume disabled (alreadyEnabled)
+ *   enabled === false → pause disabled (alreadyPaused), resume clickable
+ *
+ * The disabled button is rendered with `disabled:true` and a small reason
+ * note next to it via `mapPauseDisabledReason` / `mapResumeDisabledReason`.
+ */
+export function buildSchedulesDetailCard(
+  detail: ScheduleDetailDto,
+  opts: BuildSchedulesDetailCardOpts,
+): string {
+  const elements: unknown[] = [];
+
+  // ─── Title — status dot + bold name + id monospace ─────────────────────
+  const enabledIcon = detail.enabled
+    ? (detail.errorIndicator ? '🔴' : '🟢')
+    : '⚪';
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content:
+        `${enabledIcon} **${escapeLarkMd(detail.name)}**` +
+        `\n\`${escapeLarkMd(detail.id)}\``,
+    },
+  });
+
+  elements.push({ tag: 'hr' });
+
+  // ─── Key/value block ───────────────────────────────────────────────────
+  const enabledLabel = detail.enabled
+    ? t('card.dashboard.schedules.detail.enabled.active', undefined, opts.locale)
+    : t('card.dashboard.schedules.detail.enabled.paused', undefined, opts.locale);
+  const infoLines: string[] = [];
+  infoLines.push(
+    t('card.dashboard.schedules.detail.name_label', { name: escapeLarkMd(detail.name) }, opts.locale),
+  );
+  infoLines.push(
+    t('card.dashboard.schedules.detail.enabled_label', { status: enabledLabel }, opts.locale),
+  );
+  infoLines.push(
+    t('card.dashboard.schedules.detail.kind_label', { kind: escapeLarkMd(detail.kind) }, opts.locale),
+  );
+  infoLines.push(
+    t(
+      'card.dashboard.schedules.detail.display_label',
+      { expr: escapeLarkMd(detail.displayExpr) },
+      opts.locale,
+    ),
+  );
+  infoLines.push(
+    t(
+      'card.dashboard.schedules.detail.next_label',
+      { rel: escapeLarkMd(detail.nextRunAt ?? '—') },
+      opts.locale,
+    ),
+  );
+  infoLines.push(
+    t(
+      'card.dashboard.schedules.detail.last_label',
+      { rel: escapeLarkMd(detail.lastRunAt ?? '—') },
+      opts.locale,
+    ),
+  );
+  if (detail.lastStatus) {
+    infoLines.push(
+      t(
+        'card.dashboard.schedules.detail.status_label',
+        { status: escapeLarkMd(detail.lastStatus) },
+        opts.locale,
+      ),
+    );
+  }
+  if (detail.repeat) {
+    const repeatStr =
+      detail.repeat.times === null
+        ? `${detail.repeat.completed}/∞`
+        : `${detail.repeat.completed}/${detail.repeat.times}`;
+    infoLines.push(
+      t('card.dashboard.schedules.detail.repeat_label', { repeat: repeatStr }, opts.locale),
+    );
+  }
+  if (detail.prompt) {
+    // `detail.prompt` is already truncated by `toScheduleDetailDto`. When the
+    // raw prompt was longer than `promptTruncateAt` the DTO appends `…`, so
+    // we can render it verbatim and rely on that visible marker.
+    infoLines.push(
+      t(
+        'card.dashboard.schedules.detail.prompt_label',
+        { prompt: escapeLarkMd(detail.prompt) },
+        opts.locale,
+      ),
+    );
+  }
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: infoLines.map(l => `<font color="grey">${l}</font>`).join('\n'),
+    },
+  });
+
+  // ─── Next runs section (if any) ────────────────────────────────────────
+  if (detail.nextRuns.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content:
+          `**${t('card.dashboard.schedules.detail.next_runs_header', undefined, opts.locale)}**\n` +
+          detail.nextRuns.map(iso => `- ${escapeLarkMd(iso)}`).join('\n'),
+      },
+    });
+  }
+
+  elements.push({ tag: 'hr' });
+
+  // ─── Action row — pause / resume (mutually exclusive) + back ───────────
+  const pauseEnabled = detail.actions.pause.enabled === true;
+  const resumeEnabled = detail.actions.resume.enabled === true;
+  const pauseButton: Record<string, unknown> = {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.dashboard.schedules.btn.pause', undefined, opts.locale) },
+    type: pauseEnabled ? 'primary' : 'default',
+    value: {
+      action: SCHEDULES_ACTION_PAUSE,
+      invoker_open_id: opts.invokerOpenId,
+      schedule_id: detail.id,
+    },
+  };
+  if (!pauseEnabled) pauseButton.disabled = true;
+  const resumeButton: Record<string, unknown> = {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.dashboard.schedules.btn.resume', undefined, opts.locale) },
+    type: resumeEnabled ? 'primary' : 'default',
+    value: {
+      action: SCHEDULES_ACTION_RESUME,
+      invoker_open_id: opts.invokerOpenId,
+      schedule_id: detail.id,
+    },
+  };
+  if (!resumeEnabled) resumeButton.disabled = true;
+  elements.push({
+    tag: 'action',
+    actions: [
+      pauseButton,
+      resumeButton,
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.dashboard.schedules.btn.back', undefined, opts.locale) },
+        type: 'default',
+        value: {
+          action: SCHEDULES_ACTION_BACK_TO_LIST,
+          invoker_open_id: opts.invokerOpenId,
+        },
+      },
+    ],
+  });
+
+  // Surface reasonKey notes for whichever button is disabled. Pause/resume
+  // are mutually exclusive in this slice — only one will be disabled at a
+  // time — but render both branches defensively in case the matrix evolves.
+  if (!pauseEnabled) {
+    const reasonKey = mapPauseDisabledReason(detail.actions.pause.reasonKey);
+    if (reasonKey) {
+      elements.push({
+        tag: 'note',
+        elements: [
+          { tag: 'lark_md', content: t(reasonKey, undefined, opts.locale) },
+        ],
+      });
+    }
+  }
+  if (!resumeEnabled) {
+    const reasonKey = mapResumeDisabledReason(detail.actions.resume.reasonKey);
+    if (reasonKey) {
+      elements.push({
+        tag: 'note',
+        elements: [
+          { tag: 'lark_md', content: t(reasonKey, undefined, opts.locale) },
+        ],
+      });
+    }
+  }
+
+  // Footer security note (mirrors list card).
+  elements.push({
+    tag: 'note',
+    elements: [
+      { tag: 'lark_md', content: t('card.dashboard.settings.footer.security', undefined, opts.locale) },
+    ],
+  });
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.dashboard.schedules.detail.title', undefined, opts.locale) },
+      template: 'blue',
+    },
+    elements,
+  });
+}
+
+/** Map PR1 pause-disabled reasonKey to the slice-2a i18n key. */
+function mapPauseDisabledReason(reasonKey: string | undefined): string | undefined {
+  switch (reasonKey) {
+    case 'schedules.action.pause.alreadyPaused':
+      return 'card.dashboard.schedules.pause.disabled.alreadyPaused';
+    default:
+      return undefined;
+  }
+}
+
+/** Map PR1 resume-disabled reasonKey to the slice-2a i18n key. */
+function mapResumeDisabledReason(reasonKey: string | undefined): string | undefined {
+  switch (reasonKey) {
+    case 'schedules.action.resume.alreadyEnabled':
+      return 'card.dashboard.schedules.resume.disabled.alreadyEnabled';
+    default:
+      return undefined;
+  }
+}
+
 /**
  * Sanitize user-/CLI-supplied text for inclusion in lark_md. See
  * `sessions-card.ts:escapeLarkMd` for the order rationale: `&` first to
@@ -258,7 +548,7 @@ export async function handleSchedulesCardAction(
   const operatorOpenId = data.operator?.open_id;
   const action = value.action;
 
-  // Invoker lock — fail-closed.
+  // ─── 1) Invoker lock — fail-closed ──────────────────────────────────
   const invokerOpenId = value.invoker_open_id;
   if (typeof invokerOpenId !== 'string' || !invokerOpenId) {
     return ackToast('card.dashboard.settings.not_invoker', locale);
@@ -270,39 +560,213 @@ export async function handleSchedulesCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // Per-bot owner gate.
+  // ─── 2) Per-bot owner gate ──────────────────────────────────────────
   const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
   const expectedOwner = getOwnerOpenId(larkAppId);
   if (!expectedOwner || operatorOpenId !== expectedOwner) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
-  // Resolve target page.
+  // Validate the action BEFORE creating the Route B client — an unknown
+  // action shouldn't even open a connection (defensive, also keeps the
+  // slice-1 invariant that the unknown-action path doesn't touch the
+  // client).
+  const validActions = new Set<string>([
+    SCHEDULES_ACTION_REFRESH,
+    SCHEDULES_ACTION_PAGE,
+    SCHEDULES_ACTION_DETAIL,
+    SCHEDULES_ACTION_PAUSE,
+    SCHEDULES_ACTION_RESUME,
+    SCHEDULES_ACTION_BACK_TO_LIST,
+  ]);
+  if (!validActions.has(action)) {
+    return ackToast('card.dashboard.settings.invalid_action', locale);
+  }
+
+  const client = deps.createClient(larkAppId);
+  const now = (): number => (deps.nowMs ? deps.nowMs() : Date.now());
+
+  // ─── 3a) DETAIL — open the per-schedule detail card ─────────────────
+  if (action === SCHEDULES_ACTION_DETAIL) {
+    const scheduleId = value.schedule_id;
+    if (typeof scheduleId !== 'string' || !scheduleId) {
+      return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
+    }
+    const r = await safeGetSchedulesList(client, locale);
+    if ('errorResult' in r) return r.errorResult;
+    const row = r.tasks.find(t => t.id === scheduleId);
+    if (!row) {
+      return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
+    }
+    const detail = toScheduleDetailDto(row, { nowMs: now() });
+    const cardJson = buildSchedulesDetailCard(detail, {
+      invokerOpenId: expectedOwner,
+      locale,
+    });
+    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+  }
+
+  // ─── 3b) PAUSE / RESUME — synchronous toggle ────────────────────────
+  if (action === SCHEDULES_ACTION_PAUSE || action === SCHEDULES_ACTION_RESUME) {
+    const scheduleId = value.schedule_id;
+    if (typeof scheduleId !== 'string' || !scheduleId) {
+      return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
+    }
+    const verb = action === SCHEDULES_ACTION_PAUSE ? 'pause' : 'resume';
+    const failedKey =
+      verb === 'pause'
+        ? 'card.dashboard.schedules.pause_failed'
+        : 'card.dashboard.schedules.resume_failed';
+
+    // Pre-POST snapshot — needed both to confirm the schedule still exists
+    // AND to synthesize the new-state row in-process so we don't pay the
+    // cost (or race) of a second GET on the happy pause path.
+    const pre = await safeGetSchedulesList(client, locale);
+    if ('errorResult' in pre) return pre.errorResult;
+    const before = pre.tasks.find(t => t.id === scheduleId);
+    if (!before) {
+      return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
+    }
+
+    // codex 2026-06-10 SECURITY BLOCKER: client-side `disabled` on the
+    // pause/resume button is UX only — a replayed event, an old card
+    // still open, or a hand-crafted payload can still hit this callback.
+    // Server-side we MUST re-run the PR1 action-availability matrix
+    // against the fresh snapshot and fail-closed on `enabled === false`.
+    // This re-uses the SAME computeButtonAvailability logic the builder
+    // used to decide whether to disable the button in the first place —
+    // keeping the rules in one place avoids drift between client paint
+    // and server enforce.
+    const beforeMatrix = computeButtonAvailability(before);
+    const buttonState = verb === 'pause' ? beforeMatrix.pause : beforeMatrix.resume;
+    if (buttonState.enabled !== true) {
+      // Reuse the SAME PR1 reasonKey → i18n key mapping the builder uses
+      // for the inline disabled-button note so toast text matches what
+      // the user already sees on the card. NEVER POST; NEVER redraw.
+      const mappedKey = verb === 'pause'
+        ? mapPauseDisabledReason(buttonState.reasonKey) ?? failedKey
+        : mapResumeDisabledReason(buttonState.reasonKey) ?? failedKey;
+      return errorToast(mappedKey, undefined, locale);
+    }
+
+    // Route B owner gate is the authority on whether THIS bot's owner can
+    // toggle THIS schedule; we only sanitize the routing key above. As of
+    // 2026-06-10 the Route B handler also gates cross-bot writes.
+    let resp: Awaited<ReturnType<DaemonClient['request']>>;
+    try {
+      resp = await client.request({
+        method: 'POST',
+        path: `/__daemon/schedules/${encodeURIComponent(scheduleId)}/${verb}`,
+      });
+    } catch (e) {
+      return errorToast(failedKey, { reason: (e as Error).message }, locale);
+    }
+    if (resp.status !== 200) {
+      const body = (resp.body ?? {}) as Record<string, unknown>;
+      const reason = String(body.error ?? `http_${resp.status}`);
+      // Preserve user state — do NOT redraw card on failure.
+      return errorToast(failedKey, { reason }, locale);
+    }
+
+    if (verb === 'pause') {
+      // Pause makes nextRunAt irrelevant — the scheduler stops emitting
+      // until the task is resumed — so an in-process overlay is safe.
+      const synth: ScheduleCardTaskInput = { ...before, enabled: false };
+      const detail = toScheduleDetailDto(synth, { nowMs: now() });
+      const cardJson = buildSchedulesDetailCard(detail, {
+        invokerOpenId: expectedOwner,
+        locale,
+      });
+      return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+    }
+
+    // RESUME — nextRunAt MUST be recomputed by the real scheduler's
+    // computeNextRun (cron / interval logic lives in scheduler.ts). We
+    // do a 2nd GET to read the freshly-recomputed row. If that GET
+    // fails or the row is missing, fall back to a `{...before, enabled:
+    // true}` synth — the row will still be functional, just with a
+    // possibly-stale nextRunAt for one render cycle. The next user
+    // interaction (refresh / back-to-list / another detail click) will
+    // converge it.
+    const postRefetch = await safeGetSchedulesList(client, locale);
+    let after: ScheduleCardTaskInput | undefined;
+    if ('errorResult' in postRefetch) {
+      after = undefined;
+    } else {
+      after = postRefetch.tasks.find(t => t.id === scheduleId);
+    }
+    if (!after) {
+      // codex fall-back: resume succeeded upstream but refetch couldn't
+      // surface the new row. Render synth-with-enabled:true so the user
+      // gets a valid card; nextRunAt may be stale until the next refresh.
+      after = { ...before, enabled: true };
+    }
+    const detail = toScheduleDetailDto(after, { nowMs: now() });
+    const cardJson = buildSchedulesDetailCard(detail, {
+      invokerOpenId: expectedOwner,
+      locale,
+    });
+    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+  }
+
+  // ─── 3c) BACK TO LIST — rebuild list card at page 1 ─────────────────
+  if (action === SCHEDULES_ACTION_BACK_TO_LIST) {
+    const r = await safeGetSchedulesList(client, locale);
+    if ('errorResult' in r) return r.errorResult;
+    const cardJson = buildSchedulesCard(
+      r.tasks,
+      { invokerOpenId: expectedOwner, locale, page: 1 },
+      now(),
+    );
+    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+  }
+
+  // ─── 3d) Slice-1 actions — REFRESH + PAGE ───────────────────────────
+  // `action` is already constrained to validActions above; the only ones
+  // left here are REFRESH + PAGE (the other 4 returned early).
   let page = 1;
   if (action === SCHEDULES_ACTION_PAGE) {
     const parsed = Number.parseInt(value.page ?? '1', 10);
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
-  } else if (action !== SCHEDULES_ACTION_REFRESH) {
-    return ackToast('card.dashboard.settings.invalid_action', locale);
   }
 
-  // GET list + rebuild card. Same non-200 handling as sessions slice 1
-  // (codex blocker #1, 2026-06-09): 4xx/5xx → error toast, NOT empty list.
-  let r: Awaited<ReturnType<DaemonClient['request']>>;
-  try {
-    const client = deps.createClient(larkAppId);
-    r = await client.request({ method: 'GET', path: '/__daemon/schedules-list' });
-  } catch (e) {
-    return errorToast('card.dashboard.schedules.list_failed', { reason: (e as Error).message }, locale);
-  }
-  if (r.status !== 200) {
-    const reason = String((r.body as any)?.error ?? `http_${r.status}`);
-    return errorToast('card.dashboard.schedules.list_failed', { reason }, locale);
-  }
-  const tasks = ((r.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
-  const nowMs = deps.nowMs ? deps.nowMs() : Date.now();
-  const cardJson = buildSchedulesCard(tasks, { invokerOpenId: expectedOwner, locale, page }, nowMs);
+  const r = await safeGetSchedulesList(client, locale);
+  if ('errorResult' in r) return r.errorResult;
+  const cardJson = buildSchedulesCard(
+    r.tasks,
+    { invokerOpenId: expectedOwner, locale, page },
+    now(),
+  );
   return {
     card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
   };
+}
+
+/**
+ * GET `/__daemon/schedules-list` and surface non-200 / network errors as
+ * caller-facing error toasts. Returns either `{ tasks }` or
+ * `{ errorResult }` — exactly one is set.
+ *
+ * createDaemonClient.request does NOT throw on 4xx/5xx — it resolves with
+ * the response. If we only catch throws we'd silently render an empty list
+ * when Route B returns 500/401, masking a real backend failure as "no
+ * schedules". So check `status !== 200` explicitly and surface as an
+ * error toast.
+ */
+async function safeGetSchedulesList(
+  client: DaemonClient,
+  locale: Locale,
+): Promise<{ tasks: ReadonlyArray<ScheduleCardTaskInput> } | { errorResult: SchedulesCardHandlerResult }> {
+  let r: Awaited<ReturnType<DaemonClient['request']>>;
+  try {
+    r = await client.request({ method: 'GET', path: '/__daemon/schedules-list' });
+  } catch (e) {
+    return { errorResult: errorToast('card.dashboard.schedules.list_failed', { reason: (e as Error).message }, locale) };
+  }
+  if (r.status !== 200) {
+    const reason = String((r.body as Record<string, unknown> | undefined)?.error ?? `http_${r.status}`);
+    return { errorResult: errorToast('card.dashboard.schedules.list_failed', { reason }, locale) };
+  }
+  const tasks = ((r.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
+  return { tasks };
 }

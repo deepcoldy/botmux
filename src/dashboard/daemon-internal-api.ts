@@ -421,6 +421,15 @@ const ROUTES: RouteDef[] = [
       const action = m[2];
       const owner = deps.scheduleOwnerOf(id);
       if (!owner) return { status: 404, body: { ok: false, error: 'unknown_schedule' } };
+      // codex 2026-06-10 cross-bot guard: refuse when the caller is not the
+      // schedule's owning bot. The previous proxy handed off to `owner`
+      // without checking `ctx.callerAppId`, so a bot A owner could in
+      // principle replay or forge a schedule id and pause/resume a bot B
+      // schedule. The test seam (`callerAppId === undefined`) keeps the
+      // historical pass-through, since `dispatchForTest` is trusted.
+      if (ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+        return { status: 403, body: { ok: false, error: 'schedule_owner_mismatch' } };
+      }
       const upstream = await deps.proxyToDaemon(
         owner,
         `/api/schedules/${encodeURIComponent(id)}/${action}`,

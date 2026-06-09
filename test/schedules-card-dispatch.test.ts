@@ -110,4 +110,110 @@ describe('handleCardAction → schedules dispatch returns { card } only on succe
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
+
+  // ─── Slice 2a: detail + pause dispatch ──────────────────────────────
+  it('detail: fast path returns { card } with detail body; updateMessage NOT called', async () => {
+    const tasks = [
+      { id: 'sch_detail', name: 'detail me', enabled: true,
+        parsed: { kind: 'cron', display: '0 9 * * *', expr: '0 9 * * *' },
+        nextRunAt: '2026-06-09T13:00:00.000Z', lastRunAt: '2026-06-08T13:00:00.000Z',
+        lastStatus: 'ok', larkAppId: LARK_APP_ID, chatId: 'oc' },
+    ];
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+        return { status: 200, raw: '', body: { schedules: tasks } };
+      }
+      throw new Error('unexpected: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: { value: { action: 'dash_schedules_detail', invoker_open_id: INVOKER, schedule_id: 'sch_detail' } },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast).toBeUndefined();
+    expect(result.card).toBeDefined();
+    const cardJson = JSON.stringify(result.card?.data);
+    expect(cardJson).toContain('定时任务详情');
+    expect(cardJson).toContain('dash_schedules_pause');
+    expect(cardJson).toContain('dash_schedules_resume');
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('pause (happy): returns { card } with enabled=false detail; updateMessage NOT called', async () => {
+    const tasks = [
+      { id: 'sch_pause', name: 'pause me', enabled: true,
+        parsed: { kind: 'cron', display: '0 9 * * *', expr: '0 9 * * *' },
+        nextRunAt: '2026-06-09T13:00:00.000Z', lastRunAt: '2026-06-08T13:00:00.000Z',
+        lastStatus: 'ok', larkAppId: LARK_APP_ID, chatId: 'oc' },
+    ];
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+        return { status: 200, raw: '', body: { schedules: tasks } };
+      }
+      if (req.method === 'POST' && req.path === '/__daemon/schedules/sch_pause/pause') {
+        return { status: 200, raw: '', body: { ok: true } };
+      }
+      throw new Error('unexpected: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: INVOKER, schedule_id: 'sch_pause' } },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast).toBeUndefined();
+    expect(result.card).toBeDefined();
+    const cardJson = JSON.stringify(result.card?.data);
+    // synth-detail with enabled=false → renders the paused disabled note.
+    expect(cardJson).toContain('定时任务详情');
+    expect(cardJson).toContain('"disabled":true');
+    expect(cardJson).toContain('任务已暂停');
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('pause (snapshot already paused): { toast }, no card, updateMessage NOT called', async () => {
+    const tasks = [
+      { id: 'sch_alreadypaused', name: 'already paused', enabled: false,
+        parsed: { kind: 'cron', display: '0 9 * * *', expr: '0 9 * * *' },
+        nextRunAt: '2026-06-09T13:00:00.000Z', lastRunAt: '2026-06-08T13:00:00.000Z',
+        lastStatus: 'ok', larkAppId: LARK_APP_ID, chatId: 'oc' },
+    ];
+    const postSpy = vi.fn();
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+        return { status: 200, raw: '', body: { schedules: tasks } };
+      }
+      // SECURITY: handler MUST refuse to POST when snapshot disagrees with
+      // the click. Track if any POST sneaks past.
+      postSpy(req);
+      throw new Error('unexpected POST: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: INVOKER, schedule_id: 'sch_alreadypaused' } },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast?.content).toContain('任务已暂停');
+    expect(result.card).toBeUndefined();
+    // Server-side matrix check: pause POST MUST NOT have been issued.
+    expect(postSpy).not.toHaveBeenCalled();
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
 });

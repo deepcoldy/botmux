@@ -381,6 +381,12 @@ function cardActionKey(larkAppId: string, data: any): string {
     action: value?.action ?? action?.option ?? action?.tag,
     rootId: value?.root_id,
     sessionId: value?.session_id,
+    // PR3 schedules slice 2a (codex 2026-06-10): pause/resume share action
+    // labels (`dash_schedules_pause` / `dash_schedules_resume`) but apply to
+    // different schedule ids. Without including `scheduleId` here, two rapid
+    // clicks on different schedules' buttons would hash-collide and the
+    // second would be silently dropped. Same rationale as `sessionId` above.
+    scheduleId: value?.schedule_id,
     nonce: value?.card_nonce ?? value?.nonce,
     option: action?.option,
     key: value?.key,

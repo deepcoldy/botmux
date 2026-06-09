@@ -2797,6 +2797,62 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     release();
     await first;
   });
+
+  // PR3 schedules slice 2a — per-detail-card pause/resume buttons share
+  // `action: dash_schedules_pause` / `dash_schedules_resume`. Only
+  // `value.schedule_id` distinguishes which schedule the click targets. The
+  // cardActionKey now includes `scheduleId`; pin it down so a future key
+  // refactor can't silently drop it and turn two distinct schedule clicks
+  // into one (e.g. user opens detail A then detail B and pauses B while A
+  // is still in flight).
+  it('concurrent `dash_schedules_pause` clicks on DIFFERENT schedule_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'pause_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'pause_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (scheduleId: string) => ({
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: USER_OPEN_ID, schedule_id: scheduleId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_schedules_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('sch_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('sch_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing schedule_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion: same schedule_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent pause/resume
+  // can't double-fire on a rapid double-click.
+  it('concurrent `dash_schedules_pause` clicks on the SAME schedule_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'pause_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: USER_OPEN_ID, schedule_id: 'sch_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_schedules_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
 });
 
 describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {

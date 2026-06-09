@@ -627,6 +627,84 @@ describe('dispatch: schedules write', () => {
   });
 });
 
+/** ─── SCHEDULES write — codex hard constraint #1: cross-bot owner gate ─
+ *  PR3 schedules slice 2a (2026-06-10) introduced a write-side scope check
+ *  for pause/resume: when `callerAppId` is set (real HMAC caller) and the
+ *  schedule's `scheduleOwnerOf` returns a different bot, dispatch MUST
+ *  refuse with 403 schedule_owner_mismatch and NEVER touch
+ *  `proxyToDaemon`. The test seam (no callerAppId) keeps the historical
+ *  pass-through for `dispatchForTest`.
+ *  Run is left to slice 2b. */
+describe('dispatch: schedules write — cross-bot owner gate', () => {
+  function ownerMismatchDeps() {
+    return makeDeps({
+      // Owner is cli_b for this schedule; caller will pretend to be cli_a.
+      scheduleOwnerOf: vi.fn((id: string) => id === 'sched-known' ? 'cli_b' : undefined),
+      proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
+    });
+  }
+
+  for (const action of ['pause', 'resume'] as const) {
+    it(`callerAppId=cli_a + owner=cli_b → 403 schedule_owner_mismatch, proxyToDaemon NOT called (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-known/${action}`), '', 'cli_a');
+      expect(r.status).toBe(403);
+      expect((r.body as any).error).toBe('schedule_owner_mismatch');
+      expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+    });
+
+    it(`callerAppId=cli_b + owner=cli_b → proxyToDaemon called once, upstream status reflected (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-known/${action}`), '', 'cli_b');
+      expect(r.status).toBe(200);
+      expect(deps.proxyToDaemon).toHaveBeenCalledTimes(1);
+      expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+        'cli_b',
+        `/api/schedules/sched-known/${action}`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
+    it(`test seam (no callerAppId) → proxy still called (back-compat dispatchForTest) (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-known/${action}`));
+      expect(r.status).toBe(200);
+      expect(deps.proxyToDaemon).toHaveBeenCalledTimes(1);
+      expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+        'cli_b',
+        `/api/schedules/sched-known/${action}`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+  }
+
+  // Sanity: sessions write endpoint is NOT affected by this commit — the
+  // sessions write path still uses ownerOf-only routing (no cross-bot 403
+  // gate has been added for sessions in slice 2a). This pins down that the
+  // schedules gate did not accidentally drift into sessions/close.
+  it('sessions write path unchanged by slice 2a: dash_sessions_close still ownerOf-only (no callerAppId check)', async () => {
+    const deps = makeDeps({
+      // Sessions ownerOf returns cli_b; caller is cli_a. If a cross-bot
+      // gate had been added for sessions, this would 403.
+      ownerOf: vi.fn((sid: string) => sid === 'sess-known' ? 'cli_b' : undefined),
+      proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
+    });
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('POST', url('/__daemon/sessions/sess-known/close'), '', 'cli_a');
+    // Status passes through from proxyToDaemon (200) — NOT 403.
+    expect(r.status).toBe(200);
+    expect(deps.proxyToDaemon).toHaveBeenCalledTimes(1);
+    expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+      'cli_b',
+      '/api/sessions/sess-known/close',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+});
+
 /** ─── ROUTING EDGE CASES ─────────────────────────────────────────── */
 
 describe('dispatch: routing edge cases', () => {
