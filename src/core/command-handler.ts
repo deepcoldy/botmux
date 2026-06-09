@@ -12,6 +12,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
+import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -43,7 +44,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/dashboard']);
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -53,7 +54,7 @@ export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help'
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -1120,6 +1121,14 @@ export async function handleCommand(
         const chatId = ds?.chatId!;
         await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${logTag}] Schedule command handled`);
+        break;
+      }
+
+      case '/dashboard': {
+        const dashboardArgs = message.content.replace(/^\/dashboard\s*/, '');
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleDashboardCommand(message, dashboardArgs, rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Dashboard command handled (sub=${dashboardArgs.trim().split(/\s+/)[0] || 'overview'})`);
         break;
       }
 

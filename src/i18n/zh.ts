@@ -563,4 +563,25 @@ export const messages: Record<string, string> = {
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
+
+  // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
+  'card.dashboard.owner_only': '🔒 `/dashboard` 命令组仅 Bot Owner 可用。',
+  'card.dashboard.overview.not_implemented_yet': '🚧 `/dashboard overview` 总览卡片尚未实现，将在后续 PR 中上线。',
+  'card.dashboard.sessions.not_implemented_yet': '🚧 `/dashboard sessions` 会话卡片尚未实现，将在后续 PR 中上线。',
+  'card.dashboard.workflows.not_implemented_yet': '🚧 `/dashboard workflows` 工作流卡片尚未实现，将在后续 PR 中上线。',
+  'card.dashboard.groups.not_implemented_yet': '🚧 `/dashboard groups` 群组卡片尚未实现，将在后续 PR 中上线。',
+  'card.dashboard.schedules.not_implemented_yet': '🚧 `/dashboard schedules` 定时任务卡片尚未实现，将在后续 PR 中上线。',
+  'card.dashboard.settings.not_implemented_yet': '🚧 `/dashboard settings` 设置卡片尚未实现，将在后续 PR 中上线。',
+  'card.dashboard.help.body':
+    '⚙️ `/dashboard <module>` — 操控本 dashboard。\n\n' +
+    '可用模块：\n' +
+    '• `overview`   — 跨 bot 总览\n' +
+    '• `sessions`   — 会话列表 / 详情\n' +
+    '• `workflows`  — 工作流运行（beta）\n' +
+    '• `groups`     — 群组矩阵\n' +
+    '• `schedules`  — 定时任务\n' +
+    '• `settings`   — 全局设置（仅 owner）\n' +
+    '• `help`       — 本帮助\n\n' +
+    '不带子命令时默认 `overview`。整个命令组仅 Bot Owner 可用。',
+  'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',
 };

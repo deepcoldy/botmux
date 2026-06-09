@@ -560,4 +560,25 @@ export const messages: Record<string, string> = {
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
+
+  // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
+  'card.dashboard.owner_only': '🔒 The `/dashboard` command group is restricted to the Bot Owner.',
+  'card.dashboard.overview.not_implemented_yet': '🚧 `/dashboard overview` is not implemented yet; coming in a follow-up PR.',
+  'card.dashboard.sessions.not_implemented_yet': '🚧 `/dashboard sessions` is not implemented yet; coming in a follow-up PR.',
+  'card.dashboard.workflows.not_implemented_yet': '🚧 `/dashboard workflows` is not implemented yet; coming in a follow-up PR.',
+  'card.dashboard.groups.not_implemented_yet': '🚧 `/dashboard groups` is not implemented yet; coming in a follow-up PR.',
+  'card.dashboard.schedules.not_implemented_yet': '🚧 `/dashboard schedules` is not implemented yet; coming in a follow-up PR.',
+  'card.dashboard.settings.not_implemented_yet': '🚧 `/dashboard settings` is not implemented yet; coming in a follow-up PR.',
+  'card.dashboard.help.body':
+    '⚙️ `/dashboard <module>` — manage this dashboard.\n\n' +
+    'Modules:\n' +
+    '• `overview`   — cross-bot overview\n' +
+    '• `sessions`   — session list / detail\n' +
+    '• `workflows`  — workflow runs (beta)\n' +
+    '• `groups`     — group matrix\n' +
+    '• `schedules`  — scheduled tasks\n' +
+    '• `settings`   — global settings (owner only)\n' +
+    '• `help`       — this help\n\n' +
+    'Without a subcommand, defaults to `overview`. The entire group is owner-only.',
+  'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',
 };
