@@ -67,11 +67,10 @@ export interface BuildSettingsCardOpts {
 export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardOpts): string {
   const elements: unknown[] = [];
 
-  // ─── Header summary row (PR3 UI revision) ────────────────────────────
-  // Shows live counts so the user knows the current shape of settings at
-  // a glance without scanning every section: "访问 1/1 · 卡片 0/1 · 维护 1/2".
-  // Maintenance label flips to "受限" when blocked (localDev or autoUpdate off).
-  elements.push(buildHeaderSummary(dto, opts));
+  // Header summary was dropped per user feedback: segmented controls already
+  // make each toggle's state self-evident; a top-level summary becomes a second
+  // explanation system that drifts as configuration grows. Section-internal
+  // warnings (localDev, autoUpdate dependency) stay where the user reads them.
 
   if (dto.readOnlyHintKey) {
     elements.push({
@@ -136,43 +135,6 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
     },
     elements,
   });
-}
-
-/** Header summary: counts enabled toggles per section + "受限" when maintenance blocked. */
-function buildHeaderSummary(dto: SettingsCardDTO, opts: BuildSettingsCardOpts): unknown {
-  const access = dto.sections.find(s => s.key === 'access');
-  const cards = dto.sections.find(s => s.key === 'cards');
-  const maintenance = dto.sections.find(s => s.key === 'maintenance');
-  const countEnabled = (s?: SettingsCardDTO['sections'][number]): number =>
-    s ? s.toggles.filter(tg => tg.enabled).length : 0;
-  const accessTotal = access?.toggles.length ?? 0;
-  const cardsTotal = cards?.toggles.length ?? 0;
-  const maintenanceTotal = maintenance?.toggles.length ?? 0;
-  const maintenanceRestricted = maintenance?.toggles.some(tg => !tg.state.enabled) === true;
-  const maintenanceLabel = maintenanceRestricted
-    ? t('card.dashboard.settings.header.maintenance.restricted', undefined, opts.locale)
-    : t(
-        'card.dashboard.settings.header.maintenance.ok',
-        { enabled: String(countEnabled(maintenance)), total: String(maintenanceTotal) },
-        opts.locale,
-      );
-  return {
-    tag: 'div',
-    text: {
-      tag: 'lark_md',
-      content: t(
-        'card.dashboard.settings.header.summary',
-        {
-          access: String(countEnabled(access)),
-          accessTotal: String(accessTotal),
-          cards: String(countEnabled(cards)),
-          cardsTotal: String(cardsTotal),
-          maintenanceLabel,
-        },
-        opts.locale,
-      ),
-    },
-  };
 }
 
 /**

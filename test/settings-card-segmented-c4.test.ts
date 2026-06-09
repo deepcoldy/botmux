@@ -238,48 +238,53 @@ describe('PR3 UI revision (codex C4) — segmented control schema', () => {
   });
 });
 
-describe('PR3 UI revision — header summary + footer security note', () => {
-  it('header shows enabled counts + restricted label when maintenance is blocked', () => {
-    const card = renderCard(buildSettings({
-      publicReadOnly: true,
-      openTerminalInFeishu: false,
+describe('PR3 UI revision — no header summary + footer security note + maintenance warnings preserved', () => {
+  // User feedback (2026-06-09): the count-based "访问 1/1 · 卡片 0/1 · 维护 受限"
+  // header was semantically opaque — `1/1` reads as "one of one what?" The
+  // segmented controls already make each toggle's state self-evident, so the
+  // summary was dropped entirely. These negative assertions lock that decision
+  // in so a future regression can't sneak the count back in.
+  it('card JSON does NOT contain the legacy count-based summary fragments', () => {
+    const cards = [
+      renderCard(buildSettings({
+        publicReadOnly: true,
+        openTerminalInFeishu: false,
+        localDevInstall: true,
+        maintenance: { autoUpdate: { enabled: false, time: '04:00' } },
+      })),
+      renderCard(buildSettings({
+        publicReadOnly: false,
+        openTerminalInFeishu: true,
+        maintenance: { autoUpdate: { enabled: true, time: '04:00' }, autoRestart: { enabled: false } },
+      })),
+    ];
+    for (const card of cards) {
+      expect(card).not.toContain('访问 1/1');
+      expect(card).not.toContain('访问 0/1');
+      expect(card).not.toContain('卡片 1/1');
+      expect(card).not.toContain('卡片 0/1');
+      expect(card).not.toContain('维护 受限');
+      expect(card).not.toContain('维护 1/2');
+      expect(card).not.toContain('维护 0/2');
+    }
+  });
+
+  it('maintenance section warnings ARE preserved (we only dropped the top summary, not the section reasons)', () => {
+    // localDev autoUpdate restriction reason
+    const localDevCard = renderCard(buildSettings({
       localDevInstall: true,
       maintenance: { autoUpdate: { enabled: false, time: '04:00' } },
     }));
-    const parsed = JSON.parse(card);
-    const headerSummary = (parsed.elements as any[]).find(
-      (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
-        && (e.text.content as string).includes('访问 ')
-        && (e.text.content as string).includes('卡片 ')
-        && (e.text.content as string).includes('维护 '),
-    );
-    expect(headerSummary).toBeTruthy();
-    const content = headerSummary.text.content as string;
-    expect(content).toContain('访问 1/1');
-    expect(content).toContain('卡片 0/1');
-    expect(content).toContain('维护 受限');
-  });
+    expect(localDevCard).toContain('源码安装下不支持自动更新');
 
-  it('header shows OK count (enabled/total) when maintenance is not blocked', () => {
-    const card = renderCard(buildSettings({
-      publicReadOnly: false,
-      openTerminalInFeishu: true,
-      maintenance: { autoUpdate: { enabled: true, time: '04:00' }, autoRestart: { enabled: false } },
+    // autoRestart-needs-autoUpdate reason
+    const autoUpdateOffCard = renderCard(buildSettings({
+      maintenance: { autoUpdate: { enabled: false }, autoRestart: { enabled: false } },
     }));
-    const parsed = JSON.parse(card);
-    const headerSummary = (parsed.elements as any[]).find(
-      (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
-        && (e.text.content as string).includes('访问 ')
-        && (e.text.content as string).includes('卡片 ')
-        && (e.text.content as string).includes('维护 '),
-    );
-    const content = headerSummary.text.content as string;
-    expect(content).toContain('访问 0/1');
-    expect(content).toContain('卡片 1/1');
-    expect(content).toContain('维护 1/2');
+    expect(autoUpdateOffCard).toContain('需先开启「每日自动更新」');
   });
 
-  it('footer security note is present and mentions Bot Owner + DM + ACK', () => {
+  it('footer security note is still present and mentions Bot Owner + DM + ACK', () => {
     const card = renderCard(buildSettings());
     const parsed = JSON.parse(card);
     const elements = parsed.elements as any[];
