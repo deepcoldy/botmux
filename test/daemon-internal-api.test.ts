@@ -142,6 +142,61 @@ describe('dispatch: read endpoints', () => {
     expect(body.groups).toEqual({ chats: [], bots: [] });
   });
 
+  it('GET /__daemon/schedules-list returns deps.getSchedules() (no scoping when callerAppId absent — test seam)', async () => {
+    const api = createDaemonInternalApi(makeDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list'));
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ schedules: [{ id: 'sched-1' }] });
+  });
+});
+
+/** ─── Per-bot read scoping (codex 2026-06-09 blocker) ─────────────────
+ *  sessions-list / schedules-list MUST filter by the authenticated caller's
+ *  bot id; the aggregator (`aggregator.ts:62-63`) mixes data from all
+ *  daemons, so without this filter a bot A owner could peek into bot B's
+ *  state. Legacy rows (no larkAppId) are KEPT so a fresh upgrade doesn't
+ *  drop them. */
+describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
+  const cliA = { sessionId: 'sA', larkAppId: 'cli_a' };
+  const cliB = { sessionId: 'sB', larkAppId: 'cli_b' };
+  const legacy = { sessionId: 'sLegacy' };  // No larkAppId — must remain visible.
+  const schedA = { id: 'schA', larkAppId: 'cli_a' };
+  const schedB = { id: 'schB', larkAppId: 'cli_b' };
+  const schedLegacy = { id: 'schLegacy' };  // Legacy — must remain.
+
+  function mixedDeps(): DaemonInternalApiDeps {
+    return makeDeps({
+      getSessions: () => [cliA, cliB, legacy],
+      getSchedules: () => [schedA, schedB, schedLegacy],
+    });
+  }
+
+  it('sessions-list with callerAppId=cli_a → only cli_a rows + legacy (no cli_b)', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list'), '', 'cli_a');
+    expect(r.status).toBe(200);
+    const sessions = (r.body as any).sessions as Array<{ sessionId: string }>;
+    const ids = sessions.map(s => s.sessionId).sort();
+    expect(ids).toEqual(['sA', 'sLegacy']);
+    expect(ids).not.toContain('sB');
+  });
+
+  it('schedules-list with callerAppId=cli_b → only cli_b rows + legacy (no cli_a)', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list'), '', 'cli_b');
+    expect(r.status).toBe(200);
+    const schedules = (r.body as any).schedules as Array<{ id: string }>;
+    const ids = schedules.map(s => s.id).sort();
+    expect(ids).toEqual(['schB', 'schLegacy']);
+    expect(ids).not.toContain('schA');
+  });
+
+  it('sessions-list with no callerAppId (test seam) → full list (unfiltered)', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list'));
+    const sessions = (r.body as any).sessions as Array<{ sessionId: string }>;
+    expect(sessions.map(s => s.sessionId).sort()).toEqual(['sA', 'sB', 'sLegacy']);
+  });
 });
 
 /** ─── 1 SETTINGS-WRITE ENDPOINT — owner gate ───────────────────────── */

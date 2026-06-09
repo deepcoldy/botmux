@@ -178,8 +178,11 @@ export function buildSchedulesCard(
 function renderRow(row: ScheduleRowDto, locale: Locale): unknown {
   const icon = toneIcon(row.dot.tone);
   const errorGlyph = row.errorIndicator ? ' ⚠️' : '';
-  // Primary: status icon + bold name + (id in monospace for traceability)
-  // Secondary line:  kind · displayExpr · next · last (· repeat counter if finite)
+  // Primary: status icon + bold name + short id (8 chars) for traceability —
+  // schedules can share names (e.g. two `daily-ping` cron tasks in different
+  // chats), so we surface a stable disambiguator.
+  // Secondary: kind · displayExpr · next · last (· repeat counter if finite)
+  const shortId = row.id ? row.id.slice(0, 8) : '';
   const repeatStr =
     row.repeat
       ? row.repeat.times === null
@@ -196,12 +199,13 @@ function renderRow(row: ScheduleRowDto, locale: Locale): unknown {
     secondaryParts.push(t('card.dashboard.schedules.repeat_label', { repeat: repeatStr }, locale));
   }
 
+  const idSuffix = shortId ? ` <font color="grey">${escapeLarkMd(shortId)}</font>` : '';
   return {
     tag: 'div',
     text: {
       tag: 'lark_md',
       content:
-        `${icon} **${escapeLarkMd(row.name)}**${errorGlyph}` +
+        `${icon} **${escapeLarkMd(row.name)}**${idSuffix}${errorGlyph}` +
         `\n<font color="grey">${escapeLarkMd(secondaryParts.join(' · '))}</font>`,
     },
   };

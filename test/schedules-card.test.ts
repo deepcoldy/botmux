@@ -127,8 +127,13 @@ describe('buildSchedulesCard', () => {
       task({ id: 'errored', name: 'errored-task', enabled: true, lastStatus: 'error' }),
     ];
     const json = buildSchedulesCard(tasks, baseOpts, NOW);
-    // The errored row should include the warning glyph in its bold name span.
-    expect(json).toMatch(/\*\*errored-task\*\* ⚠️/);
+    // The errored row should include the warning glyph after its bold name
+    // (with the short-id badge between them).
+    expect(json).toMatch(/\*\*errored-task\*\*.*⚠️/);
+    // 🔴 status tone for the errored row's status dot.
+    expect(json).toMatch(/🔴 \*\*errored-task\*\*/);
+    // ⚪ tone for the paused row.
+    expect(json).toMatch(/⚪ \*\*paused-task\*\*/);
   });
 
   it('NEVER leaks `union_id` or `senderUnionId` in rendered JSON', () => {
@@ -153,7 +158,9 @@ describe('buildSchedulesCard', () => {
       const content = d.text.content as string;
       expect(content).not.toMatch(/<at\b/);
       const closingFont = (content.match(/<\/font>/g) ?? []).length;
-      expect(closingFont).toBe(1);
+      // 2 = one for the short-id badge after the name + one for the
+      // secondary line. User-supplied text never injects extra `</font>`.
+      expect(closingFont).toBe(2);
       expect(content).toContain('&lt;');
     }
     expect(json).toContain('<font color=\\"grey\\">');

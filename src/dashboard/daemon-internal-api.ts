@@ -89,6 +89,15 @@ export interface DispatchContext {
   bodyRaw: string;
   body: unknown;
   url: URL;
+  /**
+   * Authenticated caller's bot `larkAppId` — populated by `handle()` from
+   * `verify.appId` (`daemon-internal-auth.ts:232`). Read routes that surface
+   * cross-daemon aggregator state (sessions / schedules) MUST scope their
+   * response to this id so a bot A owner can't peek into bot B's state.
+   * undefined only on the test seam (`dispatchForTest`) where the caller is
+   * trusted to assert their own scope.
+   */
+  callerAppId?: string;
 }
 
 interface RouteDef {
@@ -123,6 +132,32 @@ function bodyField<T = unknown>(body: unknown, name: string): T | undefined {
   return undefined;
 }
 
+/**
+ * Restrict aggregator rows to those owned by the authenticated caller's bot.
+ *
+ * Per-bot owner gate (PR3) means a bot A owner viewing `/dashboard
+ * sessions` against bot A must never see bot B's sessions. The aggregator
+ * mixes rows from all daemons (`aggregator.ts:62-63`), so we filter at the
+ * Route B read layer using the caller's `verify.appId`.
+ *
+ * Rows without `larkAppId` (legacy persistence shape) are KEPT so they
+ * don't disappear from a freshly-upgraded deploy. callerAppId === undefined
+ * means the test seam (`dispatchForTest`) is in use; the test is trusted
+ * to assert its own scope so we pass everything through.
+ */
+function scopeByCaller(
+  rows: ReadonlyArray<unknown>,
+  callerAppId: string | undefined,
+): unknown[] {
+  if (!callerAppId) return rows.slice();
+  return rows.filter(r => {
+    const owner = (r as { larkAppId?: unknown })?.larkAppId;
+    // Keep legacy rows (no larkAppId) so a fresh deploy doesn't lose them.
+    if (typeof owner !== 'string' || owner.length === 0) return true;
+    return owner === callerAppId;
+  });
+}
+
 /** ─── Route table ────────────────────────────────────────────────── */
 
 const ROUTES: RouteDef[] = [
@@ -130,7 +165,7 @@ const ROUTES: RouteDef[] = [
   {
     method: 'GET',
     pathRe: /^\/__daemon\/sessions-list$/,
-    handle: async (_m, _ctx, deps) => ({ status: 200, body: { sessions: deps.getSessions() } }),
+    handle: async (_m, ctx, deps) => ({ status: 200, body: { sessions: scopeByCaller(deps.getSessions(), ctx.callerAppId) } }),
   },
   // PR3 `/dashboard schedules` slice 1: dedicated list endpoint so the
   // card command doesn't pay the cost of `overview-snapshot` (which also
@@ -138,7 +173,7 @@ const ROUTES: RouteDef[] = [
   {
     method: 'GET',
     pathRe: /^\/__daemon\/schedules-list$/,
-    handle: async (_m, _ctx, deps) => ({ status: 200, body: { schedules: deps.getSchedules() } }),
+    handle: async (_m, ctx, deps) => ({ status: 200, body: { schedules: scopeByCaller(deps.getSchedules(), ctx.callerAppId) } }),
   },
   {
     method: 'GET',
@@ -309,6 +344,7 @@ export async function dispatchDaemonInternalRequest(
   url: URL,
   bodyRaw: string,
   deps: DaemonInternalApiDeps,
+  callerAppId?: string,
 ): Promise<HandlerResult> {
   let body: unknown = undefined;
   if (bodyRaw.length > 0) {
@@ -316,7 +352,7 @@ export async function dispatchDaemonInternalRequest(
     catch { return { status: 400, body: { ok: false, error: 'bad_json' } }; }
   }
 
-  const ctx: DispatchContext = { bodyRaw, body, url };
+  const ctx: DispatchContext = { bodyRaw, body, url, callerAppId };
 
   let pathMatchedButMethodWrong = false;
   for (const route of ROUTES) {
@@ -342,8 +378,10 @@ function writeHandlerResult(res: ServerResponse, result: HandlerResult): void {
 export interface DaemonInternalApi {
   /** Production entry point: verify HMAC, JSON-parse, dispatch, write response. */
   handle(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean>;
-  /** Test seam: bypass HMAC, exercise dispatch shape directly. */
-  dispatchForTest(method: string, url: URL, bodyRaw?: string): Promise<HandlerResult>;
+  /** Test seam: bypass HMAC, exercise dispatch shape directly. `callerAppId`
+   *  emulates the authenticated bot id so read-scoping tests can drive the
+   *  per-bot filter without going through HMAC. */
+  dispatchForTest(method: string, url: URL, bodyRaw?: string, callerAppId?: string): Promise<HandlerResult>;
 }
 
 export function createDaemonInternalApi(deps: DaemonInternalApiDeps): DaemonInternalApi {
@@ -377,6 +415,7 @@ export function createDaemonInternalApi(deps: DaemonInternalApiDeps): DaemonInte
       requestUrl,
       verify.bodyRaw,
       deps,
+      verify.appId,
     );
     writeHandlerResult(res, result);
     return true;
@@ -386,8 +425,9 @@ export function createDaemonInternalApi(deps: DaemonInternalApiDeps): DaemonInte
     method: string,
     url: URL,
     bodyRaw: string = '',
+    callerAppId?: string,
   ): Promise<HandlerResult> {
-    return dispatchDaemonInternalRequest(method, url, bodyRaw, deps);
+    return dispatchDaemonInternalRequest(method, url, bodyRaw, deps, callerAppId);
   }
 
   return { handle, dispatchForTest };
