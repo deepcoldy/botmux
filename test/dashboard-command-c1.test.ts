@@ -200,7 +200,10 @@ describe('handleDashboardCommand — owner gate covers all subcommands', () => {
 /** ─── Owner reaches stubs/help/overview routing ───────────────────────── */
 
 describe('handleDashboardCommand — owner dispatch', () => {
-  it.each(['overview', 'sessions', 'workflows', 'groups', 'schedules', 'settings'] as const)(
+  // Note: `settings` is excluded here because PR3 C4 replaced its stub with
+  // the real `handleDashboardSettings`. Its dispatch is covered separately
+  // by test/settings-card-c4.test.ts.
+  it.each(['overview', 'sessions', 'workflows', 'groups', 'schedules'] as const)(
     'owner /dashboard %s → stub for that module',
     async (mod) => {
       const deps = makeDeps();

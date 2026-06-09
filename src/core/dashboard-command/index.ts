@@ -24,9 +24,12 @@ import {
   buildStubText,
   type DashboardModule,
 } from './stub.js';
+import { handleDashboardSettings, type DashboardSettingsCommandDeps } from './settings.js';
 
 /** Optional test seam — production omits and uses the real PR2 helper. */
-export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {}
+export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
+  settings?: DashboardSettingsCommandDeps;
+}
 
 export async function handleDashboardCommand(
   message: LarkMessage,
@@ -57,9 +60,14 @@ export async function handleDashboardCommand(
     return;
   }
 
+  // PR3 C4: settings dispatched to the real handler; the other 5 modules
+  // remain stubs until their own PR.
+  if (sub === 'settings') {
+    const settingsArgs = args.replace(/^settings\s*/, '');
+    return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, testDeps.settings);
+  }
+
   if (DASHBOARD_MODULES.includes(sub as DashboardModule)) {
-    // v4 B1: every module — including `settings` — replies with a stub at C1.
-    // C4 swaps the `'settings'` branch to `handleDashboardSettings(...)`.
     await reply(buildStubText(sub as DashboardModule, loc));
     return;
   }

@@ -365,6 +365,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
+  // PR3 C4: /dashboard settings card callbacks — dispatch BEFORE the session
+  // lookup. These actions never need an active DaemonSession; they go
+  // straight through the dashboard-internal `/__daemon/settings-*` route.
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_settings_') &&
+    larkAppId
+  ) {
+    const { handleSettingsCardAction } = await import('./settings-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    return handleSettingsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: localeForBot(larkAppId),
+    });
+  }
+
   // ─── /relay picker: state-changing actions (select / page / search) ────
   // These three actions all re-render the picker card with updated state:
   //   • relay_select — user clicked a session card → set as selectedSessionId

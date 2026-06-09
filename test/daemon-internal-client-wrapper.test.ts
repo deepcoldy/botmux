@@ -94,11 +94,10 @@ describe('resolveDashboardUrl', () => {
     expect(resolveDashboardUrl(tmp.portPath)).toBe(DEFAULT_URL);
   });
 
-  it("'1e3' (scientific notation) → fallback 7891 (not silently coerced to 1000)", () => {
-    // Number('1e3') is 1000 BUT Number.isInteger(1000) is true, so the
-    // strict check actually accepts this. Document the contract: scientific
-    // notation IS accepted by Number(), and `1000` is a valid port. Adjust
-    // expectation accordingly to nail down the current behaviour.
+  it("'1e3' (scientific notation) accepted as 1000 — integer + in range", () => {
+    // Number('1e3') === 1000 and 1000 satisfies isInteger + range check, so
+    // the strict parser accepts it. This is intentional: scientific notation
+    // that produces a valid in-range integer port is a non-pathological input.
     tmp.writePort('1e3');
     expect(resolveDashboardUrl(tmp.portPath)).toBe('http://127.0.0.1:1000');
   });
