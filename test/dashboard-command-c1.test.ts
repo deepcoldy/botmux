@@ -139,10 +139,11 @@ describe('handleDashboardCommand — owner gate covers all subcommands', () => {
 /** ─── Owner-gated replies all go to DM, NOT topic interactive ───────── */
 
 describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
-  // `sessions` and `schedules` have their own real handlers in slice 1
-  // (see dashboard-sessions-command.test.ts / dashboard-schedules-command.test.ts);
+  // `sessions`, `schedules`, and `overview` have their own real handlers in
+  // slice 1 (see dashboard-sessions-command.test.ts /
+  // dashboard-schedules-command.test.ts / dashboard-overview-command.test.ts);
   // the rest are stubs until each slice lands.
-  it.each(['overview', 'workflows', 'groups'] as const)(
+  it.each(['workflows', 'groups'] as const)(
     'owner /dashboard %s → stub DMed to owner, topic gets dm_sent confirmation',
     async (mod) => {
       const deps = makeDeps();
@@ -175,16 +176,9 @@ describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
     expect(dm.calls[0].content).toContain('overview');
   });
 
-  it('owner /dashboard (empty) → overview stub DMed', async () => {
-    const deps = makeDeps();
-    const dm = captureDM();
-    await handleDashboardCommand(
-      makeMessage(), '', 'om_root', 'oc_test', deps, 'cli_x',
-      { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
-    );
-    expect(dm.calls.length).toBe(1);
-    expect(dm.calls[0].content).toContain('overview');
-  });
+  // NOTE: empty-args default routing (`/dashboard` → overview) is exercised
+  // in dashboard-overview-command.test.ts now that overview has a real
+  // handler; tested there with a stubbed Route B client.
 
   it('DM failure → topic shows dm_failed with reason', async () => {
     const deps = makeDeps();

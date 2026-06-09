@@ -29,6 +29,7 @@ import {
 import { handleDashboardSettings, type DashboardSettingsCommandDeps } from './settings.js';
 import { handleDashboardSessions, type DashboardSessionsCommandDeps } from './sessions.js';
 import { handleDashboardSchedules, type DashboardSchedulesCommandDeps } from './schedules.js';
+import { handleDashboardOverview, type DashboardOverviewCommandDeps } from './overview.js';
 
 /** Optional test seam — production omits and uses the real PR2 helper. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
@@ -37,6 +38,7 @@ export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   settings?: DashboardSettingsCommandDeps;
   sessions?: DashboardSessionsCommandDeps;
   schedules?: DashboardSchedulesCommandDeps;
+  overview?: DashboardOverviewCommandDeps;
 }
 
 export async function handleDashboardCommand(
@@ -105,6 +107,12 @@ export async function handleDashboardCommand(
   if (sub === 'schedules') {
     const schedulesArgs = args.replace(/^schedules\s*/, '');
     return handleDashboardSchedules(message, schedulesArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.schedules);
+  }
+
+  // PR3 overview slice 1: read-only summary card + goto buttons.
+  if (sub === 'overview') {
+    const overviewArgs = args.replace(/^overview\s*/, '');
+    return handleDashboardOverview(message, overviewArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.overview);
   }
 
   if (DASHBOARD_MODULES.includes(sub as DashboardModule)) {

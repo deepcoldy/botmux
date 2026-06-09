@@ -202,13 +202,17 @@ const ROUTES: RouteDef[] = [
   {
     method: 'GET',
     pathRe: /^\/__daemon\/overview-snapshot$/,
-    handle: async (_m, _ctx, deps) => {
+    handle: async (_m, ctx, deps) => {
+      // Per-bot owner gate (PR3): the same scoping applied to
+      // sessions-list / schedules-list MUST also apply when the overview
+      // surface bundles those lists, otherwise bot A's owner would observe
+      // bot B's sessions/schedules through the aggregated overview.
       const groups = await deps.buildGroupsMatrix();
       return {
         status: 200,
         body: {
-          sessions: deps.getSessions(),
-          schedules: deps.getSchedules(),
+          sessions: scopeByCaller(deps.getSessions(), ctx.callerAppId),
+          schedules: scopeByCaller(deps.getSchedules(), ctx.callerAppId),
           settings: deps.resolveDashboardSettings(),
           groups,
         },

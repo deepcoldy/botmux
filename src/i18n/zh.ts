@@ -614,6 +614,33 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.dm_sent': '📬 Dashboard settings 卡片已私信给 Bot Owner。',
   'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送 settings 卡片失败：{reason}',
 
+  // overview card (PR3 slice 1)
+  'card.dashboard.overview.title': '⚙️ Dashboard 总览',
+  'card.dashboard.overview.sessions_section': '🖥️ 会话',
+  'card.dashboard.overview.sessions_summary': '活跃 {active} · 空闲 {idle} · 关闭 {closed}',
+  'card.dashboard.overview.schedules_section': '⏰ 定时任务',
+  'card.dashboard.overview.schedules_summary': '启用 {enabled} · 暂停 {paused} · 上次错误 {errors}',
+  'card.dashboard.overview.settings_section': '⚙️ 设置',
+  'card.dashboard.overview.settings_summary': '{publicReadOnlyLabel} · {openTerminalLabel} · {autoUpdateLabel}',
+  'card.dashboard.overview.groups_placeholder': '🚧 群矩阵 — 即将上线',
+  'card.dashboard.overview.workflows_placeholder': '🚧 Workflows — 即将上线',
+  'card.dashboard.overview.refresh': '🔄 刷新',
+  'card.dashboard.overview.goto_sessions': '📂 会话列表',
+  'card.dashboard.overview.goto_schedules': '📂 定时任务',
+  'card.dashboard.overview.goto_settings': '📂 设置',
+  'card.dashboard.overview.dm_sent': '📬 Dashboard 总览已私信给 Bot Owner。',
+  'card.dashboard.overview.dm_failed': '⚠️ 给 Bot Owner 发送总览失败：{reason}',
+  'card.dashboard.overview.overview_failed': '⚠️ 拉取总览快照失败：{reason}',
+  // settings_summary 子串
+  'card.dashboard.overview.settings.publicReadOnly.on': '公开只读已开启',
+  'card.dashboard.overview.settings.publicReadOnly.off': '公开只读已关闭',
+  'card.dashboard.overview.settings.openTerminal.feishu': '终端在飞书内打开',
+  'card.dashboard.overview.settings.openTerminal.browser': '终端在浏览器打开',
+  'card.dashboard.overview.settings.autoUpdate.localDev': '自动更新受限',
+  'card.dashboard.overview.settings.autoUpdate.off': '自动更新关闭',
+  'card.dashboard.overview.settings.autoUpdate.on': '自动更新启用 {time}',
+  'card.dashboard.overview.settings.autoUpdate.onWithRestart': '自动更新启用 {time} + 重启',
+
   // settings card (PR3 C4)
   'card.dashboard.settings.title': '⚙️ Dashboard 全局设置',
   'card.dashboard.settings.refresh': '🔄 刷新',

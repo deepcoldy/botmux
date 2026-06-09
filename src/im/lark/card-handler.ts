@@ -423,6 +423,24 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
+  // ─── PR3 `/dashboard overview` slice 1: refresh + goto callbacks ──────
+  // Goto buttons rebuild the TARGET card by re-fetching the corresponding
+  // dedicated Route B endpoint (sessions-list / schedules-list /
+  // settings-snapshot). No new endpoints, no multi_url cross-card jumps.
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_overview_') &&
+    larkAppId
+  ) {
+    const { handleOverviewCardAction } = await import('./overview-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const overviewLocale = localeForBot(larkAppId);
+    return handleOverviewCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: overviewLocale,
+    });
+  }
+
   // ─── /relay picker: state-changing actions (select / page / search) ────
   // These three actions all re-render the picker card with updated state:
   //   • relay_select — user clicked a session card → set as selectedSessionId

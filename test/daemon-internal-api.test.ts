@@ -197,6 +197,27 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     const sessions = (r.body as any).sessions as Array<{ sessionId: string }>;
     expect(sessions.map(s => s.sessionId).sort()).toEqual(['sA', 'sB', 'sLegacy']);
   });
+
+  // PR3 overview slice 1 (2026-06-09): the overview-snapshot endpoint
+  // bundles sessions + schedules from the aggregator and MUST apply the
+  // same callerAppId scoping the dedicated list endpoints do, or a bot A
+  // owner would observe bot B's sessions/schedules through the bundled
+  // overview surface.
+  it('overview-snapshot with callerAppId=cli_a → only cli_a sessions + schedules + legacy (no cli_b)', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/overview-snapshot'), '', 'cli_a');
+    expect(r.status).toBe(200);
+    const body = r.body as any;
+    const sessIds = (body.sessions as Array<{ sessionId: string }>).map(s => s.sessionId).sort();
+    expect(sessIds).toEqual(['sA', 'sLegacy']);
+    expect(sessIds).not.toContain('sB');
+    const schedIds = (body.schedules as Array<{ id: string }>).map(s => s.id).sort();
+    expect(schedIds).toEqual(['schA', 'schLegacy']);
+    expect(schedIds).not.toContain('schB');
+    // settings + groups still present in the composed response.
+    expect(body.settings).toBeDefined();
+    expect(body.groups).toBeDefined();
+  });
 });
 
 /** ─── 1 SETTINGS-WRITE ENDPOINT — owner gate ───────────────────────── */

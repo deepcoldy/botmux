@@ -611,6 +611,33 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to the Bot Owner.',
   'card.dashboard.settings.dm_failed': '⚠️ Failed to DM the settings card to Bot Owner: {reason}',
 
+  // overview card (PR3 slice 1)
+  'card.dashboard.overview.title': '⚙️ Dashboard Overview',
+  'card.dashboard.overview.sessions_section': '🖥️ Sessions',
+  'card.dashboard.overview.sessions_summary': 'Active {active} · Idle {idle} · Closed {closed}',
+  'card.dashboard.overview.schedules_section': '⏰ Schedules',
+  'card.dashboard.overview.schedules_summary': 'Enabled {enabled} · Paused {paused} · Last errors {errors}',
+  'card.dashboard.overview.settings_section': '⚙️ Settings',
+  'card.dashboard.overview.settings_summary': '{publicReadOnlyLabel} · {openTerminalLabel} · {autoUpdateLabel}',
+  'card.dashboard.overview.groups_placeholder': '🚧 Group matrix — coming soon',
+  'card.dashboard.overview.workflows_placeholder': '🚧 Workflows — coming soon',
+  'card.dashboard.overview.refresh': '🔄 Refresh',
+  'card.dashboard.overview.goto_sessions': '📂 Sessions',
+  'card.dashboard.overview.goto_schedules': '📂 Schedules',
+  'card.dashboard.overview.goto_settings': '📂 Settings',
+  'card.dashboard.overview.dm_sent': '📬 The dashboard overview was DMed to the Bot Owner.',
+  'card.dashboard.overview.dm_failed': '⚠️ Failed to DM the overview to Bot Owner: {reason}',
+  'card.dashboard.overview.overview_failed': '⚠️ Failed to fetch overview snapshot: {reason}',
+  // settings_summary substrings
+  'card.dashboard.overview.settings.publicReadOnly.on': 'Public read-only ON',
+  'card.dashboard.overview.settings.publicReadOnly.off': 'Public read-only OFF',
+  'card.dashboard.overview.settings.openTerminal.feishu': 'Terminal opens in Feishu',
+  'card.dashboard.overview.settings.openTerminal.browser': 'Terminal opens in browser',
+  'card.dashboard.overview.settings.autoUpdate.localDev': 'Auto-update unavailable (local dev)',
+  'card.dashboard.overview.settings.autoUpdate.off': 'Auto-update OFF',
+  'card.dashboard.overview.settings.autoUpdate.on': 'Auto-update at {time}',
+  'card.dashboard.overview.settings.autoUpdate.onWithRestart': 'Auto-update at {time} + restart',
+
   // settings card (PR3 C4)
   'card.dashboard.settings.title': '⚙️ Dashboard Global Settings',
   'card.dashboard.settings.refresh': '🔄 Refresh',
