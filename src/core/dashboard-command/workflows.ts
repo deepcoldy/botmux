@@ -43,7 +43,13 @@ export async function handleDashboardWorkflows(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let snap;
   try {
-    snap = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot' });
+    // codex 2026-06-09 blocker: listRuns default hides TERMINAL_RUN_STATUSES
+    // (succeeded/failed/cancelled). Without `all=1` the "完成 M · 失败 K"
+    // counts in the card would basically always be 0 — the user would see
+    // "non-terminal list", not the runs history we advertise. The endpoint
+    // already transparently forwards `?all`; only the consumer side needs to
+    // ask for it.
+    snap = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1' });
   } catch (e: any) {
     await deps.sessionReply(
       rootId,

@@ -205,7 +205,7 @@ describe('handleWorkflowsCardAction', () => {
     } as any;
   }
 
-  it('refresh → GET /__daemon/workflows-runs-snapshot, returns { card } only (no toast)', async () => {
+  it('refresh → GET /__daemon/workflows-runs-snapshot?all=1, returns { card } only (no toast)', async () => {
     const deps = makeDeps();
     const r = await handleWorkflowsCardAction(
       makeAction({ action: WORKFLOWS_ACTION_REFRESH, invoker_open_id: INVOKER }),
@@ -213,7 +213,9 @@ describe('handleWorkflowsCardAction', () => {
       deps,
     );
     expect(deps.requestSpy).toHaveBeenCalledOnce();
-    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/workflows-runs-snapshot' });
+    // codex 2026-06-09 blocker: ?all=1 is required so the response includes
+    // terminal runs; otherwise the card's done/failed counts are empty.
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1' });
     expect(r.toast).toBeUndefined();
     expect(r.card?.type).toBe('raw');
   });

@@ -58,9 +58,12 @@ function makeDeps(): any {
 }
 
 describe('handleCardAction → workflows dispatch returns { card } only on success', () => {
-  it('refresh: result.card is the rebuilt list card; updateMessage NOT called on fast path', async () => {
+  it('refresh: result.card is the rebuilt list card; ?all=1 query sent; updateMessage NOT called on fast path', async () => {
     const requestSpy = vi.fn(async (req: any) => {
-      if (req.method === 'GET' && req.path === '/__daemon/workflows-runs-snapshot') {
+      // codex 2026-06-09 blocker: must request with ?all=1 (default listRuns
+      // hides terminal runs). Match the path strictly so this test catches
+      // any regression that drops the query.
+      if (req.method === 'GET' && req.path === '/__daemon/workflows-runs-snapshot?all=1') {
         return {
           status: 200, raw: '',
           body: { runs: [
@@ -90,7 +93,7 @@ describe('handleCardAction → workflows dispatch returns { card } only on succe
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
 
-  it('page: result.card reflects the requested page', async () => {
+  it('page: result.card reflects the requested page; request still carries ?all=1', async () => {
     const rows = Array.from({ length: 25 }, (_, i) => ({
       runId: `r_${i}`, workflowId: `wf_${i}`, status: 'running',
       startedAt: 1_000 - i, updatedAt: 1_500, nodesDone: 1, nodesTotal: 3,
@@ -108,6 +111,13 @@ describe('handleCardAction → workflows dispatch returns { card } only on succe
     expect(result.card).toBeDefined();
     const cardJson = JSON.stringify(result.card?.data);
     expect(cardJson).toContain('第 2/3 页');
+
+    // codex blocker: page action must also carry ?all=1 — same reason as refresh.
+    expect(requestSpy).toHaveBeenCalledOnce();
+    expect(requestSpy.mock.calls[0][0]).toEqual({
+      method: 'GET',
+      path: '/__daemon/workflows-runs-snapshot?all=1',
+    });
 
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();

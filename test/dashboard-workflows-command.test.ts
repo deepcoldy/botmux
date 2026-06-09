@@ -70,7 +70,10 @@ describe('handleDashboardWorkflows (command path)', () => {
     );
 
     expect(requestSpy).toHaveBeenCalledOnce();
-    expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/workflows-runs-snapshot' });
+    // codex 2026-06-09 blocker: must request with ?all=1 so the response
+    // includes terminal runs (succeeded/failed/cancelled). Without it the
+    // card's "完成 · 失败" buckets would basically always be empty.
+    expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1' });
     expect(dm.calls.length).toBe(1);
     expect(dm.calls[0].openId).toBe(OWNER);
     expect(dm.calls[0].msgType).toBe('interactive');

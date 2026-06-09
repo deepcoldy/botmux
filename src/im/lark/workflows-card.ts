@@ -14,9 +14,10 @@
  * Response: success returns `{ card }` only (no toast) — single-pass render,
  * no stale-frame flash. Errors / permission denials return `{ toast }`.
  *
- * Sort order: active group (running/waiting/pending) before terminal group
- * (succeeded/failed/cancelled); within each group, ordered by startedAtMs
- * descending. Rows without startedAt sink to the bottom of their group.
+ * Order: the server-side `listRuns` order is preserved verbatim. The card
+ * does NOT re-sort — the dashboard web UI already consumes
+ * `/api/workflows/runs` in this canonical order, and silently diverging
+ * would be harder to reason about than letting the daemon own the sort.
  */
 
 import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
@@ -129,11 +130,9 @@ function paginate<T>(
   };
 }
 
-/** Build the workflows list card JSON. Pure (sorts + paginates + renders).
- *
- *  Sort: active group (running/waiting/pending) before terminal
- *  (succeeded/failed/cancelled); within each group, startedAtMs descending.
- */
+/** Build the workflows list card JSON. Pure (paginates + renders).
+ *  Server-side listRuns order is preserved verbatim — no client-side resort.
+ *  See module docblock for the rationale. */
 export function buildWorkflowsCard(
   rows: ReadonlyArray<WorkflowRunInput>,
   opts: BuildWorkflowsCardOpts,
@@ -368,7 +367,10 @@ export async function handleWorkflowsCardAction(
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
     const client = deps.createClient(larkAppId);
-    r = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot' });
+    // ?all=1 — see workflows command handler note: default listRuns hides
+    // terminal runs (succeeded/failed/cancelled), so the "完成 M · 失败 K"
+    // summary would be empty without this flag.
+    r = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1' });
   } catch (e) {
     return errorToast('card.dashboard.workflows.list_failed', { reason: (e as Error).message }, locale);
   }
