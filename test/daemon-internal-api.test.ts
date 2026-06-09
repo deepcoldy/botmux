@@ -220,6 +220,106 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
   });
 });
 
+/** ─── workflows-runs-snapshot: per-bot scope + query passthrough + non-200 passthrough ─────
+ *  PR3 workflows slice 1 (codex required points):
+ *   - rows are scoped by callerAppId via nested `chatBinding.larkAppId`
+ *     (workflows have a different shape from sessions/schedules where
+ *     `larkAppId` is top-level).
+ *   - Query string `?all=1&status=running,waiting` MUST reach `listRuns`
+ *     with the right typed shape; scoping must NOT eat the query.
+ *   - Non-200 results from listWorkflowRuns are passed through unchanged
+ *     so a malformed body doesn't surface as an empty list. */
+describe('workflows-runs-snapshot: per-bot scope + query passthrough', () => {
+  const cliARow = { runId: 'rA', chatBinding: { chatId: 'oc_a', larkAppId: 'cli_a' } };
+  const cliBRow = { runId: 'rB', chatBinding: { chatId: 'oc_b', larkAppId: 'cli_b' } };
+  const legacyRow = { runId: 'rLegacy' }; // No chatBinding — must remain visible.
+
+  function mixedWorkflowsDeps(): DaemonInternalApiDeps {
+    return makeDeps({
+      workflowsActionDeps: {
+        runsDir: '/tmp/runs-test',
+        proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
+        listRuns: vi.fn(async () => [cliARow, cliBRow, legacyRow]),
+        readRunSnapshot: vi.fn(async () => null),
+        scrubSnapshotForUnauthed: vi.fn((s: any) => s),
+        TERMINAL_RUN_STATUSES: new Set(['succeeded', 'failed', 'cancelled']),
+        isValidRunId: vi.fn(() => true),
+      } as any,
+    });
+  }
+
+  it('callerAppId=cli_a → only cli_a runs + legacy (no cli_b)', async () => {
+    const api = createDaemonInternalApi(mixedWorkflowsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/workflows-runs-snapshot'), '', 'cli_a');
+    expect(r.status).toBe(200);
+    const runs = (r.body as any).runs as Array<{ runId: string }>;
+    const ids = runs.map(x => x.runId).sort();
+    expect(ids).toEqual(['rA', 'rLegacy']);
+    expect(ids).not.toContain('rB');
+  });
+
+  it('callerAppId=cli_b → only cli_b runs + legacy (no cli_a)', async () => {
+    const api = createDaemonInternalApi(mixedWorkflowsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/workflows-runs-snapshot'), '', 'cli_b');
+    expect(r.status).toBe(200);
+    const runs = (r.body as any).runs as Array<{ runId: string }>;
+    const ids = runs.map(x => x.runId).sort();
+    expect(ids).toEqual(['rB', 'rLegacy']);
+    expect(ids).not.toContain('rA');
+  });
+
+  it('query passthrough — ?all=1&status=running,waiting reaches listRuns with typed shape; scoping does NOT eat the query', async () => {
+    const deps = mixedWorkflowsDeps();
+    const listSpy = vi.spyOn(deps.workflowsActionDeps as any, 'listRuns');
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest(
+      'GET',
+      url('/__daemon/workflows-runs-snapshot', { all: '1', status: 'running,waiting' }),
+      '',
+      'cli_a',
+    );
+    expect(r.status).toBe(200);
+    expect(listSpy).toHaveBeenCalledWith('/tmp/runs-test', {
+      all: true,
+      statuses: new Set(['running', 'waiting']),
+      includeBinding: true,
+    });
+  });
+
+  it('non-200 result from listWorkflowRuns passes through unchanged (don’t try to filter a malformed body)', async () => {
+    const deps = makeDeps({
+      workflowsActionDeps: {
+        runsDir: '/tmp/runs-test',
+        proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
+        listRuns: vi.fn(async () => { throw new Error('boom'); }),
+        readRunSnapshot: vi.fn(async () => null),
+        scrubSnapshotForUnauthed: vi.fn((s: any) => s),
+        TERMINAL_RUN_STATUSES: new Set(['succeeded', 'failed', 'cancelled']),
+        isValidRunId: vi.fn(() => true),
+      } as any,
+    });
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest(
+      'GET',
+      url('/__daemon/workflows-runs-snapshot'),
+      '',
+      'cli_a',
+    );
+    expect(r.status).toBe(500);
+    expect((r.body as any).error).toBe('listRuns_failed');
+    expect((r.body as any).message).toBe('boom');
+    // No spurious `runs` key added by the scoping wrapper on a non-200.
+    expect((r.body as any).runs).toBeUndefined();
+  });
+
+  it('no callerAppId (test seam) → full list (unfiltered)', async () => {
+    const api = createDaemonInternalApi(mixedWorkflowsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/workflows-runs-snapshot'));
+    const runs = (r.body as any).runs as Array<{ runId: string }>;
+    expect(runs.map(x => x.runId).sort()).toEqual(['rA', 'rB', 'rLegacy']);
+  });
+});
+
 /** ─── 1 SETTINGS-WRITE ENDPOINT — owner gate ───────────────────────── */
 
 describe('dispatch: PUT /__daemon/settings-write owner gate', () => {

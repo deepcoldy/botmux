@@ -133,29 +133,52 @@ function bodyField<T = unknown>(body: unknown, name: string): T | undefined {
 }
 
 /**
- * Restrict aggregator rows to those owned by the authenticated caller's bot.
+ * Generic per-bot scoping helper — restricts aggregator rows to those owned
+ * by the authenticated caller's bot.
  *
  * Per-bot owner gate (PR3) means a bot A owner viewing `/dashboard
  * sessions` against bot A must never see bot B's sessions. The aggregator
  * mixes rows from all daemons (`aggregator.ts:62-63`), so we filter at the
  * Route B read layer using the caller's `verify.appId`.
  *
- * Rows without `larkAppId` (legacy persistence shape) are KEPT so they
- * don't disappear from a freshly-upgraded deploy. callerAppId === undefined
- * means the test seam (`dispatchForTest`) is in use; the test is trusted
- * to assert its own scope so we pass everything through.
+ * Rows whose owner getter returns undefined / empty string (legacy
+ * persistence shape) are KEPT so they don't disappear from a freshly-
+ * upgraded deploy. callerAppId === undefined means the test seam
+ * (`dispatchForTest`) is in use; the test is trusted to assert its own
+ * scope so we pass everything through.
+ *
+ * The owner getter argument lets workflows (nested
+ * `chatBinding.larkAppId`) reuse the same filter pipeline as sessions /
+ * schedules (top-level `larkAppId`).
+ */
+function scopeRowsByCaller<T>(
+  rows: ReadonlyArray<T>,
+  callerAppId: string | undefined,
+  getOwnerAppId: (row: T) => string | undefined,
+): T[] {
+  if (!callerAppId) return rows.slice();
+  return rows.filter(r => {
+    const owner = getOwnerAppId(r);
+    // Keep legacy rows (no owner resolvable) so a fresh deploy doesn't lose them.
+    if (typeof owner !== 'string' || owner.length === 0) return true;
+    return owner === callerAppId;
+  });
+}
+
+/**
+ * Thin wrapper around `scopeRowsByCaller` for rows with a top-level
+ * `larkAppId` field (sessions / schedules / aggregator-shape). Workflows
+ * call `scopeRowsByCaller` directly with their own owner getter.
  */
 function scopeByCaller(
   rows: ReadonlyArray<unknown>,
   callerAppId: string | undefined,
 ): unknown[] {
-  if (!callerAppId) return rows.slice();
-  return rows.filter(r => {
-    const owner = (r as { larkAppId?: unknown })?.larkAppId;
-    // Keep legacy rows (no larkAppId) so a fresh deploy doesn't lose them.
-    if (typeof owner !== 'string' || owner.length === 0) return true;
-    return owner === callerAppId;
-  });
+  return scopeRowsByCaller(
+    rows,
+    callerAppId,
+    r => (r as { larkAppId?: unknown })?.larkAppId as string | undefined,
+  );
 }
 
 /** ─── Route table ────────────────────────────────────────────────── */
@@ -196,7 +219,32 @@ const ROUTES: RouteDef[] = [
         all: ctx.url.searchParams.get('all') === '1',
         statuses: parseStatusesParam(ctx.url.searchParams.get('status')),
       };
-      return listWorkflowRuns(query, deps.workflowsActionDeps);
+      // PR3 workflows slice 1: listWorkflowRuns returns
+      // `{ status, body: { runs } }` (HandlerResult), NOT a raw array.
+      // Only filter on a 200 with a runs array; pass through other shapes
+      // verbatim (errors, non-runs bodies) so callers see the real failure
+      // instead of an empty list. Owner getter reaches into nested
+      // `chatBinding.larkAppId` — workflow rows differ from sessions /
+      // schedules where larkAppId is top-level.
+      const result = await listWorkflowRuns(query, deps.workflowsActionDeps);
+      if (
+        result.status === 200 &&
+        result.body &&
+        typeof result.body === 'object' &&
+        Array.isArray((result.body as { runs?: unknown }).runs)
+      ) {
+        const runs = (result.body as { runs: ReadonlyArray<unknown> }).runs;
+        const scoped = scopeRowsByCaller(
+          runs,
+          ctx.callerAppId,
+          r => (r as { chatBinding?: { larkAppId?: unknown } })?.chatBinding?.larkAppId as string | undefined,
+        );
+        return {
+          status: 200,
+          body: { ...(result.body as Record<string, unknown>), runs: scoped },
+        };
+      }
+      return result;
     },
   },
   {

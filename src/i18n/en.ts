@@ -608,6 +608,20 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.dm_failed': '⚠️ Failed to DM the schedules list to Bot Owner: {reason}',
   'card.dashboard.schedules.list_failed': '⚠️ Failed to fetch schedules list: {reason}',
 
+  // workflows card (PR3 slice 1)
+  'card.dashboard.workflows.title': '🧩 Dashboard Workflows',
+  'card.dashboard.workflows.count_summary': 'Running {running} · Done {done} · Failed {failed} · Page {page}/{totalPages}',
+  'card.dashboard.workflows.empty': '_No workflow runs yet_',
+  'card.dashboard.workflows.refresh': '🔄 Refresh',
+  'card.dashboard.workflows.prev': '← Prev',
+  'card.dashboard.workflows.next': 'Next →',
+  'card.dashboard.workflows.progress_label': 'step {done}/{total}',
+  'card.dashboard.workflows.started_label': 'started {rel}',
+  'card.dashboard.workflows.updated_label': 'updated {rel}',
+  'card.dashboard.workflows.dm_sent': '📬 The dashboard workflows list was DMed to the Bot Owner.',
+  'card.dashboard.workflows.dm_failed': '⚠️ Failed to DM the workflows list to Bot Owner: {reason}',
+  'card.dashboard.workflows.list_failed': '⚠️ Failed to fetch workflows list: {reason}',
+
   'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to the Bot Owner.',
   'card.dashboard.settings.dm_failed': '⚠️ Failed to DM the settings card to Bot Owner: {reason}',
 

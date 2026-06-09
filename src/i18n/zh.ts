@@ -611,6 +611,20 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.dm_failed': '⚠️ 给 Bot Owner 发送定时任务列表失败：{reason}',
   'card.dashboard.schedules.list_failed': '⚠️ 拉取定时任务列表失败：{reason}',
 
+  // workflows card (PR3 slice 1)
+  'card.dashboard.workflows.title': '🧩 Dashboard 工作流',
+  'card.dashboard.workflows.count_summary': '进行中 {running} · 完成 {done} · 失败 {failed} · 第 {page}/{totalPages} 页',
+  'card.dashboard.workflows.empty': '_当前没有工作流运行_',
+  'card.dashboard.workflows.refresh': '🔄 刷新',
+  'card.dashboard.workflows.prev': '← 上一页',
+  'card.dashboard.workflows.next': '下一页 →',
+  'card.dashboard.workflows.progress_label': '步 {done}/{total}',
+  'card.dashboard.workflows.started_label': '启动 {rel}',
+  'card.dashboard.workflows.updated_label': '上次 {rel}',
+  'card.dashboard.workflows.dm_sent': '📬 Dashboard 工作流列表已私信给 Bot Owner。',
+  'card.dashboard.workflows.dm_failed': '⚠️ 给 Bot Owner 发送工作流列表失败：{reason}',
+  'card.dashboard.workflows.list_failed': '⚠️ 拉取工作流列表失败：{reason}',
+
   'card.dashboard.settings.dm_sent': '📬 Dashboard settings 卡片已私信给 Bot Owner。',
   'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送 settings 卡片失败：{reason}',
 

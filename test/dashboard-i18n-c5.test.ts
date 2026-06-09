@@ -54,6 +54,20 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.schedules.dm_failed',
   'card.dashboard.schedules.list_failed',
 
+  // ─── workflows card (PR3 slice 1) ───────────────────────────────────
+  'card.dashboard.workflows.title',
+  'card.dashboard.workflows.count_summary',
+  'card.dashboard.workflows.empty',
+  'card.dashboard.workflows.refresh',
+  'card.dashboard.workflows.prev',
+  'card.dashboard.workflows.next',
+  'card.dashboard.workflows.progress_label',
+  'card.dashboard.workflows.started_label',
+  'card.dashboard.workflows.updated_label',
+  'card.dashboard.workflows.dm_sent',
+  'card.dashboard.workflows.dm_failed',
+  'card.dashboard.workflows.list_failed',
+
   // ─── overview card (PR3 slice 1) ────────────────────────────────────
   'card.dashboard.overview.title',
   'card.dashboard.overview.sessions_section',

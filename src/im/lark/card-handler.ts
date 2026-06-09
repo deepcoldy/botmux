@@ -423,6 +423,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
+  // ─── PR3 `/dashboard workflows` slice 1: refresh + page callbacks ─────
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_workflows_') &&
+    larkAppId
+  ) {
+    const { handleWorkflowsCardAction } = await import('./workflows-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const workflowsLocale = localeForBot(larkAppId);
+    return handleWorkflowsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: workflowsLocale,
+    });
+  }
+
   // ─── PR3 `/dashboard overview` slice 1: refresh + goto callbacks ──────
   // Goto buttons rebuild the TARGET card by re-fetching the corresponding
   // dedicated Route B endpoint (sessions-list / schedules-list /

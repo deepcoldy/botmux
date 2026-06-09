@@ -30,6 +30,7 @@ import { handleDashboardSettings, type DashboardSettingsCommandDeps } from './se
 import { handleDashboardSessions, type DashboardSessionsCommandDeps } from './sessions.js';
 import { handleDashboardSchedules, type DashboardSchedulesCommandDeps } from './schedules.js';
 import { handleDashboardOverview, type DashboardOverviewCommandDeps } from './overview.js';
+import { handleDashboardWorkflows, type DashboardWorkflowsCommandDeps } from './workflows.js';
 
 /** Optional test seam — production omits and uses the real PR2 helper. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
@@ -39,6 +40,7 @@ export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   sessions?: DashboardSessionsCommandDeps;
   schedules?: DashboardSchedulesCommandDeps;
   overview?: DashboardOverviewCommandDeps;
+  workflows?: DashboardWorkflowsCommandDeps;
 }
 
 export async function handleDashboardCommand(
@@ -107,6 +109,12 @@ export async function handleDashboardCommand(
   if (sub === 'schedules') {
     const schedulesArgs = args.replace(/^schedules\s*/, '');
     return handleDashboardSchedules(message, schedulesArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.schedules);
+  }
+
+  // PR3 workflows slice 1: read-only list + pagination + refresh.
+  if (sub === 'workflows') {
+    const workflowsArgs = args.replace(/^workflows\s*/, '');
+    return handleDashboardWorkflows(message, workflowsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.workflows);
   }
 
   // PR3 overview slice 1: read-only summary card + goto buttons.

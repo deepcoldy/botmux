@@ -471,11 +471,11 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
     expect(text).toContain('🔒');
   });
 
-  it('owner /dashboard workflows still returns stub via DM (modules without a real handler yet)', async () => {
+  it('owner /dashboard groups still returns stub via DM (modules without a real handler yet)', async () => {
     // Was originally `/dashboard sessions` → switched to `/dashboard overview`
-    // when sessions got a real handler (2026-06-09). overview itself now has
-    // a real handler too, so workflows is the canonical remaining stub
-    // sample; groups is also still a stub (covered by C1's parametric).
+    // when sessions got a real handler (2026-06-09), then `/dashboard workflows`
+    // until that got a real handler too (this slice). `groups` is the canonical
+    // remaining stub sample.
     const sendUserMessage = vi.fn(async () => 'om_dm');
     const deps: CommandHandlerDeps = {
       activeSessions: new Map() as any,
@@ -484,8 +484,8 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
       lastRepoScan: new Map() as any,
     };
     await handleDashboardCommand(
-      { senderId: INVOKER, content: '/dashboard workflows', chatId: 'oc', rootMessageId: 'om' } as LarkMessage,
-      'workflows',
+      { senderId: INVOKER, content: '/dashboard groups', chatId: 'oc', rootMessageId: 'om' } as LarkMessage,
+      'groups',
       'om_root',
       'oc_test',
       deps,
@@ -495,6 +495,6 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
     expect(sendUserMessage).toHaveBeenCalledOnce();
     const dmText = (sendUserMessage as any).mock.calls[0][2] as string;
     expect(dmText).toContain('🚧');
-    expect(dmText).toContain('workflows');
+    expect(dmText).toContain('groups');
   });
 });
