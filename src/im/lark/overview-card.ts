@@ -60,7 +60,9 @@ export interface SessionCounts {
 export interface ScheduleCounts {
   enabled: number;
   paused: number;
-  /** Enabled schedules whose last run errored. */
+  /** Schedules whose last run errored — counted regardless of enabled state,
+   *  to match the schedules list-card's ⚠️ semantics (see countSchedules
+   *  docblock + `schedule-card-model.ts:201`). */
   errors: number;
 }
 
