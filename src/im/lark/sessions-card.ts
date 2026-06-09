@@ -163,16 +163,32 @@ function renderRow(entry: SessionRowDto, _locale: Locale): unknown {
     text: {
       tag: 'lark_md',
       content:
-        `${icon} **${escapeMd(entry.primary)}**` +
-        (entry.secondary ? `\n<font color="grey">${escapeMd(entry.secondary)}</font>` : ''),
+        `${icon} **${escapeLarkMd(entry.primary)}**` +
+        (entry.secondary ? `\n<font color="grey">${escapeLarkMd(entry.secondary)}</font>` : ''),
     },
   };
 }
 
-/** Minimal markdown-safe escape — protects `*`, `_`, `~`, `` ` `` from
- *  being interpreted as markup since session titles may contain anything. */
-function escapeMd(text: string): string {
-  return text.replace(/([*_~`])/g, '\\$1');
+/**
+ * Sanitize user/filesystem-supplied text for inclusion in a Lark `lark_md`
+ * element — particularly inside our `<font color="grey">…</font>` wrapper.
+ *
+ * codex slice-1 blocker #3: title comes from session.title (user-controlled
+ * chat content) and workingDir comes from the filesystem. Both flow into a
+ * span we wrap with `<font>`; without escaping, a payload containing
+ * `</font><at id=ou_x></at>` would close our wrapper and inject a
+ * @mention-looking element. We also need to handle `*_~\``-style markdown
+ * controls so plain filenames don't render as bold/italic.
+ *
+ * Order matters: escape `&` FIRST so a later `<` → `&lt;` doesn't get
+ * re-encoded as `&amp;lt;`.
+ */
+function escapeLarkMd(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/([*_~`])/g, '\\$1');
 }
 
 /** ─── Handler ─────────────────────────────────────────────────────────── */
@@ -246,17 +262,27 @@ export async function handleSessionsCardAction(
   }
 
   // ─── 4) GET list + rebuild card ─────────────────────────────────────
+  // codex slice-1 blocker #1: createDaemonClient.request does NOT throw on
+  // 4xx/5xx — it resolves with the response. If we only catch throws we'd
+  // silently render an empty list when Route B returns 500/401, masking
+  // a real backend failure as "no sessions". So check `status !== 200`
+  // explicitly and surface as an error toast.
+  let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
     const client = deps.createClient(larkAppId);
-    const r = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
-    const rows = ((r.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
-    const nowMs = deps.nowMs ? deps.nowMs() : Date.now();
-    const cardJson = buildSessionsCard(rows, { invokerOpenId: expectedOwner, locale, page }, nowMs);
-    return {
-      // Card-only success path — see settings-card.ts docblock for why no toast.
-      card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
-    };
+    r = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
   } catch (e) {
     return errorToast('card.dashboard.sessions.list_failed', { reason: (e as Error).message }, locale);
   }
+  if (r.status !== 200) {
+    const reason = String((r.body as any)?.error ?? `http_${r.status}`);
+    return errorToast('card.dashboard.sessions.list_failed', { reason }, locale);
+  }
+  const rows = ((r.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
+  const nowMs = deps.nowMs ? deps.nowMs() : Date.now();
+  const cardJson = buildSessionsCard(rows, { invokerOpenId: expectedOwner, locale, page }, nowMs);
+  return {
+    // Card-only success path — see settings-card.ts docblock for why no toast.
+    card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
+  };
 }

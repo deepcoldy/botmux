@@ -124,6 +124,59 @@ describe('buildSessionsCard', () => {
     expect(json).not.toContain('"senderUnionId"');
   });
 
+  // codex slice-1 blocker #3: title/workingDir are user/filesystem-controlled
+  // and flow into a `<font color="grey">…</font>` wrapper. Without HTML escape,
+  // a payload like `</font><at ...></at>` would close our wrapper and inject
+  // a @mention-shaped element. Test with codex's two sample payloads.
+  it('escapes HTML control chars in title / workingDir — no naked <at or stray </font> in row content', () => {
+    const rows: SessionRow[] = [
+      row({
+        sessionId: 's_inject_title',
+        status: 'idle',
+        title: '<at id=ou_x></at> evil title',
+        workingDir: '~/normal',
+      }),
+      row({
+        sessionId: 's_inject_dir',
+        status: 'idle',
+        title: 'normal title',
+        workingDir: '</font><at id=ou_y></at>',
+      }),
+    ];
+    const json = buildSessionsCard(rows, baseOpts, NOW);
+    const parsed = JSON.parse(json);
+    const rowDivs = (parsed.elements as any[]).filter(
+      (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
+        && /(evil title|normal title)/.test(e.text.content as string),
+    );
+    expect(rowDivs.length).toBe(2);
+    for (const d of rowDivs) {
+      const content = d.text.content as string;
+      // No naked `<at` allowed anywhere
+      expect(content).not.toMatch(/<at\b/);
+      // No stray `</font>` other than our own intentional closing tag.
+      // Our renderer emits exactly ONE outer `<font color="grey">…</font>`,
+      // so closing tag count should be exactly 1.
+      const closingFontCount = (content.match(/<\/font>/g) ?? []).length;
+      expect(closingFontCount).toBe(1);
+      // The escaped form should be visible in the output.
+      expect(content).toContain('&lt;');
+    }
+    // The intentional outer wrapper is still there (JSON-encoded, so the
+    // attribute quote becomes \").
+    expect(json).toContain('<font color=\\"grey\\">');
+  });
+
+  it('escape order — `&` is escaped first so `<` does NOT become `&amp;lt;`', () => {
+    const rows: SessionRow[] = [
+      row({ sessionId: 'amp', status: 'idle', title: 'A & B', workingDir: '~/x<y>' }),
+    ];
+    const json = buildSessionsCard(rows, baseOpts, NOW);
+    expect(json).toContain('A &amp; B');
+    expect(json).not.toContain('&amp;lt;');
+    expect(json).not.toContain('&amp;amp;');
+  });
+
   it('every action button carries `invoker_open_id` bound to the OWNER', () => {
     const rows: SessionRow[] = Array.from({ length: 15 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
     const json = buildSessionsCard(rows, baseOpts, NOW);
@@ -238,6 +291,39 @@ describe('handleSessionsCardAction', () => {
     expect(r.toast?.content).toContain('拉取会话列表失败');
     expect(r.toast?.content).toContain('boom');
     expect(r.card).toBeUndefined();
+  });
+
+  // codex slice-1 blocker #1: createDaemonClient.request does NOT throw on
+  // 4xx/5xx — it returns the response. Before the fix a 500 would surface
+  // as an empty list (sessions undefined → []), masking the real failure.
+  it('Route B returns 500 → toast `list_failed` with http_500, NO empty list card', async () => {
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: async () => ({ status: 500, body: {}, raw: '' }),
+      } as any)),
+    });
+    const r = await handleSessionsCardAction(
+      makeAction({ action: SESSIONS_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('http_500');
+    expect(r.card).toBeUndefined();
+  });
+
+  it('Route B 401 with body.error → reason uses body.error verbatim', async () => {
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: async () => ({ status: 401, body: { error: 'bad_signature' }, raw: '' }),
+      } as any)),
+    });
+    const r = await handleSessionsCardAction(
+      makeAction({ action: SESSIONS_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('bad_signature');
+    expect(r.toast?.content).not.toContain('http_401');
   });
 
   it('unknown action → toast `invalid_action`, no client call', async () => {

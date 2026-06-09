@@ -390,6 +390,12 @@ function cardActionKey(larkAppId: string, data: any): string {
     // to the same in-flight key and the second click would be deduped.
     field: value?.field,
     next_value: value?.next_value,
+    // PR3 sessions slice 1 (codex blocker #2): prev/next pagination share
+    // `action: dash_sessions_page`, only `page` distinguishes them. Without
+    // including `page` here a quick prev→next sequence (e.g. user lands on
+    // page 5 and immediately decides they meant page 4) would be deduped
+    // as "in-flight" and the second click silently dropped.
+    page: value?.page,
   })}`;
 }
 

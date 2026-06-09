@@ -2689,6 +2689,61 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(second).toEqual({ card: { type: 'raw', data: { type: 'toggled' } } });
     expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
   });
+
+  // codex slice-1 blocker #2: dash_sessions_page only differs by `page`. If
+  // `cardActionKey` doesn't include `page`, a rapid prev→next sequence in
+  // the in-flight window would hash to the same key and the second click
+  // would be silently dropped.
+  it('concurrent `dash_sessions_page` clicks at DIFFERENT pages must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'card1' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'card2' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (page: string) => ({
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_page_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('5'));   // user lands on page 5
+    const secondP = capturedHandlers['card.action.trigger'](ev('4'));  // immediately clicks prev → page 4
+
+    // Both handler invocations are in flight; neither was suppressed.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Settings counterpart guard — dash_settings_toggle on different fields.
+  // Sanity check that the existing settings dedupe key still works.
+  it('concurrent `dash_settings_toggle` clicks on DIFFERENT fields must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    handlers.handleCardAction
+      .mockReturnValueOnce(new Promise(resolve => { release1 = () => resolve({ type: 'a' }); }) as any)
+      .mockReturnValueOnce(new Promise(resolve => { release2 = () => resolve({ type: 'b' }); }) as any);
+
+    const ev = (field: string, next: string) => ({
+      action: { value: {
+        action: 'dash_settings_toggle', invoker_open_id: USER_OPEN_ID,
+        field, next_value: next,
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_settings_card' },
+    });
+
+    const a = capturedHandlers['card.action.trigger'](ev('publicReadOnly', 'true'));
+    const b = capturedHandlers['card.action.trigger'](ev('openTerminalInFeishu', 'true'));
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([a, b]);
+  });
 });
 
 describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {
