@@ -42,8 +42,8 @@ function makeAction(value: Record<string, string>, formValue: Record<string, str
   };
 }
 
-function ackToastText(result: { ack: any }): string {
-  return (result.ack?.toast?.content ?? '') as string;
+function ackToastText(result: { toast: { content: string } }): string {
+  return result.toast?.content ?? '';
 }
 
 const allowAuth = (): SettingsCardHandlerDeps['isAuthorized'] => async () => true;
@@ -200,6 +200,38 @@ describe('handleSettingsCardAction', () => {
     } as any;
   }
 
+  it('ACK shape: returns { toast } at the top level — NOT { ack: { toast } } (B1)', async () => {
+    const deps = makeDeps();
+    const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect((r as any).ack).toBeUndefined();
+    expect((r as any).toast).toBeDefined();
+    expect((r as any).toast.content).toContain('⏳');
+    expect((r as any).toast.type).toBe('info');
+  });
+
+  it('invoker lock fail-closed: missing invoker_open_id → not_invoker, no client (B3)', async () => {
+    const deps = makeDeps();
+    const data: CardActionData = {
+      operator: { open_id: INVOKER, union_id: OWNER_UNION },
+      action: { value: { action: SETTINGS_ACTION_TOGGLE, field: 'publicReadOnly', next_value: 'true' } },
+    };
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect(ackToastText(r)).toContain('🔒');
+    expect(deps.createClientSpy).not.toHaveBeenCalled();
+  });
+
+  it('invoker lock fail-closed: missing operator.open_id → not_invoker, no client (B3)', async () => {
+    const deps = makeDeps();
+    const data: CardActionData = {
+      operator: { union_id: OWNER_UNION },
+      action: { value: { action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' } },
+    };
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect(ackToastText(r)).toContain('🔒');
+    expect(deps.createClientSpy).not.toHaveBeenCalled();
+  });
+
   it('invoker lock: operator !== invoker → not_invoker, no client call', async () => {
     const deps = makeDeps();
     const data: CardActionData = {
@@ -298,6 +330,36 @@ describe('handleSettingsCardAction', () => {
     expect(call.path).toBe('/__daemon/settings-snapshot');
     // Most importantly: no PUT was issued.
     expect(reqSpy.mock.calls.find((c: any) => c[0].method === 'PUT')).toBeUndefined();
+  });
+
+  it('happy toggle: PUT response triggers patchCard so the original card is updated (B2)', async () => {
+    const requestSpy = vi.fn(async () => ({
+      status: 200, raw: '',
+      body: { ok: true, settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
+    }));
+    const patchSpy = vi.fn(async () => {});
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({ request: requestSpy } as any)),
+      patchCard: patchSpy,
+    });
+    const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
+    await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect(patchSpy).toHaveBeenCalledOnce();
+    expect(patchSpy.mock.calls[0]![2]).toBe((await requestSpy.mock.results[0]!.value)); // payload IS the route-B response
+  });
+
+  it('refresh: patchCard receives the GET snapshot response (B2)', async () => {
+    const snapshotResponse = { status: 200, raw: '', body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } } };
+    const requestSpy = vi.fn(async () => snapshotResponse);
+    const patchSpy = vi.fn(async () => {});
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({ request: requestSpy } as any)),
+      patchCard: patchSpy,
+    });
+    const data = makeAction({ action: SETTINGS_ACTION_REFRESH, invoker_open_id: INVOKER });
+    await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect(patchSpy).toHaveBeenCalledOnce();
+    expect(patchSpy.mock.calls[0]![2]).toBe(snapshotResponse);
   });
 
   it('action.value.union_id is ignored — uses verified operator.union_id only', async () => {

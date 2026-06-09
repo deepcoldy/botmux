@@ -373,11 +373,50 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     value.action.startsWith('dash_settings_') &&
     larkAppId
   ) {
-    const { handleSettingsCardAction } = await import('./settings-card.js');
+    const { handleSettingsCardAction, buildSettingsCard } = await import('./settings-card.js');
     const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const { composeSections } = await import('../../dashboard/settings-card-model.js');
+    const settingsLocale = localeForBot(larkAppId);
     return handleSettingsCardAction(data, larkAppId, {
       createClient: (appId: string) => createDaemonClientFor(appId),
-      locale: localeForBot(larkAppId),
+      locale: settingsLocale,
+      patchCard: async (ctx, appId, payload) => {
+        // ACK-then-patch: rebuild the card from the post-write snapshot and
+        // updateMessage the original card in place. PUT response carries
+        // `{settings}`; refresh GET returns `{settings}` too. If neither is
+        // present we fall back to a fresh GET so the user still sees an
+        // updated view.
+        let settings: any = (payload as any)?.body?.settings ?? (payload as any)?.settings;
+        if (!settings) {
+          try {
+            const snap = await createDaemonClientFor(appId).request({
+              method: 'GET', path: '/__daemon/settings-snapshot',
+            });
+            settings = (snap.body as any)?.settings;
+          } catch (e) {
+            logger.warn(`[dash_settings patch] snapshot refetch failed: ${(e as Error).message}`);
+            return;
+          }
+        }
+        if (!settings || typeof settings !== 'object') return;
+        const messageId = ctx.context?.open_message_id ?? ctx.open_message_id;
+        if (!messageId) {
+          logger.warn('[dash_settings patch] no open_message_id; skipping in-place update');
+          return;
+        }
+        const invokerOpenId = ctx.action?.value?.invoker_open_id ?? ctx.operator?.open_id ?? '';
+        const dto = composeSections(settings, { canWrite: true });
+        const cardJson = buildSettingsCard(dto, {
+          invokerOpenId,
+          locale: settingsLocale,
+          canWrite: true,
+        });
+        try {
+          await updateMessage(appId, messageId, cardJson);
+        } catch (e) {
+          logger.warn(`[dash_settings patch] updateMessage failed: ${(e as Error).message}`);
+        }
+      },
     });
   }
 

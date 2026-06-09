@@ -207,8 +207,14 @@ export interface SettingsCardHandlerDeps extends ResolveCardOperatorUnionIdDeps 
   locale?: Locale;
 }
 
+/**
+ * Lark card-callback result envelope. event-dispatcher pass-through expects
+ * either `{ toast }`, `{ card }`, or both — see `event-dispatcher.ts:390-395`.
+ * We return ONLY `{ toast }` because the actual card patch is performed
+ * asynchronously via `deps.patchCard` (ACK-then-patch).
+ */
 export interface SettingsCardHandlerResult {
-  ack: unknown;
+  toast: { type: 'info' | 'success' | 'error'; content: string };
 }
 
 export type PatchBuildResult =
@@ -260,11 +266,7 @@ export function buildPatchFromAction(
 }
 
 function ackToast(textKey: string, locale: Locale): SettingsCardHandlerResult {
-  return {
-    ack: {
-      toast: { type: 'info', content: t(textKey, undefined, locale) },
-    },
-  };
+  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
 }
 
 const defaultScheduleAsync = (fn: () => Promise<void>): void => {
@@ -286,9 +288,18 @@ export async function handleSettingsCardAction(
   const operatorOpenId = data.operator?.open_id;
   const action = value.action;
 
-  // ─── 1) Invoker lock ────────────────────────────────────────────────
+  // ─── 1) Invoker lock — fail-closed (B3) ─────────────────────────────
+  // Settings card is new — there is no legacy callback shape to keep
+  // compatible. Reject any callback whose envelope is missing either side
+  // of the invoker assertion, then reject when they disagree.
   const invokerOpenId = value.invoker_open_id;
-  if (invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId) {
+  if (typeof invokerOpenId !== 'string' || !invokerOpenId) {
+    return ackToast('card.dashboard.settings.not_invoker', locale);
+  }
+  if (typeof operatorOpenId !== 'string' || !operatorOpenId) {
+    return ackToast('card.dashboard.settings.not_invoker', locale);
+  }
+  if (invokerOpenId !== operatorOpenId) {
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
