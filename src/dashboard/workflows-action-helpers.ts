@@ -63,6 +63,31 @@ export interface WorkflowsActionDeps<TSnap extends RunSnapshotLike = RunSnapshot
   isValidRunId: (id: string) => boolean;
 }
 
+/**
+ * Build a real production deps object for the workflow-runs helpers — wires up
+ * the `ops-projection` imports as the snapshot/list source and the caller's
+ * own `proxyToDaemon` for owner routing. Tests should pass their own mocks.
+ */
+export function defaultWorkflowsActionDeps<TSnap extends RunSnapshotLike = RunSnapshotLike>(opts: {
+  runsDir: string;
+  proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
+  listRuns: (runsDir: string, opts: ListRunsOpts) => Promise<unknown[]>;
+  readRunSnapshot: (runsDir: string, runId: string) => Promise<TSnap | undefined | null>;
+  scrubSnapshotForUnauthed: (snap: TSnap) => TSnap;
+  TERMINAL_RUN_STATUSES: ReadonlySet<string>;
+  isValidRunId: (id: string) => boolean;
+}): WorkflowsActionDeps<TSnap> {
+  return {
+    runsDir: opts.runsDir,
+    proxyToDaemon: opts.proxyToDaemon,
+    listRuns: opts.listRuns,
+    readRunSnapshot: opts.readRunSnapshot,
+    scrubSnapshotForUnauthed: opts.scrubSnapshotForUnauthed,
+    TERMINAL_RUN_STATUSES: opts.TERMINAL_RUN_STATUSES,
+    isValidRunId: opts.isValidRunId,
+  };
+}
+
 function safeParseJson(bodyRaw: string): { ok: true; value: unknown } | { ok: false } {
   if (bodyRaw.length === 0) return { ok: true, value: {} };
   try { return { ok: true, value: JSON.parse(bodyRaw) }; }

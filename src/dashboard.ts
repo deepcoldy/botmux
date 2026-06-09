@@ -43,6 +43,16 @@ import {
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
 } from './dashboard/groups-action-helpers.js';
+import { defaultWorkflowsActionDeps } from './dashboard/workflows-action-helpers.js';
+import {
+  listRuns as listRunsImpl,
+  readRunSnapshot as readRunSnapshotImpl,
+  scrubSnapshotForUnauthed as scrubSnapshotImpl,
+  isValidRunId as isValidRunIdImpl,
+  TERMINAL_RUN_STATUSES as TERMINAL_RUN_STATUSES_IMPL,
+  type RunSnapshotDTO,
+} from './workflows/ops-projection.js';
+import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 
@@ -124,6 +134,42 @@ const groupsActionDeps: GroupsActionDeps = {
   proxyToDaemon,
   closeSessionsMatching,
 };
+
+// ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
+// HMAC + loopback + ts ±60s + nonce TTL, signed-request envelope = full
+// (ts, nonce, method, pathWithQuery, sha256(body)). Reuses `.dashboard-secret`
+// for the HMAC key — the same secret `/__cli/rotate` already uses — but the
+// signing material is wider so a `/__cli/rotate` signature cannot be replayed
+// here and vice versa (different protocols, same secret, no cross-replay).
+//
+// SECRET fail-closed: `loadOrCreateSecret()` returns a 32-byte base64url
+// string and never empty; we still guard below at server-startup time.
+if (!SECRET || SECRET.length === 0) {
+  logger.error('[dashboard] SECRET is empty — refusing to mount /__daemon/* dispatcher');
+  process.exit(1);
+}
+
+const daemonInternalApi = createDaemonInternalApi({
+  secret: SECRET,
+  getSessions: () => aggregator.getSessions(),
+  getSchedules: () => aggregator.getSchedules(),
+  resolveDashboardSettings,
+  buildGroupsMatrix,
+  settingsApplierDeps: settingsWriteApplierDeps,
+  groupsActionDeps,
+  workflowsActionDeps: defaultWorkflowsActionDeps<RunSnapshotDTO>({
+    runsDir: getRunsDir(),
+    proxyToDaemon,
+    listRuns: listRunsImpl,
+    readRunSnapshot: readRunSnapshotImpl,
+    scrubSnapshotForUnauthed: scrubSnapshotImpl,
+    TERMINAL_RUN_STATUSES: TERMINAL_RUN_STATUSES_IMPL,
+    isValidRunId: isValidRunIdImpl,
+  }),
+  proxyToDaemon,
+  ownerOf: (sid) => aggregator.ownerOf(sid),
+  scheduleOwnerOf: (id) => aggregator.scheduleOwnerOf(id),
+});
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -358,6 +404,59 @@ async function createLifecycleGroupForWebhook(
  * leaving bot's sessions in chat) so the UI doesn't end up with zombie workers
  * pointing at a chat the bot can no longer post into.
  */
+/**
+ * Build the per-(chat × bot) coverage matrix shared by `GET /api/groups`
+ * (browser) and `GET /__daemon/groups-matrix` (Route B). Pure aggregation,
+ * always returns the raw (unscrubbed) view — the browser route applies its
+ * `redactGroupsForPublic` scrub on top when the caller is unauthed.
+ */
+async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
+  const out = new Map<string, any>();
+  const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+  await Promise.all(onlineBots.map(async d => {
+    try {
+      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
+      if (!r.ok) return;
+      const j = await r.json() as { chats?: any[] };
+      for (const c of j.chats ?? []) {
+        const { oncallChat, firstSeenAt, hasRole, ...chatBase } = c;
+        const cur = out.get(c.chatId) ?? { ...chatBase, memberBots: [] as any[], _firstSeenAt: null as number | null };
+        cur.memberBots.push({
+          larkAppId: d.larkAppId,
+          botName: d.botName,
+          inChat: true,
+          oncallChat: oncallChat ?? null,
+          hasRole: hasRole ?? false,
+        });
+        if (typeof firstSeenAt === 'number') {
+          cur._firstSeenAt = cur._firstSeenAt === null
+            ? firstSeenAt
+            : Math.min(cur._firstSeenAt, firstSeenAt);
+        }
+        out.set(c.chatId, cur);
+      }
+    } catch { /* skip offline daemons silently — best-effort */ }
+  }));
+  for (const c of out.values()) {
+    const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
+    for (const b of onlineBots) {
+      if (!present.has(b.larkAppId)) {
+        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, inChat: false, oncallChat: null, hasRole: false });
+      }
+    }
+  }
+  const chats = [...out.values()]
+    .sort((a, b) => {
+      const ta = a._firstSeenAt ?? 0;
+      const tb = b._firstSeenAt ?? 0;
+      if (tb !== ta) return tb - ta;
+      return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
+    })
+    .map(({ _firstSeenAt, ...rest }) => rest);
+  const bots = onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName, botAvatarUrl: b.botAvatarUrl }));
+  return { chats, bots };
+}
+
 async function closeSessionsMatching(
   pred: (s: any) => boolean,
 ): Promise<{ sessionId: string; ok: boolean; error?: string }[]> {
@@ -407,6 +506,17 @@ const server = createServer(async (req, res) => {
     // syncToken, so mounted before the token gate (like webhook/team routes).
     // createTeamGroup injected for the delegate-group path (hub→spoke 拉群).
     if (await handleFederationApi(req, res, url, { createTeamGroup, liveBots })) {
+      return;
+    }
+
+    // Route B: daemon internal API (`/__daemon/*`) — HMAC + loopback,
+    // mounted BEFORE the browser cookie/token gate because this protocol is
+    // entirely self-contained (the daemon caller has the shared secret and
+    // the signing-envelope already binds method/path/body to the timestamp).
+    // Letting the auth gate touch these paths would be wrong: there is no
+    // cookie or token to set/check; the gate would either 401 the daemon
+    // (false negative) or grant cross-protocol access (false positive).
+    if (await daemonInternalApi.handle(req, res, url)) {
       return;
     }
 
@@ -600,68 +710,14 @@ const server = createServer(async (req, res) => {
     // ─── Groups (Phase B) ────────────────────────────────────────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/groups') {
-      // Fan out: each online daemon returns the chats its bot is in.
-      // Merge by chatId; populate memberBots with inChat flags for every configured bot.
-      const out = new Map<string, any>();
-      // Sort by botIndex so the matrix columns + the create-group bot picker
-      // both match the order in bots.json (fs.readdir order is unstable).
-      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
-      await Promise.all(onlineBots.map(async d => {
-        try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
-          if (!r.ok) return;
-          const j = await r.json() as { chats?: any[] };
-          for (const c of j.chats ?? []) {
-            // Strip per-bot fields from chat-level so the merged record stays
-            // bot-agnostic. oncallChat lives inside memberBots; firstSeenAt is
-            // accumulated as the earliest observation across all bots.
-            const { oncallChat, firstSeenAt, hasRole, ...chatBase } = c;
-            const cur = out.get(c.chatId) ?? { ...chatBase, memberBots: [] as any[], _firstSeenAt: null as number | null };
-            cur.memberBots.push({
-              larkAppId: d.larkAppId,
-              botName: d.botName,
-              inChat: true,
-              oncallChat: oncallChat ?? null,
-              hasRole: hasRole ?? false,
-            });
-            if (typeof firstSeenAt === 'number') {
-              cur._firstSeenAt = cur._firstSeenAt === null
-                ? firstSeenAt
-                : Math.min(cur._firstSeenAt, firstSeenAt);
-            }
-            out.set(c.chatId, cur);
-          }
-        } catch { /* skip offline daemons silently — best-effort */ }
-      }));
-      // Fill in inChat:false slots for bots NOT returned for a given chat (matrix view)
-      for (const c of out.values()) {
-        const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
-        for (const b of onlineBots) {
-          if (!present.has(b.larkAppId)) {
-            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, inChat: false, oncallChat: null, hasRole: false });
-          }
-        }
-      }
-      // Sort newest-first by client-side firstSeenAt (Lark exposes no chat
-      // create_time, so daemon stamps timestamps the first time it lists each
-      // chat). Tie-break by name asc so chats backfilled in the same listChats
-      // pass — typically every chat on first deploy — get a stable order.
-      const sorted = [...out.values()]
-        .sort((a, b) => {
-          const ta = a._firstSeenAt ?? 0;
-          const tb = b._firstSeenAt ?? 0;
-          if (tb !== ta) return tb - ta;
-          return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
-        })
-        .map(({ _firstSeenAt, ...rest }) => rest);
-      // Public-read carve-out: oncall bindings carry workingDir (repo/customer
-      // paths). The read-only board only needs chat/bot names; the oncall
-      // editor that consumes oncallChat is authed-only. Strip for anon so the
-      // bound dirs don't leak via /api/groups (mirrors the /api/schedules
-      // prompt strip + keeps /api/bots oncall removal honest).
+      // Fan out via the shared `buildGroupsMatrix` helper so the browser
+      // route and the Route B `/__daemon/groups-matrix` endpoint return the
+      // same matrix shape. Public-read carve-out: oncall bindings carry
+      // workingDir (repo/customer paths) so we scrub when unauthed.
+      const matrix = await buildGroupsMatrix();
       return jsonRes(res, 200, {
-        chats: authed ? sorted : redactGroupsForPublic(sorted),
-        bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName, botAvatarUrl: b.botAvatarUrl })),
+        chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
+        bots: matrix.bots,
       });
     }
 
