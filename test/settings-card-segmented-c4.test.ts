@@ -191,7 +191,6 @@ describe('PR3 UI revision (codex C4) — segmented control schema', () => {
         createClient: createClient as any,
         getOwnerOpenId: () => INVOKER,
         resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
-        scheduleAsync: (fn) => { void fn(); },
         locale: 'zh',
       },
     );
@@ -207,7 +206,7 @@ describe('PR3 UI revision (codex C4) — segmented control schema', () => {
         return { status: 200, body: { ok: true, settings: buildSettings() }, raw: '' };
       },
     });
-    let pending: Promise<void> | undefined;
+    // PR3 UI revision: handler awaits the PUT inline — no scheduleAsync needed.
     await handleSettingsCardAction(
       {
         operator: { open_id: INVOKER },
@@ -227,11 +226,9 @@ describe('PR3 UI revision (codex C4) — segmented control schema', () => {
         getOwnerOpenId: () => INVOKER,
         resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
         patchCard: async () => {},
-        scheduleAsync: (fn) => { pending = fn(); },
         locale: 'zh',
       },
     );
-    await pending;
     expect(putBody).toBeTruthy();
     expect(putBody.patch).toEqual({ publicReadOnly: true });
     expect(putBody.ownerUnionId).toBe(OWNER_UNION);

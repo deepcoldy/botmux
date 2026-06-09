@@ -194,22 +194,22 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     const createClient = () =>
       createDaemonClient({ dashboardUrl: fx.baseUrl, appId: LARK_APP_ID, secret: SECRET, retries: 0 });
 
-    let pending: Promise<void> | undefined;
     const result = await handleSettingsCardAction(data, LARK_APP_ID, {
       createClient,
       getOwnerOpenId: () => INVOKER,
       // Server PUT requires ownerUnionId; tests skip the real Lark contact API.
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       patchCard: patchSpy,
-      // Capture the in-flight write so the test can await it.
-      scheduleAsync: (fn) => { pending = fn(); },
       locale: 'en',
     });
 
+    // PR3 UI revision: handler awaits the PUT inline, so by the time the
+    // promise resolves, the server state is already updated and patchCard
+    // has received the merged settings. Toast reports the FINAL outcome
+    // (Saved), not the legacy mid-flight "Saving…".
     expect(result.toast).toBeDefined();
-    expect(result.toast.content).toContain('Saving');
-
-    await pending;
+    expect(result.toast.content).toContain('Saved');
+    expect(result.toast.type).toBe('success');
 
     expect(fx.hits.PUT).toBe(1);
     expect((fx.state.settings as any).publicReadOnly).toBe(true);
@@ -230,16 +230,13 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
     const createClient = () =>
       createDaemonClient({ dashboardUrl: fx.baseUrl, appId: LARK_APP_ID, secret: SECRET, retries: 0 });
 
-    let pending: Promise<void> | undefined;
     await handleSettingsCardAction(data, LARK_APP_ID, {
       createClient,
       getOwnerOpenId: () => INVOKER,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       patchCard: patchSpy,
-      scheduleAsync: (fn) => { pending = fn(); },
       locale: 'en',
     });
-    await pending;
 
     expect(fx.hits.GET).toBe(1);
     expect(fx.hits.PUT).toBe(0);
@@ -271,7 +268,6 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
       createClient,
       getOwnerOpenId: () => INVOKER,  // owner is INVOKER, stranger denied
       patchCard: patchSpy,
-      scheduleAsync: (fn) => { void fn(); },
       locale: 'en',
     });
 

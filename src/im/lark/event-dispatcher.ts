@@ -384,6 +384,12 @@ function cardActionKey(larkAppId: string, data: any): string {
     nonce: value?.card_nonce ?? value?.nonce,
     option: action?.option,
     key: value?.key,
+    // PR3 UI revision: settings toggles share `action: dash_settings_toggle`,
+    // so without distinguishing `field` + `next_value` a rapid sequence of
+    // distinct toggle clicks (e.g. flip A then immediately flip B) hashes
+    // to the same in-flight key and the second click would be deduped.
+    field: value?.field,
+    next_value: value?.next_value,
   })}`;
 }
 

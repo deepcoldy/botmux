@@ -47,15 +47,10 @@ function ackToastText(result: { toast: { content: string } }): string {
   return result.toast?.content ?? '';
 }
 
-let lastScheduled: Promise<void> | undefined;
-function syncSchedule(fn: () => Promise<void>): void {
-  // Capture the async write so tests can `await lastScheduled` to flush it.
-  lastScheduled = fn();
-}
-async function flushScheduled(): Promise<void> {
-  await lastScheduled;
-  lastScheduled = undefined;
-}
+// PR3 UI revision: handler is fully synchronous now (awaits PUT/GET inline),
+// so legacy `lastScheduled`/`flushScheduled` is a noop. Kept as no-op stubs
+// so the existing test bodies remain untouched; future cleanup may inline.
+async function flushScheduled(): Promise<void> { /* no-op since handler awaits inline */ }
 
 /** ─── buildPatchFromAction — pure ─────────────────────────────────────── */
 
@@ -194,7 +189,6 @@ describe('handleSettingsCardAction', () => {
     return {
       createClient: createClientSpy,
       patchCard: patchSpy,
-      scheduleAsync: syncSchedule,
       getOwnerOpenId: () => BOT_OWNER,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       locale: 'zh',
@@ -210,8 +204,11 @@ describe('handleSettingsCardAction', () => {
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
     expect((r as any).ack).toBeUndefined();
     expect((r as any).toast).toBeDefined();
-    expect((r as any).toast.content).toContain('⏳');
-    expect((r as any).toast.type).toBe('info');
+    // PR3 UI revision: handler now awaits the write inline so Lark's button
+    // spinner shows; the toast reports the FINAL outcome (success), not
+    // the legacy mid-flight "⏳ Saving…".
+    expect((r as any).toast.content).toContain('✅');
+    expect((r as any).toast.type).toBe('success');
   });
 
   it('invoker lock fail-closed: missing invoker_open_id → not_invoker, no client (B3)', async () => {
@@ -266,12 +263,13 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('happy toggle → ACK + async PUT /__daemon/settings-write with patch + ownerUnionId', async () => {
+  it('happy toggle → sync PUT /__daemon/settings-write with patch + ownerUnionId, final toast = saved', async () => {
     const deps = makeDeps();
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
-    expect(ackToastText(r)).toContain('⏳');
-    await flushScheduled();
+    // PR3 UI revision: handler awaits the PUT before returning, so by the
+    // time we're here the spy has already seen the request — no scheduler
+    // flush needed.
     expect(deps.createClientSpy).toHaveBeenCalledOnce();
     const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
     expect(reqSpy).toHaveBeenCalledWith({
@@ -279,6 +277,8 @@ describe('handleSettingsCardAction', () => {
       path: '/__daemon/settings-write',
       body: { patch: { publicReadOnly: true }, ownerUnionId: OWNER_UNION },
     });
+    expect(ackToastText(r)).toContain('✅');
+    expect((r as any).toast.type).toBe('success');
   });
 
   it('happy set_time → ACK + async PUT with maintenance.autoUpdate.time', async () => {
@@ -322,19 +322,18 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('refresh action → ACK + async GET /__daemon/settings-snapshot, NO PUT (v3 B4)', async () => {
+  it('refresh action → sync GET /__daemon/settings-snapshot, NO PUT, final toast = refreshed', async () => {
     const deps = makeDeps();
     const data = makeAction({ action: SETTINGS_ACTION_REFRESH, invoker_open_id: INVOKER });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
-    expect(ackToastText(r)).toContain('⏳');
-    await flushScheduled();
     const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
     expect(reqSpy).toHaveBeenCalledOnce();
     const call = (reqSpy as any).mock.calls[0]![0];
     expect(call.method).toBe('GET');
     expect(call.path).toBe('/__daemon/settings-snapshot');
-    // Most importantly: no PUT was issued.
     expect(reqSpy.mock.calls.find((c: any) => c[0].method === 'PUT')).toBeUndefined();
+    expect(ackToastText(r)).toContain('✅');
+    expect((r as any).toast.type).toBe('success');
   });
 
   it('happy toggle: PUT response triggers patchCard so the original card is updated (B2)', async () => {

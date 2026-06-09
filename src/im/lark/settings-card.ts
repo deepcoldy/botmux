@@ -291,10 +291,9 @@ export interface SettingsCardHandlerDeps {
   resolveUserUnionId?: (larkAppId: string, openId: string) => Promise<{ unionId?: string }>;
   /** Factory returning a Route B client for the given larkAppId. */
   createClient: (larkAppId: string) => DaemonClient;
-  /** Card patch callback for ACK-then-patch — receives the post-write snapshot. */
+  /** Card-rebuild callback — receives the Route B response after the inline
+   *  await and runs `composeSections + buildSettingsCard + updateMessage`. */
   patchCard?: (data: CardActionData, larkAppId: string, payload: unknown) => Promise<void>;
-  /** Async scheduler — production uses `setImmediate`; tests pass a sync runner. */
-  scheduleAsync?: (fn: () => Promise<void>) => void;
   /** Override locale resolution; production uses the caller-supplied locale. */
   locale?: Locale;
 }
@@ -302,8 +301,16 @@ export interface SettingsCardHandlerDeps {
 /**
  * Lark card-callback result envelope. event-dispatcher pass-through expects
  * either `{ toast }`, `{ card }`, or both — see `event-dispatcher.ts:390-395`.
- * We return ONLY `{ toast }` because the actual card patch is performed
- * asynchronously via `deps.patchCard` (ACK-then-patch).
+ *
+ * PR3 UI revision (user feedback 2026-06-09): the handler awaits the GET/PUT
+ * and `patchCard` inline before returning, so Lark's client renders its
+ * built-in loading spinner on the clicked button. `/card 关闭会话` works the
+ * same way: spinner is purely a function of "callback hasn't returned yet".
+ * event-dispatcher caps the awaitable handler at 2.5s
+ * (`event-dispatcher.ts:365`); if Route B slips past that, the dispatcher
+ * ACKs with a generic toast and runs `patchCard` in the background, so the
+ * card still updates — we just lose the spinner UX for that one slow call.
+ * Local Route B HMAC RTT is ~30-80ms in practice.
  */
 export interface SettingsCardHandlerResult {
   toast: { type: 'info' | 'success' | 'error'; content: string };
@@ -361,9 +368,13 @@ function ackToast(textKey: string, locale: Locale): SettingsCardHandlerResult {
   return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
 }
 
-const defaultScheduleAsync = (fn: () => Promise<void>): void => {
-  void fn().catch(() => { /* logged inside fn */ });
-};
+function successToast(textKey: string, locale: Locale): SettingsCardHandlerResult {
+  return { toast: { type: 'success', content: t(textKey, undefined, locale) } };
+}
+
+function errorToast(textKey: string, params: Record<string, string> | undefined, locale: Locale): SettingsCardHandlerResult {
+  return { toast: { type: 'error', content: t(textKey, params, locale) } };
+}
 
 /**
  * Dispatch a `dash_settings_*` action callback. Returns the synchronous ACK
@@ -405,8 +416,6 @@ export async function handleSettingsCardAction(
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
-  const schedule = deps.scheduleAsync ?? defaultScheduleAsync;
-
   // ─── 3) Noop short-circuit (PR3 UI revision, codex C4) ───────────────
   // The current-value button in the segmented control is rendered with
   // `disabled: true` but ALSO carries `dash_settings_noop` as a fail-safe:
@@ -417,14 +426,18 @@ export async function handleSettingsCardAction(
     return ackToast('card.dashboard.settings.toggle.disabled', locale);
   }
 
-  // ─── 4a) Refresh — read-only path (NO PUT, no patch payload) ────────
+  // ─── 4a) Refresh — read-only path (NO PUT) ───────────────────────────
+  // Inline await: handler doesn't return until GET + patchCard are done,
+  // so Lark's client keeps the loading spinner up until the card is fresh.
   if (action === SETTINGS_ACTION_REFRESH) {
-    schedule(async () => {
+    try {
       const client = deps.createClient(larkAppId);
       const snap = await client.request({ method: 'GET', path: '/__daemon/settings-snapshot' });
       await deps.patchCard?.(data, larkAppId, snap);
-    });
-    return ackToast('card.dashboard.settings.refreshing', locale);
+      return successToast('card.dashboard.settings.refreshed', locale);
+    } catch (e) {
+      return errorToast('card.dashboard.settings.snapshot_failed', { reason: (e as Error).message }, locale);
+    }
   }
 
   // ─── 4b) Write path — toggle / set_time ─────────────────────────────
@@ -436,19 +449,18 @@ export async function handleSettingsCardAction(
   // PR2 Route B's `PUT /__daemon/settings-write` still expects `ownerUnionId`
   // in the body for global-owner verification on the server side. The local
   // per-bot owner gate above already accepted this caller; we just need to
-  // surface their union_id. Resolve via `resolveUserUnionId(larkAppId, openId)`.
+  // surface their union_id.
   const resolveUnion = deps.resolveUserUnionId ?? defaultResolveUserUnionId;
-  schedule(async () => {
-    let ownerUnionId: string | undefined;
-    try {
-      const r = await resolveUnion(larkAppId, expectedOwner);
-      ownerUnionId = r.unionId;
-    } catch { /* fail-closed: leave undefined → server 403 */ }
-    if (!ownerUnionId || !ownerUnionId.startsWith('on_')) {
-      // Server will 403; surface via patchCard so the user sees the error toast.
-      await deps.patchCard?.(data, larkAppId, { status: 403, body: { ok: false, error: 'owner_only' }, raw: '' });
-      return;
-    }
+  let ownerUnionId: string | undefined;
+  try {
+    const r = await resolveUnion(larkAppId, expectedOwner);
+    ownerUnionId = r.unionId;
+  } catch { /* fail-closed: leave undefined → owner_only */ }
+  if (!ownerUnionId || !ownerUnionId.startsWith('on_')) {
+    return ackToast('card.dashboard.settings.owner_only', locale);
+  }
+
+  try {
     const client = deps.createClient(larkAppId);
     const r = await client.request({
       method: 'PUT',
@@ -456,6 +468,15 @@ export async function handleSettingsCardAction(
       body: { patch: patch.value, ownerUnionId },
     });
     await deps.patchCard?.(data, larkAppId, r);
-  });
-  return ackToast('card.dashboard.settings.saving', locale);
+    if ((r as any)?.status >= 400) {
+      return errorToast(
+        'card.dashboard.settings.save_failed',
+        { reason: String((r as any)?.body?.error ?? `HTTP ${(r as any)?.status}`) },
+        locale,
+      );
+    }
+    return successToast('card.dashboard.settings.saved', locale);
+  } catch (e) {
+    return errorToast('card.dashboard.settings.save_failed', { reason: (e as Error).message }, locale);
+  }
 }
