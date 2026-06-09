@@ -5120,9 +5120,12 @@ switch (command) {
   }
   case 'collab': {
     process.env.SESSION_DATA_DIR ??= resolveDataDir();
-    // `pool register` 走交互式注册（复用 setup 凭证/写盘链路，住 cli.ts）；
-    // 其余 collab 子命令仍交给 collab/cli.ts。
-    if (process.argv[3] === 'pool' && process.argv[4] === 'register') {
+    // `pool register`（或短别名 `collab register`）走交互式注册（复用 setup
+    // 凭证/写盘链路，住 cli.ts）；其余 collab 子命令仍交给 collab/cli.ts。
+    if (
+      (process.argv[3] === 'pool' && process.argv[4] === 'register') ||
+      process.argv[3] === 'register'
+    ) {
       await cmdCollabPoolRegister();
       break;
     }
