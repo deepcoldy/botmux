@@ -438,6 +438,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
+  // ─── PR3 `/dashboard groups` slice 1: refresh + page callbacks ────────
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_groups_') &&
+    larkAppId
+  ) {
+    const { handleGroupsCardAction } = await import('./groups-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const groupsLocale = localeForBot(larkAppId);
+    return handleGroupsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: groupsLocale,
+    });
+  }
+
   // ─── PR3 `/dashboard overview` slice 1: refresh + goto callbacks ──────
   // Goto buttons rebuild the TARGET card by re-fetching the corresponding
   // dedicated Route B endpoint (sessions-list / schedules-list /

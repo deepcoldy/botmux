@@ -320,6 +320,109 @@ describe('workflows-runs-snapshot: per-bot scope + query passthrough', () => {
   });
 });
 
+/** ─── groups-matrix: codex strict per-bot scope (PR3 groups slice 1) ────
+ *  Unlike sessions / schedules where a legacy row (no `larkAppId`) is KEPT,
+ *  the groups matrix is fail-closed: bots without `larkAppId` are dropped,
+ *  and chats without a matching `memberBots[*]` where `inChat=true` for the
+ *  caller are dropped — empty/missing `memberBots` also drops the chat.
+ *  Each retained chat's `memberBots` array is trimmed to the caller's
+ *  single entry so other bots' roster never leaks. */
+describe('groups-matrix: codex strict per-bot scope', () => {
+  const strictMatrix = () => ({
+    chats: [
+      { chatId: 'c1', memberBots: [
+        { larkAppId: 'cli_a', inChat: true },
+        { larkAppId: 'cli_b', inChat: true },
+      ] },
+      { chatId: 'c2', memberBots: [
+        { larkAppId: 'cli_a', inChat: false },
+        { larkAppId: 'cli_b', inChat: true },
+      ] },
+      { chatId: 'c3', memberBots: [
+        { larkAppId: 'cli_b', inChat: true },
+      ] },
+      { chatId: 'c4_legacy', memberBots: [] },
+      { chatId: 'c5_no_members' },
+    ],
+    bots: [
+      { larkAppId: 'cli_a' },
+      { larkAppId: 'cli_b' },
+      { name: 'legacy_no_appid' },
+    ],
+  });
+
+  function mixedGroupsDeps(): DaemonInternalApiDeps {
+    return makeDeps({
+      buildGroupsMatrix: async () => strictMatrix() as unknown as { chats: unknown[]; bots: unknown[] },
+    });
+  }
+
+  it('callerAppId=cli_a → only c1 kept (cli_a present AND inChat=true); c2/c3/c4_legacy/c5_no_members dropped', async () => {
+    const api = createDaemonInternalApi(mixedGroupsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/groups-matrix'), '', 'cli_a');
+    expect(r.status).toBe(200);
+    const body = r.body as { chats: Array<{ chatId: string; memberBots: Array<{ larkAppId: string }> }>; bots: Array<{ larkAppId?: string; name?: string }> };
+    const chatIds = body.chats.map(c => c.chatId).sort();
+    expect(chatIds).toEqual(['c1']);
+    expect(chatIds).not.toContain('c2');
+    expect(chatIds).not.toContain('c3');
+    expect(chatIds).not.toContain('c4_legacy');
+    expect(chatIds).not.toContain('c5_no_members');
+  });
+
+  it('c1.memberBots has length 1, only cli_a entry (cli_b roster not leaked)', async () => {
+    const api = createDaemonInternalApi(mixedGroupsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/groups-matrix'), '', 'cli_a');
+    const body = r.body as { chats: Array<{ chatId: string; memberBots: Array<{ larkAppId: string }> }> };
+    const c1 = body.chats.find(c => c.chatId === 'c1')!;
+    expect(c1.memberBots).toHaveLength(1);
+    expect(c1.memberBots[0].larkAppId).toBe('cli_a');
+    // No cli_b leakage anywhere in the response payload.
+    expect(JSON.stringify(r.body)).not.toContain('cli_b');
+  });
+
+  it('bots = [{ larkAppId: "cli_a" }] only (cli_b dropped; legacy_no_appid dropped)', async () => {
+    const api = createDaemonInternalApi(mixedGroupsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/groups-matrix'), '', 'cli_a');
+    const body = r.body as { bots: Array<{ larkAppId?: string; name?: string }> };
+    expect(body.bots).toEqual([{ larkAppId: 'cli_a' }]);
+  });
+
+  it('test seam (no callerAppId) → full unscoped matrix returned', async () => {
+    const api = createDaemonInternalApi(mixedGroupsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/groups-matrix'));
+    expect(r.status).toBe(200);
+    const body = r.body as { chats: Array<{ chatId: string }>; bots: Array<{ larkAppId?: string; name?: string }> };
+    expect(body.chats.map(c => c.chatId).sort()).toEqual([
+      'c1', 'c2', 'c3', 'c4_legacy', 'c5_no_members',
+    ]);
+    // Full bots list (including legacy without larkAppId).
+    expect(body.bots).toHaveLength(3);
+  });
+
+  it('original matrix object is NOT mutated (memberBots arrays unchanged)', async () => {
+    // Build a single matrix object that the deps callback returns each time;
+    // after the scoping run, the original object's structure must survive.
+    const original = strictMatrix();
+    const originalC1Members = original.chats[0].memberBots.slice();
+    const originalBotsLen = original.bots.length;
+    const deps = makeDeps({
+      buildGroupsMatrix: async () => original as unknown as { chats: unknown[]; bots: unknown[] },
+    });
+    const api = createDaemonInternalApi(deps);
+    await api.dispatchForTest('GET', url('/__daemon/groups-matrix'), '', 'cli_a');
+
+    // Original arrays untouched: c1 still has 2 memberBots; bots still has 3.
+    expect(original.chats[0].memberBots).toEqual(originalC1Members);
+    expect(original.chats[0].memberBots).toHaveLength(2);
+    expect(original.bots).toHaveLength(originalBotsLen);
+    // Each chat still present in the original.
+    expect(original.chats.map(c => c.chatId)).toEqual([
+      'c1', 'c2', 'c3', 'c4_legacy', 'c5_no_members',
+    ]);
+  });
+});
+
 /** ─── 1 SETTINGS-WRITE ENDPOINT — owner gate ───────────────────────── */
 
 describe('dispatch: PUT /__daemon/settings-write owner gate', () => {

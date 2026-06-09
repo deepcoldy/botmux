@@ -139,30 +139,17 @@ describe('handleDashboardCommand — owner gate covers all subcommands', () => {
 /** ─── Owner-gated replies all go to DM, NOT topic interactive ───────── */
 
 describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
-  // `sessions`, `schedules`, `overview`, and `workflows` have their own real
-  // handlers in slice 1 (see dashboard-sessions-command.test.ts /
-  // dashboard-schedules-command.test.ts / dashboard-overview-command.test.ts /
-  // dashboard-workflows-command.test.ts); the rest are stubs until each slice lands.
-  it.each(['groups'] as const)(
-    'owner /dashboard %s → stub DMed to owner, topic gets dm_sent confirmation',
-    async (mod) => {
-      const deps = makeDeps();
-      const dm = captureDM();
-      await handleDashboardCommand(
-        makeMessage(), mod, 'om_root', 'oc_test', deps, 'cli_x',
-        { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
-      );
-      expect(dm.calls.length).toBe(1);
-      expect(dm.calls[0].openId).toBe(OWNER);
-      expect(dm.calls[0].content).toContain(mod);
-      expect(dm.calls[0].content).toContain('🚧');
-      // Topic gets only the dm_sent confirmation (NOT the stub itself, NOT interactive).
-      const topicCalls = (deps.sessionReply as any).mock.calls;
-      expect(topicCalls.length).toBe(1);
-      expect(topicCalls[0][1]).toContain('📬');
-      expect(topicCalls[0][2]).toBeUndefined(); // msgType not interactive
-    },
-  );
+  // All 5 modules (overview / sessions / workflows / groups / schedules)
+  // plus settings now have real handlers; the parametric stub loop has
+  // dropped to zero entries. Verify the stub fallback path is no longer
+  // reachable from a real module slug.
+  it('no module-stub fallback remains — every DASHBOARD_MODULES slug has a real handler', () => {
+    // Sanity: this is the canonical list of dashboard slugs; if any are
+    // still stub-bound the parametric loop above would be non-empty.
+    expect([...DASHBOARD_MODULES]).toEqual([
+      'overview', 'sessions', 'workflows', 'groups', 'schedules', 'settings',
+    ]);
+  });
 
   it('owner /dashboard help → help DMed to owner', async () => {
     const deps = makeDeps();

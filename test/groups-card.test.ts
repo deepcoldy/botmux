@@ -1,0 +1,365 @@
+/**
+ * PR3 `/dashboard groups` slice 1 — card builder + callback handler tests.
+ *
+ * Single-column matrix (post per-bot scope): the upstream Route B endpoint
+ * filters `bots` and `chats` so the rendered card sees ONLY the caller's
+ * bot. This file mirrors sessions-card.test.ts but exercises the
+ * groups-specific count summary, escaping, pagination, and handler arms.
+ */
+
+import { describe, expect, it, vi } from 'vitest';
+
+import type {
+  GroupsBotInput,
+  GroupsChatInput,
+  GroupsMemberBotInput,
+} from '../src/dashboard/groups-card-model.js';
+import type { CardActionData } from '../src/im/lark/card-handler.js';
+import {
+  buildGroupsCard,
+  handleGroupsCardAction,
+  GROUPS_ACTION_PAGE,
+  GROUPS_ACTION_REFRESH,
+} from '../src/im/lark/groups-card.js';
+
+const INVOKER = 'ou_owner';
+const LARK_APP_ID = 'cli_test';
+
+const SELF_BOT: GroupsBotInput = { larkAppId: LARK_APP_ID, botName: 'self-bot' };
+
+function member(over: Partial<GroupsMemberBotInput> = {}): GroupsMemberBotInput {
+  return {
+    larkAppId: LARK_APP_ID,
+    botName: 'self-bot',
+    inChat: true,
+    oncallChat: null,
+    ...over,
+  };
+}
+
+function chat(over: Partial<GroupsChatInput> = {}): GroupsChatInput {
+  return {
+    chatId: 'oc_default1234',
+    name: 'default-room',
+    memberBots: [member()],
+    ...over,
+  };
+}
+
+function matrix(chats: GroupsChatInput[], bots: GroupsBotInput[] = [SELF_BOT]) {
+  return { chats, bots };
+}
+
+describe('buildGroupsCard', () => {
+  const baseOpts = { invokerOpenId: INVOKER, locale: 'zh' as const, page: 1 };
+
+  it('empty list → renders empty state, refresh button present', () => {
+    const json = buildGroupsCard(matrix([], [SELF_BOT]), baseOpts);
+    expect(json).toContain('Dashboard 群矩阵');
+    expect(json).toContain('_当前没有群_');
+    // No pagination buttons (single page when empty).
+    expect(json).not.toContain('上一页');
+    expect(json).not.toContain('下一页');
+    // Refresh button always present.
+    expect(json).toContain(GROUPS_ACTION_REFRESH);
+  });
+
+  it('count summary "总群数 N · 已加入 M · 未加入 K"', () => {
+    const chats: GroupsChatInput[] = [
+      chat({ chatId: 'oc_a1', name: 'in-1', memberBots: [member({ inChat: true })] }),
+      chat({ chatId: 'oc_a2', name: 'in-2', memberBots: [member({ inChat: true })] }),
+      chat({ chatId: 'oc_b1', name: 'out-1', memberBots: [member({ inChat: false })] }),
+      chat({ chatId: 'oc_c1', name: 'unknown-1', memberBots: [member({ inChat: undefined, status: 'unknown' })] }),
+    ];
+    const json = buildGroupsCard(matrix(chats), baseOpts);
+    expect(json).toContain('总群数 4');
+    expect(json).toContain('已加入 2');
+    expect(json).toContain('未加入 2');
+    expect(json).toContain('第 1/1 页');
+  });
+
+  it('row content shows chat.name + chatIdSuffix + status (in/out/unknown/error)', () => {
+    const chats: GroupsChatInput[] = [
+      chat({ chatId: 'oc_in_xxxx', name: 'group-in', memberBots: [member({ inChat: true })] }),
+      chat({ chatId: 'oc_out_xxx', name: 'group-out', memberBots: [member({ inChat: false })] }),
+      chat({ chatId: 'oc_unk_xxx', name: 'group-unk', memberBots: [member({ inChat: undefined, status: 'unknown' })] }),
+      chat({ chatId: 'oc_err_xxx', name: 'group-err', memberBots: [member({ status: 'error' })] }),
+    ];
+    const json = buildGroupsCard(matrix(chats), baseOpts);
+    // Each name rendered.
+    expect(json).toContain('group-in');
+    expect(json).toContain('group-out');
+    expect(json).toContain('group-unk');
+    expect(json).toContain('group-err');
+    // Each chatIdSuffix (last 4 chars) rendered.
+    expect(json).toContain('xxxx');
+    // Status labels.
+    expect(json).toContain('已加入');
+    expect(json).toContain('未加入');
+    expect(json).toContain('未知');
+    expect(json).toContain('错误');
+    // Status icons.
+    expect(json).toContain('🟢');
+    expect(json).toContain('⚪');
+    expect(json).toContain('🟡');
+    expect(json).toContain('🔴');
+  });
+
+  // codex slice-1 blocker: chat.name is user-controlled (group title) and
+  // chatIdSuffix flows into a `<font color="grey">…</font>` wrapper. Without
+  // escaping, a payload like `</font><at id=ou_x></at>` in either would close
+  // our wrapper and inject @mention-shaped content.
+  it('escape: chat.name + workingDir injection with <at>/<font> → no naked <at, correct closing </font> count', () => {
+    const chats: GroupsChatInput[] = [
+      chat({
+        chatId: 'oc_inject_name',
+        // chat.name carries the <at>/<font> injection payload.
+        name: '<at id=ou_x></at> evil name',
+        memberBots: [member({ inChat: true })],
+      }),
+      chat({
+        // chatIdSuffix takes the LAST 4 chars of chatId; arrange the suffix
+        // to carry `<at>`-shaped bytes so an injection in the suffix would
+        // close our outer `<font color="grey">` wrapper if not escaped.
+        chatId: 'oc_</font><at',
+        name: 'normal name',
+        memberBots: [member({ inChat: true })],
+      }),
+    ];
+    const json = buildGroupsCard(matrix(chats), baseOpts);
+    const parsed = JSON.parse(json);
+    const rowDivs = (parsed.elements as any[]).filter(
+      (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
+        && /(evil name|normal name)/.test(e.text.content as string),
+    );
+    expect(rowDivs.length).toBe(2);
+    for (const d of rowDivs) {
+      const content = d.text.content as string;
+      // No naked `<at`.
+      expect(content).not.toMatch(/<at\b/);
+      // The row renders two intentional outer `<font color="grey">…</font>`
+      // wrappers — one for the chatIdSuffix and one for the secondary
+      // status line — so the closing tag count must match the opener count
+      // exactly (no stray closer that would escape the wrapper).
+      const closingFontCount = (content.match(/<\/font>/g) ?? []).length;
+      const openingFontCount = (content.match(/<font\b[^>]*>/g) ?? []).length;
+      expect(closingFontCount).toBe(openingFontCount);
+      expect(closingFontCount).toBeGreaterThanOrEqual(1);
+      // Escaped form visible.
+      expect(content).toContain('&lt;');
+    }
+    // The intentional outer wrapper is still there (JSON-encoded).
+    expect(json).toContain('<font color=\\"grey\\">');
+  });
+
+  it('escape order — `&` is escaped first so `<` does NOT become `&amp;lt;`', () => {
+    const chats: GroupsChatInput[] = [
+      chat({ chatId: 'oc_amp1234', name: 'A & B<x>' }),
+    ];
+    const json = buildGroupsCard(matrix(chats), baseOpts);
+    expect(json).toContain('A &amp; B');
+    expect(json).not.toContain('&amp;lt;');
+    expect(json).not.toContain('&amp;amp;');
+  });
+
+  it('pagination: > 10 rows → prev/next, boundary disable (page=2 of 3 with 25 rows)', () => {
+    const chats: GroupsChatInput[] = Array.from({ length: 25 }, (_, i) =>
+      chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
+    );
+    const json = buildGroupsCard(matrix(chats), { ...baseOpts, page: 2 });
+    expect(json).toContain('上一页');
+    expect(json).toContain('下一页');
+    expect(json).toContain('第 2/3 页');
+    // prev → page=1, next → page=3
+    expect(json).toContain('"page":"1"');
+    expect(json).toContain('"page":"3"');
+
+    const findPagerButtons = (j: string): { prev: any; next: any } => {
+      const parsed = JSON.parse(j);
+      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+      const actions = actionRow.actions as any[];
+      const prev = actions.find((a: any) => String(a.text?.content ?? '').includes('上一页'));
+      const next = actions.find((a: any) => String(a.text?.content ?? '').includes('下一页'));
+      return { prev, next };
+    };
+
+    // page=1 → prev disabled
+    const page1 = buildGroupsCard(matrix(chats), { ...baseOpts, page: 1 });
+    const { prev: p1prev, next: p1next } = findPagerButtons(page1);
+    expect(p1prev.disabled).toBe(true);
+    expect(p1next.disabled).toBe(false);
+
+    // page=3 (last) → next disabled
+    const page3 = buildGroupsCard(matrix(chats), { ...baseOpts, page: 3 });
+    const { prev: p3prev, next: p3next } = findPagerButtons(page3);
+    expect(p3prev.disabled).toBe(false);
+    expect(p3next.disabled).toBe(true);
+  });
+
+  it('every action button carries `invoker_open_id` bound to the OWNER', () => {
+    const chats: GroupsChatInput[] = Array.from({ length: 15 }, (_, i) =>
+      chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
+    );
+    const json = buildGroupsCard(matrix(chats), baseOpts);
+    const parsed = JSON.parse(json);
+    const elements = parsed.elements as any[];
+    const actionRow = elements.find((e: any) => e.tag === 'action');
+    expect(actionRow).toBeDefined();
+    for (const btn of actionRow.actions) {
+      expect(btn.value?.invoker_open_id).toBe(INVOKER);
+    }
+  });
+
+  it('NEVER leaks `union_id` or `senderUnionId` in the rendered JSON', () => {
+    const chats: GroupsChatInput[] = [chat()];
+    const json = buildGroupsCard(matrix(chats), baseOpts);
+    expect(json).not.toContain('"union_id"');
+    expect(json).not.toContain('"senderUnionId"');
+  });
+});
+
+describe('handleGroupsCardAction', () => {
+  function makeDeps(over: any = {}): any {
+    const requestSpy = vi.fn(async () => ({
+      status: 200,
+      body: { chats: [chat({ chatId: 'oc_h1', name: 'one' })], bots: [SELF_BOT] },
+      raw: '',
+    }));
+    return {
+      createClient: vi.fn(() => ({ request: requestSpy } as any)),
+      getOwnerOpenId: () => INVOKER,
+      locale: 'zh',
+      requestSpy,
+      ...over,
+    };
+  }
+
+  function makeAction(value: Record<string, string>, operator = INVOKER): CardActionData {
+    return {
+      operator: { open_id: operator },
+      action: { value },
+      context: { open_message_id: 'om_card' },
+    } as any;
+  }
+
+  it('refresh → GET /__daemon/groups-matrix, returns { card } only (no toast)', async () => {
+    const deps = makeDeps();
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy).toHaveBeenCalledOnce();
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/groups-matrix' });
+    expect(r.toast).toBeUndefined();
+    expect(r.card?.type).toBe('raw');
+  });
+
+  it('page → renders requested page', async () => {
+    const chats = Array.from({ length: 25 }, (_, i) =>
+      chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
+    );
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { chats, bots: [SELF_BOT] }, raw: '' })),
+      } as any)),
+    });
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_PAGE, invoker_open_id: INVOKER, page: '2' }),
+      LARK_APP_ID,
+      deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('第 2/3 页');
+  });
+
+  it('non-owner → toast `owner_only`, NO client call', async () => {
+    const deps = makeDeps({ getOwnerOpenId: () => 'ou_other' });
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('🔒');
+    expect(r.card).toBeUndefined();
+    expect(deps.createClient).not.toHaveBeenCalled();
+  });
+
+  it('missing invoker → toast `not_invoker`, no client call', async () => {
+    const deps = makeDeps();
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('🔒');
+    expect(r.card).toBeUndefined();
+    expect(deps.createClient).not.toHaveBeenCalled();
+  });
+
+  it('mismatch invoker (invoker_open_id !== operator.open_id) → toast `not_invoker`', async () => {
+    const deps = makeDeps();
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER }, 'ou_stranger'),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('🔒');
+    expect(deps.createClient).not.toHaveBeenCalled();
+  });
+
+  it('Route B throws → toast `list_failed` with the error reason', async () => {
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({ request: async () => { throw new Error('boom'); } } as any)),
+    });
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('拉取群矩阵失败');
+    expect(r.toast?.content).toContain('boom');
+    expect(r.card).toBeUndefined();
+  });
+
+  it('Route B returns 500 → toast `list_failed` with http_500, NO empty list card', async () => {
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: async () => ({ status: 500, body: {}, raw: '' }),
+      } as any)),
+    });
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('http_500');
+    expect(r.card).toBeUndefined();
+  });
+
+  it('Route B 401 with body.error → reason uses body.error verbatim', async () => {
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: async () => ({ status: 401, body: { error: 'bad_signature' }, raw: '' }),
+      } as any)),
+    });
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('bad_signature');
+    expect(r.toast?.content).not.toContain('http_401');
+  });
+
+  it('unknown action → toast `invalid_action`, no client call', async () => {
+    const deps = makeDeps();
+    const r = await handleGroupsCardAction(
+      makeAction({ action: 'dash_groups_evil', invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('⚠️');
+    expect(deps.createClient).not.toHaveBeenCalled();
+  });
+});

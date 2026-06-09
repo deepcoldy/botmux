@@ -608,6 +608,24 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.dm_failed': '⚠️ Failed to DM the schedules list to Bot Owner: {reason}',
   'card.dashboard.schedules.list_failed': '⚠️ Failed to fetch schedules list: {reason}',
 
+  // groups card (PR3 slice 1)
+  'card.dashboard.groups.title': '🌐 Dashboard Group Matrix',
+  'card.dashboard.groups.count_summary': 'Total {total} · Joined {joined} · Missing {missing} · Page {page}/{totalPages}',
+  'card.dashboard.groups.empty': '_No groups yet_',
+  'card.dashboard.groups.refresh': '🔄 Refresh',
+  'card.dashboard.groups.prev': '← Prev',
+  'card.dashboard.groups.next': 'Next →',
+  'card.dashboard.groups.coverage_label': 'coverage {status}',
+  'card.dashboard.groups.oncall_label': 'oncall workingDir={workingDir}',
+  'card.dashboard.groups.unnamed': '(unnamed)',
+  'card.dashboard.groups.status.in': 'in',
+  'card.dashboard.groups.status.out': 'out',
+  'card.dashboard.groups.status.unknown': 'unknown',
+  'card.dashboard.groups.status.error': 'error',
+  'card.dashboard.groups.dm_sent': '📬 The dashboard group matrix was DMed to the Bot Owner.',
+  'card.dashboard.groups.dm_failed': '⚠️ Failed to DM the group matrix to Bot Owner: {reason}',
+  'card.dashboard.groups.list_failed': '⚠️ Failed to fetch group matrix: {reason}',
+
   // workflows card (PR3 slice 1)
   'card.dashboard.workflows.title': '🧩 Dashboard Workflows',
   'card.dashboard.workflows.count_summary': 'Running {running} · Done {done} · Failed {failed} · Page {page}/{totalPages}',

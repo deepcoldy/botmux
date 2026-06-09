@@ -181,6 +181,53 @@ function scopeByCaller(
   );
 }
 
+/**
+ * Per-bot scoping for the `groups-matrix` endpoint (PR3 groups slice 1).
+ *
+ * The groups matrix returns `{ chats, bots }` where neither container has a
+ * top-level `larkAppId`, so the generic `scopeByCaller` / `scopeRowsByCaller`
+ * helpers don't fit. Codex strict-scope rules (2026-06-09):
+ *
+ *   - bots: filter to ONLY entries whose `larkAppId === callerAppId`.
+ *   - chats: keep ONLY chats where some memberBots entry has
+ *     `larkAppId === callerAppId AND inChat === true`. A bot that's listed as
+ *     a member but `inChat=false` does NOT qualify.
+ *   - each retained chat's `memberBots` is trimmed to JUST the caller's
+ *     single entry, so other bots' roster never leaks.
+ *   - NO legacy fallback: rows / bots without a recognized `larkAppId` are
+ *     dropped (fail-closed). Unlike sessions / schedules, the groups matrix
+ *     has no historical persistence shape to preserve.
+ *
+ * `callerAppId === undefined` is the `dispatchForTest` seam — pass through
+ * the full unscoped matrix so tests can assert raw aggregator output.
+ *
+ * The helper does NOT mutate the input matrix: each kept chat is spread into
+ * a new object before its `memberBots` is overwritten.
+ */
+function scopeGroupsMatrixByCaller(
+  matrix: { chats: unknown[]; bots: unknown[] },
+  callerAppId: string | undefined,
+): { chats: unknown[]; bots: unknown[] } {
+  if (callerAppId === undefined) return matrix;
+  const filteredBots = matrix.bots.filter(b =>
+    typeof (b as { larkAppId?: unknown })?.larkAppId === 'string' &&
+    (b as { larkAppId?: unknown }).larkAppId === callerAppId,
+  );
+  const filteredChats: unknown[] = [];
+  for (const c of matrix.chats) {
+    const members = (c as { memberBots?: unknown })?.memberBots as
+      | Array<{ larkAppId?: string; inChat?: boolean }>
+      | undefined;
+    if (!Array.isArray(members)) continue;
+    const ourMember = members.find(m =>
+      m?.larkAppId === callerAppId && m?.inChat === true,
+    );
+    if (!ourMember) continue;
+    filteredChats.push({ ...(c as object), memberBots: [ourMember] });
+  }
+  return { chats: filteredChats, bots: filteredBots };
+}
+
 /** ─── Route table ────────────────────────────────────────────────── */
 
 const ROUTES: RouteDef[] = [
@@ -206,9 +253,15 @@ const ROUTES: RouteDef[] = [
   {
     method: 'GET',
     pathRe: /^\/__daemon\/groups-matrix$/,
-    handle: async (_m, _ctx, deps) => {
+    handle: async (_m, ctx, deps) => {
+      // PR3 groups slice 1: per-bot owner gate. Filter the matrix so the
+      // caller's bot only sees rows where it's actually a member (`inChat`),
+      // and trim each chat's memberBots to the caller's single entry to
+      // avoid leaking other bots' membership state. overview-snapshot still
+      // uses the unscoped buildGroupsMatrix — that's a slice-2 concern.
       const matrix = await deps.buildGroupsMatrix();
-      return { status: 200, body: matrix };
+      const scoped = scopeGroupsMatrixByCaller(matrix, ctx.callerAppId);
+      return { status: 200, body: scoped };
     },
   },
   {

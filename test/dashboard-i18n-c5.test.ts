@@ -68,6 +68,23 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.workflows.dm_failed',
   'card.dashboard.workflows.list_failed',
 
+  // ─── groups card (PR3 slice 1) ──────────────────────────────────────
+  'card.dashboard.groups.title',
+  'card.dashboard.groups.count_summary',
+  'card.dashboard.groups.empty',
+  'card.dashboard.groups.refresh',
+  'card.dashboard.groups.prev',
+  'card.dashboard.groups.next',
+  'card.dashboard.groups.coverage_label',
+  'card.dashboard.groups.unnamed',
+  'card.dashboard.groups.status.in',
+  'card.dashboard.groups.status.out',
+  'card.dashboard.groups.status.unknown',
+  'card.dashboard.groups.status.error',
+  'card.dashboard.groups.dm_sent',
+  'card.dashboard.groups.dm_failed',
+  'card.dashboard.groups.list_failed',
+
   // ─── overview card (PR3 slice 1) ────────────────────────────────────
   'card.dashboard.overview.title',
   'card.dashboard.overview.sessions_section',

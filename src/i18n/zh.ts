@@ -611,6 +611,24 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.dm_failed': '⚠️ 给 Bot Owner 发送定时任务列表失败：{reason}',
   'card.dashboard.schedules.list_failed': '⚠️ 拉取定时任务列表失败：{reason}',
 
+  // groups card (PR3 slice 1)
+  'card.dashboard.groups.title': '🌐 Dashboard 群矩阵',
+  'card.dashboard.groups.count_summary': '总群数 {total} · 已加入 {joined} · 未加入 {missing} · 第 {page}/{totalPages} 页',
+  'card.dashboard.groups.empty': '_当前没有群_',
+  'card.dashboard.groups.refresh': '🔄 刷新',
+  'card.dashboard.groups.prev': '← 上一页',
+  'card.dashboard.groups.next': '下一页 →',
+  'card.dashboard.groups.coverage_label': '覆盖 {status}',
+  'card.dashboard.groups.oncall_label': 'oncall workingDir={workingDir}',
+  'card.dashboard.groups.unnamed': '(未命名)',
+  'card.dashboard.groups.status.in': '已加入',
+  'card.dashboard.groups.status.out': '未加入',
+  'card.dashboard.groups.status.unknown': '未知',
+  'card.dashboard.groups.status.error': '错误',
+  'card.dashboard.groups.dm_sent': '📬 Dashboard 群矩阵已私信给 Bot Owner。',
+  'card.dashboard.groups.dm_failed': '⚠️ 给 Bot Owner 发送群矩阵失败：{reason}',
+  'card.dashboard.groups.list_failed': '⚠️ 拉取群矩阵失败：{reason}',
+
   // workflows card (PR3 slice 1)
   'card.dashboard.workflows.title': '🧩 Dashboard 工作流',
   'card.dashboard.workflows.count_summary': '进行中 {running} · 完成 {done} · 失败 {failed} · 第 {page}/{totalPages} 页',

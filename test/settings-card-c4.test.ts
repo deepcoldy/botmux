@@ -471,30 +471,9 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
     expect(text).toContain('🔒');
   });
 
-  it('owner /dashboard groups still returns stub via DM (modules without a real handler yet)', async () => {
-    // Was originally `/dashboard sessions` → switched to `/dashboard overview`
-    // when sessions got a real handler (2026-06-09), then `/dashboard workflows`
-    // until that got a real handler too (this slice). `groups` is the canonical
-    // remaining stub sample.
-    const sendUserMessage = vi.fn(async () => 'om_dm');
-    const deps: CommandHandlerDeps = {
-      activeSessions: new Map() as any,
-      sessionReply: vi.fn(async () => 'om_reply'),
-      getActiveCount: () => 0,
-      lastRepoScan: new Map() as any,
-    };
-    await handleDashboardCommand(
-      { senderId: INVOKER, content: '/dashboard groups', chatId: 'oc', rootMessageId: 'om' } as LarkMessage,
-      'groups',
-      'om_root',
-      'oc_test',
-      deps,
-      LARK_APP_ID,
-      { getOwnerOpenId: () => INVOKER, sendUserMessage },
-    );
-    expect(sendUserMessage).toHaveBeenCalledOnce();
-    const dmText = (sendUserMessage as any).mock.calls[0][2] as string;
-    expect(dmText).toContain('🚧');
-    expect(dmText).toContain('groups');
-  });
+  // PR3 groups slice 1: removed the stub-fallback sanity test — all 5 dashboard
+  // modules (overview/sessions/workflows/groups/schedules) plus settings now
+  // have real handlers, so the i18n stub text is no longer reachable via a
+  // canonical module slug. Unknown-module fallback semantics are covered by
+  // the help-text path in dashboard-command-c1.test.ts.
 });
