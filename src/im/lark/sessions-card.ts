@@ -548,6 +548,25 @@ export async function handleSessionsCardAction(
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
 
+    // codex 2026-06-10 SECURITY BLOCKER: client-side `disabled` on the
+    // close button is UX only — a replayed event, an old card still open,
+    // or a hand-crafted payload can still hit this callback. Server-side
+    // we MUST re-run the PR1 action-availability matrix against the fresh
+    // snapshot and fail-closed on `enabled === false`. This re-uses the
+    // SAME composeDetail logic the builder used to decide whether to
+    // disable the button in the first place — keeping the rules in one
+    // place avoids drift between client paint and server enforce.
+    const beforeDetail = composeDetail(before, now());
+    if (beforeDetail.actions.close.enabled !== true) {
+      // Reuse the SAME PR1 reasonKey → i18n key mapping the builder uses
+      // for the inline disabled-button note (`mapCloseDisabledReason`) so
+      // toast text matches what the user already sees on the card. NEVER
+      // POST; NEVER redraw the card.
+      const mappedKey = mapCloseDisabledReason(beforeDetail.actions.close.reasonKey)
+        ?? 'card.dashboard.sessions.close_failed';
+      return errorToast(mappedKey, undefined, locale);
+    }
+
     // Route B owner gate is the authority on whether THIS bot's owner can
     // close THIS session; we only sanitize the routing key above.
     let resp: Awaited<ReturnType<DaemonClient['request']>>;

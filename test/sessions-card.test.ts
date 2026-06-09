@@ -759,6 +759,57 @@ describe('handleSessionsCardAction', () => {
       const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
       expect(postCalls.length).toBe(0);
     });
+
+    // codex 2026-06-10 SECURITY BLOCKER: client-side `disabled` on the close
+    // button is UX only. The callback handler MUST re-run composeDetail's
+    // action matrix against the fresh snapshot and fail-closed on
+    // `enabled === false`. These two tests cover the matrix's two
+    // closed-button reasonKeys (alreadyClosed + starting).
+    function makeCloseDepsWithStatus(sessionId: string, status: SessionRow['status']) {
+      const sessions = [row({ sessionId, status, title: 'guard me' })];
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+          return { status: 200, body: { sessions }, raw: '' };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+        requestSpy,
+      };
+    }
+
+    it('pre-POST snapshot status=starting → toast (close.disabled.starting), POST 0 times', async () => {
+      const deps = makeCloseDepsWithStatus('sess_a', 'starting');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      // Toast surfaces the matrix's starting reason (matches the inline
+      // disabled-button note text).
+      expect(r.toast?.content).toContain('启动中');
+      expect(r.card).toBeUndefined();
+      // GET happened (snapshot); POST NEVER happened.
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+
+    it('pre-POST snapshot status=closed → toast (close.disabled.alreadyClosed), POST 0 times', async () => {
+      const deps = makeCloseDepsWithStatus('sess_a', 'closed');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+      expect(r.toast?.content).toContain('已关闭');
+      expect(r.card).toBeUndefined();
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
   });
 
   // ─── Slice 2a: BACK TO LIST ─────────────────────────────────────────
