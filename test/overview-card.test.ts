@@ -120,6 +120,27 @@ describe('buildOverviewCard', () => {
     expect(json).toContain('终端在飞书内打开');
   });
 
+  // codex 2026-06-09 blocker: a paused task with lastStatus='error' must
+  // also count toward `上次错误`. Otherwise overview under-reports while the
+  // schedules list-card still draws ⚠️ on the same paused row — that
+  // mismatch is the bug.
+  it('paused tasks with lastStatus=error are counted in 上次错误 (overview must NOT undercount vs schedules list)', () => {
+    const schedules: ScheduleCardTaskInput[] = [
+      scheduleTask({ id: 'a', enabled: true, lastStatus: 'ok' }),
+      scheduleTask({ id: 'b', enabled: true, lastStatus: 'error' }),
+      scheduleTask({ id: 'c', enabled: false, lastStatus: 'error' }),  // paused + errored
+      scheduleTask({ id: 'd', enabled: false, lastStatus: 'ok' }),
+    ];
+    const json = buildOverviewCard(
+      { sessions: [], schedules, settings: makeSettings() },
+      baseOpts,
+    );
+    expect(json).toContain('启用 2');
+    expect(json).toContain('暂停 2');
+    // Both errored rows count, regardless of enabled state.
+    expect(json).toContain('上次错误 2');
+  });
+
   it('escape: name/displayExpr injection in settings summary still escaped (no naked <at, exactly correct closing </font> count)', () => {
     // Inject HTML-control text via the maintenance.autoUpdate.time path —
     // the field is sanity-validated to 04:00 default, so injection lands in

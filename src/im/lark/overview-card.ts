@@ -78,18 +78,25 @@ export function countSessions(rows: ReadonlyArray<SessionRow>): SessionCounts {
   return { active, idle, closed };
 }
 
-/** Count schedule rows into (enabled / paused / errors-in-last-run) buckets. */
+/**
+ * Count schedule rows into (enabled / paused / errors-in-last-run) buckets.
+ *
+ * `errors` counts every task whose last run failed, regardless of `enabled`.
+ * This matches the schedules list-card semantics: `schedule-card-model.ts:201`
+ * sets `errorIndicator = task.lastStatus === 'error'` independent of the
+ * paused/enabled state, and `schedules-card.ts:180+208` paints the ⚠️ glyph
+ * on any such row. Keeping the same definition prevents an undercount where
+ * overview reads "上次错误 0" while drilling into schedules surfaces a
+ * paused task with ⚠️ (codex review 2026-06-09 blocker).
+ */
 export function countSchedules(tasks: ReadonlyArray<ScheduleCardTaskInput>): ScheduleCounts {
   let enabled = 0;
   let paused = 0;
   let errors = 0;
   for (const t of tasks) {
-    if (t.enabled) {
-      enabled += 1;
-      if (t.lastStatus === 'error') errors += 1;
-    } else {
-      paused += 1;
-    }
+    if (t.enabled) enabled += 1;
+    else paused += 1;
+    if (t.lastStatus === 'error') errors += 1;
   }
   return { enabled, paused, errors };
 }
