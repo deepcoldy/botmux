@@ -48,6 +48,19 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.settings.dm_sent',
   'card.dashboard.settings.dm_failed',
 
+  // ─── PR3 UI revision (segmented control + header/footer) ───────────
+  'card.dashboard.settings.segment.on',
+  'card.dashboard.settings.segment.off',
+  'card.dashboard.settings.segment.on_current',
+  'card.dashboard.settings.segment.off_current',
+  'card.dashboard.settings.maintenance.time_display',
+  'card.dashboard.settings.header.summary',
+  'card.dashboard.settings.header.maintenance.ok',
+  'card.dashboard.settings.header.maintenance.restricted',
+  'card.dashboard.settings.footer.security',
+  'settings.autoUpdate.disabled.localDev',
+  'settings.autoRestart.disabled.needsAutoUpdate',
+
   // ─── PR1 model DTO labelKey/hintKey/sectionTitle (consumed at card build) ─
   'settings.readOnlyVisitor',
   'settings.autoUpdateLocalDev',

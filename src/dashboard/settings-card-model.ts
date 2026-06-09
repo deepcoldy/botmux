@@ -133,6 +133,12 @@ export function composeSections(
   const autoRestartEnabledUi = canWrite && !autoRestartBlocked;
   const timeValue = formatTimeForDisplay(settings.maintenance?.autoUpdate?.time);
 
+  // Per-toggle disable reasons (PR3 revision): codex C4 — autoRestart's reason
+  // MUST cite the autoUpdate dependency, not a generic "currently disabled".
+  // autoUpdate's reason MUST cite local-dev install, not a generic note.
+  const autoUpdateReasonKey = autoUpdateBlocked ? 'settings.autoUpdate.disabled.localDev' : undefined;
+  const autoRestartReasonKey = autoRestartBlocked ? 'settings.autoRestart.disabled.needsAutoUpdate' : undefined;
+
   const maintenanceSection: SettingsSectionDTO = {
     key: 'maintenance',
     titleKey: 'settings.sectionMaintenance',
@@ -142,10 +148,10 @@ export function composeSections(
         labelKey: 'settings.autoUpdate',
         hintKey: 'settings.autoUpdateHelp',
         enabled: settings.maintenance?.autoUpdate?.enabled === true,
-        state: { enabled: autoUpdateEnabledUi },
+        state: { enabled: autoUpdateEnabledUi, reasonKey: autoUpdateReasonKey },
         time: {
           value: timeValue,
-          state: { enabled: autoUpdateEnabledUi },
+          state: { enabled: autoUpdateEnabledUi, reasonKey: autoUpdateReasonKey },
         },
       },
       {
@@ -153,7 +159,7 @@ export function composeSections(
         labelKey: 'settings.autoRestart',
         hintKey: 'settings.autoRestartHelp',
         enabled: settings.maintenance?.autoRestart?.enabled === true,
-        state: { enabled: autoRestartEnabledUi },
+        state: { enabled: autoRestartEnabledUi, reasonKey: autoRestartReasonKey },
       },
     ],
     hintKey: autoUpdateBlocked ? 'settings.autoUpdateLocalDev' : undefined,

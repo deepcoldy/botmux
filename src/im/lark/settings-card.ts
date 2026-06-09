@@ -35,6 +35,12 @@ import type { CardActionData } from './card-handler.js';
 export const SETTINGS_ACTION_TOGGLE = 'dash_settings_toggle' as const;
 export const SETTINGS_ACTION_SET_TIME = 'dash_settings_set_time' as const;
 export const SETTINGS_ACTION_REFRESH = 'dash_settings_refresh' as const;
+/**
+ * PR3 UI revision (codex C4): segmented control sends a noop for the current
+ * value button as a fail-safe — even if a Lark client doesn't respect
+ * `disabled: true` and still fires the callback, the handler short-circuits.
+ */
+export const SETTINGS_ACTION_NOOP = 'dash_settings_noop' as const;
 
 const TIME_REGEX = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TOGGLE_FIELDS: ReadonlySet<string> = new Set([
@@ -55,6 +61,12 @@ export interface BuildSettingsCardOpts {
 export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardOpts): string {
   const elements: unknown[] = [];
 
+  // ─── Header summary row (PR3 UI revision) ────────────────────────────
+  // Shows live counts so the user knows the current shape of settings at
+  // a glance without scanning every section: "访问 1/1 · 卡片 0/1 · 维护 1/2".
+  // Maintenance label flips to "受限" when blocked (localDev or autoUpdate off).
+  elements.push(buildHeaderSummary(dto, opts));
+
   if (dto.readOnlyHintKey) {
     elements.push({
       tag: 'div',
@@ -63,13 +75,14 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
   }
 
   for (const section of dto.sections) {
+    elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
       text: { tag: 'lark_md', content: `**${t(section.titleKey, undefined, opts.locale)}**` },
     });
 
     for (const toggle of section.toggles) {
-      elements.push(...buildToggleRow(toggle, opts));
+      elements.push(...buildSegmentedRow(toggle, opts));
     }
 
     if (section.hintKey) {
@@ -80,8 +93,9 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
         ],
       });
     }
-    elements.push({ tag: 'hr' });
   }
+
+  elements.push({ tag: 'hr' });
 
   // Refresh button — read-only, GET-only path.
   elements.push({
@@ -99,6 +113,15 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
     ],
   });
 
+  // Footer security note (PR3 UI revision) — communicates that the card is
+  // owner-private and ACK-refreshing, so users know clicks self-heal.
+  elements.push({
+    tag: 'note',
+    elements: [
+      { tag: 'lark_md', content: t('card.dashboard.settings.footer.security', undefined, opts.locale) },
+    ],
+  });
+
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
@@ -109,7 +132,57 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
   });
 }
 
-function buildToggleRow(
+/** Header summary: counts enabled toggles per section + "受限" when maintenance blocked. */
+function buildHeaderSummary(dto: SettingsCardDTO, opts: BuildSettingsCardOpts): unknown {
+  const access = dto.sections.find(s => s.key === 'access');
+  const cards = dto.sections.find(s => s.key === 'cards');
+  const maintenance = dto.sections.find(s => s.key === 'maintenance');
+  const countEnabled = (s?: SettingsCardDTO['sections'][number]): number =>
+    s ? s.toggles.filter(tg => tg.enabled).length : 0;
+  const accessTotal = access?.toggles.length ?? 0;
+  const cardsTotal = cards?.toggles.length ?? 0;
+  const maintenanceTotal = maintenance?.toggles.length ?? 0;
+  const maintenanceRestricted = maintenance?.toggles.some(tg => !tg.state.enabled) === true;
+  const maintenanceLabel = maintenanceRestricted
+    ? t('card.dashboard.settings.header.maintenance.restricted', undefined, opts.locale)
+    : t(
+        'card.dashboard.settings.header.maintenance.ok',
+        { enabled: String(countEnabled(maintenance)), total: String(maintenanceTotal) },
+        opts.locale,
+      );
+  return {
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: t(
+        'card.dashboard.settings.header.summary',
+        {
+          access: String(countEnabled(access)),
+          accessTotal: String(accessTotal),
+          cards: String(countEnabled(cards)),
+          cardsTotal: String(cardsTotal),
+          maintenanceLabel,
+        },
+        opts.locale,
+      ),
+    },
+  };
+}
+
+/**
+ * Build a segmented control row for one toggle (PR3 UI revision):
+ *  - Current value button: `type: primary` + `disabled: true` + `✓ 已开启/已关闭`
+ *    + carries `dash_settings_noop` action (belt-and-suspenders short-circuit).
+ *  - Target value button: `type: default` + clickable + `dash_settings_toggle` action.
+ *  - When the whole toggle is disabled (state.enabled=false): both buttons
+ *    carry NO action, current still primary, target still default for clear
+ *    visual; per-toggle `state.reasonKey` is surfaced as a note.
+ *  - autoUpdate also renders a read-only "更新时间：HH:MM" line, AND when
+ *    writable a form to update the time (carries the existing set_time
+ *    action). The display line is present whether the toggle is disabled
+ *    or not, so users always see the scheduled time.
+ */
+function buildSegmentedRow(
   toggle: SettingsCardDTO['sections'][number]['toggles'][number],
   opts: BuildSettingsCardOpts,
 ): unknown[] {
@@ -123,68 +196,119 @@ function buildToggleRow(
     },
   };
 
-  // Disabled toggles are rendered without an action button — Lark can't react
-  // to a static `disabled: true` schema field reliably across all clients.
-  if (!toggle.state.enabled) {
-    return [labelLine, {
-      tag: 'note',
-      elements: [{ tag: 'lark_md', content: toggle.state.reasonKey
-        ? t(toggle.state.reasonKey, undefined, opts.locale)
-        : t('card.dashboard.settings.toggle.disabled', undefined, opts.locale) }],
-    }];
-  }
+  const enabled = toggle.enabled;
+  const writable = toggle.state.enabled;
 
-  const toggleButton = {
+  const onText = t(
+    enabled ? 'card.dashboard.settings.segment.on_current' : 'card.dashboard.settings.segment.on',
+    undefined, opts.locale,
+  );
+  const offText = t(
+    !enabled ? 'card.dashboard.settings.segment.off_current' : 'card.dashboard.settings.segment.off',
+    undefined, opts.locale,
+  );
+
+  // ON button — primary+current when ON, default+target when OFF
+  const onBtn: Record<string, unknown> = {
     tag: 'button',
-    text: {
-      tag: 'plain_text',
-      content: toggle.enabled
-        ? t('card.dashboard.settings.toggle.on', undefined, opts.locale)
-        : t('card.dashboard.settings.toggle.off', undefined, opts.locale),
-    },
-    type: toggle.enabled ? 'primary' : 'default',
-    value: {
+    text: { tag: 'plain_text', content: onText },
+    type: enabled ? 'primary' : 'default',
+  };
+  if (enabled || !writable) {
+    // Current value (always primary) — `disabled` lets the client suppress the
+    // callback, and the noop action is the fallback if it doesn't.
+    onBtn.disabled = true;
+    if (writable) {
+      onBtn.value = { action: SETTINGS_ACTION_NOOP, invoker_open_id: opts.invokerOpenId, field: toggle.key };
+    }
+  } else {
+    onBtn.value = {
       action: SETTINGS_ACTION_TOGGLE,
       invoker_open_id: opts.invokerOpenId,
       field: toggle.key,
-      next_value: toggle.enabled ? 'false' : 'true',
-    },
+      next_value: 'true',
+    };
+  }
+
+  // OFF button — primary+current when OFF, default+target when ON
+  const offBtn: Record<string, unknown> = {
+    tag: 'button',
+    text: { tag: 'plain_text', content: offText },
+    type: !enabled ? 'primary' : 'default',
   };
+  if (!enabled || !writable) {
+    offBtn.disabled = true;
+    if (writable) {
+      offBtn.value = { action: SETTINGS_ACTION_NOOP, invoker_open_id: opts.invokerOpenId, field: toggle.key };
+    }
+  } else {
+    offBtn.value = {
+      action: SETTINGS_ACTION_TOGGLE,
+      invoker_open_id: opts.invokerOpenId,
+      field: toggle.key,
+      next_value: 'false',
+    };
+  }
 
-  const row: unknown[] = [labelLine, {
-    tag: 'action',
-    actions: [toggleButton],
-  }];
+  const row: unknown[] = [
+    labelLine,
+    { tag: 'action', actions: [onBtn, offBtn] },
+  ];
 
+  // Per-toggle reason — surfaced ONLY when this specific toggle is disabled.
+  // codex C4: autoRestart's reason cites the autoUpdate dependency; autoUpdate's
+  // reason cites local-dev install. We never fall back to the generic key here.
+  if (!writable && toggle.state.reasonKey) {
+    row.push({
+      tag: 'note',
+      elements: [{ tag: 'lark_md', content: t(toggle.state.reasonKey, undefined, opts.locale) }],
+    });
+  }
+
+  // autoUpdate always shows the schedule time (read-only when toggle blocked,
+  // editable form when writable). Codex C4: even disabled, the JSON MUST
+  // contain `04:00`.
   if (toggle.time) {
     row.push({
-      tag: 'form',
-      name: `settings_time_${toggle.key}`,
-      elements: [
-        {
-          tag: 'input',
-          name: 'time',
-          placeholder: { tag: 'plain_text', content: 'HH:MM' },
-          default_value: toggle.time.value,
-        },
-        {
-          tag: 'action',
-          actions: [
-            {
-              tag: 'button',
-              text: { tag: 'plain_text', content: t('card.dashboard.settings.save_time', undefined, opts.locale) },
-              type: 'primary',
-              form_action_type: 'submit',
-              value: {
-                action: SETTINGS_ACTION_SET_TIME,
-                invoker_open_id: opts.invokerOpenId,
-                field: toggle.key,
-              },
-            },
-          ],
-        },
-      ],
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: `<font color="grey">${t(
+          'card.dashboard.settings.maintenance.time_display',
+          { time: toggle.time.value }, opts.locale,
+        )}</font>`,
+      },
     });
+    if (writable) {
+      row.push({
+        tag: 'form',
+        name: `settings_time_${toggle.key}`,
+        elements: [
+          {
+            tag: 'input',
+            name: 'time',
+            placeholder: { tag: 'plain_text', content: 'HH:MM' },
+            default_value: toggle.time.value,
+          },
+          {
+            tag: 'action',
+            actions: [
+              {
+                tag: 'button',
+                text: { tag: 'plain_text', content: t('card.dashboard.settings.save_time', undefined, opts.locale) },
+                type: 'primary',
+                form_action_type: 'submit',
+                value: {
+                  action: SETTINGS_ACTION_SET_TIME,
+                  invoker_open_id: opts.invokerOpenId,
+                  field: toggle.key,
+                },
+              },
+            ],
+          },
+        ],
+      });
+    }
   }
 
   return row;
@@ -314,6 +438,16 @@ export async function handleSettingsCardAction(
   }
 
   const schedule = deps.scheduleAsync ?? defaultScheduleAsync;
+
+  // ─── 3) Noop short-circuit (PR3 UI revision, codex C4) ───────────────
+  // The current-value button in the segmented control is rendered with
+  // `disabled: true` but ALSO carries `dash_settings_noop` as a fail-safe:
+  // if any Lark client doesn't suppress disabled callbacks, we just toast
+  // and skip the network entirely. This is the only path that returns a
+  // success-typed toast without any side effect.
+  if (action === SETTINGS_ACTION_NOOP) {
+    return ackToast('card.dashboard.settings.toggle.disabled', locale);
+  }
 
   // ─── 4a) Refresh — read-only path (NO PUT, no patch payload) ────────
   if (action === SETTINGS_ACTION_REFRESH) {

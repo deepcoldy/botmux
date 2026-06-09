@@ -37,20 +37,24 @@ describe('settings-card-model · composeSections', () => {
     expect(autoUpdate.time?.state.enabled).toBe(false);
   });
 
-  it('grays out autoUpdate toggle + its time input when localDevInstall=true and sets maintenance.hintKey', () => {
+  it('grays out autoUpdate toggle + its time input when localDevInstall=true and sets per-toggle reasonKey (localDev-specific)', () => {
     const dto = composeSections(makeSettings({ localDevInstall: true }));
     const maintenance = dto.sections[2];
     const autoUpdate = maintenance.toggles[0];
     expect(autoUpdate.state.enabled).toBe(false);
     expect(autoUpdate.time?.state.enabled).toBe(false);
+    // Section hint stays for backwards compat
     expect(maintenance.hintKey).toBe('settings.autoUpdateLocalDev');
+    // PR3 UI revision: per-toggle reasonKey MUST cite local-dev specifically
+    expect(autoUpdate.state.reasonKey).toBe('settings.autoUpdate.disabled.localDev');
+    expect(autoUpdate.time?.state.reasonKey).toBe('settings.autoUpdate.disabled.localDev');
   });
 
-  it('grays out autoRestart whenever autoUpdate.enabled !== true (covers undefined, false, and true)', () => {
-    const cases: Array<{ enabled?: boolean; expectAutoRestartEnabled: boolean }> = [
-      { enabled: undefined, expectAutoRestartEnabled: false },
-      { enabled: false, expectAutoRestartEnabled: false },
-      { enabled: true, expectAutoRestartEnabled: true },
+  it('grays out autoRestart whenever autoUpdate.enabled !== true (covers undefined, false, and true), with autoUpdate-dependency reason', () => {
+    const cases: Array<{ enabled?: boolean; expectAutoRestartEnabled: boolean; expectReason: string | undefined }> = [
+      { enabled: undefined, expectAutoRestartEnabled: false, expectReason: 'settings.autoRestart.disabled.needsAutoUpdate' },
+      { enabled: false, expectAutoRestartEnabled: false, expectReason: 'settings.autoRestart.disabled.needsAutoUpdate' },
+      { enabled: true, expectAutoRestartEnabled: true, expectReason: undefined },
     ];
     for (const c of cases) {
       const maintenance = c.enabled === undefined
@@ -59,6 +63,9 @@ describe('settings-card-model · composeSections', () => {
       const dto = composeSections(makeSettings({ maintenance }));
       const autoRestart = dto.sections[2].toggles[1];
       expect(autoRestart.state.enabled).toBe(c.expectAutoRestartEnabled);
+      // PR3 UI revision: when disabled, the reason MUST cite the autoUpdate
+      // dependency (not the generic "currently disabled").
+      expect(autoRestart.state.reasonKey).toBe(c.expectReason);
     }
   });
 
