@@ -10,7 +10,8 @@
  *      or non-`on_`.
  *   3. global owner gate via PR2 `isAuthorizedForGlobalSettings` → 403.
  *   4. ACK-then-patch:
- *        - sync `ack` payload (Lark toast),
+ *        - sync toast payload (top-level `{ toast }`; event-dispatcher passes
+ *          this through to Lark as the click acknowledgement),
  *        - async write via PR2 Route B client,
  *        - async refresh card schema with the post-write snapshot.
  *
