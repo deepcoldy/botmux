@@ -1,12 +1,19 @@
 /**
  * PR3 C5 i18n completeness — every key the /dashboard command group and the
- * settings card render at runtime MUST exist in both `zh.ts` and `en.ts`.
- * Missing locale falls back to "MISSING:<key>" which would silently leak.
+ * settings card render at runtime MUST exist in BOTH `zh.ts` and `en.ts`.
+ *
+ * We assert this by directly importing the message dictionaries and using
+ * `Object.prototype.hasOwnProperty`, NOT via `t(key, locale)`. The reason
+ * (codex C5 blocker): `src/i18n/index.ts:81-84` falls back to the zh
+ * dictionary when an en key is missing, then to the bare key string — so
+ * a `t()`-based check passes silently even when en is incomplete.
  */
 
 import { describe, expect, it } from 'vitest';
 
 import { t } from '../src/i18n/index.js';
+import { messages as zhMessages } from '../src/i18n/zh.js';
+import { messages as enMessages } from '../src/i18n/en.js';
 
 const REQUIRED_KEYS: string[] = [
   // ─── /dashboard command group (C1) ──────────────────────────────────
@@ -53,19 +60,23 @@ const REQUIRED_KEYS: string[] = [
   'settings.autoRestartHelp',
 ];
 
-describe('PR3 i18n keys — zh', () => {
-  it.each(REQUIRED_KEYS)('zh has %s', (key) => {
-    const value = t(key, undefined, 'zh');
-    expect(value, `zh.ts missing key ${key}`).toBeTruthy();
-    expect(value.startsWith('MISSING:'), `zh.ts returns MISSING fallback for ${key}: ${value}`).toBe(false);
+describe('PR3 i18n keys — zh dictionary directly', () => {
+  it.each(REQUIRED_KEYS)('zh.ts has own property %s with truthy value', (key) => {
+    expect(
+      Object.prototype.hasOwnProperty.call(zhMessages, key),
+      `zh.ts missing key ${key}`,
+    ).toBe(true);
+    expect(zhMessages[key], `zh.ts has empty value for ${key}`).toBeTruthy();
   });
 });
 
-describe('PR3 i18n keys — en', () => {
-  it.each(REQUIRED_KEYS)('en has %s', (key) => {
-    const value = t(key, undefined, 'en');
-    expect(value, `en.ts missing key ${key}`).toBeTruthy();
-    expect(value.startsWith('MISSING:'), `en.ts returns MISSING fallback for ${key}: ${value}`).toBe(false);
+describe('PR3 i18n keys — en dictionary directly', () => {
+  it.each(REQUIRED_KEYS)('en.ts has own property %s with truthy value', (key) => {
+    expect(
+      Object.prototype.hasOwnProperty.call(enMessages, key),
+      `en.ts missing key ${key}`,
+    ).toBe(true);
+    expect(enMessages[key], `en.ts has empty value for ${key}`).toBeTruthy();
   });
 });
 
