@@ -34,6 +34,15 @@ import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
 } from './dashboard/settings-write-applier.js';
+import {
+  addBotsToGroup,
+  bindOncall,
+  disbandGroup,
+  leaveGroup,
+  unbindOncall,
+  type GroupsActionDeps,
+  type HandlerResult as GroupsHandlerResult,
+} from './dashboard/groups-action-helpers.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 
@@ -97,6 +106,24 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
 // route call through this so error codes / merge semantics stay identical.
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings);
+
+/** Helper to render a {status, body} HandlerResult through `res`. */
+function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
+  const headers = { 'content-type': 'application/json', ...(result.headers ?? {}) };
+  res.writeHead(result.status, headers);
+  res.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body));
+}
+
+// Shared deps for groups-action-helpers — both the browser
+// `/api/groups/*` routes and (PR2 C6) the HMAC-gated `/__daemon/groups/*`
+// routes use these helpers so response shapes / cascade-close semantics
+// stay identical.
+const groupsActionDeps: GroupsActionDeps = {
+  registryList: () => registry.list(),
+  registryGetByAppId: (id) => registry.getByAppId(id),
+  proxyToDaemon,
+  closeSessionsMatching,
+};
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -677,45 +704,19 @@ const server = createServer(async (req, res) => {
     let m2: RegExpMatchArray | null;
     if (req.method === 'POST' && (m2 = url.pathname.match(/^\/api\/groups\/([^/]+)\/add-bots$/))) {
       const chatId = decodeURIComponent(m2[1]);
-      // Read body once; we'll forward it to the proxy daemon
-      let raw: string;
-      try {
-        const chunks: Buffer[] = [];
-        for await (const c of req) chunks.push(c as Buffer);
-        raw = Buffer.concat(chunks).toString('utf8') || '{}';
-        JSON.parse(raw); // validate is JSON
-      } catch {
-        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
-      }
-      // Find a daemon whose bot is already in this chat
-      let proxy: { larkAppId: string; ipcPort: number } | undefined;
-      for (const d of registry.list()) {
-        try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups/${encodeURIComponent(chatId)}/membership`);
-          if (!r.ok) continue;
-          const j = await r.json() as { inChat?: boolean };
-          if (j.inChat) { proxy = d; break; }
-        } catch { /* skip */ }
-      }
-      if (!proxy) return jsonRes(res, 200, { ok: false, error: 'no_proxy_bot' });
-      const upstream = await fetch(
-        `http://127.0.0.1:${proxy.ipcPort}/api/groups/${encodeURIComponent(chatId)}/add-bots`,
-        { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw },
-      );
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const result = await addBotsToGroup(chatId, raw, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
     // Disband a chat. Body: `{ larkAppId }` — the bot whose daemon should
-    // perform the delete. Disband only succeeds when that bot is currently
-    // the chat owner (or creator with operate_as_owner scope, which botmux
-    // doesn't request by default), so the frontend is responsible for picking
-    // a viable bot. The route just proxies and surfaces Lark's error verbatim.
+    // perform the delete. See `dashboard/groups-action-helpers.ts:disbandGroup`.
     let mDisband: RegExpMatchArray | null;
     if (req.method === 'POST' && (mDisband = url.pathname.match(/^\/api\/groups\/([^/]+)\/disband$/))) {
       const chatId = decodeURIComponent(mDisband[1]);
-      let parsed: { larkAppId?: unknown };
+      let parsed: unknown;
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -723,34 +724,17 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const appId = typeof parsed.larkAppId === 'string' ? parsed.larkAppId : '';
-      if (!appId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
-      const upstream = await proxyToDaemon(
-        appId, `/api/groups/${encodeURIComponent(chatId)}/disband`,
-        { method: 'POST' },
-      );
-      const upstreamText = await upstream.text();
-      let upstreamJson: any = null;
-      try { upstreamJson = JSON.parse(upstreamText); } catch { /* tolerate */ }
-      // On successful disband, the chat is gone for everyone — every bot's
-      // session in this chat becomes a zombie (worker still alive, can't post).
-      // Close them all so the UI / Sessions list don't keep them as active.
-      let closedSessions: any[] = [];
-      if (upstreamJson?.ok) {
-        closedSessions = await closeSessionsMatching(s => s.chatId === chatId);
-      }
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ...(upstreamJson ?? {}), closedSessions }));
-      return;
+      const result = await disbandGroup(chatId, parsed, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
-    // Make selected bots leave a chat. Body: `{ larkAppIds: string[] }`.  Each
-    // bot is removed via its own daemon (Lark allows self-removal under any
-    // role). Per-bot results returned so the UI can show partial successes.
+    // Make selected bots leave a chat. Body: `{ larkAppIds: string[] }`. See
+    // `dashboard/groups-action-helpers.ts:leaveGroup` for membership probe +
+    // cascade-close semantics.
     let mLeave: RegExpMatchArray | null;
     if (req.method === 'POST' && (mLeave = url.pathname.match(/^\/api\/groups\/([^/]+)\/leave$/))) {
       const chatId = decodeURIComponent(mLeave[1]);
-      let parsed: { larkAppIds?: unknown };
+      let parsed: unknown;
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -758,53 +742,13 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const ids = Array.isArray(parsed.larkAppIds)
-        ? (parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-      if (ids.length === 0) return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
-      // Re-check membership on the daemon side before issuing leave — UI cache
-      // can be stale, and Lark's bot-self-remove returns a confusing error if
-      // the bot isn't actually in the chat. Skipping such bots up-front keeps
-      // the per-bot result useful (`not_in_chat`) instead of a vague API error.
-      const result = await Promise.all(ids.map(async appId => {
-        const d = registry.getByAppId(appId);
-        if (!d) return { larkAppId: appId, ok: false, error: 'daemon_offline' };
-        try {
-          const memRes = await fetch(
-            `http://127.0.0.1:${d.ipcPort}/api/groups/${encodeURIComponent(chatId)}/membership`,
-          );
-          const memJson = await memRes.json() as { inChat?: boolean };
-          if (!memJson.inChat) return { larkAppId: appId, ok: false, error: 'not_in_chat' };
-        } catch (e: any) {
-          return { larkAppId: appId, ok: false, error: `membership_check_failed: ${e?.message ?? e}` };
-        }
-        const upstream = await proxyToDaemon(
-          appId, `/api/groups/${encodeURIComponent(chatId)}/leave`,
-          { method: 'POST' },
-        );
-        const text = await upstream.text();
-        let body: any = null;
-        try { body = JSON.parse(text); } catch { /* tolerate */ }
-        // On successful leave, the leaving bot can no longer post into the
-        // chat — its sessions there are stranded. Close only THIS bot's
-        // sessions for THIS chat (other bots may still be in the chat with
-        // their own active sessions).
-        const closedSessions = body?.ok
-          ? await closeSessionsMatching(s => s.chatId === chatId && s.larkAppId === appId)
-          : [];
-        return {
-          larkAppId: appId,
-          ok: !!body?.ok,
-          error: body?.ok ? undefined : (body?.error ?? `http_${upstream.status}`),
-          closedSessions,
-        };
-      }));
-      return jsonRes(res, 200, { result });
+      const result = await leaveGroup(chatId, parsed, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
     // ─── Oncall bindings (per chat × bot) ────────────────────────────────────
-    // PUT /api/groups/:chatId/oncall/:larkAppId    body: {workingDir}
-    // DELETE /api/groups/:chatId/oncall/:larkAppId
+    // External: PUT/DELETE /api/groups/:chatId/oncall/:larkAppId
+    // Internal: PUT/DELETE /api/oncall/:chatId (on the named bot's daemon).
     let mOncall: RegExpMatchArray | null;
     if ((mOncall = url.pathname.match(/^\/api\/groups\/([^/]+)\/oncall\/([^/]+)$/))) {
       const chatId = decodeURIComponent(mOncall[1]);
@@ -812,23 +756,13 @@ const server = createServer(async (req, res) => {
       if (req.method === 'PUT') {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
-        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-        const upstream = await proxyToDaemon(
-          appId, `/api/oncall/${encodeURIComponent(chatId)}`,
-          { method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw },
-        );
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
+        const raw = Buffer.concat(chunks).toString('utf8');
+        const result = await bindOncall(chatId, appId, raw, groupsActionDeps);
+        return writeHandlerResult(res, result);
       }
       if (req.method === 'DELETE') {
-        const upstream = await proxyToDaemon(
-          appId, `/api/oncall/${encodeURIComponent(chatId)}`,
-          { method: 'DELETE' },
-        );
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
+        const result = await unbindOncall(chatId, appId, groupsActionDeps);
+        return writeHandlerResult(res, result);
       }
     }
 
