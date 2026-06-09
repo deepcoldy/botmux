@@ -131,9 +131,11 @@ export function createDaemonClient(opts: DaemonClientOptions): DaemonClient {
     const method = (reqOpts.method ?? 'GET').toUpperCase();
     const isGet = method === 'GET';
     const retryAllowed = isGet || reqOpts.retryUnsafeWrites === true;
-    const maxAttempts = retryAllowed
-      ? Math.max(1, reqOpts.retries ?? defaultRetries) + 1
-      : 1;
+    // `retries` is the number of EXTRA attempts on top of the initial one,
+    // so `retries=0` means one attempt and no retry. Negative values clamp
+    // to 0 rather than throwing — caller intent is "no retry".
+    const retryCount = Math.max(0, reqOpts.retries ?? defaultRetries);
+    const maxAttempts = retryAllowed ? retryCount + 1 : 1;
     const timeoutMs = reqOpts.timeoutMs ?? defaultTimeoutMs;
     const bodyRaw = reqOpts.body === undefined ? '' : JSON.stringify(reqOpts.body);
     const fetchUrl = dashboardUrl + reqOpts.path;

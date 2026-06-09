@@ -223,6 +223,49 @@ describe('retry policy — non-GET (unsafe writes)', () => {
   });
 });
 
+describe('retries: 0 disables retry exactly (regression)', () => {
+  it('GET 503 + retries:0 → exactly 1 fetch call', async () => {
+    const cap = captureFetch([makeRes(503), makeRes(503)]);
+    const client = createDaemonClient(makeOpts({ fetch: cap.fetch, retries: 0 }));
+    const r = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
+    expect(r.status).toBe(503);
+    expect(cap.calls).toHaveLength(1);
+  });
+
+  it('POST 503 + retryUnsafeWrites:true + retries:0 → exactly 1 fetch call', async () => {
+    const cap = captureFetch([makeRes(503), makeRes(503)]);
+    const client = createDaemonClient(makeOpts({ fetch: cap.fetch, retries: 0 }));
+    const r = await client.request({
+      method: 'POST',
+      path: '/__daemon/sessions/sid/close',
+      body: {},
+      retryUnsafeWrites: true,
+    });
+    expect(r.status).toBe(503);
+    expect(cap.calls).toHaveLength(1);
+  });
+
+  it('per-request retries:0 overrides client default', async () => {
+    const cap = captureFetch([makeRes(503), makeRes(503), makeRes(200, {})]);
+    // Client default retries=5, but per-request retries=0 → exactly 1 call.
+    const client = createDaemonClient(makeOpts({ fetch: cap.fetch, retries: 5 }));
+    const r = await client.request({
+      method: 'GET', path: '/__daemon/sessions-list',
+      retries: 0,
+    });
+    expect(r.status).toBe(503);
+    expect(cap.calls).toHaveLength(1);
+  });
+
+  it('negative retries clamps to 0', async () => {
+    const cap = captureFetch([makeRes(503), makeRes(503)]);
+    const client = createDaemonClient(makeOpts({ fetch: cap.fetch, retries: -3 }));
+    const r = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
+    expect(r.status).toBe(503);
+    expect(cap.calls).toHaveLength(1);
+  });
+});
+
 describe('signature integrity — pathWithQuery byte-preservation', () => {
   it('fetch URL path+query matches the bytes we signed', async () => {
     const cap = captureFetch([makeRes(200, { ok: true })]);
