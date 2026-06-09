@@ -80,6 +80,8 @@ function makeDeps(over: Partial<DaemonInternalApiDeps> = {}): DaemonInternalApiD
     workflowsActionDeps,
     proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
     ownerOf: vi.fn((sid: string) => sid === 'sess-known' ? 'cli_owner' : undefined),
+    // sess-known has owner; sess-legacy exists but has no larkAppId.
+    sessionExists: vi.fn((sid: string) => sid === 'sess-known' || sid === 'sess-legacy'),
     scheduleOwnerOf: vi.fn((id: string) => id === 'sched-known' ? 'cli_owner' : undefined),
     // sched-known has owner; sched-legacy exists but has no larkAppId
     // (legacy persistence). 'sched-missing' deliberately omitted to assert
@@ -744,27 +746,86 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
     }
   });
 
-  // Sanity: sessions write endpoint is NOT affected by this commit — the
-  // sessions write path still uses ownerOf-only routing (no cross-bot 403
-  // gate has been added for sessions in slice 2a). This pins down that the
-  // schedules gate did not accidentally drift into sessions/close.
-  it('sessions write path unchanged by slice 2a: dash_sessions_close still ownerOf-only (no callerAppId check)', async () => {
-    const deps = makeDeps({
-      // Sessions ownerOf returns cli_b; caller is cli_a. If a cross-bot
-      // gate had been added for sessions, this would 403.
-      ownerOf: vi.fn((sid: string) => sid === 'sess-known' ? 'cli_b' : undefined),
-      proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
-    });
-    const api = createDaemonInternalApi(deps);
-    const r = await api.dispatchForTest('POST', url('/__daemon/sessions/sess-known/close'), '', 'cli_a');
-    // Status passes through from proxyToDaemon (200) — NOT 403.
-    expect(r.status).toBe(200);
-    expect(deps.proxyToDaemon).toHaveBeenCalledTimes(1);
-    expect(deps.proxyToDaemon).toHaveBeenCalledWith(
-      'cli_b',
-      '/api/sessions/sess-known/close',
-      expect.objectContaining({ method: 'POST' }),
-    );
+  // ─── Sessions write gate (codex 2026-06-10 follow-up hardening) ────
+  //
+  // sessions write endpoint now mirrors the schedules gate: cross-bot
+  // caller → 403; legacy row → proxy caller; missing row → 404. The slice
+  // 2a sanity test that previously LOCKED IN the "still ownerOf-only"
+  // behaviour is now inverted because the unguarded behaviour was the
+  // bug. Pattern reuse with schedules is intentional (codex follow-up).
+  describe('sessions write — cross-bot owner gate + legacy fallback', () => {
+    function ownerMismatchDeps() {
+      return makeDeps({
+        ownerOf: vi.fn((sid: string) => sid === 'sess-known' ? 'cli_b' : undefined),
+        sessionExists: vi.fn((sid: string) => sid === 'sess-known' || sid === 'sess-legacy'),
+        proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
+      });
+    }
+
+    for (const action of ['close', 'resume', 'locate'] as const) {
+      it(`callerAppId=cli_a + owner=cli_b → 403 session_owner_mismatch, proxyToDaemon NOT called (${action})`, async () => {
+        const deps = ownerMismatchDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-known/${action}`), '', 'cli_a');
+        expect(r.status).toBe(403);
+        expect((r.body as any).error).toBe('session_owner_mismatch');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+      });
+
+      it(`callerAppId=cli_b + owner=cli_b → proxy cli_b (${action})`, async () => {
+        const deps = ownerMismatchDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-known/${action}`), '', 'cli_b');
+        expect(r.status).toBe(200);
+        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+          'cli_b',
+          `/api/sessions/sess-known/${action}`,
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+
+      it(`test seam (no callerAppId) → proxy owner (back-compat) (${action})`, async () => {
+        const deps = ownerMismatchDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-known/${action}`));
+        expect(r.status).toBe(200);
+        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+          'cli_b',
+          `/api/sessions/sess-known/${action}`,
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+
+      it(`legacy row + callerAppId=cli_caller → proxy caller (${action})`, async () => {
+        const deps = ownerMismatchDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-legacy/${action}`), '', 'cli_caller');
+        expect(r.status).toBe(200);
+        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+          'cli_caller',
+          `/api/sessions/sess-legacy/${action}`,
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+
+      it(`legacy row + test seam → 404 unknown_session (back-compat) (${action})`, async () => {
+        const deps = ownerMismatchDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-legacy/${action}`));
+        expect(r.status).toBe(404);
+        expect((r.body as any).error).toBe('unknown_session');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+      });
+
+      it(`row genuinely missing → 404 unknown_session (${action})`, async () => {
+        const deps = ownerMismatchDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-vanished/${action}`), '', 'cli_caller');
+        expect(r.status).toBe(404);
+        expect((r.body as any).error).toBe('unknown_session');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+      });
+    }
   });
 });
 

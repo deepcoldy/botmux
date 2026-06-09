@@ -66,6 +66,15 @@ export class Aggregator {
   ownerOf(sessionId: string): string | undefined {
     return this.sessions.get(sessionId)?.larkAppId;
   }
+
+  /** Whether a session row with this id exists at all in the aggregator,
+   *  regardless of `larkAppId` presence. Mirrors `scheduleExists`; lets
+   *  the Route B write gate tell apart "legacy row with no owner" from
+   *  "unknown id" so the close/resume/locate handler can route legacy rows
+   *  to the caller's bot instead of 404'ing them. */
+  sessionExists(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
+  }
   scheduleOwnerOf(id: string): string | undefined {
     return (this.schedules.get(id) as { larkAppId?: string } | undefined)?.larkAppId;
   }
