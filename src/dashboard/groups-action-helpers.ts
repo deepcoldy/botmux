@@ -139,22 +139,22 @@ export async function leaveGroup(
   const fetchFn = deps.fetch ?? fetch;
   const result = await Promise.all(ids.map(async appId => {
     const d = deps.registryGetByAppId(appId);
-    if (!d) return { larkAppId: appId, ok: false, error: 'daemon_offline', closedSessions: [] as unknown[] };
+    // Pre-proxy failure shapes do NOT carry `closedSessions` — matches the
+    // historical inline route (`dashboard.ts:789-800`) which only attaches
+    // `closedSessions` to the upstream-proxy branch.
+    if (!d) return { larkAppId: appId, ok: false, error: 'daemon_offline' };
     try {
       const memRes = await fetchFn(`http://127.0.0.1:${d.ipcPort}/api/groups/${encodeURIComponent(chatId)}/membership`);
       const memJson = await memRes.json() as { inChat?: boolean };
-      if (!memJson.inChat) return { larkAppId: appId, ok: false, error: 'not_in_chat', closedSessions: [] as unknown[] };
+      if (!memJson.inChat) return { larkAppId: appId, ok: false, error: 'not_in_chat' };
     } catch (e: any) {
-      return {
-        larkAppId: appId, ok: false,
-        error: `membership_check_failed: ${e?.message ?? e}`,
-        closedSessions: [] as unknown[],
-      };
+      return { larkAppId: appId, ok: false, error: `membership_check_failed: ${e?.message ?? e}` };
     }
     const upstream = await deps.proxyToDaemon(
       appId, `/api/groups/${encodeURIComponent(chatId)}/leave`, { method: 'POST' },
     );
     const { json } = await parseUpstream(upstream);
+    // Post-proxy result always carries `closedSessions` (empty on failure).
     const closedSessions = json?.ok
       ? await deps.closeSessionsMatching(s => s.chatId === chatId && s.larkAppId === appId)
       : [];

@@ -151,16 +151,27 @@ describe('leaveGroup', () => {
 
     const r = await leaveGroup('oc_demo', { larkAppIds: ['cli_a', 'cli_b', 'cli_c'] }, deps);
     expect(r.status).toBe(200);
-    const body = r.body as { result: Array<{ larkAppId: string; ok: boolean; error?: string; closedSessions: unknown[] }> };
+    const body = r.body as { result: Array<Record<string, unknown>> };
     expect(body.result.length).toBe(3);
 
-    const byApp = Object.fromEntries(body.result.map(r => [r.larkAppId, r]));
-    expect(byApp.cli_a.ok).toBe(true);
-    expect(byApp.cli_a.closedSessions.length).toBe(1);
-    expect(byApp.cli_b.ok).toBe(false);
-    expect(byApp.cli_b.error).toBe('daemon_offline');
-    expect(byApp.cli_c.ok).toBe(false);
-    expect(byApp.cli_c.error).toBe('not_in_chat');
+    const byApp = Object.fromEntries(body.result.map((r: any) => [r.larkAppId, r]));
+
+    // Successful leave carries closedSessions (length=1, only cli_a's session).
+    expect(byApp.cli_a).toEqual({
+      larkAppId: 'cli_a',
+      ok: true,
+      error: undefined,
+      closedSessions: [{ chatId: 'oc_demo', larkAppId: 'cli_a' }],
+    });
+
+    // Pre-proxy failure branches do NOT include closedSessions (shape parity
+    // with the historical inline route at dashboard.ts:789-800).
+    expect(byApp.cli_b).toEqual({ larkAppId: 'cli_b', ok: false, error: 'daemon_offline' });
+    expect(byApp.cli_b.closedSessions).toBeUndefined();
+
+    expect(byApp.cli_c).toEqual({ larkAppId: 'cli_c', ok: false, error: 'not_in_chat' });
+    expect(byApp.cli_c.closedSessions).toBeUndefined();
+
     // Cascade close called only for cli_a (the only successful leave).
     expect(closedSpy).toHaveBeenCalledOnce();
   });
@@ -172,16 +183,37 @@ describe('leaveGroup', () => {
     expect((await leaveGroup('oc_demo', { larkAppIds: [123] }, deps)).body).toEqual({ ok: false, error: 'larkAppIds_required' });
   });
 
-  it('membership_check_failed when fetch throws on membership probe', async () => {
+  it('membership_check_failed when fetch throws — has no closedSessions field', async () => {
     const fetchSpy = vi.fn(async () => { throw new Error('econnrefused'); });
     const deps = makeDeps({
       registryGetByAppId: () => daemon('cli_x', 9000),
       fetch: fetchSpy as unknown as typeof fetch,
     });
     const r = await leaveGroup('oc_demo', { larkAppIds: ['cli_x'] }, deps);
-    const body = r.body as { result: Array<{ ok: boolean; error?: string }> };
-    expect(body.result[0].ok).toBe(false);
-    expect(body.result[0].error).toMatch(/^membership_check_failed: /);
+    const body = r.body as { result: Array<Record<string, unknown>> };
+    expect(body.result[0]).toEqual({
+      larkAppId: 'cli_x',
+      ok: false,
+      error: 'membership_check_failed: econnrefused',
+    });
+    expect(body.result[0].closedSessions).toBeUndefined();
+  });
+
+  it('upstream proxy failure carries closedSessions=[] (post-proxy branch)', async () => {
+    const fetchSpy = vi.fn(async () => makeRes(200, { inChat: true }));
+    const deps = makeDeps({
+      registryGetByAppId: () => daemon('cli_x', 9000),
+      fetch: fetchSpy as unknown as typeof fetch,
+      proxyToDaemon: vi.fn(async () => makeRes(500, { ok: false, error: 'lark_denied' })),
+    });
+    const r = await leaveGroup('oc_demo', { larkAppIds: ['cli_x'] }, deps);
+    const body = r.body as { result: Array<Record<string, unknown>> };
+    expect(body.result[0]).toEqual({
+      larkAppId: 'cli_x',
+      ok: false,
+      error: 'lark_denied',
+      closedSessions: [],
+    });
   });
 });
 
