@@ -91,7 +91,12 @@ if [[ -n "$BODY" ]]; then
   ARGS+=(--data "$BODY")
 fi
 
-OUTPUT="$(curl "${ARGS[@]}" || true)"
+# Do NOT swallow curl's exit code: under `set -e` a network failure (DNS
+# unreachable, connection refused, TLS error, etc.) propagates and the
+# script exits non-zero. HTTP 4xx/5xx are still rendered with rc=0 because
+# curl considers a successful round-trip non-fatal — that's the right
+# default for testing owner_only / unknown_endpoint responses.
+OUTPUT="$(curl "${ARGS[@]}")"
 
 # Pretty-print if jq is available; otherwise raw.
 if command -v jq >/dev/null 2>&1; then
