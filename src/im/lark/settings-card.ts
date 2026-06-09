@@ -303,17 +303,20 @@ export interface SettingsCardHandlerDeps {
  * Lark card-callback result envelope. event-dispatcher pass-through expects
  * either `{ toast }`, `{ card }`, or both — see `event-dispatcher.ts:390-395`.
  *
- * PR3 UI revision pass 2 (user feedback 2026-06-09): the handler awaits the
- * GET/PUT inline and returns BOTH `{ toast }` AND `{ card }` in the same
- * response so Lark's client renders them atomically. Why both:
- *  - `toast` → Lark client hides the button spinner and pops the toast.
- *  - `card` → Lark client patches the original card in-place to the post-
- *    write state at the same instant.
- * Returning only `{toast}` and patching out-of-band via `updateMessage`
- * produces a visible stale-render flash (a few frames where the OLD card
- * shows after the spinner dies, then the push arrives and re-renders).
- * Round-trip Route B PUT + card rebuild fits in ~30-80ms; well inside the
- * `event-dispatcher` 2.5s handler timeout (`event-dispatcher.ts:365`).
+ * PR3 UI revision pass 3 (codex A/B, 2026-06-09): the handler awaits the
+ * GET/PUT inline. On the SUCCESS path it returns ONLY `{ card }` (no
+ * toast). Why card-only:
+ *  - Pass 2 returned both `{toast, card}`. Lark's client rendered the toast
+ *    (hide spinner, pop toast) and the card replacement as TWO separate
+ *    passes; users saw the OLD card state flash for a few frames between
+ *    them.
+ *  - Card-only collapses that to a single pass — the card body itself
+ *    (`✓ 已开启` / `✓ 已关闭`) is the feedback signal; users learn the
+ *    write succeeded from the new state, not from a toast.
+ * Error / permission denial / noop still return `{ toast }` (no card to
+ * render anyway). Round-trip Route B PUT + card rebuild fits in ~30-80ms;
+ * well inside the `event-dispatcher` 2.5s handler timeout
+ * (`event-dispatcher.ts:365`).
  */
 export interface SettingsCardHandlerResult {
   /** Optional — success path now returns ONLY a `card` to avoid the
