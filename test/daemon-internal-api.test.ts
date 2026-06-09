@@ -142,12 +142,6 @@ describe('dispatch: read endpoints', () => {
     expect(body.groups).toEqual({ chats: [], bots: [] });
   });
 
-  it('GET /__daemon/workflows-runs/:id/snapshot returns the snapshot helper output', async () => {
-    const api = createDaemonInternalApi(makeDeps());
-    const r = await api.dispatchForTest('GET', url('/__daemon/workflows-runs/r-1/snapshot'));
-    expect(r.status).toBe(200);
-    expect((r.body as any).run.status).toBe('running');
-  });
 });
 
 /** ─── 1 SETTINGS-WRITE ENDPOINT — owner gate ───────────────────────── */
@@ -506,6 +500,28 @@ describe('handle(): HMAC integration', () => {
     await api.handle(req2, r2.res, new URL('http://127.0.0.1:7891/__daemon/sessions-list'));
     expect(r2.captured.status).toBe(401);
     expect(JSON.parse(r2.captured.body).error).toBe('replay');
+  });
+
+  it('caller-passed URL does not override req.url — sig minted for sessions-list cannot reach settings-snapshot (B1 regression)', async () => {
+    const clock = fixedClock(14_000_000);
+    const api = createDaemonInternalApi({ ...makeDeps(), nonceStore: createNonceStore(clock), clock });
+    const ts = String(clock.now());
+
+    // Sign for /__daemon/sessions-list, then request that same path via req.url
+    // but pass a DIFFERENT url object as the third arg to handle().
+    const req = signedReq({
+      method: 'GET', pathWithQuery: '/__daemon/sessions-list', ts, nonce: 'n-conflict',
+    });
+    const callerLiedUrl = new URL('http://127.0.0.1:7891/__daemon/settings-snapshot');
+    const { res, captured } = makeRes();
+
+    await api.handle(req, res, callerLiedUrl);
+
+    // Dispatch must follow req.url (sessions-list), NOT the caller's mismatched URL.
+    expect(captured.status).toBe(200);
+    expect(JSON.parse(captured.body)).toEqual({ sessions: [{ sessionId: 's1' }] });
+    // Critically: settings-snapshot's payload (`{settings: ...}`) must NOT appear.
+    expect(captured.body).not.toContain('publicReadOnly');
   });
 
   it('body tampering → 401 sig_mismatch (sig was for original body)', async () => {

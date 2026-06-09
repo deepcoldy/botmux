@@ -46,7 +46,6 @@ import {
   type SettingsOwnerResolverDeps,
 } from './settings-owner-resolver.js';
 import {
-  getRunSnapshot as snapshotRun,
   listWorkflowRuns,
   runApproveReject,
   runCancel,
@@ -265,14 +264,6 @@ const ROUTES: RouteDef[] = [
       runCancel(decodeURIComponent(m[1]), ctx.bodyRaw, deps.workflowsActionDeps),
   },
 
-  // ── BONUS READ: workflow snapshot (typed; used by overview drilldown) ──
-  {
-    method: 'GET',
-    pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/snapshot$/,
-    handle: async (m, _ctx, deps) =>
-      snapshotRun(decodeURIComponent(m[1]), true, deps.workflowsActionDeps),
-  },
-
   // ── WRITE: schedules × 3 ──────────────
   {
     method: 'POST',
@@ -355,7 +346,14 @@ export function createDaemonInternalApi(deps: DaemonInternalApiDeps): DaemonInte
     res: ServerResponse,
     url: URL,
   ): Promise<boolean> {
-    if (!url.pathname.startsWith('/__daemon/')) return false;
+    // ⚠️ Source-of-truth for both the `/__daemon/` gate and dispatch routing
+    // MUST be `req.url` (the exact bytes the HMAC was computed over). The
+    // caller's `url` is only trusted for its `origin` so URL parsing succeeds.
+    // Decoupling these allows a signature minted for path X to drive
+    // dispatch to path Y if a caller passes a mismatched `url`.
+    const reqPath = req.url ?? '/';
+    const requestUrl = new URL(reqPath, url.origin);
+    if (!requestUrl.pathname.startsWith('/__daemon/')) return false;
 
     const verify = await verifyDaemonRequest(req, deps.secret, nonceStore, { clock: deps.clock });
     if (!verify.ok) {
@@ -368,7 +366,7 @@ export function createDaemonInternalApi(deps: DaemonInternalApiDeps): DaemonInte
 
     const result = await dispatchDaemonInternalRequest(
       req.method ?? 'GET',
-      url,
+      requestUrl,
       verify.bodyRaw,
       deps,
     );
