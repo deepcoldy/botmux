@@ -202,11 +202,15 @@ export interface VerifyOptions {
   maxBodyBytes?: number;
 }
 
+/**
+ * Read a single header value. Duplicate (array-valued) headers are rejected
+ * rather than silently picking the first — an attacker who can inject an extra
+ * `X-Botmux-Daemon-Sig: ...` line would otherwise be able to override the one
+ * the daemon meant to send.
+ */
 function headerStr(req: IncomingMessage, name: string): string | undefined {
   const v = req.headers[name];
-  if (typeof v === 'string') return v;
-  if (Array.isArray(v) && typeof v[0] === 'string') return v[0];
-  return undefined;
+  return typeof v === 'string' ? v : undefined;
 }
 
 /**
@@ -234,21 +238,28 @@ export async function verifyDaemonRequest(
     return { ok: false, reason: 'remote_not_loopback', httpStatus: 403 };
   }
 
-  const tsMs = Number.parseInt(ts, 10);
-  if (!Number.isFinite(tsMs)) {
+  // Stricter than parseInt — rejects '123abc' / '1.5' / '' / 'NaN' / Infinity.
+  const tsMs = Number(ts);
+  if (!Number.isFinite(tsMs) || !Number.isInteger(tsMs)) {
     return { ok: false, reason: 'ts_malformed', httpStatus: 401 };
   }
   if (Math.abs(clock.now() - tsMs) > TS_WINDOW_MS) {
     return { ok: false, reason: 'ts_window', httpStatus: 401 };
   }
 
-  if (nonceStore.has(nonce)) {
-    return { ok: false, reason: 'replay', httpStatus: 401 };
-  }
-
+  // Body must be read BEFORE the nonce check so that the `has → add` window
+  // contains no `await` — concurrent requests with the same nonce can each
+  // pass `has()` only one at a time, which then `add()`s the entry before any
+  // other microtask can run. See test: "concurrent requests with the same
+  // nonce — exactly one is accepted".
   const bodyRaw = await readBodyRaw(req, { maxBytes: opts.maxBodyBytes ?? BODY_LIMIT_BYTES });
   if (bodyRaw === null) {
     return { ok: false, reason: 'body_too_large', httpStatus: 413 };
+  }
+
+  // ─── Synchronous block — no `await` until `add()` finishes. ───
+  if (nonceStore.has(nonce)) {
+    return { ok: false, reason: 'replay', httpStatus: 401 };
   }
 
   const { raw: expected } = signDaemonRequest({
@@ -264,5 +275,6 @@ export async function verifyDaemonRequest(
   }
 
   nonceStore.add(nonce, clock.now() + NONCE_TTL_MS);
+  // ─── End synchronous block. ───
   return { ok: true, appId, bodyRaw };
 }

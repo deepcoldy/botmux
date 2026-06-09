@@ -93,6 +93,9 @@ describe('signDaemonRequest', () => {
     expect(a.raw.equals(b.raw)).toBe(true);
     // base64url has no padding and uses URL-safe alphabet.
     expect(a.wire).toMatch(/^[A-Za-z0-9_-]+$/);
+    // Frozen expected value — any change to the signing material order or
+    // separator will flip this byte string, catching accidental drift.
+    expect(a.wire).toBe('NbtzoO3kRO4e1aUWs8PXoNC2s95dPgSC9_DZBJhyzdc');
   });
 
   it('produces a different wire when the body changes by one byte', () => {
@@ -279,6 +282,34 @@ describe('verifyDaemonRequest rejection matrix', () => {
     expect(out.reason).toBe('ts_malformed');
   });
 
+  it('rejects ts with trailing garbage like "3000000abc" (B2)', async () => {
+    const { req, clock } = await signedRequest({ ts: '3000000abc' });
+    const out = await verifyDaemonRequest(req, SECRET, createNonceStore(clock), { clock });
+    expect(out.ok).toBe(false);
+    if (out.ok) throw new Error('unreachable');
+    expect(out.reason).toBe('ts_malformed');
+  });
+
+  it('rejects non-integer ts like "3000000.5" (B2)', async () => {
+    const { req, clock } = await signedRequest({ ts: '3000000.5' });
+    const out = await verifyDaemonRequest(req, SECRET, createNonceStore(clock), { clock });
+    expect(out.ok).toBe(false);
+    if (out.ok) throw new Error('unreachable');
+    expect(out.reason).toBe('ts_malformed');
+  });
+
+  it('rejects empty ts string (B2)', async () => {
+    const { req, clock } = await signedRequest({ ts: '' });
+    // signedHeaders treats ts='' as missing in some paths; here we reach the
+    // typed-string branch and Number('') is 0 which is a valid integer — but
+    // the `missing_header` guard fires first because empty strings fail the
+    // truthy `!ts || !nonce` check.
+    const out = await verifyDaemonRequest(req, SECRET, createNonceStore(clock), { clock });
+    expect(out.ok).toBe(false);
+    if (out.ok) throw new Error('unreachable');
+    expect(out.reason).toBe('missing_header');
+  });
+
   it('rejects a replayed nonce', async () => {
     const clock = fixedClock(5_000_000);
     const store = createNonceStore(clock);
@@ -359,6 +390,28 @@ describe('verifyDaemonRequest rejection matrix', () => {
     expect(out.reason).toBe('remote_not_loopback');
     expect(out.httpStatus).toBe(403);
   });
+
+  it('rejects duplicate (array) headers — does not silently take the first (B3)', async () => {
+    const clock = fixedClock(9_000_000);
+    const ts = String(clock.now());
+    const body = '';
+    const goodHeaders = signedHeaders({ ts, nonce: 'dup-test', method: 'POST', url: '/__daemon/x', body });
+    // Simulate an injected duplicate header by passing an array value for x-botmux-daemon-sig.
+    const stream = Readable.from([Buffer.from(body, 'utf8')]);
+    const headers: Record<string, string | string[]> = { ...goodHeaders };
+    headers['x-botmux-daemon-sig'] = [goodHeaders['x-botmux-daemon-sig'], 'attacker-injected-sig'];
+    const req = Object.assign(stream, {
+      method: 'POST',
+      url: '/__daemon/x',
+      headers,
+      socket: { remoteAddress: '127.0.0.1' } as any,
+    }) as unknown as IncomingMessage;
+
+    const out = await verifyDaemonRequest(req, SECRET, createNonceStore(clock), { clock });
+    expect(out.ok).toBe(false);
+    if (out.ok) throw new Error('unreachable');
+    expect(out.reason).toBe('missing_header');
+  });
 });
 
 describe('verifyDaemonRequest body single-read contract', () => {
@@ -389,6 +442,28 @@ describe('verifyDaemonRequest body single-read contract', () => {
     if (out.ok) throw new Error('unreachable');
     expect(out.reason).toBe('body_too_large');
     expect(out.httpStatus).toBe(413);
+  });
+
+  it('concurrent requests with the same nonce — exactly one is accepted, the other is replay (B1)', async () => {
+    const clock = fixedClock(9_500_000);
+    const store = createNonceStore(clock);
+    const ts = String(clock.now());
+    const body = '{"shared":"nonce"}';
+    const headers = signedHeaders({ ts, nonce: 'race', method: 'POST', url: '/__daemon/race', body });
+
+    // Two structurally identical requests fire concurrently. With the
+    // has → sign → checkSig → add synchronous block, exactly one succeeds.
+    const req1 = makeReq({ method: 'POST', url: '/__daemon/race', headers, body });
+    const req2 = makeReq({ method: 'POST', url: '/__daemon/race', headers, body });
+    const [a, b] = await Promise.all([
+      verifyDaemonRequest(req1, SECRET, store, { clock }),
+      verifyDaemonRequest(req2, SECRET, store, { clock }),
+    ]);
+
+    const oks = [a, b].filter(r => r.ok).length;
+    const replays = [a, b].filter(r => !r.ok && (r as any).reason === 'replay').length;
+    expect(oks).toBe(1);
+    expect(replays).toBe(1);
   });
 
   it('allows the same nonce after the TTL window has elapsed', async () => {
