@@ -1,18 +1,24 @@
 /**
- * Settings card builder + callback handlers (PR3 C4).
+ * Settings card builder + callback handlers (PR3 C4 + revision).
  *
  * Consumes the PR1 `composeSections` DTO and emits a Feishu interactive card
  * JSON. The handler chain is:
  *
  *   1. invoker lock: `action.value.invoker_open_id === operator.open_id`
  *      (plan §7 idiom — only the user who saw the card is allowed to mutate).
- *   2. verified union_id via C2 `resolveCardOperatorUnionId` → reject if absent
- *      or non-`on_`.
- *   3. global owner gate via PR2 `isAuthorizedForGlobalSettings` → 403.
+ *   2. per-bot owner gate (PR3 revision): `operator.open_id` MUST equal
+ *      `bot-registry.getOwnerOpenId(larkAppId)`. The global union_id owner set
+ *      is NOT consulted anymore — each callback is scoped to the bot that
+ *      received it; A's owner cannot use B's `/dashboard *`.
+ *   3. noop short-circuit: `dash_settings_noop` (current-value button in the
+ *      segmented control) returns a toast WITHOUT calling the Route B client.
+ *      Fail-safe for clients that don't suppress `disabled` callbacks.
  *   4. ACK-then-patch:
  *        - sync toast payload (top-level `{ toast }`; event-dispatcher passes
  *          this through to Lark as the click acknowledgement),
- *        - async write via PR2 Route B client,
+ *        - async write via PR2 Route B client (resolves the owner's union_id
+ *          via `resolveUserUnionId` first, since the server-side write API
+ *          still requires `ownerUnionId` in the body),
  *        - async refresh card schema with the post-write snapshot.
  *
  * Write actions are NEVER retried — the C7 client retry policy already
@@ -21,7 +27,7 @@
  *
  * Sender identity (`unionId`) NEVER lands on `action.value`. The only field
  * the callback echoes from the original render is `invoker_open_id`, which
- * is `operator.open_id` (NOT `senderUnionId`).
+ * is the OWNER's open_id (not the sender's union_id).
  */
 
 import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
