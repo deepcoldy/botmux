@@ -169,6 +169,7 @@ const daemonInternalApi = createDaemonInternalApi({
   proxyToDaemon,
   ownerOf: (sid) => aggregator.ownerOf(sid),
   scheduleOwnerOf: (id) => aggregator.scheduleOwnerOf(id),
+  scheduleExists: (id) => aggregator.scheduleExists(id),
 });
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {

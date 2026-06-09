@@ -81,6 +81,10 @@ function makeDeps(over: Partial<DaemonInternalApiDeps> = {}): DaemonInternalApiD
     proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
     ownerOf: vi.fn((sid: string) => sid === 'sess-known' ? 'cli_owner' : undefined),
     scheduleOwnerOf: vi.fn((id: string) => id === 'sched-known' ? 'cli_owner' : undefined),
+    // sched-known has owner; sched-legacy exists but has no larkAppId
+    // (legacy persistence). 'sched-missing' deliberately omitted to assert
+    // 404 unknown_schedule for unknown ids.
+    scheduleExists: vi.fn((id: string) => id === 'sched-known' || id === 'sched-legacy'),
     settingsOwnerDeps: {
       resolveOwnerCandidates: vi.fn(async () => [{ unionId: 'on_admin', name: 'admin' }]),
     },
@@ -634,7 +638,9 @@ describe('dispatch: schedules write', () => {
  *  refuse with 403 schedule_owner_mismatch and NEVER touch
  *  `proxyToDaemon`. The test seam (no callerAppId) keeps the historical
  *  pass-through for `dispatchForTest`.
- *  Run is left to slice 2b. */
+ *  The Route B gate covers all three verbs (run|pause|resume) — the UI
+ *  only exposes pause/resume in slice 2a, but the underlying route table
+ *  shares one handler, so run is tested for completeness. */
 describe('dispatch: schedules write — cross-bot owner gate', () => {
   function ownerMismatchDeps() {
     return makeDeps({
@@ -644,7 +650,7 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
     });
   }
 
-  for (const action of ['pause', 'resume'] as const) {
+  for (const action of ['pause', 'resume', 'run'] as const) {
     it(`callerAppId=cli_a + owner=cli_b → 403 schedule_owner_mismatch, proxyToDaemon NOT called (${action})`, async () => {
       const deps = ownerMismatchDeps();
       const api = createDaemonInternalApi(deps);
@@ -680,6 +686,63 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
       );
     });
   }
+
+  /** Legacy schedule rows (no `larkAppId` field — persisted before per-bot
+   *  routing existed) survive the read scope filter (see scopeByCaller
+   *  short-circuit on missing larkAppId) and are still visible in the
+   *  schedules card. Without this branch, the user would click pause /
+   *  resume on a legacy row and the write would 404 because
+   *  scheduleOwnerOf returns undefined. The fix: proxy legacy rows to the
+   *  AUTHENTICATED caller's bot — the same bot that fetched and rendered
+   *  the row in the first place.
+   *  codex 2026-06-10 schedules slice 2a blocker. */
+  describe('legacy schedule rows (scheduleOwnerOf returns undefined)', () => {
+    function legacyDeps() {
+      return makeDeps({
+        // 'sched-legacy' exists but has no owner — pre-larkAppId persistence.
+        scheduleOwnerOf: vi.fn((id: string) => id === 'sched-known' ? 'cli_b' : undefined),
+        scheduleExists: vi.fn((id: string) => id === 'sched-known' || id === 'sched-legacy'),
+        proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
+      });
+    }
+
+    for (const action of ['pause', 'resume'] as const) {
+      it(`legacy row + callerAppId=cli_caller → proxy to caller (${action})`, async () => {
+        const deps = legacyDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-legacy/${action}`), '', 'cli_caller');
+        expect(r.status).toBe(200);
+        expect(deps.proxyToDaemon).toHaveBeenCalledTimes(1);
+        // Critical: routed to caller, NOT to the (nonexistent) row owner.
+        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+          'cli_caller',
+          `/api/schedules/sched-legacy/${action}`,
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+
+      it(`legacy row + test seam (no callerAppId) → 404 unknown_schedule (back-compat) (${action})`, async () => {
+        const deps = legacyDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-legacy/${action}`));
+        // dispatchForTest with no callerAppId keeps the historical 404 for
+        // legacy rows — production callers always have an HMAC appId, so
+        // the only path that hits this is the test seam itself.
+        expect(r.status).toBe(404);
+        expect((r.body as any).error).toBe('unknown_schedule');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+      });
+
+      it(`row genuinely missing → 404 unknown_schedule (regardless of caller) (${action})`, async () => {
+        const deps = legacyDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-vanished/${action}`), '', 'cli_caller');
+        expect(r.status).toBe(404);
+        expect((r.body as any).error).toBe('unknown_schedule');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+      });
+    }
+  });
 
   // Sanity: sessions write endpoint is NOT affected by this commit — the
   // sessions write path still uses ownerOf-only routing (no cross-bot 403

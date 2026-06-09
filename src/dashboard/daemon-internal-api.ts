@@ -79,6 +79,10 @@ export interface DaemonInternalApiDeps {
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
   ownerOf: (sessionId: string) => string | undefined;
   scheduleOwnerOf: (id: string) => string | undefined;
+  /** True iff a schedule row with this id exists at all in the aggregator,
+   *  regardless of its `larkAppId` presence. Used by the Route B write gate
+   *  to tell apart "legacy schedule (no owner field)" from "unknown id". */
+  scheduleExists: (id: string) => boolean;
 
   // ─── OWNER CHECK ──────────────────────────────────────────────────
   /** Override for unit tests; production omits and uses the real federation helper. */
@@ -419,14 +423,43 @@ const ROUTES: RouteDef[] = [
     handle: async (m, ctx, deps) => {
       const id = decodeURIComponent(m[1]);
       const action = m[2];
+
+      // Three-state routing (codex 2026-06-10 blocker fix):
+      //  - row missing entirely → 404 unknown_schedule
+      //  - row present with larkAppId → cross-bot gate (403 on mismatch)
+      //  - row present WITHOUT larkAppId (legacy, e.g. pre-v0.4 persistence)
+      //    → proxy to the caller's own bot. legacy rows are kept visible
+      //    in the read path (`scopeByCaller` short-circuits when caller is
+      //    undefined OR when the row has no owner) AND continue to be
+      //    executed by `scheduler.belongsToOwner` on the primary daemon.
+      //    Without this branch, the user would see the row + actionable
+      //    buttons but every POST would 404 — the read/write disconnect
+      //    codex flagged. With it, the caller's bot proxies the action
+      //    just like an explicit-owner row would.
       const owner = deps.scheduleOwnerOf(id);
-      if (!owner) return { status: 404, body: { ok: false, error: 'unknown_schedule' } };
-      // codex 2026-06-10 cross-bot guard: refuse when the caller is not the
-      // schedule's owning bot. The previous proxy handed off to `owner`
-      // without checking `ctx.callerAppId`, so a bot A owner could in
-      // principle replay or forge a schedule id and pause/resume a bot B
-      // schedule. The test seam (`callerAppId === undefined`) keeps the
-      // historical pass-through, since `dispatchForTest` is trusted.
+      if (owner === undefined) {
+        if (!deps.scheduleExists(id)) {
+          return { status: 404, body: { ok: false, error: 'unknown_schedule' } };
+        }
+        // Legacy row. Production: route to the authenticated caller's bot.
+        // Test seam (callerAppId undefined): preserve pre-blocker behaviour
+        // (404) so existing dispatchForTest tests stay deterministic.
+        if (ctx.callerAppId === undefined) {
+          return { status: 404, body: { ok: false, error: 'unknown_schedule' } };
+        }
+        const upstream = await deps.proxyToDaemon(
+          ctx.callerAppId,
+          `/api/schedules/${encodeURIComponent(id)}/${action}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: ctx.bodyRaw.length > 0 ? ctx.bodyRaw : '{}',
+          },
+        );
+        return { status: upstream.status, body: await readUpstream(upstream) };
+      }
+      // Owned row. Cross-bot guard: refuse when the caller is not the
+      // owning bot. test seam keeps the historical pass-through.
       if (ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
         return { status: 403, body: { ok: false, error: 'schedule_owner_mismatch' } };
       }
