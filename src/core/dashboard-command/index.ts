@@ -28,6 +28,7 @@ import {
 } from './stub.js';
 import { handleDashboardSettings, type DashboardSettingsCommandDeps } from './settings.js';
 import { handleDashboardSessions, type DashboardSessionsCommandDeps } from './sessions.js';
+import { handleDashboardSchedules, type DashboardSchedulesCommandDeps } from './schedules.js';
 
 /** Optional test seam — production omits and uses the real PR2 helper. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
@@ -35,6 +36,7 @@ export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   sendUserMessage?: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
   settings?: DashboardSettingsCommandDeps;
   sessions?: DashboardSessionsCommandDeps;
+  schedules?: DashboardSchedulesCommandDeps;
 }
 
 export async function handleDashboardCommand(
@@ -97,6 +99,12 @@ export async function handleDashboardCommand(
   if (sub === 'sessions') {
     const sessionsArgs = args.replace(/^sessions\s*/, '');
     return handleDashboardSessions(message, sessionsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.sessions);
+  }
+
+  // PR3 schedules slice 1: read-only list + pagination + refresh.
+  if (sub === 'schedules') {
+    const schedulesArgs = args.replace(/^schedules\s*/, '');
+    return handleDashboardSchedules(message, schedulesArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.schedules);
   }
 
   if (DASHBOARD_MODULES.includes(sub as DashboardModule)) {

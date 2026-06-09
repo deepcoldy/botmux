@@ -597,6 +597,20 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.dm_failed': '⚠️ 给 Bot Owner 发送会话列表失败：{reason}',
   'card.dashboard.sessions.list_failed': '⚠️ 拉取会话列表失败：{reason}',
 
+  // schedules card (PR3 slice 1)
+  'card.dashboard.schedules.title': '⏰ Dashboard 定时任务',
+  'card.dashboard.schedules.count_summary': '启用 {enabled} · 暂停 {paused} · 第 {page}/{totalPages} 页',
+  'card.dashboard.schedules.empty': '_当前没有定时任务_',
+  'card.dashboard.schedules.refresh': '🔄 刷新',
+  'card.dashboard.schedules.prev': '← 上一页',
+  'card.dashboard.schedules.next': '下一页 →',
+  'card.dashboard.schedules.next_label': '下次 {rel}',
+  'card.dashboard.schedules.last_label': '上次 {rel}',
+  'card.dashboard.schedules.repeat_label': '已跑 {repeat}',
+  'card.dashboard.schedules.dm_sent': '📬 Dashboard 定时任务列表已私信给 Bot Owner。',
+  'card.dashboard.schedules.dm_failed': '⚠️ 给 Bot Owner 发送定时任务列表失败：{reason}',
+  'card.dashboard.schedules.list_failed': '⚠️ 拉取定时任务列表失败：{reason}',
+
   'card.dashboard.settings.dm_sent': '📬 Dashboard settings 卡片已私信给 Bot Owner。',
   'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送 settings 卡片失败：{reason}',
 

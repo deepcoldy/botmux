@@ -132,6 +132,14 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/sessions-list$/,
     handle: async (_m, _ctx, deps) => ({ status: 200, body: { sessions: deps.getSessions() } }),
   },
+  // PR3 `/dashboard schedules` slice 1: dedicated list endpoint so the
+  // card command doesn't pay the cost of `overview-snapshot` (which also
+  // builds the groups matrix). Mirrors `sessions-list` shape.
+  {
+    method: 'GET',
+    pathRe: /^\/__daemon\/schedules-list$/,
+    handle: async (_m, _ctx, deps) => ({ status: 200, body: { schedules: deps.getSchedules() } }),
+  },
   {
     method: 'GET',
     pathRe: /^\/__daemon\/settings-snapshot$/,

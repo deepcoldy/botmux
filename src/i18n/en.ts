@@ -594,6 +594,20 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.dm_failed': '⚠️ Failed to DM the sessions list to Bot Owner: {reason}',
   'card.dashboard.sessions.list_failed': '⚠️ Failed to fetch sessions list: {reason}',
 
+  // schedules card (PR3 slice 1)
+  'card.dashboard.schedules.title': '⏰ Dashboard Schedules',
+  'card.dashboard.schedules.count_summary': 'Enabled {enabled} · Paused {paused} · Page {page}/{totalPages}',
+  'card.dashboard.schedules.empty': '_No schedules yet_',
+  'card.dashboard.schedules.refresh': '🔄 Refresh',
+  'card.dashboard.schedules.prev': '← Prev',
+  'card.dashboard.schedules.next': 'Next →',
+  'card.dashboard.schedules.next_label': 'next {rel}',
+  'card.dashboard.schedules.last_label': 'last {rel}',
+  'card.dashboard.schedules.repeat_label': 'ran {repeat}',
+  'card.dashboard.schedules.dm_sent': '📬 The dashboard schedules list was DMed to the Bot Owner.',
+  'card.dashboard.schedules.dm_failed': '⚠️ Failed to DM the schedules list to Bot Owner: {reason}',
+  'card.dashboard.schedules.list_failed': '⚠️ Failed to fetch schedules list: {reason}',
+
   'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to the Bot Owner.',
   'card.dashboard.settings.dm_failed': '⚠️ Failed to DM the settings card to Bot Owner: {reason}',
 

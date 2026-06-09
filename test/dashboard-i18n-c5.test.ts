@@ -40,6 +40,20 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.sessions.dm_failed',
   'card.dashboard.sessions.list_failed',
 
+  // ─── schedules card (PR3 slice 1) ───────────────────────────────────
+  'card.dashboard.schedules.title',
+  'card.dashboard.schedules.count_summary',
+  'card.dashboard.schedules.empty',
+  'card.dashboard.schedules.refresh',
+  'card.dashboard.schedules.prev',
+  'card.dashboard.schedules.next',
+  'card.dashboard.schedules.next_label',
+  'card.dashboard.schedules.last_label',
+  'card.dashboard.schedules.repeat_label',
+  'card.dashboard.schedules.dm_sent',
+  'card.dashboard.schedules.dm_failed',
+  'card.dashboard.schedules.list_failed',
+
   // ─── settings card (C4) ─────────────────────────────────────────────
   'card.dashboard.settings.title',
   'card.dashboard.settings.refresh',

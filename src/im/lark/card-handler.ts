@@ -408,6 +408,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
+  // ─── PR3 `/dashboard schedules` slice 1: refresh + page callbacks ─────
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_schedules_') &&
+    larkAppId
+  ) {
+    const { handleSchedulesCardAction } = await import('./schedules-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const schedulesLocale = localeForBot(larkAppId);
+    return handleSchedulesCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: schedulesLocale,
+    });
+  }
+
   // ─── /relay picker: state-changing actions (select / page / search) ────
   // These three actions all re-render the picker card with updated state:
   //   • relay_select — user clicked a session card → set as selectedSessionId
