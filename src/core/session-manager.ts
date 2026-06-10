@@ -32,6 +32,7 @@ import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRole } from './role-resolver.js';
+import { openCollabBoard, type RunStatus } from '../collab/index.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -45,6 +46,23 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
   if (!a && !b) return true;
   if (!a || !b) return false;
   return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady;
+}
+
+function isTerminalCollabRunStatus(status: RunStatus): boolean {
+  return status === 'succeeded' || status === 'failed' || status === 'stopped';
+}
+
+async function shouldKeepDormantCollabSession(ds: DaemonSession): Promise<boolean> {
+  const collab = ds.collab ?? ds.session.collab;
+  if (!collab) return false;
+  try {
+    const board = openCollabBoard(collab.runId, collab.baseDir ? { baseDir: collab.baseDir } : {});
+    const snapshot = await board.snapshot();
+    return !isTerminalCollabRunStatus(snapshot.status);
+  } catch (err) {
+    logger.warn(`[${ds.session.sessionId.substring(0, 8)}] failed to inspect collab board during restore; keeping dormant session: ${err instanceof Error ? err.message : String(err)}`);
+    return true;
+  }
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -787,6 +805,14 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
     const probe = probePersistentSession(backendType, backendName);
     if (probe === 'missing') {
+      if (await shouldKeepDormantCollabSession(ds)) {
+        // Collab recovery is owned by the lease watchdog. If daemon and worker
+        // died together, closing here erases the only active-session record the
+        // watchdog can use to emit WorkerLost and respawn a replacement.
+        const tag = ds.session.sessionId.substring(0, 8);
+        logger.warn(`[${tag}] ${backendType} backing session "${backendName}" is gone for active collab run — keeping dormant session for watchdog recovery`);
+        continue;
+      }
       // Probe succeeded and authoritatively says the backing pane/agent is gone
       // — this is a true zombie. Close it (evicts the active record + marks the
       // store row closed) so the next message starts a clean session.

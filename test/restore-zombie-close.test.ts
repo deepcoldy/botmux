@@ -140,6 +140,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import { restoreActiveSessions } from '../src/core/session-manager.js';
+import { openCollabBoard } from '../src/collab/index.js';
 import { forkWorker, closeSession } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
@@ -168,6 +169,30 @@ function makeActivePersistentSession(rootMessageId: string) {
   return s; // left active
 }
 
+async function makeActiveCollabSession(rootMessageId: string) {
+  const s = makeActivePersistentSession(rootMessageId);
+  const runId = `collab_${rootMessageId}`;
+  const baseDir = join(tempDir, 'collab-runs');
+  s.collab = { runId, workerId: 'coder-1', taskId: 'task-1', baseDir };
+  sessionStore.updateSession(s);
+  const board = openCollabBoard(runId, { baseDir });
+  await board.append({
+    type: 'RunCreated',
+    runId,
+    actor: 'control-plane',
+    idempotencyKey: 'run-created',
+    affectedPaths: ['goal', 'acceptanceCriteria', 'budget', 'status'],
+    payload: {
+      goal: 'keep working',
+      acceptanceCriteria: { command: 'false', doneWhen: 'exitZero' },
+      budgetLimit: 20,
+      budgetUnit: 'turns',
+      controlTopicId: rootMessageId,
+    },
+  });
+  return s;
+}
+
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
   it('"missing" → closes the zombie (Map eviction + store closed), does not fork', async () => {
     probe.result = 'missing';
@@ -180,6 +205,23 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect([...map.values()].some(v => v.session.sessionId === s.sessionId)).toBe(false);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('"missing" + active collab run → keeps a dormant session for watchdog recovery', async () => {
+    probe.result = 'missing';
+    const s = await makeActiveCollabSession('om_collab_missing');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    const ds = map.get(sessionKey('om_collab_missing', 'app_test'));
+    expect(ds).toBeDefined();
+    expect(ds!.worker).toBeNull();
+    expect(ds!.collab?.runId).toBe('collab_om_collab_missing');
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
