@@ -227,6 +227,115 @@ describe('buildSessionsCard', () => {
       expect(String(b.text?.content ?? '')).toContain('📂');
     }
   });
+
+  /** ─── Overview drilldown (2026-06-10) ───
+   *  When opened via `/dashboard overview` → goto sessions, the card uses
+   *  5/page and threads `origin=overview` + `page_size=5` onto every
+   *  button.value, plus renders a "🔙 返回总览" button. Standalone
+   *  `/dashboard sessions` is unaffected — opts omit both fields. */
+  describe('overview drilldown', () => {
+    const NOW = 2_000_000;
+    const rows = Array.from({ length: 12 }, (_, i) =>
+      row({ sessionId: `sess_${i}`, title: `s${i}`, status: 'idle', lastMessageAt: 1_000_000 - i * 1000 }),
+    );
+
+    it('pageSize=5 → paginates 5 rows/page (vs 10 default)', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5 }, NOW);
+      const parsed = JSON.parse(json);
+      // Each row produces two elements (info div + per-row action). Count
+      // detail buttons to know how many rows we rendered.
+      const detailButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((a: any) => a.value?.action === SESSIONS_ACTION_DETAIL);
+      expect(detailButtons.length).toBe(5);
+    });
+
+    it('standalone (no opts) → still paginates 10/page (no regression)', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1 }, NOW);
+      const parsed = JSON.parse(json);
+      const detailButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((a: any) => a.value?.action === SESSIONS_ACTION_DETAIL);
+      expect(detailButtons.length).toBe(10);
+    });
+
+    it('origin=overview → footer renders "🔙 返回总览" with action=dash_overview_refresh', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
+      expect(backBtn).toBeDefined();
+      expect(backBtn.value.invoker_open_id).toBe(INVOKER);
+      expect(String(backBtn.text?.content ?? '')).toContain('返回总览');
+    });
+
+    it('standalone (no origin) → NO back-to-overview button', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1 }, NOW);
+      const parsed = JSON.parse(json);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
+      expect(backBtn).toBeUndefined();
+    });
+
+    it('origin=overview + pageSize=5 → every button.value carries origin + page_size', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      // Every button EXCEPT the back-to-overview should carry origin +
+      // page_size. The back-to-overview itself only needs invoker_open_id
+      // (it dispatches back to the overview rebuild handler).
+      const childButtons = allButtons.filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      for (const b of childButtons) {
+        expect(b.value.origin).toBe('overview');
+        expect(b.value.page_size).toBe('5');
+      }
+    });
+
+    it('totalPages > 2 (rows=12 with pageSize=5 → 3 pages) → select_static jump-page appears', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const allActions = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const selectStatic = allActions.find((a: any) => a.tag === 'select_static');
+      expect(selectStatic).toBeDefined();
+      expect(selectStatic.value.action).toBe(SESSIONS_ACTION_PAGE);
+      // 12 rows / 5 per page = 3 pages → 3 options.
+      expect(selectStatic.options).toHaveLength(3);
+      expect(selectStatic.options.map((o: any) => o.value)).toEqual(['1', '2', '3']);
+    });
+
+    it('totalPages <= 2 → NO select_static (only prev/next + refresh)', () => {
+      const fewRows = rows.slice(0, 8); // 8 rows / 5 per page = 2 pages
+      const json = buildSessionsCard(fewRows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const allActions = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const selectStatic = allActions.find((a: any) => a.tag === 'select_static');
+      expect(selectStatic).toBeUndefined();
+    });
+
+    it('totalPages > 50 cap → NO select_static (payload safety)', () => {
+      // pageSize=1 with 60 rows → 60 pages > JUMP_PAGE_MAX_OPTIONS(50)
+      const manyRows = Array.from({ length: 60 }, (_, i) => row({ sessionId: `sess_x_${i}`, title: `s${i}` }));
+      const json = buildSessionsCard(manyRows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 1, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const allActions = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const selectStatic = allActions.find((a: any) => a.tag === 'select_static');
+      expect(selectStatic).toBeUndefined();
+    });
+  });
 });
 
 describe('buildSessionsDetailCard (slice 2a)', () => {
@@ -304,6 +413,42 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
     expect(detail.actions.close.enabled).toBe(false);
     const json = buildSessionsDetailCard(detail, baseOpts);
     expect(json).toContain('会话启动中');
+  });
+
+  /** ─── Overview drilldown — detail back button preserves nav ─── */
+  it('detail card with origin=overview → back button.value carries origin + page_size', () => {
+    const detail = detailFor({ sessionId: 'sess_back_overview', status: 'idle' });
+    const json = buildSessionsDetailCard(detail, {
+      ...baseOpts,
+      origin: 'overview',
+      pageSize: 5,
+    });
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const backBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_BACK_TO_LIST,
+    );
+    expect(backBtn.value.origin).toBe('overview');
+    expect(backBtn.value.page_size).toBe('5');
+    // The close button's value should ALSO carry nav so a successful close
+    // → rebuilt detail → then 🔙 返回 still lands on drilldown list.
+    const closeBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_CLOSE,
+    );
+    expect(closeBtn.value.origin).toBe('overview');
+    expect(closeBtn.value.page_size).toBe('5');
+  });
+
+  it('detail card WITHOUT origin → back/close values do NOT include origin/page_size', () => {
+    const detail = detailFor({ sessionId: 'sess_standalone', status: 'idle' });
+    const json = buildSessionsDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const backBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_BACK_TO_LIST,
+    );
+    expect(backBtn.value.origin).toBeUndefined();
+    expect(backBtn.value.page_size).toBeUndefined();
   });
 
   it('escapes title against <at> / <font> injection so user-supplied chars cannot break the wrapper', () => {
@@ -384,6 +529,109 @@ describe('handleSessionsCardAction', () => {
     );
     const cardJson = JSON.stringify(r.card?.data);
     expect(cardJson).toContain('第 2/3 页');
+  });
+
+  /** ─── Overview drilldown — handler honors nav state ─── */
+  it('page action via select_static (action.option, no value.page) → uses option page', async () => {
+    // 12 rows, pageSize=5 → 3 pages. select_static dispatches with
+    // action.option='3' but value.page is absent. Handler should fall back
+    // to action.option.
+    const rows = Array.from({ length: 12 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { sessions: rows }, raw: '' })),
+      } as any)),
+    });
+    // Inject `action.option` on the raw envelope (not value.page).
+    const envelope = {
+      operator: { open_id: INVOKER },
+      action: {
+        option: '3',
+        value: {
+          action: SESSIONS_ACTION_PAGE,
+          invoker_open_id: INVOKER,
+          origin: 'overview',
+          page_size: '5',
+        },
+      },
+      context: { open_message_id: 'om_card' },
+    } as any;
+    const r = await handleSessionsCardAction(envelope, LARK_APP_ID, deps);
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('第 3/3 页');
+  });
+
+  it('refresh with origin=overview → rebuilt card still has back-to-overview button + 5/page', async () => {
+    const rows = Array.from({ length: 12 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { sessions: rows }, raw: '' })),
+      } as any)),
+    });
+    const r = await handleSessionsCardAction(
+      makeAction({
+        action: SESSIONS_ACTION_REFRESH,
+        invoker_open_id: INVOKER,
+        origin: 'overview',
+        page_size: '5',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    // 12 / 5 = 3 pages.
+    expect(cardJson).toContain('第 1/3 页');
+    // Back-to-overview button.
+    expect(cardJson).toContain('dash_overview_refresh');
+    expect(cardJson).toContain('返回总览');
+  });
+
+  it('back_to_list with origin=overview → rebuilt list is drilldown shape (5/page + back btn)', async () => {
+    const rows = Array.from({ length: 12 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { sessions: rows }, raw: '' })),
+      } as any)),
+    });
+    const r = await handleSessionsCardAction(
+      makeAction({
+        action: SESSIONS_ACTION_BACK_TO_LIST,
+        invoker_open_id: INVOKER,
+        origin: 'overview',
+        page_size: '5',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('第 1/3 页');
+    expect(cardJson).toContain('dash_overview_refresh');
+  });
+
+  it('detail with origin=overview → detail card back/close values carry origin + page_size', async () => {
+    const rows = [row({ sessionId: 's_detail', title: 'detail', status: 'idle' })];
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { sessions: rows }, raw: '' })),
+      } as any)),
+    });
+    const r = await handleSessionsCardAction(
+      makeAction({
+        action: SESSIONS_ACTION_DETAIL,
+        invoker_open_id: INVOKER,
+        session_id: 's_detail',
+        origin: 'overview',
+        page_size: '5',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    // Detail card itself does NOT render back-to-overview (single back
+    // affordance per slice) but the back button must propagate nav so the
+    // rebuilt list stays drilldown.
+    expect(cardJson).toContain('"origin":"overview"');
+    expect(cardJson).toContain('"page_size":"5"');
   });
 
   it('non-owner → toast `owner_only`, NO client call', async () => {

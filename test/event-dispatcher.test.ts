@@ -2908,6 +2908,69 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     release();
     await first;
   });
+
+  // PR3 overview drilldown (2026-06-10): origin/page_size are now part of the
+  // dedupe key so a standalone-shaped click (origin=undefined, page_size=undef)
+  // and an overview-drilldown-shaped click (origin=overview, page_size=5) on
+  // the same page index don't hash-collide. The standalone+drilldown forms can
+  // theoretically reach the same handler from two different open cards within
+  // the dedupe window.
+  it('concurrent `dash_sessions_page` clicks differing ONLY by origin must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const evStandalone = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_a' },
+    };
+    const evDrilldown = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_b' },
+    };
+
+    const first = capturedHandlers['card.action.trigger'](evStandalone);
+    const second = capturedHandlers['card.action.trigger'](evDrilldown);
+    // Both should reach the handler — no dedupe.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([first, second]);
+  });
+
+  it('concurrent `dash_sessions_page` clicks at DIFFERENT pages but SAME origin must NOT dedupe (page already in key)', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const evPage1 = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '1', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    };
+    const evPage2 = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const first = capturedHandlers['card.action.trigger'](evPage1);
+    const second = capturedHandlers['card.action.trigger'](evPage2);
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([first, second]);
+  });
 });
 
 describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {

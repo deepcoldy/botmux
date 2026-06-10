@@ -51,6 +51,10 @@ export const SETTINGS_ACTION_REFRESH = 'dash_settings_refresh' as const;
  * `disabled: true` and still fires the callback, the handler short-circuits.
  */
 export const SETTINGS_ACTION_NOOP = 'dash_settings_noop' as const;
+/** Action emitted by "🔙 返回总览" on overview-origin settings cards. Same
+ *  string as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't
+ *  import to avoid a circular dep). */
+const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
 const TIME_REGEX = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TOGGLE_FIELDS: ReadonlySet<string> = new Set([
@@ -65,11 +69,22 @@ export interface BuildSettingsCardOpts {
   invokerOpenId: string;
   locale: Locale;
   canWrite: boolean;
+  /** Overview drilldown nav state. `'overview'` → footer renders
+   *  "🔙 返回总览" AND every action.value carries `origin=overview` so
+   *  toggle/set_time/refresh rebuilds keep the return affordance.
+   *  Settings is single-layer (no pages) → no `pageSize`. */
+  origin?: 'overview';
 }
 
 /** Build a Feishu interactive card JSON string from the PR1 DTO. */
 export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardOpts): string {
   const elements: unknown[] = [];
+
+  // Nav state — threaded into every action.value so the rebuild path keeps
+  // 「🔙 返回总览」 affordance across toggle/set_time/refresh round-trips.
+  // Empty values omitted → standalone cards stay byte-identical.
+  const navFields: Record<string, string> = {};
+  if (opts.origin === 'overview') navFields.origin = 'overview';
 
   // Header summary was dropped per user feedback: segmented controls already
   // make each toggle's state self-evident; a top-level summary becomes a second
@@ -91,7 +106,7 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
     });
 
     for (const toggle of section.toggles) {
-      elements.push(...buildSegmentedRow(toggle, opts));
+      elements.push(...buildSegmentedRow(toggle, opts, navFields));
     }
 
     if (section.hintKey) {
@@ -106,21 +121,33 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
 
   elements.push({ tag: 'hr' });
 
-  // Refresh button — read-only, GET-only path.
-  elements.push({
-    tag: 'action',
-    actions: [
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.dashboard.settings.refresh', undefined, opts.locale) },
-        type: 'default',
-        value: {
-          action: SETTINGS_ACTION_REFRESH,
-          invoker_open_id: opts.invokerOpenId,
-        },
+  // Refresh button — read-only, GET-only path. When the card was opened via
+  // overview drilldown, append "🔙 返回总览" beside it; standalone settings
+  // command omits the back button (no parent card to return to).
+  const footerActions: unknown[] = [
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.settings.refresh', undefined, opts.locale) },
+      type: 'default',
+      value: {
+        action: SETTINGS_ACTION_REFRESH,
+        invoker_open_id: opts.invokerOpenId,
+        ...navFields,
       },
-    ],
-  });
+    },
+  ];
+  if (opts.origin === 'overview') {
+    footerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.overview.back_button', undefined, opts.locale) },
+      type: 'default',
+      value: {
+        action: BACK_TO_OVERVIEW_ACTION,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    });
+  }
+  elements.push({ tag: 'action', actions: footerActions });
 
   // Footer security note (PR3 UI revision) — communicates that the card is
   // owner-private and ACK-refreshing, so users know clicks self-heal.
@@ -157,6 +184,7 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
 function buildSegmentedRow(
   toggle: SettingsCardDTO['sections'][number]['toggles'][number],
   opts: BuildSettingsCardOpts,
+  navFields: Record<string, string>,
 ): unknown[] {
   const labelLine = {
     tag: 'div',
@@ -191,7 +219,7 @@ function buildSegmentedRow(
     // callback, and the noop action is the fallback if it doesn't.
     onBtn.disabled = true;
     if (writable) {
-      onBtn.value = { action: SETTINGS_ACTION_NOOP, invoker_open_id: opts.invokerOpenId, field: toggle.key };
+      onBtn.value = { action: SETTINGS_ACTION_NOOP, invoker_open_id: opts.invokerOpenId, field: toggle.key, ...navFields };
     }
   } else {
     onBtn.value = {
@@ -199,6 +227,7 @@ function buildSegmentedRow(
       invoker_open_id: opts.invokerOpenId,
       field: toggle.key,
       next_value: 'true',
+      ...navFields,
     };
   }
 
@@ -211,7 +240,7 @@ function buildSegmentedRow(
   if (!enabled || !writable) {
     offBtn.disabled = true;
     if (writable) {
-      offBtn.value = { action: SETTINGS_ACTION_NOOP, invoker_open_id: opts.invokerOpenId, field: toggle.key };
+      offBtn.value = { action: SETTINGS_ACTION_NOOP, invoker_open_id: opts.invokerOpenId, field: toggle.key, ...navFields };
     }
   } else {
     offBtn.value = {
@@ -219,6 +248,7 @@ function buildSegmentedRow(
       invoker_open_id: opts.invokerOpenId,
       field: toggle.key,
       next_value: 'false',
+      ...navFields,
     };
   }
 
@@ -274,6 +304,7 @@ function buildSegmentedRow(
                   action: SETTINGS_ACTION_SET_TIME,
                   invoker_open_id: opts.invokerOpenId,
                   field: toggle.key,
+                  ...navFields,
                 },
               },
             ],
@@ -400,13 +431,14 @@ function successResult(
   invokerOpenId: string,
   locale: Locale,
   fallbackToastKey: string,
+  origin?: 'overview',
 ): SettingsCardHandlerResult {
   const settings = (payload as any)?.body?.settings ?? (payload as any)?.settings;
   if (!settings || typeof settings !== 'object') {
     return { toast: { type: 'success', content: t(fallbackToastKey, undefined, locale) } };
   }
   const dto = composeSections(settings, { canWrite: true });
-  const cardJson = buildSettingsCard(dto, { invokerOpenId, locale, canWrite: true });
+  const cardJson = buildSettingsCard(dto, { invokerOpenId, locale, canWrite: true, origin });
   // No `toast` on the success path — the card body itself ("✓ 已开启" /
   // "✓ 已关闭") is the feedback. Returning toast + card together triggers
   // two separate render passes on the Lark client and flashes the OLD card
@@ -458,6 +490,12 @@ export async function handleSettingsCardAction(
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
+  // ─── Nav state (overview drilldown) ─────────────────────────────────
+  // Threaded by buildSettingsCard onto every action.value; we parse here
+  // so refresh / toggle / set_time rebuilds keep the「🔙 返回总览」 button.
+  const navOrigin: 'overview' | undefined =
+    (value as Record<string, unknown>).origin === 'overview' ? 'overview' : undefined;
+
   // ─── 3) Noop short-circuit (PR3 UI revision, codex C4) ───────────────
   // The current-value button in the segmented control is rendered with
   // `disabled: true` but ALSO carries `dash_settings_noop` as a fail-safe:
@@ -475,7 +513,7 @@ export async function handleSettingsCardAction(
     try {
       const client = deps.createClient(larkAppId);
       const snap = await client.request({ method: 'GET', path: '/__daemon/settings-snapshot' });
-      return successResult(snap, expectedOwner, locale, 'card.dashboard.settings.refreshed');
+      return successResult(snap, expectedOwner, locale, 'card.dashboard.settings.refreshed', navOrigin);
     } catch (e) {
       return errorToast('card.dashboard.settings.snapshot_failed', { reason: (e as Error).message }, locale);
     }
@@ -515,7 +553,7 @@ export async function handleSettingsCardAction(
         locale,
       );
     }
-    return successResult(r, expectedOwner, locale, 'card.dashboard.settings.saved');
+    return successResult(r, expectedOwner, locale, 'card.dashboard.settings.saved', navOrigin);
   } catch (e) {
     return errorToast('card.dashboard.settings.save_failed', { reason: (e as Error).message }, locale);
   }

@@ -593,6 +593,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.refresh': '🔄 刷新',
   'card.dashboard.sessions.prev': '← 上一页',
   'card.dashboard.sessions.next': '下一页 →',
+  'card.dashboard.sessions.jump_page': '第 {n} 页',
   'card.dashboard.sessions.dm_sent': '📬 Dashboard 会话列表已私信给 Bot Owner。',
   'card.dashboard.sessions.dm_failed': '⚠️ 给 Bot Owner 发送会话列表失败：{reason}',
   'card.dashboard.sessions.list_failed': '⚠️ 拉取会话列表失败：{reason}',
@@ -620,6 +621,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.refresh': '🔄 刷新',
   'card.dashboard.schedules.prev': '← 上一页',
   'card.dashboard.schedules.next': '下一页 →',
+  'card.dashboard.schedules.jump_page': '第 {n} 页',
   'card.dashboard.schedules.next_label': '下次 {rel}',
   'card.dashboard.schedules.last_label': '上次 {rel}',
   'card.dashboard.schedules.repeat_label': '已跑 {repeat}',
@@ -720,6 +722,10 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_sessions': '📂 会话列表',
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
+  // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
+  // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
+  // dispatch action so the parent overview card rebuilds cleanly.
+  'card.dashboard.overview.back_button': '🔙 返回总览',
   'card.dashboard.overview.dm_sent': '📬 Dashboard 总览已私信给 Bot Owner。',
   'card.dashboard.overview.dm_failed': '⚠️ 给 Bot Owner 发送总览失败：{reason}',
   'card.dashboard.overview.overview_failed': '⚠️ 拉取总览快照失败：{reason}',

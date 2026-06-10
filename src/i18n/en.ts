@@ -590,6 +590,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.refresh': '🔄 Refresh',
   'card.dashboard.sessions.prev': '← Prev',
   'card.dashboard.sessions.next': 'Next →',
+  'card.dashboard.sessions.jump_page': 'Page {n}',
   'card.dashboard.sessions.dm_sent': '📬 The dashboard sessions list was DMed to the Bot Owner.',
   'card.dashboard.sessions.dm_failed': '⚠️ Failed to DM the sessions list to Bot Owner: {reason}',
   'card.dashboard.sessions.list_failed': '⚠️ Failed to fetch sessions list: {reason}',
@@ -617,6 +618,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.refresh': '🔄 Refresh',
   'card.dashboard.schedules.prev': '← Prev',
   'card.dashboard.schedules.next': 'Next →',
+  'card.dashboard.schedules.jump_page': 'Page {n}',
   'card.dashboard.schedules.next_label': 'next {rel}',
   'card.dashboard.schedules.last_label': 'last {rel}',
   'card.dashboard.schedules.repeat_label': 'ran {repeat}',
@@ -717,6 +719,10 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_sessions': '📂 Sessions',
   'card.dashboard.overview.goto_schedules': '📂 Schedules',
   'card.dashboard.overview.goto_settings': '📂 Settings',
+  // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
+  // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
+  // dispatch action so the parent overview card rebuilds cleanly.
+  'card.dashboard.overview.back_button': '🔙 Back to Overview',
   'card.dashboard.overview.dm_sent': '📬 The dashboard overview was DMed to the Bot Owner.',
   'card.dashboard.overview.dm_failed': '⚠️ Failed to DM the overview to Bot Owner: {reason}',
   'card.dashboard.overview.overview_failed': '⚠️ Failed to fetch overview snapshot: {reason}',

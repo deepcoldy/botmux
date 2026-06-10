@@ -138,4 +138,122 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
+
+  /** ─── Overview drilldown (2026-06-10) ───
+   *  Verifies the 3 goto handlers thread `origin=overview` + `pageSize=5`
+   *  (sessions/schedules) / `origin=overview` only (settings) into the
+   *  sub-card body. The footer of each sub-card should render
+   *  "🔙 返回总览" via the shared `dash_overview_refresh` action so the
+   *  parent overview rebuilds without a custom return route. */
+  describe('overview drilldown — goto threads origin + pageSize into sub-card', () => {
+    function makeRows(n: number) {
+      return Array.from({ length: n }, (_, i) => ({
+        sessionId: `s_${i}`,
+        rootMessageId: 'om',
+        chatId: 'oc',
+        chatType: 'group',
+        title: `t${i}`,
+        cliId: 'claude-code',
+        workingDir: '~/x',
+        status: 'idle',
+        lastMessageAt: 1_000_000 - i * 100,
+        cliVersion: 'v',
+        webPort: 7891,
+        scope: 'thread',
+        spawnedAt: 0,
+        larkAppId: LARK_APP_ID,
+        isOncall: false,
+        hasHistory: true,
+      }));
+    }
+
+    it('goto_sessions → sessions card has 5/page, 返回总览, origin/page_size on all child buttons', async () => {
+      // 12 rows → with pageSize=5, 3 pages, select_static jump appears.
+      const rows = makeRows(12);
+      const requestSpy = vi.fn(async () => ({ status: 200, raw: '', body: { sessions: rows } }));
+      mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+      const data: CardActionData = {
+        operator: { open_id: INVOKER },
+        action: { value: { action: 'dash_overview_goto_sessions', invoker_open_id: INVOKER } },
+        context: { open_message_id: 'om_card' },
+      };
+      const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+      expect(result.card).toBeDefined();
+      const cardJson = JSON.stringify(result.card?.data);
+
+      // 1) 5/page → 12 rows → 3 pages.
+      expect(cardJson).toContain('第 1/3 页');
+
+      // 2) Back-to-overview button present.
+      expect(cardJson).toContain('"action":"dash_overview_refresh"');
+      expect(cardJson).toContain('返回总览');
+
+      // 3) All child buttons carry origin + page_size.
+      expect(cardJson).toContain('"origin":"overview"');
+      expect(cardJson).toContain('"page_size":"5"');
+
+      // 4) select_static jump-page picker present (3 pages > 2).
+      expect(cardJson).toContain('select_static');
+    });
+
+    it('goto_schedules → schedules card has 5/page, 返回总览, origin/page_size threaded', async () => {
+      const tasks = Array.from({ length: 12 }, (_, i) => ({
+        id: `sch_${i}`,
+        name: `daily-${i}`,
+        prompt: 'say hi',
+        parsed: { kind: 'cron', display: '0 9 * * *', expr: '0 9 * * *' },
+        enabled: true,
+        larkAppId: LARK_APP_ID,
+        chatId: 'oc',
+        nextRunAt: `2026-06-09T13:0${i % 10}:00.000Z`,
+        lastRunAt: '2026-06-08T13:00:00.000Z',
+        lastStatus: 'ok',
+      }));
+      const requestSpy = vi.fn(async () => ({ status: 200, raw: '', body: { schedules: tasks } }));
+      mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+      const data: CardActionData = {
+        operator: { open_id: INVOKER },
+        action: { value: { action: 'dash_overview_goto_schedules', invoker_open_id: INVOKER } },
+        context: { open_message_id: 'om_card' },
+      };
+      const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+      expect(result.card).toBeDefined();
+      const cardJson = JSON.stringify(result.card?.data);
+      expect(cardJson).toContain('第 1/3 页');
+      expect(cardJson).toContain('"action":"dash_overview_refresh"');
+      expect(cardJson).toContain('返回总览');
+      expect(cardJson).toContain('"origin":"overview"');
+      expect(cardJson).toContain('"page_size":"5"');
+    });
+
+    it('goto_settings → settings card has 返回总览 + origin on every action.value; NO page_size', async () => {
+      const requestSpy = vi.fn(async () => ({
+        status: 200, raw: '',
+        body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
+      }));
+      mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+      const data: CardActionData = {
+        operator: { open_id: INVOKER },
+        action: { value: { action: 'dash_overview_goto_settings', invoker_open_id: INVOKER } },
+        context: { open_message_id: 'om_card' },
+      };
+      const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+      expect(result.card).toBeDefined();
+      const cardJson = JSON.stringify(result.card?.data);
+      // Settings sub-card.
+      expect(cardJson).toContain('Dashboard 全局设置');
+      // Back-to-overview button + origin threaded.
+      expect(cardJson).toContain('"action":"dash_overview_refresh"');
+      expect(cardJson).toContain('返回总览');
+      expect(cardJson).toContain('"origin":"overview"');
+      // Settings single-layer → never carries page_size.
+      expect(cardJson).not.toContain('"page_size"');
+    });
+  });
 });

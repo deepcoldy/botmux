@@ -407,6 +407,15 @@ function cardActionKey(larkAppId: string, data: any): string {
     // page 5 and immediately decides they meant page 4) would be deduped
     // as "in-flight" and the second click silently dropped.
     page: value?.page,
+    // PR3 overview drilldown (codex 2026-06-10): when a user switches
+    // between a standalone list card and an overview-drilldown list card
+    // pointed at the same module within the dedupe window, `origin`
+    // distinguishes the two so the second click isn't dropped. `page_size`
+    // covers a similar edge — overview drilldown uses 5/page while the
+    // standalone command stays on 10/page; without it a rapid mode-switch
+    // would hash-collide.
+    origin: value?.origin,
+    pageSize: value?.page_size,
   })}`;
 }
 

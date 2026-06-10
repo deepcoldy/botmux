@@ -64,8 +64,17 @@ export const SCHEDULES_ACTION_DETAIL = 'dash_schedules_detail' as const;
 export const SCHEDULES_ACTION_PAUSE = 'dash_schedules_pause' as const;
 export const SCHEDULES_ACTION_RESUME = 'dash_schedules_resume' as const;
 export const SCHEDULES_ACTION_BACK_TO_LIST = 'dash_schedules_back_to_list' as const;
+/** Action emitted by "🔙 返回总览" on overview-origin sub-cards. Same string
+ *  as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't import
+ *  to avoid a circular dep). */
+const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
+/** Default page size for standalone `/dashboard schedules`. Overview
+ *  drilldown overrides to 5 via `pageSize` opt. */
 const PAGE_SIZE = 10;
+
+/** Hard cap on `select_static` jump-page option count. */
+const JUMP_PAGE_MAX_OPTIONS = 50;
 
 function toneIcon(tone: string): string {
   switch (tone) {
@@ -102,6 +111,12 @@ export interface BuildSchedulesCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
+  /** Page size override. Standalone `/dashboard schedules` omits → PAGE_SIZE (10).
+   *  Overview drilldown sets to 5. Threaded through every button.value. */
+  pageSize?: number;
+  /** Navigation origin. `'overview'` → footer renders "🔙 返回总览" and every
+   *  button.value carries `origin=overview`. Undefined → standalone card. */
+  origin?: 'overview';
 }
 
 /** Build the schedules list card JSON. Pure (sorts + paginates + renders). */
@@ -110,8 +125,18 @@ export function buildSchedulesCard(
   opts: BuildSchedulesCardOpts,
   nowMs: number,
 ): string {
+  const effectivePageSize =
+    typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
+      ? Math.floor(opts.pageSize)
+      : PAGE_SIZE;
   const sorted = sortForList(tasks);
-  const { items, total, page, totalPages } = paginateSchedules(sorted, opts.page, PAGE_SIZE);
+  const { items, total, page, totalPages } = paginateSchedules(sorted, opts.page, effectivePageSize);
+
+  // Plumb origin + page_size onto every button.value so refresh/page/detail/
+  // detail-back rebuilds keep the same drilldown state.
+  const navFields: Record<string, string> = {};
+  if (opts.origin === 'overview') navFields.origin = 'overview';
+  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
 
   const enabledCount = sorted.filter(t => t.enabled).length;
   const pausedCount = total - enabledCount;
@@ -166,6 +191,7 @@ export function buildSchedulesCard(
               action: SCHEDULES_ACTION_DETAIL,
               invoker_open_id: opts.invokerOpenId,
               schedule_id: dto.id,
+              ...navFields,
             },
           },
         ],
@@ -187,6 +213,7 @@ export function buildSchedulesCard(
         action: SCHEDULES_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.max(1, page - 1)),
+        ...navFields,
       },
     });
     actions.push({
@@ -198,8 +225,35 @@ export function buildSchedulesCard(
         action: SCHEDULES_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.min(totalPages, page + 1)),
+        ...navFields,
       },
     });
+    // "Jump to page" select — same action as prev/next, page comes via
+    // action.option. Handler reads `value.page ?? action.option ?? '1'`.
+    // Capped at JUMP_PAGE_MAX_OPTIONS to keep payload small.
+    if (totalPages > 2 && totalPages <= JUMP_PAGE_MAX_OPTIONS) {
+      const options = Array.from({ length: totalPages }, (_, i) => {
+        const n = i + 1;
+        return {
+          text: { tag: 'plain_text', content: t('card.dashboard.schedules.jump_page', { n: String(n) }, opts.locale) },
+          value: String(n),
+        };
+      });
+      actions.push({
+        tag: 'select_static',
+        placeholder: {
+          tag: 'plain_text',
+          content: t('card.dashboard.schedules.jump_page', { n: String(page) }, opts.locale),
+        },
+        initial_option: String(page),
+        options,
+        value: {
+          action: SCHEDULES_ACTION_PAGE,
+          invoker_open_id: opts.invokerOpenId,
+          ...navFields,
+        },
+      });
+    }
   }
   actions.push({
     tag: 'button',
@@ -208,8 +262,22 @@ export function buildSchedulesCard(
     value: {
       action: SCHEDULES_ACTION_REFRESH,
       invoker_open_id: opts.invokerOpenId,
+      ...navFields,
     },
   });
+  // Overview drilldown only — back-to-overview reuses overview-refresh
+  // action; card-handler routes by action prefix.
+  if (opts.origin === 'overview') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.overview.back_button', undefined, opts.locale) },
+      type: 'default',
+      value: {
+        action: BACK_TO_OVERVIEW_ACTION,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    });
+  }
   elements.push({ tag: 'action', actions });
 
   elements.push({
@@ -269,6 +337,11 @@ function renderRow(row: ScheduleRowDto, locale: Locale): unknown {
 export interface BuildSchedulesDetailCardOpts {
   invokerOpenId: string;
   locale: Locale;
+  /** Overview drilldown nav state — threaded into the "🔙 返回" button so
+   *  the list rebuilt by BACK_TO_LIST is still drilldown-shaped (5/page +
+   *  return-to-overview). Detail itself does NOT render return-to-overview. */
+  origin?: 'overview';
+  pageSize?: number;
 }
 
 /**
@@ -395,6 +468,19 @@ export function buildSchedulesDetailCard(
 
   elements.push({ tag: 'hr' });
 
+  // Threaded nav state — pause/resume rebuild this same detail card on
+  // success, so users may then press 🔙 返回 and expect the drilldown list.
+  const navFields: Record<string, string> = {};
+  if (opts.origin === 'overview') navFields.origin = 'overview';
+  if (
+    typeof opts.pageSize === 'number'
+    && Number.isFinite(opts.pageSize)
+    && opts.pageSize > 0
+    && opts.pageSize !== PAGE_SIZE
+  ) {
+    navFields.page_size = String(Math.floor(opts.pageSize));
+  }
+
   // ─── Action row — pause / resume (mutually exclusive) + back ───────────
   const pauseEnabled = detail.actions.pause.enabled === true;
   const resumeEnabled = detail.actions.resume.enabled === true;
@@ -406,6 +492,7 @@ export function buildSchedulesDetailCard(
       action: SCHEDULES_ACTION_PAUSE,
       invoker_open_id: opts.invokerOpenId,
       schedule_id: detail.id,
+      ...navFields,
     },
   };
   if (!pauseEnabled) pauseButton.disabled = true;
@@ -417,6 +504,7 @@ export function buildSchedulesDetailCard(
       action: SCHEDULES_ACTION_RESUME,
       invoker_open_id: opts.invokerOpenId,
       schedule_id: detail.id,
+      ...navFields,
     },
   };
   if (!resumeEnabled) resumeButton.disabled = true;
@@ -432,6 +520,7 @@ export function buildSchedulesDetailCard(
         value: {
           action: SCHEDULES_ACTION_BACK_TO_LIST,
           invoker_open_id: opts.invokerOpenId,
+          ...navFields,
         },
       },
     ],
@@ -586,6 +675,14 @@ export async function handleSchedulesCardAction(
   const client = deps.createClient(larkAppId);
   const now = (): number => (deps.nowMs ? deps.nowMs() : Date.now());
 
+  // ─── Nav state (overview drilldown) ─────────────────────────────────
+  // Threaded by buildSchedulesCard onto every button.value; we parse here
+  // so the rebuild path keeps the same shape (5/page + 🔙 返回总览).
+  const navOrigin: 'overview' | undefined = value.origin === 'overview' ? 'overview' : undefined;
+  const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
+  const navPageSize: number | undefined =
+    Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+
   // ─── 3a) DETAIL — open the per-schedule detail card ─────────────────
   if (action === SCHEDULES_ACTION_DETAIL) {
     const scheduleId = value.schedule_id;
@@ -602,6 +699,8 @@ export async function handleSchedulesCardAction(
     const cardJson = buildSchedulesDetailCard(detail, {
       invokerOpenId: expectedOwner,
       locale,
+      origin: navOrigin,
+      pageSize: navPageSize,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -676,6 +775,8 @@ export async function handleSchedulesCardAction(
       const cardJson = buildSchedulesDetailCard(detail, {
         invokerOpenId: expectedOwner,
         locale,
+        origin: navOrigin,
+        pageSize: navPageSize,
       });
       return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
     }
@@ -705,6 +806,8 @@ export async function handleSchedulesCardAction(
     const cardJson = buildSchedulesDetailCard(detail, {
       invokerOpenId: expectedOwner,
       locale,
+      origin: navOrigin,
+      pageSize: navPageSize,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -715,7 +818,13 @@ export async function handleSchedulesCardAction(
     if ('errorResult' in r) return r.errorResult;
     const cardJson = buildSchedulesCard(
       r.tasks,
-      { invokerOpenId: expectedOwner, locale, page: 1 },
+      {
+        invokerOpenId: expectedOwner,
+        locale,
+        page: 1,
+        pageSize: navPageSize,
+        origin: navOrigin,
+      },
       now(),
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -726,7 +835,11 @@ export async function handleSchedulesCardAction(
   // left here are REFRESH + PAGE (the other 4 returned early).
   let page = 1;
   if (action === SCHEDULES_ACTION_PAGE) {
-    const parsed = Number.parseInt(value.page ?? '1', 10);
+    // Page comes from value.page (prev/next button) OR action.option
+    // (select_static "jump to page" picker). Same action key, different
+    // dispatch field — handler converges on one branch.
+    const raw = value.page ?? (data.action as { option?: string } | undefined)?.option ?? '1';
+    const parsed = Number.parseInt(raw, 10);
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
   }
 
@@ -734,7 +847,13 @@ export async function handleSchedulesCardAction(
   if ('errorResult' in r) return r.errorResult;
   const cardJson = buildSchedulesCard(
     r.tasks,
-    { invokerOpenId: expectedOwner, locale, page },
+    {
+      invokerOpenId: expectedOwner,
+      locale,
+      page,
+      pageSize: navPageSize,
+      origin: navOrigin,
+    },
     now(),
   );
   return {

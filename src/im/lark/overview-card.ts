@@ -441,7 +441,16 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.sessions.list_failed', { reason }, locale);
     }
     const rows = ((r.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
-    const cardJson = buildSessionsCard(rows, { invokerOpenId: expectedOwner, locale, page: 1 }, nowMs);
+    // Drilldown subcard — mobile-friendlier 5/page + return-to-overview
+    // affordance. `origin: 'overview'` is threaded through every button.value
+    // by buildSessionsCard so the back button persists across page/refresh/
+    // detail/detail-back round-trips. Standalone `/dashboard sessions`
+    // (entry point in cli-handler.ts) is unaffected — it omits both opts.
+    const cardJson = buildSessionsCard(
+      rows,
+      { invokerOpenId: expectedOwner, locale, page: 1, pageSize: 5, origin: 'overview' },
+      nowMs,
+    );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
@@ -457,7 +466,12 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.schedules.list_failed', { reason }, locale);
     }
     const tasks = ((r.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
-    const cardJson = buildSchedulesCard(tasks, { invokerOpenId: expectedOwner, locale, page: 1 }, nowMs);
+    // See sessions branch above — drilldown 5/page + origin=overview.
+    const cardJson = buildSchedulesCard(
+      tasks,
+      { invokerOpenId: expectedOwner, locale, page: 1, pageSize: 5, origin: 'overview' },
+      nowMs,
+    );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
@@ -477,7 +491,13 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.settings.snapshot_failed', { reason: 'malformed_body' }, locale);
     }
     const dto = composeSections(settings, { canWrite: true });
-    const cardJson = buildSettingsCard(dto, { invokerOpenId: expectedOwner, locale, canWrite: true });
+    // Drilldown settings — origin=overview so toggle/set_time/refresh
+    // rebuilds keep the「🔙 返回总览」 button. Standalone settings command
+    // (cli-handler) calls buildSettingsCard without `origin`.
+    const cardJson = buildSettingsCard(
+      dto,
+      { invokerOpenId: expectedOwner, locale, canWrite: true, origin: 'overview' },
+    );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 

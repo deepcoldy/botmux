@@ -216,6 +216,73 @@ describe('buildSchedulesCard', () => {
       expect(b.value.invoker_open_id).toBe(INVOKER);
     }
   });
+
+  /** ─── Overview drilldown ─── */
+  describe('overview drilldown', () => {
+    const NOW = Date.parse('2026-06-09T12:00:00.000Z');
+    const tasks = Array.from({ length: 12 }, (_, i) =>
+      task({ id: `sch_${i}`, name: `s${i}`, enabled: true, nextRunAt: `2026-06-09T13:0${i % 10}:00.000Z` }),
+    );
+
+    it('pageSize=5 → 5/page; standalone (no opts) stays at 10/page', () => {
+      const drilldown = JSON.parse(buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5 }, NOW));
+      const standalone = JSON.parse(buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1 }, NOW));
+      const detailBtns = (parsed: any) => (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((a: any) => a.value?.action === SCHEDULES_ACTION_DETAIL);
+      expect(detailBtns(drilldown).length).toBe(5);
+      expect(detailBtns(standalone).length).toBe(10);
+    });
+
+    it('origin=overview → footer renders "🔙 返回总览" with dash_overview_refresh', () => {
+      const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
+      expect(backBtn).toBeDefined();
+      expect(backBtn.value.invoker_open_id).toBe(INVOKER);
+      expect(String(backBtn.text?.content ?? '')).toContain('返回总览');
+    });
+
+    it('standalone (no origin) → no back-to-overview button', () => {
+      const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1 }, NOW);
+      expect(json).not.toContain('dash_overview_refresh');
+    });
+
+    it('every child button.value carries origin + page_size (skip the back-to-overview itself)', () => {
+      const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const childButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      for (const b of childButtons) {
+        expect(b.value.origin).toBe('overview');
+        expect(b.value.page_size).toBe('5');
+      }
+    });
+
+    it('totalPages=3 (>2) → select_static jump-page appears, options=[1,2,3]', () => {
+      const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const selectStatic = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .find((a: any) => a.tag === 'select_static');
+      expect(selectStatic).toBeDefined();
+      expect(selectStatic.value.action).toBe(SCHEDULES_ACTION_PAGE);
+      expect(selectStatic.options.map((o: any) => o.value)).toEqual(['1', '2', '3']);
+    });
+
+    it('totalPages>50 cap → NO select_static', () => {
+      const many = Array.from({ length: 60 }, (_, i) => task({ id: `sch_x_${i}`, name: `s${i}` }));
+      const json = buildSchedulesCard(many, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 1, origin: 'overview' }, NOW);
+      expect(json).not.toContain('select_static');
+    });
+  });
 });
 
 describe('buildSchedulesDetailCard (slice 2a)', () => {
@@ -270,6 +337,31 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     // Reason note for resume disabled (mapped via mapResumeDisabledReason →
     // card.dashboard.schedules.resume.disabled.alreadyEnabled = '任务已启用').
     expect(json).toContain('任务已启用');
+  });
+
+  /** ─── Overview drilldown — detail back/pause/resume propagate nav ─── */
+  it('detail with origin=overview → back/pause/resume values carry origin + page_size', () => {
+    const detail = detailFor({ id: 'sch_nav', enabled: true });
+    const json = buildSchedulesDetailCard(detail, { ...baseOpts, origin: 'overview', pageSize: 5 });
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const acts = actionRow.actions as any[];
+    for (const a of acts) {
+      expect(a.value.origin).toBe('overview');
+      expect(a.value.page_size).toBe('5');
+    }
+  });
+
+  it('detail without origin → no origin/page_size on values (no regression)', () => {
+    const detail = detailFor({ id: 'sch_standalone', enabled: true });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const back = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_BACK_TO_LIST,
+    );
+    expect(back.value.origin).toBeUndefined();
+    expect(back.value.page_size).toBeUndefined();
   });
 
   it('enabled=false → resume enabled / pause disabled with alreadyPaused note', () => {
@@ -361,6 +453,53 @@ describe('handleSchedulesCardAction', () => {
       LARK_APP_ID, deps,
     );
     expect(JSON.stringify(r.card?.data)).toContain('第 2/3 页');
+  });
+
+  /** ─── Overview drilldown — handler nav propagation ─── */
+  it('page via select_static option (no value.page) → handler reads action.option', async () => {
+    const tasks = Array.from({ length: 12 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({ request: vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' })) } as any)),
+    });
+    const envelope = {
+      operator: { open_id: INVOKER },
+      action: {
+        option: '3',
+        value: { action: SCHEDULES_ACTION_PAGE, invoker_open_id: INVOKER, origin: 'overview', page_size: '5' },
+      },
+      context: { open_message_id: 'om_card' },
+    } as any;
+    const r = await handleSchedulesCardAction(envelope, LARK_APP_ID, deps);
+    expect(JSON.stringify(r.card?.data)).toContain('第 3/3 页');
+  });
+
+  it('refresh with origin=overview → rebuilt list still has 返回总览 + 5/page', async () => {
+    const tasks = Array.from({ length: 12 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({ request: vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' })) } as any)),
+    });
+    const r = await handleSchedulesCardAction(
+      makeAction({ action: SCHEDULES_ACTION_REFRESH, invoker_open_id: INVOKER, origin: 'overview', page_size: '5' }),
+      LARK_APP_ID, deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('第 1/3 页');
+    expect(cardJson).toContain('dash_overview_refresh');
+    expect(cardJson).toContain('返回总览');
+  });
+
+  it('back_to_list with origin=overview → rebuilt list is drilldown shape', async () => {
+    const tasks = Array.from({ length: 12 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({ request: vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' })) } as any)),
+    });
+    const r = await handleSchedulesCardAction(
+      makeAction({ action: SCHEDULES_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER, origin: 'overview', page_size: '5' }),
+      LARK_APP_ID, deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('第 1/3 页');
+    expect(cardJson).toContain('dash_overview_refresh');
   });
 
   it('non-owner → owner_only toast, no client call', async () => {

@@ -49,8 +49,21 @@ export const SESSIONS_ACTION_PAGE = 'dash_sessions_page' as const;
 export const SESSIONS_ACTION_DETAIL = 'dash_sessions_detail' as const;
 export const SESSIONS_ACTION_CLOSE = 'dash_sessions_close' as const;
 export const SESSIONS_ACTION_BACK_TO_LIST = 'dash_sessions_back_to_list' as const;
+/** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
+ *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
+ *  import). card-handler routes by action prefix, so dispatch lands on the
+ *  overview handler regardless of which sub-card emitted it. */
+const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
+/** Default page size for the standalone `/dashboard sessions` command. The
+ *  overview drilldown overrides this to 5 via the `pageSize` opt for a
+ *  mobile-friendlier sub-card. */
 const PAGE_SIZE = 10;
+
+/** Hard cap on `select_static` option count for the "jump to page" picker.
+ *  Lark caps select options around this; we also keep payload small. Above
+ *  the cap we fall back to prev/next only. */
+const JUMP_PAGE_MAX_OPTIONS = 50;
 
 /** Mapping from `StatusDot.tone` to a stable colour-emoji prefix. Pure. */
 function toneIcon(tone: string): string {
@@ -68,6 +81,17 @@ export interface BuildSessionsCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
+  /** Page size override. Standalone `/dashboard sessions` omits → PAGE_SIZE (10).
+   *  Overview drilldown sets to 5 for a mobile-friendlier sub-card. Threaded
+   *  through every button.value so the size persists across page/refresh/
+   *  detail-back round-trips. */
+  pageSize?: number;
+  /** Navigation origin. `'overview'` means this card was opened via
+   *  `/dashboard overview` → goto sessions; the footer renders an extra
+   *  "🔙 返回总览" button, and every button.value carries `origin=overview`
+   *  to keep that affordance across rebuilds. Undefined → standalone card,
+   *  no overview link. */
+  origin?: 'overview';
 }
 
 /** Build the sessions list card JSON from raw rows. Pure (composes + paginates). */
@@ -76,8 +100,19 @@ export function buildSessionsCard(
   opts: BuildSessionsCardOpts,
   nowMs: number,
 ): string {
+  const effectivePageSize =
+    typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
+      ? Math.floor(opts.pageSize)
+      : PAGE_SIZE;
   const sorted = sortByStatus(composeEntries(rows, nowMs));
-  const { items, meta } = paginate(sorted, opts.page, PAGE_SIZE);
+  const { items, meta } = paginate(sorted, opts.page, effectivePageSize);
+
+  // Plumb origin + page_size into every button.value so refresh/page/detail/
+  // detail-back rebuilds keep the same drilldown state. Empty values are
+  // omitted so standalone cards stay byte-identical to before this change.
+  const navFields: Record<string, string> = {};
+  if (opts.origin === 'overview') navFields.origin = 'overview';
+  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
 
   const activeCount = sorted.filter(e => e.status !== 'closed').length;
   const closedCount = sorted.length - activeCount;
@@ -132,6 +167,7 @@ export function buildSessionsCard(
               action: SESSIONS_ACTION_DETAIL,
               invoker_open_id: opts.invokerOpenId,
               session_id: e.sessionId,
+              ...navFields,
             },
           },
         ],
@@ -153,6 +189,7 @@ export function buildSessionsCard(
         action: SESSIONS_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.max(1, meta.page - 1)),
+        ...navFields,
       },
     });
     actions.push({
@@ -164,8 +201,37 @@ export function buildSessionsCard(
         action: SESSIONS_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.min(meta.totalPages, meta.page + 1)),
+        ...navFields,
       },
     });
+    // "Jump to page" select — same action as prev/next, page comes via
+    // action.option instead of value.page. Handler reads `value.page ??
+    // action.option ?? '1'` so both paths converge on one branch. Capped at
+    // JUMP_PAGE_MAX_OPTIONS to keep payload small / inside Lark's option
+    // limit (above the cap, prev/next still works).
+    if (meta.totalPages > 2 && meta.totalPages <= JUMP_PAGE_MAX_OPTIONS) {
+      const options = Array.from({ length: meta.totalPages }, (_, i) => {
+        const n = i + 1;
+        return {
+          text: { tag: 'plain_text', content: t('card.dashboard.sessions.jump_page', { n: String(n) }, opts.locale) },
+          value: String(n),
+        };
+      });
+      actions.push({
+        tag: 'select_static',
+        placeholder: {
+          tag: 'plain_text',
+          content: t('card.dashboard.sessions.jump_page', { n: String(meta.page) }, opts.locale),
+        },
+        initial_option: String(meta.page),
+        options,
+        value: {
+          action: SESSIONS_ACTION_PAGE,
+          invoker_open_id: opts.invokerOpenId,
+          ...navFields,
+        },
+      });
+    }
   }
   actions.push({
     tag: 'button',
@@ -174,8 +240,23 @@ export function buildSessionsCard(
     value: {
       action: SESSIONS_ACTION_REFRESH,
       invoker_open_id: opts.invokerOpenId,
+      ...navFields,
     },
   });
+  // Overview drilldown only — "🔙 返回总览" reuses the overview-refresh
+  // action; card-handler routes by action prefix, so dispatch lands on
+  // overview-card.ts which rebuilds the parent card cleanly.
+  if (opts.origin === 'overview') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.overview.back_button', undefined, opts.locale) },
+      type: 'default',
+      value: {
+        action: BACK_TO_OVERVIEW_ACTION,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    });
+  }
   elements.push({ tag: 'action', actions });
 
   // Footer security note (matches /dashboard settings idiom).
@@ -217,6 +298,12 @@ export interface BuildSessionsDetailCardOpts {
   locale: Locale;
   /** Override `Date.now()` for the relative-time label. Tests pass a fixed value. */
   nowMs?: number;
+  /** Overview drilldown nav state — threaded into the "🔙 返回" button so the
+   *  list rebuilt by `BACK_TO_LIST` is still drilldown-shaped (5/page +
+   *  return-to-overview). Detail itself does NOT render a return-to-overview
+   *  button (single back affordance per slice). */
+  origin?: 'overview';
+  pageSize?: number;
 }
 
 /**
@@ -331,6 +418,23 @@ export function buildSessionsDetailCard(
   } else {
     closeButton.disabled = true;
   }
+  const backNav: Record<string, string> = {};
+  if (opts.origin === 'overview') backNav.origin = 'overview';
+  if (
+    typeof opts.pageSize === 'number'
+    && Number.isFinite(opts.pageSize)
+    && opts.pageSize > 0
+    && opts.pageSize !== PAGE_SIZE
+  ) {
+    backNav.page_size = String(Math.floor(opts.pageSize));
+  }
+  // Also propagate the same nav onto the close button — successful close
+  // rebuilds this same detail card and the user may then press 🔙 返回 to go
+  // back to the drilldown list, which still needs origin/pageSize.
+  (closeButton.value as Record<string, unknown>) = {
+    ...(closeButton.value as Record<string, unknown>),
+    ...backNav,
+  };
   elements.push({
     tag: 'action',
     actions: [
@@ -342,6 +446,7 @@ export function buildSessionsDetailCard(
         value: {
           action: SESSIONS_ACTION_BACK_TO_LIST,
           invoker_open_id: opts.invokerOpenId,
+          ...backNav,
         },
       },
     ],
@@ -510,6 +615,14 @@ export async function handleSessionsCardAction(
   const client = deps.createClient(larkAppId);
   const now = (): number => (deps.nowMs ? deps.nowMs() : Date.now());
 
+  // ─── Nav state (overview drilldown) ─────────────────────────────────
+  // Threaded by buildSessionsCard onto every button.value; we parse here
+  // so the rebuild path keeps the same shape (5/page + 🔙 返回总览).
+  const navOrigin: 'overview' | undefined = value.origin === 'overview' ? 'overview' : undefined;
+  const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
+  const navPageSize: number | undefined =
+    Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+
   // ─── 3a) DETAIL — open the per-session detail card ──────────────────
   if (action === SESSIONS_ACTION_DETAIL) {
     const sessionId = value.session_id;
@@ -527,6 +640,8 @@ export async function handleSessionsCardAction(
       invokerOpenId: expectedOwner,
       locale,
       nowMs: now(),
+      origin: navOrigin,
+      pageSize: navPageSize,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -606,6 +721,8 @@ export async function handleSessionsCardAction(
       invokerOpenId: expectedOwner,
       locale,
       nowMs: now(),
+      origin: navOrigin,
+      pageSize: navPageSize,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -616,7 +733,13 @@ export async function handleSessionsCardAction(
     if ('errorResult' in r) return r.errorResult;
     const cardJson = buildSessionsCard(
       r.rows,
-      { invokerOpenId: expectedOwner, locale, page: 1 },
+      {
+        invokerOpenId: expectedOwner,
+        locale,
+        page: 1,
+        pageSize: navPageSize,
+        origin: navOrigin,
+      },
       now(),
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -627,7 +750,11 @@ export async function handleSessionsCardAction(
   // left here are REFRESH + PAGE (the other 3 returned early).
   let page = 1;
   if (action === SESSIONS_ACTION_PAGE) {
-    const parsed = Number.parseInt(value.page ?? '1', 10);
+    // Page comes from value.page (prev/next button) OR action.option
+    // (select_static "jump to page" picker). Same action key, different
+    // dispatch field — handler converges on one branch.
+    const raw = value.page ?? (data.action as { option?: string } | undefined)?.option ?? '1';
+    const parsed = Number.parseInt(raw, 10);
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
   }
 
@@ -635,7 +762,13 @@ export async function handleSessionsCardAction(
   if ('errorResult' in r) return r.errorResult;
   const cardJson = buildSessionsCard(
     r.rows,
-    { invokerOpenId: expectedOwner, locale, page },
+    {
+      invokerOpenId: expectedOwner,
+      locale,
+      page,
+      pageSize: navPageSize,
+      origin: navOrigin,
+    },
     now(),
   );
   return {

@@ -175,6 +175,64 @@ describe('buildSettingsCard', () => {
     expect(raw).toContain('"action":"dash_settings_refresh"');
     expect(raw).toContain('"invoker_open_id":"ou_alice"');
   });
+
+  /** ─── Overview drilldown ───
+   *  When opened via `/dashboard overview` → goto settings, the card carries
+   *  `origin=overview` on every action.value AND renders "🔙 返回总览" beside
+   *  the refresh button. Standalone settings command stays byte-identical. */
+  describe('overview drilldown', () => {
+    it('origin=overview → footer renders 返回总览 button (dash_overview_refresh)', () => {
+      const dto = makeDTO();
+      const raw = buildSettingsCard(dto, { invokerOpenId: INVOKER, locale: 'zh', canWrite: true, origin: 'overview' });
+      expect(raw).toContain('"action":"dash_overview_refresh"');
+      expect(raw).toContain('返回总览');
+    });
+
+    it('standalone (no origin) → NO back-to-overview button (no regression)', () => {
+      const dto = makeDTO();
+      const raw = buildSettingsCard(dto, { invokerOpenId: INVOKER, locale: 'zh', canWrite: true });
+      expect(raw).not.toContain('"action":"dash_overview_refresh"');
+      expect(raw).not.toContain('返回总览');
+    });
+
+    it('origin=overview → toggle/refresh action.value carry origin=overview', () => {
+      const dto = makeDTO({ enabled: false, state: { enabled: true } });
+      const raw = buildSettingsCard(dto, { invokerOpenId: INVOKER, locale: 'zh', canWrite: true, origin: 'overview' });
+      // Toggle button value
+      expect(raw).toContain('"action":"dash_settings_toggle"');
+      // Both the toggle and refresh should have origin=overview in their value.
+      const parsed = JSON.parse(raw);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      // The back-to-overview button itself doesn't need origin (it's the
+      // dispatch target). Every other button should carry origin.
+      const childButtons = allButtons.filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      for (const b of childButtons) {
+        expect(b.value.origin).toBe('overview');
+      }
+    });
+
+    it('origin=overview → settings does NOT carry page_size (single-layer, no pagination)', () => {
+      const dto = makeDTO();
+      const raw = buildSettingsCard(dto, { invokerOpenId: INVOKER, locale: 'zh', canWrite: true, origin: 'overview' });
+      expect(raw).not.toContain('"page_size"');
+    });
+
+    it('disabled (noop) buttons also carry origin so a fail-safe click rebuilds drilldown', () => {
+      const dto = makeDTO({ enabled: true, state: { enabled: true } });
+      const raw = buildSettingsCard(dto, { invokerOpenId: INVOKER, locale: 'zh', canWrite: true, origin: 'overview' });
+      const parsed = JSON.parse(raw);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const noopButtons = allButtons.filter((b: any) => b.value?.action === 'dash_settings_noop');
+      // Current value buttons emit noop; should also carry origin.
+      for (const b of noopButtons) {
+        expect(b.value.origin).toBe('overview');
+      }
+    });
+  });
 });
 
 /** ─── handleSettingsCardAction ──────────────────────────────────────── */
@@ -275,6 +333,81 @@ describe('handleSettingsCardAction', () => {
     // codex: success returns card only (no toast) — see ACK shape test above.
     expect((r as any).toast).toBeUndefined();
     expect((r as any).card).toBeDefined();
+  });
+
+  /** ─── Overview drilldown — handler honors origin on rebuild ─── */
+  it('toggle with origin=overview → rebuilt card still carries 返回总览 button', async () => {
+    // Mock the PUT response with a real settings shape so composeSections
+    // produces non-trivial DTO. The drilldown back-button depends ONLY on
+    // opts.origin so even an empty settings would surface it, but using
+    // a realistic body matches production traffic.
+    const reqSpy = vi.fn(async () => ({
+      status: 200,
+      body: { settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
+      raw: '',
+    }));
+    const deps = {
+      createClient: vi.fn(() => ({ request: reqSpy } as any)),
+      getOwnerOpenId: () => BOT_OWNER,
+      resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
+      locale: 'zh' as const,
+    } as any;
+    const data = makeAction({
+      action: SETTINGS_ACTION_TOGGLE,
+      invoker_open_id: INVOKER,
+      field: 'publicReadOnly',
+      next_value: 'true',
+      origin: 'overview',
+    });
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect((r as any).card).toBeDefined();
+    const cardJson = JSON.stringify((r as any).card.data);
+    expect(cardJson).toContain('dash_overview_refresh');
+    expect(cardJson).toContain('返回总览');
+  });
+
+  it('refresh with origin=overview → rebuilt card carries 返回总览', async () => {
+    const reqSpy = vi.fn(async () => ({
+      status: 200,
+      body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
+      raw: '',
+    }));
+    const deps = {
+      createClient: vi.fn(() => ({ request: reqSpy } as any)),
+      getOwnerOpenId: () => BOT_OWNER,
+      resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
+      locale: 'zh' as const,
+    } as any;
+    const data = makeAction({
+      action: SETTINGS_ACTION_REFRESH,
+      invoker_open_id: INVOKER,
+      origin: 'overview',
+    });
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect((r as any).card).toBeDefined();
+    const cardJson = JSON.stringify((r as any).card.data);
+    expect(cardJson).toContain('dash_overview_refresh');
+    expect(cardJson).toContain('返回总览');
+  });
+
+  it('toggle WITHOUT origin → rebuilt card does NOT have 返回总览 (no regression)', async () => {
+    const reqSpy = vi.fn(async () => ({
+      status: 200,
+      body: { settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
+      raw: '',
+    }));
+    const deps = {
+      createClient: vi.fn(() => ({ request: reqSpy } as any)),
+      getOwnerOpenId: () => BOT_OWNER,
+      resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
+      locale: 'zh' as const,
+    } as any;
+    const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect((r as any).card).toBeDefined();
+    const cardJson = JSON.stringify((r as any).card.data);
+    expect(cardJson).not.toContain('dash_overview_refresh');
+    expect(cardJson).not.toContain('返回总览');
   });
 
   it('happy set_time → ACK + async PUT with maintenance.autoUpdate.time', async () => {
