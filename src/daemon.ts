@@ -1982,6 +1982,8 @@ async function resolvePinnedWorkingDir(ctx: {
   return { pinnedWorkingDir, oncallEntry, inheritedFrom };
 }
 
+export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
+
 async function replyInvalidWorkingDirs(
   anchor: string,
   larkAppId: string,
@@ -2930,34 +2932,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.scope = scope;
     sessionStore.updateSession(session);
 
-    // Oncall group: pin working dir from the chat-level binding, even if a
-    // sibling bot (running in another daemon) is the one that persisted it.
-    // Defaults auto-bind path mirrors handleNewTopic — keep both call sites
-    // in sync (this is the auto-create branch that fires when routing lands
-    // here without an active session, e.g. chat-scope first-reply paths).
-    let oncallEntry = findOncallChatForAnyBot(autoCreateChatId);
-    if (!oncallEntry) {
-      oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, autoCreateChatId, autoCreateChatType);
-    }
-
-    // Cross-bot / chat-scope inheritance — see findInheritablePeer comments.
-    const inheritedFrom = !oncallEntry
-      ? findInheritablePeer({
-          scope,
-          anchor,
-          chatId: autoCreateChatId,
-          chatType: autoCreateChatType,
-          selfAppId: larkAppId,
-        })
-      : null;
-
-    // Last-resort fallback: this bot's `defaultWorkingDir`. See handleNewTopic
-    // for the symmetric block — both call sites must stay in sync.
-    const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-      ? resolveBotDefaultWorkingDir(larkAppId)
-      : undefined;
-
-    const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+    // Use the same layered oncall / inherit / default lookup as handleNewTopic
+    // so stale inherited peers are ignored consistently in both spawn paths.
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({
+      scope,
+      anchor,
+      chatId: autoCreateChatId,
+      chatType: autoCreateChatType,
+      larkAppId,
+    });
     // Now we know the message will spawn or pend a real session — resolve
     // sender (may await contact API budget) since every downstream branch
     // injects it either into the immediate prompt or stashes it on
