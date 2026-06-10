@@ -232,11 +232,11 @@ describe('buildSessionsCard', () => {
   });
 
   /** ─── Overview drilldown (2026-06-10) ───
-   *  When opened via `/dashboard overview` → goto sessions, the card renders
-   *  a "🔙 返回总览" button on the footer (only present when
-   *  `origin='overview'`). Page size is unified at 5 across standalone and
-   *  drilldown (2026-06-10 user request); the standalone command no longer
-   *  uses 10/page. */
+   *  Standalone and drilldown both use the unified default 5/page; `origin`
+   *  is the only thing the drilldown sub-card carries — it controls the
+   *  「🔙 返回总览」 button and is threaded through every callback so the
+   *  back affordance persists across page/refresh/detail/detail-back/
+   *  toggle round-trips. */
   describe('overview drilldown', () => {
     const NOW = 2_000_000;
     const rows = Array.from({ length: 12 }, (_, i) =>

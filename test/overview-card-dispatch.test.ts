@@ -140,12 +140,12 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
   });
 
   /** ─── Overview drilldown (2026-06-10) ───
-   *  Verifies the 3 goto handlers thread `origin=overview` + `pageSize=5`
-   *  (sessions/schedules) / `origin=overview` only (settings) into the
-   *  sub-card body. The footer of each sub-card should render
-   *  "🔙 返回总览" via the shared `dash_overview_refresh` action so the
-   *  parent overview rebuilds without a custom return route. */
-  describe('overview drilldown — goto threads origin + pageSize into sub-card', () => {
+   *  Verifies the 3 goto handlers thread `origin=overview` into the sub-card
+   *  body (no `pageSize` — global default is 5/page after unification, so
+   *  drilldown doesn't need to override). The footer of each sub-card
+   *  renders "🔙 返回总览" via the shared `dash_overview_refresh` action so
+   *  the parent overview rebuilds without a custom return route. */
+  describe('overview drilldown — goto threads origin into sub-card', () => {
     function makeRows(n: number) {
       return Array.from({ length: n }, (_, i) => ({
         sessionId: `s_${i}`,
