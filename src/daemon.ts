@@ -1758,6 +1758,7 @@ async function createCollabWorkerTopic(input: {
     content,
     'text',
     `collab-worker-topic:${shortRun}:${input.workerId}`,
+    // hookContext is telemetry only; the route is the top-level sendMessage to chatId.
     { sessionId: input.runId, scope: 'thread', anchor: input.controlTopicId },
   );
 }
