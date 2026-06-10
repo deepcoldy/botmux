@@ -110,7 +110,8 @@ describe('handleCardAction → workflows dispatch returns { card } only on succe
 
     expect(result.card).toBeDefined();
     const cardJson = JSON.stringify(result.card?.data);
-    expect(cardJson).toContain('第 2/3 页');
+    // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
+    expect(cardJson).toContain('第 2/5 页');
 
     // codex blocker: page action must also carry ?all=1 — same reason as refresh.
     expect(requestSpy).toHaveBeenCalledOnce();

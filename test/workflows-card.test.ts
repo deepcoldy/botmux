@@ -78,7 +78,8 @@ describe('buildWorkflowsCard', () => {
     expect(idx('wfC')).toBeLessThan(idx('wfD'));
   });
 
-  it('count summary: 进行中 N · 完成 M · 失败 K · 第 1/1 页 (running = pending|running|waiting, done = succeeded, failed = failed|cancelled)', () => {
+  it('count summary: 进行中 N · 完成 M · 失败 K · page indicator (running = pending|running|waiting, done = succeeded, failed = failed|cancelled)', () => {
+    // 7 rows / PAGE_SIZE=5 = 2 pages (unified 2026-06-10).
     const rows: WorkflowRunInput[] = [
       run({ runId: 'a', status: 'running' }),
       run({ runId: 'b', status: 'waiting' }),
@@ -92,17 +93,18 @@ describe('buildWorkflowsCard', () => {
     expect(json).toContain('进行中 3');
     expect(json).toContain('完成 2');
     expect(json).toContain('失败 2');
-    expect(json).toContain('第 1/1 页');
+    expect(json).toContain('第 1/2 页');
   });
 
-  it('pagination: > 10 rows → prev/next; page=2 of 3 with 25 rows', () => {
+  it('pagination: > 5 rows → prev/next; page=2 of 5 with 25 rows', () => {
+    // PAGE_SIZE=5 → 25 / 5 = 5 pages.
     const rows: WorkflowRunInput[] = Array.from({ length: 25 }, (_, i) =>
       run({ runId: `r_${i}`, workflowId: `wf_${i}`, status: 'running', startedAt: 1_000 - i }),
     );
     const json = buildWorkflowsCard(rows, { ...baseOpts, page: 2 }, NOW);
     expect(json).toContain('上一页');
     expect(json).toContain('下一页');
-    expect(json).toContain('第 2/3 页');
+    expect(json).toContain('第 2/5 页');
     // prev → 1, next → 3
     expect(json).toContain('"page":"1"');
     expect(json).toContain('"page":"3"');
@@ -125,11 +127,11 @@ describe('buildWorkflowsCard', () => {
     expect(p1prev.disabled).toBe(true);
     expect(p1next.disabled).toBe(false);
 
-    // On page=3 (last), next disabled
-    const page3 = buildWorkflowsCard(rows, { ...baseOpts, page: 3 }, NOW);
-    const { prev: p3prev, next: p3next } = findPagerButtons(page3);
-    expect(p3prev.disabled).toBe(false);
-    expect(p3next.disabled).toBe(true);
+    // On page=5 (last), next disabled
+    const page5 = buildWorkflowsCard(rows, { ...baseOpts, page: 5 }, NOW);
+    const { prev: p5prev, next: p5next } = findPagerButtons(page5);
+    expect(p5prev.disabled).toBe(false);
+    expect(p5next.disabled).toBe(true);
   });
 
   it('escapes HTML control chars in workflowId / runId — no naked <at, exactly correct closing </font> count', () => {
@@ -236,7 +238,8 @@ describe('handleWorkflowsCardAction', () => {
     expect(r.card?.type).toBe('raw');
   });
 
-  it('page=2 with 25 rows → 第 2/3 页', async () => {
+  it('page=2 with 25 rows → 第 2/5 页', async () => {
+    // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
     const rows = Array.from({ length: 25 }, (_, i) =>
       run({ runId: `r_${i}`, workflowId: `wf_${i}`, status: 'running', startedAt: 1_000 - i }),
     );
@@ -251,7 +254,7 @@ describe('handleWorkflowsCardAction', () => {
       deps,
     );
     const cardJson = JSON.stringify(r.card?.data);
-    expect(cardJson).toContain('第 2/3 页');
+    expect(cardJson).toContain('第 2/5 页');
   });
 
   it('non-owner → toast `owner_only`, NO client call', async () => {

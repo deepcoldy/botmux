@@ -116,7 +116,8 @@ describe('handleCardAction → groups dispatch returns { card } only on success'
 
     expect(result.card).toBeDefined();
     const cardJson = JSON.stringify(result.card?.data);
-    expect(cardJson).toContain('第 2/3 页');
+    // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
+    expect(cardJson).toContain('第 2/5 页');
 
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();

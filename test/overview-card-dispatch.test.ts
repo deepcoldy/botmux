@@ -200,7 +200,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(cardJson).toContain('select_static');
     });
 
-    it('goto_schedules → schedules card has 5/page, 返回总览, origin/page_size threaded', async () => {
+    it('goto_schedules → schedules card has 5/page, 返回总览, origin threaded (page_size omitted at default)', async () => {
       const tasks = Array.from({ length: 12 }, (_, i) => ({
         id: `sch_${i}`,
         name: `daily-${i}`,
@@ -225,11 +225,13 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
 
       expect(result.card).toBeDefined();
       const cardJson = JSON.stringify(result.card?.data);
+      // PAGE_SIZE=5 (unified 2026-06-10). 12 / 5 = 3 pages.
       expect(cardJson).toContain('第 1/3 页');
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
       expect(cardJson).toContain('返回总览');
       expect(cardJson).toContain('"origin":"overview"');
-      expect(cardJson).toContain('"page_size":"5"');
+      // page_size omitted: drilldown uses default (5 == PAGE_SIZE).
+      expect(cardJson).not.toContain('"page_size"');
     });
 
     it('goto_settings → settings card has 返回总览 + origin on every action.value; NO page_size', async () => {

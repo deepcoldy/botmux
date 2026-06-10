@@ -68,7 +68,9 @@ export const WORKFLOWS_ACTION_DETAIL = 'dash_workflows_detail' as const;
 export const WORKFLOWS_ACTION_CANCEL = 'dash_workflows_cancel' as const;
 export const WORKFLOWS_ACTION_BACK_TO_LIST = 'dash_workflows_back_to_list' as const;
 
-const PAGE_SIZE = 10;
+/** Default page size for `/dashboard workflows` — unified at 5/page across
+ *  all dashboard list cards on user request 2026-06-10. */
+const PAGE_SIZE = 5;
 
 /** Mapping from `StatusDot.tone` to a stable colour-emoji prefix. Pure. */
 function toneIcon(tone: string): string {

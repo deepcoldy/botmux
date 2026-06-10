@@ -162,14 +162,15 @@ describe('buildGroupsCard', () => {
     expect(json).not.toContain('&amp;amp;');
   });
 
-  it('pagination: > 10 rows → prev/next, boundary disable (page=2 of 3 with 25 rows)', () => {
+  it('pagination: > 5 rows → prev/next, boundary disable (page=2 of 5 with 25 rows)', () => {
+    // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
     const chats: GroupsChatInput[] = Array.from({ length: 25 }, (_, i) =>
       chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
     );
     const json = buildGroupsCard(matrix(chats), { ...baseOpts, page: 2 });
     expect(json).toContain('上一页');
     expect(json).toContain('下一页');
-    expect(json).toContain('第 2/3 页');
+    expect(json).toContain('第 2/5 页');
     // prev → page=1, next → page=3
     expect(json).toContain('"page":"1"');
     expect(json).toContain('"page":"3"');
@@ -189,11 +190,11 @@ describe('buildGroupsCard', () => {
     expect(p1prev.disabled).toBe(true);
     expect(p1next.disabled).toBe(false);
 
-    // page=3 (last) → next disabled
-    const page3 = buildGroupsCard(matrix(chats), { ...baseOpts, page: 3 });
-    const { prev: p3prev, next: p3next } = findPagerButtons(page3);
-    expect(p3prev.disabled).toBe(false);
-    expect(p3next.disabled).toBe(true);
+    // page=5 (last) → next disabled
+    const page5 = buildGroupsCard(matrix(chats), { ...baseOpts, page: 5 });
+    const { prev: p5prev, next: p5next } = findPagerButtons(page5);
+    expect(p5prev.disabled).toBe(false);
+    expect(p5next.disabled).toBe(true);
   });
 
   it('every action button carries `invoker_open_id` bound to the OWNER', () => {
@@ -270,7 +271,8 @@ describe('handleGroupsCardAction', () => {
       deps,
     );
     const cardJson = JSON.stringify(r.card?.data);
-    expect(cardJson).toContain('第 2/3 页');
+    // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
+    expect(cardJson).toContain('第 2/5 页');
   });
 
   it('non-owner → toast `owner_only`, NO client call', async () => {

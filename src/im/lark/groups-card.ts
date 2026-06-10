@@ -40,7 +40,9 @@ import type { CardActionData } from './card-handler.js';
 export const GROUPS_ACTION_REFRESH = 'dash_groups_refresh' as const;
 export const GROUPS_ACTION_PAGE = 'dash_groups_page' as const;
 
-const PAGE_SIZE = 10;
+/** Default page size for `/dashboard groups` — unified at 5/page across
+ *  all dashboard list cards on user request 2026-06-10. */
+const PAGE_SIZE = 5;
 
 /** Mapping from coverage status to a stable colour-emoji prefix. Pure. */
 function statusIcon(status: string): string {

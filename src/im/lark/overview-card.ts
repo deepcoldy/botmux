@@ -441,14 +441,14 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.sessions.list_failed', { reason }, locale);
     }
     const rows = ((r.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
-    // Drilldown subcard — mobile-friendlier 5/page + return-to-overview
-    // affordance. `origin: 'overview'` is threaded through every button.value
-    // by buildSessionsCard so the back button persists across page/refresh/
-    // detail/detail-back round-trips. Standalone `/dashboard sessions`
-    // (entry point in cli-handler.ts) is unaffected — it omits both opts.
+    // Drilldown subcard — only differs from standalone in `origin: 'overview'`,
+    // which makes buildSessionsCard render the 「🔙 返回总览」 button and
+    // thread `origin=overview` through every callback so the back affordance
+    // persists across page/refresh/detail/detail-back round-trips. Page size
+    // is the default 5 (unified globally on 2026-06-10) — no need to override.
     const cardJson = buildSessionsCard(
       rows,
-      { invokerOpenId: expectedOwner, locale, page: 1, pageSize: 5, origin: 'overview' },
+      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -466,10 +466,11 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.schedules.list_failed', { reason }, locale);
     }
     const tasks = ((r.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
-    // See sessions branch above — drilldown 5/page + origin=overview.
+    // See sessions branch above — only `origin: 'overview'` differs from
+    // standalone (default page size is the unified 5).
     const cardJson = buildSchedulesCard(
       tasks,
-      { invokerOpenId: expectedOwner, locale, page: 1, pageSize: 5, origin: 'overview' },
+      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };

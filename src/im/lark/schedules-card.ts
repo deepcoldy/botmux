@@ -69,9 +69,10 @@ export const SCHEDULES_ACTION_BACK_TO_LIST = 'dash_schedules_back_to_list' as co
  *  to avoid a circular dep). */
 const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for standalone `/dashboard schedules`. Overview
- *  drilldown overrides to 5 via `pageSize` opt. */
-const PAGE_SIZE = 10;
+/** Default page size for `/dashboard schedules` (standalone AND overview
+ *  drilldown — unified at 5/page across all dashboard list cards on user
+ *  request 2026-06-10). `pageSize` opt still works as an override. */
+const PAGE_SIZE = 5;
 
 /** Hard cap on `select_static` jump-page option count. */
 const JUMP_PAGE_MAX_OPTIONS = 50;
@@ -111,8 +112,8 @@ export interface BuildSchedulesCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
-  /** Page size override. Standalone `/dashboard schedules` omits → PAGE_SIZE (10).
-   *  Overview drilldown sets to 5. Threaded through every button.value. */
+  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
+   *  drilldown 2026-06-10). Threaded through every button.value. */
   pageSize?: number;
   /** Navigation origin. `'overview'` → footer renders "🔙 返回总览" and every
    *  button.value carries `origin=overview`. Undefined → standalone card. */

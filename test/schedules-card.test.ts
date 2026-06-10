@@ -98,18 +98,20 @@ describe('buildSchedulesCard', () => {
     expect(json).toContain('已跑 3/10');
   });
 
-  it('pagination at >10 tasks; page=2 emits prev=1 / next=3', () => {
+  it('pagination at >5 tasks; page=2 of 5 emits prev=1 / next=3', () => {
+    // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
     const tasks: ScheduleCardTaskInput[] = Array.from({ length: 25 }, (_, i) =>
       task({ id: `t_${i}`, name: `task-${i}`, enabled: true, nextRunAt: `2026-06-09T${String(13 + (i % 10)).padStart(2, '0')}:00:00.000Z` }),
     );
     const json = buildSchedulesCard(tasks, { ...baseOpts, page: 2 }, NOW);
-    expect(json).toContain('第 2/3 页');
+    expect(json).toContain('第 2/5 页');
     expect(json).toContain('"page":"1"');
     expect(json).toContain('"page":"3"');
   });
 
   it('first/last page disable prev/next respectively', () => {
-    const tasks = Array.from({ length: 15 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
+    // 8 tasks / PAGE_SIZE=5 = 2 pages → boundary test easy.
+    const tasks = Array.from({ length: 8 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
     const findPager = (json: string): { prev: any; next: any } => {
       const parsed = JSON.parse(json);
       // Slice 2a introduced per-row `📂 详情` action elements before the
@@ -224,15 +226,22 @@ describe('buildSchedulesCard', () => {
       task({ id: `sch_${i}`, name: `s${i}`, enabled: true, nextRunAt: `2026-06-09T13:0${i % 10}:00.000Z` }),
     );
 
-    it('pageSize=5 → 5/page; standalone (no opts) stays at 10/page', () => {
-      const drilldown = JSON.parse(buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5 }, NOW));
+    it('default PAGE_SIZE → 5 rows/page (standalone and drilldown unified 2026-06-10)', () => {
       const standalone = JSON.parse(buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1 }, NOW));
       const detailBtns = (parsed: any) => (parsed.elements as any[])
         .filter((e: any) => e.tag === 'action')
         .flatMap((e: any) => e.actions ?? [])
         .filter((a: any) => a.value?.action === SCHEDULES_ACTION_DETAIL);
-      expect(detailBtns(drilldown).length).toBe(5);
-      expect(detailBtns(standalone).length).toBe(10);
+      expect(detailBtns(standalone).length).toBe(5);
+    });
+
+    it('explicit pageSize override still works (caller can pick a different size)', () => {
+      const overridden = JSON.parse(buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 3 }, NOW));
+      const detailBtns = (overridden.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((a: any) => a.value?.action === SCHEDULES_ACTION_DETAIL);
+      expect(detailBtns.length).toBe(3);
     });
 
     it('origin=overview → footer renders "🔙 返回总览" with dash_overview_refresh', () => {
@@ -252,8 +261,11 @@ describe('buildSchedulesCard', () => {
       expect(json).not.toContain('dash_overview_refresh');
     });
 
-    it('every child button.value carries origin + page_size (skip the back-to-overview itself)', () => {
-      const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
+    it('origin=overview → every child button.value carries origin (page_size omitted at default)', () => {
+      // After 2026-06-10 unification PAGE_SIZE=5 default. When drilldown
+      // omits pageSize (or passes 5), effectivePageSize === PAGE_SIZE branch
+      // → `page_size` is NOT threaded. Origin remains the canonical signal.
+      const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, origin: 'overview' }, NOW);
       const parsed = JSON.parse(json);
       const childButtons = (parsed.elements as any[])
         .filter((e: any) => e.tag === 'action')
@@ -261,7 +273,20 @@ describe('buildSchedulesCard', () => {
         .filter((b: any) => b.value?.action !== 'dash_overview_refresh');
       for (const b of childButtons) {
         expect(b.value.origin).toBe('overview');
-        expect(b.value.page_size).toBe('5');
+        expect(b.value.page_size).toBeUndefined();
+      }
+    });
+
+    it('origin=overview + pageSize=3 (override) → button.value carries BOTH origin AND page_size', () => {
+      const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 3, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const childButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      for (const b of childButtons) {
+        expect(b.value.origin).toBe('overview');
+        expect(b.value.page_size).toBe('3');
       }
     });
 
@@ -340,7 +365,8 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
   });
 
   /** ─── Overview drilldown — detail back/pause/resume propagate nav ─── */
-  it('detail with origin=overview → back/pause/resume values carry origin + page_size', () => {
+  it('detail with origin=overview (default page size) → back/pause/resume carry origin (page_size omitted)', () => {
+    // PAGE_SIZE=5 default after 2026-06-10. pageSize=5 == default → omitted.
     const detail = detailFor({ id: 'sch_nav', enabled: true });
     const json = buildSchedulesDetailCard(detail, { ...baseOpts, origin: 'overview', pageSize: 5 });
     const parsed = JSON.parse(json);
@@ -348,7 +374,19 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     const acts = actionRow.actions as any[];
     for (const a of acts) {
       expect(a.value.origin).toBe('overview');
-      expect(a.value.page_size).toBe('5');
+      expect(a.value.page_size).toBeUndefined();
+    }
+  });
+
+  it('detail with origin=overview AND overridden pageSize=3 → back/pause/resume carry origin AND page_size', () => {
+    const detail = detailFor({ id: 'sch_override', enabled: true });
+    const json = buildSchedulesDetailCard(detail, { ...baseOpts, origin: 'overview', pageSize: 3 });
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const acts = actionRow.actions as any[];
+    for (const a of acts) {
+      expect(a.value.origin).toBe('overview');
+      expect(a.value.page_size).toBe('3');
     }
   });
 
@@ -444,6 +482,7 @@ describe('handleSchedulesCardAction', () => {
   });
 
   it('page → renders requested page', async () => {
+    // PAGE_SIZE=5 → 25 / 5 = 5 pages.
     const tasks = Array.from({ length: 25 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
     const deps = makeDeps({
       createClient: vi.fn(() => ({ request: vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' })) } as any)),
@@ -452,7 +491,7 @@ describe('handleSchedulesCardAction', () => {
       makeAction({ action: SCHEDULES_ACTION_PAGE, invoker_open_id: INVOKER, page: '2' }),
       LARK_APP_ID, deps,
     );
-    expect(JSON.stringify(r.card?.data)).toContain('第 2/3 页');
+    expect(JSON.stringify(r.card?.data)).toContain('第 2/5 页');
   });
 
   /** ─── Overview drilldown — handler nav propagation ─── */
@@ -995,8 +1034,8 @@ describe('handleSchedulesCardAction', () => {
       expect(r.card?.type).toBe('raw');
       const cardJson = JSON.stringify(r.card?.data);
       expect(cardJson).toContain('Dashboard 定时任务');
-      // page 1 of 3 pages (25 / 10)
-      expect(cardJson).toContain('第 1/3 页');
+      // page 1 of 5 pages (25 / 5; PAGE_SIZE=5 after 2026-06-10 unification).
+      expect(cardJson).toContain('第 1/5 页');
     });
 
     it('non-owner → toast, no GET', async () => {

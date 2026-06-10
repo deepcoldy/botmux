@@ -105,7 +105,8 @@ describe('handleCardAction → schedules dispatch returns { card } only on succe
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
 
     expect(result.card).toBeDefined();
-    expect(JSON.stringify(result.card?.data)).toContain('第 2/3 页');
+    // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
+    expect(JSON.stringify(result.card?.data)).toContain('第 2/5 页');
 
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
