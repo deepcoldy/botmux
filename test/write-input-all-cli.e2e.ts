@@ -80,6 +80,14 @@ function hasDelayBetween(writes: WriteRecord[], minMs: number): boolean {
   return false;
 }
 
+/** True when nothing the adapter wrote contains a raw newline. Runner adapters
+ *  (mira / codex-app) base64-encode the whole message into a single control
+ *  line, so the content's own newlines never reach the TUI as Enter keystrokes
+ *  — a stronger multi-line-safety strategy than bracketed paste or delay. */
+function hasNoRawNewline(writes: WriteRecord[]): boolean {
+  return !writes.map(w => w.data).join('').includes('\n');
+}
+
 // ─── Test fixtures ──────────────────────────────────────────────────────────
 
 const SINGLE_LINE = 'hello world';
@@ -154,16 +162,19 @@ describe('writeInput: write sequence verification (all CLIs × all scenarios)', 
 
             const usesBracket = hasBracketedPaste(pty.writes);
             const usesDelay = hasDelayBetween(pty.writes, 100);
+            const usesEncoding = hasNoRawNewline(pty.writes);
 
             console.log(`\n[${adapterDef.name}] ${scenario.name} multi-line strategy:`);
             console.log(`  bracketed paste: ${usesBracket}`);
             console.log(`  has delay (>=100ms): ${usesDelay}`);
+            console.log(`  no raw newline (encoded): ${usesEncoding}`);
             console.log(pty.dump());
 
-            // Multi-line MUST use some strategy to avoid \n being treated as Enter
+            // Multi-line MUST use some strategy to avoid \n being treated as Enter:
+            // bracketed paste, a delay before CR, or encoding it away (runner adapters).
             expect(
-              usesBracket || usesDelay,
-              `${adapterDef.name}: multi-line needs bracketed paste or delay before CR`,
+              usesBracket || usesDelay || usesEncoding,
+              `${adapterDef.name}: multi-line needs bracketed paste, delay, or newline-free encoding`,
             ).toBe(true);
           });
         }
