@@ -88,21 +88,24 @@ describe('buildSessionsCard', () => {
     expect(json).toContain('已关闭 2');
   });
 
-  it('renders pagination buttons when > 10 rows; page=2 emits prev=1 / next=3', () => {
+  it('renders pagination buttons when > 5 rows; page=2 emits prev=1 / next=3', () => {
+    // Default PAGE_SIZE=5 (unified with overview drilldown 2026-06-10).
+    // 25 rows / 5 per page = 5 pages.
     const rows: SessionRow[] = Array.from({ length: 25 }, (_, i) =>
       row({ sessionId: `sess_${i}`, title: `title-${i}`, status: 'idle' }),
     );
     const json = buildSessionsCard(rows, { ...baseOpts, page: 2 }, NOW);
     expect(json).toContain('上一页');
     expect(json).toContain('下一页');
-    expect(json).toContain('第 2/3 页');
+    expect(json).toContain('第 2/5 页');
     // prev → page=1, next → page=3
     expect(json).toContain('"page":"1"');
     expect(json).toContain('"page":"3"');
   });
 
   it('on first page prev is disabled; on last page next is disabled', () => {
-    const rows: SessionRow[] = Array.from({ length: 15 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
+    // 8 rows / PAGE_SIZE=5 = 2 pages → easy boundary test.
+    const rows: SessionRow[] = Array.from({ length: 8 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
     const findPagerButtons = (json: string): { prev: any; next: any } => {
       const parsed = JSON.parse(json);
       // Slice 2a introduced per-row `📂 详情` action elements before the
@@ -229,21 +232,20 @@ describe('buildSessionsCard', () => {
   });
 
   /** ─── Overview drilldown (2026-06-10) ───
-   *  When opened via `/dashboard overview` → goto sessions, the card uses
-   *  5/page and threads `origin=overview` + `page_size=5` onto every
-   *  button.value, plus renders a "🔙 返回总览" button. Standalone
-   *  `/dashboard sessions` is unaffected — opts omit both fields. */
+   *  When opened via `/dashboard overview` → goto sessions, the card renders
+   *  a "🔙 返回总览" button on the footer (only present when
+   *  `origin='overview'`). Page size is unified at 5 across standalone and
+   *  drilldown (2026-06-10 user request); the standalone command no longer
+   *  uses 10/page. */
   describe('overview drilldown', () => {
     const NOW = 2_000_000;
     const rows = Array.from({ length: 12 }, (_, i) =>
       row({ sessionId: `sess_${i}`, title: `s${i}`, status: 'idle', lastMessageAt: 1_000_000 - i * 1000 }),
     );
 
-    it('pageSize=5 → paginates 5 rows/page (vs 10 default)', () => {
-      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5 }, NOW);
+    it('default PAGE_SIZE → 5 rows/page (standalone and drilldown both 5 after 2026-06-10 unification)', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1 }, NOW);
       const parsed = JSON.parse(json);
-      // Each row produces two elements (info div + per-row action). Count
-      // detail buttons to know how many rows we rendered.
       const detailButtons = (parsed.elements as any[])
         .filter((e: any) => e.tag === 'action')
         .flatMap((e: any) => e.actions ?? [])
@@ -251,14 +253,14 @@ describe('buildSessionsCard', () => {
       expect(detailButtons.length).toBe(5);
     });
 
-    it('standalone (no opts) → still paginates 10/page (no regression)', () => {
-      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1 }, NOW);
+    it('explicit pageSize override still works (caller can pick a different size)', () => {
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 3 }, NOW);
       const parsed = JSON.parse(json);
       const detailButtons = (parsed.elements as any[])
         .filter((e: any) => e.tag === 'action')
         .flatMap((e: any) => e.actions ?? [])
         .filter((a: any) => a.value?.action === SESSIONS_ACTION_DETAIL);
-      expect(detailButtons.length).toBe(10);
+      expect(detailButtons.length).toBe(3);
     });
 
     it('origin=overview → footer renders "🔙 返回总览" with action=dash_overview_refresh', () => {
@@ -283,19 +285,36 @@ describe('buildSessionsCard', () => {
       expect(backBtn).toBeUndefined();
     });
 
-    it('origin=overview + pageSize=5 → every button.value carries origin + page_size', () => {
+    it('origin=overview → every child button.value carries origin (page_size omitted when == default)', () => {
+      // After 2026-06-10 unification, PAGE_SIZE=5 default. When drilldown
+      // also passes pageSize=5 (== default), `page_size` is NOT threaded
+      // onto button.value (effectivePageSize === PAGE_SIZE branch). Origin
+      // remains the canonical drilldown signal.
       const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
       const parsed = JSON.parse(json);
       const allButtons = (parsed.elements as any[])
         .filter((e: any) => e.tag === 'action')
         .flatMap((e: any) => e.actions ?? []);
-      // Every button EXCEPT the back-to-overview should carry origin +
-      // page_size. The back-to-overview itself only needs invoker_open_id
-      // (it dispatches back to the overview rebuild handler).
       const childButtons = allButtons.filter((b: any) => b.value?.action !== 'dash_overview_refresh');
       for (const b of childButtons) {
         expect(b.value.origin).toBe('overview');
-        expect(b.value.page_size).toBe('5');
+        // page_size omitted because effective size equals PAGE_SIZE default.
+        expect(b.value.page_size).toBeUndefined();
+      }
+    });
+
+    it('origin=overview + pageSize=3 (overridden) → button.value carries BOTH origin AND page_size', () => {
+      // Demonstrate the nav-fields contract still works when the caller
+      // overrides to a non-default size.
+      const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 3, origin: 'overview' }, NOW);
+      const parsed = JSON.parse(json);
+      const childButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      for (const b of childButtons) {
+        expect(b.value.origin).toBe('overview');
+        expect(b.value.page_size).toBe('3');
       }
     });
 
@@ -416,7 +435,10 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
   });
 
   /** ─── Overview drilldown — detail back button preserves nav ─── */
-  it('detail card with origin=overview → back button.value carries origin + page_size', () => {
+  it('detail card with origin=overview (pageSize at default) → back button.value carries origin (page_size omitted)', () => {
+    // After 2026-06-10 unification, PAGE_SIZE=5; drilldown passes
+    // pageSize=5 (== default), so `page_size` is omitted from nav fields
+    // (only included when different from default).
     const detail = detailFor({ sessionId: 'sess_back_overview', status: 'idle' });
     const json = buildSessionsDetailCard(detail, {
       ...baseOpts,
@@ -429,14 +451,30 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
       (a: any) => a.value?.action === SESSIONS_ACTION_BACK_TO_LIST,
     );
     expect(backBtn.value.origin).toBe('overview');
-    expect(backBtn.value.page_size).toBe('5');
-    // The close button's value should ALSO carry nav so a successful close
-    // → rebuilt detail → then 🔙 返回 still lands on drilldown list.
+    expect(backBtn.value.page_size).toBeUndefined();
+    // close button mirrors back-button nav (so successful close → rebuilt
+    // detail → 🔙 返回 still lands on drilldown list).
     const closeBtn = (actionRow.actions as any[]).find(
       (a: any) => a.value?.action === SESSIONS_ACTION_CLOSE,
     );
     expect(closeBtn.value.origin).toBe('overview');
-    expect(closeBtn.value.page_size).toBe('5');
+    expect(closeBtn.value.page_size).toBeUndefined();
+  });
+
+  it('detail card with origin=overview AND overridden pageSize=3 → back/close carry origin AND page_size', () => {
+    const detail = detailFor({ sessionId: 'sess_override', status: 'idle' });
+    const json = buildSessionsDetailCard(detail, {
+      ...baseOpts,
+      origin: 'overview',
+      pageSize: 3,
+    });
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const backBtn = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SESSIONS_ACTION_BACK_TO_LIST,
+    );
+    expect(backBtn.value.origin).toBe('overview');
+    expect(backBtn.value.page_size).toBe('3');
   });
 
   it('detail card WITHOUT origin → back/close values do NOT include origin/page_size', () => {
@@ -516,6 +554,7 @@ describe('handleSessionsCardAction', () => {
   });
 
   it('page → uses the requested page index (clamped)', async () => {
+    // 25 rows / PAGE_SIZE=5 = 5 pages.
     const rows = Array.from({ length: 25 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
     const deps = makeDeps({
       createClient: vi.fn(() => ({
@@ -528,7 +567,7 @@ describe('handleSessionsCardAction', () => {
       deps,
     );
     const cardJson = JSON.stringify(r.card?.data);
-    expect(cardJson).toContain('第 2/3 页');
+    expect(cardJson).toContain('第 2/5 页');
   });
 
   /** ─── Overview drilldown — handler honors nav state ─── */
@@ -608,7 +647,9 @@ describe('handleSessionsCardAction', () => {
     expect(cardJson).toContain('dash_overview_refresh');
   });
 
-  it('detail with origin=overview → detail card back/close values carry origin + page_size', async () => {
+  it('detail with origin=overview (default page size) → detail back/close values carry origin (page_size omitted)', async () => {
+    // After 2026-06-10 unification PAGE_SIZE=5; 5 == default → page_size
+    // omitted (only origin remains as the drilldown signal).
     const rows = [row({ sessionId: 's_detail', title: 'detail', status: 'idle' })];
     const deps = makeDeps({
       createClient: vi.fn(() => ({
@@ -628,10 +669,33 @@ describe('handleSessionsCardAction', () => {
     );
     const cardJson = JSON.stringify(r.card?.data);
     // Detail card itself does NOT render back-to-overview (single back
-    // affordance per slice) but the back button must propagate nav so the
-    // rebuilt list stays drilldown.
+    // affordance per slice) but the back button must propagate origin so
+    // the rebuilt list stays drilldown.
     expect(cardJson).toContain('"origin":"overview"');
-    expect(cardJson).toContain('"page_size":"5"');
+    expect(cardJson).not.toContain('"page_size":"5"');
+  });
+
+  it('detail with origin=overview AND overridden page_size=3 → back/close carry origin AND page_size', async () => {
+    const rows = [row({ sessionId: 's_detail_override', title: 'detail', status: 'idle' })];
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { sessions: rows }, raw: '' })),
+      } as any)),
+    });
+    const r = await handleSessionsCardAction(
+      makeAction({
+        action: SESSIONS_ACTION_DETAIL,
+        invoker_open_id: INVOKER,
+        session_id: 's_detail_override',
+        origin: 'overview',
+        page_size: '3',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('"origin":"overview"');
+    expect(cardJson).toContain('"page_size":"3"');
   });
 
   it('non-owner → toast `owner_only`, NO client call', async () => {
@@ -1063,6 +1127,7 @@ describe('handleSessionsCardAction', () => {
   // ─── Slice 2a: BACK TO LIST ─────────────────────────────────────────
   describe('action=dash_sessions_back_to_list', () => {
     it('GET sessions-list → returns { card } with list card body at page 1', async () => {
+      // 25 rows / PAGE_SIZE=5 = 5 pages.
       const sessions = Array.from({ length: 25 }, (_, i) =>
         row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }),
       );
@@ -1083,9 +1148,9 @@ describe('handleSessionsCardAction', () => {
       expect(r.toast).toBeUndefined();
       expect(r.card?.type).toBe('raw');
       const cardJson = JSON.stringify(r.card?.data);
-      // Renders the list card title + lands on page 1 of the 3-page set.
+      // Renders the list card title + lands on page 1 of the 5-page set.
       expect(cardJson).toContain('Dashboard 会话');
-      expect(cardJson).toContain('第 1/3 页');
+      expect(cardJson).toContain('第 1/5 页');
     });
 
     it('non-owner → toast, no GET', async () => {

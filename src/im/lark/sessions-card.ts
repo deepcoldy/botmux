@@ -55,10 +55,12 @@ export const SESSIONS_ACTION_BACK_TO_LIST = 'dash_sessions_back_to_list' as cons
  *  overview handler regardless of which sub-card emitted it. */
 const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for the standalone `/dashboard sessions` command. The
- *  overview drilldown overrides this to 5 via the `pageSize` opt for a
- *  mobile-friendlier sub-card. */
-const PAGE_SIZE = 10;
+/** Default page size for `/dashboard sessions` (standalone AND overview
+ *  drilldown — unified at 5/page on user request 2026-06-10 so the
+ *  standalone card matches drilldown behavior; both are mobile-friendly).
+ *  The `pageSize` opt still works as an override for callers that need a
+ *  different size in the future. */
+const PAGE_SIZE = 5;
 
 /** Hard cap on `select_static` option count for the "jump to page" picker.
  *  Lark caps select options around this; we also keep payload small. Above
@@ -81,10 +83,10 @@ export interface BuildSessionsCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
-  /** Page size override. Standalone `/dashboard sessions` omits → PAGE_SIZE (10).
-   *  Overview drilldown sets to 5 for a mobile-friendlier sub-card. Threaded
-   *  through every button.value so the size persists across page/refresh/
-   *  detail-back round-trips. */
+  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
+   *  drilldown 2026-06-10). Override only when a caller needs a different
+   *  size. Threaded through every button.value so the size persists across
+   *  page/refresh/detail-back round-trips. */
   pageSize?: number;
   /** Navigation origin. `'overview'` means this card was opened via
    *  `/dashboard overview` → goto sessions; the footer renders an extra

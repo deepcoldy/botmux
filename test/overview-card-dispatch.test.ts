@@ -183,16 +183,18 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(result.card).toBeDefined();
       const cardJson = JSON.stringify(result.card?.data);
 
-      // 1) 5/page → 12 rows → 3 pages.
+      // 1) 5/page → 12 rows → 3 pages (PAGE_SIZE=5 default after 2026-06-10 unification).
       expect(cardJson).toContain('第 1/3 页');
 
       // 2) Back-to-overview button present.
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
       expect(cardJson).toContain('返回总览');
 
-      // 3) All child buttons carry origin + page_size.
+      // 3) Origin threaded onto button.value. page_size is OMITTED when
+      //    effective size equals default (5 == PAGE_SIZE) — origin alone is
+      //    the canonical drilldown signal.
       expect(cardJson).toContain('"origin":"overview"');
-      expect(cardJson).toContain('"page_size":"5"');
+      expect(cardJson).not.toContain('"page_size"');
 
       // 4) select_static jump-page picker present (3 pages > 2).
       expect(cardJson).toContain('select_static');
