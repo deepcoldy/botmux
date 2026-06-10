@@ -31,8 +31,10 @@ export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot
   let worker: WorkerState | null = null;
   const artifacts: ArtifactRef[] = [];
   const progressLog: ProgressEntry[] = [];
+  let stall: BoardSnapshot['stall'] = null;
   const interventions = new Map<string, InterventionState>();
   let status: RunStatus = 'pending';
+  let controlTopicId: string | null = null;
 
   let budgetLimit: number | null = null;
   let budgetUnit: BudgetState['unit'] = 'tokens';
@@ -48,6 +50,7 @@ export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot
         acceptanceCriteria = e.payload.acceptanceCriteria;
         budgetLimit = e.payload.budgetLimit;
         budgetUnit = e.payload.budgetUnit;
+        controlTopicId = e.payload.controlTopicId;
         if (status === 'pending') status = 'running';
         break;
       case 'GoalChanged':
@@ -121,11 +124,22 @@ export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot
           seq: e.seq,
           timestamp: e.timestamp,
           verdict: e.payload.verdict,
+          direction: e.payload.progress?.direction,
+          streak: e.payload.progress?.streak,
           metric: e.payload.signal?.metric,
           value: e.payload.signal?.value,
           prevValue: e.payload.signal?.prevValue,
           summary: e.payload.provenance.summary,
         });
+        // An improved/done evaluation resolves any active stall.
+        if (e.payload.verdict === 'done' || e.payload.progress?.direction === 'improved') stall = null;
+        break;
+      case 'ProgressStallRaised':
+        stall = {
+          streak: e.payload.streak,
+          threshold: e.payload.threshold,
+          raisedAtSeq: e.seq,
+        };
         break;
 
       case 'BudgetExhausted':
@@ -187,7 +201,9 @@ export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot
     worker,
     artifacts,
     progressLog,
+    stall,
     budget,
     interventions: [...interventions.values()],
+    controlTopicId,
   };
 }

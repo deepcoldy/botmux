@@ -64,6 +64,7 @@ export const BoardPathEnum = z.enum([
   'worker',
   'artifacts',
   'progressLog',
+  'stall',
   'budget',
   'interventions',
   'status',
@@ -228,11 +229,23 @@ export const ArtifactRecordedEventSchema = event('ArtifactRecorded', z.object({
 
 export const RefereeVerdictEnum = z.enum(['done', 'progressing', 'stuck', 'regressed']);
 export type RefereeVerdict = z.infer<typeof RefereeVerdictEnum>;
+
+/** P2 dual output: which way this evaluation moved relative to the last one.
+ *  'improved' resets the stall streak; everything else extends it. First
+ *  measurement WITH a metric = 'improved' (a baseline is information gained);
+ *  a failing binary evaluation with no metric = 'unknown' (no progress signal
+ *  at all — exactly the case that should escalate fastest). */
+export const ProgressDirectionEnum = z.enum(['improved', 'regressed', 'flat', 'unknown']);
+export type ProgressDirection = z.infer<typeof ProgressDirectionEnum>;
+
 export const RefereeEvaluatedEventSchema = event('RefereeEvaluated', z.object({
   taskId: TaskIdSchema,
+  /** Human-readable rollup of (completion, progress); kept for continuity. */
   verdict: RefereeVerdictEnum,
   /** Proof the verdict is real, not claimed — the referee ran the command. */
   provenance: z.object({
+    /** Which oracle adapter produced this evaluation. P2 v1: exec only. */
+    adapter: z.enum(['exec']).optional(),
     command: z.string(),
     exitCode: z.number().int(),
     durationMs: z.number().int().nonnegative().optional(),
@@ -244,6 +257,30 @@ export const RefereeEvaluatedEventSchema = event('RefereeEvaluated', z.object({
     value: z.number(),
     prevValue: z.number().optional(),
   }).optional(),
+  /** P2 dual output ① — completion decides termination, nothing else does. */
+  completion: z.object({
+    done: z.boolean(),
+    rule: z.literal('exitZero'),
+  }).optional(),
+  /** P2 dual output ② — progress informs budget attention, never termination.
+   *  streak = consecutive evaluations without improvement, INCLUDING this one;
+   *  0 when improved/done. */
+  progress: z.object({
+    direction: ProgressDirectionEnum,
+    streak: z.number().int().nonnegative(),
+  }).optional(),
+}));
+
+/** Edge-trigger raised by the referee when the no-improvement streak hits the
+ *  stall threshold (and again at each further multiple). The board only
+ *  records it; notifying the control topic is the integration面's reaction.
+ *  Budget remains the only breaker — a stall NEVER terminates the run, it
+ *  schedules human attention before the wallet burns dry. */
+export const ProgressStallRaisedEventSchema = event('ProgressStallRaised', z.object({
+  taskId: TaskIdSchema,
+  streak: z.number().int().positive(),
+  threshold: z.number().int().positive(),
+  lastVerdict: RefereeVerdictEnum,
 }));
 
 // ── budget (the incorruptible circuit-breaker) ───────────────────────────────
@@ -299,6 +336,7 @@ export const CollabEventSchema = z.discriminatedUnion('type', [
   WorkerLostEventSchema,
   ArtifactRecordedEventSchema,
   RefereeEvaluatedEventSchema,
+  ProgressStallRaisedEventSchema,
   BudgetSpentEventSchema,
   BudgetExhaustedEventSchema,
   GoalChangeRequestedEventSchema,
@@ -361,10 +399,21 @@ export interface ProgressEntry {
   seq: number;
   timestamp: number;
   verdict: RefereeVerdict;
+  /** P2 dual output; absent on entries from pre-P2 events. */
+  direction?: ProgressDirection;
+  streak?: number;
   metric?: string;
   value?: number;
   prevValue?: number;
   summary?: string;
+}
+
+/** Active stall (no-improvement streak hit the threshold). Cleared by the next
+ *  improved/done evaluation. */
+export interface StallState {
+  streak: number;
+  threshold: number;
+  raisedAtSeq: number;
 }
 
 export interface BudgetState {
@@ -393,8 +442,13 @@ export interface BoardSnapshot {
   worker: WorkerState | null;
   artifacts: ArtifactRef[];
   progressLog: ProgressEntry[];
+  /** Set by ProgressStallRaised; cleared by the next improved/done evaluation. */
+  stall: StallState | null;
   budget: BudgetState | null;
   interventions: InterventionState[];
+  /** Topic where the human steers this run (from RunCreated) — the delivery
+   *  anchor for stall notices and other control-plane→human signals. */
+  controlTopicId: string | null;
 }
 
 // ════════════════════════════════════════════════════════════════════════════

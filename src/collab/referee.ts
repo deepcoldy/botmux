@@ -1,5 +1,5 @@
 /**
- * collab/referee.ts — the deterministic loop-closer.
+ * collab/referee.ts — the deterministic loop-closer (P2: dual-output oracle).
  *
  * The referee is NOT an agent and holds NO context. It reads the board, runs the
  * acceptance command ITSELF (so the verdict has executable provenance — a worker
@@ -7,23 +7,96 @@
  * run; if the budget breaker has tripped it stops the run instead. That's the
  * whole point of acceptance test ④: progress can't be claimed, only proven.
  *
+ * P2 dual output: every evaluation now states (a) COMPLETION — does the
+ * acceptance rule pass; this and only this terminates the run — and (b)
+ * PROGRESS — which way the run is moving. Progress never terminates anything;
+ * its one job is scheduling budget attention: a no-improvement streak hitting
+ * STALL_THRESHOLD raises ProgressStallRaised so a human gets called BEFORE the
+ * wallet burns dry. Budget remains the only breaker.
+ *
+ * The measurement itself lives behind OracleAdapter; v1 ships exec only
+ * (debug/research adapters plug in here later without touching the shell).
+ *
  * It is code, not an LLM, so it spends ~no budget; LLM control-plane spend
  * (intake NLU) is what uses BudgetSpent.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type {
+  AcceptanceCriteria,
   CollabBoard,
   CollabEventDraft,
+  ProgressDirection,
   RefereeVerdict,
 } from './contract.js';
 
 const pexec = promisify(execFile);
 
+/** Consecutive no-improvement evaluations before the referee calls a human. */
+export const STALL_THRESHOLD = 3;
+
+export interface OracleEvaluation {
+  /** Completion judgment — decides termination, nothing else does. */
+  completion: { done: boolean; rule: 'exitZero' };
+  /** Extracted progress metric value, when the criteria defines one and the
+   *  output matched. */
+  metricValue?: number;
+  /** Proof the evaluation is real — the adapter measured unforgeable state. */
+  provenance: { adapter: 'exec'; command: string; exitCode: number; durationMs: number; summary: string };
+}
+
+/**
+ * An oracle adapter performs ONE measurement against unforgeable state. The
+ * referee shell (self-gate, budget breaker, verdict, stall escalation,
+ * termination) is adapter-agnostic.
+ */
+export interface OracleAdapter {
+  evaluate(criteria: AcceptanceCriteria, opts: { cwd?: string }): Promise<OracleEvaluation>;
+}
+
+/** v1 adapter: run the acceptance command, completion = exit 0, progress
+ *  metric extracted from combined output by the criteria's regex. */
+export const execOracleAdapter: OracleAdapter = {
+  async evaluate(criteria, opts) {
+    const { command } = criteria;
+    let exitCode = 0;
+    let output = '';
+    const start = Date.now();
+    try {
+      const { stdout, stderr } = await pexec('bash', ['-lc', command], {
+        cwd: opts.cwd,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      output = String(stdout) + String(stderr);
+    } catch (err) {
+      const e = err as { code?: unknown; stdout?: unknown; stderr?: unknown };
+      exitCode = typeof e.code === 'number' ? e.code : 1;
+      output = String(e.stdout ?? '') + String(e.stderr ?? '');
+    }
+    const durationMs = Date.now() - start;
+
+    let metricValue: number | undefined;
+    if (criteria.progressMetric) {
+      const m = output.match(new RegExp(criteria.progressMetric.pattern));
+      if (m && m[1] != null && !Number.isNaN(Number(m[1]))) metricValue = Number(m[1]);
+    }
+
+    return {
+      completion: { done: exitCode === 0, rule: 'exitZero' },
+      metricValue,
+      provenance: { adapter: 'exec', command, exitCode, durationMs, summary: output.trim().slice(-300) },
+    };
+  },
+};
+
 export interface RefereeResult {
   verdict: RefereeVerdict | 'budget-exhausted' | 'no-op';
   exitCode?: number;
   metricValue?: number;
+  /** true ⇔ this evaluation crossed a stall edge (streak hit a multiple of
+   *  STALL_THRESHOLD) and ProgressStallRaised was appended. The integration面
+   *  reacts by notifying the control topic. */
+  stalled?: boolean;
 }
 
 export interface RefereeOptions {
@@ -32,6 +105,8 @@ export interface RefereeOptions {
   /** Idempotency discriminator; defaults to the board revision so one verdict
    *  is recorded per board state. */
   idemSuffix?: string;
+  /** Measurement backend; defaults to the exec adapter. */
+  adapter?: OracleAdapter;
 }
 
 export async function runReferee(board: CollabBoard, opts: RefereeOptions = {}): Promise<RefereeResult> {
@@ -61,51 +136,44 @@ export async function runReferee(board: CollabBoard, opts: RefereeOptions = {}):
     if (!changedSince) return { verdict: 'no-op' };
   }
 
-  const { command } = snap.acceptanceCriteria;
-  let exitCode = 0;
-  let output = '';
-  const start = Date.now();
-  try {
-    const { stdout, stderr } = await pexec('bash', ['-lc', command], {
-      cwd: opts.cwd,
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    output = String(stdout) + String(stderr);
-  } catch (err) {
-    const e = err as { code?: unknown; stdout?: unknown; stderr?: unknown };
-    exitCode = typeof e.code === 'number' ? e.code : 1;
-    output = String(e.stdout ?? '') + String(e.stderr ?? '');
-  }
-  const durationMs = Date.now() - start;
-  const summary = output.trim().slice(-300);
+  const evaluation = await (opts.adapter ?? execOracleAdapter).evaluate(snap.acceptanceCriteria, { cwd: opts.cwd });
+  const { exitCode } = evaluation.provenance;
+  const done = evaluation.completion.done;
 
-  // Extract the progress metric, if the criteria says how to measure it.
+  // Progress signal: metric value + its prior measurement.
   let signal: { metric: string; value: number; prevValue?: number } | undefined;
   const pm = snap.acceptanceCriteria.progressMetric;
-  if (pm) {
-    const m = output.match(new RegExp(pm.pattern));
-    if (m && m[1] != null && !Number.isNaN(Number(m[1]))) {
-      const value = Number(m[1]);
-      const prevValue = [...snap.progressLog].reverse().find((p) => p.metric === pm.name)?.value;
-      signal = { metric: pm.name, value, prevValue };
-    }
+  if (pm && evaluation.metricValue !== undefined) {
+    const prevValue = [...snap.progressLog].reverse().find((p) => p.metric === pm.name)?.value;
+    signal = { metric: pm.name, value: evaluation.metricValue, prevValue };
   }
 
-  // Verdict: exit 0 ⇒ done. Otherwise grade by the metric gradient when we have
-  // one (lower = progress), else we can only say "not done" ⇒ stuck.
-  let verdict: RefereeVerdict;
-  if (exitCode === 0) {
-    verdict = 'done';
+  // Dual output ②: direction + streak. First measurement WITH a metric is
+  // 'improved' (a baseline is information gained); a failing binary evaluation
+  // with no metric is 'unknown' — no progress signal at all is exactly the
+  // case that should escalate fastest.
+  let direction: ProgressDirection;
+  if (done) {
+    direction = 'improved';
   } else if (signal && signal.prevValue !== undefined) {
-    verdict =
-      signal.value < signal.prevValue ? 'progressing'
+    direction =
+      signal.value < signal.prevValue ? 'improved'
       : signal.value > signal.prevValue ? 'regressed'
-      : 'stuck';
+      : 'flat';
   } else if (signal) {
-    verdict = 'progressing'; // first measurement establishes a baseline
+    direction = 'improved';
   } else {
-    verdict = 'stuck';
+    direction = 'unknown';
   }
+  const lastEntry = snap.progressLog[snap.progressLog.length - 1];
+  const streak = direction === 'improved' ? 0 : (lastEntry?.streak ?? 0) + 1;
+
+  // Verdict stays the human-readable rollup of (completion, progress).
+  let verdict: RefereeVerdict;
+  if (done) verdict = 'done';
+  else if (direction === 'improved') verdict = 'progressing';
+  else if (direction === 'regressed') verdict = 'regressed';
+  else verdict = 'stuck'; // flat | unknown
 
   await board.append({
     type: 'RefereeEvaluated',
@@ -117,10 +185,28 @@ export async function runReferee(board: CollabBoard, opts: RefereeOptions = {}):
     payload: {
       taskId: snap.task.taskId,
       verdict,
-      provenance: { command, exitCode, durationMs, summary },
+      provenance: evaluation.provenance,
       signal,
+      completion: evaluation.completion,
+      progress: { direction, streak },
     },
   } as CollabEventDraft);
+
+  // Stall escalation: raise at each streak edge (3, 6, 9 …). The eval idem in
+  // the key keeps a re-stall after recovery distinct from the first one.
+  let stalled = false;
+  if (!done && streak > 0 && streak % STALL_THRESHOLD === 0) {
+    await board.append({
+      type: 'ProgressStallRaised',
+      runId: snap.runId,
+      actor: 'referee',
+      idempotencyKey: `stall:${snap.task.taskId}:${streak}:${idem}`,
+      affectedPaths: ['stall'],
+      taskId: snap.task.taskId,
+      payload: { taskId: snap.task.taskId, streak, threshold: STALL_THRESHOLD, lastVerdict: verdict },
+    } as CollabEventDraft);
+    stalled = true;
+  }
 
   if (verdict === 'done') {
     await board.append({
@@ -135,7 +221,7 @@ export async function runReferee(board: CollabBoard, opts: RefereeOptions = {}):
     await board.append(finish(snap.runId, idem, 'succeeded', 'acceptance criteria met'));
   }
 
-  return { verdict, exitCode, metricValue: signal?.value };
+  return { verdict, exitCode, metricValue: signal?.value, stalled };
 }
 
 function finish(
