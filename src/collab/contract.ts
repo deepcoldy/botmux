@@ -197,11 +197,13 @@ export const WorkerAllocatedEventSchema = event('WorkerAllocated', z.object({
   taskId: TaskIdSchema,
   /** epoch ms; watchdog reclaims the lease past this. */
   leaseExpiresAt: z.number().int().positive().optional(),
-  /** Where this worker physically runs: its own bot identity + topic/chat
-   *  anchor. Set when the worker is spawned under a pool bot in its own topic
-   *  (P0.1) so the control-plane can route interventions to the worker's
-   *  session instead of colocating it under the control bot. Omitted ⇒ legacy
-   *  colocated-under-control behaviour. */
+  /** Where this worker physically runs. `larkAppId` is set iff the worker is
+   *  a pooled identity (its own bot, not the control app). `topicId` is set
+   *  whenever the worker's route is independent of the control topic — pooled
+   *  worker AND/OR a per-run worker topic (T2: control-plane creates a fresh
+   *  topic per run and anchors the worker session there; reallocation keeps
+   *  the same topic — the topic belongs to the run, not the process). Both
+   *  omitted ⇒ legacy colocated-under-control behaviour. */
   larkAppId: z.string().optional(),
   topicId: z.string().optional(),
 }));
@@ -379,8 +381,9 @@ export interface WorkerState {
   taskId: string;
   phase: 'allocated' | 'running' | 'suspended' | 'lost';
   leaseExpiresAt?: number;
-  /** Worker's own bot identity + topic/chat anchor (P0.1 separate-identity
-   *  routing). The control-plane routes interventions here; null/undefined ⇒
+  /** Worker's own bot identity (pooled only) + route anchor (set whenever the
+   *  route is independent of the control topic: pooled identity and/or per-run
+   *  worker topic). The control-plane routes interventions here; undefined ⇒
    *  legacy colocated-under-control worker. */
   larkAppId?: string;
   topicId?: string;
