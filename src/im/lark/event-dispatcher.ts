@@ -387,6 +387,11 @@ function cardActionKey(larkAppId: string, data: any): string {
     // clicks on different schedules' buttons would hash-collide and the
     // second would be silently dropped. Same rationale as `sessionId` above.
     scheduleId: value?.schedule_id,
+    // PR3 workflows slice 2a (codex 2026-06-10): detail/cancel/back share
+    // action labels per verb (`dash_workflows_detail` / `dash_workflows_cancel`)
+    // but apply to different run ids. Same dedupe-collision rationale as
+    // `sessionId` / `scheduleId` above.
+    runId: value?.run_id,
     nonce: value?.card_nonce ?? value?.nonce,
     option: action?.option,
     key: value?.key,

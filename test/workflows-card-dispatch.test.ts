@@ -122,4 +122,139 @@ describe('handleCardAction → workflows dispatch returns { card } only on succe
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
+
+  /* ─── Slice 2a — detail / cancel dispatch ──────────────────────────── */
+
+  it('detail: result.card is the detail card on the fast path; updateMessage NOT called', async () => {
+    const runs = [{
+      runId: 'r_dispatch_detail',
+      workflowId: 'wfDispatchDetail',
+      status: 'running',
+      startedAt: 1_000_000,
+      updatedAt: 1_500_000,
+      nodesDone: 1,
+      nodesTotal: 3,
+      chatBinding: { chatId: 'oc_demo', larkAppId: 'cli_demo' },
+    }];
+    const requestSpy = vi.fn(async () => ({ status: 200, raw: '', body: { runs } }));
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: {
+        value: {
+          action: 'dash_workflows_detail',
+          invoker_open_id: INVOKER,
+          run_id: 'r_dispatch_detail',
+        },
+      },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast).toBeUndefined();
+    expect(result.card).toBeDefined();
+    expect(result.card?.type).toBe('raw');
+    const cardJson = JSON.stringify(result.card?.data);
+    expect(cardJson).toContain('工作流详情');
+    expect(cardJson).toContain('r_dispatch_detail');
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('cancel happy: result.card is the cancelled-state detail; no updateMessage', async () => {
+    const before = {
+      runId: 'r_dispatch_cancel',
+      workflowId: 'wfDispatchCancel',
+      status: 'running',
+      startedAt: 1_000_000,
+      updatedAt: 1_500_000,
+      nodesDone: 1,
+      nodesTotal: 3,
+      chatBinding: { chatId: 'oc_demo', larkAppId: 'cli_demo' },
+    };
+    const after = { ...before, status: 'cancelled' };
+    let getCalls = 0;
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/workflows-runs-snapshot?all=1') {
+        getCalls += 1;
+        return { status: 200, raw: '', body: { runs: [getCalls === 1 ? before : after] } };
+      }
+      if (req.method === 'POST' && req.path === '/__daemon/workflows-runs/r_dispatch_cancel/cancel') {
+        return { status: 200, raw: '', body: { ok: true } };
+      }
+      throw new Error('unexpected: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: {
+        value: {
+          action: 'dash_workflows_cancel',
+          invoker_open_id: INVOKER,
+          run_id: 'r_dispatch_cancel',
+        },
+      },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast).toBeUndefined();
+    expect(result.card).toBeDefined();
+    expect(result.card?.type).toBe('raw');
+    const cardJson = JSON.stringify(result.card?.data);
+    expect(cardJson).toContain('工作流详情');
+    // cancelled state → cancel button disabled with alreadyTerminal note.
+    expect(cardJson).toContain('"disabled":true');
+    expect(cardJson).toContain('run 已处于终态，无法取消');
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('cancel snapshot already terminal: result.toast (alreadyTerminal); no card; no updateMessage', async () => {
+    const before = {
+      runId: 'r_dispatch_done',
+      workflowId: 'wfDispatchDone',
+      status: 'succeeded', // terminal
+      startedAt: 1_000_000,
+      updatedAt: 1_500_000,
+      nodesDone: 3,
+      nodesTotal: 3,
+      chatBinding: { chatId: 'oc_demo', larkAppId: 'cli_demo' },
+    };
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET' && req.path === '/__daemon/workflows-runs-snapshot?all=1') {
+        return { status: 200, raw: '', body: { runs: [before] } };
+      }
+      throw new Error('unexpected: ' + JSON.stringify(req));
+    });
+    mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
+
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: {
+        value: {
+          action: 'dash_workflows_cancel',
+          invoker_open_id: INVOKER,
+          run_id: 'r_dispatch_done',
+        },
+      },
+      context: { open_message_id: 'om_card' },
+    };
+    const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
+
+    expect(result.toast).toBeDefined();
+    expect(result.toast?.content).toContain('run 已处于终态，无法取消');
+    expect(result.card).toBeUndefined();
+
+    // Defense-in-depth: NO POST was issued.
+    const postCalls = requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+    expect(postCalls.length).toBe(0);
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockedUpdateMessage).not.toHaveBeenCalled();
+  });
 });

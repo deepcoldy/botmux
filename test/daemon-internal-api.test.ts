@@ -610,6 +610,280 @@ describe('dispatch: workflows write', () => {
   });
 });
 
+/** ─── WORKFLOWS write — codex hard constraint: cross-bot owner gate ───
+ *  PR3 workflows slice 2a (2026-06-10) introduced a write-side scope check
+ *  for cancel/approve/reject: when `callerAppId` is set (real HMAC caller)
+ *  and the run's `chatBinding.larkAppId` returns a different bot, dispatch
+ *  MUST refuse with 403 workflow_owner_mismatch and NEVER touch
+ *  `proxyToDaemon`. The test seam (no callerAppId) keeps the historical
+ *  pass-through for `dispatchForTest`.
+ *
+ *  Unlike sessions / schedules, workflow runs with `chatBinding`
+ *  undefined are NOT proxied to the caller — they have no routable owner
+ *  semantically and `runCancel` / `runApproveReject` return 409
+ *  needs_lark_or_cli / needs_cli_cancel for that case. This test exercises
+ *  all three verbs because the route table shares one shape; the UI only
+ *  exposes cancel in slice 2a but slice 2b/2c will reuse the gate.
+ */
+describe('dispatch: workflows write — cross-bot owner gate', () => {
+  function ownerMismatchDeps() {
+    const proxySpy = vi.fn(async () => makeUpstream(200, { ok: true }));
+    return makeDeps({
+      workflowsActionDeps: {
+        runsDir: '/tmp/runs-test',
+        // Owner is cli_b for r1; caller will pretend to be cli_a.
+        readRunSnapshot: vi.fn(async (_dir: string, runId: string) => {
+          if (runId === 'r1') {
+            return {
+              run: { status: 'running' },
+              chatBinding: { chatId: 'oc_demo', larkAppId: 'cli_b' },
+              updatedAt: 1_700_000_000_000,
+              lastSeq: 42,
+            };
+          }
+          if (runId === 'r-legacy') {
+            // Exists but no chatBinding — legacy persistence shape.
+            return {
+              run: { status: 'running' },
+              updatedAt: 1_700_000_000_000,
+              lastSeq: 42,
+            };
+          }
+          return null;
+        }),
+        listRuns: vi.fn(async () => [{ runId: 'r1' }]),
+        scrubSnapshotForUnauthed: vi.fn((s: any) => s),
+        TERMINAL_RUN_STATUSES: new Set(['succeeded', 'failed', 'cancelled']),
+        isValidRunId: vi.fn(() => true),
+        proxyToDaemon: proxySpy,
+      },
+    });
+  }
+
+  for (const action of ['cancel', 'approve', 'reject'] as const) {
+    it(`callerAppId=cli_a + owner=cli_b → 403 workflow_owner_mismatch, proxyToDaemon NOT called (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r1/${action}`),
+        JSON.stringify({}),
+        'cli_a',
+      );
+      expect(r.status).toBe(403);
+      expect((r.body as any).error).toBe('workflow_owner_mismatch');
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).not.toHaveBeenCalled();
+    });
+
+    it(`callerAppId=cli_b + owner=cli_b → proxyToDaemon called once, upstream status reflected (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r1/${action}`),
+        JSON.stringify({}),
+        'cli_b',
+      );
+      expect(r.status).toBe(200);
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).toHaveBeenCalledTimes(1);
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).toHaveBeenCalledWith(
+        'cli_b',
+        `/api/workflows/runs/r1/${action}`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
+    it(`test seam (no callerAppId) → proxy still called (back-compat dispatchForTest) (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r1/${action}`),
+        JSON.stringify({}),
+      );
+      expect(r.status).toBe(200);
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).toHaveBeenCalledTimes(1);
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).toHaveBeenCalledWith(
+        'cli_b',
+        `/api/workflows/runs/r1/${action}`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
+    it(`unknown runId (readRunSnapshot returns null) → 404 unknown_run (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r-vanished/${action}`),
+        JSON.stringify({}),
+        'cli_caller',
+      );
+      expect(r.status).toBe(404);
+      expect((r.body as any).error).toBe('unknown_run');
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).not.toHaveBeenCalled();
+    });
+
+    it(`run with no chatBinding → falls through to helper (returns 409 needs_lark_or_cli / needs_cli_cancel, NOT proxied to caller) (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r-legacy/${action}`),
+        JSON.stringify({}),
+        'cli_caller',
+      );
+      expect(r.status).toBe(409);
+      // cancel returns needs_cli_cancel; approve/reject returns needs_lark_or_cli.
+      const expectedError = action === 'cancel' ? 'needs_cli_cancel' : 'needs_lark_or_cli';
+      expect((r.body as any).error).toBe(expectedError);
+      // CRITICAL: helper produced the 409, but we must NOT have proxied to
+      // the caller (no legacy fallback for workflows — unlike schedules).
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).not.toHaveBeenCalled();
+    });
+  }
+});
+
+/** ─── WORKFLOWS write — Codex Route B gate regression (slice 2a) ─────
+ *  The owner-gate at daemon-internal-api.ts:460-494 runs BEFORE the
+ *  workflows helpers `runCancel` / `runApproveReject`. Use `isValidRunId`
+ *  as a tripwire spy on workflowsActionDeps because:
+ *    - the daemon-internal-api gate calls `readRunSnapshot` directly
+ *      (so spying on that doesn't tell apart "gate ran" from "helper ran"),
+ *    - `isValidRunId` is ONLY consumed inside the helpers
+ *      (`workflows-action-helpers.ts:153, 227`), so if it never fires we
+ *      proved the helper was short-circuited by the gate.
+ *  This is the regression Codex refinement #1 asked us to lock down:
+ *  the owner-mismatch case must 403 before the helper enters; the
+ *  owner-missing case still falls through (the gate is silent on that). */
+describe('dispatch: workflows write — cross-bot owner gate regression (isValidRunId tripwire)', () => {
+  function gateRegressionDeps() {
+    const isValidRunIdSpy = vi.fn(() => true);
+    const proxySpy = vi.fn(async () => makeUpstream(200, { ok: true }));
+    const readRunSnapshotSpy = vi.fn(async (_dir: string, runId: string) => {
+      if (runId === 'r1') {
+        return {
+          run: { status: 'running' },
+          chatBinding: { chatId: 'oc_demo', larkAppId: 'cli_b' },
+          updatedAt: 1_700_000_000_000,
+          lastSeq: 42,
+        };
+      }
+      if (runId === 'r-legacy') {
+        // Exists but no chatBinding — gate must NOT inject a caller-proxy
+        // legacy fallback; the helper handles it (409 needs_*).
+        return {
+          run: { status: 'running' },
+          updatedAt: 1_700_000_000_000,
+          lastSeq: 42,
+        };
+      }
+      return null;
+    });
+    const deps = makeDeps({
+      workflowsActionDeps: {
+        runsDir: '/tmp/runs-test',
+        readRunSnapshot: readRunSnapshotSpy,
+        listRuns: vi.fn(async () => [{ runId: 'r1' }]),
+        scrubSnapshotForUnauthed: vi.fn((s: any) => s),
+        TERMINAL_RUN_STATUSES: new Set(['succeeded', 'failed', 'cancelled']),
+        isValidRunId: isValidRunIdSpy,
+        proxyToDaemon: proxySpy,
+      },
+    });
+    return { deps, isValidRunIdSpy, proxySpy, readRunSnapshotSpy };
+  }
+
+  for (const action of ['cancel', 'approve', 'reject'] as const) {
+    it(`mismatch (owner=cli_b, caller=cli_a) → 403, runCancel/runApproveReject NEVER entered (isValidRunId not called) (${action})`, async () => {
+      const { deps, isValidRunIdSpy, proxySpy } = gateRegressionDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r1/${action}`),
+        JSON.stringify({}),
+        'cli_a',
+      );
+      expect(r.status).toBe(403);
+      expect((r.body as any).error).toBe('workflow_owner_mismatch');
+      // Tripwire: isValidRunId is exclusive to the helpers. Not called → helper not entered.
+      expect(isValidRunIdSpy).not.toHaveBeenCalled();
+      expect(proxySpy).not.toHaveBeenCalled();
+    });
+
+    it(`match (owner=cli_b, caller=cli_b) → upstream helper called once (isValidRunId fires) (${action})`, async () => {
+      const { deps, isValidRunIdSpy, proxySpy } = gateRegressionDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r1/${action}`),
+        JSON.stringify({}),
+        'cli_b',
+      );
+      expect(r.status).toBe(200);
+      // Helper entered → isValidRunId called exactly once (one helper invocation).
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
+      expect(isValidRunIdSpy).toHaveBeenCalledWith('r1');
+      // Helper got far enough to call proxyToDaemon.
+      expect(proxySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it(`test seam (no callerAppId) → upstream helper called (isValidRunId fires) (${action})`, async () => {
+      const { deps, isValidRunIdSpy, proxySpy } = gateRegressionDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r1/${action}`),
+        JSON.stringify({}),
+      );
+      expect(r.status).toBe(200);
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
+      expect(proxySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it(`chatBinding undefined (no owner) + callerAppId set → helper STILL called (gate has no opinion on owner-missing) (${action})`, async () => {
+      // The gate ONLY blocks owner mismatch. Owner-missing is the helper's
+      // problem (it returns 409 needs_lark_or_cli / needs_cli_cancel) — the
+      // gate must NOT proxy to the caller as a "legacy fallback" the way
+      // schedules does, because workflows runs have no routable owner
+      // semantically. See codex refinement #1.
+      const { deps, isValidRunIdSpy, proxySpy } = gateRegressionDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r-legacy/${action}`),
+        JSON.stringify({}),
+        'cli_caller',
+      );
+      expect(r.status).toBe(409);
+      const expectedError = action === 'cancel' ? 'needs_cli_cancel' : 'needs_lark_or_cli';
+      expect((r.body as any).error).toBe(expectedError);
+      // Tripwire fires → helper was entered (the gate did NOT short-circuit).
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
+      // But no proxy to caller — workflows gate is forbidden from such fallback.
+      expect(proxySpy).not.toHaveBeenCalled();
+    });
+
+    it(`readRunSnapshot returns null → 404 unknown_run, helper NEVER entered (isValidRunId not called) (${action})`, async () => {
+      const { deps, isValidRunIdSpy, proxySpy, readRunSnapshotSpy } = gateRegressionDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r-vanished/${action}`),
+        JSON.stringify({}),
+        'cli_caller',
+      );
+      expect(r.status).toBe(404);
+      expect((r.body as any).error).toBe('unknown_run');
+      // readRunSnapshot was called by the gate (returning null) — but the gate
+      // short-circuited before the helper ran.
+      expect(readRunSnapshotSpy).toHaveBeenCalled();
+      expect(isValidRunIdSpy).not.toHaveBeenCalled();
+      expect(proxySpy).not.toHaveBeenCalled();
+    });
+  }
+});
+
 /** ─── SCHEDULES write × 3 ───────────────────────────────────────── */
 
 describe('dispatch: schedules write', () => {

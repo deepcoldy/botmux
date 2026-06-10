@@ -109,6 +109,28 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.workflows.dm_failed',
   'card.dashboard.workflows.list_failed',
 
+  // ─── workflows card (PR3 slice 2a) — detail card + cancel action ────
+  'card.dashboard.workflows.row_detail',
+  'card.dashboard.workflows.detail.title',
+  'card.dashboard.workflows.detail.workflow_label',
+  'card.dashboard.workflows.detail.run_label',
+  'card.dashboard.workflows.detail.status_label',
+  'card.dashboard.workflows.detail.started_label',
+  'card.dashboard.workflows.detail.updated_label',
+  'card.dashboard.workflows.detail.finished_label',
+  'card.dashboard.workflows.detail.elapsed_label',
+  'card.dashboard.workflows.detail.progress_label',
+  'card.dashboard.workflows.detail.chat_label',
+  'card.dashboard.workflows.detail.nodes_header',
+  'card.dashboard.workflows.btn.cancel',
+  'card.dashboard.workflows.btn.back',
+  'card.dashboard.workflows.confirm.cancel.title',
+  'card.dashboard.workflows.confirm.cancel.text',
+  'card.dashboard.workflows.cancel.disabled.alreadyTerminal',
+  'card.dashboard.workflows.cancel.disabled.noOwner',
+  'card.dashboard.workflows.cancel_failed',
+  'card.dashboard.workflows.workflow_not_found',
+
   // ─── groups card (PR3 slice 1) ──────────────────────────────────────
   'card.dashboard.groups.title',
   'card.dashboard.groups.count_summary',

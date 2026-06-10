@@ -2853,6 +2853,61 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     release();
     await first;
   });
+
+  // PR3 workflows slice 2a (codex 2026-06-10) — per-detail-card cancel buttons
+  // share `action: dash_workflows_cancel`. Only `value.run_id` distinguishes
+  // which run the click targets. The cardActionKey now includes `runId`; pin
+  // it down so a future key refactor can't silently drop it and turn two
+  // distinct run cancel clicks into one (e.g. user opens detail A then detail
+  // B and cancels B while A is still in flight).
+  it('concurrent `dash_workflows_cancel` clicks on DIFFERENT run_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'cancel_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'cancel_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (runId: string) => ({
+      action: { value: { action: 'dash_workflows_cancel', invoker_open_id: USER_OPEN_ID, run_id: runId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_workflows_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('run_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('run_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing run_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion: same run_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent cancel can't
+  // double-fire on a rapid double-click against the same run.
+  it('concurrent `dash_workflows_cancel` clicks on the SAME run_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'cancel_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_workflows_cancel', invoker_open_id: USER_OPEN_ID, run_id: 'run_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_workflows_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
 });
 
 describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {

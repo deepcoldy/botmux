@@ -436,22 +436,61 @@ const ROUTES: RouteDef[] = [
   },
 
   // ── WRITE: workflows × 3 ──────────────
+  //
+  // Cross-bot owner gate (codex 2026-06-10, follow-up to sessions /
+  // schedules slice 2a hardening): the helpers (`runApproveReject` /
+  // `runCancel`) only know the run's chatBinding via `readRunSnapshot`,
+  // so without an upfront snapshot read here, a bot A owner with a
+  // hand-crafted callback could pass bot B's runId and the helper would
+  // happily proxy to bot B's daemon. Unlike sessions / schedules, there
+  // is NO legacy "proxy to caller" fallback for workflows: a run without
+  // chatBinding lacks a routable owner entirely and the existing helper
+  // returns 409 needs_lark_or_cli / needs_cli_cancel for that case —
+  // preserve that semantic by NOT intercepting (fall through to the
+  // helper which produces the 409 with its existing error code).
+  //
+  //   - snapshot null → 404 unknown_run (don't expose the helper's
+  //     non-existent run path)
+  //   - owner !== undefined + caller mismatch → 403 workflow_owner_mismatch
+  //   - owner !== undefined + caller match (or test seam) → fall through
+  //   - owner === undefined → fall through (helper returns 409)
+  //
+  // The slice 2a UI only exposes cancel; approve/reject get the same
+  // treatment so a follow-up slice doesn't ship the same hole again.
   {
     method: 'POST',
     pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/(approve|reject)$/,
-    handle: async (m, ctx, deps) =>
-      runApproveReject(
-        decodeURIComponent(m[1]),
-        m[2] as 'approve' | 'reject',
-        ctx.bodyRaw,
-        deps.workflowsActionDeps,
-      ),
+    handle: async (m, ctx, deps) => {
+      const runId = decodeURIComponent(m[1]);
+      const action = m[2] as 'approve' | 'reject';
+      const snap = await deps.workflowsActionDeps.readRunSnapshot(
+        deps.workflowsActionDeps.runsDir,
+        runId,
+      );
+      if (!snap) return { status: 404, body: { ok: false, error: 'unknown_run' } };
+      const owner = snap.chatBinding?.larkAppId;
+      if (owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+        return { status: 403, body: { ok: false, error: 'workflow_owner_mismatch' } };
+      }
+      return runApproveReject(runId, action, ctx.bodyRaw, deps.workflowsActionDeps);
+    },
   },
   {
     method: 'POST',
     pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/cancel$/,
-    handle: async (m, ctx, deps) =>
-      runCancel(decodeURIComponent(m[1]), ctx.bodyRaw, deps.workflowsActionDeps),
+    handle: async (m, ctx, deps) => {
+      const runId = decodeURIComponent(m[1]);
+      const snap = await deps.workflowsActionDeps.readRunSnapshot(
+        deps.workflowsActionDeps.runsDir,
+        runId,
+      );
+      if (!snap) return { status: 404, body: { ok: false, error: 'unknown_run' } };
+      const owner = snap.chatBinding?.larkAppId;
+      if (owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+        return { status: 403, body: { ok: false, error: 'workflow_owner_mismatch' } };
+      }
+      return runCancel(runId, ctx.bodyRaw, deps.workflowsActionDeps);
+    },
   },
 
   // ── WRITE: schedules × 3 ──────────────
