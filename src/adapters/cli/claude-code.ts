@@ -2,6 +2,7 @@ import { existsSync, statSync, openSync, readSync, closeSync, readFileSync, read
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
+import { sessionReadyHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { t } from '../../i18n/index.js';
@@ -456,15 +457,30 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       }
       if (!disableCliBypass) {
         args.push('--dangerously-skip-permissions');
-        // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
-        // 注意：askUserQuestion hook 不在这里注入——它要写全局 settings.json（见下方
-        // hookInstall），这样 adopt 模式（botmux 接管的是别处已启动、拿不到本 --settings
-        // 的 claude 会话）才能让那条会话读到 hook。
-        args.push('--settings', JSON.stringify({
-          skipDangerousModePermissionPrompt: true,
-          permissions: { defaultMode: 'bypassPermissions' },
-        }));
       }
+      // 进程级 --settings JSON：作用域仅限本次 spawn，不写入用户全局 ~/.claude/settings.json，
+      // 并与用户自有 settings.json 合并（Claude 把多个 settings 源按事件 **合并** hooks 数组，
+      // 不互相覆盖——所以用户自己的 SessionStart hook 不会失效）。承载两件事：
+      //   1. SessionStart hook → `botmux session-ready`：CLI「真就绪」信号。cjadk 之类自定义
+      //      launcher 的启动选择器光标 ❯ 会误命中 readyPattern → IdleDetector 误判就绪 → 首条
+      //      prompt 被选择器整条吞掉。SessionStart 在真输入框渲染时才触发（卡在选择器期间不
+      //      触发），是无歧义的就绪信号；worker 收到前不投首条 prompt（见 worker ready-gate）。
+      //      无条件注入（即便 disableCliBypass）：否则 worker 的就绪门控会空等到超时兜底。
+      //   2. bypass 权限相关键（仅 !disableCliBypass）。
+      // 注意：askUserQuestion hook 不在这里——它要写全局 settings.json（见下方 hookInstall），
+      // 这样 adopt 模式（接管的别处 claude 会话拿不到本 --settings）才能读到那条 hook。
+      // SessionStart 就绪信号无需兼容 adopt（adopt 会话不走 botmux 投首条的门控），故只走
+      // 进程级注入足矣。
+      const inlineSettings: Record<string, unknown> = {
+        hooks: {
+          SessionStart: [{ hooks: [{ type: 'command', command: sessionReadyHookCommand() }] }],
+        },
+      };
+      if (!disableCliBypass) {
+        inlineSettings.skipDangerousModePermissionPrompt = true;
+        inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
+      }
+      args.push('--settings', JSON.stringify(inlineSettings));
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
@@ -779,6 +795,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
+    // Claude 家族在 spawn 时注入 SessionStart hook（见 buildArgs），回调
+    // `botmux session-ready` 给出「真就绪」信号。worker 据此武装 ready-gate：
+    // 收到信号前不投首条 prompt，绕开 cjadk 启动选择器吞首条消息的 bug。
+    injectsReadyHook: true,
     systemHints: [],
     altScreen: false,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT

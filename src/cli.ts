@@ -4424,6 +4424,49 @@ async function cmdHook(cliId: string): Promise<void> {
   process.exit(0);
 }
 
+// ─── botmux session-ready ─────────────────────────────────────────────────────
+//
+// Claude 家族（claude/seed）的 SessionStart hook 客户端。Claude 在 TUI 输入框
+// 真正渲染就绪时（startup / resume / clear / compact）触发本命令；它通知 daemon
+// 「CLI 真就绪」，放行 worker 端被 ready-gate 门控的首条 prompt——绕开 cjadk 之类
+// 自定义 launcher 启动选择器的 ❯ 误命中 readyPattern、把首条消息整条吞掉的 bug。
+//
+// 会话归属只靠 hook 子进程继承的 env（worker spawn 时设的 BOTMUX_SESSION_ID /
+// BOTMUX_LARK_APP_ID）。任何失败（env 缺失=adopt/非 botmux 会话、daemon 不可达）
+// 都静默 exit 0：绝不挂死 CLI 启动；信号丢了 worker 有超时兜底。
+async function cmdSessionReady(): Promise<void> {
+  // 排空 stdin：Claude 把 SessionStart payload 写到这里。我们只取 source 字段
+  // （诊断用），但务必消费掉，避免 CLI 端写满管道阻塞。best-effort。
+  let payloadText = '';
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    payloadText = Buffer.concat(chunks).toString('utf-8');
+  } catch { /* stdin 读不到也无所谓 */ }
+  let source: string | undefined;
+  try {
+    const p = JSON.parse(payloadText);
+    if (p && typeof p.source === 'string') source = p.source;
+  } catch { /* 非 JSON / 空 → 不带 source */ }
+
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  // env 缺失 → adopt / 非 botmux 会话；就绪门控对它们不适用，静默放行。
+  if (!sessionId || !larkAppId) process.exit(0);
+
+  const daemon = findDaemon(larkAppId);
+  if (daemon) {
+    try {
+      await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/session-ready`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, source }),
+      });
+    } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
+  }
+  process.exit(0);
+}
+
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -5021,6 +5064,12 @@ switch (command) {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';
     await cmdHook(cliId);
+    break;
+  }
+  case 'session-ready': {
+    // `botmux session-ready` — Claude 家族 SessionStart hook 客户端，通知 daemon
+    // 「CLI 真就绪」，放行被门控的首条 prompt。
+    await cmdSessionReady();
     break;
   }
   case 'workflow': {

@@ -153,6 +153,15 @@ export interface CliAdapter {
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
 
+  /** Claude-family CLIs only. When true, the adapter injects a `SessionStart`
+   *  hook at spawn (process-level `--settings`) that calls `botmux session-ready`
+   *  once the CLI's input box is genuinely rendered. The worker arms a ready-gate
+   *  on this flag and holds the FIRST prompt until the signal arrives (or a
+   *  fallback timeout), so a startup launcher's selector `❯` — which falsely
+   *  matches `readyPattern` — can't trip an early flush that the selector eats.
+   *  undefined/false → no gate (every other CLI behaves exactly as before). */
+  readonly injectsReadyHook?: boolean;
+
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */
   readonly systemHints: string[];

@@ -19,6 +19,7 @@ import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, fin
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
+import { ReadyGate } from './utils/ready-gate.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -130,6 +131,28 @@ function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
+/** Ready-gate (Claude-family): holds the first prompt until the SessionStart
+ *  hook fires a true-ready signal, so a cjadk-style startup selector's ❯ (which
+ *  falsely matches readyPattern) can't eat the first message. Recreated + armed
+ *  per spawn in spawnCli; disarmed on signal or fallback timeout. */
+let readyGate = new ReadyGate();
+/** Fallback timer: if the SessionStart signal never arrives (hook injection
+ *  failed / old CLI / launcher didn't pass --settings / adopt) release the gate
+ *  and fall back to readyPattern + quiescence. */
+let readySignalTimer: ReturnType<typeof setTimeout> | null = null;
+/** How long the ready-gate waits for the SessionStart signal before falling
+ *  back. The real signal lands within ~ms of the input box rendering, so this is
+ *  pure insurance against a missing/failed hook — generous but bounded. */
+const READY_SIGNAL_TIMEOUT_MS = 45_000;
+/** Release the ready-gate and flush anything it held. No-op when the gate was
+ *  never armed (other CLIs / adopt) or already released (idempotent). */
+function releaseReadyGate(reason: string): void {
+  if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
+  if (readyGate.receive()) {
+    log(`Ready gate released (${reason}); delivering held first prompt`);
+    flushPending();
+  }
+}
 const pendingMessages: Array<{ content: string; turnId?: string }> = [];
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
@@ -2635,6 +2658,16 @@ function onPtyData(data: string): void {
 
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
+  // Ready-gate: a startup selector's ❯ (cjadk et al.) falsely matches
+  // readyPattern → the IdleDetector fires idle while the CLI is NOT actually at
+  // its input box. Hold off declaring ready until the SessionStart hook signal
+  // (or the fallback timeout) so the first prompt isn't typed into the selector.
+  // releaseReadyGate() drives flushPending() once the real signal lands, and a
+  // later genuine idle then runs this fully. No-op for non-armed gates.
+  if (readyGate.shouldHold()) {
+    log('Idle detected but holding for SessionStart ready signal (startup selector guard)');
+    return;
+  }
   isPromptReady = true;
   // CLI is back at its prompt — every previously written input has been
   // consumed, so nothing is in flight anymore. A later crash must not
@@ -2792,6 +2825,14 @@ async function flushPending(): Promise<void> {
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
+  // Ready-gate: hold the FIRST prompt until the SessionStart hook fires a true-
+  // ready signal. A cjadk-style startup selector's ❯ falsely matches readyPattern
+  // and would otherwise eat this message. releaseReadyGate() re-invokes us once
+  // the signal (or fallback timeout) lands. No-op for non-armed gates / other CLIs.
+  if (readyGate.shouldHold()) {
+    log(`Holding ${pendingMessages.length} pending message(s) until SessionStart ready signal`);
+    return;
+  }
   // Type-ahead adapters flush even while the CLI is busy; others wait for
   // idle. Claude bridge fallback used to also disable type-ahead because
   // BridgeTurnQueue.ingest didn't recognise the `attachment(queued_command)`
@@ -3686,6 +3727,25 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
 
+  // Arm the ready-gate for Claude-family CLIs (which inject the SessionStart
+  // hook via --settings; see claude-code.ts buildArgs). Until `botmux
+  // session-ready` fires (daemon → 'session_ready' IPC → releaseReadyGate) we
+  // hold the first prompt so a cjadk-style startup selector's ❯ can't eat it.
+  // Adopt panes aren't spawned with our --settings (can't get the hook), so we
+  // don't arm them — they'd only wait out the timeout. Fallback: release after
+  // READY_SIGNAL_TIMEOUT_MS and fall back to readyPattern + quiescence.
+  readyGate = new ReadyGate();
+  if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
+  if (cliAdapter.injectsReadyHook && !cfg.adoptMode) {
+    readyGate.arm();
+    log('Ready gate armed — holding first prompt until SessionStart ready signal');
+    readySignalTimer = setTimeout(() => {
+      readySignalTimer = null;
+      releaseReadyGate('signal timeout fallback');
+    }, READY_SIGNAL_TIMEOUT_MS);
+    readySignalTimer.unref?.();
+  }
+
   // Set up idle detection
   idleDetector = new IdleDetector(cliAdapter);
   idleDetector.onIdle(() => {
@@ -3748,6 +3808,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 function killCli(): void {
   idleDetector?.dispose();
   idleDetector = null;
+  // Cancel any pending ready-gate fallback timer; spawnCli re-arms on respawn.
+  if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();
@@ -4511,6 +4573,16 @@ process.on('message', async (raw: unknown) => {
 
     case 'coco_drive_picker': {
       void driveCocoPicker(msg.navKeys, msg.needsReviewSubmit, msg.comment);
+      break;
+    }
+
+    case 'session_ready': {
+      // Claude-family SessionStart hook fired (via `botmux session-ready` →
+      // daemon). The CLI's input box is genuinely rendered — release the
+      // ready-gate and deliver any held first prompt. Idempotent: a later
+      // duplicate (clear/compact source) or a post-timeout fire is a no-op.
+      log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
+      releaseReadyGate('SessionStart hook');
       break;
     }
 
