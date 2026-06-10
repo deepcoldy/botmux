@@ -2104,6 +2104,20 @@ async function notifyCollabStalled(ds: DaemonSession, snapshot: BoardSnapshot, t
   }
 }
 
+function isTerminalCollabStatus(status: BoardSnapshot['status']): boolean {
+  return status !== 'running' && status !== 'pending';
+}
+
+async function closeTerminalCollabSession(ds: DaemonSession, snapshot: BoardSnapshot, tag: string): Promise<boolean> {
+  if (!isTerminalCollabStatus(snapshot.status)) return false;
+  const collab = ds.collab ?? ds.session.collab;
+  if (!collab) return true;
+  await releaseCollabWorker(config.session.dataDir, collab.runId);
+  await closeSession(ds.session.sessionId);
+  logger.info(`[${tag}] collab run terminal (${snapshot.status}); session closed`);
+  return true;
+}
+
 async function handleCollabTurnFinished(
   ds: DaemonSession,
   signal: CollabTurnFinishSignal,
@@ -2113,6 +2127,7 @@ async function handleCollabTurnFinished(
   if (!collab) return;
   const board = openCollabBoard(collab.runId, collab.baseDir ? { baseDir: collab.baseDir } : {});
   const snapshot = await board.snapshot();
+  if (await closeTerminalCollabSession(ds, snapshot, tag)) return;
   if (snapshot.worker?.workerId !== collab.workerId || snapshot.worker.phase !== 'running') return;
   if (signal.source === 'idle') {
     const history = await board.history();
@@ -2156,11 +2171,7 @@ async function handleCollabTurnFinished(
       logger.warn(`[${tag}] collab stall notification failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  if (after.status !== 'running' && after.status !== 'pending') {
-    await releaseCollabWorker(config.session.dataDir, collab.runId);
-    await closeSession(ds.session.sessionId);
-    logger.info(`[${tag}] collab run terminal (${after.status}); session closed`);
-  }
+  await closeTerminalCollabSession(ds, after, tag);
 }
 
 /** Deliver a bridge `final_output` to Lark. The worker emits each turn
