@@ -217,6 +217,133 @@ describe('buildGroupsCard', () => {
     expect(json).not.toContain('"union_id"');
     expect(json).not.toContain('"senderUnionId"');
   });
+
+  /** ─── Overview drilldown (2026-06-10) ───
+   *  Standalone and drilldown both use the unified default 5/page; `origin`
+   *  is the only thing the drilldown sub-card carries — it controls the
+   *  「🔙 返回总览」 button and is threaded through every callback so the
+   *  back affordance persists across page/refresh round-trips. */
+  describe('overview drilldown', () => {
+    const chats12: GroupsChatInput[] = Array.from({ length: 12 }, (_, i) =>
+      chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
+    );
+
+    it('default PAGE_SIZE → 5 rows/page (regression: matches standalone behavior)', () => {
+      const json = buildGroupsCard(matrix(chats12), { invokerOpenId: INVOKER, locale: 'zh', page: 1 });
+      const parsed = JSON.parse(json);
+      const rowDivs = (parsed.elements as any[]).filter(
+        (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
+          && /chat-\d+/.test(e.text.content as string),
+      );
+      expect(rowDivs.length).toBe(5);
+    });
+
+    it('explicit pageSize=3 override → 3 rows', () => {
+      const json = buildGroupsCard(matrix(chats12), { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 3 });
+      const parsed = JSON.parse(json);
+      const rowDivs = (parsed.elements as any[]).filter(
+        (e: any) => e.tag === 'div' && typeof e.text?.content === 'string'
+          && /chat-\d+/.test(e.text.content as string),
+      );
+      expect(rowDivs.length).toBe(3);
+    });
+
+    it('origin=overview → footer renders "🔙 返回总览" with action=dash_overview_refresh', () => {
+      const json = buildGroupsCard(
+        matrix(chats12),
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' },
+      );
+      const parsed = JSON.parse(json);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
+      expect(backBtn).toBeDefined();
+      expect(backBtn.value.invoker_open_id).toBe(INVOKER);
+      expect(String(backBtn.text?.content ?? '')).toContain('返回总览');
+    });
+
+    it('standalone (no origin) → NO back-to-overview button', () => {
+      const json = buildGroupsCard(matrix(chats12), { invokerOpenId: INVOKER, locale: 'zh', page: 1 });
+      const parsed = JSON.parse(json);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
+      expect(backBtn).toBeUndefined();
+    });
+
+    it('origin=overview → every child button.value carries origin (page_size omitted when == default)', () => {
+      // PAGE_SIZE=5 default; drilldown passes pageSize=5 (== default), so
+      // `page_size` is NOT threaded onto button.value. Origin remains the
+      // canonical drilldown signal.
+      const json = buildGroupsCard(
+        matrix(chats12),
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' },
+      );
+      const parsed = JSON.parse(json);
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const childButtons = allButtons.filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      expect(childButtons.length).toBeGreaterThan(0);
+      for (const b of childButtons) {
+        expect(b.value.origin).toBe('overview');
+        expect(b.value.page_size).toBeUndefined();
+      }
+    });
+
+    it('origin=overview + pageSize=3 (overridden) → button.value carries BOTH origin AND page_size', () => {
+      const json = buildGroupsCard(
+        matrix(chats12),
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 3, origin: 'overview' },
+      );
+      const parsed = JSON.parse(json);
+      const childButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      expect(childButtons.length).toBeGreaterThan(0);
+      for (const b of childButtons) {
+        expect(b.value.origin).toBe('overview');
+        expect(b.value.page_size).toBe('3');
+      }
+    });
+
+    it('totalPages > 2 (rows=12 with pageSize=5 → 3 pages) → select_static jump-page appears', () => {
+      const json = buildGroupsCard(
+        matrix(chats12),
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' },
+      );
+      const parsed = JSON.parse(json);
+      const allActions = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const selectStatic = allActions.find((a: any) => a.tag === 'select_static');
+      expect(selectStatic).toBeDefined();
+      expect(selectStatic.value.action).toBe(GROUPS_ACTION_PAGE);
+      // 12 rows / 5 per page = 3 pages → 3 options.
+      expect(selectStatic.options).toHaveLength(3);
+      expect(selectStatic.options.map((o: any) => o.value)).toEqual(['1', '2', '3']);
+    });
+
+    it('totalPages > 50 cap → NO select_static (payload safety)', () => {
+      // pageSize=1 with 60 rows → 60 pages > JUMP_PAGE_MAX_OPTIONS(50)
+      const manyChats: GroupsChatInput[] = Array.from({ length: 60 }, (_, i) =>
+        chat({ chatId: `oc_xx${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
+      );
+      const json = buildGroupsCard(
+        matrix(manyChats),
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 1, origin: 'overview' },
+      );
+      const parsed = JSON.parse(json);
+      const allActions = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const selectStatic = allActions.find((a: any) => a.tag === 'select_static');
+      expect(selectStatic).toBeUndefined();
+    });
+  });
 });
 
 describe('handleGroupsCardAction', () => {
@@ -363,5 +490,62 @@ describe('handleGroupsCardAction', () => {
     );
     expect(r.toast?.content).toContain('⚠️');
     expect(deps.createClient).not.toHaveBeenCalled();
+  });
+
+  /** ─── Overview drilldown — handler honors nav state ─── */
+  it('page action via select_static (action.option, no value.page) → uses option page', async () => {
+    // 12 chats, pageSize=5 → 3 pages. select_static dispatches with
+    // action.option='3' but value.page is absent. Handler should fall back
+    // to action.option.
+    const chats = Array.from({ length: 12 }, (_, i) =>
+      chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
+    );
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { chats, bots: [SELF_BOT] }, raw: '' })),
+      } as any)),
+    });
+    // Inject `action.option` on the raw envelope (not value.page).
+    const envelope = {
+      operator: { open_id: INVOKER },
+      action: {
+        option: '3',
+        value: {
+          action: GROUPS_ACTION_PAGE,
+          invoker_open_id: INVOKER,
+          origin: 'overview',
+        },
+      },
+      context: { open_message_id: 'om_card' },
+    } as any;
+    const r = await handleGroupsCardAction(envelope, LARK_APP_ID, deps);
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('第 3/3 页');
+  });
+
+  it('refresh with origin=overview → rebuilt card has 返回总览 button', async () => {
+    const chats = Array.from({ length: 12 }, (_, i) =>
+      chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
+    );
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({ status: 200, body: { chats, bots: [SELF_BOT] }, raw: '' })),
+      } as any)),
+    });
+    const r = await handleGroupsCardAction(
+      makeAction({
+        action: GROUPS_ACTION_REFRESH,
+        invoker_open_id: INVOKER,
+        origin: 'overview',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    // 12 / 5 = 3 pages.
+    expect(cardJson).toContain('第 1/3 页');
+    // Back-to-overview button.
+    expect(cardJson).toContain('dash_overview_refresh');
+    expect(cardJson).toContain('返回总览');
   });
 });

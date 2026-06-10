@@ -713,12 +713,14 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.schedules_summary': 'Enabled {enabled} · Paused {paused} · Last errors {errors}',
   'card.dashboard.overview.settings_section': '⚙️ Settings',
   'card.dashboard.overview.settings_summary': '{publicReadOnlyLabel} · {openTerminalLabel} · {autoUpdateLabel}',
-  'card.dashboard.overview.groups_placeholder': '🚧 Group matrix — coming soon',
-  'card.dashboard.overview.workflows_placeholder': '🚧 Workflows — coming soon',
+  'card.dashboard.overview.groups_section': '🧑‍🤝‍🧑 Group matrix',
+  'card.dashboard.overview.workflows_section': '🌀 Workflows',
   'card.dashboard.overview.refresh': '🔄 Refresh',
   'card.dashboard.overview.goto_sessions': '📂 Sessions',
   'card.dashboard.overview.goto_schedules': '📂 Schedules',
   'card.dashboard.overview.goto_settings': '📂 Settings',
+  'card.dashboard.overview.goto_groups': '📂 Group matrix',
+  'card.dashboard.overview.goto_workflows': '📂 Workflows',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

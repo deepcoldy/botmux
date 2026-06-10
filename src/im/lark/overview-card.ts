@@ -33,13 +33,19 @@ import { type Locale, t } from '../../i18n/index.js';
 import { buildSessionsCard } from './sessions-card.js';
 import { buildSchedulesCard } from './schedules-card.js';
 import { buildSettingsCard } from './settings-card.js';
+import { buildGroupsCard } from './groups-card.js';
+import { buildWorkflowsCard } from './workflows-card.js';
 import { composeSections } from '../../dashboard/settings-card-model.js';
+import type { GroupsBotInput, GroupsChatInput } from '../../dashboard/groups-card-model.js';
+import type { WorkflowRunInput } from '../../dashboard/workflow-card-model.js';
 import type { CardActionData } from './card-handler.js';
 
 export const OVERVIEW_ACTION_REFRESH = 'dash_overview_refresh' as const;
 export const OVERVIEW_ACTION_GOTO_SESSIONS = 'dash_overview_goto_sessions' as const;
 export const OVERVIEW_ACTION_GOTO_SCHEDULES = 'dash_overview_goto_schedules' as const;
 export const OVERVIEW_ACTION_GOTO_SETTINGS = 'dash_overview_goto_settings' as const;
+export const OVERVIEW_ACTION_GOTO_GROUPS = 'dash_overview_goto_groups' as const;
+export const OVERVIEW_ACTION_GOTO_WORKFLOWS = 'dash_overview_goto_workflows' as const;
 
 /** Status set treated as "active" (working / analyzing / starting / limited). */
 const ACTIVE_STATUSES: ReadonlySet<string> = new Set([
@@ -291,20 +297,57 @@ export function buildOverviewCard(
 
   elements.push({ tag: 'hr' });
 
-  // ─── Placeholders: groups + workflows (no buttons) ───────────────────
+  // ─── Groups section ──────────────────────────────────────────────────
+  // overview-snapshot doesn't carry groups counts yet (would require a
+  // server-side aggregator); the entry button is enough for navigation.
+  // Counts may be backfilled in a later slice without breaking this card.
   elements.push({
     tag: 'div',
     text: {
       tag: 'lark_md',
-      content: t('card.dashboard.overview.groups_placeholder', undefined, opts.locale),
+      content: `**${t('card.dashboard.overview.groups_section', undefined, opts.locale)}**`,
     },
   });
   elements.push({
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        content: t('card.dashboard.overview.goto_groups', undefined, opts.locale),
+      },
+      type: 'default',
+      value: {
+        action: OVERVIEW_ACTION_GOTO_GROUPS,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    }],
+  });
+
+  elements.push({ tag: 'hr' });
+
+  // ─── Workflows section ───────────────────────────────────────────────
+  elements.push({
     tag: 'div',
     text: {
       tag: 'lark_md',
-      content: t('card.dashboard.overview.workflows_placeholder', undefined, opts.locale),
+      content: `**${t('card.dashboard.overview.workflows_section', undefined, opts.locale)}**`,
     },
+  });
+  elements.push({
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        content: t('card.dashboard.overview.goto_workflows', undefined, opts.locale),
+      },
+      type: 'default',
+      value: {
+        action: OVERVIEW_ACTION_GOTO_WORKFLOWS,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    }],
   });
 
   elements.push({ tag: 'hr' });
@@ -498,6 +541,55 @@ export async function handleOverviewCardAction(
     const cardJson = buildSettingsCard(
       dto,
       { invokerOpenId: expectedOwner, locale, canWrite: true, origin: 'overview' },
+    );
+    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+  }
+
+  if (action === OVERVIEW_ACTION_GOTO_GROUPS) {
+    let r: Awaited<ReturnType<DaemonClient['request']>>;
+    try {
+      r = await client.request({ method: 'GET', path: '/__daemon/groups-matrix' });
+    } catch (e) {
+      return errorToast('card.dashboard.groups.list_failed', { reason: (e as Error).message }, locale);
+    }
+    if (r.status !== 200) {
+      const reason = String((r.body as any)?.error ?? `http_${r.status}`);
+      return errorToast('card.dashboard.groups.list_failed', { reason }, locale);
+    }
+    const body = (r.body as { chats?: ReadonlyArray<GroupsChatInput>; bots?: ReadonlyArray<GroupsBotInput> }) ?? {};
+    const matrix = { chats: body.chats ?? [], bots: body.bots ?? [] };
+    // Drilldown subcard — only `origin: 'overview'` differs from standalone
+    // (default page size is the unified 5).
+    const cardJson = buildGroupsCard(matrix, {
+      invokerOpenId: expectedOwner,
+      locale,
+      page: 1,
+      origin: 'overview',
+    });
+    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+  }
+
+  if (action === OVERVIEW_ACTION_GOTO_WORKFLOWS) {
+    let r: Awaited<ReturnType<DaemonClient['request']>>;
+    try {
+      // ?all=1 to include terminal runs (default `listRuns` hides them);
+      // matches the workflows refresh action so the cards stay byte-identical.
+      r = await client.request({
+        method: 'GET',
+        path: '/__daemon/workflows-runs-snapshot?all=1',
+      });
+    } catch (e) {
+      return errorToast('card.dashboard.workflows.list_failed', { reason: (e as Error).message }, locale);
+    }
+    if (r.status !== 200) {
+      const reason = String((r.body as any)?.error ?? `http_${r.status}`);
+      return errorToast('card.dashboard.workflows.list_failed', { reason }, locale);
+    }
+    const runs = ((r.body as { runs?: ReadonlyArray<WorkflowRunInput> })?.runs) ?? [];
+    const cardJson = buildWorkflowsCard(
+      runs,
+      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview' },
+      nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }

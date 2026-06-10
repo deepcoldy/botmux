@@ -67,10 +67,21 @@ export const WORKFLOWS_ACTION_PAGE = 'dash_workflows_page' as const;
 export const WORKFLOWS_ACTION_DETAIL = 'dash_workflows_detail' as const;
 export const WORKFLOWS_ACTION_CANCEL = 'dash_workflows_cancel' as const;
 export const WORKFLOWS_ACTION_BACK_TO_LIST = 'dash_workflows_back_to_list' as const;
+/** Action emitted by "🔙 返回总览" on overview-origin sub-cards. Same string
+ *  as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't import
+ *  to avoid a circular dep). card-handler routes by action prefix, so
+ *  dispatch lands on the overview handler regardless of which sub-card
+ *  emitted it. */
+const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
 /** Default page size for `/dashboard workflows` — unified at 5/page across
  *  all dashboard list cards on user request 2026-06-10. */
 const PAGE_SIZE = 5;
+
+/** Hard cap on `select_static` jump-page option count. Lark caps select
+ *  options around this; we also keep payload small. Above the cap we fall
+ *  back to prev/next only. */
+const JUMP_PAGE_MAX_OPTIONS = 50;
 
 /** Mapping from `StatusDot.tone` to a stable colour-emoji prefix. Pure. */
 function toneIcon(tone: string): string {
@@ -109,6 +120,15 @@ export interface BuildWorkflowsCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
+  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
+   *  drilldown 2026-06-10). Threaded through every button.value so the
+   *  size persists across page/refresh/detail-back round-trips. */
+  pageSize?: number;
+  /** Navigation origin. `'overview'` means this card was opened via
+   *  `/dashboard overview` → goto workflows; the footer renders an extra
+   *  "🔙 返回总览" button, and every button.value carries `origin=overview`
+   *  to keep that affordance across rebuilds. Undefined → standalone card. */
+  origin?: 'overview';
 }
 
 /** Tally counts across the (unfiltered) run pool. Pure.
@@ -174,9 +194,20 @@ export function buildWorkflowsCard(
   opts: BuildWorkflowsCardOpts,
   nowMs: number,
 ): string {
+  const effectivePageSize =
+    typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
+      ? Math.floor(opts.pageSize)
+      : PAGE_SIZE;
   const { running, done, failed } = countByStatus(rows);
   // Server order from listRuns is preserved verbatim — paginate directly.
-  const paged = paginate(rows, opts.page, PAGE_SIZE);
+  const paged = paginate(rows, opts.page, effectivePageSize);
+
+  // Plumb origin + page_size into every button.value so refresh/page/detail/
+  // detail-back rebuilds keep the same drilldown state. Empty values are
+  // omitted so standalone cards stay byte-identical to before this change.
+  const navFields: Record<string, string> = {};
+  if (opts.origin === 'overview') navFields.origin = 'overview';
+  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
 
   const elements: unknown[] = [];
 
@@ -227,6 +258,7 @@ export function buildWorkflowsCard(
               action: WORKFLOWS_ACTION_DETAIL,
               invoker_open_id: opts.invokerOpenId,
               run_id: dto.runId,
+              ...navFields,
             },
           },
         ],
@@ -248,6 +280,7 @@ export function buildWorkflowsCard(
         action: WORKFLOWS_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.max(1, paged.page - 1)),
+        ...navFields,
       },
     });
     actions.push({
@@ -259,8 +292,37 @@ export function buildWorkflowsCard(
         action: WORKFLOWS_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.min(paged.totalPages, paged.page + 1)),
+        ...navFields,
       },
     });
+    // "Jump to page" select — same action as prev/next, page comes via
+    // action.option instead of value.page. Handler reads `value.page ??
+    // action.option ?? '1'` so both paths converge on one branch. Capped at
+    // JUMP_PAGE_MAX_OPTIONS to keep payload small / inside Lark's option
+    // limit (above the cap, prev/next still works).
+    if (paged.totalPages > 2 && paged.totalPages <= JUMP_PAGE_MAX_OPTIONS) {
+      const options = Array.from({ length: paged.totalPages }, (_, i) => {
+        const n = i + 1;
+        return {
+          text: { tag: 'plain_text', content: t('card.dashboard.workflows.jump_page', { n: String(n) }, opts.locale) },
+          value: String(n),
+        };
+      });
+      actions.push({
+        tag: 'select_static',
+        placeholder: {
+          tag: 'plain_text',
+          content: t('card.dashboard.workflows.jump_page', { n: String(paged.page) }, opts.locale),
+        },
+        initial_option: String(paged.page),
+        options,
+        value: {
+          action: WORKFLOWS_ACTION_PAGE,
+          invoker_open_id: opts.invokerOpenId,
+          ...navFields,
+        },
+      });
+    }
   }
   actions.push({
     tag: 'button',
@@ -269,8 +331,23 @@ export function buildWorkflowsCard(
     value: {
       action: WORKFLOWS_ACTION_REFRESH,
       invoker_open_id: opts.invokerOpenId,
+      ...navFields,
     },
   });
+  // Overview drilldown only — "🔙 返回总览" reuses the overview-refresh
+  // action; card-handler routes by action prefix, so dispatch lands on
+  // overview-card.ts which rebuilds the parent card cleanly.
+  if (opts.origin === 'overview') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.overview.back_button', undefined, opts.locale) },
+      type: 'default',
+      value: {
+        action: BACK_TO_OVERVIEW_ACTION,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    });
+  }
   elements.push({ tag: 'action', actions });
 
   elements.push({
@@ -343,6 +420,12 @@ export interface BuildWorkflowsDetailCardOpts {
   locale: Locale;
   /** Override `Date.now()` so the relative-time formatter is deterministic in tests. */
   nowMs?: number;
+  /** Overview drilldown nav state — threaded into the "🔙 返回" button so the
+   *  list rebuilt by `BACK_TO_LIST` is still drilldown-shaped (5/page +
+   *  return-to-overview). Detail itself does NOT render a return-to-overview
+   *  button (single back affordance per slice). */
+  origin?: 'overview';
+  pageSize?: number;
 }
 
 /**
@@ -477,6 +560,21 @@ export function buildWorkflowsDetailCard(
     typeof detail.chatBinding?.larkAppId === 'string' && detail.chatBinding.larkAppId.length > 0;
   const cancelEnabled = matrixAllows && hasOwner;
 
+  // Threaded nav state — successful cancel rebuilds this same detail card,
+  // and the user may then press 🔙 返回 to go back to the drilldown list,
+  // which still needs origin/pageSize. So plumb the same fields onto both
+  // the cancel button (round-trip preservation) and the back button.
+  const backNav: Record<string, string> = {};
+  if (opts.origin === 'overview') backNav.origin = 'overview';
+  if (
+    typeof opts.pageSize === 'number'
+    && Number.isFinite(opts.pageSize)
+    && opts.pageSize > 0
+    && opts.pageSize !== PAGE_SIZE
+  ) {
+    backNav.page_size = String(Math.floor(opts.pageSize));
+  }
+
   const cancelButton: Record<string, unknown> = {
     tag: 'button',
     text: { tag: 'plain_text', content: t('card.dashboard.workflows.btn.cancel', undefined, opts.locale) },
@@ -485,6 +583,7 @@ export function buildWorkflowsDetailCard(
       action: WORKFLOWS_ACTION_CANCEL,
       invoker_open_id: opts.invokerOpenId,
       run_id: detail.runId,
+      ...backNav,
     },
   };
   if (cancelEnabled) {
@@ -516,6 +615,7 @@ export function buildWorkflowsDetailCard(
         value: {
           action: WORKFLOWS_ACTION_BACK_TO_LIST,
           invoker_open_id: opts.invokerOpenId,
+          ...backNav,
         },
       },
     ],
@@ -657,6 +757,14 @@ export async function handleWorkflowsCardAction(
   const client = deps.createClient(larkAppId);
   const now = (): number => (deps.nowMs ? deps.nowMs() : Date.now());
 
+  // ─── Nav state (overview drilldown) ─────────────────────────────────
+  // Threaded by buildWorkflowsCard onto every button.value; we parse here
+  // so the rebuild path keeps the same shape (5/page + 🔙 返回总览).
+  const navOrigin: 'overview' | undefined = value.origin === 'overview' ? 'overview' : undefined;
+  const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
+  const navPageSize: number | undefined =
+    Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+
   // ─── 3a) DETAIL — open the per-run detail card ──────────────────────
   if (action === WORKFLOWS_ACTION_DETAIL) {
     const runId = value.run_id;
@@ -674,6 +782,8 @@ export async function handleWorkflowsCardAction(
       invokerOpenId: expectedOwner,
       locale,
       nowMs: now(),
+      origin: navOrigin,
+      pageSize: navPageSize,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -752,6 +862,8 @@ export async function handleWorkflowsCardAction(
       invokerOpenId: expectedOwner,
       locale,
       nowMs: now(),
+      origin: navOrigin,
+      pageSize: navPageSize,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -762,7 +874,13 @@ export async function handleWorkflowsCardAction(
     if ('errorResult' in r) return r.errorResult;
     const cardJson = buildWorkflowsCard(
       r.runs,
-      { invokerOpenId: expectedOwner, locale, page: 1 },
+      {
+        invokerOpenId: expectedOwner,
+        locale,
+        page: 1,
+        pageSize: navPageSize,
+        origin: navOrigin,
+      },
       now(),
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -773,7 +891,11 @@ export async function handleWorkflowsCardAction(
   // left here are REFRESH + PAGE (the other 3 returned early).
   let page = 1;
   if (action === WORKFLOWS_ACTION_PAGE) {
-    const parsed = Number.parseInt(value.page ?? '1', 10);
+    // Page comes from value.page (prev/next button) OR action.option
+    // (select_static "jump to page" picker). Same action key, different
+    // dispatch field — handler converges on one branch.
+    const raw = value.page ?? (data.action as { option?: string } | undefined)?.option ?? '1';
+    const parsed = Number.parseInt(raw, 10);
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
   }
 
@@ -781,7 +903,13 @@ export async function handleWorkflowsCardAction(
   if ('errorResult' in r) return r.errorResult;
   const cardJson = buildWorkflowsCard(
     r.runs,
-    { invokerOpenId: expectedOwner, locale, page },
+    {
+      invokerOpenId: expectedOwner,
+      locale,
+      page,
+      pageSize: navPageSize,
+      origin: navOrigin,
+    },
     now(),
   );
   return {

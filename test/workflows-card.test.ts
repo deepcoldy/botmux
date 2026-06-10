@@ -379,6 +379,180 @@ describe('buildWorkflowsCard — slice 2a inline 📂 详情 buttons', () => {
   });
 });
 
+/** ─── Slice 2: buildWorkflowsCard — overview drilldown ──────────────── */
+
+describe('buildWorkflowsCard — overview drilldown', () => {
+  const NOW = 2_000_000;
+
+  function makeRows(n: number): WorkflowRunInput[] {
+    return Array.from({ length: n }, (_, i) =>
+      run({ runId: `r_${i}`, workflowId: `wf_${i}`, status: 'running', startedAt: 1_000 - i }),
+    );
+  }
+
+  /** Helper: parse the card JSON and return every button.value + select_static.value across all action rows. */
+  function allActionValues(json: string): any[] {
+    const parsed = JSON.parse(json);
+    const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+    return actionRows.flatMap((ar: any) => (ar.actions as any[]) ?? []).map((a: any) => a.value);
+  }
+
+  it('default PAGE_SIZE → 5 rows per page (regression guard)', () => {
+    const rows = makeRows(7);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1 },
+      NOW,
+    );
+    // 7 rows / 5 = 2 pages.
+    expect(json).toContain('第 1/2 页');
+  });
+
+  it('explicit pageSize=3 override → 3 rows per page', () => {
+    const rows = makeRows(7);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 3 },
+      NOW,
+    );
+    // 7 rows / 3 = 3 pages.
+    expect(json).toContain('第 1/3 页');
+  });
+
+  it('origin=overview → footer renders 🔙 返回总览 button with dash_overview_refresh action', () => {
+    const rows = makeRows(2);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1, origin: 'overview' },
+      NOW,
+    );
+    const parsed = JSON.parse(json);
+    const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+    const allBtns = actionRows.flatMap((ar: any) => (ar.actions as any[]) ?? []);
+    const backToOverview = allBtns.find((a: any) => a.value?.action === 'dash_overview_refresh');
+    expect(backToOverview).toBeDefined();
+    expect(String(backToOverview.text?.content ?? '')).toContain('返回总览');
+    expect(backToOverview.value.invoker_open_id).toBe(INVOKER);
+  });
+
+  it('standalone (no origin) → NO 🔙 返回总览 button', () => {
+    const rows = makeRows(2);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1 },
+      NOW,
+    );
+    expect(json).not.toContain('dash_overview_refresh');
+    expect(json).not.toContain('返回总览');
+  });
+
+  it('origin=overview (default pageSize) → every child button.value carries origin; page_size omitted', () => {
+    // 16 rows / default 5 = 4 pages → prev/next AND jump-page select also emitted.
+    const rows = makeRows(16);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 2, origin: 'overview' },
+      NOW,
+    );
+    const values = allActionValues(json);
+    // Filter out the back-to-overview button (it intentionally does NOT carry
+    // origin since it IS the back-to-overview action). All OTHER buttons /
+    // selects within the workflows card must carry origin=overview.
+    const ownValues = values.filter((v: any) => v?.action !== 'dash_overview_refresh');
+    expect(ownValues.length).toBeGreaterThan(0);
+    for (const v of ownValues) {
+      expect(v.origin).toBe('overview');
+      // page_size should be omitted because we used default PAGE_SIZE.
+      expect(v.page_size).toBeUndefined();
+    }
+  });
+
+  it('origin=overview + pageSize=3 → every child button.value carries both origin AND page_size', () => {
+    // 7 rows / 3 = 3 pages → prev/next AND jump-page select.
+    const rows = makeRows(7);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1, origin: 'overview', pageSize: 3 },
+      NOW,
+    );
+    const values = allActionValues(json);
+    const ownValues = values.filter((v: any) => v?.action !== 'dash_overview_refresh');
+    expect(ownValues.length).toBeGreaterThan(0);
+    for (const v of ownValues) {
+      expect(v.origin).toBe('overview');
+      expect(v.page_size).toBe('3');
+    }
+  });
+
+  it('totalPages=3 (>2 and ≤50) → select_static jump-page rendered with option count = totalPages', () => {
+    // 12 rows / default 5 = 3 pages.
+    const rows = makeRows(12);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1 },
+      NOW,
+    );
+    const parsed = JSON.parse(json);
+    const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+    const allBtns = actionRows.flatMap((ar: any) => (ar.actions as any[]) ?? []);
+    const jumpSelects = allBtns.filter((a: any) => a.tag === 'select_static');
+    expect(jumpSelects.length).toBe(1);
+    const jumpSel = jumpSelects[0];
+    expect(Array.isArray(jumpSel.options)).toBe(true);
+    expect(jumpSel.options.length).toBe(3);
+    for (const opt of jumpSel.options) {
+      expect(typeof opt.value).toBe('string');
+      expect(opt.text?.tag).toBe('plain_text');
+    }
+    expect(jumpSel.value?.action).toBe(WORKFLOWS_ACTION_PAGE);
+  });
+
+  it('totalPages > JUMP_PAGE_MAX_OPTIONS (50) cap → NO select_static rendered', () => {
+    // pageSize=1 with 60 rows → 60 pages, > 50 cap.
+    const rows = makeRows(60);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 1 },
+      NOW,
+    );
+    const parsed = JSON.parse(json);
+    const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+    const allBtns = actionRows.flatMap((ar: any) => (ar.actions as any[]) ?? []);
+    const jumpSelects = allBtns.filter((a: any) => a.tag === 'select_static');
+    expect(jumpSelects.length).toBe(0);
+    // Prev/next still present.
+    expect(json).toContain('上一页');
+    expect(json).toContain('下一页');
+  });
+
+  it('totalPages <= 2 → NO select_static rendered (prev/next still on totalPages=2)', () => {
+    // 7 rows / default 5 = 2 pages → prev/next yes, jump-page no.
+    const rows = makeRows(7);
+    const json = buildWorkflowsCard(
+      rows,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1 },
+      NOW,
+    );
+    const parsed = JSON.parse(json);
+    const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+    const allBtns = actionRows.flatMap((ar: any) => (ar.actions as any[]) ?? []);
+    const jumpSelects = allBtns.filter((a: any) => a.tag === 'select_static');
+    expect(jumpSelects.length).toBe(0);
+    // 1 page → also no select_static.
+    const rowsOnePage = makeRows(3);
+    const jsonOne = buildWorkflowsCard(
+      rowsOnePage,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1 },
+      NOW,
+    );
+    const parsedOne = JSON.parse(jsonOne);
+    const allBtnsOne = (parsedOne.elements as any[])
+      .filter((e: any) => e.tag === 'action')
+      .flatMap((ar: any) => (ar.actions as any[]) ?? []);
+    expect(allBtnsOne.filter((a: any) => a.tag === 'select_static').length).toBe(0);
+  });
+});
+
 /** ─── Slice 2a: buildWorkflowsDetailCard ──────────────────────────────── */
 
 describe('buildWorkflowsDetailCard (slice 2a)', () => {
@@ -473,6 +647,63 @@ describe('buildWorkflowsDetailCard (slice 2a)', () => {
     }
     // &lt; must appear somewhere in the rendered body (escape took effect).
     expect(json).toContain('&lt;');
+  });
+
+  it('origin=overview + default pageSize → cancel/back values carry origin; page_size omitted', () => {
+    const detail = detailFor({ status: 'running' });
+    const json = buildWorkflowsDetailCard(detail, { ...baseOpts, origin: 'overview' });
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const cancel = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_CANCEL,
+    );
+    const back = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_BACK_TO_LIST,
+    );
+    expect(cancel.value.origin).toBe('overview');
+    expect(cancel.value.page_size).toBeUndefined();
+    expect(back.value.origin).toBe('overview');
+    expect(back.value.page_size).toBeUndefined();
+    // Detail card itself does NOT render a back-to-overview button.
+    expect(json).not.toContain('dash_overview_refresh');
+  });
+
+  it('origin=overview + pageSize=3 override → cancel/back values carry origin AND page_size', () => {
+    const detail = detailFor({ status: 'running' });
+    const json = buildWorkflowsDetailCard(detail, {
+      ...baseOpts,
+      origin: 'overview',
+      pageSize: 3,
+    });
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const cancel = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_CANCEL,
+    );
+    const back = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_BACK_TO_LIST,
+    );
+    expect(cancel.value.origin).toBe('overview');
+    expect(cancel.value.page_size).toBe('3');
+    expect(back.value.origin).toBe('overview');
+    expect(back.value.page_size).toBe('3');
+  });
+
+  it('no origin → cancel/back values carry NEITHER origin NOR page_size (no regression)', () => {
+    const detail = detailFor({ status: 'running' });
+    const json = buildWorkflowsDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const cancel = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_CANCEL,
+    );
+    const back = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_BACK_TO_LIST,
+    );
+    expect(cancel.value.origin).toBeUndefined();
+    expect(cancel.value.page_size).toBeUndefined();
+    expect(back.value.origin).toBeUndefined();
+    expect(back.value.page_size).toBeUndefined();
   });
 });
 
@@ -899,5 +1130,166 @@ describe('handleWorkflowsCardAction — dash_workflows_back_to_list', () => {
     expect(cardJson).toContain('Dashboard 工作流');
     expect(cardJson).toContain('wfBackOne');
     expect(cardJson).toContain('wfBackTwo');
+  });
+});
+
+/** ─── Slice 2: handleWorkflowsCardAction — overview drilldown plumbing ── */
+
+describe('handleWorkflowsCardAction — overview drilldown', () => {
+  function makeAction(value: Record<string, string>, operator = INVOKER): CardActionData {
+    return {
+      operator: { open_id: operator },
+      action: { value },
+      context: { open_message_id: 'om_card' },
+    } as any;
+  }
+
+  function makeListDeps(runs: WorkflowRunInput[]) {
+    const requestSpy = vi.fn(async () => ({ status: 200, body: { runs }, raw: '' }));
+    return {
+      createClient: vi.fn(() => ({ request: requestSpy } as any)),
+      getOwnerOpenId: () => INVOKER,
+      locale: 'zh' as const,
+      nowMs: () => 2_000_000,
+      requestSpy,
+    };
+  }
+
+  it('PAGE via select_static (action.option, no value.page) → uses option page in rebuild', async () => {
+    // 12 rows / default 5 = 3 pages.
+    const runs = Array.from({ length: 12 }, (_, i) =>
+      run({ runId: `r_${i}`, workflowId: `wf_${i}`, status: 'running', startedAt: 1_000 - i }),
+    );
+    const deps = makeListDeps(runs);
+    // action.option is the select_static jump-page dispatch field (no value.page).
+    const data: CardActionData = {
+      operator: { open_id: INVOKER },
+      action: { value: { action: WORKFLOWS_ACTION_PAGE, invoker_open_id: INVOKER }, option: '3' },
+      context: { open_message_id: 'om_card' },
+    } as any;
+    const r = await handleWorkflowsCardAction(data, LARK_APP_ID, deps);
+    expect(r.toast).toBeUndefined();
+    expect(r.card?.type).toBe('raw');
+    const cardJson = JSON.stringify(r.card?.data);
+    // 12 rows / 5 = 3 pages, jumped to page 3.
+    expect(cardJson).toContain('第 3/3 页');
+  });
+
+  it('REFRESH with origin=overview → rebuilt list card has 🔙 返回总览', async () => {
+    const runs: WorkflowRunInput[] = [
+      run({ runId: 'r_o', workflowId: 'wfOver', status: 'running' }),
+    ];
+    const deps = makeListDeps(runs);
+    const r = await handleWorkflowsCardAction(
+      makeAction({
+        action: WORKFLOWS_ACTION_REFRESH,
+        invoker_open_id: INVOKER,
+        origin: 'overview',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.card?.type).toBe('raw');
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('dash_overview_refresh');
+  });
+
+  it('BACK_TO_LIST with origin=overview → rebuilt list has 🔙 返回总览 and threads origin onto child buttons', async () => {
+    const runs: WorkflowRunInput[] = [
+      run({ runId: 'r_b1', workflowId: 'wfB1', status: 'running' }),
+    ];
+    const deps = makeListDeps(runs);
+    const r = await handleWorkflowsCardAction(
+      makeAction({
+        action: WORKFLOWS_ACTION_BACK_TO_LIST,
+        invoker_open_id: INVOKER,
+        origin: 'overview',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.card?.type).toBe('raw');
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('返回总览');
+    // Detail button (per-row) and refresh button must both carry origin=overview.
+    const card: any = r.card?.data;
+    const allBtns = (card.elements as any[])
+      .filter((e: any) => e.tag === 'action')
+      .flatMap((ar: any) => (ar.actions as any[]) ?? []);
+    const ownBtns = allBtns.filter((a: any) => a.value?.action !== 'dash_overview_refresh');
+    expect(ownBtns.length).toBeGreaterThan(0);
+    for (const b of ownBtns) {
+      expect(b.value?.origin).toBe('overview');
+    }
+  });
+
+  it('DETAIL with origin=overview → rebuilt detail card carries origin on back+cancel button values', async () => {
+    const runs: WorkflowRunInput[] = [
+      run({
+        runId: 'r_d',
+        workflowId: 'wfD',
+        status: 'running',
+        chatBinding: { chatId: 'oc_demo', larkAppId: 'cli_demo' },
+      }),
+    ];
+    const deps = makeListDeps(runs);
+    const r = await handleWorkflowsCardAction(
+      makeAction({
+        action: WORKFLOWS_ACTION_DETAIL,
+        invoker_open_id: INVOKER,
+        run_id: 'r_d',
+        origin: 'overview',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.card?.type).toBe('raw');
+    const card: any = r.card?.data;
+    const actionRow = (card.elements as any[]).find((e: any) => e.tag === 'action');
+    const cancel = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_CANCEL,
+    );
+    const back = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_BACK_TO_LIST,
+    );
+    expect(cancel.value.origin).toBe('overview');
+    expect(back.value.origin).toBe('overview');
+  });
+
+  it('DETAIL with origin=overview + page_size → detail card cancel/back values carry both', async () => {
+    const runs: WorkflowRunInput[] = [
+      run({
+        runId: 'r_dp',
+        workflowId: 'wfDP',
+        status: 'running',
+        chatBinding: { chatId: 'oc_demo', larkAppId: 'cli_demo' },
+      }),
+    ];
+    const deps = makeListDeps(runs);
+    const r = await handleWorkflowsCardAction(
+      makeAction({
+        action: WORKFLOWS_ACTION_DETAIL,
+        invoker_open_id: INVOKER,
+        run_id: 'r_dp',
+        origin: 'overview',
+        page_size: '3',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.card?.type).toBe('raw');
+    const card: any = r.card?.data;
+    const actionRow = (card.elements as any[]).find((e: any) => e.tag === 'action');
+    const cancel = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_CANCEL,
+    );
+    const back = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === WORKFLOWS_ACTION_BACK_TO_LIST,
+    );
+    expect(cancel.value.origin).toBe('overview');
+    expect(cancel.value.page_size).toBe('3');
+    expect(back.value.origin).toBe('overview');
+    expect(back.value.page_size).toBe('3');
   });
 });

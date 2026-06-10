@@ -659,6 +659,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.groups.refresh': '🔄 刷新',
   'card.dashboard.groups.prev': '← 上一页',
   'card.dashboard.groups.next': '下一页 →',
+  'card.dashboard.groups.jump_page': '第 {n} 页',
   'card.dashboard.groups.coverage_label': '覆盖 {status}',
   'card.dashboard.groups.oncall_label': 'oncall workingDir={workingDir}',
   'card.dashboard.groups.unnamed': '(未命名)',
@@ -677,6 +678,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.workflows.refresh': '🔄 刷新',
   'card.dashboard.workflows.prev': '← 上一页',
   'card.dashboard.workflows.next': '下一页 →',
+  'card.dashboard.workflows.jump_page': '第 {n} 页',
   'card.dashboard.workflows.progress_label': '步 {done}/{total}',
   'card.dashboard.workflows.started_label': '启动 {rel}',
   'card.dashboard.workflows.updated_label': '上次 {rel}',
@@ -716,12 +718,14 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.schedules_summary': '启用 {enabled} · 暂停 {paused} · 上次错误 {errors}',
   'card.dashboard.overview.settings_section': '⚙️ 设置',
   'card.dashboard.overview.settings_summary': '{publicReadOnlyLabel} · {openTerminalLabel} · {autoUpdateLabel}',
-  'card.dashboard.overview.groups_placeholder': '🚧 群矩阵 — 即将上线',
-  'card.dashboard.overview.workflows_placeholder': '🚧 Workflows — 即将上线',
+  'card.dashboard.overview.groups_section': '🧑‍🤝‍🧑 群矩阵',
+  'card.dashboard.overview.workflows_section': '🌀 Workflows',
   'card.dashboard.overview.refresh': '🔄 刷新',
   'card.dashboard.overview.goto_sessions': '📂 会话列表',
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
+  'card.dashboard.overview.goto_groups': '📂 群矩阵',
+  'card.dashboard.overview.goto_workflows': '📂 Workflows',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

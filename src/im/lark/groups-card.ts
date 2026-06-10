@@ -39,10 +39,20 @@ import type { CardActionData } from './card-handler.js';
 
 export const GROUPS_ACTION_REFRESH = 'dash_groups_refresh' as const;
 export const GROUPS_ACTION_PAGE = 'dash_groups_page' as const;
+/** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
+ *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
+ *  import). card-handler routes by action prefix, so dispatch lands on the
+ *  overview handler regardless of which sub-card emitted it. */
+const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
 /** Default page size for `/dashboard groups` — unified at 5/page across
  *  all dashboard list cards on user request 2026-06-10. */
 const PAGE_SIZE = 5;
+
+/** Hard cap on `select_static` option count for the "jump to page" picker.
+ *  Lark caps select options around this; we also keep payload small. Above
+ *  the cap we fall back to prev/next only. */
+const JUMP_PAGE_MAX_OPTIONS = 50;
 
 /** Mapping from coverage status to a stable colour-emoji prefix. Pure. */
 function statusIcon(status: string): string {
@@ -71,6 +81,17 @@ export interface BuildGroupsCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
+  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
+   *  drilldown 2026-06-10). Override only when a caller needs a different
+   *  size. Threaded through every button.value so the size persists across
+   *  page/refresh round-trips. */
+  pageSize?: number;
+  /** Navigation origin. `'overview'` means this card was opened via
+   *  `/dashboard overview` → goto groups; the footer renders an extra
+   *  "🔙 返回总览" button, and every button.value carries `origin=overview`
+   *  to keep that affordance across rebuilds. Undefined → standalone card,
+   *  no overview link. */
+  origin?: 'overview';
 }
 
 /** Build the groups list card JSON. Pure (composes + paginates + renders).
@@ -79,6 +100,11 @@ export function buildGroupsCard(
   matrix: { chats: ReadonlyArray<GroupsChatInput>; bots: ReadonlyArray<GroupsBotInput> },
   opts: BuildGroupsCardOpts,
 ): string {
+  const effectivePageSize =
+    typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
+      ? Math.floor(opts.pageSize)
+      : PAGE_SIZE;
+
   // Project EVERY chat into a row DTO ourselves rather than going through
   // `buildGroupRows`, because the pipeline helper also paginates (default
   // pageSize=20) which would silently clip past the 10-per-page card layout.
@@ -96,12 +122,19 @@ export function buildGroupsCard(
   const missing = total - joined;
 
   // Paginate the DTO list (mirror paginateGroups semantics on the projected rows).
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(total / effectivePageSize));
   let activePage = Number.isFinite(opts.page) ? Math.floor(opts.page) : 1;
   if (activePage < 1) activePage = 1;
   if (activePage > totalPages) activePage = totalPages;
-  const start = (activePage - 1) * PAGE_SIZE;
-  const pageItems = allRows.slice(start, start + PAGE_SIZE);
+  const start = (activePage - 1) * effectivePageSize;
+  const pageItems = allRows.slice(start, start + effectivePageSize);
+
+  // Plumb origin + page_size into every button.value so refresh/page rebuilds
+  // keep the same drilldown state. Empty values are omitted so standalone
+  // cards stay byte-identical to before this change.
+  const navFields: Record<string, string> = {};
+  if (opts.origin === 'overview') navFields.origin = 'overview';
+  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
 
   const elements: unknown[] = [];
 
@@ -154,6 +187,7 @@ export function buildGroupsCard(
         action: GROUPS_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.max(1, activePage - 1)),
+        ...navFields,
       },
     });
     actions.push({
@@ -165,8 +199,37 @@ export function buildGroupsCard(
         action: GROUPS_ACTION_PAGE,
         invoker_open_id: opts.invokerOpenId,
         page: String(Math.min(totalPages, activePage + 1)),
+        ...navFields,
       },
     });
+    // "Jump to page" select — same action as prev/next, page comes via
+    // action.option instead of value.page. Handler reads `value.page ??
+    // action.option ?? '1'` so both paths converge on one branch. Capped at
+    // JUMP_PAGE_MAX_OPTIONS to keep payload small / inside Lark's option
+    // limit (above the cap, prev/next still works).
+    if (totalPages > 2 && totalPages <= JUMP_PAGE_MAX_OPTIONS) {
+      const options = Array.from({ length: totalPages }, (_, i) => {
+        const n = i + 1;
+        return {
+          text: { tag: 'plain_text', content: t('card.dashboard.groups.jump_page', { n: String(n) }, opts.locale) },
+          value: String(n),
+        };
+      });
+      actions.push({
+        tag: 'select_static',
+        placeholder: {
+          tag: 'plain_text',
+          content: t('card.dashboard.groups.jump_page', { n: String(activePage) }, opts.locale),
+        },
+        initial_option: String(activePage),
+        options,
+        value: {
+          action: GROUPS_ACTION_PAGE,
+          invoker_open_id: opts.invokerOpenId,
+          ...navFields,
+        },
+      });
+    }
   }
   actions.push({
     tag: 'button',
@@ -175,8 +238,23 @@ export function buildGroupsCard(
     value: {
       action: GROUPS_ACTION_REFRESH,
       invoker_open_id: opts.invokerOpenId,
+      ...navFields,
     },
   });
+  // Overview drilldown only — "🔙 返回总览" reuses the overview-refresh
+  // action; card-handler routes by action prefix, so dispatch lands on
+  // overview-card.ts which rebuilds the parent card cleanly.
+  if (opts.origin === 'overview') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.overview.back_button', undefined, opts.locale) },
+      type: 'default',
+      value: {
+        action: BACK_TO_OVERVIEW_ACTION,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    });
+  }
   elements.push({ tag: 'action', actions });
 
   elements.push({
@@ -307,10 +385,23 @@ export async function handleGroupsCardAction(
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
+  // ─── Nav state (overview drilldown) ─────────────────────────────────
+  // Threaded by buildGroupsCard onto every button.value; we parse here so
+  // the rebuild path keeps the same shape (origin + page_size persist
+  // across refresh/page round-trips).
+  const navOrigin: 'overview' | undefined = value.origin === 'overview' ? 'overview' : undefined;
+  const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
+  const navPageSize: number | undefined =
+    Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+
   // Resolve target page.
   let page = 1;
   if (action === GROUPS_ACTION_PAGE) {
-    const parsed = Number.parseInt(value.page ?? '1', 10);
+    // Page comes from value.page (prev/next button) OR action.option
+    // (select_static "jump to page" picker). Same action key, different
+    // dispatch field — handler converges on one branch.
+    const raw = value.page ?? (data.action as { option?: string } | undefined)?.option ?? '1';
+    const parsed = Number.parseInt(raw, 10);
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
   } else if (action !== GROUPS_ACTION_REFRESH) {
     return ackToast('card.dashboard.settings.invalid_action', locale);
@@ -337,7 +428,13 @@ export async function handleGroupsCardAction(
     chats: body.chats ?? [],
     bots: body.bots ?? [],
   };
-  const cardJson = buildGroupsCard(matrix, { invokerOpenId: expectedOwner, locale, page });
+  const cardJson = buildGroupsCard(matrix, {
+    invokerOpenId: expectedOwner,
+    locale,
+    page,
+    pageSize: navPageSize,
+    origin: navOrigin,
+  });
   return {
     card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
   };
