@@ -746,17 +746,20 @@ describe('dispatch: workflows write — cross-bot owner gate', () => {
 
 /** ─── WORKFLOWS write — Codex Route B gate regression (slice 2a) ─────
  *  The owner-gate at daemon-internal-api.ts:460-494 runs BEFORE the
- *  workflows helpers `runCancel` / `runApproveReject`. Use `isValidRunId`
- *  as a tripwire spy on workflowsActionDeps because:
- *    - the daemon-internal-api gate calls `readRunSnapshot` directly
- *      (so spying on that doesn't tell apart "gate ran" from "helper ran"),
- *    - `isValidRunId` is ONLY consumed inside the helpers
- *      (`workflows-action-helpers.ts:153, 227`), so if it never fires we
- *      proved the helper was short-circuited by the gate.
+ *  workflows helpers `runCancel` / `runApproveReject`. Tripwire layout:
+ *    - `proxySpy` (workflowsActionDeps.proxyToDaemon) is the CANONICAL
+ *      "helper reached business logic" tripwire — helpers only proxy after
+ *      passing isValidRunId + snapshot + body validation.
+ *    - `isValidRunIdSpy` fires from BOTH the gate (codex 2026-06-10 compat
+ *      fix at daemon-internal-api.ts:466,484) AND the helpers themselves
+ *      (`workflows-action-helpers.ts:153,227`). Count interpretation:
+ *        * 0 → gate short-circuited before id validation (e.g. regex miss)
+ *        * 1 → gate validated; helper never entered (mismatch/null-snapshot)
+ *        * 2 → gate validated AND helper validated (helper entered)
  *  This is the regression Codex refinement #1 asked us to lock down:
  *  the owner-mismatch case must 403 before the helper enters; the
  *  owner-missing case still falls through (the gate is silent on that). */
-describe('dispatch: workflows write — cross-bot owner gate regression (isValidRunId tripwire)', () => {
+describe('dispatch: workflows write — cross-bot owner gate regression (proxy + isValidRunId tripwires)', () => {
   function gateRegressionDeps() {
     const isValidRunIdSpy = vi.fn(() => true);
     const proxySpy = vi.fn(async () => makeUpstream(200, { ok: true }));
@@ -795,7 +798,7 @@ describe('dispatch: workflows write — cross-bot owner gate regression (isValid
   }
 
   for (const action of ['cancel', 'approve', 'reject'] as const) {
-    it(`mismatch (owner=cli_b, caller=cli_a) → 403, runCancel/runApproveReject NEVER entered (isValidRunId not called) (${action})`, async () => {
+    it(`mismatch (owner=cli_b, caller=cli_a) → 403, helper NEVER entered (proxy not called) (${action})`, async () => {
       const { deps, isValidRunIdSpy, proxySpy } = gateRegressionDeps();
       const api = createDaemonInternalApi(deps);
       const r = await api.dispatchForTest(
@@ -806,12 +809,13 @@ describe('dispatch: workflows write — cross-bot owner gate regression (isValid
       );
       expect(r.status).toBe(403);
       expect((r.body as any).error).toBe('workflow_owner_mismatch');
-      // Tripwire: isValidRunId is exclusive to the helpers. Not called → helper not entered.
-      expect(isValidRunIdSpy).not.toHaveBeenCalled();
+      // Tripwire: proxy is helper-exclusive; gate path never proxies.
       expect(proxySpy).not.toHaveBeenCalled();
+      // Gate ran id validation but stopped at owner-mismatch (count=1).
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
     });
 
-    it(`match (owner=cli_b, caller=cli_b) → upstream helper called once (isValidRunId fires) (${action})`, async () => {
+    it(`match (owner=cli_b, caller=cli_b) → upstream helper called once (proxy fires) (${action})`, async () => {
       const { deps, isValidRunIdSpy, proxySpy } = gateRegressionDeps();
       const api = createDaemonInternalApi(deps);
       const r = await api.dispatchForTest(
@@ -821,14 +825,14 @@ describe('dispatch: workflows write — cross-bot owner gate regression (isValid
         'cli_b',
       );
       expect(r.status).toBe(200);
-      // Helper entered → isValidRunId called exactly once (one helper invocation).
-      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
-      expect(isValidRunIdSpy).toHaveBeenCalledWith('r1');
-      // Helper got far enough to call proxyToDaemon.
+      // Helper reached proxy → business logic ran.
       expect(proxySpy).toHaveBeenCalledTimes(1);
+      // isValidRunId fires twice: once in gate, once in helper.
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(2);
+      expect(isValidRunIdSpy).toHaveBeenCalledWith('r1');
     });
 
-    it(`test seam (no callerAppId) → upstream helper called (isValidRunId fires) (${action})`, async () => {
+    it(`test seam (no callerAppId) → upstream helper called (proxy fires) (${action})`, async () => {
       const { deps, isValidRunIdSpy, proxySpy } = gateRegressionDeps();
       const api = createDaemonInternalApi(deps);
       const r = await api.dispatchForTest(
@@ -837,8 +841,8 @@ describe('dispatch: workflows write — cross-bot owner gate regression (isValid
         JSON.stringify({}),
       );
       expect(r.status).toBe(200);
-      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
       expect(proxySpy).toHaveBeenCalledTimes(1);
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(2);
     });
 
     it(`chatBinding undefined (no owner) + callerAppId set → helper STILL called (gate has no opinion on owner-missing) (${action})`, async () => {
@@ -858,13 +862,13 @@ describe('dispatch: workflows write — cross-bot owner gate regression (isValid
       expect(r.status).toBe(409);
       const expectedError = action === 'cancel' ? 'needs_cli_cancel' : 'needs_lark_or_cli';
       expect((r.body as any).error).toBe(expectedError);
-      // Tripwire fires → helper was entered (the gate did NOT short-circuit).
-      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
+      // Helper was entered (gate + helper both validated id → count=2).
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(2);
       // But no proxy to caller — workflows gate is forbidden from such fallback.
       expect(proxySpy).not.toHaveBeenCalled();
     });
 
-    it(`readRunSnapshot returns null → 404 unknown_run, helper NEVER entered (isValidRunId not called) (${action})`, async () => {
+    it(`readRunSnapshot returns null → 404 unknown_run, helper NEVER entered (proxy not called) (${action})`, async () => {
       const { deps, isValidRunIdSpy, proxySpy, readRunSnapshotSpy } = gateRegressionDeps();
       const api = createDaemonInternalApi(deps);
       const r = await api.dispatchForTest(
@@ -875,10 +879,49 @@ describe('dispatch: workflows write — cross-bot owner gate regression (isValid
       );
       expect(r.status).toBe(404);
       expect((r.body as any).error).toBe('unknown_run');
-      // readRunSnapshot was called by the gate (returning null) — but the gate
-      // short-circuited before the helper ran.
+      // Gate validated id (count=1) then read snapshot (returned null) then 404'd.
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
       expect(readRunSnapshotSpy).toHaveBeenCalled();
-      expect(isValidRunIdSpy).not.toHaveBeenCalled();
+      // Helper never proxied.
+      expect(proxySpy).not.toHaveBeenCalled();
+    });
+
+    /** codex 2026-06-10 compat blocker: gate must preserve helper's
+     *  400 bad_run_id semantics. Without this check, readRunSnapshot
+     *  would null on invalid ids and the gate would shadow into a
+     *  404 unknown_run — breaking callers that distinguish bad input
+     *  from missing run (workflows-action-helpers.test +
+     *  dashboard-workflow-api.test both lock this). */
+    it.each([
+      // Encoded segment must survive the path regex `[^/]+` and reach the
+      // handler — then isValidRunId rejects the decoded form. Single-segment
+      // ids like `.` get normalized away by URL parsing before dispatch and
+      // can't be tested via the URL surface (helpers cover that case directly
+      // — see workflows-action-helpers.test.ts).
+      ['traversal', '../x'],
+      ['slash-injection', 'r/cancel'],
+    ] as const)(`gate rejects %s id → 400 bad_run_id, no snapshot read, no proxy (${action})`, async (_label, badId) => {
+      const { deps, isValidRunIdSpy, proxySpy, readRunSnapshotSpy } = gateRegressionDeps();
+      // Force isValidRunId false for these test ids (the real impl rejects
+      // them too — see ops-projection.isValidRunId — but mocking makes the
+      // gate's invariant explicit: "whatever isValidRunId says, the gate
+      // honors before any IO").
+      isValidRunIdSpy.mockImplementation((id: string) => id === 'r1');
+      const api = createDaemonInternalApi(deps);
+      const encoded = encodeURIComponent(badId);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/${encoded}/${action}`),
+        JSON.stringify({}),
+        'cli_caller',
+      );
+      expect(r.status).toBe(400);
+      expect(r.body).toEqual({ ok: false, error: 'bad_run_id' });
+      // Gate called isValidRunId on the decoded form, got false, returned 400.
+      expect(isValidRunIdSpy).toHaveBeenCalledTimes(1);
+      expect(isValidRunIdSpy).toHaveBeenCalledWith(badId);
+      // Defense-in-depth: snapshot reader + proxy must NOT have run.
+      expect(readRunSnapshotSpy).not.toHaveBeenCalled();
       expect(proxySpy).not.toHaveBeenCalled();
     });
   }

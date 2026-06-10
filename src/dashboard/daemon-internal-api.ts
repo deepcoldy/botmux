@@ -463,6 +463,14 @@ const ROUTES: RouteDef[] = [
     handle: async (m, ctx, deps) => {
       const runId = decodeURIComponent(m[1]);
       const action = m[2] as 'approve' | 'reject';
+      // codex 2026-06-10 compat blocker: helper used to return 400 bad_run_id
+      // on invalid ids; without this check readRunSnapshot would null on a
+      // bad id and the gate would shadow the bad-input case into 404
+      // unknown_run, breaking callers that distinguish bad input from missing
+      // run (helper tests + dashboard-workflow-api.test lock this semantics).
+      if (!deps.workflowsActionDeps.isValidRunId(runId)) {
+        return { status: 400, body: { ok: false, error: 'bad_run_id' } };
+      }
       const snap = await deps.workflowsActionDeps.readRunSnapshot(
         deps.workflowsActionDeps.runsDir,
         runId,
@@ -480,6 +488,10 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/cancel$/,
     handle: async (m, ctx, deps) => {
       const runId = decodeURIComponent(m[1]);
+      // codex 2026-06-10 compat blocker (see approve/reject above).
+      if (!deps.workflowsActionDeps.isValidRunId(runId)) {
+        return { status: 400, body: { ok: false, error: 'bad_run_id' } };
+      }
       const snap = await deps.workflowsActionDeps.readRunSnapshot(
         deps.workflowsActionDeps.runsDir,
         runId,
