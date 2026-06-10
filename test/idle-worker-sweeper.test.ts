@@ -197,6 +197,37 @@ describe('sweepIdleWorkers', () => {
     expect(activeSessions.get('b').worker).not.toBe(null);
   });
 
+  it('never suspends collab sessions because their lease watchdog owns lifecycle', () => {
+    const now = 1_000_000;
+    const collabRuntime = {
+      ...ds('a', 'tmux', now - 90 * 60_000),
+      collab: { runId: 'run-a', workerId: 'coder-1', taskId: 'task-1' },
+    };
+    const collabPersisted = ds('b', 'herdr', now - 80 * 60_000);
+    collabPersisted.session.collab = { runId: 'run-b', workerId: 'coder-2', taskId: 'task-1' };
+    const activeSessions = new Map<string, any>([
+      ['a', collabRuntime],
+      ['b', collabPersisted],
+      ['c', ds('c', 'zellij', now - 70 * 60_000)],
+      ['d', ds('d', 'tmux', now - 60 * 60_000)],
+      ['e', ds('e', 'herdr', now - 50 * 60_000)],
+      ['f', ds('f', 'zellij', now - 40 * 60_000)],
+      ['g', ds('g', 'tmux', now - 35 * 60_000)],
+      ['h', ds('h', 'herdr', now - 31 * 60_000)],
+      ['i', ds('i', 'zellij', now - 30 * 60_000)],
+      ['j', ds('j', 'tmux', now - 2 * 60_000)],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, {
+      now,
+      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000 },
+    });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['c', 'd']);
+    expect(activeSessions.get('a').worker).not.toBe(null);
+    expect(activeSessions.get('b').worker).not.toBe(null);
+  });
+
   it('does not suspend an adopt session even if it is the only over-budget candidate', () => {
     const now = 1_000_000;
     // Budget 1, but the single eligible-looking over-budget worker is an adopt

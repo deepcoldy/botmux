@@ -40,6 +40,10 @@ export function sweepIdleWorkers(
     // un-injected external CLI. Check both the runtime mirror and the persisted
     // marker so a restored adopt session is excluded too.
     .filter(ds => !ds.adoptedFrom && !ds.session.adoptedFrom)
+    // Collab workers hold explicit pool leases and have a dedicated watchdog.
+    // Suspending them here makes the watchdog interpret a healthy idle worker
+    // as lost, causing respawn loops and eventually crash-loop failure.
+    .filter(ds => !ds.collab && !ds.session.collab)
     .filter(ds => isSuspendableBackendType(ds.initConfig?.backendType))
     .filter(ds => ds.lastScreenStatus === 'idle')
     .filter(ds => now - (ds.lastMessageAt || 0) >= idleMs)
