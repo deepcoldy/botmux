@@ -133,6 +133,75 @@ describe('collab control-plane integration seam', () => {
     expect(index.topics['cli_control::om_topic_root']).toBe(spawns[0].runId);
   });
 
+  it('strips /t before collab intake when a regular group forces a new topic', async () => {
+    await handleCollabControlMessage(
+      rawTextEvent('/t /collab forced topic run | test: test -f done.txt', 'om_force_topic_seed'),
+      ctx('om_force_topic_seed'),
+    );
+
+    expect(spawns).toHaveLength(1);
+    const board = openCollabBoard(spawns[0].runId, { baseDir: spawns[0].baseDir });
+    const snapshot = await board.snapshot();
+    expect(snapshot.goal).toBe('forced topic run');
+    expect(snapshot.task?.spec).toBe('forced topic run');
+    expect(snapshot.acceptanceCriteria?.command).toBe('test -f done.txt');
+  });
+
+  it('allows concurrent collab runs in distinct topics with distinct pooled workers', async () => {
+    await addCollabWorker(dataDir, {
+      id: 'coder-1',
+      larkAppId: 'worker_app_1',
+      label: 'Coder 1',
+      cliId: 'codex',
+    });
+    await addCollabWorker(dataDir, {
+      id: 'coder-2',
+      larkAppId: 'worker_app_2',
+      label: 'Coder 2',
+      cliId: 'claude-code',
+    });
+
+    await handleCollabControlMessage(rawTextEvent('/collab run A | test: test -f a.txt', 'om_seed_a'), ctx('om_thread_a'));
+    await handleCollabControlMessage(rawTextEvent('/collab run B | test: test -f b.txt', 'om_seed_b'), ctx('om_thread_b'));
+
+    expect(spawns).toHaveLength(2);
+    expect(spawns[0]).toMatchObject({ workerId: 'coder-1', larkAppId: 'worker_app_1', topicId: 'om_thread_a' });
+    expect(spawns[1]).toMatchObject({ workerId: 'coder-2', larkAppId: 'worker_app_2', topicId: 'om_thread_b' });
+    expect(spawns[0].runId).not.toBe(spawns[1].runId);
+
+    const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
+    expect(index.topics['cli_control::om_thread_a']).toBe(spawns[0].runId);
+    expect(index.topics['cli_control::om_thread_b']).toBe(spawns[1].runId);
+
+    const pool = readCollabWorkerPool(dataDir);
+    expect(pool.workers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'coder-1', status: 'leased', leasedBy: spawns[0].runId }),
+      expect.objectContaining({ id: 'coder-2', status: 'leased', leasedBy: spawns[1].runId }),
+    ]));
+
+    const boardA = openCollabBoard(spawns[0].runId, { baseDir: spawns[0].baseDir });
+    const boardB = openCollabBoard(spawns[1].runId, { baseDir: spawns[1].baseDir });
+    expect((await boardA.snapshot()).goal).toBe('run A');
+    expect((await boardB.snapshot()).goal).toBe('run B');
+  });
+
+  it('rejects a second chat-scope /collab while that chat has an active run', async () => {
+    const chatCtx = ctx('oc_collab');
+    chatCtx.scope = 'chat';
+    await handleCollabControlMessage(rawTextEvent('/collab first chat run | test: test -f done.txt', 'om_chat_seed_1'), chatCtx);
+
+    await handleCollabControlMessage(rawTextEvent('/collab second chat run | test: test -f done2.txt', 'om_chat_seed_2'), chatCtx);
+
+    expect(spawns).toHaveLength(1);
+    expect(replies.at(-1)).toMatchObject({ anchor: 'oc_collab', msgType: 'text', larkAppId: 'cli_control' });
+    expect(replies.at(-1)?.content).toContain('already has an active collab run');
+
+    const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
+    expect(index.topics['cli_control::oc_collab']).toBe(spawns[0].runId);
+    const board = openCollabBoard(spawns[0].runId, { baseDir: spawns[0].baseDir });
+    expect((await board.snapshot()).goal).toBe('first chat run');
+  });
+
   it('leases a pooled collab-worker identity and writes its route into WorkerAllocated', async () => {
     await addCollabWorker(dataDir, {
       id: 'coder-1',

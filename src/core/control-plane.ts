@@ -6,6 +6,7 @@ import { leaseCollabWorker, readCollabWorkerPool, releaseCollabWorker } from '..
 import { buildCollabControlCard } from '../im/lark/card-builder.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions } from '../im/lark/message-parser.js';
 import type { RoutingContext } from '../im/lark/event-dispatcher.js';
+import { parseForceTopicInvocation } from './command-handler.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 
@@ -177,6 +178,14 @@ async function boardForTopic(larkAppId: string, topicId: string): Promise<{ boar
   return { board: await boardForRun(runId), created };
 }
 
+async function replaceBoardForTopic(larkAppId: string, topicId: string): Promise<CollabBoard> {
+  const index = readIndex();
+  const runId = makeRunId(topicId);
+  index.topics[topicKey(larkAppId, topicId)] = runId;
+  writeIndex(index);
+  return boardForRun(runId);
+}
+
 function workerIdForRun(runId: string): string {
   return `${runId}-worker-1`;
 }
@@ -253,6 +262,15 @@ function workerAssignmentPrompt(goal: string, task: { title: string; taskId: str
 
 function normalizeGoalInput(raw: string): string {
   return raw.trim().replace(/^\/(?:goal|set-goal)\s+/i, '').trim();
+}
+
+function normalizeControlInput(raw: string): string {
+  const forced = parseForceTopicInvocation(raw);
+  return (forced ? forced.prompt : raw).trim();
+}
+
+function isCollabStart(raw: string): boolean {
+  return /^\/collab(?:\s|$)/i.test(raw.trim());
 }
 
 async function ensureRunCreated(board: CollabBoard, input: {
@@ -600,11 +618,26 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
   await resolveNonsupportMessage(data, ctx.larkAppId);
   const { parsed } = parseEventMessage(data);
   const topicId = ctx.anchor;
-  const raw = stripLeadingMentions(parsed.content.trim(), parsed.mentions).trim();
+  const raw = normalizeControlInput(stripLeadingMentions(parsed.content.trim(), parsed.mentions).trim());
   if (!raw) return;
 
   try {
-    const { board } = await boardForTopic(ctx.larkAppId, topicId);
+    let { board, created } = await boardForTopic(ctx.larkAppId, topicId);
+    const isStart = isCollabStart(raw);
+    const existing = created ? null : await board.snapshot().catch(() => null);
+    if (!created && isStart && existing?.goal) {
+      if (!isTerminalStatus(existing.status)) {
+        await cfg.reply(
+          topicId,
+          `This chat/topic already has an active collab run (${board.runId}). Start another run in a new Lark topic/thread, or stop the current run first.`,
+          'text',
+          ctx.larkAppId,
+        );
+        return;
+      }
+      board = await replaceBoardForTopic(ctx.larkAppId, topicId);
+      created = true;
+    }
     const intake = parseCollabIntake(raw);
     await ensureRunCreated(board, {
       goal: intake.goal || raw,
