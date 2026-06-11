@@ -1198,6 +1198,7 @@ async function cmdStart(): Promise<void> {
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`   autostart unit 已同步到当前 Node/cli.js 路径`);
   }
+  await printDashboardHintWithRetry();
 }
 
 /**
@@ -1318,6 +1319,7 @@ async function cmdRestart(): Promise<void> {
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
   }
+  await printDashboardHintWithRetry();
 }
 
 /** Wraps `ensureDependencies()`. Neither tmux nor fonts are load-bearing —
@@ -1420,23 +1422,26 @@ function cmdUpgrade(): void {
 }
 
 /**
- * Print a fresh dashboard URL by HMAC-authing to the dashboard process's
- * loopback rotation endpoint. Each call invalidates the previously-issued
- * token, so sharing a URL is the same as sharing a one-shot session.
+ * Call one of the dashboard's loopback HMAC `/__cli/*` endpoints.
+ * - `/__cli/rotate` mints a fresh token and returns its URL, invalidating the
+ *   previously-issued link.
+ * - `/__cli/current` returns the existing token's URL WITHOUT rotating (404 →
+ *   no token has ever been minted → `no-active-token`).
+ * Returns { ok: true, url } on success, or { ok: false, reason } so callers can
+ * decide how to surface the failure (hard error vs soft hint).
  */
-async function cmdDashboard(): Promise<void> {
+async function callDashboardEndpoint(
+  path: '/__cli/rotate' | '/__cli/current',
+): Promise<
+  | { ok: true; url: string }
+  | { ok: false; reason: 'no-secret' | 'unreachable' | 'http-error' | 'no-active-token'; detail?: string }
+> {
   const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
-  if (!existsSync(SECRET_PATH)) {
-    console.error('Dashboard not initialised. Run `botmux restart` first.');
-    process.exit(1);
-  }
+  if (!existsSync(SECRET_PATH)) return { ok: false, reason: 'no-secret' };
   const secret = readFileSync(SECRET_PATH, 'utf8').trim();
   const ts = Math.floor(Date.now() / 1000).toString();
   const nonce = randomBytes(8).toString('hex');
   const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
-  // Prefer the port the dashboard actually bound (it probes upward on
-  // EADDRINUSE, so the live port can differ from the configured default). The
-  // running dashboard refreshes this file on every successful bind.
   const portFile = join(CONFIG_DIR, '.dashboard-port');
   const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
     || process.env.BOTMUX_DASHBOARD_PORT
@@ -1444,7 +1449,7 @@ async function cmdDashboard(): Promise<void> {
 
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}/__cli/rotate`, {
+    res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method: 'POST',
       headers: {
         'X-Botmux-Cli-Ts': ts,
@@ -1453,17 +1458,74 @@ async function cmdDashboard(): Promise<void> {
       },
     });
   } catch {
+    return { ok: false, reason: 'unreachable' };
+  }
+  if (res.status === 404) return { ok: false, reason: 'no-active-token' };
+  if (!res.ok) {
+    return { ok: false, reason: 'http-error', detail: `${res.status} ${await res.text()}` };
+  }
+  const body = await res.json() as { url: string };
+  return { ok: true, url: body.url };
+}
+
+/**
+ * Best-effort dashboard hint printed after start/restart. Reads the LIVE link
+ * via /__cli/current (non-rotating) so an already-shared URL is preserved.
+ * Retries for a few seconds since the dashboard process boots after the daemon;
+ * if it still isn't ready, prints a soft fallback so the user isn't blocked.
+ */
+async function printDashboardHintWithRetry(): Promise<void> {
+  const maxWaitMs = 6000;
+  const stepMs = 500;
+  const started = Date.now();
+  let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
+  while (Date.now() - started < maxWaitMs) {
+    last = await callDashboardEndpoint('/__cli/current');
+    if (last.ok) {
+      console.log(`   面板: botmux dashboard (${last.url})`);
+      return;
+    }
+    // Terminal states — file-backed secret/token won't appear mid-poll, unlike
+    // a not-yet-listening port. Don't spin on them.
+    if (last.reason === 'no-secret' || last.reason === 'no-active-token') break;
+    await new Promise(r => setTimeout(r, stepMs));
+  }
+  // Soft fallback
+  if (last?.reason === 'no-active-token') {
+    console.log('   面板: 运行 `botmux dashboard` 获取链接');
+  } else if (last?.reason === 'no-secret') {
+    console.log('   面板: dashboard 凭证未就绪，启动后可用 `botmux dashboard` 获取链接');
+  } else {
+    console.log('   面板: `botmux dashboard`（daemon 启动中，稍后可获取链接）');
+  }
+}
+
+/**
+ * Print a fresh dashboard URL by HMAC-authing to the dashboard process's
+ * loopback rotation endpoint. Each call invalidates the previously-issued
+ * token, so sharing a URL is the same as sharing a one-shot session.
+ */
+async function cmdDashboard(): Promise<void> {
+  const r = await callDashboardEndpoint('/__cli/rotate');
+  if (r.ok) {
+    console.log(r.url);
+    return;
+  }
+  if (r.reason === 'no-secret') {
+    console.error('Dashboard not initialised. Run `botmux restart` first.');
+  } else if (r.reason === 'unreachable') {
+    const portFile = join(CONFIG_DIR, '.dashboard-port');
+    const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+      || process.env.BOTMUX_DASHBOARD_PORT
+      || '7891';
     console.error(
       `dashboard process not reachable on 127.0.0.1:${port} — \`botmux restart\` will start it`,
     );
-    process.exit(1);
+  } else {
+    // `no-active-token` can't occur on rotate (it always mints); fall through.
+    console.error('Rotation failed:', r.detail ?? r.reason);
   }
-  if (!res.ok) {
-    console.error('Rotation failed:', res.status, await res.text());
-    process.exit(1);
-  }
-  const body = await res.json() as { url: string };
-  console.log(body.url);
+  process.exit(1);
 }
 
 // ─── Session helpers ──────────────────────────────────────────────────────────
