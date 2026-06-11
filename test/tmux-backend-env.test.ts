@@ -42,6 +42,10 @@ describe('buildBotmuxEnvAssignments()', () => {
       IS_SANDBOX: '1',
       BOTMUX_LARK_APP_ID: 'cli_namespaced',
       BOTMUX_TURN_ID: 'om_turn',
+      BOTMUX_COLLAB_RUN_ID: 'collab_run',
+      BOTMUX_COLLAB_WORKER_ID: 'worker_1',
+      BOTMUX_COLLAB_TASK_ID: 'task_1',
+      BOTMUX_COLLAB_RUNS_DIR: '/tmp/collab-runs',
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -56,6 +60,10 @@ describe('buildBotmuxEnvAssignments()', () => {
       'IS_SANDBOX=1',
       'BOTMUX_LARK_APP_ID=cli_namespaced',
       'BOTMUX_TURN_ID=om_turn',
+      'BOTMUX_COLLAB_RUN_ID=collab_run',
+      'BOTMUX_COLLAB_WORKER_ID=worker_1',
+      'BOTMUX_COLLAB_TASK_ID=task_1',
+      'BOTMUX_COLLAB_RUNS_DIR=/tmp/collab-runs',
     ]);
     expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
     expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
@@ -72,6 +80,23 @@ describe('buildBotmuxEnvAssignments()', () => {
     });
     expect(out).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=2147483647');
     expect(out).not.toContain('PATH=/usr/bin');
+  });
+
+  it('forwards collab board coordinates so tmux workers can use botmux collab without flags', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_COLLAB_RUN_ID: 'collab_123',
+      BOTMUX_COLLAB_WORKER_ID: 'worker-a',
+      BOTMUX_COLLAB_TASK_ID: 'task-1',
+      BOTMUX_COLLAB_RUNS_DIR: '/data/collab-runs',
+    });
+    expect(out).toEqual([
+      'BOTMUX=1',
+      'BOTMUX_COLLAB_RUN_ID=collab_123',
+      'BOTMUX_COLLAB_WORKER_ID=worker-a',
+      'BOTMUX_COLLAB_TASK_ID=task-1',
+      'BOTMUX_COLLAB_RUNS_DIR=/data/collab-runs',
+    ]);
   });
 
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {
