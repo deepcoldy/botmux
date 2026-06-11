@@ -192,6 +192,8 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.wasm': 'application/wasm',
+  '.pck': 'application/octet-stream',
 };
 
 function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
@@ -470,9 +472,12 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/*) ──────────────────────────
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/assets/'))) {
-      // Map /assets/foo.js → WEB_DIR/foo.js
+    // ─── Static frontend (index.html + /assets/* + /game/*) ────────────────
+    if (
+      req.method === 'GET' &&
+      (url.pathname === '/' || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/game/'))
+    ) {
+      // Map /assets/foo.js → WEB_DIR/foo.js; /game/* is served as-is (HD2D office bundle)
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
         : url.pathname;
