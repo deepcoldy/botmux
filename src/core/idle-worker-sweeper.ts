@@ -1,13 +1,19 @@
 import type { DaemonSession } from './types.js';
 import { countConfiguredBots } from '../bot-registry.js';
-import { readGlobalConfig } from '../global-config.js';
+import { readGlobalConfig, type IdleSuspendMode, type WorkerConfig } from '../global-config.js';
 import { DEFAULT_IDLE_SUSPEND_MS, resolveWorkerBudget, type ResolvedWorkerBudget } from './worker-budget.js';
 import { suspendWorker } from './worker-pool.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
 
 export interface IdleWorkerSweepOptions {
   now?: number;
-  workerBudget?: Pick<ResolvedWorkerBudget, 'maxLiveWorkers' | 'idleSuspendMs'>;
+  workerBudget?: Pick<ResolvedWorkerBudget, 'maxLiveWorkers' | 'idleSuspendMs'> & { idleSuspendMode?: IdleSuspendMode };
+  /**
+   * This daemon's per-bot WorkerConfig (bots.json `worker` field), merged
+   * field-by-field over the global config — multi-daemon deployments run one
+   * bot per daemon, so the override scopes naturally to this process.
+   */
+  botWorkerOverride?: WorkerConfig;
 }
 
 export interface IdleWorkerSweepResult {
@@ -26,11 +32,18 @@ export function sweepIdleWorkers(
   opts: IdleWorkerSweepOptions = {},
 ): IdleWorkerSweepResult[] {
   const now = opts.now ?? Date.now();
-  const budget = opts.workerBudget ?? resolveWorkerBudget(readGlobalConfig().worker, undefined, countConfiguredBots());
+  const globalWorker = readGlobalConfig().worker;
+  const workerConfig = (globalWorker || opts.botWorkerOverride)
+    ? { ...globalWorker, ...opts.botWorkerOverride }
+    : undefined;
+  const budget = opts.workerBudget ?? resolveWorkerBudget(workerConfig, undefined, countConfiguredBots());
+  const mode: IdleSuspendMode = budget.idleSuspendMode ?? 'budget';
   const maxLiveWorkers = budget.maxLiveWorkers;
   const idleMs = budget.idleSuspendMs;
   const running = liveWorkers(activeSessions);
-  if (running.length <= maxLiveWorkers) return [];
+  // 'always' suspends every eligible idle worker; 'budget' (default) only
+  // trims the overflow above maxLiveWorkers, oldest-idle first.
+  if (mode !== 'always' && running.length <= maxLiveWorkers) return [];
 
   const candidates = running
     // Never suspend an adopted session. forkAdoptWorker stamps its
@@ -48,11 +61,12 @@ export function sweepIdleWorkers(
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 
   const suspended: IdleWorkerSweepResult[] = [];
+  const reason = mode === 'always' ? 'idle_suspend_always' : 'idle_worker_budget';
   let liveCount = running.length;
   for (const ds of candidates) {
-    if (liveCount <= maxLiveWorkers) break;
-    if (!suspendWorker(ds, 'idle_worker_budget')) continue;
-    suspended.push({ sessionId: ds.session.sessionId, reason: 'idle_worker_budget' });
+    if (mode !== 'always' && liveCount <= maxLiveWorkers) break;
+    if (!suspendWorker(ds, reason)) continue;
+    suspended.push({ sessionId: ds.session.sessionId, reason });
     liveCount--;
   }
   return suspended;

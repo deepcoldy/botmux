@@ -4836,8 +4836,14 @@ function cmdWorkerBudget(args: string[]): void {
   if (sub === '--help' || sub === '-h' || sub === 'help') {
     console.log(`Usage:
   botmux worker-budget [status]
-  botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>]
-  botmux worker-budget unset`);
+  botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>] [--idle-suspend-mode budget|always]
+  botmux worker-budget unset
+
+idle-suspend-mode:
+  budget (default)  suspend idle workers only while live workers exceed maxLiveWorkers
+  always            suspend any worker idle >= the threshold, regardless of count
+                    (sessions stay active; the next message transparently resumes them)
+Per-bot override: set a "worker" object on the bot entry in bots.json.`);
     return;
   }
 
@@ -4849,6 +4855,7 @@ function cmdWorkerBudget(args: string[]): void {
     console.log('Worker budget');
     console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
     console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);
+    console.log(`  idleSuspendMode: ${budget.idleSuspendMode} (${budget.idleSuspendModeSource})`);
     console.log(`  auto baseline:  ${budget.autoMaxLiveWorkers} from cpu=${resources.cpuCount}, memory=${formatGib(resources.memoryBytes)}, daemons=${daemonCount} (per-daemon share)`);
     console.log(`  Config file:    ${globalConfigPath()}`);
     console.log('');
@@ -4863,12 +4870,17 @@ function cmdWorkerBudget(args: string[]): void {
     const maxLive = argValue(rest, '--max-live-workers', '--max-live');
     const idleMs = argValue(rest, '--idle-ms', '--idle-suspend-ms');
     const idleMinutes = argValue(rest, '--idle-minutes', '--idle-min');
-    if (maxLive === undefined && idleMs === undefined && idleMinutes === undefined) {
-      console.error('Usage: botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>]');
+    const idleMode = argValue(rest, '--idle-suspend-mode', '--idle-mode');
+    if (maxLive === undefined && idleMs === undefined && idleMinutes === undefined && idleMode === undefined) {
+      console.error('Usage: botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>] [--idle-suspend-mode budget|always]');
       process.exit(1);
     }
     if (idleMs !== undefined && idleMinutes !== undefined) {
       console.error('Use only one of --idle-ms or --idle-minutes.');
+      process.exit(1);
+    }
+    if (idleMode !== undefined && idleMode !== 'budget' && idleMode !== 'always') {
+      console.error('--idle-suspend-mode must be "budget" or "always".');
       process.exit(1);
     }
 
@@ -4877,12 +4889,14 @@ function cmdWorkerBudget(args: string[]): void {
     if (maxLive !== undefined) next.maxLiveWorkers = parsePositiveInt(maxLive, '--max-live-workers');
     if (idleMs !== undefined) next.idleSuspendMs = parsePositiveInt(idleMs, '--idle-ms');
     if (idleMinutes !== undefined) next.idleSuspendMs = parsePositiveInt(idleMinutes, '--idle-minutes') * 60_000;
+    if (idleMode !== undefined) next.idleSuspendMode = idleMode;
 
     mergeGlobalConfig({ worker: next });
     const budget = resolveWorkerBudget(next, undefined, countConfiguredBots());
     console.log('✅ Updated worker budget.');
     console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
     console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);
+    console.log(`  idleSuspendMode: ${budget.idleSuspendMode} (${budget.idleSuspendModeSource})`);
     console.log(`  Config file:    ${globalConfigPath()}`);
     console.log('Daemon reads this on the next idle-worker sweep; restart also picks it up.');
     return;

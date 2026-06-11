@@ -1005,11 +1005,16 @@ botmux worker-budget status
 # 覆盖 live worker 上限；idle 阈值可选
 botmux worker-budget set --max-live-workers 12 --idle-minutes 45
 
+# 切换挂起策略：always = 闲置即挂起（不看预算），budget = 仅超预算时挂起（默认）
+botmux worker-budget set --idle-suspend-mode always
+
 # 清除覆盖，恢复按 CPU/内存自动推导
 botmux worker-budget unset
 \`\`\`
 
 \`maxLiveWorkers\` 控制多少个 live worker 以内保持常驻；超过预算时 daemon 会优先暂停最久未活跃的 worker。\`idleSuspendMs\` 控制 worker 需要闲置多久才允许被暂停。
+
+\`idleSuspendMode\` 控制挂起时机：\`budget\`（默认）仅在 live worker 超过预算时挂起多余的；\`always\` 对任何闲置达到阈值的 worker 直接挂起、不看预算——挂起后会话仍是 active，话题里来新消息会自动带上下文重新拉起 CLI，适合报警归因这类「出结论即闲置」的一次性 bot。单个 bot 也可在 bots.json 对应条目加 \`"worker": { "idleSuspendMode": "always", "idleSuspendMs": 600000 }\` 做 per-bot 覆盖（改完需重启 daemon）。
 `;
 
 const ORCHESTRATE_SKILL = `---

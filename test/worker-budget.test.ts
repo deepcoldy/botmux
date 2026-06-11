@@ -41,9 +41,25 @@ describe('resolveWorkerBudget', () => {
     expect(resolved).toEqual({
       maxLiveWorkers: 12,
       idleSuspendMs: 45 * 60_000,
+      idleSuspendMode: 'budget',
       autoMaxLiveWorkers: 8,
       maxLiveWorkersSource: 'config',
       idleSuspendMsSource: 'config',
+      idleSuspendModeSource: 'default',
     });
+  });
+
+  it('defaults idleSuspendMode to budget and honors a configured always', () => {
+    const box = { cpuCount: 4, memoryBytes: gib(8) };
+    const def = resolveWorkerBudget(undefined, box);
+    expect(def.idleSuspendMode).toBe('budget');
+    expect(def.idleSuspendModeSource).toBe('default');
+
+    const always = resolveWorkerBudget({ idleSuspendMode: 'always' }, box);
+    expect(always.idleSuspendMode).toBe('always');
+    expect(always.idleSuspendModeSource).toBe('config');
+    // Mode alone doesn't touch the numeric budget fields.
+    expect(always.maxLiveWorkers).toBe(8);
+    expect(always.maxLiveWorkersSource).toBe('auto');
   });
 });

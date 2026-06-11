@@ -1,10 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { availableParallelism, totalmem } from 'node:os';
-import type { WorkerConfig } from '../global-config.js';
+import type { IdleSuspendMode, WorkerConfig } from '../global-config.js';
 
 export const MIN_AUTO_MAX_LIVE_WORKERS = 4;
 export const MAX_AUTO_MAX_LIVE_WORKERS = 32;
 export const DEFAULT_IDLE_SUSPEND_MS = 30 * 60_000;
+export const DEFAULT_IDLE_SUSPEND_MODE: IdleSuspendMode = 'budget';
 
 export interface WorkerResources {
   cpuCount: number;
@@ -14,9 +15,11 @@ export interface WorkerResources {
 export interface ResolvedWorkerBudget {
   maxLiveWorkers: number;
   idleSuspendMs: number;
+  idleSuspendMode: IdleSuspendMode;
   autoMaxLiveWorkers: number;
   maxLiveWorkersSource: 'auto' | 'config';
   idleSuspendMsSource: 'default' | 'config';
+  idleSuspendModeSource: 'default' | 'config';
 }
 
 function clamp(n: number, min: number, max: number): number {
@@ -75,8 +78,10 @@ export function resolveWorkerBudget(
   return {
     maxLiveWorkers: workerConfig?.maxLiveWorkers ?? auto,
     idleSuspendMs: workerConfig?.idleSuspendMs ?? DEFAULT_IDLE_SUSPEND_MS,
+    idleSuspendMode: workerConfig?.idleSuspendMode ?? DEFAULT_IDLE_SUSPEND_MODE,
     autoMaxLiveWorkers: auto,
     maxLiveWorkersSource: workerConfig?.maxLiveWorkers === undefined ? 'auto' : 'config',
     idleSuspendMsSource: workerConfig?.idleSuspendMs === undefined ? 'default' : 'config',
+    idleSuspendModeSource: workerConfig?.idleSuspendMode === undefined ? 'default' : 'config',
   };
 }

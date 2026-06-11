@@ -3457,7 +3457,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   const idleWorkerSweepTimer = setInterval(() => {
-    const suspended = sweepIdleWorkers(activeSessions);
+    // Per-bot worker override (one bot per daemon): lets e.g. one-shot
+    // attribution bots opt into idleSuspendMode 'always' while resident bots
+    // keep the global budget policy. Read via getBot each tick so in-process
+    // config updates apply on the next sweep; hand-edits to bots.json still
+    // need a daemon restart (the file is only loaded at startup).
+    let botWorker;
+    try { botWorker = getBot(cfg.larkAppId).config.worker; } catch { /* bot deregistered */ }
+    const suspended = sweepIdleWorkers(activeSessions, { botWorkerOverride: botWorker });
     if (suspended.length > 0) {
       logger.info(`[idle-worker-sweeper] suspended ${suspended.length} idle worker(s)`);
     }

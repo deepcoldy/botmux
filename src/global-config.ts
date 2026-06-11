@@ -18,9 +18,22 @@ import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
 
+/**
+ * When idle workers get suspended:
+ *   - 'budget' (default): only while live workers exceed `maxLiveWorkers`,
+ *     oldest-idle first, down to the budget — the original behavior.
+ *   - 'always': any suspendable worker idle ≥ `idleSuspendMs` is suspended
+ *     regardless of the live count. Suspension keeps the session active, so
+ *     the next message in the topic transparently re-forks the CLI with its
+ *     context restored — suited to one-shot bots (e.g. alert attribution)
+ *     whose sessions are rarely followed up.
+ */
+export type IdleSuspendMode = 'budget' | 'always';
+
 export interface WorkerConfig {
   maxLiveWorkers?: number;
   idleSuspendMs?: number;
+  idleSuspendMode?: IdleSuspendMode;
 }
 
 export interface GlobalConfig {
@@ -178,6 +191,7 @@ function readWorker(raw: unknown): WorkerConfig | undefined {
   const idleSuspendMs = readPositiveInteger(v.idleSuspendMs);
   if (maxLiveWorkers !== undefined) worker.maxLiveWorkers = maxLiveWorkers;
   if (idleSuspendMs !== undefined) worker.idleSuspendMs = idleSuspendMs;
+  if (v.idleSuspendMode === 'budget' || v.idleSuspendMode === 'always') worker.idleSuspendMode = v.idleSuspendMode;
   return Object.keys(worker).length > 0 ? worker : undefined;
 }
 

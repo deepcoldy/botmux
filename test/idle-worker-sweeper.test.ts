@@ -215,4 +215,50 @@ describe('sweepIdleWorkers', () => {
     expect(suspended).toEqual([]);
     expect(activeSessions.get('a').worker).not.toBe(null);
   });
+
+  it('always mode suspends every eligible idle worker even under the budget', () => {
+    const now = 1_000_000;
+    const activeSessions = new Map<string, any>([
+      ['a', ds('a', 'tmux', now - 90 * 60_000)],
+      ['b', ds('b', 'herdr', now - 80 * 60_000)],
+      ['c', ds('c', 'zellij', now - 31 * 60_000)],
+      ['d', ds('d', 'tmux', now - 2 * 60_000)], // under the idle threshold
+    ]);
+
+    // 4 live workers, budget 8 — budget mode would do nothing here.
+    const suspended = sweepIdleWorkers(activeSessions, {
+      now,
+      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000, idleSuspendMode: 'always' },
+    });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['a', 'b', 'c']);
+    expect(suspended.every(s => s.reason === 'idle_suspend_always')).toBe(true);
+    expect(activeSessions.get('a').worker).toBe(null);
+    expect(activeSessions.get('b').worker).toBe(null);
+    expect(activeSessions.get('c').worker).toBe(null);
+    expect(activeSessions.get('d').worker).not.toBe(null);
+    // Suspension keeps sessions active (resumable on the next message).
+    expect(activeSessions.get('a').session.status).toBe('active');
+  });
+
+  it('always mode still skips non-idle, non-suspendable, and adopt sessions', () => {
+    const now = 1_000_000;
+    const adopt = { ...ds('a', 'tmux', now - 90 * 60_000), adoptedFrom: { tmuxTarget: 'user:0.1' } };
+    const activeSessions = new Map<string, any>([
+      ['a', adopt],
+      ['b', { ...ds('b', 'herdr', now - 80 * 60_000), lastScreenStatus: 'working' }],
+      ['c', ds('c', 'pty', now - 70 * 60_000)],
+      ['d', ds('d', 'tmux', now - 60 * 60_000)],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, {
+      now,
+      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000, idleSuspendMode: 'always' },
+    });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['d']);
+    expect(activeSessions.get('a').worker).not.toBe(null);
+    expect(activeSessions.get('b').worker).not.toBe(null);
+    expect(activeSessions.get('c').worker).not.toBe(null);
+  });
 });

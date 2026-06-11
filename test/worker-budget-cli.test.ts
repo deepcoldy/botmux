@@ -56,4 +56,23 @@ describe('botmux worker-budget CLI', () => {
     expect(unset.status).toBe(0);
     expect(readConfig().worker).toBeUndefined();
   });
+
+  it('sets and validates idle suspend mode', () => {
+    const set = runCli(['worker-budget', 'set', '--idle-suspend-mode', 'always']);
+    expect(set.status).toBe(0);
+    expect(readConfig().worker).toEqual({ idleSuspendMode: 'always' });
+    expect(set.stdout).toContain('idleSuspendMode: always (config)');
+
+    const status = runCli(['worker-budget', 'status']);
+    expect(status.status).toBe(0);
+    expect(status.stdout).toContain('idleSuspendMode: always (config)');
+
+    const bad = runCli(['worker-budget', 'set', '--idle-suspend-mode', 'sometimes']);
+    expect(bad.status).toBe(1);
+    expect(bad.stderr).toContain('--idle-suspend-mode must be "budget" or "always"');
+
+    const unset = runCli(['worker-budget', 'unset']);
+    expect(unset.status).toBe(0);
+    expect(readConfig().worker).toBeUndefined();
+  });
 });

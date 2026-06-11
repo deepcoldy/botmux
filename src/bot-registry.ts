@@ -6,6 +6,7 @@ import type { BackendType } from './adapters/backend/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
+import type { WorkerConfig } from './global-config.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
@@ -89,6 +90,16 @@ export interface BotConfig {
   oncallChats?: OncallChat[];
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
+  /**
+   * Per-bot worker 生命周期覆盖，逐字段 merge 在全局 `config.json#worker` 之上
+   * （multi-daemon 部署一 bot 一进程，本覆盖只影响该 bot 自己的 daemon）。
+   * 典型用法：报警归因这类"一次性"bot 配
+   * `{ "idleSuspendMode": "always", "idleSuspendMs": 600000 }` ——
+   * 出结论后闲置 10 分钟即挂起释放内存；话题里有人跟进时，active 会话的
+   * worker-null resume 路径会自动带上下文重新拉起 CLI，对用户透明。
+   * 常驻型 bot 不配则跟随全局预算策略。
+   */
+  worker?: WorkerConfig;
   /**
    * Per-bot default working directory. When set, new topics that have no
    * oncall binding and no sibling-session inheritance skip the repo-select
