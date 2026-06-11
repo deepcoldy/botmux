@@ -613,6 +613,17 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.session_not_found': '⚠️ 会话不存在或已被清理。',
   'card.dashboard.sessions.close.disabled.alreadyClosed': '会话已关闭',
   'card.dashboard.sessions.close.disabled.starting': '会话启动中，暂不可关闭',
+  // sessions card (PR3 slice 2b) — locate / terminal / resume buttons
+  'card.dashboard.sessions.btn.locate': '📍 定位话题',
+  'card.dashboard.sessions.btn.terminal': '🌐 终端',
+  'card.dashboard.sessions.btn.resume': '▶ 恢复',
+  'card.dashboard.sessions.locate.success': '📬 已在原话题发送定位标记。',
+  'card.dashboard.sessions.locate_failed': '⚠️ 定位失败：{reason}',
+  'card.dashboard.sessions.resume_failed': '⚠️ 恢复失败：{reason}',
+  'card.dashboard.sessions.confirm.resume.title': '确认恢复会话？',
+  'card.dashboard.sessions.confirm.resume.text': '恢复后将重新创建 worker 并继续会话。会话：{title}',
+  'card.dashboard.sessions.terminal.disabled.noPort': '会话尚无 Web Terminal 端口（未启动或已关闭）',
+  'card.dashboard.sessions.resume.disabled.onlyClosed': '仅可恢复已关闭的会话',
 
   // schedules card (PR3 slice 1)
   'card.dashboard.schedules.title': '⏰ Dashboard 定时任务',

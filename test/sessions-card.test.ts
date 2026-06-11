@@ -14,8 +14,10 @@ import {
   SESSIONS_ACTION_BACK_TO_LIST,
   SESSIONS_ACTION_CLOSE,
   SESSIONS_ACTION_DETAIL,
+  SESSIONS_ACTION_LOCATE,
   SESSIONS_ACTION_PAGE,
   SESSIONS_ACTION_REFRESH,
+  SESSIONS_ACTION_RESUME,
 } from '../src/im/lark/sessions-card.js';
 
 const INVOKER = 'ou_owner';
@@ -411,20 +413,25 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
     expect(closeBtn.disabled).not.toBe(true); // enabled, must not be marked disabled
   });
 
-  it('disabled close (closed status) → button disabled + reason note rendered', () => {
+  it('closed status → resume button replaces close (slice 2b)', () => {
+    // Slice 2b: status='closed' rows render resume INSTEAD OF the close
+    // button. The PR1 matrix says `close.enabled=false, resume.enabled=true`
+    // when closed. Builder swaps the button rather than rendering a
+    // disabled close.
     const detail = detailFor({ sessionId: 'sess_already_closed', status: 'closed' });
     expect(detail.actions.close.enabled).toBe(false);
+    expect(detail.actions.resume.enabled).toBe(true);
     const json = buildSessionsDetailCard(detail, baseOpts);
     const parsed = JSON.parse(json);
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
-    const closeBtn = (actionRow.actions as any[]).find(
-      (a: any) => a.value?.action === SESSIONS_ACTION_CLOSE,
-    );
-    expect(closeBtn.disabled).toBe(true);
-    // No confirm attached on a disabled button.
-    expect(closeBtn.confirm).toBeUndefined();
-    // The reasonKey note for alreadyClosed should render somewhere on the card.
-    expect(json).toContain('会话已关闭');
+    const actions = actionRow.actions as any[];
+    // No close button on a closed-state card.
+    expect(actions.find((a: any) => a.value?.action === SESSIONS_ACTION_CLOSE)).toBeUndefined();
+    // resume button present with confirm dialog.
+    const resumeBtn = actions.find((a: any) => a.value?.action === 'dash_sessions_resume');
+    expect(resumeBtn).toBeDefined();
+    expect(resumeBtn.disabled).not.toBe(true);
+    expect(resumeBtn.confirm).toBeDefined();
   });
 
   it('disabled close (starting status) → reason note renders the starting copy', () => {
@@ -487,6 +494,112 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
     );
     expect(backBtn.value.origin).toBeUndefined();
     expect(backBtn.value.page_size).toBeUndefined();
+  });
+
+  /** ─── Slice 2b — locate / terminal / resume buttons ─────────────────── */
+  describe('slice 2b: detail card 4-action row', () => {
+    it('active session → row has locate / terminal / close / back; NO resume', () => {
+      const detail = detailFor({ sessionId: 'sess_active', status: 'idle' });
+      const json = buildSessionsDetailCard(detail, {
+        ...baseOpts,
+        terminalUrl: 'http://host:7891',
+      });
+      const parsed = JSON.parse(json);
+      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+      const acts = actionRow.actions as any[];
+      expect(acts).toHaveLength(4);
+      // Locate present (action callback for thread-scope; no feishuChatLink passed).
+      expect(acts[0].value?.action).toBe('dash_sessions_locate');
+      // Terminal present with multi_url.
+      expect(acts[1].multi_url).toBeDefined();
+      expect(acts[1].multi_url?.url).toContain('http://host:7891');
+      // Close present (NOT resume) — active state.
+      expect(acts[2].value?.action).toBe(SESSIONS_ACTION_CLOSE);
+      // Back present.
+      expect(acts[3].value?.action).toBe(SESSIONS_ACTION_BACK_TO_LIST);
+      // No resume button anywhere on the row.
+      expect(acts.find(a => a.value?.action === 'dash_sessions_resume')).toBeUndefined();
+    });
+
+    it('closed session → row has locate / terminal / resume / back; NO close', () => {
+      const detail = detailFor({ sessionId: 'sess_closed', status: 'closed', webPort: null });
+      const json = buildSessionsDetailCard(detail, baseOpts);
+      const parsed = JSON.parse(json);
+      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+      const acts = actionRow.actions as any[];
+      expect(acts).toHaveLength(4);
+      // Resume present (NOT close).
+      const resumeBtn = acts.find(a => a.value?.action === 'dash_sessions_resume');
+      expect(resumeBtn).toBeDefined();
+      expect(resumeBtn.confirm).toBeDefined();
+      // No close button.
+      expect(acts.find(a => a.value?.action === SESSIONS_ACTION_CLOSE)).toBeUndefined();
+    });
+
+    it('terminal: no webPort → button disabled + noPort reason note', () => {
+      const detail = detailFor({ sessionId: 'sess_noterm', status: 'closed', webPort: null });
+      const json = buildSessionsDetailCard(detail, baseOpts); // no terminalUrl
+      const parsed = JSON.parse(json);
+      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+      const terminalBtn = (actionRow.actions as any[])[1];
+      expect(terminalBtn.disabled).toBe(true);
+      expect(terminalBtn.multi_url).toBeUndefined();
+      expect(json).toContain('Web Terminal 端口');
+    });
+
+    it('terminal: has webPort → button has multi_url, NOT disabled', () => {
+      const detail = detailFor({ sessionId: 'sess_term', status: 'idle' });
+      const json = buildSessionsDetailCard(detail, {
+        ...baseOpts,
+        terminalUrl: 'http://host:7891/s/sess_term',
+      });
+      const parsed = JSON.parse(json);
+      const terminalBtn = (parsed.elements as any[]).find(
+        (e: any) => e.tag === 'action',
+      ).actions[1];
+      expect(terminalBtn.disabled).not.toBe(true);
+      expect(terminalBtn.multi_url?.url).toBeDefined();
+    });
+
+    it('locate (chat-scope) → multi_url to feishuChatLink, NO callback', () => {
+      const detail = detailFor({ sessionId: 'sess_chat', status: 'idle', scope: 'chat' });
+      expect(detail.actions.locateMode).toBe('openChat');
+      const json = buildSessionsDetailCard(detail, {
+        ...baseOpts,
+        feishuChatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_chat',
+      });
+      const parsed = JSON.parse(json);
+      const locateBtn = (parsed.elements as any[]).find(
+        (e: any) => e.tag === 'action',
+      ).actions[0];
+      expect(locateBtn.multi_url?.url).toContain('openChatId');
+      expect(locateBtn.value?.action).toBeUndefined();
+    });
+
+    it('locate (thread-scope) → callback action, NO multi_url', () => {
+      const detail = detailFor({ sessionId: 'sess_thread', status: 'idle', scope: 'thread' });
+      expect(detail.actions.locateMode).toBe('openTopic');
+      const json = buildSessionsDetailCard(detail, baseOpts);
+      const parsed = JSON.parse(json);
+      const locateBtn = (parsed.elements as any[]).find(
+        (e: any) => e.tag === 'action',
+      ).actions[0];
+      expect(locateBtn.multi_url).toBeUndefined();
+      expect(locateBtn.value?.action).toBe('dash_sessions_locate');
+      expect(locateBtn.value?.session_id).toBe('sess_thread');
+    });
+
+    it('origin=overview → locate / resume callback values carry origin', () => {
+      const detail = detailFor({ sessionId: 'sess_nav', status: 'closed', webPort: null });
+      const json = buildSessionsDetailCard(detail, { ...baseOpts, origin: 'overview' });
+      const parsed = JSON.parse(json);
+      const actions = (parsed.elements as any[]).find((e: any) => e.tag === 'action').actions as any[];
+      const locateBtn = actions[0];
+      const resumeBtn = actions.find(a => a.value?.action === 'dash_sessions_resume');
+      // thread-scope locate has callback; carries origin.
+      expect(locateBtn.value?.origin).toBe('overview');
+      expect(resumeBtn.value.origin).toBe('overview');
+    });
   });
 
   it('escapes title against <at> / <font> injection so user-supplied chars cannot break the wrapper', () => {
@@ -970,12 +1083,15 @@ describe('handleSessionsCardAction', () => {
       );
       // No toast on success.
       expect(r.toast).toBeUndefined();
-      // Detail card returned, with close button DISABLED (status overlay → 'closed').
+      // Detail card returned. Slice 2b: closed-state detail no longer has
+      // a disabled close button — it renders the resume button instead.
       expect(r.card?.type).toBe('raw');
       const cardJson = JSON.stringify(r.card?.data);
       expect(cardJson).toContain('会话详情');
-      expect(cardJson).toContain('"disabled":true');
-      expect(cardJson).toContain('会话已关闭');
+      // Resume button on closed-state card.
+      expect(cardJson).toContain('dash_sessions_resume');
+      // No close action button (it's been replaced by resume).
+      expect(cardJson).not.toContain('"action":"dash_sessions_close"');
     });
 
     it('POST 404 → toast close_failed, NO card (state preserved)', async () => {
@@ -1187,6 +1303,199 @@ describe('handleSessionsCardAction', () => {
       expect(r.toast?.content).toContain('🔒');
       expect(r.card).toBeUndefined();
       expect(deps.createClient).not.toHaveBeenCalled();
+    });
+  });
+
+  /** ─── Slice 2b: LOCATE + RESUME handler ──────────────────────────── */
+  describe('action=dash_sessions_locate', () => {
+    it('happy → POST /__daemon/sessions/:id/locate, toast-only success, no card', async () => {
+      const requestSpy = vi.fn(async () => ({ status: 200, body: { ok: true }, raw: '' }));
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER, session_id: 'sess_locate' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(requestSpy).toHaveBeenCalledOnce();
+      expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'POST', path: '/__daemon/sessions/sess_locate/locate' });
+      expect(r.toast?.type).toBe('success');
+      expect(r.toast?.content).toContain('定位标记');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST 429 → toast locate_failed, no card', async () => {
+      const requestSpy = vi.fn(async () => ({ status: 429, body: { error: 'cooldown' }, raw: '' }));
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER, session_id: 'sess_cd' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.type).toBe('error');
+      expect(r.toast?.content).toContain('定位失败');
+      expect(r.toast?.content).toContain('cooldown');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('POST throws → toast locate_failed with reason, no card', async () => {
+      const requestSpy = vi.fn(async () => { throw new Error('econnrefused'); });
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER, session_id: 'sess_x' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.type).toBe('error');
+      expect(r.toast?.content).toContain('econnrefused');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('missing session_id → session_not_found toast, no client call', async () => {
+      const requestSpy = vi.fn();
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('不存在');
+      expect(requestSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('action=dash_sessions_resume', () => {
+    function makeResumeDeps(sessionId: string, postResp: { status: number; body: any } = { status: 200, body: { ok: true } }, postRefetchRow?: SessionRow | null) {
+      const closedRow = row({ sessionId, status: 'closed', title: 'closed-row' });
+      const refetchRow = postRefetchRow === undefined
+        ? row({ sessionId, status: 'idle', webPort: 7892, title: 'closed-row' })
+        : postRefetchRow;
+      let getCalls = 0;
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+          getCalls += 1;
+          if (getCalls === 1) return { status: 200, body: { sessions: [closedRow] }, raw: '' };
+          return { status: 200, body: { sessions: refetchRow ? [refetchRow] : [] }, raw: '' };
+        }
+        if (req.method === 'POST' && req.path === `/__daemon/sessions/${sessionId}/resume`) {
+          return { status: postResp.status, body: postResp.body, raw: '' };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+        requestSpy,
+      };
+    }
+
+    it('happy: GET + POST + 2nd GET → rebuild detail with fresh row', async () => {
+      const deps = makeResumeDeps('sess_r');
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_RESUME, invoker_open_id: INVOKER, session_id: 'sess_r' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      // 3 calls: pre-GET + POST + post-GET
+      expect(deps.requestSpy).toHaveBeenCalledTimes(3);
+      expect(deps.requestSpy.mock.calls[0][0].method).toBe('GET');
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ method: 'POST', path: '/__daemon/sessions/sess_r/resume' }),
+      );
+      expect(deps.requestSpy.mock.calls[2][0].method).toBe('GET');
+      // Fresh row → idle status → card no longer shows resume button.
+      expect(r.toast).toBeUndefined();
+      const cardJson = JSON.stringify(r.card?.data);
+      // Idle now → close button reappears, resume gone.
+      expect(cardJson).toContain('"action":"dash_sessions_close"');
+      expect(cardJson).not.toContain('"action":"dash_sessions_resume"');
+    });
+
+    it('active state replay (matrix says resume.enabled=false) → toast resume.disabled.onlyClosed, 0 POST', async () => {
+      const activeRow = row({ sessionId: 'sess_active', status: 'idle' });
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET') return { status: 200, body: { sessions: [activeRow] }, raw: '' };
+        throw new Error('POST should not be called');
+      });
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_RESUME, invoker_open_id: INVOKER, session_id: 'sess_active' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.type).toBe('error');
+      expect(r.toast?.content).toContain('仅可恢复已关闭');
+      // No POST was issued — security matrix gate worked.
+      const postCalls = requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls).toHaveLength(0);
+    });
+
+    it('POST 500 → toast resume_failed, no card', async () => {
+      const deps = makeResumeDeps('sess_r', { status: 500, body: { error: 'worker_failed' } });
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_RESUME, invoker_open_id: INVOKER, session_id: 'sess_r' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.type).toBe('error');
+      expect(r.toast?.content).toContain('恢复失败');
+      expect(r.toast?.content).toContain('worker_failed');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('2nd GET refetch row vanished → fallback synth with status=idle', async () => {
+      const deps = makeResumeDeps('sess_r', { status: 200, body: { ok: true } }, null);
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_RESUME, invoker_open_id: INVOKER, session_id: 'sess_r' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      // Fallback synth: still renders a card (no error).
+      expect(r.toast).toBeUndefined();
+      expect(r.card).toBeDefined();
+    });
+
+    it('missing session_id → session_not_found toast, no client call', async () => {
+      const requestSpy = vi.fn();
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_RESUME, invoker_open_id: INVOKER }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('不存在');
+      expect(requestSpy).not.toHaveBeenCalled();
     });
   });
 });

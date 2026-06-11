@@ -179,9 +179,9 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
     expect(result.toast).toBeUndefined();
     expect(result.card).toBeDefined();
     const cardJson = JSON.stringify(result.card?.data);
-    // Closed-state synth: detail card renders the disabled-close note.
-    expect(cardJson).toContain('会话已关闭');
-    expect(cardJson).toContain('"disabled":true');
+    // Closed-state synth (slice 2b): close button replaced by resume.
+    expect(cardJson).toContain('dash_sessions_resume');
+    expect(cardJson).not.toContain('"action":"dash_sessions_close"');
 
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();

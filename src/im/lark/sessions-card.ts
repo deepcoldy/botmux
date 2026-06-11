@@ -40,8 +40,10 @@ import type { SessionRowDto, SessionDetailDto } from '../../dashboard/session-ca
 import { composeEntries, sortByStatus, paginate, composeDetail } from '../../dashboard/session-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
+import { config } from '../../config.js';
 import { type Locale, t } from '../../i18n/index.js';
 
+import { terminalMultiUrl } from './card-builder.js';
 import type { CardActionData } from './card-handler.js';
 
 export const SESSIONS_ACTION_REFRESH = 'dash_sessions_refresh' as const;
@@ -49,6 +51,14 @@ export const SESSIONS_ACTION_PAGE = 'dash_sessions_page' as const;
 export const SESSIONS_ACTION_DETAIL = 'dash_sessions_detail' as const;
 export const SESSIONS_ACTION_CLOSE = 'dash_sessions_close' as const;
 export const SESSIONS_ACTION_BACK_TO_LIST = 'dash_sessions_back_to_list' as const;
+/** slice 2b: thread-scope locate sends a @mention into the original topic.
+ *  chat-scope locate uses the row's `feishuChatLink` as a `multi_url` and
+ *  doesn't go through this action at all. */
+export const SESSIONS_ACTION_LOCATE = 'dash_sessions_locate' as const;
+/** slice 2b: replaces the close button when status === 'closed'. Routed
+ *  through Route B `/__daemon/sessions/:id/resume`; 2nd GET fetches the
+ *  fresh row so the rebuilt detail card reflects the post-resume state. */
+export const SESSIONS_ACTION_RESUME = 'dash_sessions_resume' as const;
 /** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
  *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
  *  import). card-handler routes by action prefix, so dispatch lands on the
@@ -294,7 +304,7 @@ function renderRow(entry: SessionRowDto, _locale: Locale): unknown {
   };
 }
 
-/** Slice-2a options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
+/** Slice-2a/2b options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
 export interface BuildSessionsDetailCardOpts {
   invokerOpenId: string;
   locale: Locale;
@@ -306,6 +316,15 @@ export interface BuildSessionsDetailCardOpts {
    *  button (single back affordance per slice). */
   origin?: 'overview';
   pageSize?: number;
+  /** Slice 2b — Web terminal URL for the openTerminal button. Caller computes
+   *  via `buildSessionTerminalUrl(row)`; null when the session has no port
+   *  (the button renders disabled with a noPort reason note). */
+  terminalUrl?: string | null;
+  /** Slice 2b — `feishuChatLink` from the SessionRow, used when
+   *  `detail.actions.locateMode === 'openChat'` (chat-scope sessions skip
+   *  the POST-and-toast flow and jump straight into the group chat via
+   *  `multi_url`). null/undefined for thread-scope. */
+  feishuChatLink?: string | null;
 }
 
 /**
@@ -391,35 +410,10 @@ export function buildSessionsDetailCard(
 
   elements.push({ tag: 'hr' });
 
-  // ─── Action row — close (danger w/ confirm) + back ─────────────────────
-  const closeEnabled = detail.actions.close.enabled === true;
-  const closeButton: Record<string, unknown> = {
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.close', undefined, opts.locale) },
-    type: 'danger',
-    value: {
-      action: SESSIONS_ACTION_CLOSE,
-      invoker_open_id: opts.invokerOpenId,
-      session_id: detail.sessionId,
-    },
-  };
-  if (closeEnabled) {
-    // Feishu V1 card schema confirm dialog. Only attach when the button is
-    // actually clickable — there is no value in confirming a disabled button.
-    closeButton.confirm = {
-      title: { tag: 'plain_text', content: t('card.dashboard.sessions.confirm.close.title', undefined, opts.locale) },
-      text: {
-        tag: 'plain_text',
-        content: t(
-          'card.dashboard.sessions.confirm.close.text',
-          { title: detail.title },
-          opts.locale,
-        ),
-      },
-    };
-  } else {
-    closeButton.disabled = true;
-  }
+  // ─── Action row — locate / terminal / (close OR resume) / back ────────
+  // Slice 2b: detail card matches the Web dashboard's four primary actions.
+  // active state shows close (danger); closed state replaces close with
+  // resume so the user can revive the session.
   const backNav: Record<string, string> = {};
   if (opts.origin === 'overview') backNav.origin = 'overview';
   if (
@@ -430,47 +424,138 @@ export function buildSessionsDetailCard(
   ) {
     backNav.page_size = String(Math.floor(opts.pageSize));
   }
-  // Also propagate the same nav onto the close button — successful close
-  // rebuilds this same detail card and the user may then press 🔙 返回 to go
-  // back to the drilldown list, which still needs origin/pageSize.
-  (closeButton.value as Record<string, unknown>) = {
-    ...(closeButton.value as Record<string, unknown>),
-    ...backNav,
+  // Track reason notes to render below the action row in row order.
+  const reasonNotes: { key: string; titleKey?: string }[] = [];
+
+  // 1) Locate button. PR1 matrix says it's always enabled; we still gate
+  //    on matrix to stay matrix-driven.
+  const locateEnabled = detail.actions.locate.enabled === true;
+  const locateButton: Record<string, unknown> = {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.locate', undefined, opts.locale) },
+    type: 'default',
   };
-  elements.push({
-    tag: 'action',
-    actions: [
-      closeButton,
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.back', undefined, opts.locale) },
-        type: 'default',
-        value: {
-          action: SESSIONS_ACTION_BACK_TO_LIST,
-          invoker_open_id: opts.invokerOpenId,
-          ...backNav,
+  if (locateEnabled) {
+    if (
+      detail.actions.locateMode === 'openChat'
+      && typeof opts.feishuChatLink === 'string'
+      && opts.feishuChatLink.length > 0
+    ) {
+      // chat-scope: jump straight into the group via multi_url. No callback.
+      locateButton.multi_url = {
+        url: opts.feishuChatLink,
+        pc_url: opts.feishuChatLink,
+        android_url: opts.feishuChatLink,
+        ios_url: opts.feishuChatLink,
+      };
+    } else {
+      // thread-scope (default) OR chat-scope missing the link: POST to
+      // Route B locate which sends a @mention into the original topic.
+      locateButton.value = {
+        action: SESSIONS_ACTION_LOCATE,
+        invoker_open_id: opts.invokerOpenId,
+        session_id: detail.sessionId,
+        ...backNav,
+      };
+    }
+  } else {
+    locateButton.disabled = true;
+  }
+
+  // 2) Open Terminal button. multi_url-based — no callback.
+  //    Disabled when actions.openTerminal.enabled === false OR no terminalUrl.
+  const terminalEnabled =
+    detail.actions.openTerminal.enabled === true
+    && typeof opts.terminalUrl === 'string'
+    && opts.terminalUrl.length > 0;
+  const terminalButton: Record<string, unknown> = {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.terminal', undefined, opts.locale) },
+    type: 'default',
+  };
+  if (terminalEnabled) {
+    // Wrap with the project's terminal multi-url policy (PC sidebar vs direct).
+    terminalButton.multi_url = terminalMultiUrl(opts.terminalUrl as string);
+  } else {
+    terminalButton.disabled = true;
+    const reasonKey = mapTerminalDisabledReason(detail.actions.openTerminal.reasonKey);
+    if (reasonKey) reasonNotes.push({ key: reasonKey });
+  }
+
+  // 3) close OR resume — mutually exclusive based on row status.
+  //    closed → resume button replaces close; otherwise → close stays.
+  const isClosed = detail.actions.resume.enabled === true;
+  let writeButton: Record<string, unknown>;
+  if (isClosed) {
+    // Resume button: green primary, confirm dialog.
+    writeButton = {
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.resume', undefined, opts.locale) },
+      type: 'primary',
+      value: {
+        action: SESSIONS_ACTION_RESUME,
+        invoker_open_id: opts.invokerOpenId,
+        session_id: detail.sessionId,
+        ...backNav,
+      },
+      confirm: {
+        title: { tag: 'plain_text', content: t('card.dashboard.sessions.confirm.resume.title', undefined, opts.locale) },
+        text: {
+          tag: 'plain_text',
+          content: t('card.dashboard.sessions.confirm.resume.text', { title: detail.title }, opts.locale),
         },
       },
-    ],
+    };
+  } else {
+    const closeEnabled = detail.actions.close.enabled === true;
+    writeButton = {
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.close', undefined, opts.locale) },
+      type: 'danger',
+      value: {
+        action: SESSIONS_ACTION_CLOSE,
+        invoker_open_id: opts.invokerOpenId,
+        session_id: detail.sessionId,
+        ...backNav,
+      },
+    };
+    if (closeEnabled) {
+      (writeButton as Record<string, unknown>).confirm = {
+        title: { tag: 'plain_text', content: t('card.dashboard.sessions.confirm.close.title', undefined, opts.locale) },
+        text: {
+          tag: 'plain_text',
+          content: t('card.dashboard.sessions.confirm.close.text', { title: detail.title }, opts.locale),
+        },
+      };
+    } else {
+      (writeButton as Record<string, unknown>).disabled = true;
+      const reasonKey = mapCloseDisabledReason(detail.actions.close.reasonKey);
+      if (reasonKey) reasonNotes.push({ key: reasonKey });
+    }
+  }
+
+  // 4) Back button — always.
+  const backButton = {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.back', undefined, opts.locale) },
+    type: 'default',
+    value: {
+      action: SESSIONS_ACTION_BACK_TO_LIST,
+      invoker_open_id: opts.invokerOpenId,
+      ...backNav,
+    },
+  };
+
+  elements.push({
+    tag: 'action',
+    actions: [locateButton, terminalButton, writeButton, backButton],
   });
 
-  // When the close button is disabled, surface the reason inline as a small
-  // note so the user knows WHY they can't close (e.g. starting / already
-  // closed). The reasonKey from composeDetail is one of:
-  //   sessions.action.close.starting | sessions.action.close.alreadyClosed
-  // which we translate to user-facing strings here.
-  if (!closeEnabled) {
-    const reasonKey = detail.actions.close.enabled === false
-      ? mapCloseDisabledReason(detail.actions.close.reasonKey)
-      : undefined;
-    if (reasonKey) {
-      elements.push({
-        tag: 'note',
-        elements: [
-          { tag: 'lark_md', content: t(reasonKey, undefined, opts.locale) },
-        ],
-      });
-    }
+  for (const r of reasonNotes) {
+    elements.push({
+      tag: 'note',
+      elements: [{ tag: 'lark_md', content: t(r.key, undefined, opts.locale) }],
+    });
   }
 
   // Footer security note (mirrors list card).
@@ -501,6 +586,42 @@ function mapCloseDisabledReason(reasonKey: string | undefined): string | undefin
     default:
       return undefined;
   }
+}
+
+/** Slice 2b — map PR1 openTerminal reasonKey to the i18n note shown next to a disabled terminal button. */
+function mapTerminalDisabledReason(reasonKey: string | undefined): string | undefined {
+  switch (reasonKey) {
+    case 'sessions.action.terminal.noPort':
+      return 'card.dashboard.sessions.terminal.disabled.noPort';
+    default:
+      return undefined;
+  }
+}
+
+/** Slice 2b — map PR1 resume reasonKey to the i18n note shown when resume is the
+ *  failed candidate (e.g. POST replay against an active session). */
+function mapResumeDisabledReason(reasonKey: string | undefined): string | undefined {
+  switch (reasonKey) {
+    case 'sessions.action.resume.onlyClosed':
+      return 'card.dashboard.sessions.resume.disabled.onlyClosed';
+    default:
+      return undefined;
+  }
+}
+
+/** Slice 2b — compute the Web Terminal URL for a SessionRow. Mirrors
+ *  `src/dashboard/web/sessions.ts:terminalHref`: proxy port wins (with the
+ *  `/s/{sessionId}` suffix); otherwise direct worker port. Returns null when
+ *  the session has no port at all (e.g. closed / starting). */
+export function buildSessionTerminalUrl(row: SessionRow): string | null {
+  const host = config.web.externalHost;
+  if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
+    return `http://${host}:${row.proxyPort}/s/${encodeURIComponent(row.sessionId)}`;
+  }
+  if (typeof row.webPort === 'number' && row.webPort > 0) {
+    return `http://${host}:${row.webPort}`;
+  }
+  return null;
 }
 
 function formatRelativeForDetail(fromMs: number, nowMs: number): string {
@@ -609,6 +730,8 @@ export async function handleSessionsCardAction(
     SESSIONS_ACTION_DETAIL,
     SESSIONS_ACTION_CLOSE,
     SESSIONS_ACTION_BACK_TO_LIST,
+    SESSIONS_ACTION_LOCATE,
+    SESSIONS_ACTION_RESUME,
   ]);
   if (!validActions.has(action)) {
     return ackToast('card.dashboard.settings.invalid_action', locale);
@@ -644,6 +767,8 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      terminalUrl: buildSessionTerminalUrl(row),
+      feishuChatLink: row.feishuChatLink ?? null,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -725,6 +850,108 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      terminalUrl: buildSessionTerminalUrl(synth),
+      feishuChatLink: synth.feishuChatLink ?? null,
+    });
+    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+  }
+
+  // ─── 3b2) LOCATE (thread-scope) — POST + toast-only ─────────────────
+  // chat-scope locate uses multi_url in the builder and never hits this
+  // callback. Sync block: await POST → success toast (or error toast on
+  // non-200 / network throw). Card is NEVER redrawn — UX matches the Web
+  // dashboard's "fire a locate notification" behavior.
+  if (action === SESSIONS_ACTION_LOCATE) {
+    const sessionId = value.session_id;
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
+    }
+    let resp: Awaited<ReturnType<DaemonClient['request']>>;
+    try {
+      resp = await client.request({
+        method: 'POST',
+        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/locate`,
+      });
+    } catch (e) {
+      return errorToast('card.dashboard.sessions.locate_failed', { reason: (e as Error).message }, locale);
+    }
+    if (resp.status !== 200) {
+      const body = (resp.body ?? {}) as Record<string, unknown>;
+      const reason = String(body.error ?? `http_${resp.status}`);
+      return errorToast('card.dashboard.sessions.locate_failed', { reason }, locale);
+    }
+    return { toast: { type: 'success', content: t('card.dashboard.sessions.locate.success', undefined, locale) } };
+  }
+
+  // ─── 3b3) RESUME — server-side matrix check, sync POST, 2nd GET ──────
+  // closed → idle/active. Mirrors the close path but inverted: pre-GET
+  // confirms session exists and resume is matrix-permitted; on success
+  // we issue a 2nd GET to read the post-resume row (status/webPort/proxyPort
+  // all change), falling back to a synth only when the row vanished.
+  if (action === SESSIONS_ACTION_RESUME) {
+    const sessionId = value.session_id;
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
+    }
+    const pre = await safeGetSessionsList(client, locale);
+    if ('errorResult' in pre) return pre.errorResult;
+    const before = pre.rows.find(s => s.sessionId === sessionId);
+    if (!before) {
+      return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
+    }
+    // codex 2026-06-10 SECURITY: re-run the PR1 matrix against the fresh
+    // snapshot. A replayed event on a not-closed session must be rejected
+    // here — never POST resume against an active row.
+    const beforeDetail = composeDetail(before, now());
+    if (beforeDetail.actions.resume.enabled !== true) {
+      const mappedKey = mapResumeDisabledReason(beforeDetail.actions.resume.reasonKey)
+        ?? 'card.dashboard.sessions.resume_failed';
+      return errorToast(mappedKey, undefined, locale);
+    }
+
+    let resp: Awaited<ReturnType<DaemonClient['request']>>;
+    try {
+      resp = await client.request({
+        method: 'POST',
+        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/resume`,
+      });
+    } catch (e) {
+      return errorToast('card.dashboard.sessions.resume_failed', { reason: (e as Error).message }, locale);
+    }
+    if (resp.status !== 200) {
+      const body = (resp.body ?? {}) as Record<string, unknown>;
+      const reason = String(body.error ?? `http_${resp.status}`);
+      return errorToast('card.dashboard.sessions.resume_failed', { reason }, locale);
+    }
+
+    // 2nd GET — read the fresh row. Resume regenerates worker port + can
+    // toggle status to 'idle' or 'starting', so we don't synth this; we
+    // refetch. If the refetch fails OR the row vanished (unlikely — resume
+    // creates a NEW session id in some flows; but our resume verb keeps the
+    // same id), fall back to a synth with cleared closedAt and a hint
+    // status. The fresh row may be one render-cycle stale; the next user
+    // interaction will converge it.
+    const postRefetch = await safeGetSessionsList(client, locale);
+    let after: SessionRow | undefined;
+    if (!('errorResult' in postRefetch)) {
+      after = postRefetch.rows.find(s => s.sessionId === sessionId);
+    }
+    if (!after) {
+      // Fallback: synth a minimally-recovered row. status='idle' is the
+      // most likely post-resume state for a session that just came up;
+      // the actual status may differ — one render of staleness, then the
+      // next refresh converges.
+      after = { ...before, status: 'idle', closedAt: undefined };
+    }
+    const detail = composeDetail(after, now());
+    const cardJson = buildSessionsDetailCard(detail, {
+      invokerOpenId: expectedOwner,
+      locale,
+      nowMs: now(),
+      origin: navOrigin,
+      pageSize: navPageSize,
+      terminalUrl: buildSessionTerminalUrl(after),
+      feishuChatLink: after.feishuChatLink ?? null,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }

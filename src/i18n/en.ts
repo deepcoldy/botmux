@@ -610,6 +610,17 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.session_not_found': '⚠️ Session not found or already cleaned up.',
   'card.dashboard.sessions.close.disabled.alreadyClosed': 'Session already closed',
   'card.dashboard.sessions.close.disabled.starting': 'Session is starting; close disabled',
+  // sessions card (PR3 slice 2b) — locate / terminal / resume buttons
+  'card.dashboard.sessions.btn.locate': '📍 Locate',
+  'card.dashboard.sessions.btn.terminal': '🌐 Terminal',
+  'card.dashboard.sessions.btn.resume': '▶ Resume',
+  'card.dashboard.sessions.locate.success': '📬 Locate ping sent into the original topic.',
+  'card.dashboard.sessions.locate_failed': '⚠️ Locate failed: {reason}',
+  'card.dashboard.sessions.resume_failed': '⚠️ Resume failed: {reason}',
+  'card.dashboard.sessions.confirm.resume.title': 'Resume this session?',
+  'card.dashboard.sessions.confirm.resume.text': 'Resume will recreate the worker and continue the session. Session: {title}',
+  'card.dashboard.sessions.terminal.disabled.noPort': 'Web Terminal port is not available (not started or already closed)',
+  'card.dashboard.sessions.resume.disabled.onlyClosed': 'Only closed sessions can be resumed',
 
   // schedules card (PR3 slice 1)
   'card.dashboard.schedules.title': '⏰ Dashboard Schedules',
