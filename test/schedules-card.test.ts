@@ -308,6 +308,65 @@ describe('buildSchedulesCard', () => {
       expect(json).not.toContain('select_static');
     });
   });
+
+  /** ─── global-schedules slice (codex 2026-06-11) ────────────────────── */
+  describe('global scope', () => {
+    const NOW = Date.parse('2026-06-09T12:00:00.000Z');
+    const mixedTasks = [
+      task({ id: 'sch_claude', name: 'claude-job', enabled: true, larkAppId: 'cli_aa8f', botName: 'zkd-claude-bot' }),
+      task({ id: 'sch_codex',  name: 'codex-job',  enabled: true, larkAppId: 'cli_aa80', botName: 'zkd-codex-bot' }),
+    ];
+
+    it('scope=global → every child button.value carries dashboard_scope=global', () => {
+      const json = buildSchedulesCard(
+        mixedTasks,
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, scope: 'global' },
+        NOW,
+      );
+      const parsed = JSON.parse(json);
+      const childButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? [])
+        .filter((b: any) => b.value?.action !== 'dash_overview_refresh');
+      for (const b of childButtons) {
+        expect(b.value.dashboard_scope).toBe('global');
+      }
+    });
+
+    it('scope=global → rows show bot label (botName)', () => {
+      const json = buildSchedulesCard(
+        mixedTasks,
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, scope: 'global' },
+        NOW,
+      );
+      // Both bot labels surface so the user can tell rows apart.
+      expect(json).toContain('zkd-claude-bot');
+      expect(json).toContain('zkd-codex-bot');
+    });
+
+    it('scope=global → row missing botName falls back to bot:<larkAppId suffix>', () => {
+      const onlyAppId = [task({ id: 'sch_x', name: 'noname-job', enabled: true, larkAppId: 'cli_aa8417992abbdcb0', botName: undefined })];
+      const json = buildSchedulesCard(
+        onlyAppId,
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, scope: 'global' },
+        NOW,
+      );
+      // Last 6 chars of the larkAppId: `bbdcb0`.
+      expect(json).toContain('bot:bbdcb0');
+    });
+
+    it('no scope (per-bot default) → NO bot label rendered, NO dashboard_scope on values (back-compat)', () => {
+      const json = buildSchedulesCard(
+        mixedTasks,
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1 },
+        NOW,
+      );
+      expect(json).not.toContain('dashboard_scope');
+      // The row shouldn't surface a bot label by default (per-bot view —
+      // the bot is implicit). bot_label i18n inserts the "🤖" glyph.
+      expect(json).not.toContain('🤖');
+    });
+  });
 });
 
 describe('buildSchedulesDetailCard (slice 2a)', () => {

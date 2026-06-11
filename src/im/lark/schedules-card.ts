@@ -118,6 +118,13 @@ export interface BuildSchedulesCardOpts {
   /** Navigation origin. `'overview'` → footer renders "🔙 返回总览" and every
    *  button.value carries `origin=overview`. Undefined → standalone card. */
   origin?: 'overview';
+  /** Dashboard scope. `'global'` (2026-06-11): the `/dashboard` command
+   *  family is a tool panel for the Bot Owner; schedules from any bot show
+   *  up regardless of which bot dispatched the callback. Threaded onto
+   *  every button.value so refresh/page/detail/back keep the scope; the
+   *  handler appends `?scope=global` to every Route B GET/POST. Undefined
+   *  → per-bot (back-compat default). */
+  scope?: 'global';
 }
 
 /** Build the schedules list card JSON. Pure (sorts + paginates + renders). */
@@ -133,11 +140,12 @@ export function buildSchedulesCard(
   const sorted = sortForList(tasks);
   const { items, total, page, totalPages } = paginateSchedules(sorted, opts.page, effectivePageSize);
 
-  // Plumb origin + page_size onto every button.value so refresh/page/detail/
-  // detail-back rebuilds keep the same drilldown state.
+  // Plumb origin + page_size + scope onto every button.value so refresh/
+  // page/detail/detail-back rebuilds keep the same drilldown state.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
   if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   const enabledCount = sorted.filter(t => t.enabled).length;
   const pausedCount = total - enabledCount;
@@ -175,7 +183,7 @@ export function buildSchedulesCard(
     for (const task of items) {
       const dto = toScheduleRowDto(task, { nowMs });
       // Row text element.
-      elements.push(renderRow(dto, opts.locale));
+      elements.push(renderRow(dto, opts.locale, opts.scope === 'global'));
       // Per-row action element holding ONLY the "📂 详情" button (slice 2a).
       // Keeping each row's actions in its own `action` element (rather than
       // one shared element for the whole page) makes the visual layout
@@ -298,7 +306,7 @@ export function buildSchedulesCard(
   });
 }
 
-function renderRow(row: ScheduleRowDto, locale: Locale): unknown {
+function renderRow(row: ScheduleRowDto, locale: Locale, showBotLabel: boolean): unknown {
   const icon = toneIcon(row.dot.tone);
   const errorGlyph = row.errorIndicator ? ' ⚠️' : '';
   // Primary: status icon + bold name + short id (8 chars) for traceability —
@@ -321,6 +329,14 @@ function renderRow(row: ScheduleRowDto, locale: Locale): unknown {
   if (repeatStr) {
     secondaryParts.push(t('card.dashboard.schedules.repeat_label', { repeat: repeatStr }, locale));
   }
+  // Global-scope (2026-06-11): prefix the secondary line with the owning
+  // bot so the user can tell which bot a schedule belongs to (different
+  // bots can share schedule names; per-bot scope didn't need this).
+  // Preference: row.raw.botName → larkAppId short-suffix → '—'.
+  if (showBotLabel) {
+    const botLabel = botLabelFromRow(row);
+    secondaryParts.unshift(t('card.dashboard.schedules.bot_label', { bot: botLabel }, locale));
+  }
 
   const idSuffix = shortId ? ` <font color="grey">${escapeLarkMd(shortId)}</font>` : '';
   return {
@@ -334,6 +350,16 @@ function renderRow(row: ScheduleRowDto, locale: Locale): unknown {
   };
 }
 
+/** Resolve the human label for a schedule's owning bot. */
+function botLabelFromRow(row: ScheduleRowDto): string {
+  const raw = row.raw as { botName?: string; larkAppId?: string };
+  if (typeof raw.botName === 'string' && raw.botName.length > 0) return raw.botName;
+  if (typeof raw.larkAppId === 'string' && raw.larkAppId.length > 0) {
+    return `bot:${raw.larkAppId.slice(-6)}`;
+  }
+  return '—';
+}
+
 /** Slice-2a options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
 export interface BuildSchedulesDetailCardOpts {
   invokerOpenId: string;
@@ -343,6 +369,9 @@ export interface BuildSchedulesDetailCardOpts {
    *  return-to-overview). Detail itself does NOT render return-to-overview. */
   origin?: 'overview';
   pageSize?: number;
+  /** Global-scope flag (2026-06-11) — threaded into pause/resume/back so
+   *  the rebuilt list and follow-on writes keep `?scope=global` semantics. */
+  scope?: 'global';
 }
 
 /**
@@ -481,6 +510,7 @@ export function buildSchedulesDetailCard(
   ) {
     navFields.page_size = String(Math.floor(opts.pageSize));
   }
+  if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   // ─── Action row — pause / resume (mutually exclusive) + back ───────────
   const pauseEnabled = detail.actions.pause.enabled === true;
@@ -676,13 +706,17 @@ export async function handleSchedulesCardAction(
   const client = deps.createClient(larkAppId);
   const now = (): number => (deps.nowMs ? deps.nowMs() : Date.now());
 
-  // ─── Nav state (overview drilldown) ─────────────────────────────────
+  // ─── Nav state (overview drilldown + global scope) ──────────────────
   // Threaded by buildSchedulesCard onto every button.value; we parse here
-  // so the rebuild path keeps the same shape (5/page + 🔙 返回总览).
+  // so the rebuild path keeps the same shape (5/page + 🔙 返回总览 +
+  // global scope).
   const navOrigin: 'overview' | undefined = value.origin === 'overview' ? 'overview' : undefined;
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+  const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
+  const listPathSuffix = navScope === 'global' ? '?scope=global' : '';
+  const writePathSuffix = navScope === 'global' ? '?scope=global' : '';
 
   // ─── 3a) DETAIL — open the per-schedule detail card ─────────────────
   if (action === SCHEDULES_ACTION_DETAIL) {
@@ -690,7 +724,7 @@ export async function handleSchedulesCardAction(
     if (typeof scheduleId !== 'string' || !scheduleId) {
       return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
     }
-    const r = await safeGetSchedulesList(client, locale);
+    const r = await safeGetSchedulesList(client, locale, listPathSuffix);
     if ('errorResult' in r) return r.errorResult;
     const row = r.tasks.find(t => t.id === scheduleId);
     if (!row) {
@@ -702,6 +736,7 @@ export async function handleSchedulesCardAction(
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
+      scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -721,7 +756,7 @@ export async function handleSchedulesCardAction(
     // Pre-POST snapshot — needed both to confirm the schedule still exists
     // AND to synthesize the new-state row in-process so we don't pay the
     // cost (or race) of a second GET on the happy pause path.
-    const pre = await safeGetSchedulesList(client, locale);
+    const pre = await safeGetSchedulesList(client, locale, listPathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const before = pre.tasks.find(t => t.id === scheduleId);
     if (!before) {
@@ -756,7 +791,7 @@ export async function handleSchedulesCardAction(
     try {
       resp = await client.request({
         method: 'POST',
-        path: `/__daemon/schedules/${encodeURIComponent(scheduleId)}/${verb}`,
+        path: `/__daemon/schedules/${encodeURIComponent(scheduleId)}/${verb}${writePathSuffix}`,
       });
     } catch (e) {
       return errorToast(failedKey, { reason: (e as Error).message }, locale);
@@ -778,6 +813,7 @@ export async function handleSchedulesCardAction(
         locale,
         origin: navOrigin,
         pageSize: navPageSize,
+        scope: navScope,
       });
       return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
     }
@@ -790,7 +826,7 @@ export async function handleSchedulesCardAction(
     // possibly-stale nextRunAt for one render cycle. The next user
     // interaction (refresh / back-to-list / another detail click) will
     // converge it.
-    const postRefetch = await safeGetSchedulesList(client, locale);
+    const postRefetch = await safeGetSchedulesList(client, locale, listPathSuffix);
     let after: ScheduleCardTaskInput | undefined;
     if ('errorResult' in postRefetch) {
       after = undefined;
@@ -809,13 +845,14 @@ export async function handleSchedulesCardAction(
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
+      scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
   // ─── 3c) BACK TO LIST — rebuild list card at page 1 ─────────────────
   if (action === SCHEDULES_ACTION_BACK_TO_LIST) {
-    const r = await safeGetSchedulesList(client, locale);
+    const r = await safeGetSchedulesList(client, locale, listPathSuffix);
     if ('errorResult' in r) return r.errorResult;
     const cardJson = buildSchedulesCard(
       r.tasks,
@@ -825,6 +862,7 @@ export async function handleSchedulesCardAction(
         page: 1,
         pageSize: navPageSize,
         origin: navOrigin,
+        scope: navScope,
       },
       now(),
     );
@@ -844,7 +882,7 @@ export async function handleSchedulesCardAction(
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
   }
 
-  const r = await safeGetSchedulesList(client, locale);
+  const r = await safeGetSchedulesList(client, locale, listPathSuffix);
   if ('errorResult' in r) return r.errorResult;
   const cardJson = buildSchedulesCard(
     r.tasks,
@@ -854,6 +892,7 @@ export async function handleSchedulesCardAction(
       page,
       pageSize: navPageSize,
       origin: navOrigin,
+      scope: navScope,
     },
     now(),
   );
@@ -876,10 +915,11 @@ export async function handleSchedulesCardAction(
 async function safeGetSchedulesList(
   client: DaemonClient,
   locale: Locale,
+  pathSuffix: string = '',
 ): Promise<{ tasks: ReadonlyArray<ScheduleCardTaskInput> } | { errorResult: SchedulesCardHandlerResult }> {
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
-    r = await client.request({ method: 'GET', path: '/__daemon/schedules-list' });
+    r = await client.request({ method: 'GET', path: `/__daemon/schedules-list${pathSuffix}` });
   } catch (e) {
     return { errorResult: errorToast('card.dashboard.schedules.list_failed', { reason: (e as Error).message }, locale) };
   }

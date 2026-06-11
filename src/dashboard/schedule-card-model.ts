@@ -37,6 +37,11 @@ export interface ScheduleCardTaskInput {
   parsed: ParsedSchedule;
   enabled: boolean;
   larkAppId?: string;
+  /** Human bot label (e.g. `zkd-claude-bot`). Optional — when present the
+   *  global-scope card row prefixes the row with it so the user can tell
+   *  which bot owns the schedule. Falls back to a `larkAppId` short suffix
+   *  when missing. */
+  botName?: string;
   chatId?: string;
   /** ISO of the next scheduled run (precomputed by caller). */
   nextRunAt?: string;

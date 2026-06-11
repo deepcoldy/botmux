@@ -633,6 +633,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.prev': '← 上一页',
   'card.dashboard.schedules.next': '下一页 →',
   'card.dashboard.schedules.jump_page': '第 {n} 页',
+  'card.dashboard.schedules.bot_label': '🤖 {bot}',
   'card.dashboard.schedules.next_label': '下次 {rel}',
   'card.dashboard.schedules.last_label': '上次 {rel}',
   'card.dashboard.schedules.repeat_label': '已跑 {repeat}',

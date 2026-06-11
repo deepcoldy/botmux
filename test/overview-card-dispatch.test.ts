@@ -79,7 +79,9 @@ function sampleSnapshotBody() {
 describe('handleCardAction → overview dispatch returns { card } only on success', () => {
   it('dash_overview_refresh: result.card is the rebuilt overview card; updateMessage NOT called', async () => {
     const requestSpy = vi.fn(async (req: any) => {
-      if (req.method === 'GET' && req.path === '/__daemon/overview-snapshot') {
+      // global-schedules slice (2026-06-11): overview-snapshot is fetched
+      // with `?scope=global` so schedules are returned cross-bot.
+      if (req.method === 'GET' && req.path === '/__daemon/overview-snapshot?scope=global') {
         return { status: 200, raw: '', body: sampleSnapshotBody() };
       }
       throw new Error('unexpected: ' + JSON.stringify(req));

@@ -244,13 +244,27 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/sessions-list$/,
     handle: async (_m, ctx, deps) => ({ status: 200, body: { sessions: scopeByCaller(deps.getSessions(), ctx.callerAppId) } }),
   },
-  // PR3 `/dashboard schedules` slice 1: dedicated list endpoint so the
-  // card command doesn't pay the cost of `overview-snapshot` (which also
-  // builds the groups matrix). Mirrors `sessions-list` shape.
+  // PR3 `/dashboard schedules` slice 1 + global-schedules (2026-06-11):
+  //   dedicated list endpoint; mirrors `sessions-list` shape.
+  //
+  //   Global scope (`?scope=global`): the `/dashboard` command family is a
+  //   user-facing tool panel for the Bot Owner, not a per-bot view. When the
+  //   caller marks the request global, we skip the per-bot row filter so
+  //   `/dashboard schedules` against bot B can still see schedules owned by
+  //   bot A. The user-owner / HMAC / invoker lock gates upstream are NOT
+  //   relaxed — only the row scope changes. Per-bot scope remains the
+  //   default for any caller that doesn't opt in (back-compat with internal
+  //   tests + future per-bot views).
   {
     method: 'GET',
     pathRe: /^\/__daemon\/schedules-list$/,
-    handle: async (_m, ctx, deps) => ({ status: 200, body: { schedules: scopeByCaller(deps.getSchedules(), ctx.callerAppId) } }),
+    handle: async (_m, ctx, deps) => {
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      const schedules = isGlobal
+        ? deps.getSchedules()
+        : scopeByCaller(deps.getSchedules(), ctx.callerAppId);
+      return { status: 200, body: { schedules } };
+    },
   },
   {
     method: 'GET',
@@ -315,12 +329,21 @@ const ROUTES: RouteDef[] = [
       // sessions-list / schedules-list MUST also apply when the overview
       // surface bundles those lists, otherwise bot A's owner would observe
       // bot B's sessions/schedules through the aggregated overview.
+      //
+      // global-schedules slice (2026-06-11): when `?scope=global`, the
+      // schedules slice of the bundle is returned cross-bot — matches the
+      // `/dashboard` family's global-tool semantics. Sessions / workflows /
+      // groups still scope per-bot until their own global slices land
+      // (codex slice-cut: don't change too much at once).
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
       const groups = await deps.buildGroupsMatrix();
       return {
         status: 200,
         body: {
           sessions: scopeByCaller(deps.getSessions(), ctx.callerAppId),
-          schedules: scopeByCaller(deps.getSchedules(), ctx.callerAppId),
+          schedules: isGlobal
+            ? deps.getSchedules()
+            : scopeByCaller(deps.getSchedules(), ctx.callerAppId),
           settings: deps.resolveDashboardSettings(),
           groups,
         },
@@ -549,7 +572,16 @@ const ROUTES: RouteDef[] = [
       }
       // Owned row. Cross-bot guard: refuse when the caller is not the
       // owning bot. test seam keeps the historical pass-through.
-      if (ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+      //
+      // global-schedules slice (2026-06-11): when the request is marked
+      // `?scope=global`, the cross-bot guard is intentionally bypassed —
+      // global cards are a tool-panel surface that can show rows from any
+      // bot. We still proxy to the row's TRUE owner daemon (not the
+      // caller), so the write reaches the right scheduler. Three-state
+      // semantics around legacy / missing rows are preserved; global only
+      // changes "owner exists + caller mismatch" from 403 to "proxy owner".
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      if (!isGlobal && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
         return { status: 403, body: { ok: false, error: 'schedule_owner_mismatch' } };
       }
       const upstream = await deps.proxyToDaemon(

@@ -500,7 +500,11 @@ export async function handleOverviewCardAction(
   if (action === OVERVIEW_ACTION_GOTO_SCHEDULES) {
     let r: Awaited<ReturnType<DaemonClient['request']>>;
     try {
-      r = await client.request({ method: 'GET', path: '/__daemon/schedules-list' });
+      // global-schedules slice (2026-06-11): `/dashboard` is a global tool
+      // panel — schedules from any bot must surface here, not just the
+      // caller's own. The Route B handler honors `?scope=global` by
+      // skipping `scopeByCaller` for this branch.
+      r = await client.request({ method: 'GET', path: '/__daemon/schedules-list?scope=global' });
     } catch (e) {
       return errorToast('card.dashboard.schedules.list_failed', { reason: (e as Error).message }, locale);
     }
@@ -509,11 +513,13 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.schedules.list_failed', { reason }, locale);
     }
     const tasks = ((r.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
-    // See sessions branch above — only `origin: 'overview'` differs from
-    // standalone (default page size is the unified 5).
+    // See sessions branch above for drilldown opts. `scope: 'global'` is
+    // 2026-06-11's `/dashboard` global tool-panel semantics: the sub-card
+    // threads scope onto every button.value so refresh/page/detail/back/
+    // pause/resume keep the global view + cross-bot owner-routing.
     const cardJson = buildSchedulesCard(
       tasks,
-      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview' },
+      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview', scope: 'global' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -605,7 +611,10 @@ async function rebuildOverview(
 ): Promise<OverviewCardHandlerResult> {
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
-    r = await client.request({ method: 'GET', path: '/__daemon/overview-snapshot' });
+    // global-schedules slice: overview-snapshot's schedules slice is
+    // returned cross-bot under `?scope=global` so the bundled card matches
+    // the standalone `/dashboard schedules` view.
+    r = await client.request({ method: 'GET', path: '/__daemon/overview-snapshot?scope=global' });
   } catch (e) {
     return errorToast('card.dashboard.overview.overview_failed', { reason: (e as Error).message }, locale);
   }

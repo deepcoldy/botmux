@@ -630,6 +630,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.prev': '← Prev',
   'card.dashboard.schedules.next': 'Next →',
   'card.dashboard.schedules.jump_page': 'Page {n}',
+  'card.dashboard.schedules.bot_label': '🤖 {bot}',
   'card.dashboard.schedules.next_label': 'next {rel}',
   'card.dashboard.schedules.last_label': 'last {rel}',
   'card.dashboard.schedules.repeat_label': 'ran {repeat}',

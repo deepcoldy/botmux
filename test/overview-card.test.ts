@@ -224,13 +224,17 @@ describe('handleOverviewCardAction', () => {
       settings: makeSettings(),
     };
     const requestSpy = vi.fn(async (req: any) => {
-      if (req.path === '/__daemon/overview-snapshot') {
+      // global-schedules slice (2026-06-11): overview-snapshot +
+      // schedules-list now carry `?scope=global` for the `/dashboard`
+      // tool-panel; sessions-list still per-bot until its own global
+      // slice lands.
+      if (req.path === '/__daemon/overview-snapshot' || req.path === '/__daemon/overview-snapshot?scope=global') {
         return { status: 200, body: overviewBody, raw: '' };
       }
       if (req.path === '/__daemon/sessions-list') {
         return { status: 200, body: { sessions: [sessionRow()] }, raw: '' };
       }
-      if (req.path === '/__daemon/schedules-list') {
+      if (req.path === '/__daemon/schedules-list' || req.path === '/__daemon/schedules-list?scope=global') {
         return { status: 200, body: { schedules: [scheduleTask()] }, raw: '' };
       }
       if (req.path === '/__daemon/settings-snapshot') {
@@ -270,7 +274,9 @@ describe('handleOverviewCardAction', () => {
       deps,
     );
     expect(deps.requestSpy).toHaveBeenCalledOnce();
-    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/overview-snapshot' });
+    // global-schedules slice: overview-snapshot is requested with `?scope=global`
+    // so the schedules slice surfaces cross-bot rows.
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/overview-snapshot?scope=global' });
     expect(r.toast).toBeUndefined();
     expect(r.card?.type).toBe('raw');
     const cardJson = JSON.stringify(r.card?.data);
@@ -300,7 +306,7 @@ describe('handleOverviewCardAction', () => {
       LARK_APP_ID,
       deps,
     );
-    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list?scope=global' });
     expect(r.toast).toBeUndefined();
     expect(r.card?.type).toBe('raw');
     const cardJson = JSON.stringify(r.card?.data);

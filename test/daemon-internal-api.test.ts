@@ -197,6 +197,29 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     expect(ids).not.toContain('schA');
   });
 
+  /** ─── global-schedules slice (codex 2026-06-11) ──────────────────────
+   *  `/dashboard` is a Bot-Owner tool panel; `?scope=global` returns the
+   *  schedules slice cross-bot (no `scopeByCaller`). The per-bot default
+   *  is preserved for any caller that doesn't opt in, so existing
+   *  isolation tests stay deterministic. */
+  it('schedules-list with callerAppId=cli_b AND ?scope=global → ALL rows cross-bot (cli_a + cli_b + legacy)', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list?scope=global'), '', 'cli_b');
+    expect(r.status).toBe(200);
+    const schedules = (r.body as any).schedules as Array<{ id: string }>;
+    const ids = schedules.map(s => s.id).sort();
+    expect(ids).toEqual(['schA', 'schB', 'schLegacy']);
+  });
+
+  it('schedules-list `?scope=globalish` (typo / unknown value) → falls back to per-bot scope (no surprise widen)', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list?scope=globalish'), '', 'cli_b');
+    expect(r.status).toBe(200);
+    const schedules = (r.body as any).schedules as Array<{ id: string }>;
+    const ids = schedules.map(s => s.id).sort();
+    expect(ids).toEqual(['schB', 'schLegacy']);
+  });
+
   it('sessions-list with no callerAppId (test seam) → full list (unfiltered)', async () => {
     const api = createDaemonInternalApi(mixedDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list'));
@@ -223,6 +246,25 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     // settings + groups still present in the composed response.
     expect(body.settings).toBeDefined();
     expect(body.groups).toBeDefined();
+  });
+
+  /** global-schedules slice (codex 2026-06-11) — `?scope=global` widens
+   *  the schedules slice cross-bot AT the overview surface too, matching
+   *  the dedicated schedules-list endpoint. Sessions stay per-bot until
+   *  their own global slice lands (codex scope-cut: don't change too
+   *  much at once). */
+  it('overview-snapshot with callerAppId=cli_b AND ?scope=global → schedules cross-bot; sessions still per-bot', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/overview-snapshot?scope=global'), '', 'cli_b');
+    expect(r.status).toBe(200);
+    const body = r.body as any;
+    // Sessions: still per-bot (no slice yet).
+    const sessIds = (body.sessions as Array<{ sessionId: string }>).map(s => s.sessionId).sort();
+    expect(sessIds).toEqual(['sB', 'sLegacy']);
+    expect(sessIds).not.toContain('sA');
+    // Schedules: cross-bot.
+    const schedIds = (body.schedules as Array<{ id: string }>).map(s => s.id).sort();
+    expect(schedIds).toEqual(['schA', 'schB', 'schLegacy']);
   });
 });
 
@@ -1058,6 +1100,92 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
         const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-vanished/${action}`), '', 'cli_caller');
         expect(r.status).toBe(404);
         expect((r.body as any).error).toBe('unknown_schedule');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+      });
+    }
+  });
+
+  /** ─── global-schedules slice (codex 2026-06-11) ───────────────────────
+   *  When the schedule POST is marked `?scope=global`, the cross-bot 403
+   *  is bypassed and the write is proxied to the row's TRUE owner (not
+   *  the caller). The three-state semantics around legacy / missing rows
+   *  are preserved unchanged — global only changes "owner exists +
+   *  caller mismatch" from 403 to "proxy owner". */
+  describe('global scope (?scope=global)', () => {
+    function ownedDeps() {
+      return makeDeps({
+        scheduleOwnerOf: vi.fn((id: string) => id === 'sched-known' ? 'cli_b' : undefined),
+        scheduleExists: vi.fn((id: string) => id === 'sched-known' || id === 'sched-legacy'),
+        proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
+      });
+    }
+
+    for (const action of ['pause', 'resume', 'run'] as const) {
+      it(`?scope=global + callerAppId=cli_a + owner=cli_b → proxy to OWNER (cli_b), NOT 403 (${action})`, async () => {
+        const deps = ownedDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest(
+          'POST',
+          url(`/__daemon/schedules/sched-known/${action}?scope=global`),
+          '',
+          'cli_a',
+        );
+        // The cross-bot 403 is bypassed under global scope.
+        expect(r.status).toBe(200);
+        expect((r.body as any).error).toBeUndefined();
+        expect(deps.proxyToDaemon).toHaveBeenCalledTimes(1);
+        // Route to the OWNER (cli_b), not the caller (cli_a).
+        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+          'cli_b',
+          `/api/schedules/sched-known/${action}`,
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+
+      it(`?scope=global + legacy row + callerAppId=cli_caller → STILL proxies to caller (legacy three-state preserved) (${action})`, async () => {
+        const deps = ownedDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest(
+          'POST',
+          url(`/__daemon/schedules/sched-legacy/${action}?scope=global`),
+          '',
+          'cli_caller',
+        );
+        expect(r.status).toBe(200);
+        // Legacy branch still fires — global does NOT route legacy to a
+        // ghost owner. It routes to the authenticated caller, as before.
+        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+          'cli_caller',
+          `/api/schedules/sched-legacy/${action}`,
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+
+      it(`?scope=global + missing row → 404 unknown_schedule (three-state preserved) (${action})`, async () => {
+        const deps = ownedDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest(
+          'POST',
+          url(`/__daemon/schedules/sched-vanished/${action}?scope=global`),
+          '',
+          'cli_caller',
+        );
+        expect(r.status).toBe(404);
+        expect((r.body as any).error).toBe('unknown_schedule');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+      });
+
+      it(`?scope=globalish (typo) + cross-bot caller → falls back to 403 (no surprise widen) (${action})`, async () => {
+        const deps = ownedDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest(
+          'POST',
+          url(`/__daemon/schedules/sched-known/${action}?scope=globalish`),
+          '',
+          'cli_a',
+        );
+        expect(r.status).toBe(403);
+        expect((r.body as any).error).toBe('schedule_owner_mismatch');
         expect(deps.proxyToDaemon).not.toHaveBeenCalled();
       });
     }

@@ -41,7 +41,11 @@ export async function handleDashboardSchedules(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let snap;
   try {
-    snap = await client.request({ method: 'GET', path: '/__daemon/schedules-list' });
+    // global-schedules slice (2026-06-11): `/dashboard schedules` is part
+    // of the global tool-panel — surface schedules owned by any bot, not
+    // just the caller. `?scope=global` makes the Route B handler skip
+    // `scopeByCaller`; write actions (pause/resume) route to row owner.
+    snap = await client.request({ method: 'GET', path: '/__daemon/schedules-list?scope=global' });
   } catch (e: any) {
     await deps.sessionReply(
       rootId,
@@ -63,7 +67,15 @@ export async function handleDashboardSchedules(
 
   const tasks = ((snap.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
   const nowMs = testDeps.nowMs ? testDeps.nowMs() : Date.now();
-  const cardJson = buildSchedulesCard(tasks, { invokerOpenId: ownerOpenId, locale, page: 1 }, nowMs);
+  // Standalone `/dashboard schedules` is the global tool-panel surface
+  // (2026-06-11): `scope: 'global'` threads `dashboard_scope=global` onto
+  // every callback so refresh/page/detail/back/pause/resume keep the
+  // global view and route writes to the row's true owner.
+  const cardJson = buildSchedulesCard(
+    tasks,
+    { invokerOpenId: ownerOpenId, locale, page: 1, scope: 'global' },
+    nowMs,
+  );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
