@@ -49,17 +49,29 @@ export function detectWorkerResources(): WorkerResources {
   };
 }
 
-export function autoMaxLiveWorkers(resources: WorkerResources = detectWorkerResources()): number {
+/**
+ * Auto-derived per-daemon live-worker budget.
+ *
+ * `daemonCount` is the number of daemons sharing this machine (= bots in the
+ * shared bots.json; multi-daemon deployments run one bot per process). The
+ * machine-level budget min(cpu×2, memGiB) is split evenly across daemons —
+ * without this, N daemons each claim the whole box and the effective
+ * machine-wide cap silently becomes N × budget.
+ */
+export function autoMaxLiveWorkers(resources: WorkerResources = detectWorkerResources(), daemonCount = 1): number {
   const cpuBudget = Math.max(1, resources.cpuCount) * 2;
   const memoryBudget = Math.max(1, Math.round(resources.memoryBytes / 1024 ** 3));
-  return clamp(Math.min(cpuBudget, memoryBudget), MIN_AUTO_MAX_LIVE_WORKERS, MAX_AUTO_MAX_LIVE_WORKERS);
+  const machineBudget = Math.min(cpuBudget, memoryBudget);
+  const perDaemon = Math.floor(machineBudget / Math.max(1, daemonCount));
+  return clamp(perDaemon, MIN_AUTO_MAX_LIVE_WORKERS, MAX_AUTO_MAX_LIVE_WORKERS);
 }
 
 export function resolveWorkerBudget(
   workerConfig?: WorkerConfig,
   resources: WorkerResources = detectWorkerResources(),
+  daemonCount = 1,
 ): ResolvedWorkerBudget {
-  const auto = autoMaxLiveWorkers(resources);
+  const auto = autoMaxLiveWorkers(resources, daemonCount);
   return {
     maxLiveWorkers: workerConfig?.maxLiveWorkers ?? auto,
     idleSuspendMs: workerConfig?.idleSuspendMs ?? DEFAULT_IDLE_SUSPEND_MS,

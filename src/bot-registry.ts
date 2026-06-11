@@ -454,6 +454,32 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
   }
 }
 
+// Configured-bot count, mtime-cached like the other disk fallbacks above.
+let botCountCache: { mtimeMs: number; count: number } | null = null;
+
+/**
+ * How many bots the shared bots.json configures — i.e. how many daemons share
+ * this machine (multi-daemon deployments run one bot per process, so the
+ * in-memory registry only sees this daemon's own bot). Used to split the
+ * auto-derived worker budget across daemons. Falls back to the in-memory
+ * registry size (≥1) when no config file is readable, which also covers
+ * single-process/test setups.
+ */
+export function countConfiguredBots(): number {
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const stat = statSync(path);
+      if (!botCountCache || botCountCache.mtimeMs !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(path, 'utf-8'));
+        botCountCache = { mtimeMs: stat.mtimeMs, count: Array.isArray(raw) ? Math.max(1, raw.length) : 1 };
+      }
+      return botCountCache.count;
+    } catch { /* fall through to registry size */ }
+  }
+  return Math.max(1, bots.size);
+}
+
 /**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file

@@ -1,4 +1,5 @@
 import type { DaemonSession } from './types.js';
+import { countConfiguredBots } from '../bot-registry.js';
 import { readGlobalConfig } from '../global-config.js';
 import { DEFAULT_IDLE_SUSPEND_MS, resolveWorkerBudget, type ResolvedWorkerBudget } from './worker-budget.js';
 import { suspendWorker } from './worker-pool.js';
@@ -25,7 +26,7 @@ export function sweepIdleWorkers(
   opts: IdleWorkerSweepOptions = {},
 ): IdleWorkerSweepResult[] {
   const now = opts.now ?? Date.now();
-  const budget = opts.workerBudget ?? resolveWorkerBudget(readGlobalConfig().worker);
+  const budget = opts.workerBudget ?? resolveWorkerBudget(readGlobalConfig().worker, undefined, countConfiguredBots());
   const maxLiveWorkers = budget.maxLiveWorkers;
   const idleMs = budget.idleSuspendMs;
   const running = liveWorkers(activeSessions);
