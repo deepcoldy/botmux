@@ -1,17 +1,24 @@
 /**
- * `/dashboard overview` real sub-handler (PR3 slice 1).
+ * `/dashboard overview` real sub-handler (PR3 slice 1 + global-schedules
+ * 2026-06-11).
  *
  * Pipeline (mirrors `/dashboard sessions` / `/dashboard schedules`):
  *   1. Owner gate has ALREADY run in `handleDashboardCommand`; this function
  *      is called with `ownerOpenId` already resolved.
  *   2. Fetch the live overview snapshot via PR2 Route B
- *      (`GET /__daemon/overview-snapshot`) — Route B now scopes sessions
- *      + schedules by caller appId, matching the per-bot owner gate.
- *   3. Project through `buildOverviewCard` (counts + settings summary line).
+ *      (`GET /__daemon/overview-snapshot?scope=global`). `/dashboard` is
+ *      a Bot Owner tool panel — the schedules slice surfaces cross-bot
+ *      under `?scope=global` so the first-open view matches the refresh
+ *      callback view (otherwise users would see "0 schedules" the first
+ *      time and "all schedules" only after pressing refresh). Sessions /
+ *      workflows / groups still scope per-bot until their own global
+ *      slices land (codex scope-cut).
+ *   3. Project through `buildOverviewCard` (counts + settings summary line)
+ *      with section buttons routed to the goto handlers (which also send
+ *      `?scope=global`).
  *   4. DM the card to the OWNER; topic only gets a short `dm_sent` line.
  *
- * Read-only — no buttons mutate state. 群矩阵 / Workflows render as
- * 即将上线 placeholders (no buttons).
+ * Read-only — no buttons mutate state from the overview surface itself.
  */
 
 import type { LarkMessage } from '../../types.js';
@@ -54,7 +61,11 @@ export async function handleDashboardOverview(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let snap;
   try {
-    snap = await client.request({ method: 'GET', path: '/__daemon/overview-snapshot' });
+    // `/dashboard` first-open MUST match the refresh-callback view:
+    // schedules cross-bot under `?scope=global`. Without this, the user
+    // would see "0 schedules" on the first open until they pressed
+    // refresh — the very inconsistency this slice is fixing.
+    snap = await client.request({ method: 'GET', path: '/__daemon/overview-snapshot?scope=global' });
   } catch (e: any) {
     await deps.sessionReply(
       rootId,

@@ -67,6 +67,12 @@ describe('handleDashboardSchedules (command path)', () => {
     );
 
     expect(requestSpy).toHaveBeenCalledOnce();
+    // global-schedules slice (2026-06-11): standalone `/dashboard schedules`
+    // is also part of the global tool-panel — first-open GET MUST carry
+    // `?scope=global` so the card shows schedules from any bot, not just
+    // the caller. Without this lock the entry-scope could silently drift
+    // back to per-bot and the regression would only surface in production.
+    expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list?scope=global' });
     expect(dm.calls.length).toBe(1);
     expect(dm.calls[0].openId).toBe(OWNER);
     expect(dm.calls[0].msgType).toBe('interactive');
