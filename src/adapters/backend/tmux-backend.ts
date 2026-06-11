@@ -486,6 +486,7 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   // MIRA_COOKIE_DB 注入登录态，而不是读取 macOS Mira.app cookie DB。
   'MIRA_COOKIE_HEADER',
   'MIRA_SESSION',
+  'MIRA_CONFIG',
   'MIRA_COOKIE_DB',
   'MIRA_MODEL',
   'MIRA_API_BASE_URL',

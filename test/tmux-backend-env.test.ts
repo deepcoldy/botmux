@@ -77,6 +77,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       BOTMUX: '1',
       MIRA_COOKIE_HEADER: 'mira_session=secret',
       MIRA_SESSION: 'session-token',
+      MIRA_CONFIG: '/home/u/.mira/config.json',
       MIRA_COOKIE_DB: '/home/u/.config/mira/Cookies',
       MIRA_MODEL: 'kimi-k2.5',
       MIRA_API_BASE_URL: 'https://mira.example/api',
@@ -89,6 +90,7 @@ describe('buildBotmuxEnvAssignments()', () => {
 
     expect(out).toContain('MIRA_COOKIE_HEADER=mira_session=secret');
     expect(out).toContain('MIRA_SESSION=session-token');
+    expect(out).toContain('MIRA_CONFIG=/home/u/.mira/config.json');
     expect(out).toContain('MIRA_COOKIE_DB=/home/u/.config/mira/Cookies');
     expect(out).toContain('MIRA_MODEL=kimi-k2.5');
     expect(out).toContain('MIRA_API_BASE_URL=https://mira.example/api');

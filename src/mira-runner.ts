@@ -1,10 +1,7 @@
 #!/usr/bin/env node
-import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
 import { extractMiraHistoryFinalText, sanitizeMiraFinalText } from './mira-output.js';
+import { readCookieHeader } from './mira-auth.js';
 
 type JsonObject = Record<string, any>;
 
@@ -69,77 +66,6 @@ function errorMessage(err: unknown): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function runSqliteCookieQuery(dbPath: string): string {
-  const sql = [
-    "select name || '=' || value",
-    'from cookies',
-    "where value != ''",
-    "  and (host_key = 'mira.bytedance.com' or host_key = '.mira.bytedance.com' or host_key like '%.mira.bytedance.com')",
-    "order by case when name = 'mira_session' then 0 else 1 end",
-  ].join(' ');
-  return execFileSync('sqlite3', [dbPath, sql], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 5_000,
-  });
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return Array.from(new Set(values));
-}
-
-function defaultCookieDbCandidates(): string[] {
-  const home = homedir();
-  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config');
-  return uniqueStrings([
-    // macOS Mira.app / Electron default used by the original runner.
-    join(home, 'Library', 'Application Support', 'mira', 'Cookies'),
-    // Linux XDG config locations. Some Electron apps preserve the package name
-    // casing, and Chromium-based profiles may put cookies under Default/.
-    join(xdgConfigHome, 'mira', 'Cookies'),
-    join(xdgConfigHome, 'Mira', 'Cookies'),
-    join(xdgConfigHome, 'mira', 'Default', 'Cookies'),
-    join(xdgConfigHome, 'Mira', 'Default', 'Cookies'),
-  ]);
-}
-
-function cookieDbCandidates(): string[] {
-  const explicitPath = process.env.MIRA_COOKIE_DB?.trim();
-  if (explicitPath) return [explicitPath];
-  return defaultCookieDbCandidates();
-}
-
-function formatCookieDbNotFoundMessage(candidates: string[]): string {
-  const searched = candidates.length > 0 ? candidates.join(', ') : '(none)';
-  return [
-    `Mira cookie database not found. Searched: ${searched}.`,
-    'Set MIRA_COOKIE_HEADER, MIRA_SESSION, or MIRA_COOKIE_DB.',
-    'On Linux, make sure these MIRA_* variables are exported in the environment used to start botmux.',
-  ].join(' ');
-}
-
-function readCookieHeader(): string {
-  if (process.env.MIRA_COOKIE_HEADER?.trim()) return process.env.MIRA_COOKIE_HEADER.trim();
-  if (process.env.MIRA_SESSION?.trim()) return `mira_session=${process.env.MIRA_SESSION.trim()}`;
-  const candidates = cookieDbCandidates();
-  const cookieDbPath = candidates.find(path => existsSync(path));
-  if (!cookieDbPath) throw new Error(formatCookieDbNotFoundMessage(candidates));
-
-  let output: string;
-  try {
-    output = runSqliteCookieQuery(cookieDbPath);
-  } catch (err: any) {
-    const detail = err?.stderr ? String(err.stderr).trim() : errorMessage(err);
-    throw new Error(`Failed to read Mira cookies via sqlite3 from ${cookieDbPath}: ${detail}`);
-  }
-
-  const cookies = output.split('\n').map(s => s.trim()).filter(Boolean);
-  if (!cookies.some(c => c.startsWith('mira_session='))) {
-    throw new Error('Mira login cookie mira_session was not found. Set MIRA_COOKIE_HEADER or MIRA_SESSION, or sign in to Mira and set MIRA_COOKIE_DB.');
-  }
-  return cookies.join('; ');
 }
 
 function parseDataSources(): string[] {
