@@ -234,7 +234,13 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
   const isClosed = row.status === 'closed';
   const isStarting = row.status === 'starting';
   const canCloseNow = !isClosed && !isStarting;
-  const canOpenTerminal = row.webPort !== null && row.webPort !== undefined;
+  // Codex 2026-06-11 blocker #1: closed sessions can still carry a stale
+  // webPort (closeSession / dashboard close don't null the field), so a
+  // simple `webPort != null` check would surface a dead terminal link on
+  // the closed detail card. Gate openTerminal on status too — terminals
+  // are only meaningful on a live worker.
+  const canOpenTerminal =
+    !isClosed && row.webPort !== null && row.webPort !== undefined;
   const locateMode: LocateMode = row.scope === 'chat' ? 'openChat' : 'openTopic';
 
   const actions: SessionActionMatrix = {

@@ -600,6 +600,27 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
       expect(locateBtn.value?.origin).toBe('overview');
       expect(resumeBtn.value.origin).toBe('overview');
     });
+
+    /** Codex 2026-06-11 blocker #1 — closed sessions can carry a stale
+     *  webPort (closeSession doesn't null it). The matrix status gate AND
+     *  the buildSessionTerminalUrl status gate together guarantee the
+     *  closed detail card never advertises a Web Terminal link. */
+    it('closed status with stale webPort → terminal disabled + no multi_url (regression)', () => {
+      // Force a closed row that still carries an old webPort (real-world
+      // shape: closeSession only flips status, doesn't null the port).
+      const detail = detailFor({ sessionId: 'sess_stale', status: 'closed', webPort: 7891 });
+      // PR1 matrix must say openTerminal disabled despite the webPort.
+      expect(detail.actions.openTerminal.enabled).toBe(false);
+      const json = buildSessionsDetailCard(detail, {
+        ...baseOpts,
+        terminalUrl: 'http://host:7891', // also force a stale URL
+      });
+      const parsed = JSON.parse(json);
+      const actions = (parsed.elements as any[]).find((e: any) => e.tag === 'action').actions as any[];
+      const terminalBtn = actions[1];
+      expect(terminalBtn.disabled).toBe(true);
+      expect(terminalBtn.multi_url).toBeUndefined();
+    });
   });
 
   it('escapes title against <at> / <font> injection so user-supplied chars cannot break the wrapper', () => {
@@ -1092,6 +1113,10 @@ describe('handleSessionsCardAction', () => {
       expect(cardJson).toContain('dash_sessions_resume');
       // No close action button (it's been replaced by resume).
       expect(cardJson).not.toContain('"action":"dash_sessions_close"');
+      // Codex 2026-06-11 blocker #1: terminal must be disabled and have no
+      // multi_url on the closed synth (port cleared, status gate fires).
+      expect(cardJson).not.toContain('multi_url');
+      expect(cardJson).toContain('Web Terminal 端口');
     });
 
     it('POST 404 → toast close_failed, NO card (state preserved)', async () => {
@@ -1308,34 +1333,72 @@ describe('handleSessionsCardAction', () => {
 
   /** ─── Slice 2b: LOCATE + RESUME handler ──────────────────────────── */
   describe('action=dash_sessions_locate', () => {
-    it('happy → POST /__daemon/sessions/:id/locate, toast-only success, no card', async () => {
-      const requestSpy = vi.fn(async () => ({ status: 200, body: { ok: true }, raw: '' }));
-      const deps = {
+    /** Codex 2026-06-11 blocker #2 — locate now pre-GETs to verify scope.
+     *  Helper makes a 2-stage spy: GET returns the row, POST returns the
+     *  configured response. */
+    function makeLocateDeps(rowOver: Partial<SessionRow> & { sessionId: string }, postResp: { status: number; body: any } = { status: 200, body: { ok: true } }) {
+      const sessionRow = row({ status: 'idle', scope: 'thread', ...rowOver });
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+          return { status: 200, body: { sessions: [sessionRow] }, raw: '' };
+        }
+        if (req.method === 'POST' && req.path === `/__daemon/sessions/${sessionRow.sessionId}/locate`) {
+          return { status: postResp.status, body: postResp.body, raw: '' };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
+      return {
         createClient: vi.fn(() => ({ request: requestSpy } as any)),
         getOwnerOpenId: () => INVOKER,
         locale: 'zh' as const,
         nowMs: () => 2_000_000,
+        requestSpy,
       };
+    }
+
+    it('happy (thread-scope) → GET + POST, toast-only success, no card', async () => {
+      const deps = makeLocateDeps({ sessionId: 'sess_locate', scope: 'thread' });
       const r = await handleSessionsCardAction(
         makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER, session_id: 'sess_locate' }),
         LARK_APP_ID,
         deps as any,
       );
-      expect(requestSpy).toHaveBeenCalledOnce();
-      expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'POST', path: '/__daemon/sessions/sess_locate/locate' });
+      // 2 calls: pre-GET (scope check) + POST.
+      expect(deps.requestSpy).toHaveBeenCalledTimes(2);
+      expect(deps.requestSpy.mock.calls[0][0].method).toBe('GET');
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ method: 'POST', path: '/__daemon/sessions/sess_locate/locate' }),
+      );
       expect(r.toast?.type).toBe('success');
       expect(r.toast?.content).toContain('定位标记');
       expect(r.card).toBeUndefined();
     });
 
+    it('chat-scope crafted callback → server-side rejected, POST 0 times', async () => {
+      // Codex 2026-06-11 blocker #2: chat-scope rows render `multi_url(feishuChatLink)`,
+      // never the action callback. A hand-crafted callback against a chat-scope
+      // row must be rejected before any POST hits the daemon — otherwise the
+      // thread-locate path would fire a misleading @mention in a chat that
+      // wasn't asked for it.
+      const deps = makeLocateDeps({ sessionId: 'sess_chat', scope: 'chat' });
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER, session_id: 'sess_chat' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.type).toBe('error');
+      expect(r.toast?.content).toContain('定位失败');
+      expect(r.toast?.content).toContain('chat_scope_not_supported');
+      // Defense-in-depth: only the GET ran; no POST issued.
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls).toHaveLength(0);
+    });
+
     it('POST 429 → toast locate_failed, no card', async () => {
-      const requestSpy = vi.fn(async () => ({ status: 429, body: { error: 'cooldown' }, raw: '' }));
-      const deps = {
-        createClient: vi.fn(() => ({ request: requestSpy } as any)),
-        getOwnerOpenId: () => INVOKER,
-        locale: 'zh' as const,
-        nowMs: () => 2_000_000,
-      };
+      const deps = makeLocateDeps(
+        { sessionId: 'sess_cd', scope: 'thread' },
+        { status: 429, body: { error: 'cooldown' } },
+      );
       const r = await handleSessionsCardAction(
         makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER, session_id: 'sess_cd' }),
         LARK_APP_ID,
@@ -1348,7 +1411,11 @@ describe('handleSessionsCardAction', () => {
     });
 
     it('POST throws → toast locate_failed with reason, no card', async () => {
-      const requestSpy = vi.fn(async () => { throw new Error('econnrefused'); });
+      const sessionRow = row({ sessionId: 'sess_x', scope: 'thread' });
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET') return { status: 200, body: { sessions: [sessionRow] }, raw: '' };
+        throw new Error('econnrefused');
+      });
       const deps = {
         createClient: vi.fn(() => ({ request: requestSpy } as any)),
         getOwnerOpenId: () => INVOKER,
@@ -1380,6 +1447,24 @@ describe('handleSessionsCardAction', () => {
       );
       expect(r.toast?.content).toContain('不存在');
       expect(requestSpy).not.toHaveBeenCalled();
+    });
+
+    it('row vanished → session_not_found toast, no POST', async () => {
+      const requestSpy = vi.fn(async () => ({ status: 200, body: { sessions: [] }, raw: '' }));
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_LOCATE, invoker_open_id: INVOKER, session_id: 'sess_ghost' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.toast?.content).toContain('不存在');
+      const postCalls = requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls).toHaveLength(0);
     });
   });
 

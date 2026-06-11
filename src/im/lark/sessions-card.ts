@@ -1,26 +1,31 @@
 /**
- * Sessions list card (PR3 `/dashboard sessions` slice 1 + slice 2a).
+ * Sessions list card (PR3 `/dashboard sessions` slices 1 + 2a + 2b).
  *
  * Slice 1 — read-only list + pagination + refresh.
  * Slice 2a — per-row "📂 详情" button opens a detail card; detail card has
  *           "⏏ 关闭" (with Feishu confirm dialog) + "🔙 返回" actions.
+ * Slice 2b — detail card now matches the Web dashboard's four primary
+ *           actions: 📍 定位话题 / 🌐 终端 / (active=⏏ 关闭 OR closed=▶ 恢复)
+ *           / 🔙 返回. Locate/terminal use Feishu multi_url where possible
+ *           (chat-scope locate jumps into the group, terminal opens the
+ *           Web Terminal via PC sidebar / direct URL); close + resume go
+ *           through Route B with a server-side composeDetail matrix check.
  *
- * Detail-card pattern (codex 2026-06-09 scope-cut):
- *  - List card stays read-only beyond the "📂 详情" inline button.
- *  - All action buttons live on the detail card.
- *  - Close is the ONLY action this slice. Restart/resume/locate/terminal
- *    land in slice 2b/2c — keeping per-action callbacks scoped to one
- *    detail card avoids optimistic-state + rollback design conflated with
- *    the list itself.
- *
- * Sync close (NOT optimistic state):
- *  - The close callback awaits the Route B POST inline.
- *  - On 200 → synthesize the closed-state row in-process (snapshot from
- *    the pre-POST GET overlaid with status:'closed' + any closedAt/
- *    cliResumeCommand returned by the close endpoint), then rebuild the
- *    detail card. NO toast on success — single-pass card render.
+ * Sync write actions (close / resume):
+ *  - The callback awaits the Route B POST inline.
+ *  - On 200 → close synthesizes the closed-state row in-process (pre-POST
+ *    snapshot + status:'closed' + cleared webPort/proxyPort so the rebuilt
+ *    card never advertises a dead Web Terminal); resume issues a 2nd GET
+ *    to read the fresh status/webPort/proxyPort (fallback synth with
+ *    status:'idle' when the row vanished from the listing).
  *  - On non-200 → return ONLY a toast. We do NOT redraw the card so the
  *    user keeps their current state for retry (codex 2026-06-09).
+ *
+ * Locate (slice 2b):
+ *  - Chat-scope rows render `multi_url(feishuChatLink)` — no callback.
+ *  - Thread-scope rows render an action callback that POSTs Route B
+ *    locate (sends a @mention into the original topic); chat-scope
+ *    crafted callbacks are server-side rejected before the POST.
  *
  * Identity / security:
  *  - `invokerOpenId` is the owner's `ou_*` and is the invoker-lock anchor.
@@ -29,10 +34,13 @@
  *  - `value.session_id` is read but NEVER trusted for identity — only used
  *    as the routing key. The owner gate is the only authority. The Route B
  *    upstream further enforces `ownerOf(sessionId)` scope.
+ *  - close + resume re-run the PR1 composeDetail matrix against the
+ *    pre-POST snapshot and fail-closed if the action is not enabled there
+ *    — keeps client paint and server enforce in lock-step.
  *
  * Response shape mirrors `/dashboard settings` slice 3: success path returns
- * ONLY `{ card }` (no toast) so Lark renders the card in a single pass
- * (toast + card would trigger a two-pass render and flash the stale list).
+ * ONLY `{ card }` (no toast for close/resume) so Lark renders the card in a
+ * single pass. Locate returns a toast-only result (no card change).
  */
 
 import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
@@ -612,8 +620,14 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
 /** Slice 2b — compute the Web Terminal URL for a SessionRow. Mirrors
  *  `src/dashboard/web/sessions.ts:terminalHref`: proxy port wins (with the
  *  `/s/{sessionId}` suffix); otherwise direct worker port. Returns null when
- *  the session has no port at all (e.g. closed / starting). */
+ *  the session has no port at all (e.g. closed / starting).
+ *
+ *  Codex 2026-06-11 defense-in-depth: closed sessions can carry a stale
+ *  webPort (the daemon's closeSession doesn't null it). Even if the matrix
+ *  check passes upstream, this helper hard-rejects closed rows so a
+ *  fence-line build can never advertise a dead URL. */
 export function buildSessionTerminalUrl(row: SessionRow): string | null {
+  if (row.status === 'closed') return null;
   const host = config.web.externalHost;
   if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
     return `http://${host}:${row.proxyPort}/s/${encodeURIComponent(row.sessionId)}`;
@@ -838,10 +852,18 @@ export async function handleSessionsCardAction(
         : (typeof body.closedAt === 'string' && Number.isFinite(Date.parse(body.closedAt))
             ? Date.parse(body.closedAt)
             : (before.closedAt ?? now()));
+    // Codex 2026-06-11 blocker #1: clear port fields on the synth so the
+    // closed-state detail card never advertises a dead Web Terminal URL
+    // (the daemon's closeSession doesn't null webPort itself, so a synth
+    // that re-uses pre-POST values would carry stale ports). The
+    // composeDetail status gate already prevents the matrix from enabling
+    // openTerminal on closed rows; this is defense in depth.
     const synth: SessionRow = {
       ...before,
       status: 'closed',
       closedAt: synthClosedAt,
+      webPort: null,
+      proxyPort: undefined,
     };
     const detail = composeDetail(synth, now());
     const cardJson = buildSessionsDetailCard(detail, {
@@ -856,15 +878,38 @@ export async function handleSessionsCardAction(
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3b2) LOCATE (thread-scope) — POST + toast-only ─────────────────
-  // chat-scope locate uses multi_url in the builder and never hits this
-  // callback. Sync block: await POST → success toast (or error toast on
-  // non-200 / network throw). Card is NEVER redrawn — UX matches the Web
-  // dashboard's "fire a locate notification" behavior.
+  // ─── 3b2) LOCATE — POST + toast-only (thread-scope only) ────────────
+  // Sync block: await POST → success toast (or error toast on non-200 /
+  // network throw). Card is NEVER redrawn — UX matches the Web dashboard's
+  // "fire a locate notification" behavior.
+  //
+  // Codex 2026-06-11 blocker #2: chat-scope sessions should NEVER hit this
+  // POST path. The builder uses `multi_url(feishuChatLink)` for chat-scope
+  // and only emits `dash_sessions_locate` for thread-scope; but a hand-
+  // crafted / replayed callback could still target a chat-scope row. We
+  // pre-GET + re-run composeDetail and reject when locateMode==='openChat'
+  // (the user already has a button that jumps into the chat directly —
+  // pinging a thread message would be misleading).
   if (action === SESSIONS_ACTION_LOCATE) {
     const sessionId = value.session_id;
     if (typeof sessionId !== 'string' || !sessionId) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
+    }
+    const pre = await safeGetSessionsList(client, locale);
+    if ('errorResult' in pre) return pre.errorResult;
+    const row = pre.rows.find(s => s.sessionId === sessionId);
+    if (!row) {
+      return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
+    }
+    const beforeDetail = composeDetail(row, now());
+    if (beforeDetail.actions.locateMode !== 'openTopic') {
+      // chat-scope: refuse to POST. Surface a locate_failed with an
+      // explicit reason so the test can pin the gate behavior.
+      return errorToast(
+        'card.dashboard.sessions.locate_failed',
+        { reason: 'chat_scope_not_supported' },
+        locale,
+      );
     }
     let resp: Awaited<ReturnType<DaemonClient['request']>>;
     try {
