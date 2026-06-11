@@ -10,11 +10,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
+import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTranscript,
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
+  trailingAssistantText,
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
@@ -1290,5 +1292,107 @@ describe('splitTranscriptEventsByCutoff', () => {
     );
     expect(history).toEqual([]);
     expect(live).toEqual([boundaryLarkEvent]);
+  });
+});
+
+// ─── trailingAssistantText：误兜底回归（PR#174 material-longer 闸 × 整轮拼接） ──
+//
+// 2026-06-11 现场：一个长工作轮（多次 tool_use、13 段过程旁白）结束时模型已
+// 显式 `botmux send`（窗口内最大 contentLength=749），但 joinAssistantText 把
+// 整轮旁白拼成 normalized 1530 当 finalText，material-longer 闸（≥2× 且 +120）
+// 判「未被覆盖」放行兜底，把整轮旁白拼贴发进了群。
+// 修复：非 adopt 的兜底 final 改取「最后一次 tool_use 之后的尾部 assistant
+// 文本」= 真正的收尾回答（该现场 normalized 903 < 749×2 → 正确抑制）。
+describe('trailingAssistantText', () => {
+  const aText = (uuid: string, text: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'text', text }] },
+  });
+  const aTool = (uuid: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'tool_use', id: `tu-${uuid}`, name: 'Bash', input: {} } as any] },
+  });
+  const aThinking = (uuid: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'hmm' } as any] },
+  });
+  const toolResult = (uuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x' } as any] },
+  });
+  const metaLine = (type: string): TranscriptEvent => ({ type } as TranscriptEvent);
+
+  it('pure-text turn (no tool_use): identical to joinAssistantText', () => {
+    const events = [aText('a1', 'first'), aText('a2', 'second')];
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe('first\n\nsecond');
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe(joinAssistantText(events));
+  });
+
+  it('narration + tool_use + final: returns ONLY the text after the last tool_use', () => {
+    const events = [
+      aText('a1', '旁白：我先看看代码。'),
+      aTool('t1'), toolResult('r1'),
+      aText('a2', '旁白：红了，10 个失败。'),
+      aTool('t2'), toolResult('r2'),
+      aText('a3', '修复完成，PR 已开。'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2', 'a3'])).toBe('修复完成，PR 已开。');
+  });
+
+  it('multi-segment final after the last tool_use is fully collected', () => {
+    const events = [
+      aTool('t1'), toolResult('r1'),
+      aText('a1', '结论第一段。'),
+      aText('a2', '结论第二段。'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe('结论第一段。\n\n结论第二段。');
+  });
+
+  it('thinking lines and non-message meta lines inside the tail are crossed, not boundaries', () => {
+    const events = [
+      aText('a1', '旁白'),
+      aTool('t1'), toolResult('r1'),
+      aText('a2', '收尾上半'),
+      aThinking('th1'),
+      metaLine('last-prompt'), metaLine('ai-title'),
+      aText('a3', '收尾下半'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2', 'a3'])).toBe('收尾上半\n\n收尾下半');
+  });
+
+  it('turn ending in a tool_use (no final text): returns empty — nothing to fall back with', () => {
+    const events = [aText('a1', '旁白'), aTool('t1'), toolResult('r1')];
+    expect(trailingAssistantText(events, ['a1'])).toBe('');
+  });
+
+  it('only collects uuids belonging to THIS turn (a previous turn final right before is not swept in)', () => {
+    const events = [
+      aText('prev', '上一轮的收尾。'),
+      aText('a1', '本轮收尾。'),
+    ];
+    expect(trailingAssistantText(events, ['a1'])).toBe('本轮收尾。');
+  });
+
+  it('field replay of the 2026-06-11 leak: gate passes the joined narration (bug) but suppresses the trailing final (fix)', () => {
+    // 形状还原：旁白若干段 + 多次工具调用 + 精炼收尾；窗口内已有
+    // contentLength=749 的显式 send marker。
+    const narration = Array.from({ length: 12 }, (_, i) => `过程旁白第 ${i} 段：`.padEnd(60, '细'));
+    const finalText = '最终收尾回答：'.padEnd(900, '答');
+    const events: TranscriptEvent[] = [];
+    const uuids: string[] = [];
+    narration.forEach((t, i) => {
+      events.push(aText(`n${i}`, t), aTool(`t${i}`), toolResult(`r${i}`));
+      uuids.push(`n${i}`);
+    });
+    events.push(aText('final', finalText));
+    uuids.push('final');
+
+    const markers = [{ sentAtMs: 5_000, contentLength: 749 }];
+    const turnBase = { markTimeMs: 1_000, isLocal: false };
+
+    const joined = joinAssistantText(events);
+    const trailing = trailingAssistantText(events, uuids);
+    expect(trailing).toBe(finalText);
+
+    // 旧行为：整轮拼接远超 749×2 → 闸放行 → 误兜底（这就是回归本体）
+    expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: joined }, undefined, markers, false)).toBe(false);
+    // 新行为：尾段 900 < 749×2 → 抑制 ✓
+    expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: trailing }, undefined, markers, false)).toBe(true);
   });
 });

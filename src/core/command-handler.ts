@@ -11,6 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
+import { createRepoWorktree } from '../services/git-worktree.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -73,21 +74,47 @@ export const PASSTHROUGH_COMMANDS = new Set([
   '/btw',
 ]);
 
+function normalizePassthroughCommand(cmd: unknown): string | null {
+  if (typeof cmd !== 'string') return null;
+  const normalized = cmd.trim().toLowerCase();
+  if (!/^\/[a-z0-9][a-z0-9:_-]*$/.test(normalized)) return null;
+  if (DAEMON_COMMANDS.has(normalized)) return null;
+  return normalized;
+}
+
+export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
+  if (!larkAppId) return [];
+  try {
+    const bot = getBot(larkAppId);
+    const adapter = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride);
+    const normalized = (adapter.defaultPassthroughCommands ?? [])
+      .map(normalizePassthroughCommand)
+      .filter((c): c is string => !!c);
+    return [...new Set(normalized)];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Effective passthrough set for a bot: the fixed {@link PASSTHROUGH_COMMANDS}
- * plus the bot's `customPassthroughCommands` (bots.json). Entries that would
- * shadow a botmux daemon command are dropped — daemon commands must keep their
- * daemon semantics, and passthrough is checked BEFORE DAEMON_COMMANDS in the
- * router, so an un-filtered custom `/status` would hijack the daemon's own.
+ * plus adapter-scoped defaults and the bot's `customPassthroughCommands`
+ * (bots.json). Entries that would shadow a botmux daemon command are dropped —
+ * daemon commands must keep their daemon semantics, and passthrough is checked
+ * BEFORE DAEMON_COMMANDS in the router, so an un-filtered custom `/status`
+ * would hijack the daemon's own.
  * Unknown / no bot → falls back to the builtin set unchanged.
  */
 export function resolvePassthroughCommands(larkAppId?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
+  for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId)) {
+    effective.add(c);
+  }
   try {
     for (const c of getBot(larkAppId).config.customPassthroughCommands ?? []) {
-      if (DAEMON_COMMANDS.has(c)) continue; // never shadow a daemon command
-      effective.add(c);
+      const normalized = normalizePassthroughCommand(c);
+      if (normalized) effective.add(normalized);
     }
   } catch {
     /* unknown bot — builtin set only */
@@ -290,7 +317,7 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 
 export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
 }
@@ -850,8 +877,12 @@ export async function handleCommand(
   larkAppId?: string,
 ): Promise<void> {
   const { activeSessions, getActiveCount, lastRepoScan } = deps;
+  // Command replies carry the triggering messageId as the turnId so a shared
+  // (chat-scope) session triggered from inside a Lark thread anchors them into
+  // that thread (resolveSessionReplyTarget turnId gate) instead of leaking a
+  // plain top-level message.
   const sessionReply = (rid: string, content: string, msgType?: string) =>
-    deps.sessionReply(rid, content, msgType, larkAppId);
+    deps.sessionReply(rid, content, msgType, larkAppId, message.messageId);
   const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
   const logTag = ds ? tag(ds) : rootId.substring(0, 12);
   const loc: Locale = localeForBot(ds?.larkAppId ?? larkAppId);
@@ -1018,9 +1049,11 @@ export async function handleCommand(
         const forkPendingCli = async (replyText: string) => {
           const selfBot = getBot(ds!.larkAppId);
           const botCfg = selfBot.config;
+          const commitGenSessionId = ds!.session.sessionId;
           ds!.pendingRepo = false;
           publishAttentionPatch(ds!);
           const pendingPrompt = ds!.pendingPrompt ?? '';
+          const pendingRawInput = ds!.pendingRawInput;
           // Was there an actual buffered user message to deliver? A session
           // launched *via* `/repo` (the command itself is the first message) has
           // none — so boot the CLI idle and let the user's NEXT message be the
@@ -1029,7 +1062,34 @@ export async function handleCommand(
             pendingPrompt.trim().length > 0 ||
             (ds!.pendingAttachments?.length ?? 0) > 0 ||
             (ds!.pendingFollowUps?.length ?? 0) > 0;
-          if (hasBufferedInput) {
+          if (pendingRawInput) {
+            // Messages buffered while the repo card was pending must not be
+            // dropped: wrap them now (full prompt-building context lives here)
+            // and stash for delivery right after the raw input on prompt_ready.
+            if (hasBufferedInput) {
+              const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+              const followUpPrompt = buildNewTopicPrompt(
+                pendingPrompt,
+                ds!.session.sessionId,
+                botCfg.cliId,
+                botCfg.cliPathOverride,
+                ds!.pendingAttachments,
+                ds!.pendingMentions,
+                await getAvailableBots(ds!.larkAppId, ds!.chatId),
+                ds!.pendingFollowUps,
+                { name: selfBot.botName, openId: selfBot.botOpenId },
+                loc,
+                ds!.pendingSender,
+                { larkAppId, chatId: ds!.chatId },
+              );
+              ds!.pendingFollowUpInput = {
+                userPrompt: pendingPrompt || (ds!.pendingFollowUps?.join('\n\n') ?? ''),
+                cliInput: followUpPrompt,
+              };
+            }
+            rememberLastCliInput(ds!, pendingRawInput, pendingRawInput);
+            forkWorker(ds!, '', false);
+          } else if (hasBufferedInput) {
             const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
             const prompt = buildNewTopicPrompt(
               pendingPrompt,
@@ -1045,6 +1105,15 @@ export async function handleCommand(
               ds!.pendingSender,
               { larkAppId, chatId: ds!.chatId },
             );
+            // Last-line defence: prompt prep awaited above — if anything
+            // replaced OR closed the session in that window (`/close` deletes
+            // the active-map entry without touching sessionId), forking now
+            // would clobber it or resurrect a closed session.
+            const stillActive = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds;
+            if (!stillActive || ds!.session.sessionId !== commitGenSessionId) {
+              logger.warn(`[${logTag}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds!.session.sessionId}, active=${stillActive}) — aborting this fork`);
+              return;
+            }
             rememberLastCliInput(ds!, pendingPrompt, prompt);
             forkWorker(ds!, prompt);
           } else {
@@ -1091,6 +1160,106 @@ export async function handleCommand(
           }
           logger.info(`[${logTag}] Repo selected via ${how}: ${selectedPath}`);
         };
+
+        // `/repo wt <N|name|path> [branch]` → create a worktree off the repo's
+        // remote default branch and open THAT as the session repo. Without a
+        // branch arg the branch/dir are auto-named (wt/N, <repo>-wt-N).
+        if (ds && /^wt(\s|$)/i.test(repoArg)) {
+          const rest = repoArg.replace(/^wt\s*/i, '').trim().split(/\s+/).filter(Boolean);
+          if (rest.length < 1 || rest.length > 2) {
+            await sessionReply(rootId, t('cmd.repo.worktree_usage', undefined, loc));
+            break;
+          }
+          const [targetArg, branchArg] = rest;
+          let repoPath: string;
+          if (/^\d+$/.test(targetArg!)) {
+            const cached = lastRepoScan.get(ds.chatId);
+            if (!cached || cached.length === 0) {
+              await sessionReply(rootId, t('cmd.repo.no_prior_scan', undefined, loc));
+              break;
+            }
+            const repoIndex = parseInt(targetArg!, 10);
+            if (repoIndex < 1 || repoIndex > cached.length) {
+              await sessionReply(rootId, t('cmd.repo.index_out_of_range', { max: cached.length }, loc));
+              break;
+            }
+            repoPath = cached[repoIndex - 1]!.path;
+          } else {
+            const resolved = resolveRepoSelection(targetArg!, getProjectScanDirs(ds));
+            if (!resolved) {
+              await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: targetArg! }, loc));
+              break;
+            }
+            repoPath = resolved.path;
+          }
+          if (ds.worktreeCreating) {
+            await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
+            break;
+          }
+          ds.worktreeCreating = true;
+          // Session generation snapshot — another selection can land while the
+          // (awaited) git fetch runs; committing afterwards would kill the
+          // session it just spawned. Mirror of the card-side guard.
+          const startSessionId = ds.session.sessionId;
+          const wasPending = !!ds.pendingRepo;
+          // Identity against the active map catches `/close` (which deletes
+          // the entry without touching sessionId/pendingRepo) alongside the
+          // generation snapshots.
+          const wtSessionChanged = () =>
+            activeSessions.get(sessionKey(rootId, larkAppId!)) !== ds ||
+            ds!.session.sessionId !== startSessionId || !!ds!.pendingRepo !== wasPending;
+          // Hold the in-flight lock through commit (matching the card path) —
+          // releasing it right after `git` would let a second `/repo wt` start
+          // while this one is still replying/committing.
+          try {
+            await sessionReply(rootId, t('cmd.repo.worktree_creating', { repo: repoPath }, loc));
+            let creation;
+            try {
+              creation = await createRepoWorktree(repoPath, { branch: branchArg });
+            } catch (e) {
+              await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, loc));
+              break;
+            }
+            if (wtSessionChanged()) {
+              logger.info(`[${logTag}] Worktree ${creation.path} created but session changed mid-flight — not switching`);
+              await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, loc));
+              break;
+            }
+            await sessionReply(rootId, t('cmd.repo.worktree_created', {
+              path: creation.path, branch: creation.branch, base: creation.baseRef,
+            }, loc));
+            // The reply above awaited a Lark round-trip — a plain selection
+            // (not gated by worktreeCreating) can land in that window. Re-check
+            // right before committing. Mirror of the card-side double guard.
+            if (wtSessionChanged()) {
+              logger.info(`[${logTag}] Worktree ${creation.path} created but session changed during reply — not switching`);
+              await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, loc));
+              break;
+            }
+            try {
+              await commitRepoSelection(creation.path, `${basename(creation.path)} (${creation.branch})`, `/repo wt`);
+            } catch (e) {
+              // The worktree DOES exist — only the switch failed. Don't report
+              // it as a creation failure, or a retry trips over "already exists".
+              logger.warn(`[${logTag}] Worktree ${creation.path} created but switching failed: ${e instanceof Error ? e.message : e}`);
+              await sessionReply(rootId, t('cmd.repo.worktree_switch_failed', { path: creation.path, error: e instanceof Error ? e.message : String(e) }, loc));
+            }
+          } finally {
+            ds.worktreeCreating = false;
+          }
+          break;
+        }
+
+        // Plain selections are blocked while a worktree creation/commit is in
+        // flight: the worktree commit awaits (Lark replies, prompt prep) after
+        // its generation checks, and a plain selection interleaving there
+        // would double-fork. One lock gates both kinds until the commit
+        // settles. (Bare `/repo` without pending only posts the picker card —
+        // harmless, so it stays open.)
+        if (ds?.worktreeCreating && (repoArg || ds.pendingRepo)) {
+          await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
+          break;
+        }
 
         // Numeric arg → pick by 1-based index from the last scan.
         if (repoArg && ds && /^\d+$/.test(repoArg)) {
@@ -2074,10 +2243,11 @@ export async function handleCommand(
 
       case '/list-slash-command':
       case '/slash': {
-        // 列出本 bot 当前可用的 slash 命令，分三段：
+        // 列出本 bot 当前可用的 slash 命令，分四段：
         //   ① botmux 固定放行的透传白名单（PASSTHROUGH_COMMANDS）
-        //   ② 用户在 bots.json 自定义配置的额外透传命令（customPassthroughCommands）
-        //   ③ 文件系统自动发现的 CLI 自定义命令 / skill / 插件
+        //   ② 当前 CLI adapter 默认透传命令（defaultPassthroughCommands）
+        //   ③ 用户在 bots.json 自定义配置的额外透传命令（customPassthroughCommands）
+        //   ④ 文件系统自动发现的 CLI 自定义命令 / skill / 插件
         // MCP 的 /mcp__<server>__<prompt> 需运行时握手才能枚举，这里仅按 .mcp.json 提示 server 名。
         const botCfg = ds
           ? getBot(ds.larkAppId).config
@@ -2086,6 +2256,7 @@ export async function handleCommand(
         const cliName = getCliDisplayName(cliId);
         const workingDir = getSessionWorkingDir(ds);
         const builtin = [...PASSTHROUGH_COMMANDS];
+        const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
         const custom = botCfg?.customPassthroughCommands ?? [];
         let cliAdapter;
         try {
@@ -2100,7 +2271,7 @@ export async function handleCommand(
         const mcpServers = listMcpServerNames(workingDir);
 
         const card = buildSlashListCard(
-          { cliName, builtin, custom, discovered, workingDir, mcpServers, discoverySupported },
+          { cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
           loc,
         );
         await sessionReply(rootId, card, 'interactive');
@@ -2119,6 +2290,7 @@ export async function handleCommand(
           t('help.repo_list', undefined, loc),
           t('help.repo_n', undefined, loc),
           t('help.repo_path', undefined, loc),
+          t('help.repo_wt', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),

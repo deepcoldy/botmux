@@ -123,6 +123,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
+    authPaths: ['~/.codex/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
@@ -236,6 +237,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    defaultPassthroughCommands: ['/goal'],
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an

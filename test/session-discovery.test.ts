@@ -656,6 +656,68 @@ describe('discoverAdoptableSessions', () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.sessionId).toBeUndefined();
   });
+
+  // ── TRAE (traex) /proc/<pid>/fd-based session discovery ─────────────────
+  // TRAE is a Codex-family CLI: it holds its rollout JSONL fd open for the
+  // session lifetime, so the pid → rollout probe mirrors Codex but matches
+  // the ~/.trae/cli/sessions layout.
+
+  it('detects a TRAE (traex) CLI process and captures sessionId from the open rollout fd', () => {
+    setupMocks({
+      paneLines: 'work:0.0 9000\n',
+      commMap: { 9000: 'bash', 9001: 'traex' },
+      childMap: { 9000: [9001] },
+      cwdMap: { 9001: '/workspace/proj' },
+      dimsMap: { 'work:0.0': '120 30' },
+      procFdMap: {
+        9001: [
+          '/dev/null',
+          '/home/testuser/.trae/cli/sessions/2026/06/11/rollout-2026-06-11T10-00-00-8db7d911-96f3-4764-a310-e42ae4cb626f.jsonl',
+        ],
+      },
+    });
+
+    const results = discoverAdoptableSessions();
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('traex');
+    expect(results[0]!.cwd).toBe('/workspace/proj');
+    expect(results[0]!.sessionId).toBe('8db7d911-96f3-4764-a310-e42ae4cb626f');
+  });
+
+  it('returns traex discovery without sessionId when no rollout fd is open', () => {
+    setupMocks({
+      paneLines: 'work:0.0 9100\n',
+      commMap: { 9100: 'bash', 9101: 'traex' },
+      childMap: { 9100: [9101] },
+      cwdMap: { 9101: '/workspace/proj' },
+      dimsMap: { 'work:0.0': '120 30' },
+      procFdMap: {
+        9101: ['/dev/null', '/tmp/somefile.log'],
+      },
+    });
+
+    const results = discoverAdoptableSessions();
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('traex');
+    expect(results[0]!.sessionId).toBeUndefined();
+  });
+
+  it('filters to traex sessions only when a TRAE bot adopts', () => {
+    setupMocks({
+      paneLines: 'work:0.0 9200\nwork:0.1 9300\n',
+      commMap: { 9200: 'traex', 9300: 'codex' },
+      cwdMap: { 9200: '/workspace/trae-proj', 9300: '/workspace/codex-proj' },
+      dimsMap: { 'work:0.0': '120 30', 'work:0.1': '120 30' },
+    });
+
+    const results = discoverAdoptableSessions('traex' as CliId);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('traex');
+    expect(results[0]!.cwd).toBe('/workspace/trae-proj');
+  });
 });
 
 describe('validateAdoptTarget', () => {

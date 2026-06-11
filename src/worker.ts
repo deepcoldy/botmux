@@ -14,8 +14,9 @@
  */
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
+import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { isAbsolute, join } from 'node:path';
-import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
@@ -93,6 +94,26 @@ let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
 let sandboxCleanup: (() => void) | null = null;      // unmount overlays + rm the per-session sandbox tree
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
+/** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
+ *  the SECONDARY guard so an adapter whose checkResumeTargetExists misses
+ *  (returns undefined) or whose resume target vanishes between the check and
+ *  spawn never crash-loops: 2nd consecutive restart → drop resume semantics,
+ *  spawn fresh. Reset to 0 whenever spawnCli proceeds with a successful
+ *  (non-forced) config, so healthy restarts (e.g. user `/restart`) are
+ *  unaffected. */
+let consecutiveInWorkerRestarts = 0;
+/** Guard: user_notify for "resume → fresh fallback" is sent once per worker
+ *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
+ *  of the same warning. */
+let resumeFallbackNotified = false;
+/** The effectiveResume flag used by the most recent spawnCli call. Written
+ *  immediately after the two-tier fallback check so late-attach timers
+ *  (hermes, cursor, etc.) can read THE SAME semantics the spawn used,
+ *  instead of re-deriving from lastInitConfig.resume (which never reflects
+ *  Tier-1/Tier-2 fresh demotion). Updated in spawnCli BEFORE any bridge
+ *  setup so even the tick that fires between spawnCli-start and the
+ *  adapter's hermesBridgeAttach reads the correct mode. */
+let lastSpawnEffectiveResume = false;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
@@ -119,7 +140,9 @@ let zellijAttachCfgPath: string | null = null;
 function ensureZellijAttachConfig(): string {
   if (zellijAttachCfgPath) return zellijAttachCfgPath;
   const p = join(process.env.SESSION_DATA_DIR ?? '/tmp', '.zellij-web-attach.kdl');
-  try { writeFileSync(p, ZELLIJ_CONFIG_KDL); } catch { /* best effort */ }
+  // 原子写：同一 data dir 下多个 worker 进程会写同一路径（内容相同），
+  // 裸写并发互踩会让 attach 客户端读到半截 kdl。
+  try { atomicWriteFileSync(p, ZELLIJ_CONFIG_KDL); } catch { /* best effort */ }
   zellijAttachCfgPath = p;
   return p;
 }
@@ -164,7 +187,8 @@ let currentBotmuxTurnId: string | undefined;
 function writeCliPidMarker(): void {
   if (!cliPidMarker || !sessionId) return;
   try {
-    writeFileSync(cliPidMarker, JSON.stringify({ sessionId, turnId: currentBotmuxTurnId ?? null }));
+    // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
+    atomicWriteFileSync(cliPidMarker, JSON.stringify({ sessionId, turnId: currentBotmuxTurnId ?? null }));
   } catch (err: any) {
     log(`Failed to update CLI PID marker: ${err?.message ?? err}`);
   }
@@ -1377,7 +1401,13 @@ function emitReadyTurns(): void {
     }
     const set = new Set(turn.assistantUuids);
     const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));
-    const assistantText = joinAssistantText(matched);
+    // Non-adopt fallback posts the turn's FINAL answer (text after the last
+    // tool_use), not the whole-turn narration collage — joining every interim
+    // block both reads as noise in Lark and inflates finalText past the
+    // material-longer gate, re-posting turns the model already `botmux send`ed.
+    // Adopt keeps the full join: transcript drain is that mode's only channel,
+    // so interim narration is the user's only window into the turn.
+    const assistantText = adoptMode ? joinAssistantText(matched) : trailingAssistantText(drained.events, turn.assistantUuids);
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
@@ -1506,7 +1536,11 @@ function codexBridgeStartTimer(): void {
   codexBridgeTimer = setInterval(() => {
     try {
       if (structuredBridgeIsHermes()) {
-        if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastInitConfig?.resume ? 'baseline-existing' : 'fresh-empty');
+        // Use lastSpawnEffectiveResume (written by spawnCli AFTER the
+        // two-tier fallback), NOT lastInitConfig.resume. Otherwise a
+        // Tier-1/Tier-2 demotion to fresh would still baseline the empty
+        // hermes store as "existing" and swallow the first turn.
+        if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty');
         hermesBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
@@ -2675,6 +2709,13 @@ function markPromptReady(): void {
     return;
   }
   isPromptReady = true;
+  // CLI 实际启动成功（回到 prompt）：复位连续重启计数。
+  // 任何能到这一步的 spawn 都算"成功"——后续即便再崩溃（不是 resume 目标不存在
+  // 的问题），下一轮也该有新的 2 次重试预算，而不是被历史重启计数卡住。
+  if (consecutiveInWorkerRestarts > 0) {
+    log(`CLI reached prompt successfully — resetting consecutive restart count (was ${consecutiveInWorkerRestarts})`);
+    consecutiveInWorkerRestarts = 0;
+  }
   // CLI is back at its prompt — every previously written input has been
   // consumed, so nothing is in flight anymore. A later crash must not
   // replay these.
@@ -3381,16 +3422,86 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log(`[sandbox] redirecting Claude bridge dataDir → overlay upper: ${redirected}`);
     claudeDataDir = redirected;
   }
-  if (claudeDataDir) {
-    (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
-      claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir, claudeDataDir);
+  // ── Resume pre-flight check + two-tier fallback ──────────────────────────
+  // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
+  // → skip --resume, spawn FRESH.
+  // Tier 2 (restart count): 2nd consecutive in-worker restart → force FRESH,
+  // regardless of probe result. This covers adapters without a probe AND
+  // probe/spawn races (target vanishes between the check and spawn).
+  //
+  // Supersedes the claude-family-only inline probe (PR #189) with a
+  // general adapter-owned check (cleaner boundary) + a numeric safety net.
+  //
+  // User impact: losing context is better than a 4× daemon-side crash loop
+  // that leaves the bot stuck in "crashed N times" state until the human
+  // re-closes the session.
+  let effectiveResume = cfg.resume ?? false;
+  let effectiveCliSessionId = cfg.cliSessionId;
+  let effectiveAdapterSessionId = adapterSessionId;
+  const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
+  let tier1ProbeFalse = false;
+  if (effectiveResume && !tier2ForceFresh) {
+    const probe = cliAdapter.checkResumeTargetExists?.({
+      sessionId: effectiveAdapterSessionId,
+      cliSessionId: effectiveCliSessionId,
+      workingDir: cfg.workingDir,
+      dataDir: claudeDataDir,
+    });
+    if (probe === false) tier1ProbeFalse = true;
   }
+  const fallBackToFresh = effectiveResume && (tier1ProbeFalse || tier2ForceFresh);
+  if (fallBackToFresh) {
+    const reason = tier2ForceFresh
+      ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
+      : 'adapter confirmed resume target does not exist on disk';
+    log(`Resume fallback: dropping --resume (${reason}) → fresh session ${cfg.sessionId}`);
+    effectiveResume = false;
+    effectiveCliSessionId = undefined;
+    effectiveAdapterSessionId = cfg.sessionId;
+    // Recompute the claude-family JSONL path: it now targets the FRESH
+    // sessionId (fresh spawn creates <newSid>.jsonl, not the old one).
+    if (claudeDataDir) {
+      (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
+        claudeJsonlPathForSession(effectiveAdapterSessionId, cfg.workingDir, claudeDataDir);
+    }
+    // Single human-visible warning. Spam guard: at most once per worker
+    // lifecycle (a 4× crash loop otherwise duplicates the notice).
+    if (!resumeFallbackNotified) {
+      resumeFallbackNotified = true;
+      send({
+        type: 'user_notify',
+        turnId: currentBotmuxTurnId,
+        message:
+          `⚠️  历史会话（${(cfg.cliSessionId ?? cfg.originalSessionId ?? cfg.sessionId).substring(0, 16)}…）` +
+          `无法恢复，已为你**新起一个干净会话**（原因：${reason}）。\n` +
+          `之前的上下文不会带到本轮，需要的话请简述背景。`,
+      });
+    }
+    // Reset the counter so the fresh spawn gets a clean 2-attempt budget in
+    // case IT crashes later for an unrelated reason.
+    consecutiveInWorkerRestarts = 0;
+  } else if (claudeDataDir) {
+    // Watch where the spawned CLI will actually write: the resumed conversation
+    // when resuming, else the fresh session id (a stale cliSessionId would point
+    // the bridge at the gone jsonl).
+    const bridgeWatchId = effectiveResume
+      ? (effectiveCliSessionId ?? effectiveAdapterSessionId)
+      : effectiveAdapterSessionId;
+    (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
+      claudeJsonlPathForSession(bridgeWatchId, cfg.workingDir, claudeDataDir);
+  }
+  // Publish the resolved resume semantics so any late-attach timer (hermes,
+  // cursor, …) driven by codexBridgeStartTimer sees the SAME mode the spawn
+  // used. Without this, Tier-1/Tier-2 fresh demotion would still use
+  // `lastInitConfig.resume` (= true) and baseline an empty store, swallowing
+  // the fresh session's first turn.
+  lastSpawnEffectiveResume = effectiveResume;
 
   const args = cliAdapter.buildArgs({
-    sessionId: adapterSessionId,
-    resume: cfg.resume ?? false,
+    sessionId: effectiveAdapterSessionId,
+    resume: effectiveResume,
     workingDir: cfg.workingDir,
-    resumeSessionId: cfg.cliSessionId,
+    resumeSessionId: effectiveCliSessionId,
     initialPrompt: cfg.prompt || undefined,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
@@ -3567,6 +3678,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           cliBin: cliAdapter.resolvedBin,
           cliArgs: args,
           hidePaths: cfg.sandboxHidePaths ?? [],
+          authPaths: cliAdapter.authPaths,
         });
         if (sbx) {
           spawnBin = sbx.bin;
@@ -3666,9 +3778,6 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     setTimeout(resolveCliPidLate, 120);
   }
 
-  // On tmux re-attach, keep awaitingFirstPrompt = true so screen updates are
-  // suppressed until the idle detector fires markNewTurn() — this prevents the
-  // full tmux scrollback history from leaking into the streaming card.
   // Bridge fallback: claude-code only. Tail Claude's transcript JSONL so a
   // turn the model finishes WITHOUT calling `botmux send` still gets its
   // assistant text forwarded to Lark (the gate in emitReadyTurns suppresses
@@ -3677,13 +3786,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the file Claude creates on first submit isn't absorbed as history,
   // and baseline-existing on resume so prior-run turns ARE absorbed (we
   // don't want to re-emit yesterday's conversation as fresh turns).
-  if (claudeDataDir && adapterSessionId) {
-    const claudeBridgeSessionId = cfg.cliSessionId ?? adapterSessionId;
+  //
+  // NOTE: use effectiveResume / effectiveAdapterSessionId / effectiveCliSessionId
+  // here, NOT cfg.* — the two-tier fallback above may have flipped
+  // resume → FRESH, in which case the baseline mode and session id MUST
+  // follow the flip. The same variables also cover Tier-2 (count-based)
+  // fallbacks that fire for non-Claude CLIs (below).
+  if (claudeDataDir && effectiveAdapterSessionId) {
+    const claudeBridgeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
     const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir, claudeDataDir);
     startBridgeWatcher(claudeJsonl, {
       cliPid: cliPid ?? undefined,
       cliCwd: cfg.workingDir,
-      mode: cfg.resume ? 'baseline-existing' : 'fresh-empty',
+      mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: claudeDataDir,
     });
   }
@@ -3694,15 +3809,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // discovered after the first submit; CoCo's events path is deterministic
   // from botmux sessionId. Hermes and MTR use SQLite stores, so baseline the
   // relevant cursor at spawn and poll for rows after each queued prompt flushes.
+  //
+  // Mode uses effectiveResume: when the resume probe flipped us to FRESH, we
+  // must NOT baseline the "restored" cursor against an empty / absent store
+  // (would otherwise swallow the fresh session's first turn).
   if (cfg.cliId === 'hermes') {
-    hermesBridgeAttach(cfg.resume ? 'baseline-existing' : 'fresh-empty');
+    hermesBridgeAttach(effectiveResume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
-    if (cfg.cliSessionId) {
-      const rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
+    if (effectiveCliSessionId) {
+      const rolloutPath = findCodexRolloutBySessionId(effectiveCliSessionId);
       if (rolloutPath) {
         codexBridgeAttach(rolloutPath, 'baseline-existing');
       } else {
-        codexBridgePendingSessionId = cfg.cliSessionId;
+        codexBridgePendingSessionId = effectiveCliSessionId;
         codexBridgeStartTimer();
       }
     } else {
@@ -3713,27 +3832,27 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // spawn (no cliSessionId yet) we just arm the poller; writeInput will
     // surface the cliSessionId on the first successful submit and trigger
     // codexBridgeNotifyCliSessionId → rollout attach.
-    if (cfg.cliSessionId) {
-      const rolloutPath = findTraexRolloutBySessionId(cfg.cliSessionId);
+    if (effectiveCliSessionId) {
+      const rolloutPath = findTraexRolloutBySessionId(effectiveCliSessionId);
       if (rolloutPath) {
         codexBridgeAttach(rolloutPath, 'baseline-existing');
       } else {
-        codexBridgePendingSessionId = cfg.cliSessionId;
+        codexBridgePendingSessionId = effectiveCliSessionId;
         codexBridgeStartTimer();
       }
     } else {
       codexBridgeStartTimer();
     }
   } else if (cfg.cliId === 'coco') {
-    const eventsPath = cocoEventsPathForSession(cfg.sessionId);
-    codexBridgeAttach(eventsPath, cfg.resume ? 'baseline-existing' : 'fresh-empty');
+    const eventsPath = cocoEventsPathForSession(effectiveAdapterSessionId);
+    codexBridgeAttach(eventsPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
     codexBridgeStartTimer();
   } else if (cfg.cliId === 'mtr') {
-    const mtrSessionId = cfg.cliSessionId ?? mtrSessionIdForBotmuxSession(cfg.sessionId);
+    const mtrSessionId = effectiveCliSessionId ?? mtrSessionIdForBotmuxSession(effectiveAdapterSessionId);
     codexBridgePendingSessionId = mtrSessionId;
     const source = findMtrSessionById(mtrSessionId);
     if (source) {
-      mtrBridgeAttach(source, cfg.resume ? 'baseline-existing' : 'fresh-empty');
+      mtrBridgeAttach(source, effectiveResume ? 'baseline-existing' : 'fresh-empty');
     } else {
       codexBridgeStartTimer();
     }
@@ -4549,6 +4668,14 @@ process.on('message', async (raw: unknown) => {
         isPromptReady = false;
         idleDetector?.reset();
         log(`Passthrough slash command: ${msg.content}`);
+        // Follow-up rides on the SAME IPC (see DaemonToWorker.raw_input) so it
+        // cannot race the 200ms text→Enter window above. Enqueue only after the
+        // Enter landed: sendToPty queues it as the next turn (type-ahead /
+        // pendingMessages), exactly like a Lark message arriving while busy.
+        if (msg.followUpContent) {
+          sendToPty(msg.followUpContent);
+          log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
+        }
       }
       break;
     }
@@ -4559,6 +4686,17 @@ process.on('message', async (raw: unknown) => {
         break;
       }
       log('Restart requested');
+      // Tier-2 guard: 2nd consecutive in-worker restart forces FRESH.
+      // Increment BEFORE spawnCli so the guard trips at count==2 (i.e. the
+      // third attempted spawn in a 1-success → 2-failure sequence):
+      //   initial spawn (count=0) → fail → claude_exit → daemon sends restart
+      //   1st restart (count=1) → resume still fails → restart
+      //   2nd restart (count=2) → tier-2 kicks in → FRESH
+      // Tier 1 probe (adapter.checkResumeTargetExists) is re-run on each
+      // spawn, so even count=1 often short-circuits; tier-2 only catches
+      // silent/race failures and adapters that don't implement the probe.
+      consecutiveInWorkerRestarts++;
+      log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
       // Must destroySession(), not kill(): for persistent backends (tmux/herdr)
       // kill() only detaches — the backing session + CLI process keep running,
       // so the resume:true spawnCli below would re-attach to the SAME live CLI

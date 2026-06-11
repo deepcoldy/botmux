@@ -9,6 +9,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'omp');
   return {
     id: 'oh-my-pi',
+    authPaths: ['~/.omp/agent/auth.json'],
     resolvedBin: bin,
 
     // oh-my-pi has no --session-id; sessions are managed internally.

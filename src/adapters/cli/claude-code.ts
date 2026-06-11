@@ -411,11 +411,14 @@ export interface ClaudeFamilyVariant {
    *  aliases; forks whose model set is gateway-defined
    *  pass undefined so setup skips the prompt. */
   readonly modelChoices?: readonly string[];
+  /** Auth/login paths kept real+writable in the file sandbox (see CliAdapter.authPaths). */
+  readonly authPaths?: readonly string[];
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   return createClaudeFamilyAdapter({
     id: 'claude-code',
+    authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
@@ -437,6 +440,38 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     claudeDataDir: variant.dataDir,
     claudeStateJsonPath: variant.stateJsonPath,
     spawnEnv: variant.spawnEnv,
+    authPaths: variant.authPaths,
+
+    /** Prove the resume JSONL exists (or at least the project dir does, so the
+     *  sessionId lookup will find it). Conservative: only returns true when we
+     *  can stat the exact file; false when the file is provably absent;
+     *  undefined on any weirdness (caller will still try the spawn and rely on
+     *  the secondary guard).
+     *
+     *  The `dataDir` parameter carries the EFFECTIVE data root, i.e. after any
+     *  sandbox overlay redirection — the worker mirrors the same calculation
+     *  into `(backend).claudeJsonlPath = claudeJsonlPathForSession(...)` so
+     *  this probe sees the same filesystem the spawned CLI will write to. */
+    checkResumeTargetExists({ sessionId, cliSessionId, workingDir, dataDir }) {
+      if (!workingDir) return undefined;
+      const effectiveDataDir = dataDir ?? variant.dataDir;
+      const sid = cliSessionId ?? sessionId;
+      if (!sid) return undefined;
+      try {
+        const p = claudeJsonlPathForSession(sid, workingDir, effectiveDataDir);
+        if (existsSync(p)) return true;
+        // Also try the project directory (allows partial matches): absent
+        // projectDir means no resume target could possibly exist — Claude
+        // writes `<sid>.jsonl` there on first submit and never moves it.
+        if (!existsSync(dirname(p))) return false;
+        // Project dir exists but this specific sid doesn't. Could be a
+        // mid-session rotation the adapter's pid resolver would catch — don't
+        // block, let spawn try; the secondary guard still covers it.
+        return undefined;
+      } catch {
+        return undefined;
+      }
+    },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
       // Claude resumes by reading <id>.jsonl, so we need the most recently
@@ -799,6 +834,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // `botmux session-ready` 给出「真就绪」信号。worker 据此武装 ready-gate：
     // 收到信号前不投首条 prompt，绕开 cjadk 启动选择器吞首条消息的 bug。
     injectsReadyHook: true,
+    defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
     systemHints: [],
     altScreen: false,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT

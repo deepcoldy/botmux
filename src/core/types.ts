@@ -50,7 +50,21 @@ export interface DaemonSession {
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
+  worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** One-shot CLI slash command to send literally after the worker reports
+   *  prompt_ready. Used when a new topic starts with an adapter-default
+   *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
+   *  botmux-wrapped `<user_message>`. In-memory only to avoid replaying after
+   *  daemon restart. */
+  pendingRawInput?: string;
+  /** Wrapped prompt for messages buffered while a pendingRawInput session
+   *  waited for repo selection (pendingFollowUps / attachments). Built at the
+   *  fork site (where prompt-building context lives) and delivered right
+   *  after the raw input on prompt_ready, so the buffered messages queue as
+   *  the next turn instead of being dropped. In-memory only, like
+   *  pendingRawInput. */
+  pendingFollowUpInput?: { userPrompt: string; cliInput: string };
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   /** Sender (open_id + type + resolved name) of the initial message — stashed

@@ -27,6 +27,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
   let cachedCodexBin: string | undefined;
   return {
     id: 'codex-app',
+    authPaths: ['~/.codex/auth.json'],
     resolvedBin: process.execPath,
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale }) {

@@ -27,6 +27,11 @@ vi.mock('node:fs', async (importOriginal) => {
     mkdirSync: vi.fn(),
   };
 });
+// bots-info.json 走原子写 helper；这里直接代理到 mockWriteFileSync，
+// 断言面（最终路径 + 完整内容）与裸 writeFileSync 时代保持一致。
+vi.mock('../src/utils/atomic-write.js', () => ({
+  atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
+}));
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);

@@ -12,6 +12,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'opencode',
+    authPaths: ['~/.local/share/opencode/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ initialPrompt, model }) {

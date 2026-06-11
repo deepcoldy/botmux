@@ -684,6 +684,78 @@ th {
 }
 
 tbody tr:last-child td { border-bottom: 0; }
+
+/* ── 首尾列固定的横向滚动矩阵（群组与 Bot）─────────────────────────────
+   bot 一多中间的成员列就溢出视口，操作按钮被顶出屏幕。把圆角/阴影挪到
+   滚动容器上，表格本体放开宽度横向滚，首列（群）和尾列（操作）sticky 钉住。 */
+.table-scroll { overflow-x: auto; }
+.matrix-scroll {
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.matrix-scroll table {
+  width: max-content;
+  min-width: 100%;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible; /* 基础样式的 overflow:hidden 会把 sticky 列钉死在表格自身 */
+}
+.matrix-scroll th:first-child,
+.matrix-scroll td:first-child { position: sticky; left: 0; z-index: 2; }
+.matrix-scroll th:last-child,
+.matrix-scroll td:last-child { position: sticky; right: 0; z-index: 2; }
+.matrix-scroll th:first-child,
+.matrix-scroll th:last-child { z-index: 3; }
+/* sticky 单元格必须有不透明底色，否则中间列会从底下透出来 */
+.matrix-scroll td:first-child,
+.matrix-scroll td:last-child { background: var(--surface); }
+/* 暗色主题下表格本体有一层 3% 白的提亮，sticky 格子补同款混色保持一致 */
+:root[data-theme="dark"] .matrix-scroll td:first-child,
+:root[data-theme="dark"] .matrix-scroll td:last-child {
+  background: color-mix(in srgb, #ffffff 3%, var(--surface));
+}
+/* 暗色主题 th 也是半透明提亮（4% 白）——sticky 表头必须不透明，否则横滚时
+   中间列标题会从「群聊」「操作」底下透出来。7% ≈ 表格 3% + th 4% 的叠加效果 */
+:root[data-theme="dark"] .matrix-scroll th:first-child,
+:root[data-theme="dark"] .matrix-scroll th:last-child {
+  background: color-mix(in srgb, #ffffff 7%, var(--surface));
+}
+.matrix-scroll tr[data-chat]:hover td:first-child,
+.matrix-scroll tr[data-chat]:hover td:last-child { background: var(--surface-muted); }
+/* 滚动边界提示线 */
+.matrix-scroll th:first-child,
+.matrix-scroll td:first-child { box-shadow: 1px 0 0 var(--border-soft); }
+.matrix-scroll th:last-child,
+.matrix-scroll td:last-child { box-shadow: -1px 0 0 var(--border-soft); }
+
+/* ── 慢接口在途的页面级 loading 占位：在内容区水平垂直居中 ── */
+.page-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  width: 100%;
+  min-height: 220px;
+  padding: 40px 20px;
+  color: var(--muted);
+  font-size: 13px;
+  animation: page-loading-in 0.25s ease-out;
+}
+.page-loading-spin {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 50%;
+  border: 2.5px solid var(--border-soft);
+  border-top-color: var(--accent);
+  animation: page-loading-rotate 0.8s linear infinite;
+}
+@keyframes page-loading-rotate { to { transform: rotate(360deg); } }
+@keyframes page-loading-in { from { opacity: 0; } }
 th[data-sort] { cursor: pointer; user-select: none; }
 th[data-sort]:hover,
 th.sorted { color: var(--fg); background: var(--bg-soft); }
@@ -1297,7 +1369,9 @@ fieldset legend {
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  background: var(--warning-soft);
+  /* warning-soft 在暗色主题带透明度，sticky 浮条悬在列表上会透字——
+     垫一层页面底色保证不透明，同时保留各主题自己的警示色调 */
+  background: linear-gradient(var(--warning-soft), var(--warning-soft)), var(--bg);
   border: 1px solid color-mix(in srgb, var(--warning) 28%, transparent);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -2306,6 +2380,21 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
   gap: 13px;
 }
+/* AI 团队折叠/展开开关：贴着卡片栅格下沿居中，弱化成次级控件 */
+.team-toggle {
+  justify-self: center;
+  margin-top: -6px;
+  min-height: 28px;
+  padding: 3px 18px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  box-shadow: none;
+}
+.team-toggle:hover { color: var(--fg); border-color: var(--accent); }
 .mate {
   display: flex;
   flex-direction: column;

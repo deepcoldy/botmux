@@ -210,14 +210,59 @@ export interface CliAdapter {
    *  data root for forks that set CLAUDE_CONFIG_DIR. */
   readonly claudeStateJsonPath?: string;
 
+  /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
+   *  REAL + writable inside the file sandbox. The sandbox isolates writes (so the
+   *  agent's project edits are reviewable), but a CLI's token refresh / login
+   *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
+   *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
+   *  the isolated overlay so auth reads/refreshes/logins hit the real files.
+   *  `~` is expanded. Keep NARROW (auth only) so session history stays isolated.
+   *  undefined / empty → no carve-out. */
+  readonly authPaths?: readonly string[];
+
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).
    *  Keys placed here are also forwarded through the tmux backend (see
    *  BOTMUX_INJECTED_ENV_KEYS). undefined → inherit the worker env unchanged. */
   readonly spawnEnv?: Readonly<Record<string, string>>;
 
+  /** Optional: pre-flight check for resume targets.
+   *
+   *  Called with `resume=true` before spawn so a missing conversation JSONL /
+   *  rollout / DB entry does not produce a CLI-level "No conversation found"
+   *  exit code 1 — which would otherwise be amplified into an auto-restart
+   *  crash loop by the daemon's claude_exit handler.
+   *
+   *  Return `true` = resume target looks present (spawn normally with --resume).
+   *  Return `false` = target is provably missing → worker will fall back to a
+   *  FRESH session (resume=false, drop cliSessionId, log + user_notify once).
+   *  Return `undefined` / omit = adapter cannot tell cheaply → rely on the
+   *  worker's SECONDARY guard (2nd restart forces fresh) so unknown-shape CLIs
+   *  still degrade without crash-looping.
+   *
+   *  Must be synchronous, cheap, and conservative. An adapter that can verify
+   *  the resume target without spawning a subprocess implements this; others
+   *  simply leave it undefined (the secondary guard is always active). */
+  checkResumeTargetExists?(opts: {
+    sessionId: string;
+    /** CLI-native session id from session.cliSessionId, when available. */
+    cliSessionId?: string;
+    /** Working directory the CLI will spawn in. Used by Claude-family to
+     *  locate <projects>/<cwdHash>/<id>.jsonl. */
+    workingDir?: string;
+    /** Claude-family data dir (~/.claude, ~/.claude-runtime, …) so the probe
+     *  targets the SAME root the adapter will actually write into. */
+    dataDir?: string;
+  }): boolean | undefined;
+
   /** Optional CLI version command override. Defaults to `[resolvedBin, '--version']`. */
   versionCommand?(): { bin: string; args: string[] };
+
+  /** Slash commands this CLI natively supports and botmux should pass through
+   *  by default for this adapter. Unlike the global passthrough allowlist, these
+   *  are scoped to the current CLI so unsupported commands do not leak to other
+   *  adapters. */
+  readonly defaultPassthroughCommands?: readonly string[];
 }
 
 export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi';

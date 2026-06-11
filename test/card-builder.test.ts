@@ -716,13 +716,52 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('should have 4 top-level elements: div, hr, action, note', () => {
+    it('should have 5 top-level elements: div, hr, action, worktree action, note', () => {
       const card = parse(buildRepoSelectCard(projects));
-      expect(card.elements).toHaveLength(4);
+      expect(card.elements).toHaveLength(5);
       expect(card.elements[0].tag).toBe('div');
       expect(card.elements[1].tag).toBe('hr');
       expect(card.elements[2].tag).toBe('action');
-      expect(card.elements[3].tag).toBe('note');
+      expect(card.elements[3].tag).toBe('action');
+      expect(card.elements[4].tag).toBe('note');
+    });
+  });
+
+  // ── Worktree-open dropdown ─────────────────────────────────────────────
+
+  describe('worktree-open dropdown', () => {
+    function worktreeSelect(card: any): any {
+      const actionEls = card.elements.filter((e: any) => e.tag === 'action');
+      for (const el of actionEls) {
+        const sel = el.actions.find((a: any) => a.value?.key === 'repo_worktree');
+        if (sel) return sel;
+      }
+      return undefined;
+    }
+
+    it('should list only main repos (no existing worktrees)', () => {
+      const card = parse(buildRepoSelectCard(projects));
+      const sel = worktreeSelect(card);
+      expect(sel.options).toHaveLength(2);
+      const labels = sel.options.map((o: any) => o.text.content);
+      expect(labels.join()).toContain('alpha');
+      expect(labels.join()).toContain('gamma');
+      expect(labels.join()).not.toContain('beta');
+    });
+
+    it('should carry the repo path as the option value and root_id in value', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const sel = worktreeSelect(card);
+      expect(sel.options[0].value).toBe('/home/user/alpha');
+      expect(sel.value.root_id).toBe('om_root');
+    });
+
+    it('should be omitted when no main repos exist', () => {
+      const onlyWorktrees: ProjectInfo[] = [
+        { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
+      ];
+      const card = parse(buildRepoSelectCard(onlyWorktrees));
+      expect(worktreeSelect(card)).toBeUndefined();
     });
   });
 

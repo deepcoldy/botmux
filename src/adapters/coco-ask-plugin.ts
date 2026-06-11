@@ -21,7 +21,8 @@
  * CoCo（与 Claude 写全局 settings.json 的安全模型一致）。
  */
 
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -59,15 +60,14 @@ export function installCocoAskPlugin(cocoBin: string): void {
     };
 
     mkdirSync(join(COCO_ASK_PLUGIN_DIR, '.codex-plugin'), { recursive: true });
-    writeFileSync(
+    // 原子写：多个 daemon（一 bot 一进程）启动时会并发刷同一份共享插件目录。
+    atomicWriteFileSync(
       join(COCO_ASK_PLUGIN_DIR, '.codex-plugin', 'plugin.json'),
       JSON.stringify(manifest, null, 2) + '\n',
-      'utf-8',
     );
-    writeFileSync(
+    atomicWriteFileSync(
       join(COCO_ASK_PLUGIN_DIR, 'hooks.json'),
       JSON.stringify(hooks, null, 2) + '\n',
-      'utf-8',
     );
 
     // 幂等安装（--yes 跳过确认）。stdio 忽略，避免污染 daemon 日志；超时兜底。

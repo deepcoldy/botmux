@@ -258,10 +258,11 @@ const chatNameById = new Map<string, string>();
 const chatAvatarById = new Map<string, string>();
 let nameMapsPromise: Promise<void> | null = null;
 
-// 头像 URL 本地持久化：飞书 CDN 的图本身有 14 天 HTTP 缓存，但「先渲染渐变球、
-// 等 /api/groups 回来再换头像」这一刷会在每次冷加载/切页时出现。把 URL 存进
-// localStorage 并在模块加载时同步回灌，让任意页面首屏就拿得到头像 URL —— 配合
-// 浏览器图片缓存即时出图，彻底消除「球→头像」那一刷。
+// 头像 URL / 展示名本地持久化：飞书 CDN 的图本身有 14 天 HTTP 缓存，但「先渲染
+// 渐变球 + cli_xxx 原始 id、等 /api/groups 回来再换头像/友好名」这一刷会在每次
+// 冷加载/切页时出现。把 URL 和名字映射都存进 localStorage 并在模块加载时同步
+// 回灌，让任意页面首屏就拿得到头像 URL 与人话名字 —— 配合浏览器图片缓存即时
+// 出图，彻底消除「球→头像」「cli_xxx→名字」那一刷。
 const AVATAR_CACHE_KEY = 'botmux.avatarCache.v1';
 
 function hydrateAvatarCache(): void {
@@ -272,10 +273,14 @@ function hydrateAvatarCache(): void {
       botByAppId?: Record<string, string>;
       botByName?: Record<string, string>;
       chatById?: Record<string, string>;
+      nameByAppId?: Record<string, string>;
+      chatNameById?: Record<string, string>;
     };
     for (const [k, v] of Object.entries(c.botByAppId ?? {})) botAvatarByAppId.set(k, v);
     for (const [k, v] of Object.entries(c.botByName ?? {})) botAvatarByName.set(k, v);
     for (const [k, v] of Object.entries(c.chatById ?? {})) chatAvatarById.set(k, v);
+    for (const [k, v] of Object.entries(c.nameByAppId ?? {})) botNameByAppId.set(k, v);
+    for (const [k, v] of Object.entries(c.chatNameById ?? {})) chatNameById.set(k, v);
   } catch { /* 损坏/无 localStorage 时静默 */ }
 }
 
@@ -286,6 +291,8 @@ function persistAvatarCache(): void {
       botByAppId: Object.fromEntries(botAvatarByAppId),
       botByName: Object.fromEntries(botAvatarByName),
       chatById: Object.fromEntries(chatAvatarById),
+      nameByAppId: Object.fromEntries(botNameByAppId),
+      chatNameById: Object.fromEntries(chatNameById),
     }));
   } catch { /* 配额/SSR 时静默 */ }
 }
@@ -321,6 +328,11 @@ export function loadNameMaps(): Promise<void> {
   return nameMapsPromise;
 }
 
+/** 按 larkAppId 查注册表友好名（含 localStorage 回灌的缓存）；查不到返回 undefined。 */
+export function botNameForAppId(appId?: string): string | undefined {
+  return appId ? botNameByAppId.get(appId) : undefined;
+}
+
 /** 会话所属 bot 的显示名：注册表友好名 → 会话自带 botName（非 id 时）→ id。 */
 export function botDisplayName(s: Record<string, any>): string {
   const mapped = s.larkAppId ? botNameByAppId.get(s.larkAppId) : undefined;
@@ -340,6 +352,11 @@ export function stripMentionPrefix(title: unknown): string {
   const raw = String(title ?? '');
   const out = raw.replace(/^(?:@\S+\s*)+/, '').trim();
   return out || raw;
+}
+
+/** 全站统一的页面级 loading 占位（慢接口在途时先渲染这个，避免白屏假死）。 */
+export function loadingHtml(label?: string): string {
+  return `<div class="page-loading" role="status"><i class="page-loading-spin" aria-hidden="true"></i>${escapeHtml(label ?? t('common.loading'))}</div>`;
 }
 
 /** 会话当前是否卡在等人，以及等什么（全局 strip 和工作台共用同一判定）。 */

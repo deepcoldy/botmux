@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteFile } from '../utils/atomic-write.js';
 import {
   canonicalJsonStringify,
   parseWorkflowDefinition,
@@ -53,7 +54,7 @@ export async function snapshotWorkflowDefinition(
 ): Promise<string> {
   const dir = await getOrEnsureRunDir(runId, opts);
   const path = join(dir, 'workflow.json');
-  await fs.writeFile(path, canonicalJsonStringify(def), 'utf-8');
+  await atomicWriteFile(path, canonicalJsonStringify(def));
   return path;
 }
 
@@ -96,7 +97,7 @@ export async function writeRunChatBinding(
 ): Promise<string> {
   const dir = await getOrEnsureRunDir(runId, opts);
   const path = join(dir, 'chat-binding.json');
-  await fs.writeFile(path, JSON.stringify(binding, null, 2), 'utf-8');
+  await atomicWriteFile(path, JSON.stringify(binding, null, 2));
   return path;
 }
 

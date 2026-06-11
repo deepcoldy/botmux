@@ -13,7 +13,8 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
 import { jsonRes } from './workflow-api.js';
@@ -118,7 +119,7 @@ function writeTeamRole(dataDir: string, larkAppId: string, content: string): voi
   mkdirSync(dirname(fp), { recursive: true });
   let out = content.trim();
   while (Buffer.byteLength(out, 'utf-8') > MAX_ROLE_BYTES) out = out.slice(0, -1);
-  writeFileSync(fp, out, 'utf-8');
+  atomicWriteFileSync(fp, out);
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise<any> {

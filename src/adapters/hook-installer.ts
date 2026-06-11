@@ -4,7 +4,8 @@
  * 把 botmux 的 askUserQuestion hook 写入各 CLI 的配置文件。
  * 幂等：写前比对内容，相同则跳过；展开 ~ 路径；出错只 warn 不抛。
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
@@ -42,7 +43,9 @@ function writeIfChanged(filePath: string, content: string): boolean {
       if (existing === content) return false; // 内容相同，无需写入
     }
     mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, content, 'utf-8');
+    // 原子写：目标是 ~/.claude/settings.json 这类被 CLI 并发读写的热配置，
+    // 裸写半截会让并发读者拿到坏 JSON 再整文件覆写回来（cjadk 事故同类）。
+    atomicWriteFileSync(filePath, content);
     return true;
   } catch (err: any) {
     throw new Error(`写入 ${filePath} 失败：${err.message}`);

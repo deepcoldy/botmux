@@ -12,6 +12,7 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'gemini',
+    authPaths: ['~/.gemini/oauth_creds.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ initialPrompt, model, disableCliBypass }) {

@@ -243,7 +243,12 @@ export type TermActionKey =
 export type DaemonToWorker =
   | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; model?: string; disableCliBypass?: boolean; sandbox?: boolean; sandboxHidePaths?: string[]; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; collab?: { runId: string; workerId: string; taskId: string; baseDir?: string }; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string; turnId?: string }
-  | { type: 'raw_input'; content: string }
+  /** Literal slash-command passthrough. `followUpContent` rides along so the
+   *  worker enqueues it strictly AFTER the slash command's Enter — two separate
+   *  IPCs would race: process.on('message') handlers don't serialize, and the
+   *  raw_input branch awaits 200ms between sendText and Enter, a window where
+   *  a separate `message` IPC could write into the PTY first. */
+  | { type: 'raw_input'; content: string; followUpContent?: string }
   | { type: 'close' }
   | { type: 'suspend' }
   | { type: 'restart' }

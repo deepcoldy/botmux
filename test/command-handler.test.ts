@@ -125,6 +125,10 @@ vi.mock('../src/services/project-scanner.js', () => ({
   describeProjectDir: vi.fn(() => null),
 }));
 
+vi.mock('../src/services/git-worktree.js', () => ({
+  createRepoWorktree: vi.fn(),
+}));
+
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildRepoSelectCard: vi.fn(() => '{"card":"json"}'),
   buildAdoptSelectCard: vi.fn(() => '{"card":"adopt-select"}'),
@@ -329,7 +333,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile, resolveRole } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -341,7 +345,7 @@ import type { LarkMessage, Session } from '../src/types.js';
 import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
-import { getSessionWorkingDir, buildNewTopicPrompt } from '../src/core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
@@ -353,6 +357,7 @@ import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
 import { bindOncall } from '../src/services/oncall-store.js';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
+import { createRepoWorktree } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';
@@ -583,6 +588,12 @@ describe('PASSTHROUGH_COMMANDS set', () => {
       expect(DAEMON_COMMANDS.has(cmd), `${cmd} must not be in both sets`).toBe(false);
     }
   });
+
+  it('keeps /goal out of the global passthrough list but enables it for Claude and Codex adapters', () => {
+    expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
+    expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);
+    expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
+  });
 });
 
 describe('parseSlashCommandInvocation', () => {
@@ -710,6 +721,7 @@ describe('handleCommand', () => {
         expect.stringContaining('会话已关闭'),
         'interactive',
         LARK_APP_ID,
+        'msg_001',
       );
       const replyArgs = (deps.sessionReply as any).mock.calls[0];
       const cardJson = replyArgs[1] as string;
@@ -728,6 +740,7 @@ describe('handleCommand', () => {
         expect.stringContaining('没有活跃的会话'),
         undefined,
         LARK_APP_ID,
+        'msg_001',
       );
     });
   });
@@ -750,6 +763,7 @@ describe('handleCommand', () => {
         expect.stringContaining('正在重启'),
         undefined,
         LARK_APP_ID,
+        'msg_001',
       );
     });
 
@@ -767,6 +781,7 @@ describe('handleCommand', () => {
         expect.stringContaining('进程已终止'),
         undefined,
         LARK_APP_ID,
+        'msg_001',
       );
     });
 
@@ -782,6 +797,7 @@ describe('handleCommand', () => {
         expect.stringContaining('进程已终止'),
         undefined,
         LARK_APP_ID,
+        'msg_001',
       );
     });
 
@@ -795,6 +811,7 @@ describe('handleCommand', () => {
         expect.stringContaining('没有活跃的会话'),
         undefined,
         LARK_APP_ID,
+        'msg_001',
       );
     });
   });
@@ -979,6 +996,41 @@ describe('handleCommand', () => {
   // ─── /repo ──────────────────────────────────────────────────────────────
 
   describe('/repo', () => {
+    it('shared fold-back: every command reply carries the triggering messageId as turnId', async () => {
+      // A shared (chat-scope) session triggered from inside a Lark thread
+      // records currentReplyTarget={turnId: messageId}. Command replies must
+      // pass that same messageId through sessionReply so the turnId gate in
+      // resolveSessionReplyTarget anchors them into the topic instead of
+      // leaking a plain top-level message.
+      const ds = makeDaemonSession({ scope: 'chat' } as Partial<DaemonSession>);
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1', { messageId: 'msg_turn' }), deps, LARK_APP_ID);
+
+      const call = vi.mocked(deps.sessionReply).mock.calls[0];
+      expect(call[4]).toBe('msg_turn');
+    });
+
+    it('pendingRepo first-spawn: the 已选择 confirmation carries the triggering messageId as turnId', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        scope: 'chat',
+        currentReplyTarget: { rootMessageId: 'om_topic_root', turnId: 'msg_prime', updatedAt: new Date().toISOString() },
+      } as Partial<DaemonSession>);
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1', { messageId: 'msg_prime' }), deps, LARK_APP_ID);
+
+      const selected = vi.mocked(deps.sessionReply).mock.calls.find(
+        (c) => typeof c[1] === 'string' && (c[1] as string).includes('已选择'),
+      );
+      expect(selected, 'no 已选择 confirmation was sent').toBeDefined();
+      expect(selected![4]).toBe('msg_prime');
+    });
+
     it('should prompt to run /repo first when index given but no cached scan', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -1064,6 +1116,7 @@ describe('handleCommand', () => {
         expect.any(String),
         'interactive',
         LARK_APP_ID,
+        'msg_001',
       );
     });
 
@@ -1108,6 +1161,142 @@ describe('handleCommand', () => {
     });
   });
 
+  // ─── /repo wt — worktree creation entry ────────────────────────────────────
+
+  describe('/repo wt', () => {
+    const SCAN = [{ name: 'project-a', path: '/home/testuser/project-a', branch: 'main' }];
+    const CREATION = { path: '/home/testuser/project-a-wt-1', branch: 'wt/1', baseRef: 'origin/main' };
+
+    it('creates a worktree off the picked repo and commits the selection', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(createRepoWorktree).toHaveBeenCalledWith('/home/testuser/project-a', { branch: undefined });
+      expect(ds.workingDir).toBe('/home/testuser/project-a-wt-1');
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(ds.worktreeCreating).toBe(false);
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('worktree 已创建');
+    });
+
+    it('holds the in-flight lock through the created-notice reply (post-git window)', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+      // Park the FIRST run inside its created-notice reply, then fire a second
+      // /repo wt — it must bounce off the lock instead of starting another git.
+      let releaseReply: (() => void) | undefined;
+      vi.mocked(deps.sessionReply).mockImplementation(async (_root, text) => {
+        if (typeof text === 'string' && text.includes('worktree 已创建：') && !releaseReply) {
+          return new Promise<string>(res => { releaseReply = () => res('reply-msg-id'); });
+        }
+        return 'reply-msg-id';
+      });
+
+      const first = handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+      await vi.waitFor(() => expect(releaseReply).toBeTruthy());
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(createRepoWorktree).toHaveBeenCalledTimes(1);
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('已有一个 worktree 正在创建');
+
+      releaseReply!();
+      await first;
+      expect(ds.worktreeCreating).toBe(false);
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('re-checks the session generation after the created notice (during-reply window)', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+      // Another selection swaps the session while the created notice is in flight.
+      vi.mocked(deps.sessionReply).mockImplementation(async (_root, text) => {
+        if (typeof text === 'string' && text.includes('worktree 已创建：') && ds.session.sessionId !== 'hijacked') {
+          ds.session = { ...ds.session, sessionId: 'hijacked' };
+        }
+        return 'reply-msg-id';
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBeUndefined();
+      expect(ds.worktreeCreating).toBe(false);
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('未自动切换');
+    });
+
+    it('blocks a plain numeric selection while a worktree is in flight', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false, worktreeCreating: true });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBeUndefined();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('已有一个 worktree 正在创建');
+    });
+
+    it('blocks the bare-/repo pending launch while a worktree is in flight', async () => {
+      const ds = makeDaemonSession({ pendingRepo: true, worktreeCreating: true });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(true); // not consumed
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('已有一个 worktree 正在创建');
+    });
+
+    it('aborts the pending fork when the session is /close\'d during prompt prep (last-line defence)', async () => {
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: 'hello world' });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+      // /close lands inside forkPendingCli's prompt prep — deletes the
+      // active-map entry but mutates neither sessionId nor pendingRepo; only
+      // the pre-fork identity check can stop the fork.
+      vi.mocked(getAvailableBots).mockImplementationOnce(async () => {
+        deps.activeSessions.delete(sessionKey(ROOT_ID, LARK_APP_ID));
+        return [];
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.worktreeCreating).toBe(false);
+    });
+
+    it('reports a commit failure as a switch failure — the worktree exists by then', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+      vi.mocked(forkWorker).mockImplementationOnce(() => { throw new Error('fork boom'); });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(ds.worktreeCreating).toBe(false);
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('自动切换失败');
+      expect(replies).toContain('fork boom');
+      expect(replies).not.toContain('创建 worktree 失败');
+    });
+  });
+
   // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
   describe('/repo (bare) while pending', () => {
@@ -1147,6 +1336,50 @@ describe('handleCommand', () => {
       expect((buildNewTopicPrompt as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('帮我看看这个 bug');
       expect(forkWorker).toHaveBeenCalledWith(ds, 'WRAPPED:帮我看看这个 bug');
       expect(ds.pendingRepo).toBe(false);
+    });
+
+    it('raw-input cold start boots idle and leaves pendingRawInput for prompt_ready', async () => {
+      // /goal cold start → repo card → bare /repo skip: the raw command must
+      // NOT be wrapped into a prompt; it stays on ds.pendingRawInput and the
+      // prompt_ready handler delivers it literally.
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', pendingRawInput: '/goal 发布 onboarding' });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(buildNewTopicPrompt).not.toHaveBeenCalled();
+      expect(ds.pendingRawInput).toBe('/goal 发布 onboarding');
+      expect(ds.pendingFollowUpInput).toBeUndefined();
+    });
+
+    it('raw-input cold start wraps follow-ups buffered during repo wait into pendingFollowUpInput', async () => {
+      // /goal cold start → repo card pending → user keeps typing (buffered in
+      // pendingFollowUps) → bare /repo skips the card. The buffered messages
+      // must be wrapped and stashed for delivery after the raw input — not
+      // silently dropped.
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingRawInput: '/goal 发布 onboarding',
+        pendingFollowUps: ['对了顺手看下 CI', '别忘了更新 changelog'],
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      // Wrapped via buildNewTopicPrompt (mock → `WRAPPED:<pendingPrompt>`),
+      // follow-ups passed through as the 8th arg.
+      expect(buildNewTopicPrompt).toHaveBeenCalled();
+      expect((buildNewTopicPrompt as ReturnType<typeof vi.fn>).mock.calls[0][7])
+        .toEqual(['对了顺手看下 CI', '别忘了更新 changelog']);
+      expect(ds.pendingFollowUpInput).toEqual({
+        userPrompt: '对了顺手看下 CI\n\n别忘了更新 changelog',
+        cliInput: 'WRAPPED:',
+      });
+      expect(ds.pendingRawInput).toBe('/goal 发布 onboarding');
+      expect(ds.pendingFollowUps).toBeUndefined();
     });
 
     it('should report an invalid workingDir and not spawn (keeps pending for recovery)', async () => {

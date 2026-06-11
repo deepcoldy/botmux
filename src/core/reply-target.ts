@@ -63,6 +63,22 @@ export function beginReplyTargetTurn(
   ds.session.currentReplyTarget = undefined;
 }
 
+/**
+ * Effective turnId for a daemon-side message. Callers that know their turn
+ * (worker final_output, placeholder cards) pass it explicitly and the
+ * stale-turn gate in resolveSessionReplyTarget stays authoritative. Callers
+ * with NO turn context of their own (the worker's first streaming card,
+ * crash notices) fall back to the session's current reply-target turn — in a
+ * shared fold-back topic they then follow the conversation into the thread
+ * instead of leaking to the chat top level.
+ */
+export function fallbackTurnId(
+  ds: Pick<DaemonSession, 'session' | 'currentReplyTarget'>,
+  turnId: string | undefined,
+): string | undefined {
+  return turnId ?? (ds.currentReplyTarget ?? ds.session.currentReplyTarget)?.turnId;
+}
+
 export function syncReplyTargetState(ds: DaemonSession, s?: Session): void {
   const source = s ?? ds.session;
   ds.replyThreadAliases = source.replyThreadAliases;

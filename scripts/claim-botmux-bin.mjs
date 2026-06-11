@@ -6,9 +6,31 @@
 // 写入内容与 daemon 启动时写的 wrapper 完全一致（见 src/daemon.ts），所以两者幂等：
 // 「在哪 build+use，全局 botmux 就指哪；下次 daemon restart-from-dir 再覆盖」均自洽。
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, basename, join } from 'node:path';
 import { homedir } from 'node:os';
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, unlinkSync, realpathSync, chmodSync } from 'node:fs';
+
+// 原子写（与 src/utils/atomic-write.ts 同构，.mjs 不依赖 dist 故内联）：
+// 这个 wrapper 随时被并发会话 exec，裸写半截会让它们的 `botmux send` 全体失败。
+// 同构三要素缺一不可：①写前 realpath 穿透 symlink（否则把链接本体 rename 成
+// 普通文件）②唯一 tmp 名 ③写后显式 chmod（creation mode 被 umask 截断，
+// umask 077 下 0o755 会落成 0o700）。
+function atomicWriteFileSync(filePath, data, mode) {
+  try { filePath = realpathSync(filePath); }
+  catch {
+    try { filePath = join(realpathSync(dirname(filePath)), basename(filePath)); }
+    catch { /* 父目录也不存在，保持原路径 */ }
+  }
+  const tmp = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2, 10)}.tmp`;
+  try {
+    writeFileSync(tmp, data, { mode });
+    chmodSync(tmp, mode);
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* tmp 可能根本没写出来 */ }
+    throw err;
+  }
+}
 
 // 逃生阀：偶尔只想 build 不想抢全局时 `BOTMUX_NO_CLAIM=1 pnpm use:here`
 if (process.env.BOTMUX_NO_CLAIM) {
@@ -33,7 +55,7 @@ try {
   if (existing === content) {
     console.log(`✓ 全局 botmux 已指向本 checkout（${cliScript}）`);
   } else {
-    writeFileSync(wrapper, content, { mode: 0o755 });
+    atomicWriteFileSync(wrapper, content, 0o755);
     console.log(`✅ 全局 botmux → 本 checkout（${cliScript}）`);
     console.log('   下一步 `botmux restart` 即从本 checkout 重启 daemon。');
   }

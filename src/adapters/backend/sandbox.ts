@@ -21,6 +21,7 @@
  */
 import { homedir } from 'node:os';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
@@ -40,12 +41,23 @@ export function mountOverlay(opts: { lower: string; upper: string; work: string;
   for (const d of [opts.upper, opts.work, opts.merged]) {
     try { mkdirSync(d, { recursive: true }); } catch { /* */ }
   }
-  const r = spawnSync('mount', [
-    '-t', 'overlay', 'overlay',
-    '-o', `lowerdir=${opts.lower},upperdir=${opts.upper},workdir=${opts.work}`,
-    opts.merged,
-  ], { stdio: 'pipe' });
-  return r.status === 0;
+  const optStr = `lowerdir=${opts.lower},upperdir=${opts.upper},workdir=${opts.work}`;
+  // A privileged (root) daemon uses the kernel overlayfs driver — fastest. A
+  // non-root daemon CANNOT mount kernel overlayfs even inside bwrap's userns (the
+  // hardened mount env rejects it on this kernel), so it falls back to
+  // fuse-overlayfs — a userspace overlay needing no root, only /dev/fuse. Same
+  // lowerdir/upperdir/workdir semantics → landing, the bridge redirect, and the
+  // privacy masks all work identically; only the mount mechanism differs.
+  // BOTMUX_SANDBOX_FUSE=1 forces the userspace path even as root (escape hatch +
+  // lets a root daemon exercise exactly what unprivileged users hit).
+  const forceFuse = process.env.BOTMUX_SANDBOX_FUSE === '1';
+  if (!forceFuse && process.getuid?.() === 0) {
+    const r = spawnSync('mount', ['-t', 'overlay', 'overlay', '-o', optStr, opts.merged], { stdio: 'pipe' });
+    if (r.status === 0) return true;
+    // root but kernel mount failed (rare) → fall through to fuse-overlayfs
+  }
+  const f = spawnSync('fuse-overlayfs', ['-o', optStr, opts.merged], { stdio: 'pipe' });
+  return f.status === 0;
 }
 
 /** True iff `path` is currently a mountpoint (host-side overlay still mounted). */
@@ -57,8 +69,45 @@ export function isMounted(path: string): boolean {
  *  umount fails (busy fd from a still-draining child). No-op if not a mount. */
 export function unmountOverlay(merged: string): void {
   if (!isMounted(merged)) return; // not a mountpoint
-  const r = spawnSync('umount', [merged], { stdio: 'ignore' });
-  if (r.status !== 0) spawnSync('umount', ['-l', merged], { stdio: 'ignore' });
+  // kernel overlay → `umount`; fuse-overlayfs → `fusermount -u` (a non-root
+  // daemon can't `umount` its own fuse mount); lazy `-l` as a last resort for a
+  // busy fd from a still-draining child.
+  if (spawnSync('umount', [merged], { stdio: 'ignore' }).status === 0) return;
+  if (spawnSync('fusermount', ['-u', merged], { stdio: 'ignore' }).status === 0) return;
+  spawnSync('umount', ['-l', merged], { stdio: 'ignore' });
+}
+
+/** Verify (and best-effort auto-install) the sandbox runtime deps so the user
+ *  needn't pre-install: `bubblewrap` always, `fuse-overlayfs` when the userspace
+ *  overlay path is used (non-root daemon, or BOTMUX_SANDBOX_FUSE=1). Installs via
+ *  the system package manager when the daemon can (root, or passwordless sudo);
+ *  otherwise logs a one-line manual-install hint and returns false so the caller
+ *  fails the spawn (never a silent unsandboxed run). Returns true if all present. */
+function ensureSandboxDeps(needFuse: boolean): boolean {
+  const has = (cmd: string) => spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
+  const missing: string[] = [];
+  if (!has('bwrap')) missing.push('bubblewrap');
+  if (needFuse && !has('fuse-overlayfs')) missing.push('fuse-overlayfs');
+  if (!missing.length) return true;
+
+  const pm =
+    has('apt-get') ? ['apt-get', 'install', '-y', ...missing] :
+    has('dnf')     ? ['dnf', 'install', '-y', ...missing] :
+    has('yum')     ? ['yum', 'install', '-y', ...missing] :
+    has('apk')     ? ['apk', 'add', ...missing] :
+    has('pacman')  ? ['pacman', '-S', '--noconfirm', ...missing] :
+    null;
+  const isRoot = process.getuid?.() === 0;
+  if (pm) {
+    // root installs directly; a non-root daemon tries passwordless sudo only
+    // (never blocks on an interactive prompt).
+    const argv = isRoot ? pm : ['sudo', '-n', ...pm];
+    const r = spawnSync(argv[0], argv.slice(1), { stdio: 'ignore', timeout: 180_000 });
+    if (r.status === 0 && !missing.some(m => !has(m === 'bubblewrap' ? 'bwrap' : m))) return true;
+  }
+  const guide = pm ? `${isRoot ? '' : 'sudo '}${pm.join(' ')}` : `install: ${missing.join(', ')}`;
+  console.error(`[sandbox] missing deps (${missing.join(', ')}); auto-install unavailable — install manually then retry: ${guide}`);
+  return false;
 }
 
 // ───────────────────────────── argv builder ──────────────────────────────────
@@ -80,6 +129,10 @@ export interface SandboxPlan {
   hideDirs: string[];
   /** Per-bot privacy masks: files blanked with a read-only empty placeholder. */
   hideFiles: { path: string; empty: string }[];
+  /** CLI auth/login paths kept REAL + writable (bound rw over the isolated home so
+   *  the CLI's token refresh / login persists — unlike project edits which are
+   *  isolated). Resolved + existence-filtered by prepareSandbox. */
+  authReal?: string[];
   /** Keep network egress. File-only scope ⇒ default true (npm/pip/git work). */
   net?: boolean;
 }
@@ -102,6 +155,9 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   // Write-isolated home + project (overlay merged: reads=real lower, writes=upper).
   a.push('--bind', plan.homeMerged, plan.home);
   a.push('--bind', plan.projectMerged, plan.projectMount);
+  // CLI auth/login dirs kept REAL + writable (bind over the isolated home) so token
+  // refresh / login persists. Narrow (auth only) → session history stays isolated.
+  for (const p of plan.authReal ?? []) a.push('--bind', p, p);
   // Per-bot privacy masks (opt-in, no defaults).
   for (const dir of plan.hideDirs) a.push('--tmpfs', dir);
   for (const f of plan.hideFiles) a.push('--ro-bind', f.empty, f.path);
@@ -185,9 +241,17 @@ export function prepareSandbox(opts: {
   /** Per-bot privacy masks (opt-in, no defaults). Paths existing as dirs are
    *  blanked with a tmpfs; files with an empty read-only placeholder. */
   hidePaths?: string[];
+  /** This CLI's auth/login paths (CliAdapter.authPaths) to keep real+writable so
+   *  token refresh / login persists. `~` expanded; missing paths skipped. */
+  authPaths?: readonly string[];
 }): SandboxSpawn | null {
   if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // overlayfs + bwrap are Linux-only
+
+  // Auto-provision deps so the user needn't pre-install (bwrap; + fuse-overlayfs
+  // for the rootless/userspace overlay path). Fail the spawn if unavailable.
+  const needFuse = process.env.BOTMUX_SANDBOX_FUSE === '1' || process.getuid?.() !== 0;
+  if (!ensureSandboxDeps(needFuse)) return null;
 
   const sessionRoot = join(opts.dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
@@ -255,6 +319,17 @@ export function prepareSandbox(opts: {
     }
   }
 
+  // CLI auth/login paths kept real+writable (token refresh / login must persist,
+  // unlike isolated project edits). Resolve `~` and bind only existing paths — a
+  // missing auth file isn't a valid mountpoint (the CLI must be logged in on the
+  // host; login-from-scratch inside the sandbox isn't supported).
+  const authReal: string[] = [];
+  for (const raw of opts.authPaths ?? []) {
+    if (!raw || typeof raw !== 'string') continue;
+    const p = raw.replace(/^~(?=\/|$)/, home);
+    try { if (existsSync(p)) authReal.push(p); } catch { /* */ }
+  }
+
   const plan: SandboxPlan = {
     projectMount,
     projectMerged: projMerged,
@@ -263,6 +338,7 @@ export function prepareSandbox(opts: {
     outbox,
     hideDirs,
     hideFiles,
+    authReal,
     net: true,
   };
   const args = buildSandboxArgs(plan);
@@ -536,7 +612,8 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
   const staging = join(dirname(outbox), 'relay-staging');
 
   const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string) => {
-    try { writeFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
+    // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
+    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
     try { rmSync(reqPath, { force: true }); } catch { /* */ }
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);

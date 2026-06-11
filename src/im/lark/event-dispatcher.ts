@@ -4,7 +4,8 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
@@ -68,7 +69,10 @@ export function writeBotInfoFile(dataDir: string): void {
     });
   }
 
-  writeFileSync(filePath, JSON.stringify([...map.values()], null, 2) + '\n');
+  // 原子写：一 bot 一 daemon，多个 daemon 进程并发 upsert 同一个 bots-info.json，
+  // 裸写会让并发读者看到半截 JSON。（read-merge-write 的 lost-update 仍存在，
+  // 但每个 daemon 周期性重写自己的条目，可自愈。）
+  atomicWriteFileSync(filePath, JSON.stringify([...map.values()], null, 2) + '\n');
 }
 
 /**
@@ -576,7 +580,7 @@ export function updateBotOpenIdCrossRef(
   if (changed) {
     try {
       if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-      writeFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
+      atomicWriteFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
       logger.debug(`Updated bot open_id cross-ref for ${larkAppId}: ${JSON.stringify(existing)}`);
     } catch (err) {
       logger.debug(`Failed to write bot open_id cross-ref: ${err}`);

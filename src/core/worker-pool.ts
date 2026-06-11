@@ -5,7 +5,8 @@
 import { fork, execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
@@ -13,7 +14,8 @@ import { hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
-import { persistStreamCardState } from './session-manager.js';
+import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
+import { fallbackTurnId } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -844,7 +846,9 @@ function removeJsonKey(configPath: string, pathSegments: string[], keyToRemove: 
     }
     if (!node || typeof node !== 'object' || !(keyToRemove in node)) return false;
     delete node[keyToRemove];
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：这里改的是外部 CLI 自己的热配置文件（如 ~/.claude.json），
+    // 裸写半截会弄坏 CLI 的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     return true;
   } catch {
     return false;
@@ -973,7 +977,9 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
     if (entry.hasTrustDialogAccepted === true) return; // already trusted — skip write
 
     entry.hasTrustDialogAccepted = true;
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：~/.claude.json 是 Claude Code 的热状态文件，所有并发 claude
+    // 实例都在读写，裸写半截会弄坏它们的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     logger.info(`[claude-trust] Pre-accepted folder trust for ${canonical}`);
   } catch (err) {
     logger.debug(`[claude-trust] seed failed (ignored): ${err}`);
@@ -1589,8 +1595,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  // Worker messages without a turn of their own (first streaming card, crash
+  // notices) anchor to the session's current reply-target turn so a shared
+  // fold-back topic keeps them in-thread instead of leaking top-level.
   const scopedReply = (content: string, msgType?: string, turnId?: string) =>
-    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, turnId);
+    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
@@ -1792,6 +1801,24 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
+          const rawInput = ds.pendingRawInput;
+          ds.pendingRawInput = undefined;
+          // Input buffered while the repo card was pending rides on the SAME
+          // IPC: worker message handlers run concurrently (async handlers
+          // don't serialize), so a separate `message` IPC could write into
+          // the PTY during raw_input's 200ms text→Enter beat. The worker
+          // enqueues followUpContent only after the Enter landed.
+          const followUp = ds.pendingFollowUpInput;
+          ds.pendingFollowUpInput = undefined;
+          ds.worker.send({
+            type: 'raw_input',
+            content: rawInput,
+            followUpContent: followUp?.cliInput,
+          } as DaemonToWorker);
+          logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
+          if (followUp) rememberLastCliInput(ds, followUp.userPrompt, followUp.cliInput);
+        }
         break;
       }
 
@@ -2445,7 +2472,7 @@ function deliverFinalOutput(
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const scopedReply = (content: string, msgType?: string, turnId?: string) =>
-    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, turnId);
+    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
   setTimeout(async () => {
     let pendingCardId: string | undefined;
     let pendingQuoteTargetId: string | undefined;
@@ -2611,6 +2638,8 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //   - codex: worker resolves the rollout path either from cliSessionId
   //     (passed below when known) or by reading the Codex pid's open fds
   //     in /proc — so we always pass the pid for codex adopt.
+  //   - traex: same rollout strategy as codex (byte-identical JSONL format),
+  //     only the directory layout (~/.trae/cli/sessions) and finders differ.
   //   - coco: events.jsonl path is `~/.cache/coco/sessions/<sid>/events.jsonl`,
   //     deterministic from cliSessionId. PID is the fallback when discovery
   //     missed (events.jsonl isn't held open continuously, so worker may need
@@ -2642,7 +2671,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   // open store.db fd (chatId), or from cliSessionId (= chatId) when discovery
   // captured it — so adopt must forward the pid + cwd like the other
   // transcript-backed CLIs.
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
+  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'traex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   const initMsg: DaemonToWorker = {
@@ -2809,7 +2838,7 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
 
   try {
     mkdirSync(config.session.dataDir, { recursive: true });
-    writeFileSync(cliIdFile, currentCliId);
+    atomicWriteFileSync(cliIdFile, currentCliId);
   } catch (err) {
     logger.warn(`Failed to write ${cliIdFile}: ${err}`);
   }

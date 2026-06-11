@@ -1,7 +1,7 @@
 // Roles page: hierarchical group → bot role editor.
 // Displays groups as collapsible sections with bots nested inside.
 // Each bot has its own per-group role definition selectable for editing.
-import { botAvatarHtml, escapeHtml, loadNameMaps, t } from './ui.js';
+import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
 
 interface BotInfo {
   larkAppId: string;
@@ -290,6 +290,9 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
   expandedGroups.clear();
   resetEditor();
 
+  // /api/groups 慢——树区域先亮 loading，避免左栏长时间空白像挂了。
+  const treeEl = document.getElementById('roles-tree');
+  if (treeEl) treeEl.innerHTML = loadingHtml();
   await loadGroups();
   await loadNameMaps(); // 预热共享头像表，让角色树首屏就能出真实头像
   // Auto-expand groups that have at least one bot with a role

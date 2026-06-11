@@ -48,6 +48,7 @@ export function createSeedAdapter(pathOverride?: string): CliAdapter {
   const dataDir = deriveSeedDataDir(bin);
   return createClaudeFamilyAdapter({
     id: 'seed',
+    authPaths: ['~/.local/share/bytedcli'],
     resumeBin: 'seed',
     dataDir,
     // Seed keeps `.claude.json` inside its data root (CLAUDE_CONFIG_DIR layout),

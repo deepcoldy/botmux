@@ -194,6 +194,65 @@ export function joinAssistantText(events: TranscriptEvent[]): string {
     .join('\n\n');
 }
 
+function hasToolUseBlock(ev: TranscriptEvent): boolean {
+  const content = ev.message?.content;
+  return Array.isArray(content) && content.some(b => b && (b as any).type === 'tool_use');
+}
+
+/**
+ * The turn's FINAL answer: the contiguous run of this turn's assistant-text
+ * events after its last tool_use. A long agentic turn writes many interim
+ * narration blocks between tool calls; joining them all (joinAssistantText)
+ * makes the fallback both post a narration collage AND look "materially
+ * longer" than the model's own explicit `botmux send`, defeating the
+ * bridge-fallback gate. Walking back from the turn's last text event until a
+ * tool_use / tool_result boundary yields just the closing answer.
+ *
+ * Crossed (not boundaries): thinking-only assistant lines and non-message
+ * meta lines (`last-prompt`, `ai-title`, system, attachments) — Claude Code
+ * interleaves these freely inside a closing answer. Events from other turns
+ * never contribute: only uuids in `turnAssistantUuids` are collected.
+ * Returns '' for a turn with no text after its last tool_use (nothing worth
+ * falling back with — e.g. the turn ended in a `botmux send` call).
+ */
+export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUuids: readonly string[]): string {
+  if (turnAssistantUuids.length === 0) return '';
+  const uuids = new Set(turnAssistantUuids);
+  const lastUuid = turnAssistantUuids[turnAssistantUuids.length - 1];
+  let end = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]?.uuid === lastUuid) { end = i; break; }
+  }
+  if (end === -1) return '';
+  // The turn must actually END in text: if an assistant tool_use line follows
+  // the last text event (before any real next-turn user message), the turn
+  // closed mid-tooling — there is no final answer to fall back with.
+  for (let i = end + 1; i < events.length; i++) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    if (role === 'assistant' && hasToolUseBlock(ev)) return '';
+    if (role === 'user' && isMeaningfulUserEvent(ev)) break;
+  }
+  const tail: TranscriptEvent[] = [];
+  for (let i = end; i >= 0; i--) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    if (role === 'assistant') {
+      if (hasToolUseBlock(ev)) break;
+      if (ev.uuid && uuids.has(ev.uuid)) { tail.unshift(ev); continue; }
+      // Thinking-only / non-turn assistant lines: cross unless they belong to
+      // a DIFFERENT turn's visible text (then we've walked past our turn).
+      if (pickAssistantTextEvents([ev]).length > 0) break;
+      continue;
+    }
+    if (role === 'user') break;
+    // system / attachment / meta lines (last-prompt, ai-title, …): cross.
+  }
+  return joinAssistantText(tail);
+}
+
 /** XML wrappers Claude Code uses for synthetic user events that aren't real
  *  prompts (slash command invocation, local-command output caveat, etc.).
  *  These should usually carry `isMeta:true` and we'd filter on that — this

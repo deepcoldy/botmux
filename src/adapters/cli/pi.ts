@@ -9,6 +9,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
     id: 'pi',
+    authPaths: ['~/.pi/agent/auth.json'],
     resolvedBin: bin,
 
     buildArgs({ sessionId, initialPrompt }) {

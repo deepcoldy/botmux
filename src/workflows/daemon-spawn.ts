@@ -21,7 +21,8 @@
 
 import { fork, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -568,10 +569,10 @@ function writeAttemptTerminalSidecar(
       updatedAt: now,
       ...(status === 'closed' ? { closedAt: now } : {}),
     };
-    writeFileSync(
+    // 原子写：daemon 重启后 attempt-resume 会读这个 sidecar 恢复会话。
+    atomicWriteFileSync(
       join(dir, ATTEMPT_TERMINAL_SIDECAR),
       JSON.stringify(sidecar, null, 2),
-      'utf-8',
     );
   } catch (err) {
     appendAttemptLog(

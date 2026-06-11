@@ -1,8 +1,9 @@
 // src/dashboard.ts
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import {
-  readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, statSync,
+  readFileSync, existsSync, chmodSync, mkdirSync, statSync,
 } from 'node:fs';
+import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes, createHmac } from 'node:crypto';
@@ -47,7 +48,7 @@ function loadOrCreateSecret(): string {
   if (existsSync(SECRET_PATH)) return readFileSync(SECRET_PATH, 'utf8').trim();
   const s = randomBytes(32).toString('base64url');
   mkdirSync(dirname(SECRET_PATH), { recursive: true });
-  writeFileSync(SECRET_PATH, s, { mode: 0o600 });
+  atomicWriteFileSync(SECRET_PATH, s, { mode: 0o600 });
   chmodSync(SECRET_PATH, 0o600);
   logger.info(`[dashboard] Generated dashboard secret at ${SECRET_PATH}`);
   return s;
@@ -1230,7 +1231,7 @@ listenWithProbe({
   log: (m) => logger.warn(`[dashboard] ${m}`),
 }).then((port) => {
   boundDashboardPort = port;
-  try { writeFileSync(PORT_PATH, String(port)); } catch (e) {
+  try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);

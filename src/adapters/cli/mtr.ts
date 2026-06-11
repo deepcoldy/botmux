@@ -33,6 +33,7 @@ export function createMtrAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'mtr',
+    authPaths: ['~/.local/share/opencode/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, initialPrompt }) {

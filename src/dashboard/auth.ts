@@ -1,7 +1,8 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import {
-  readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync,
+  readFileSync, existsSync, mkdirSync, chmodSync,
 } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
 
 const NONCE_TTL_MS = 60_000;
@@ -78,7 +79,7 @@ export function loadPersistedToken(tokenPath: string): string | null {
 /** Persist the active dashboard token to `tokenPath` with 0600 perms. */
 export function persistToken(tokenPath: string, token: string): void {
   mkdirSync(dirname(tokenPath), { recursive: true });
-  writeFileSync(tokenPath, token, { mode: 0o600 });
+  atomicWriteFileSync(tokenPath, token, { mode: 0o600 });
   chmodSync(tokenPath, 0o600);
 }
 

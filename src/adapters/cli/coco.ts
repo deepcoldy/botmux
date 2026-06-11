@@ -119,6 +119,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
+    authPaths: ['~/.trae/cli/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass }) {

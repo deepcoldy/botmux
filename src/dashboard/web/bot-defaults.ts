@@ -4,7 +4,7 @@
 // after the save; existing chats are left alone, and chats already auto-bound
 // once stay user-controlled.
 import { store } from './store.js';
-import { botAvatarHtml, escapeHtml, loadNameMaps, t } from './ui.js';
+import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
 
 let cache: { bots: any[] } = { bots: [] };
 let loadError: string | null = null;
@@ -98,6 +98,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     }
   });
 
+  // /api/bots 要逐 daemon 探活，慢——先亮 loading 占住右侧详情区。
+  listEl.innerHTML = loadingHtml();
   await loadBots();
 
   function rerender() {

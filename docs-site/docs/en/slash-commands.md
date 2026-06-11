@@ -20,15 +20,18 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` — delivered literally to the underlying CLI and handled by its built-in commands.
 
-To allow more commands through, configure [`customPassthroughCommands`](/en/bots-json) for that bot (e.g. `["/goal", "/export"]`) to extend beyond the allowlist above as needed. Entries that would shadow a botmux daemon command (such as `/status`, `/help`, `/cd`) are automatically dropped — daemon commands always keep their own semantics and cannot be overridden via passthrough.
+Some CLIs also declare adapter-default passthrough commands: Claude Code and Codex default-allow `/goal`, so a new topic whose first message is `/goal ...` will start/select the repository first and then send `/goal ...` to the CLI literally.
+
+To allow more commands through, configure [`customPassthroughCommands`](/en/bots-json) for that bot (e.g. `["/export"]`) to extend beyond the allowlist above as needed. Entries that would shadow a botmux daemon command (such as `/status`, `/help`, `/cd`) are automatically dropped — daemon commands always keep their own semantics and cannot be overridden via passthrough.
 
 ## 🧩 View Available Commands
 
-`/list-slash-command` (alias `/slash`): lists the currently available slash commands in a card, in three sections —
+`/list-slash-command` (alias `/slash`): lists the currently available slash commands in a card, in four sections —
 
 1. botmux's fixed passthrough allowlist;
-2. commands this bot custom-allows via `customPassthroughCommands` in bots.json;
-3. custom commands / skills / plugins auto-discovered from the `.claude` directory (project-level + `~/.claude` + plugin cache), shown in a paginated "command ｜ description" table, with a note of any detected MCP server names.
+2. commands default-allowed by the current CLI adapter;
+3. commands this bot custom-allows via `customPassthroughCommands` in bots.json;
+4. custom commands / skills / plugins auto-discovered from the `.claude` directory (project-level + `~/.claude` + plugin cache), shown in a paginated "command ｜ description" table, with a note of any detected MCP server names.
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
 

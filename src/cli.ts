@@ -20,6 +20,7 @@
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -183,7 +184,7 @@ function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
   }
 
   try {
-    writeFileSync(pidFile, `${keepPid}\n`, 'utf-8');
+    atomicWriteFileSync(pidFile, `${keepPid}\n`);
   } catch { /* ignore */ }
 
   console.warn(`⚠️  检测到同一 PM2_HOME (${home}) 下存在多个 PM2 God Daemon，已清理重复实例；保留 pid ${keepPid}，移除: ${dupes.join(', ')}`);
@@ -3197,7 +3198,9 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
     else if (FLAGS_VAL.has(tok) && i + 1 < rest.length) flags.push(tok, rest[++i]);
     // else dropped
   }
-  writeFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, flags }));
+  // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
+  // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, flags }));
 
   const resPath = join(relayDir, `${id}.res.json`);
   const deadlineMs = Date.now() + 120_000;
@@ -4062,7 +4065,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         title: title.trim(),
         bots: built.mentionedOpenIds,
       };
-      writeFileSync(regPath, JSON.stringify(reg, null, 2));
+      // 原子写：共享 data dir，其它 bot 的 daemon 会并发读这个注册表。
+      atomicWriteFileSync(regPath, JSON.stringify(reg, null, 2));
     } catch { /* registry is best-effort */ }
 
     // 2. Optional repo prime — a plain TEXT message "@bot /repo <path>" (like a

@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, Pi) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -11,6 +11,7 @@ import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
+import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
@@ -49,6 +50,9 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // 改写过；macOS 下 `ps -o comm=` 拿到的是真实 argv[0]，因此这里需要
   // 把别名 traecli 也识别成 coco，否则 /adopt 扫不到这种会话。
   traecli: 'coco',
+  // TRAE（traex）是另一套 Codex 系 CLI，可执行就叫 `traex`，与上面 CoCo 的
+  // traecli 别名是两个不同的二进制（traecli 是 coco 的软链）。
+  traex: 'traex',
   gemini: 'gemini',
   opencode: 'opencode',
   mtr: 'mtr',
@@ -560,6 +564,12 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
         // re-probes too, so undefined here is acceptable.
         const cocoSession = findCocoSessionByPid(match.pid);
         if (cocoSession) sessionId = cocoSession.sessionId;
+      } else if (match.cliId === 'traex') {
+        // TRAE: same open-rollout-fd probe as Codex, with a TRAE-specific
+        // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
+        // pid as a fallback, so undefined here is acceptable.
+        const rollout = findTraexRolloutByPid(match.pid);
+        if (rollout) sessionId = rollout.cliSessionId;
       }
 
       // 5b. Fall back to the CLI process's own start time for uptime. Without

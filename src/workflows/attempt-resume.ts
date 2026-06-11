@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -457,7 +458,7 @@ export class AttemptResumeManager {
       ...(status === 'closed' ? { closedAt: now, closeReason: entry.closeReason } : {}),
     };
     mkdirSync(dirname(entry.sidecarPath), { recursive: true });
-    writeFileSync(entry.sidecarPath, JSON.stringify(sidecar, null, 2), 'utf-8');
+    atomicWriteFileSync(entry.sidecarPath, JSON.stringify(sidecar, null, 2));
   }
 
   private resumeUrl(webPort: number, writeToken: string): string {
