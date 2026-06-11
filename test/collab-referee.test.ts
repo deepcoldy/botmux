@@ -77,6 +77,68 @@ describe('referee', () => {
     expect(last.verdict).toBe('done');
   });
 
+  it('closes accepted derived tasks and rejects still-pending proposals when run acceptance passes', async () => {
+    const board = openCollabBoard(RUN, { baseDir });
+    await seed(board, 'true');
+    await board.append(d({
+      type: 'TaskProposed', actor: 'worker', idempotencyKey: 'prop-accepted', affectedPaths: ['proposals'],
+      taskId: 'task-1', workerId: 'w1',
+      payload: {
+        proposalId: 'proposal-report',
+        title: 'write report',
+        spec: 'write report.md',
+        why: 'acceptance needs it',
+        parentTaskId: 'task-1',
+      },
+    }));
+    await board.append(d({
+      type: 'TaskProposalResolved', actor: 'control-plane', idempotencyKey: 'prop-accepted-resolved', affectedPaths: ['proposals'],
+      payload: { proposalId: 'proposal-report', resolution: 'accepted', taskId: 'task-proposal-proposal-report' },
+    }));
+    await board.append(d({
+      type: 'TaskCreated', idempotencyKey: 'derived-created', affectedPaths: ['task'], taskId: 'task-proposal-proposal-report',
+      payload: { taskId: 'task-proposal-proposal-report', title: 'write report', spec: 'write report.md' },
+    }));
+    await board.append(d({
+      type: 'TaskAssigned', idempotencyKey: 'derived-assigned', affectedPaths: ['task'], taskId: 'task-proposal-proposal-report', workerId: 'w1',
+      payload: { taskId: 'task-proposal-proposal-report', workerId: 'w1' },
+    }));
+    await board.append(d({
+      type: 'TaskStatusChanged', actor: 'worker', idempotencyKey: 'derived-started', affectedPaths: ['task'], taskId: 'task-proposal-proposal-report',
+      payload: { taskId: 'task-proposal-proposal-report', status: 'in_progress' },
+    }));
+    await board.append(d({
+      type: 'TaskProposed', actor: 'worker', idempotencyKey: 'prop-pending', affectedPaths: ['proposals'],
+      taskId: 'task-1', workerId: 'w1',
+      payload: {
+        proposalId: 'proposal-extra',
+        title: 'extra',
+        spec: 'extra work',
+        why: 'nice to have',
+        parentTaskId: 'task-1',
+      },
+    }));
+
+    const r = await runReferee(board, { cwd, idemSuffix: 'acceptance-pass' });
+    expect(r.verdict).toBe('done');
+
+    const snap = await board.snapshot();
+    expect(snap.status).toBe('succeeded');
+    expect(snap.task?.status).toBe('done');
+    const derived = snap.tasks.find((t) => t.taskId === 'task-proposal-proposal-report');
+    expect(derived).toMatchObject({
+      status: 'done',
+      note: 'closed by run acceptance PASS (not individually verified)',
+    });
+    expect(snap.proposals.find((p) => p.proposalId === 'proposal-extra')).toMatchObject({
+      status: 'rejected',
+      reason: 'run-closed',
+    });
+
+    const tail = (await board.history()).slice(-4).map((e) => e.type);
+    expect(tail).toEqual(['TaskStatusChanged', 'TaskStatusChanged', 'TaskProposalResolved', 'RunFinished']);
+  });
+
   it('self-gates: a heartbeat with no new work since the last verdict is a no-op', async () => {
     const board = openCollabBoard(RUN, { baseDir });
     const flag = join(cwd, 'failing.txt');

@@ -24,6 +24,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type {
   AcceptanceCriteria,
+  BoardSnapshot,
   CollabBoard,
   CollabEventDraft,
   ProgressDirection,
@@ -226,10 +227,43 @@ export async function runReferee(board: CollabBoard, opts: RefereeOptions = {}):
       taskId: snap.task.taskId,
       payload: { taskId: snap.task.taskId, status: 'done' },
     } as CollabEventDraft);
+    await closeDerivedTasksOnRunAcceptance(board, snap, idem);
+    await rejectPendingProposalsOnRunClose(board, snap, idem);
     await board.append(finish(snap.runId, idem, 'succeeded', 'acceptance criteria met'));
   }
 
   return { verdict, exitCode, metricValue: signal?.value, stalled };
+}
+
+async function closeDerivedTasksOnRunAcceptance(board: CollabBoard, snap: BoardSnapshot, idem: string): Promise<void> {
+  const note = 'closed by run acceptance PASS (not individually verified)';
+  for (const task of snap.tasks) {
+    if (!task.taskId.startsWith('task-proposal-')) continue;
+    if (task.status !== 'open' && task.status !== 'in_progress') continue;
+    await board.append({
+      type: 'TaskStatusChanged',
+      runId: snap.runId,
+      actor: 'referee',
+      idempotencyKey: `done-task:${task.taskId}:${idem}`,
+      affectedPaths: ['task'],
+      taskId: task.taskId,
+      payload: { taskId: task.taskId, status: 'done', note },
+    } as CollabEventDraft);
+  }
+}
+
+async function rejectPendingProposalsOnRunClose(board: CollabBoard, snap: BoardSnapshot, idem: string): Promise<void> {
+  for (const proposal of snap.proposals) {
+    if (proposal.status !== 'pending') continue;
+    await board.append({
+      type: 'TaskProposalResolved',
+      runId: snap.runId,
+      actor: 'referee',
+      idempotencyKey: `reject-proposal:${proposal.proposalId}:run-closed:${idem}`,
+      affectedPaths: ['proposals'],
+      payload: { proposalId: proposal.proposalId, resolution: 'rejected', reason: 'run-closed' },
+    } as CollabEventDraft);
+  }
 }
 
 function finish(
