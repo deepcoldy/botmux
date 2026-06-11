@@ -24,6 +24,15 @@ function th(sort: string, label: string): string {
   return `<th data-sort="${sort}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</th>`;
 }
 
+function tokenCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function formatTokenCount(value: unknown): string {
+  const n = tokenCount(value);
+  return n === null ? '-' : n.toLocaleString('en-US');
+}
+
 const CLI_FILTER_OPTIONS = [
   'claude-code',
   'seed',
@@ -191,6 +200,8 @@ function pageHtml(): string {
         ${th('botName', t('sessions.bot'))}
         ${th('cliId', t('sessions.cli'))}
         ${th('status', t('sessions.status'))}
+        ${th('tokenIn', t('sessions.tokenIn'))}
+        ${th('tokenOut', t('sessions.tokenOut'))}
         ${th('title', t('sessions.titleCol'))}
         ${th('workingDir', t('sessions.workingDir'))}
         ${th('spawnedAt', t('sessions.created'))}
@@ -271,6 +282,8 @@ export function renderSessionsPage(root: HTMLElement) {
       <td>${escapeHtml(botDisplayName(s))}</td>
       <td><span class="badge cli-${cssToken(s.cliId)}">${escapeHtml(s.cliId ?? 'unknown')}</span></td>
       <td><span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span></td>
+      <td class="token-cell">${formatTokenCount(s.tokenUsage?.in)}</td>
+      <td class="token-cell">${formatTokenCount(s.tokenUsage?.out)}</td>
       <td title="${escapeHtml(String(s.title ?? ''))}">${escapeHtml(stripMentionPrefix(s.title ?? '').slice(0, 48))}</td>
       <td title="${escapeHtml(s.workingDir ?? '')}">${escapeHtml((s.workingDir ?? '').slice(-34))}</td>
       <td>${relTime(s.spawnedAt)}</td>
@@ -405,6 +418,8 @@ export function renderSessionsPage(root: HTMLElement) {
 
   function sortValue(s: any, key: string): string | number | boolean {
     if (key === 'spawnedAt' || key === 'lastMessageAt') return Number(s[key] ?? 0);
+    if (key === 'tokenIn') return tokenCount(s.tokenUsage?.in) ?? -1;
+    if (key === 'tokenOut') return tokenCount(s.tokenUsage?.out) ?? -1;
     if (key === 'adopt') return !!s.adopt;
     return String(s[key] ?? '').toLowerCase();
   }
@@ -477,7 +492,7 @@ export function renderSessionsPage(root: HTMLElement) {
     if (viewMode === 'table') {
       const tableHtml = rows.length
         ? rows.map(rowHtml).join('')
-        : `<tr><td colspan="10" class="empty">${t('sessions.empty')}</td></tr>`;
+        : `<tr><td colspan="12" class="empty">${t('sessions.empty')}</td></tr>`;
       if (tableHtml !== lastTableHtml) {
         lastTableHtml = tableHtml;
         tbody.innerHTML = tableHtml;

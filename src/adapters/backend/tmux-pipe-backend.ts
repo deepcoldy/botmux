@@ -222,10 +222,10 @@ export class TmuxPipeBackend implements SessionBackend {
     this.sendText(data);
   }
 
-  sendText(text: string): void {
-    if (this.exited) return;
+  sendText(text: string): boolean {
+    if (this.exited) return false;
     this.exitCopyModeIfNeeded();
-    this.guardedSend('send-keys (text)', () => {
+    return this.guardedSend('send-keys (text)', () => {
       execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
         stdio: 'ignore',
         timeout: 5000,
@@ -234,10 +234,10 @@ export class TmuxPipeBackend implements SessionBackend {
     });
   }
 
-  sendSpecialKeys(...keys: string[]): void {
-    if (this.exited) return;
+  sendSpecialKeys(...keys: string[]): boolean {
+    if (this.exited) return false;
     this.exitCopyModeIfNeeded();
-    this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
+    return this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
       execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
         stdio: 'ignore',
         timeout: 5000,
@@ -297,14 +297,20 @@ export class TmuxPipeBackend implements SessionBackend {
    *
    * Either way this method never throws — every send-keys caller (web-terminal
    * keys, TUI input, the typing loop) stays crash-safe without its own guard.
+   *
+   * Returns true when the write succeeded, false when it was dropped (pane gone
+   * or a pane-alive hiccup). Callers that verify submission (runner adapters)
+   * read this to report a non-submission; the many fire-and-forget callers
+   * (web-terminal keys, copy-mode) just ignore it.
    */
-  private guardedSend(op: string, run: () => void): void {
+  private guardedSend(op: string, run: () => void): boolean {
     try {
       run();
+      return true;
     } catch (err: any) {
       // A kill()/handlePaneExit() may have flipped exited between the guard
       // and here; if so the teardown already happened.
-      if (this.exited) return;
+      if (this.exited) return false;
       const alive = this.isPaneAlive();
       process.stderr.write(
         `[tmux-pipe-backend] ${op} failed (pane ${alive ? 'ALIVE' : 'GONE'}): ${err?.message ?? err}\n`,
@@ -320,6 +326,7 @@ export class TmuxPipeBackend implements SessionBackend {
         }
         this.handlePaneExit();
       }
+      return false;
     }
   }
 

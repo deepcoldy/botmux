@@ -205,6 +205,7 @@ const SYNTHETIC_USER_PREFIXES = [
   '<local-command-caveat>',
   '<local-command-stdout>',
   '<local-command-stderr>',
+  '<task-notification>',
 ];
 
 /** True when a `type:'user'` (or `message.role:'user'`) event represents a
@@ -240,6 +241,7 @@ export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined
   if (!ev || typeof ev !== 'object') return false;
   if (ev.type !== 'attachment') return false;
   if (ev.attachment?.type !== 'queued_command') return false;
+  if (ev.attachment.commandMode === 'task-notification') return false;
   if ((ev as any).isSidechain === true) return false;
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;

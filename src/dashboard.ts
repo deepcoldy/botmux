@@ -56,6 +56,8 @@ function loadOrCreateSecret(): string {
 // The active dashboard token is persisted to disk so a previously-issued
 // dashboard URL survives `botmux restart`; only `botmux dashboard` (the
 // /__cli/rotate endpoint) rotates it and thereby invalidates the old link.
+// The start/restart hint reads it via the non-rotating /__cli/current endpoint
+// so it can show the live link without invalidating it.
 let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
 
 // The port we actually bound (may differ from config.dashboard.port after an
@@ -360,6 +362,30 @@ async function closeSessionsMatching(
   }));
 }
 
+/**
+ * Shared loopback-HMAC gate for the `/__cli/*` endpoints. Returns `{ ok: true }`
+ * on success, or a ready-to-send `{ status, body }` error otherwise.
+ */
+function verifyCliRequest(req: IncomingMessage):
+  | { ok: true }
+  | { ok: false; status: number; body: Record<string, unknown> } {
+  const ts = req.headers['x-botmux-cli-ts'];
+  const nonce = req.headers['x-botmux-cli-nonce'];
+  const sig = req.headers['x-botmux-cli-auth'];
+  if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') {
+    return { ok: false, status: 400, body: { error: 'missing_headers' } };
+  }
+  const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  const r = verifyHmac(SECRET, { ts, nonce, sig }, remote);
+  if (!r.ok) return { ok: false, status: 401, body: { error: 'unauthorized', reason: r.reason } };
+  return { ok: true };
+}
+
+/** Build the dashboard URL for a token, using the actually-bound port. */
+function dashboardUrlFor(token: string): string {
+  return `http://${config.dashboard.externalHost}:${boundDashboardPort}/?t=${token}`;
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -387,25 +413,29 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // CLI rotate (HMAC + loopback only) — for `botmux dashboard`
+    // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
+    // token, invalidating any previously-issued link.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
-      const ts = req.headers['x-botmux-cli-ts'];
-      const nonce = req.headers['x-botmux-cli-nonce'];
-      const sig = req.headers['x-botmux-cli-auth'];
-      if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') {
-        return jsonRes(res, 400, { error: 'missing_headers' });
-      }
-      const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
-      const r = verifyHmac(SECRET, { ts, nonce, sig }, remote);
-      if (!r.ok) return jsonRes(res, 401, { error: 'unauthorized', reason: r.reason });
+      const gate = verifyCliRequest(req);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       activeToken = generateToken();
       try {
         persistToken(TOKEN_PATH, activeToken);
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
       }
-      const fullUrl = `http://${config.dashboard.externalHost}:${boundDashboardPort}/?t=${activeToken}`;
-      return jsonRes(res, 200, { url: fullUrl });
+      return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
+    }
+
+    // CLI read current URL (HMAC + loopback only) — for the start/restart hint.
+    // Unlike /__cli/rotate this does NOT mint a token, so an already-issued
+    // dashboard link survives restart untouched. 404 → no token has ever been
+    // minted (caller falls back to suggesting `botmux dashboard`).
+    if (req.method === 'POST' && url.pathname === '/__cli/current') {
+      const gate = verifyCliRequest(req);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
+      return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
     }
 
     const presentedToken = authedToken(req, url);

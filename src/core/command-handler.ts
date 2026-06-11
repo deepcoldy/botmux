@@ -6,7 +6,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -34,6 +34,7 @@ import {
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
+import { canOperate } from '../im/lark/event-dispatcher.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
 import { writeRoleFile, deleteRoleFile, resolveRole, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
 import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
@@ -711,7 +712,7 @@ async function handleConfigCommand(
 // ─── Main command handler ────────────────────────────────────────────────────
 
 /**
- * Handle `/card` (owner-only). Resolves the active session itself, so off/on
+ * Handle `/card` (operator-only). Resolves the active session itself, so off/on
  * work WITHOUT one -- they only toggle the per-chat `noCardChats` config. A
  * summon (show/bare) needs a live session.
  *
@@ -734,9 +735,12 @@ export async function handleCardCommand(
   const loc = localeForBot(larkAppId);
   const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
 
-  const ownerOpenId = getOwnerOpenId(larkAppId);
-  if (!ownerOpenId || !senderOpenId || senderOpenId !== ownerOpenId) {
-    await reply(t('cmd.card.owner_only', undefined, loc));
+  // /card is an operator command — gate on canOperate, the same model every other
+  // daemon command uses. Open mode (no owner/allowlist) → canOperate passes for
+  // everyone; configured → any allowedUser (owner or co-owner); talk-only grantees
+  // (chatGrant/globalGrant/oncall members) are never operators.
+  if (!canOperate(larkAppId, chatId, senderOpenId)) {
+    await reply(t('cmd.card.operator_only', undefined, loc));
     return;
   }
 
@@ -791,18 +795,18 @@ export async function handleCardCommand(
 }
 
 /**
- * Handle `/term` (owner-only) — the slash-command twin of the "🔑 获取操作链接"
- * card button. Privately hands the owner a writable (token-bearing) terminal card:
- * an in-chat visible-to-you ephemeral card in plain groups, auto-falling back to a
- * DM in topic / p2p chats. The link rides only that private channel — never the
- * group. Gated identically to /card (`senderOpenId === owner`), and strictly
- * needs a live session whose terminal is up. Routed for both the new-topic path
- * (daemon.ts) and the existing-session switch below.
+ * Handle `/term` (operator-only) — the slash-command twin of the "🔑 获取操作链接"
+ * card button. Privately hands the operator a writable (token-bearing) terminal
+ * card: an in-chat visible-to-you ephemeral card in plain groups, auto-falling back
+ * to a DM in topic / p2p chats. The link rides only that private channel — never the
+ * group. Gated identically to /card (`canOperate`), and strictly needs a live
+ * session whose terminal is up. Routed for both the new-topic path (daemon.ts) and
+ * the existing-session switch below.
  */
 export async function handleTermLinkCommand(
   rootId: string,
   larkAppId: string,
-  _chatId: string,
+  chatId: string,
   senderOpenId: string | undefined,
   _content: string,
   deps: CommandHandlerDeps,
@@ -810,9 +814,12 @@ export async function handleTermLinkCommand(
   const loc = localeForBot(larkAppId);
   const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
 
-  const ownerOpenId = getOwnerOpenId(larkAppId);
-  if (!ownerOpenId || !senderOpenId || senderOpenId !== ownerOpenId) {
-    await reply(t('cmd.term.owner_only', undefined, loc));
+  // /term is an operator command that hands out a *writable* terminal link — gate
+  // on canOperate (same model as other daemon commands). senderOpenId must be
+  // present: open-mode canOperate passes even an undefined sender, but the writable
+  // card is delivered privately to that exact open_id.
+  if (!senderOpenId || !canOperate(larkAppId, chatId, senderOpenId)) {
+    await reply(t('cmd.term.operator_only', undefined, loc));
     return;
   }
 

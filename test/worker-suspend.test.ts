@@ -18,7 +18,8 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-import { isSuspendableBackendType, suspendWorker } from '../src/core/worker-pool.js';
+import { suspendWorker } from '../src/core/worker-pool.js';
+import { isSuspendableBackendType } from '../src/core/persistent-backend.js';
 
 const CLI_IDS: CliId[] = [
   'claude-code',

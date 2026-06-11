@@ -12,7 +12,7 @@ import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
-import { chatHasAllowedUser, resolveGroupJoinPrompt } from './core/auto-start.js';
+import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, isDaemonBotConfig, isUserVisibleBotConfig, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -2011,6 +2011,39 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   return jsonRes(res, 200, { ok: true });
 });
 
+// ─── session-ready IPC route (internal: Claude-family 真就绪信号) ─────────────
+//
+// NOT an agent-facing command. Claude/Seed 的 SessionStart hook 经
+// `botmux session-ready`（cli.ts cmdSessionReady）调到这里，daemon 把信号转发给
+// 该会话的 worker；worker 放行被 ready-gate 门控的首条 prompt（绕开 cjadk 启动
+// 选择器吞首条消息）。找不到会话 / worker 仍返回 200（best-effort）：worker 侧
+// 有超时兜底，信号丢失不致命，没必要让 hook 客户端报错。
+ipcRoute('POST', '/api/session-ready', async (req, res) => {
+  let raw: { sessionId?: unknown; source?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+  const source = typeof raw.source === 'string' ? raw.source : undefined;
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  if (ds?.worker) {
+    try {
+      ds.worker.send({ type: 'session_ready', source } as DaemonToWorker);
+      logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
+    } catch (err) {
+      logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return jsonRes(res, 200, { ok: true });
+});
+
 // ─── hooks emit 转发端点 ────────────────────────────────────────────────────
 // CLI side（botmux send 等）调用 emitHookEvent 时，把事件转发到 daemon 这条
 // 接口；daemon 在自己的长寿命事件循环里负责 spawn hook、跑 timeout、超时杀
@@ -2151,6 +2184,8 @@ async function resolvePinnedWorkingDir(ctx: {
   const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
   return { pinnedWorkingDir, oncallEntry, inheritedFrom };
 }
+
+export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
 
 async function replyInvalidWorkingDirs(
   anchor: string,
@@ -2560,16 +2595,26 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
   if (priorAnchorKey) groupJoinAnchorByChat.delete(chatLiveKey); // stale entry, will re-register below
   autoStartJoinInFlight.add(lockKey);
   try {
-    // D7 gate: an allowedUser must be a member of the chat.
-    let memberOpenIds: string[];
+    // D7 gate: an allowedUser must be a member of the chat. Alarm/oncall
+    // platforms (e.g. Nexus) create the chat, add bots first and the human
+    // members moments later — a one-shot membership snapshot here races
+    // against that and loses, so re-check with backoff before giving up
+    // (the in-flight lock above keeps duplicate bot.added events deduped
+    // while we wait).
+    let hasAllowedUser: boolean;
     try {
-      memberOpenIds = await listChatMemberOpenIds(larkAppId, chatId);
+      hasAllowedUser = await waitForAllowedUserInChat({
+        listMembers: () => listChatMemberOpenIds(larkAppId, chatId),
+        allowedUsers: bot.resolvedAllowedUsers,
+        onRetry: (attempt, delayMs) =>
+          logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 暂无 allowedUser 成员，${delayMs}ms 后重查（第 ${attempt} 次）`),
+      });
     } catch (err: any) {
       logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉群成员失败：${err?.message ?? err}`);
       await warnGroupJoinScopeOnce(larkAppId, String(err?.message ?? err));
       return;
     }
-    if (!chatHasAllowedUser(memberOpenIds, bot.resolvedAllowedUsers)) {
+    if (!hasAllowedUser) {
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 群内无 allowedUser 成员，忽略`);
       return;
     }
@@ -2886,7 +2931,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // /term only hands out a writable link for an ALREADY-live session — it must
       // never pre-create one. Special-case it before the canOperate gate + the
       // pre-create block below (mirrors the new-topic route + /card). Its own
-      // owner gate (stricter than canOperate) is the sole authority; without this,
+      // canOperate gate (inside the handler) is the sole authority; without this,
       // /term in a thread with no existingDs would spawn a worker:null phantom
       // session and pollute the dashboard before replying not_ready/owner_only.
       if (cmd === '/term') {
@@ -3117,34 +3162,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.scope = scope;
     sessionStore.updateSession(session);
 
-    // Oncall group: pin working dir from the chat-level binding, even if a
-    // sibling bot (running in another daemon) is the one that persisted it.
-    // Defaults auto-bind path mirrors handleNewTopic — keep both call sites
-    // in sync (this is the auto-create branch that fires when routing lands
-    // here without an active session, e.g. chat-scope first-reply paths).
-    let oncallEntry = findOncallChatForAnyBot(autoCreateChatId);
-    if (!oncallEntry) {
-      oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, autoCreateChatId, autoCreateChatType);
-    }
-
-    // Cross-bot / chat-scope inheritance — see findInheritablePeer comments.
-    const inheritedFrom = !oncallEntry
-      ? findInheritablePeer({
-          scope,
-          anchor,
-          chatId: autoCreateChatId,
-          chatType: autoCreateChatType,
-          selfAppId: larkAppId,
-        })
-      : null;
-
-    // Last-resort fallback: this bot's `defaultWorkingDir`. See handleNewTopic
-    // for the symmetric block — both call sites must stay in sync.
-    const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-      ? resolveBotDefaultWorkingDir(larkAppId)
-      : undefined;
-
-    const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+    // Use the same layered oncall / inherit / default lookup as handleNewTopic
+    // so stale inherited peers are ignored consistently in both spawn paths.
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({
+      scope,
+      anchor,
+      chatId: autoCreateChatId,
+      chatType: autoCreateChatType,
+      larkAppId,
+    });
     // Now we know the message will spawn or pend a real session — resolve
     // sender (may await contact API budget) since every downstream branch
     // injects it either into the immediate prompt or stashes it on

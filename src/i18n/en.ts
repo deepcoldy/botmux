@@ -180,8 +180,8 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
-  'cmd.card.owner_only': '⚠️ Only the bot owner can use /card.',
-  'cmd.term.owner_only': '⚠️ Only the bot owner can use /term to get the operable terminal link.',
+  'cmd.card.operator_only': '⚠️ Only authorized users (allowedUsers) can use /card.',
+  'cmd.term.operator_only': '⚠️ Only authorized users (allowedUsers) can use /term to get the operable terminal link.',
   'cmd.term.no_session': 'No active session in this topic — /term needs a running session.',
   'cmd.term.not_ready': '🔒 Terminal isn’t ready yet; send /term again once the session is up.',
   'cmd.term.failed': '⚠️ Failed to send the operable link (both the private card and DM failed); check the daemon logs.',

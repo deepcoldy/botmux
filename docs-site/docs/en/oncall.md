@@ -53,6 +53,8 @@ From then on, **all of the bot's unbound groups** automatically bind to this dir
 - Only the **owner** can switch session state (`/cd`, `/restart`, `/close`, clicking the streaming card buttons)
 - This prevents external group members from accidentally messing up the session
 
+> Want semi-trusted members' **changes to also never touch the real repo**? Enable the [File Sandbox](/en/sandbox) — all writes are isolated and only land after the owner reviews the diff.
+
 ## Take Off with Scheduled Tasks
 
 In an on-call group, send `/schedule 每天9:00 检查昨天的报警趋势并总结` to feed a report into the group at a fixed time every day — even when you're off duty, the bot keeps an eye on things for you. The reply card automatically "sends to @asker / cc @owner", so you can stay on top of group activity remotely too.

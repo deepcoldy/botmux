@@ -228,9 +228,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    // TRAE's prompt indicator is identical to Codex's `›`. The status bar
-    // does not currently surface a "% left" counter, so only `›` is needed.
-    readyPattern: /›/,
+    // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
+    // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
+    readyPattern: /[›❯]|\d+% left/,
     systemHints: BOTMUX_SHELL_HINTS,
     // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
     // a turn is running is parked and merged into the active turn.

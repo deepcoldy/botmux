@@ -14,14 +14,12 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
-import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
-import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
+import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, killPersistentSession } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
-import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
-import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
+import type { BackendType } from '../adapters/backend/types.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
@@ -858,32 +856,6 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
-}
-
-function getSessionPersistentBackendType(ds: DaemonSession): Exclude<BackendType, 'pty'> | undefined {
-  let backendType = config.daemon.backendType;
-  try {
-    backendType = getBot(ds.larkAppId).config.backendType ?? backendType;
-  } catch { /* bot deregistered */ }
-  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij' ? backendType : undefined;
-}
-
-function persistentSessionName(backendType: Exclude<BackendType, 'pty'>, sessionId: string): string {
-  if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);
-  if (backendType === 'zellij') return ZellijBackend.sessionName(sessionId);
-  return HerdrBackend.sessionName(sessionId);
-}
-
-function probePersistentSession(backendType: Exclude<BackendType, 'pty'>, name: string): SessionProbe {
-  if (backendType === 'tmux') return TmuxBackend.probeSession(name);
-  if (backendType === 'zellij') return ZellijBackend.probeSession(name);
-  return HerdrBackend.probeSession(name);
-}
-
-function killPersistentSession(backendType: Exclude<BackendType, 'pty'>, name: string): void {
-  if (backendType === 'tmux') TmuxBackend.killSession(name);
-  else if (backendType === 'zellij') ZellijBackend.killSession(name);
-  else HerdrBackend.killSession(name);
 }
 
 /**

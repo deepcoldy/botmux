@@ -11,6 +11,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
+import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -54,6 +55,8 @@ export interface SessionRow {
    *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
    *  which a silent raise never bumps. Feeds the needs-you column. */
   agentAttention?: { kind: string; reason: string; at: number };
+  /** Native Agent CLI token usage for this session. Null means unavailable. */
+  tokenUsage?: SessionTokenUsage | null;
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -76,6 +79,15 @@ function sessionCreatedAtMs(s: Session): number {
 
 export function sessionLastActivityAtMs(s: Session): number {
   return parseSessionTime(s.lastMessageAt) ?? sessionCreatedAtMs(s);
+}
+
+function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage | null {
+  return getSessionTokenUsage({
+    cliId: s.cliId ?? 'unknown',
+    sessionId: s.sessionId,
+    cliSessionId: s.cliSessionId,
+    cwd: workingDir ?? s.workingDir,
+  });
 }
 
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
@@ -109,6 +121,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     agentAttention: ds.agentAttention
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
+    tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
   };
 }
 
@@ -131,5 +144,6 @@ export function composeRowFromClosed(s: Session): SessionRow {
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
     feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
+    tokenUsage: sessionTokenUsage(s),
   };
 }

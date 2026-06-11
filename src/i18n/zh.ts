@@ -183,8 +183,8 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
-  'cmd.card.owner_only': '⚠️ 仅 bot 主人可以使用 /card。',
-  'cmd.term.owner_only': '⚠️ 仅 bot 主人可以用 /term 获取可操作终端链接。',
+  'cmd.card.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /card。',
+  'cmd.term.operator_only': '⚠️ 仅授权用户（allowedUsers）可以用 /term 获取可操作终端链接。',
   'cmd.term.no_session': '当前话题没有活跃会话，/term 需要一个跑着的会话。',
   'cmd.term.not_ready': '🔒 终端还没就绪，等会话起好后再发 /term。',
   'cmd.term.failed': '⚠️ 可操作链接发送失败（私密卡与 DM 均失败），看 daemon 日志。',

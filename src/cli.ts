@@ -1344,6 +1344,7 @@ async function cmdStart(): Promise<void> {
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`   autostart unit 已同步到当前 Node/cli.js 路径`);
   }
+  await printDashboardHintWithRetry();
 }
 
 /**
@@ -1464,6 +1465,7 @@ async function cmdRestart(): Promise<void> {
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
   }
+  await printDashboardHintWithRetry();
 }
 
 /** Wraps `ensureDependencies()`. Neither tmux nor fonts are load-bearing —
@@ -1566,23 +1568,26 @@ function cmdUpgrade(): void {
 }
 
 /**
- * Print a fresh dashboard URL by HMAC-authing to the dashboard process's
- * loopback rotation endpoint. Each call invalidates the previously-issued
- * token, so sharing a URL is the same as sharing a one-shot session.
+ * Call one of the dashboard's loopback HMAC `/__cli/*` endpoints.
+ * - `/__cli/rotate` mints a fresh token and returns its URL, invalidating the
+ *   previously-issued link.
+ * - `/__cli/current` returns the existing token's URL WITHOUT rotating (404 →
+ *   no token has ever been minted → `no-active-token`).
+ * Returns { ok: true, url } on success, or { ok: false, reason } so callers can
+ * decide how to surface the failure (hard error vs soft hint).
  */
-async function cmdDashboard(): Promise<void> {
+async function callDashboardEndpoint(
+  path: '/__cli/rotate' | '/__cli/current',
+): Promise<
+  | { ok: true; url: string }
+  | { ok: false; reason: 'no-secret' | 'unreachable' | 'http-error' | 'no-active-token'; detail?: string }
+> {
   const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
-  if (!existsSync(SECRET_PATH)) {
-    console.error('Dashboard not initialised. Run `botmux restart` first.');
-    process.exit(1);
-  }
+  if (!existsSync(SECRET_PATH)) return { ok: false, reason: 'no-secret' };
   const secret = readFileSync(SECRET_PATH, 'utf8').trim();
   const ts = Math.floor(Date.now() / 1000).toString();
   const nonce = randomBytes(8).toString('hex');
   const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
-  // Prefer the port the dashboard actually bound (it probes upward on
-  // EADDRINUSE, so the live port can differ from the configured default). The
-  // running dashboard refreshes this file on every successful bind.
   const portFile = join(CONFIG_DIR, '.dashboard-port');
   const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
     || process.env.BOTMUX_DASHBOARD_PORT
@@ -1590,7 +1595,7 @@ async function cmdDashboard(): Promise<void> {
 
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}/__cli/rotate`, {
+    res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method: 'POST',
       headers: {
         'X-Botmux-Cli-Ts': ts,
@@ -1599,17 +1604,74 @@ async function cmdDashboard(): Promise<void> {
       },
     });
   } catch {
+    return { ok: false, reason: 'unreachable' };
+  }
+  if (res.status === 404) return { ok: false, reason: 'no-active-token' };
+  if (!res.ok) {
+    return { ok: false, reason: 'http-error', detail: `${res.status} ${await res.text()}` };
+  }
+  const body = await res.json() as { url: string };
+  return { ok: true, url: body.url };
+}
+
+/**
+ * Best-effort dashboard hint printed after start/restart. Reads the LIVE link
+ * via /__cli/current (non-rotating) so an already-shared URL is preserved.
+ * Retries for a few seconds since the dashboard process boots after the daemon;
+ * if it still isn't ready, prints a soft fallback so the user isn't blocked.
+ */
+async function printDashboardHintWithRetry(): Promise<void> {
+  const maxWaitMs = 6000;
+  const stepMs = 500;
+  const started = Date.now();
+  let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
+  while (Date.now() - started < maxWaitMs) {
+    last = await callDashboardEndpoint('/__cli/current');
+    if (last.ok) {
+      console.log(`   面板: botmux dashboard (${last.url})`);
+      return;
+    }
+    // Terminal states — file-backed secret/token won't appear mid-poll, unlike
+    // a not-yet-listening port. Don't spin on them.
+    if (last.reason === 'no-secret' || last.reason === 'no-active-token') break;
+    await new Promise(r => setTimeout(r, stepMs));
+  }
+  // Soft fallback
+  if (last?.reason === 'no-active-token') {
+    console.log('   面板: 运行 `botmux dashboard` 获取链接');
+  } else if (last?.reason === 'no-secret') {
+    console.log('   面板: dashboard 凭证未就绪，启动后可用 `botmux dashboard` 获取链接');
+  } else {
+    console.log('   面板: `botmux dashboard`（daemon 启动中，稍后可获取链接）');
+  }
+}
+
+/**
+ * Print a fresh dashboard URL by HMAC-authing to the dashboard process's
+ * loopback rotation endpoint. Each call invalidates the previously-issued
+ * token, so sharing a URL is the same as sharing a one-shot session.
+ */
+async function cmdDashboard(): Promise<void> {
+  const r = await callDashboardEndpoint('/__cli/rotate');
+  if (r.ok) {
+    console.log(r.url);
+    return;
+  }
+  if (r.reason === 'no-secret') {
+    console.error('Dashboard not initialised. Run `botmux restart` first.');
+  } else if (r.reason === 'unreachable') {
+    const portFile = join(CONFIG_DIR, '.dashboard-port');
+    const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+      || process.env.BOTMUX_DASHBOARD_PORT
+      || '7891';
     console.error(
       `dashboard process not reachable on 127.0.0.1:${port} — \`botmux restart\` will start it`,
     );
-    process.exit(1);
+  } else {
+    // `no-active-token` can't occur on rotate (it always mints); fall through.
+    console.error('Rotation failed:', r.detail ?? r.reason);
   }
-  if (!res.ok) {
-    console.error('Rotation failed:', res.status, await res.text());
-    process.exit(1);
-  }
-  const body = await res.json() as { url: string };
-  console.log(body.url);
+  process.exit(1);
 }
 
 // ─── Session helpers ──────────────────────────────────────────────────────────
@@ -4690,6 +4752,49 @@ async function cmdHook(cliId: string): Promise<void> {
   process.exit(0);
 }
 
+// ─── botmux session-ready ─────────────────────────────────────────────────────
+//
+// Claude 家族（claude/seed）的 SessionStart hook 客户端。Claude 在 TUI 输入框
+// 真正渲染就绪时（startup / resume / clear / compact）触发本命令；它通知 daemon
+// 「CLI 真就绪」，放行 worker 端被 ready-gate 门控的首条 prompt——绕开 cjadk 之类
+// 自定义 launcher 启动选择器的 ❯ 误命中 readyPattern、把首条消息整条吞掉的 bug。
+//
+// 会话归属只靠 hook 子进程继承的 env（worker spawn 时设的 BOTMUX_SESSION_ID /
+// BOTMUX_LARK_APP_ID）。任何失败（env 缺失=adopt/非 botmux 会话、daemon 不可达）
+// 都静默 exit 0：绝不挂死 CLI 启动；信号丢了 worker 有超时兜底。
+async function cmdSessionReady(): Promise<void> {
+  // 排空 stdin：Claude 把 SessionStart payload 写到这里。我们只取 source 字段
+  // （诊断用），但务必消费掉，避免 CLI 端写满管道阻塞。best-effort。
+  let payloadText = '';
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    payloadText = Buffer.concat(chunks).toString('utf-8');
+  } catch { /* stdin 读不到也无所谓 */ }
+  let source: string | undefined;
+  try {
+    const p = JSON.parse(payloadText);
+    if (p && typeof p.source === 'string') source = p.source;
+  } catch { /* 非 JSON / 空 → 不带 source */ }
+
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  // env 缺失 → adopt / 非 botmux 会话；就绪门控对它们不适用，静默放行。
+  if (!sessionId || !larkAppId) process.exit(0);
+
+  const daemon = findDaemon(larkAppId);
+  if (daemon) {
+    try {
+      await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/session-ready`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, source }),
+      });
+    } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
+  }
+  process.exit(0);
+}
+
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -5288,6 +5393,12 @@ switch (command) {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';
     await cmdHook(cliId);
+    break;
+  }
+  case 'session-ready': {
+    // `botmux session-ready` — Claude 家族 SessionStart hook 客户端，通知 daemon
+    // 「CLI 真就绪」，放行被门控的首条 prompt。
+    await cmdSessionReady();
     break;
   }
   case 'workflow': {

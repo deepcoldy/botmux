@@ -1,9 +1,13 @@
 export interface PtyHandle {
   write(data: string): void;
-  /** Send text literally via tmux send-keys -l (tmux mode only). */
-  sendText?(text: string): void;
-  /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only). */
-  sendSpecialKeys?(...keys: string[]): void;
+  /** Send text literally via tmux send-keys -l (tmux mode only).
+   *  Returns `false` when the write was dropped (e.g. send-keys failed while the
+   *  pane is still alive) so callers can surface a non-submission; `void`/`true`
+   *  means the write was issued. Backends that can't tell return void. */
+  sendText?(text: string): void | boolean;
+  /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
+   *  Returns `false` on a dropped write (see sendText). */
+  sendSpecialKeys?(...keys: string[]): void | boolean;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
@@ -152,6 +156,15 @@ export interface CliAdapter {
    *
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
+
+  /** Claude-family CLIs only. When true, the adapter injects a `SessionStart`
+   *  hook at spawn (process-level `--settings`) that calls `botmux session-ready`
+   *  once the CLI's input box is genuinely rendered. The worker arms a ready-gate
+   *  on this flag and holds the FIRST prompt until the signal arrives (or a
+   *  fallback timeout), so a startup launcher's selector `❯` — which falsely
+   *  matches `readyPattern` — can't trip an early flush that the selector eats.
+   *  undefined/false → no gate (every other CLI behaves exactly as before). */
+  readonly injectsReadyHook?: boolean;
 
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */

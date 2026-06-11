@@ -316,9 +316,21 @@ vi.mock('../src/services/oncall-store.js', () => ({
   getOncallStatus: vi.fn(() => undefined),
 }));
 
+// /card and /term gate on canOperate (the operator model). Default allow; tests
+// flip the return per-scenario to exercise the gate without re-testing canOperate's
+// own open-mode / allowlist / peer-bot logic (that lives in event-dispatcher).
+vi.mock('../src/im/lark/event-dispatcher.js', () => ({
+  canOperate: vi.fn(() => true),
+}));
+
+vi.mock('../src/services/card-mode-store.js', () => ({
+  setCardMode: vi.fn(async () => ({ ok: true })),
+}));
+
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile, resolveRole } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
@@ -328,6 +340,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
+import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -2572,19 +2585,74 @@ describe('/role subcommand routing', () => {
   });
 });
 
-describe('/term — operable terminal slash command (owner-only)', () => {
+describe('/card — operator / canOperate gate', () => {
+  const CHAT_ID = 'oc_chat_1';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    vi.mocked(setCardMode).mockResolvedValue({ ok: true } as any);
+  });
+
+  it('rejects a non-operator (canOperate=false): operator_only notice, no mode change', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const deps = makeDeps();
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_random', '/card off', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('仅授权用户');
+    expect(setCardMode).not.toHaveBeenCalled();
+  });
+
+  it('operator: /card off toggles the per-chat streaming card off', async () => {
+    const deps = makeDeps();
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card off', deps);
+    expect(setCardMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已关闭');
+  });
+
+  it('open mode: a non-owner sender passes canOperate and /card on works', async () => {
+    const deps = makeDeps();
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_random', '/card on', deps);
+    expect(setCardMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已恢复');
+  });
+});
+
+describe('/term — operable terminal slash command (operator / canOperate)', () => {
   const ownerMsg = (over: Partial<LarkMessage> = {}) => makeLarkMessage('/term', { senderId: 'ou_owner', ...over });
 
   beforeEach(() => {
+    vi.clearAllMocks();
     vi.mocked(getOwnerOpenId).mockReturnValue('ou_owner');
+    vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('ephemeral');
   });
 
-  it('rejects a non-owner sender and never delivers a card', async () => {
+  it('rejects a non-operator (canOperate=false) and never delivers a card', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
     const deps = makeDeps(makeDaemonSession({ workerPort: 41000, workerToken: 't' }));
     await handleCommand('/term', ROOT_ID, makeLarkMessage('/term', { senderId: 'ou_random' }), deps, LARK_APP_ID);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-    expect(reply).toContain('仅 bot 主人');
+    expect(reply).toContain('仅授权用户');
+    expect(deliverWritableTerminalCardTo).not.toHaveBeenCalled();
+  });
+
+  it('open mode / operator: a non-owner sender passes canOperate and gets the card', async () => {
+    // canOperate=true (open mode returns true for everyone) → delivery goes to the
+    // actual sender, not a fixed owner.
+    const ds = makeDaemonSession({ workerPort: 41000, workerToken: 'wtok' });
+    const deps = makeDeps(ds);
+    await handleCommand('/term', ROOT_ID, makeLarkMessage('/term', { senderId: 'ou_random' }), deps, LARK_APP_ID);
+    expect(deliverWritableTerminalCardTo).toHaveBeenCalledWith(ds, 'ou_random');
+  });
+
+  it('rejects when senderOpenId is missing even if canOperate passes (needs a recipient)', async () => {
+    const deps = makeDeps(makeDaemonSession({ workerPort: 41000, workerToken: 't' }));
+    await handleCommand('/term', ROOT_ID, makeLarkMessage('/term', { senderId: undefined as any }), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('仅授权用户');
     expect(deliverWritableTerminalCardTo).not.toHaveBeenCalled();
   });
 

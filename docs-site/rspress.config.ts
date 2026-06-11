@@ -33,6 +33,7 @@ const zhSidebar = [
       { text: '一键建会话群', link: '/group' },
       { text: '定时任务', link: '/schedule' },
       { text: 'Oncall 模式', link: '/oncall' },
+      { text: '文件沙盒', link: '/sandbox' },
       { text: '语音总结', link: '/voice' },
       { text: 'Dashboard 管控面', link: '/dashboard' },
       { text: '接入点（Webhook）', link: '/webhook' },
@@ -103,6 +104,7 @@ const enSidebar = [
       { text: 'One-Click Session Groups', link: '/en/group' },
       { text: 'Scheduled Tasks', link: '/en/schedule' },
       { text: 'On-Call Mode', link: '/en/oncall' },
+      { text: 'File Sandbox', link: '/en/sandbox' },
       { text: 'Voice Summary', link: '/en/voice' },
       { text: 'Dashboard', link: '/en/dashboard' },
       { text: 'Webhook Ingress', link: '/en/webhook' },
@@ -166,7 +168,7 @@ export default defineConfig({
   search: { codeBlocks: true },
   markdown: { link: { checkDeadLinks: true } },
   builderConfig: {
-    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v15/" },
+    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v16/" },
   },
   themeConfig: {
     editLink: {

@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { writeRunnerInput } from './runner-input.js';
 
 function runnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -16,10 +17,6 @@ function runnerPath(): string {
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
   args.push(key, value);
-}
-
-function encodeInput(content: string): string {
-  return Buffer.from(JSON.stringify({ type: 'message', content }), 'utf8').toString('base64');
 }
 
 export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
@@ -54,18 +51,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      const line = `::botmux-codex-app:${encodeInput(content)}`;
-      try {
-        if (pty.sendText && pty.sendSpecialKeys) {
-          pty.sendText(line);
-          pty.sendSpecialKeys('Enter');
-        } else {
-          pty.write(line + '\r');
-        }
-      } catch {
-        return { submitted: false };
-      }
-      return { submitted: true };
+      // Chunked + throttled stdin injection — a single send-keys of the whole
+      // (potentially ~20KB) control line overruns the pane pty input buffer and
+      // gets dropped. See runner-input.ts.
+      return writeRunnerInput(pty, '::botmux-codex-app:', content);
     },
 
     completionPattern: undefined,

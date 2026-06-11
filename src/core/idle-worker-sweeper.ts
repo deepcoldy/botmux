@@ -1,7 +1,8 @@
 import type { DaemonSession } from './types.js';
 import { readGlobalConfig } from '../global-config.js';
 import { DEFAULT_IDLE_SUSPEND_MS, resolveWorkerBudget, type ResolvedWorkerBudget } from './worker-budget.js';
-import { isSuspendableBackendType, suspendWorker } from './worker-pool.js';
+import { suspendWorker } from './worker-pool.js';
+import { isSuspendableBackendType } from './persistent-backend.js';
 
 export interface IdleWorkerSweepOptions {
   now?: number;
