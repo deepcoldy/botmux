@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import { countConfiguredBots } from '../bot-registry.js';
+import { countConfiguredBots, ownBotWorkerConfig } from '../bot-registry.js';
 import { readGlobalConfig } from '../global-config.js';
 import { DEFAULT_IDLE_SUSPEND_MS, resolveWorkerBudget, type ResolvedWorkerBudget } from './worker-budget.js';
 import { suspendWorker } from './worker-pool.js';
@@ -26,7 +26,12 @@ export function sweepIdleWorkers(
   opts: IdleWorkerSweepOptions = {},
 ): IdleWorkerSweepResult[] {
   const now = opts.now ?? Date.now();
-  const budget = opts.workerBudget ?? resolveWorkerBudget(readGlobalConfig().worker, undefined, countConfiguredBots());
+  // Per-bot worker override (if this bot configured one) wins field-by-field
+  // over the machine-wide global block; unset fields fall through to the
+  // per-daemon auto split inside resolveWorkerBudget. An explicit per-bot
+  // maxLiveWorkers therefore bypasses the split entirely (config source).
+  const workerConfig = { ...readGlobalConfig().worker, ...ownBotWorkerConfig() };
+  const budget = opts.workerBudget ?? resolveWorkerBudget(workerConfig, undefined, countConfiguredBots());
   const maxLiveWorkers = budget.maxLiveWorkers;
   const idleMs = budget.idleSuspendMs;
   const running = liveWorkers(activeSessions);

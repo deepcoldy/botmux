@@ -6,6 +6,7 @@ import type { BackendType } from './adapters/backend/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
+import { readWorker, type WorkerConfig } from './global-config.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
@@ -252,6 +253,16 @@ export interface BotConfig {
    * cards render the "🔊 语音总结" button. See services/voice/types.ts.
    */
   voice?: VoiceConfig;
+  /**
+   * Per-bot live-worker budget override. Fields set here win over the global
+   * `worker` block in ~/.botmux/config.json for THIS bot's idle sweeper, and
+   * are NOT subject to the per-daemon auto split — a bot that configures
+   * `maxLiveWorkers` gets exactly that many, regardless of how many bots share
+   * the box. Unset fields fall through to the global config, then to the
+   * auto-derived (machine-budget ÷ bot-count) baseline. Use it to give a
+   * heavily-used bot a bigger slice without raising every other bot's cap.
+   */
+  worker?: WorkerConfig;
 }
 
 export interface BotState {
@@ -481,6 +492,20 @@ export function countConfiguredBots(): number {
 }
 
 /**
+ * This daemon's own bot's per-bot worker override, if any. A daemon process
+ * hosts exactly one bot (see daemon.ts — registerBot is called once per
+ * BOTMUX_BOT_INDEX), so the in-memory registry has a single entry whose
+ * `worker` block, when present, governs this bot's idle sweeper. Returns
+ * undefined when unconfigured (caller falls back to global + auto budget).
+ */
+export function ownBotWorkerConfig(): WorkerConfig | undefined {
+  for (const bot of bots.values()) {
+    if (bot.config.worker) return bot.config.worker;
+  }
+  return undefined;
+}
+
+/**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
  * 2. ~/.botmux/bots.json — default config path
@@ -679,6 +704,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       }
     }
 
+    // worker：per-bot live-worker 预算覆盖。复用 global-config.readWorker 同口径
+    // 校验（maxLiveWorkers/idleSuspendMs 仅取正整数，非法/缺省 → undefined）。
+    const worker = readWorker(entry.worker);
+
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
@@ -746,6 +775,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.regularGroupMentionMode
         : undefined,
       voice,
+      worker,
     });
   }
 
