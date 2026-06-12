@@ -1542,7 +1542,13 @@ const cardDeps: CardHandlerDeps = {
   sessionReply,
   lastRepoScan,
   continueGrantReplay: async (replay: PendingGrantReplay) => {
-    const { ownsSession, ...ctx } = replay.ctx;
+    const { ownsSession: _ownsAtRequestTime, ...ctx } = replay.ctx;
+    // Re-evaluate ownership NOW, not at request time: the owner may approve the
+    // grant minutes later, and a session can appear on this anchor in between
+    // (e.g. the owner replied in the topic himself). Replaying a stale
+    // ownsSession=false through handleNewTopic would double-spawn on an anchor
+    // that already has a live session.
+    const ownsSession = activeSessions.has(sessionKey(ctx.anchor, ctx.larkAppId));
     logger.info(
       `[grant] auto-continuing approved message ${ctx.messageId.substring(0, 12)} ` +
       `on anchor=${ctx.anchor.substring(0, 12)} ownsSession=${ownsSession}`,
