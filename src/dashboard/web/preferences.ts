@@ -1,6 +1,6 @@
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type ResolvedTheme = 'light' | 'dark';
-export type SessionsViewMode = 'board' | 'table';
+export type SessionsViewMode = 'kanban' | 'board' | 'table';
 
 export const THEME_STORAGE_KEY = 'botmux.dashboard.theme';
 export const SESSIONS_VIEW_STORAGE_KEY = 'botmux.dashboard.sessions.view';
@@ -10,7 +10,7 @@ export function normalizeThemeMode(value: unknown): ThemeMode | null {
 }
 
 export function normalizeSessionsViewMode(value: unknown): SessionsViewMode | null {
-  return value === 'board' || value === 'table' ? value : null;
+  return value === 'kanban' || value === 'board' || value === 'table' ? value : null;
 }
 
 export function resolveThemeMode(mode: ThemeMode, systemPrefersDark: boolean): ResolvedTheme {
@@ -64,6 +64,49 @@ export function writeStoredSessionsViewMode(storage: Storage | undefined, mode: 
     storage?.setItem(SESSIONS_VIEW_STORAGE_KEY, mode);
   } catch {
     // Some embedded browsers deny localStorage. The current page still updates.
+  }
+}
+
+// ── 看板分组维度：工作流列 / 团队（筛选某团队的工作流）/ 机器人列 ─────────────
+export type KanbanGroupBy = 'flow' | 'team' | 'bot';
+
+export const KANBAN_GROUPBY_STORAGE_KEY = 'botmux.dashboard.sessions.kanbanGroupBy';
+export const KANBAN_TEAM_STORAGE_KEY = 'botmux.dashboard.sessions.kanbanTeam';
+
+export function normalizeKanbanGroupBy(value: unknown): KanbanGroupBy | null {
+  return value === 'flow' || value === 'team' || value === 'bot' ? value : null;
+}
+
+export function readStoredKanbanGroupBy(storage: Storage | undefined): KanbanGroupBy {
+  return normalizeKanbanGroupBy(storage?.getItem(KANBAN_GROUPBY_STORAGE_KEY)) ?? 'flow';
+}
+
+export function writeStoredKanbanGroupBy(storage: Storage | undefined, mode: KanbanGroupBy): void {
+  try {
+    storage?.setItem(KANBAN_GROUPBY_STORAGE_KEY, mode);
+  } catch {
+    // localStorage 不可用时只在当前页生效
+  }
+}
+
+// ── 左侧菜单栏收起/展开 ───────────────────────────────────────────────────────
+export type SidebarMode = 'expanded' | 'collapsed';
+
+export const SIDEBAR_STORAGE_KEY = 'botmux.dashboard.sidebar';
+
+export function normalizeSidebarMode(value: unknown): SidebarMode | null {
+  return value === 'expanded' || value === 'collapsed' ? value : null;
+}
+
+export function readStoredSidebarMode(storage: Storage | undefined): SidebarMode {
+  return normalizeSidebarMode(storage?.getItem(SIDEBAR_STORAGE_KEY)) ?? 'expanded';
+}
+
+export function writeStoredSidebarMode(storage: Storage | undefined, mode: SidebarMode): void {
+  try {
+    storage?.setItem(SIDEBAR_STORAGE_KEY, mode);
+  } catch {
+    // localStorage 不可用时只在当前页生效
   }
 }
 

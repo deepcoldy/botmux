@@ -33,6 +33,10 @@ export interface SessionRow {
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
   title?: string;
+  /** 看板视图的手动放置（列 id / 列内排序位置），用户拖拽后持久化在 Session 上。
+   *  未设置时前端按运行状态推导默认列。 */
+  kanbanColumn?: string;
+  kanbanPosition?: number;
   ownerOpenId?: string;
   webPort: number | null;
   /** Owning daemon's advertised reverse-proxy port — WEB_EXTERNAL_PORT + botIndex
@@ -105,6 +109,8 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     rootMessageId: ds.session.rootMessageId,
     scope: ds.session.scope,
     title: ds.session.title,
+    kanbanColumn: ds.session.kanbanColumn,
+    kanbanPosition: ds.session.kanbanPosition,
     // Read from the persisted Session — single source of truth.
     // ds.ownerOpenId is a parallel in-memory copy that gets cleared on
     // restoreActiveSessions (which builds a fresh DaemonSession from disk
@@ -141,6 +147,8 @@ export function composeRowFromClosed(s: Session): SessionRow {
     rootMessageId: s.rootMessageId,
     scope: s.scope,
     title: s.title,
+    kanbanColumn: s.kanbanColumn,
+    kanbanPosition: s.kanbanPosition,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
     feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),

@@ -11,6 +11,7 @@
 import { buildFederatedRoster } from '../services/federation-roster.js';
 import { listFederatedDeployments } from '../services/federation-store.js';
 import { DEFAULT_TEAM_ID } from '../services/team-store.js';
+import { recordTeamGroup } from '../services/team-groups-store.js';
 import { logger } from '../utils/logger.js';
 import type { LiveBot } from '../services/team-roster.js';
 
@@ -107,6 +108,8 @@ export async function orchestrateFederatedGroup(
     if (invalidOwners.length > 0 && r.chatId) {
       invalidOwners = await delegateAddOwners(dataDir, teamId, r.chatId, invalidOwners, eligible, requestId, deps.fetcher);
     }
+    // 记录 team↔chatId 绑定 —— 看板团队筛选据此识别「dashboard 发起的协作群」。
+    if (r.chatId) recordTeamGroup(dataDir, teamId, String(r.chatId));
     return { status: 200, body: { ...r, invalidOwnerUnionIds: invalidOwners, missingOperatorIdentity, skippedNoOwner } };
   }
 
@@ -133,6 +136,7 @@ export async function orchestrateFederatedGroup(
           if (invalidOwners.length > 0) {
             invalidOwners = await delegateAddOwners(dataDir, teamId, dj.chatId, invalidOwners, eligible, requestId, deps.fetcher);
           }
+          recordTeamGroup(dataDir, teamId, String(dj.chatId));
           return { status: 200, body: { ...dj, invalidOwnerUnionIds: invalidOwners, delegatedTo: dep.name, missingOperatorIdentity, skippedNoOwner } };
         }
         lastErr = dj?.error || `hub_${dr.status}`;

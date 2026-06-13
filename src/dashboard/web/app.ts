@@ -15,6 +15,7 @@ import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
 import { normalizeDashboardLocale, type DashboardLocale } from './i18n.js';
+import { readStoredSidebarMode, writeStoredSidebarMode, type SidebarMode } from './preferences.js';
 
 const root = document.getElementById('root')!;
 
@@ -284,6 +285,51 @@ function wireChromeControls() {
     };
   });
   initThemeMenu();
+  wireSidebarToggle();
+}
+
+// 左上角 brand 显示部署 owner（「我」）的飞书头像：localStorage 缓存先出图
+// 防闪烁，再后台刷新；拿不到（未绑定 owner / 只读访客 401）保持渐变球。
+const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
+
+function paintOwnerAvatar(avatarUrl: string, name?: string): void {
+  const mark = document.querySelector<HTMLElement>('.brand-mark');
+  if (!mark || !avatarUrl) return;
+  mark.innerHTML = `<img class="brand-owner-img" src="${escapeHtml(avatarUrl)}" alt="" decoding="async" referrerpolicy="no-referrer" onerror="this.remove()">`;
+  if (name) mark.title = name;
+}
+
+function initOwnerAvatar(): void {
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(OWNER_AVATAR_KEY) ?? 'null');
+    if (cached?.avatarUrl) paintOwnerAvatar(String(cached.avatarUrl), cached.name ? String(cached.name) : undefined);
+  } catch { /* 缓存损坏忽略 */ }
+  void fetch('/api/owner-profile')
+    .then(r => (r.ok ? r.json() : null))
+    .then(body => {
+      if (!body?.ok || !body.avatarUrl) return;
+      paintOwnerAvatar(String(body.avatarUrl), body.name ? String(body.name) : undefined);
+      try { window.localStorage.setItem(OWNER_AVATAR_KEY, JSON.stringify({ avatarUrl: body.avatarUrl, name: body.name ?? '' })); } catch { /* 忽略 */ }
+    })
+    .catch(() => { /* 只读访客/离线：保持渐变球 */ });
+}
+
+// 左侧菜单栏收起/展开：状态挂在 <html data-sidebar>，CSS 收窄成图标栏；
+// 偏好进 localStorage，刷新/换页保持。
+function wireSidebarToggle() {
+  const btn = document.getElementById('sidebar-toggle');
+  if (!btn) return;
+  let mode: SidebarMode = readStoredSidebarMode(window.localStorage);
+  const apply = () => {
+    document.documentElement.dataset.sidebar = mode;
+    btn.title = t(mode === 'collapsed' ? 'nav.sidebarExpand' : 'nav.sidebarCollapse');
+  };
+  apply();
+  btn.addEventListener('click', () => {
+    mode = mode === 'collapsed' ? 'expanded' : 'collapsed';
+    writeStoredSidebarMode(window.localStorage, mode);
+    apply();
+  });
 }
 
 // esbuild's IIFE bundle does not support top-level await — use an async IIFE.
@@ -302,6 +348,7 @@ void (async () => {
   // hidden and route guards are active for read-only visitors from frame one.
   await loadAuthState();
   applyAuthVisibility();
+  initOwnerAvatar();
   try {
     await bootstrap();
   } catch (err) {

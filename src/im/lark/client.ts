@@ -239,6 +239,41 @@ export async function resolveUnionIdFromOpenId(
   }
 }
 
+/** 用户资料（名字+头像）查询缓存：key = appId:idType:id。负结果也缓存——
+ *  不在通讯录可见范围（41050）的用户每次查都会失败，别反复打 API。 */
+const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | null>();
+const USER_PROFILE_CACHE_MAX = 1000;
+
+/**
+ * Best-effort 拉用户资料（名字 + 头像 URL）。拿不到（缺 scope / 不在可见
+ * 范围 / 网络错误）返回 null，调用方自行回退占位。
+ */
+export async function getUserProfile(
+  larkAppId: string,
+  userId: string,
+  idType: 'open_id' | 'union_id' = 'open_id',
+): Promise<{ name: string; avatarUrl?: string } | null> {
+  const key = `${larkAppId}:${idType}:${userId}`;
+  const hit = userProfileCache.get(key);
+  if (hit !== undefined) return hit;
+  let out: { name: string; avatarUrl?: string } | null = null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(userId)}`, {
+      user_id_type: idType,
+    });
+    const u = res?.code === 0 ? res?.data?.user : null;
+    if (u?.name) {
+      out = { name: String(u.name), avatarUrl: u.avatar?.avatar_72 ?? u.avatar?.avatar_240 ?? undefined };
+    }
+  } catch (err) {
+    logger.debug(`[user-profile] lookup threw for ${userId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  }
+  if (userProfileCache.size >= USER_PROFILE_CACHE_MAX) userProfileCache.clear();
+  userProfileCache.set(key, out);
+  return out;
+}
+
 /**
  * Best-effort 判断一个 open_id 是否为「真人」（通讯录里查得到 user）。
  *

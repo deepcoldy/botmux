@@ -25,6 +25,7 @@ import { addMembership, listMemberships, removeMembership } from '../services/fe
 import type { FederatedBot } from '../services/federation-store.js';
 import { listFederatedDeployments } from '../services/federation-store.js';
 import { ensureDefaultTeam, DEFAULT_TEAM_ID, listTeams, createTeam, deleteTeam, getTeam } from '../services/team-store.js';
+import { listTeamGroups } from '../services/team-groups-store.js';
 import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js';
 import { removeTeamFederation, removeDeployment } from '../services/federation-store.js';
 import { loadBotConfigs, registerBot, getBot, type BotConfig } from '../bot-registry.js';
@@ -163,8 +164,28 @@ function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
   }));
 }
 
-/** Push this deployment's current bots to every joined hub. Best-effort. */
-export async function syncAllMemberships(dataDir: string, fetcher: Fetcher = fetch, live?: LiveBot[]): Promise<{ synced: number; failed: number }> {
+/** 上报给团队看板的会话裁剪行所需的最小字段（来源 SessionRow）。 */
+export interface TeamSessionRowLike {
+  sessionId: string;
+  botName?: string;
+  cliId?: string;
+  status?: string;
+  title?: string;
+  chatId: string;
+  scope?: string;
+  adopt?: boolean;
+  lastMessageAt?: number;
+}
+
+/** Push this deployment's current bots to every joined hub. Best-effort.
+ *  传 sessionsProvider 时顺带上报团队看板的会话裁剪行：hub 在 sync 响应里下发
+ *  该团队的协作群清单，按 chatId 过滤本地会话 POST 回 hub（活跃优先，截 200）。 */
+export async function syncAllMemberships(
+  dataDir: string,
+  fetcher: Fetcher = fetch,
+  live?: LiveBot[],
+  sessionsProvider?: () => TeamSessionRowLike[],
+): Promise<{ synced: number; failed: number }> {
   const bots = localBots(dataDir, live);
   const me = getDeploymentIdentity(dataDir);
   let synced = 0, failed = 0;
@@ -176,6 +197,41 @@ export async function syncAllMemberships(dataDir: string, fetcher: Fetcher = fet
         body: JSON.stringify({ syncToken: m.syncToken, bots, ownerUnionId: me.ownerUnionId, ownerName: me.ownerName, name: me.name }),
       });
       if (r.ok) synced++; else failed++;
+      if (r.ok && sessionsProvider) {
+        try {
+          const j = await r.json().catch(() => ({} as any));
+          const groupChatIds: unknown[] = Array.isArray(j?.groupChatIds) ? j.groupChatIds : [];
+          if (groupChatIds.length) {
+            const teamChats = new Set(groupChatIds.map(String));
+            const sessions = sessionsProvider()
+              .filter(s => teamChats.has(String(s.chatId)))
+              .sort((a, b) => {
+                // 活跃优先，再按最近活跃倒序——截断时先丢最旧的已关闭会话
+                const ac = a.status === 'closed' ? 1 : 0;
+                const bc = b.status === 'closed' ? 1 : 0;
+                if (ac !== bc) return ac - bc;
+                return Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0);
+              })
+              .slice(0, 200)
+              .map(s => ({
+                sessionId: s.sessionId,
+                botName: s.botName,
+                cliId: s.cliId,
+                status: s.status,
+                title: s.title,
+                chatId: s.chatId,
+                scope: s.scope,
+                adopt: s.adopt || undefined,
+                lastMessageAt: Number(s.lastMessageAt ?? 0),
+              }));
+            await fetchWithTimeout(fetcher, `${m.hubUrl}/api/federation/team-sessions`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: `Bearer ${m.syncToken}` },
+              body: JSON.stringify({ sessions }),
+            });
+          }
+        } catch { /* 上报失败不影响心跳同步本身 */ }
+      }
     } catch { failed++; }
   }
   return { synced, failed };
@@ -208,7 +264,8 @@ export async function handleFederationSpokeApi(
   const LOCAL = new Set(['/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment', '/api/team/federated-group',
     '/api/team/identity/start', '/api/team/identity/status', '/api/team/identity/consume', '/api/team/identity/auto-bind',
     '/api/team/hosted']);
-  const REMOTE = new Set(['/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote', '/api/team/remote-group']);
+  const REMOTE = new Set(['/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote', '/api/team/remote-group',
+    '/api/team/remote-board', '/api/team/remote-board-move']);
   const localBotEdit = path.match(/^\/api\/team\/local-bots\/([^/]+)\/(capability|role)$/);
   const memberDel = path.match(/^\/api\/team\/hosted\/([^/]+)\/members\/([^/]+)$/);
   const hostedDel = path.match(/^\/api\/team\/hosted\/([^/]+)$/);
@@ -388,6 +445,8 @@ export async function handleFederationSpokeApi(
     const suggestedHubUrl = `http://${config.dashboard.externalHost}:${config.dashboard.port}`;
     const teams = listTeams(dataDir).map(t => ({
       teamId: t.id, name: t.name, isDefault: t.id === DEFAULT_TEAM_ID,
+      // dashboard 团队页发起过的协作群 —— 看板团队筛选的白名单之一
+      groupChatIds: listTeamGroups(dataDir, t.id).map(b => b.chatId),
       ...buildFederatedRoster(dataDir, t.id, botConfigOrder(), undefined, live),
     }));
     jsonRes(res, 200, { ok: true, deployment: me, suggestedHubUrl, teams });
@@ -494,6 +553,44 @@ export async function handleFederationSpokeApi(
       }
     }
     jsonRes(res, 200, { ok: true, memberships: out });
+    return true;
+  }
+
+  // ── 远程团队看板代理：成员的浏览器 → 本地 dashboard → hub ──────────────────
+  // key = `${hubUrl}::${teamId}`（与 membership 存储键、前端团队 key 同构）。
+  if (path === '/api/team/remote-board' && method === 'GET') {
+    const key = String(url.searchParams.get('key') ?? '');
+    const m = listMemberships(dataDir).find(mm => `${mm.hubUrl}::${mm.teamId}` === key);
+    if (!m) { jsonRes(res, 404, { ok: false, error: 'membership_not_found' }); return true; }
+    try {
+      const r = await fetchWithTimeout(fetcher, `${m.hubUrl}/api/federation/team-board`, {
+        headers: { authorization: `Bearer ${m.syncToken}` },
+      });
+      const j = await r.json().catch(() => ({} as any));
+      jsonRes(res, r.ok ? 200 : 502, j);
+    } catch (e) {
+      jsonRes(res, 502, { ok: false, ...hubError(e) });
+    }
+    return true;
+  }
+
+  if (path === '/api/team/remote-board-move' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const key = String(body?.key ?? '');
+    const m = listMemberships(dataDir).find(mm => `${mm.hubUrl}::${mm.teamId}` === key);
+    if (!m) { jsonRes(res, 404, { ok: false, error: 'membership_not_found' }); return true; }
+    try {
+      const r = await fetchWithTimeout(fetcher, `${m.hubUrl}/api/federation/team-board-move`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${m.syncToken}` },
+        body: JSON.stringify({ sessionId: body?.sessionId, column: body?.column, position: body?.position }),
+      });
+      const j = await r.json().catch(() => ({} as any));
+      jsonRes(res, r.ok ? 200 : 502, j);
+    } catch (e) {
+      jsonRes(res, 502, { ok: false, ...hubError(e) });
+    }
     return true;
   }
 

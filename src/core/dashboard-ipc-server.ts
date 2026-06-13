@@ -14,6 +14,8 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import * as observedBotsStore from '../services/observed-bots-store.js';
+import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField } from '../services/bot-config-store.js';
 import { config } from '../config.js';
@@ -27,7 +29,8 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
+import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -55,7 +58,8 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot } from '../bot-registry.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
+import type { ScheduledTask, ParsedSchedule, Session } from '../types.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -174,6 +178,114 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+/** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
+ *  store 持有同一对象，改字段后 updateSession 即落盘。 */
+function findSessionRecord(sessionId: string): Session | undefined {
+  return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
+}
+
+// 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
+// 改完广播 session.update，所有打开的 dashboard 实时同步。
+ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
+  let body: { column?: unknown; position?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const column = normalizeKanbanColumn(body.column);
+  const position = normalizeKanbanPosition(body.position);
+  if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (column) session.kanbanColumn = column;
+  if (position !== null) session.kanbanPosition = position;
+  sessionStore.updateSession(session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: params.sessionId,
+      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition },
+    },
+  });
+  jsonRes(res, 200, { ok: true });
+});
+
+// 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，
+// 消息体不落盘），给 dashboard 的会话历史弹窗。复杂卡片的「请升级」兜底文本
+// 用 message.get 的完整表示补齐；merge_forward 保持占位符（原型不展开）。
+ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => {
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const appId = session.larkAppId || cachedLarkAppId;
+  if (!appId) return jsonRes(res, 422, { ok: false, error: 'no_lark_app' });
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '80', 10) || 80, 1), 200);
+  try {
+    const raw = session.scope === 'chat'
+      ? await listChatMessages(appId, session.chatId, limit)
+      : await listThreadMessages(appId, session.chatId, session.rootMessageId, limit);
+    const messages = await Promise.all(raw.map(async (m: any) => {
+      const parsed = parseApiMessage(m);
+      if (parsed.msgType === 'interactive' && cardContentHasUpgradeFallback(parsed.content)) {
+        const merged = await resolveMergedCardContent(appId, parsed.messageId).catch(() => null);
+        if (merged) parsed.content = merged.text;
+      }
+      return {
+        messageId: parsed.messageId,
+        senderId: parsed.senderId,
+        senderType: parsed.senderType,
+        msgType: parsed.msgType,
+        content: parsed.content,
+        // Lark create_time 是毫秒 epoch 字符串——规范成数字，前端 new Date 直接用
+        createTime: Number(parsed.createTime) || undefined,
+      };
+    }));
+    // 真人发送者补名字+头像（contact API，带缓存；不在可见范围的回退占位）
+    const senders = new Map<string, { name: string; avatarUrl?: string } | null>();
+    await Promise.all(
+      [...new Set(messages.filter(m => m.senderType === 'user' && m.senderId).map(m => m.senderId))]
+        .map(async id => { senders.set(id, await getUserProfile(appId, id)); }),
+    );
+    jsonRes(res, 200, {
+      ok: true,
+      scope: session.scope ?? 'thread',
+      ownerOpenId: session.ownerOpenId,
+      messages: messages.map(m => {
+        const p = m.senderType === 'user' ? senders.get(m.senderId) : null;
+        return p ? { ...m, senderName: p.name, senderAvatar: p.avatarUrl } : m;
+      }),
+    });
+  } catch (err: any) {
+    jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// 部署 owner 的资料（名字 + 头像）——dashboard 左上角和历史弹窗展示「我」。
+// owner 身份来自 deployment identity（ownerUnionId），头像经 contact API 查询
+// （带缓存）；未绑定 owner 或查不到时回退名字/null。
+ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const me = getDeploymentIdentity(config.session.dataDir);
+  if (!me.ownerUnionId) return jsonRes(res, 200, { ok: false, error: 'owner_unbound', name: me.ownerName ?? null });
+  const p = await getUserProfile(cachedLarkAppId, me.ownerUnionId, 'union_id');
+  jsonRes(res, 200, { ok: true, name: p?.name ?? me.ownerName ?? null, avatarUrl: p?.avatarUrl ?? null });
+});
+
+// 会话重命名：dashboard 看板卡片就地编辑标题。title 只是展示元数据（飞书话题
+// 标题不受影响），但全视图（看板/状态板/表格/抽屉）读同一字段，改一处全变。
+ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
+  let body: { title?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const title = normalizeSessionTitle(body.title);
+  if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  session.title = title;
+  sessionStore.updateSession(session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { title } },
+  });
+  jsonRes(res, 200, { ok: true, title });
 });
 
 /**
@@ -587,7 +699,12 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const enriched = chats.map(c => {
       const oncall = oncallStore.getOncallStatus(cachedLarkAppId, c.chatId);
       const hasRole = resolveRoleFile(cachedLarkAppId, c.chatId) !== null;
-      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole };
+      // /introduce 记录的外部 botmux 机器人（按名字）——dashboard 团队看板用
+      // 它识别「介绍过同团队机器人的协作群」。
+      const observedBotNames = observedBotsStore
+        .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
+        .map(b => b.name);
+      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, observedBotNames };
     });
     jsonRes(res, 200, { chats: enriched });
   } catch (e) {

@@ -4,8 +4,12 @@ import { stripMentionPrefix } from '../src/dashboard/web/ui.js';
 import {
   DEFAULT_BOARD_ORDER,
   normalizeBoardOrder,
+  normalizeSessionsViewMode,
+  normalizeSidebarMode,
   normalizeSkin,
   normalizeThemeMode,
+  readStoredSessionsViewMode,
+  readStoredSidebarMode,
   readStoredSkin,
   resolveThemeMode,
 } from '../src/dashboard/web/preferences.js';
@@ -56,6 +60,43 @@ describe('dashboard skin preferences', () => {
     expect(readStoredSkin(make(null))).toBe('default');
     expect(readStoredSkin(make('nope'))).toBe('default');
     expect(readStoredSkin(make('cyber'))).toBe('cyber');
+  });
+});
+
+describe('sessions view mode preference', () => {
+  it('accepts kanban, board, and table', () => {
+    expect(normalizeSessionsViewMode('kanban')).toBe('kanban');
+    expect(normalizeSessionsViewMode('board')).toBe('board');
+    expect(normalizeSessionsViewMode('table')).toBe('table');
+    expect(normalizeSessionsViewMode('list')).toBeNull();
+    expect(normalizeSessionsViewMode(undefined)).toBeNull();
+  });
+
+  it('falls back to board for missing/invalid storage', () => {
+    const make = (value: string | null): Storage =>
+      ({ getItem: () => value }) as unknown as Storage;
+    expect(readStoredSessionsViewMode(undefined)).toBe('board');
+    expect(readStoredSessionsViewMode(make(null))).toBe('board');
+    expect(readStoredSessionsViewMode(make('nope'))).toBe('board');
+    expect(readStoredSessionsViewMode(make('kanban'))).toBe('kanban');
+  });
+});
+
+describe('sidebar mode preference', () => {
+  it('accepts expanded/collapsed and rejects junk', () => {
+    expect(normalizeSidebarMode('expanded')).toBe('expanded');
+    expect(normalizeSidebarMode('collapsed')).toBe('collapsed');
+    expect(normalizeSidebarMode('hidden')).toBeNull();
+    expect(normalizeSidebarMode(undefined)).toBeNull();
+  });
+
+  it('falls back to expanded for missing/invalid storage', () => {
+    const make = (value: string | null): Storage =>
+      ({ getItem: () => value }) as unknown as Storage;
+    expect(readStoredSidebarMode(undefined)).toBe('expanded');
+    expect(readStoredSidebarMode(make(null))).toBe('expanded');
+    expect(readStoredSidebarMode(make('nope'))).toBe('expanded');
+    expect(readStoredSidebarMode(make('collapsed'))).toBe('collapsed');
   });
 });
 

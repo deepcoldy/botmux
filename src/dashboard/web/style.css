@@ -158,6 +158,77 @@ a { color: inherit; }
 .sidebar-foot {
   margin-top: auto;
   padding: 10px 8px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sidebar-toggle {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.sidebar-toggle:hover {
+  background: var(--surface-muted);
+  color: var(--fg);
+}
+
+.sidebar-toggle svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 160ms ease;
+}
+
+/* 收起态：侧栏收窄成图标栏（只在桌面布局生效；窄屏侧栏本来就折成顶栏） */
+@media (min-width: 981px) {
+  :root[data-sidebar="collapsed"] {
+    --sidebar-width: 68px;
+  }
+  :root[data-sidebar="collapsed"] .sidebar {
+    padding: 18px 10px;
+  }
+  :root[data-sidebar="collapsed"] .brand {
+    justify-content: center;
+    padding: 8px 0;
+  }
+  :root[data-sidebar="collapsed"] .brand > span:not(.brand-mark) {
+    display: none;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-nav a {
+    justify-content: center;
+    padding: 8px;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-nav a span {
+    display: none;
+  }
+  :root[data-sidebar="collapsed"] .connection-status {
+    display: none;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-foot {
+    justify-content: center;
+    padding: 10px 0 4px;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-toggle svg {
+    transform: rotate(180deg);
+  }
 }
 
 .connection-status {
@@ -315,7 +386,8 @@ a { color: inherit; }
 
 main {
   width: 100%;
-  max-width: 1480px;
+  /* 不设上限：收起侧栏腾出的宽度交还内容区（看板/表格都按容器弹性布局）。 */
+  max-width: none;
   padding: 24px;
 }
 
@@ -1141,6 +1213,609 @@ button.primary {
   font-size: 12px;
 }
 
+/* ── 看板视图（multica Issues 风格）：横排状态列 + 简洁卡片 ─────────────────── */
+.sessions-kanban {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 4px 2px 12px;
+}
+
+.sessions-kanban[hidden] {
+  display: none;
+}
+
+.kanban-column {
+  /* 弹性等分而非固定 280px：5 列在任何视口宽度下收缩到容器内，
+     不再把页面撑出横向滚动条（极窄屏由媒体查询改纵向堆叠兜底）。 */
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 320px;
+  max-height: calc(100vh - 250px);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-muted) 72%, transparent);
+}
+
+.kanban-column > header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 12px 8px;
+}
+
+.kanban-col-icon {
+  display: inline-flex;
+  flex: none;
+}
+
+.kanban-col-icon svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.kanban-column h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.kanban-col-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 视图控件排布：团队筛选 + 分组维度切换 + 视图切换并排（窄屏自动换行） */
+.sessions-view-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* .segmented 自带 display:inline-flex 会盖掉 [hidden] 的 UA 样式——显式补回 */
+.sessions-view-controls [hidden] {
+  display: none !important;
+}
+
+/* 团队下拉做成与右侧 .segmented 同款胶囊：同高、同边框、圆角 999，
+   去掉原生箭头换内嵌 chevron */
+.kanban-team-select {
+  appearance: none;
+  -webkit-appearance: none;
+  max-width: 200px;
+  min-height: 38px;
+  padding: 0 30px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background-color: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.6 4.4 6 7.8l3.4-3.4' fill='none' stroke='%238b98aa' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px;
+}
+
+.kanban-team-select:hover {
+  background-color: var(--surface-muted);
+}
+
+.kanban-team-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 团队筛选范围统计：让"筛掉了什么"可见 */
+.kanban-team-stats {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 团队清单加载中的整板占位（替代裸文本） */
+.kanban-loading {
+  flex: 1;
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  font-size: 13px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+}
+
+.kanban-team-select:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+
+/* 对方部署的会话卡：来源徽章 + 虚线边框区分快照身份 */
+.kanban-remote-badge {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-muted));
+  color: var(--accent-strong);
+  white-space: nowrap;
+  flex: none;
+}
+
+.kanban-card-remote {
+  border-style: dashed;
+}
+
+/* 机器人视角：bot 多时列不再无限压缩——固定列宽 + 容器横向滚动 */
+.sessions-kanban.kanban-mode-bot .kanban-column {
+  flex: 0 0 264px;
+}
+
+/* 整簇拖拽 */
+.kanban-cluster > header {
+  cursor: grab;
+}
+
+.kanban-cluster.dragging {
+  opacity: 0.45;
+}
+
+/* 同群聚簇容器：虚线框 + 群名头，一眼看出卡片同属一个群 */
+.kanban-cluster {
+  display: grid;
+  gap: 6px;
+  padding: 6px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 38%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 3%, transparent);
+}
+
+.kanban-cluster > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.kanban-cluster-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kanban-cluster-count {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 团队模式列头：bot 头像替代状态图标 */
+.kanban-col-avatar {
+  display: inline-flex;
+  flex: none;
+}
+
+.kanban-backlog .kanban-col-icon { color: var(--faint); }
+.kanban-todo .kanban-col-icon { color: var(--muted); }
+.kanban-in_progress .kanban-col-icon { color: var(--warning); }
+.kanban-in_review .kanban-col-icon { color: var(--success); }
+.kanban-done .kanban-col-icon { color: var(--accent); }
+
+/* 拖拽视觉：目标列描边、插入位置在目标卡上沿画一条插入线、拖拽源半透明 */
+.kanban-column.drag-over {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.kanban-card.dragging {
+  opacity: 0.45;
+}
+
+.kanban-card.drop-before {
+  box-shadow: 0 -2px 0 0 var(--accent);
+}
+
+.kanban-col-list {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 2px 8px 10px;
+  overflow-y: auto;
+}
+
+.kanban-col-empty {
+  padding: 32px 0;
+  color: var(--faint);
+  font-size: 12px;
+  text-align: center;
+}
+
+.kanban-col-more {
+  padding: 6px 0 2px;
+  color: var(--faint);
+  font-size: 11px;
+  text-align: center;
+}
+
+.kanban-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.kanban-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface-raised));
+}
+
+.kanban-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.kanban-card-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* CLI 徽章别折行（claude-code 之类带连字符的会被 280px 卡片拆成两行） */
+.kanban-card-top .badge {
+  white-space: nowrap;
+  flex: none;
+}
+
+/* 右上角动作区：运行状态点常显；重命名/详情按钮平时隐身，悬停/聚焦才浮现 */
+.kanban-card-top-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kanban-card-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: none;
+}
+
+.kanban-card-dot[data-status="working"],
+.kanban-card-dot[data-status="analyzing"],
+.kanban-card-dot[data-status="active"] {
+  background: var(--success);
+}
+
+.kanban-card-dot[data-status="starting"] {
+  background: var(--warning);
+}
+
+.kanban-card-dot[data-status="limited"] {
+  background: var(--danger);
+}
+
+.kanban-card-dot[data-status="closed"] {
+  background: var(--border);
+}
+
+/* 选择器带上 .kanban-card 提特异性：通用 .card-act 基础规则（display/尺寸）
+   定义在本节之后，同特异性会反杀这里的覆盖。 */
+.kanban-card .kanban-card-act {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  /* 不悬停时彻底不占位（opacity:0 仍会把短 ID 永久挤成省略号） */
+  display: none;
+}
+
+.kanban-card:hover .kanban-card-act,
+.kanban-card:focus-within .kanban-card-act {
+  display: inline-flex;
+}
+
+/* 标题就地编辑输入框：占标题原位，不撑破卡片 */
+.kanban-rename-input {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.kanban-card-title {
+  margin: 0;
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.kanban-card-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kanban-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+  min-width: 0;
+}
+
+.kanban-card-owner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.kanban-card-owner > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kanban-card-updated {
+  flex: none;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* ── 页面内终端弹窗（看板卡片点击落点）───────────────────────────────────── */
+.term-modal {
+  width: min(1560px, 96vw);
+  height: min(88vh, 1100px);
+  max-height: calc(100vh - 24px);
+  padding: 0;
+  overflow: hidden;
+}
+
+.term-modal[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.term-modal-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.term-modal-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.term-modal-title strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 终端弹窗标题旁的铅笔：常显小尺寸，与 card-act 一致 */
+.term-modal-title .card-act {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  flex: none;
+}
+
+/* 标题就地编辑输入框：宽度由 JS 按内容实测设定（fitInput），这里只给兜底上限 */
+.term-modal-name-input {
+  max-width: 60vw;
+  margin: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.term-modal-actions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.term-modal-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.term-modal-frame {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #000;
+}
+
+.term-modal-loading {
+  margin: auto;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+/* ── 会话历史弹窗：飞书式左右气泡 ─────────────────────────────────────────── */
+.history-modal {
+  width: min(860px, 94vw);
+  height: min(82vh, 900px);
+  max-height: calc(100vh - 24px);
+  padding: 0;
+  overflow: hidden;
+}
+
+.history-modal[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.history-scope-tag {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.history-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 14px 16px;
+  background: var(--bg-soft);
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-msg {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  max-width: 82%;
+}
+
+.history-msg.mine {
+  margin-left: auto;
+  flex-direction: row-reverse;
+}
+
+.history-msg-main {
+  min-width: 0;
+}
+
+.history-msg-meta {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 3px;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.history-msg.mine .history-msg-meta {
+  justify-content: flex-end;
+}
+
+.history-bubble {
+  padding: 8px 11px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-raised);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.history-msg.mine .history-bubble {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.history-avatar-user {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 12px;
+}
+
+/* 真人头像（contact API 拿到的）——与首字圆同尺寸 */
+.history-avatar-img {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/* 左上角 brand 的 owner 头像：盖满 brand-mark 方块 */
+.brand-mark {
+  position: relative;
+  overflow: hidden;
+}
+
+.brand-owner-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.history-error {
+  margin: auto;
+  color: var(--faint);
+  font-size: 13px;
+}
+
 /* 图标方按钮：会话卡片操作行一排，也被详情抽屉 .actions 复用（chat-scope 的
    「打开群聊」走同一个 .card-act）。图标宽度与语言无关，en/zh 都稳定一行，修掉了
    EN 文案更宽把「关闭」挤下行的崩布局。基础按钮外观放在通用 .card-act 选择器上，
@@ -1667,6 +2342,22 @@ input.row-select,
   }
   .sessions-board {
     grid-template-columns: 1fr;
+  }
+  /* 窄屏看板：列改纵向堆叠，高度交还内容 */
+  .sessions-kanban {
+    flex-direction: column;
+  }
+  .kanban-column {
+    flex: none;
+    min-height: 0;
+    max-height: none;
+  }
+  .kanban-col-list {
+    overflow-y: visible;
+  }
+  .term-modal {
+    width: calc(100vw - 16px);
+    height: calc(100vh - 24px);
   }
   .filter-check-group {
     grid-template-columns: repeat(2, minmax(0, 1fr));
