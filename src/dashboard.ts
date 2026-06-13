@@ -487,7 +487,17 @@ const server = createServer(async (req, res) => {
     // ─── Public API (cookie/token already validated above) ──────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
-      return jsonRes(res, 200, { sessions: aggregator.getSessions() });
+      // Sessions spawned before a bot config carried a display name store the
+      // raw appId as botName — resolve through the live registry so consumers
+      // (dashboard, HD2D office tab) always see the human-facing name.
+      const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
+      const sessions = aggregator.getSessions().map(s => {
+        const n = names.get(s.larkAppId);
+        return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
+          ? { ...s, botName: n }
+          : s;
+      });
+      return jsonRes(res, 200, { sessions });
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       // Public-read carve-out: the row carries CONTENT (prompt = business
