@@ -40,6 +40,17 @@ describe('shouldArmReadyGate', () => {
   it('reattach exclusion wins even for an otherwise-eligible fresh-looking spawn', () => {
     expect(shouldArmReadyGate({ injectsReadyHook: true, adoptMode: false, willReattachPersistent: true })).toBe(false);
   });
+
+  it('does NOT arm when the launcher strips --settings (aiden x claude → no SessionStart hook)', () => {
+    // wrapperCli "aiden x claude" drops --settings before launching real Claude;
+    // the SessionStart signal can never fire, so arming would stall the first
+    // prompt for the full 45s timeout. Fall back to readyPattern instead.
+    expect(shouldArmReadyGate({ ...base, launcherStripsSettings: true })).toBe(false);
+  });
+
+  it('still arms when a launcher is present but keeps --settings (e.g. ccr)', () => {
+    expect(shouldArmReadyGate({ ...base, launcherStripsSettings: false })).toBe(true);
+  });
 });
 
 describe('ReadyGate', () => {

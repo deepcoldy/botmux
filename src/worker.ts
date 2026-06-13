@@ -56,7 +56,7 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
-import { buildWrappedLaunch } from './setup/cli-selection.js';
+import { buildWrappedLaunch, wrapperStripsSettings } from './setup/cli-selection.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './adapters/cli/types.js';
@@ -3885,6 +3885,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     injectsReadyHook: cliAdapter.injectsReadyHook === true,
     adoptMode: cfg.adoptMode === true,
     willReattachPersistent,
+    // aiden x claude 剥掉了 --settings → SessionStart 就绪 hook 不会送达 claude，
+    // 武装只会让首条 prompt 空等 45s 超时；退回 readyPattern（aiden 跑的是真 claude，无选择器）。
+    launcherStripsSettings: wrapperStripsSettings(cfg.wrapperCli),
   })) {
     readyGate.arm();
     log('Ready gate armed — holding first prompt until SessionStart ready signal');

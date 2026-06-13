@@ -117,6 +117,15 @@ function isAidenXClaude(tokens: ReadonlyArray<string>): boolean {
 }
 
 /**
+ * 该启动前缀是否会剥掉 botmux 注入的 `--settings`（目前 = aiden x claude）。
+ * 剥了则 claude 收不到进程级 SessionStart ready hook，worker 据此**不武装 ready-gate**
+ * （否则会空等 45s 超时兜底，拖慢首条 prompt 注入）——退回 readyPattern + quiescence。
+ */
+export function wrapperStripsSettings(wrapperCli: string | undefined): boolean {
+  return !!wrapperCli && isAidenXClaude(parseWrapperCli(wrapperCli));
+}
+
+/**
  * 剥掉 aiden x claude 拒收的 `--settings`（含其值），支持 `--settings <v>` 与
  * `--settings=<v>` 两种写法。其余参数原样保留。改用纯 argv 处理（跨系统、无 shell）。
  */

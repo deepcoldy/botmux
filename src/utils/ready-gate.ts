@@ -46,6 +46,13 @@
  *                                 already-idle Claude would otherwise have its
  *                                 first post-recovery message held until the
  *                                 fallback timeout — a user-visible regression.
+ *   - NOT `launcherStripsSettings` — a wrapperCli launcher that drops our
+ *                                 `--settings` (e.g. `aiden x claude`, which
+ *                                 rejects it) means the SessionStart hook never
+ *                                 reaches Claude → the signal can't fire → arming
+ *                                 would hold the first prompt for the full 45s
+ *                                 timeout. aiden launches REAL Claude Code (no
+ *                                 cjadk selector), so readyPattern is safe here.
  *
  * Any of the negatives → don't arm; the gate stays open and the spawn behaves
  * exactly as before (readyPattern + quiescence).
@@ -54,8 +61,9 @@ export function shouldArmReadyGate(state: {
   injectsReadyHook: boolean;
   adoptMode: boolean;
   willReattachPersistent: boolean;
+  launcherStripsSettings?: boolean;
 }): boolean {
-  return state.injectsReadyHook && !state.adoptMode && !state.willReattachPersistent;
+  return state.injectsReadyHook && !state.adoptMode && !state.willReattachPersistent && !state.launcherStripsSettings;
 }
 
 export class ReadyGate {

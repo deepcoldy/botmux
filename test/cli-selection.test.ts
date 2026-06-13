@@ -10,6 +10,7 @@ import {
   buildWrappedLaunch,
   parseWrapperCli,
   decorateResumeForWrapper,
+  wrapperStripsSettings,
 } from '../src/setup/cli-selection.js';
 
 describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
@@ -124,6 +125,19 @@ describe('buildWrappedLaunch', () => {
 
   it('returns empty bin for a blank prefix so callers can skip', () => {
     expect(buildWrappedLaunch('   ', ['--resume', 'x'])).toEqual({ bin: '', args: ['--resume', 'x'] });
+  });
+});
+
+describe('wrapperStripsSettings', () => {
+  it('is true only for aiden x claude (the prefix that rejects --settings)', () => {
+    expect(wrapperStripsSettings('aiden x claude')).toBe(true);
+  });
+
+  it('is false for aiden x codex, generic launchers, and unset', () => {
+    expect(wrapperStripsSettings('aiden x codex')).toBe(false);
+    expect(wrapperStripsSettings('ccr')).toBe(false);
+    expect(wrapperStripsSettings('')).toBe(false);
+    expect(wrapperStripsSettings(undefined)).toBe(false);
   });
 });
 
