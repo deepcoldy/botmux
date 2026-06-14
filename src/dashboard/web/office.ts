@@ -68,7 +68,7 @@ export function renderOfficePage(host: HTMLElement): (() => void) | void {
           把每个会话变成办公室里的一个机器人，实时映射屏幕状态。<br>
           首次进入需下载约 ${mb(total)} MB 游戏资源（仅一次，之后本地缓存）。
         </div>
-        ${err ? `<div style="color:#e06c75;font-size:12px;margin-bottom:14px;">下载失败：${escapeHtml(s.error ?? '未知错误')}</div>` : ''}
+        ${err ? `<div style="color:#e06c75;font-size:12px;margin-bottom:14px;">上次下载失败：${escapeHtml(s.error ?? '未知错误')}<br><span style="opacity:.7;">填代理后点重试</span></div>` : ''}
         ${downloading ? `
           <div style="background:rgba(127,127,127,.2);border-radius:6px;height:10px;overflow:hidden;margin-bottom:10px;">
             <div style="height:100%;width:${pct}%;background:#4a9eff;transition:width .3s;"></div>
