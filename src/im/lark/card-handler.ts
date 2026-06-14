@@ -32,6 +32,7 @@ import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLi
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
 import { publishAttentionPatch } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
+import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -141,6 +142,143 @@ function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string
     `action=${value?.action ?? '?'} expected=${expected} actual=${actual}`,
   );
   return false;
+}
+
+/**
+ * Commit a resolved working directory onto a repo-select session: pin it, then
+ * either fork the pending CLI (first selection) or close + recreate the session
+ * (mid-session switch). Shared by the dropdown flow, the worktree flow (which
+ * funnels back in with the freshly created worktree path) and the manual
+ * directory-entry form. Extracted to module scope so the form-submit branch can
+ * reuse the exact same spawn/switch path instead of duplicating it.
+ */
+async function commitRepoSelection(
+  ctx: {
+    ds: DaemonSession;
+    rootId: string;
+    cardMessageId?: string;
+    larkAppId?: string;
+    activeSessions: Map<string, DaemonSession>;
+    sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+  },
+  dirPath: string,
+  dirLabel: string,
+): Promise<void> {
+  const { ds, rootId, cardMessageId, larkAppId, activeSessions, sessionReply } = ctx;
+  const locTarget = localeForBot(ds.larkAppId);
+  // `/close` deletes the active-map entry without touching sessionId or
+  // pendingRepo — identity against the map is the only tell that the session
+  // this flow captured is gone. Checked alongside the generation snapshots.
+  const repoSessionKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
+  const sessionStillActive = () => activeSessions.get(repoSessionKey) === ds;
+  const commitGenSessionId = ds.session.sessionId;
+  ds.workingDir = dirPath;
+  ds.session.workingDir = dirPath;
+  sessionStore.updateSession(ds.session);
+
+  if (ds.pendingRepo) {
+    const selfBot = getBot(ds.larkAppId);
+    const botCfg = selfBot.config;
+    const effectiveCliId = sessionCliId(ds);
+    // First-time repo selection — now spawn CLI with the original prompt
+    ds.pendingRepo = false;
+    publishAttentionPatch(ds);
+    const pendingPrompt = ds.pendingPrompt ?? '';
+    const pendingRawInput = ds.pendingRawInput;
+    // Raw-input cold start still wraps any input buffered while the repo card
+    // was pending — see the skip_repo branch for the rationale.
+    const hasBufferedInput =
+      pendingPrompt.trim().length > 0 ||
+      (ds.pendingAttachments?.length ?? 0) > 0 ||
+      (ds.pendingFollowUps?.length ?? 0) > 0;
+    const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
+      ? buildNewTopicPrompt(
+          pendingPrompt,
+          ds.session.sessionId,
+          effectiveCliId,
+          botCfg.cliPathOverride,
+          ds.pendingAttachments,
+          ds.pendingMentions,
+          await getAvailableBots(ds.larkAppId, ds.chatId),
+          ds.pendingFollowUps,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
+          locTarget,
+          ds.pendingSender,
+          { larkAppId: ds.larkAppId, chatId: ds.chatId },
+        )
+      : '';
+    const prompt = pendingRawInput ? '' : wrappedPrompt;
+    // Last-line defence: prompt prep awaited above — if anything replaced
+    // OR closed the session in that window, forking now would clobber it
+    // (or resurrect a /close'd session).
+    if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId) {
+      logger.warn(`[${tag(ds)}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}) — aborting this fork`);
+      return;
+    }
+    if (pendingRawInput && hasBufferedInput) {
+      ds.pendingFollowUpInput = {
+        userPrompt: pendingPrompt || (ds.pendingFollowUps?.join('\n\n') ?? ''),
+        cliInput: wrappedPrompt,
+      };
+    }
+    rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? prompt);
+    ds.pendingPrompt = undefined;
+    ds.pendingAttachments = undefined;
+    ds.pendingMentions = undefined;
+    ds.pendingSender = undefined;
+    ds.pendingFollowUps = undefined;
+    forkWorker(ds, prompt);
+    // A card click has no turn of its own — anchor the confirmation to the
+    // session's current reply-target turn so a shared fold-back topic keeps
+    // it in-thread (same leak as the /repo command path).
+    await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget), undefined, fallbackTurnId(ds, undefined));
+    logger.info(`[${tag(ds)}] Repo selected: ${dirPath}, spawning CLI`);
+  } else {
+    // Mid-session repo switch — close old session, start fresh.
+    killWorker(ds);
+    // Park the current card in `frozenCards` so the next POST under the new
+    // session sweeps it via recall. closeSession() wipes the on-disk
+    // frozen-cards file under the OLD sessionId, but the in-memory Map
+    // travels with `ds` into the new session and still carries the
+    // old messageId for deletion. If fork or POST fails, the parked card
+    // stays in the thread instead of vanishing prematurely.
+    parkStreamCard(ds);
+    sessionStore.closeSession(ds.session.sessionId);
+    const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
+    ds.session = session;
+    ds.lastUserPrompt = undefined;
+    ds.lastCliInput = undefined;
+    // Pin workingDir + larkAppId onto the new session before forkWorker.
+    // Without this, a daemon restart restores the session with an empty
+    // workingDir and the worker spawns in the bot's default cwd, so
+    // `claude --resume` looks in the wrong .claude/projects/<hash>/ dir and
+    // exits code 0 immediately, crash-looping until the rate-limiter trips.
+    ds.session.workingDir = dirPath;
+    ds.session.larkAppId = ds.larkAppId;
+    sessionStore.updateSession(ds.session);
+    ds.hasHistory = false;
+    // Re-persist the parked card under the NEW sessionId so a daemon crash
+    // before the next POST doesn't strand it. closeSession() above wiped
+    // the on-disk file under the OLD sessionId; without this re-save, the
+    // in-memory Map only survives in process memory.
+    if (ds.frozenCards && ds.frozenCards.size > 0) {
+      saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+    }
+    // Drop the old turn's streaming-card reference so worker_ready POSTs a
+    // fresh card for the new session instead of PATCHing the previous one.
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    ds.streamCardPending = undefined;
+    ds.lastScreenContent = undefined;
+    ds.lastScreenStatus = undefined;
+    forkWorker(ds, '', false);
+    await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
+    logger.info(`[${tag(ds)}] Repo switched to ${dirPath}, new session created`);
+  }
+
+  // Withdraw the repo selection card
+  if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+  ds.repoCardMessageId = undefined;
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────
@@ -637,7 +775,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -658,10 +796,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : undefined;
     const effectiveAppId = larkAppId ?? ds?.larkAppId ?? closedForCtx?.larkAppId;
     const chatId = ds?.chatId ?? closedForCtx?.chatId;
-    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo 起会话——
-    // 与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo / 手动填目录
+    // 起会话——与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
     const pendingRepoOwnerException =
-      value.action === 'skip_repo' && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_manual_submit') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -1354,6 +1492,35 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
       ds.repoCardMessageId = undefined;
     }
+
+    // Manual working-directory entry from the repo card form. The project scan
+    // may not surface every useful directory; this mirrors `/repo <path>` from
+    // the card. Permission is gated at the top (isSensitive + pendingRepoOwner
+    // exception), same as skip_repo. Always a plain commit — worktree creation
+    // needs a scanned git repo root, not an arbitrary path.
+    if (actionType === 'repo_manual_submit' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const rawPath = String(action?.form_value?.repo_manual_path ?? '').trim();
+      if (!rawPath) {
+        return { toast: { type: 'error', content: t('card.repo.manual_empty', undefined, locDs) } };
+      }
+      const validation = validateWorkingDir(rawPath, locDs);
+      if (!validation.ok) {
+        return { toast: { type: 'error', content: validation.error } };
+      }
+      // A worktree creation in flight holds the commit lock — a manual switch
+      // interleaving there would double-fork (same guard as the plain switch).
+      if (ds.worktreeCreating) {
+        return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
+      }
+      const selectedPath = validation.resolvedPath;
+      const displayName = pathBasename(selectedPath) || selectedPath;
+      await commitRepoSelection(
+        { ds, rootId, cardMessageId, larkAppId, activeSessions, sessionReply },
+        selectedPath,
+        displayName,
+      );
+    }
     return;
   }
 
@@ -1548,120 +1715,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   const repoSessionKey = sessionKey(rootId, larkAppId!);
   const sessionStillActive = () => activeSessions.get(repoSessionKey) === targetDs;
 
-  // Shared commit path for a resolved directory: pin it on the session, then
-  // either fork the pending CLI (first selection) or close + recreate the
-  // session (mid-session switch). The worktree flow funnels back in here with
-  // the freshly created worktree path.
-  const commitSelection = async (dirPath: string, dirLabel: string) => {
-    const commitGenSessionId = targetDs.session.sessionId;
-    targetDs.workingDir = dirPath;
-    targetDs.session.workingDir = dirPath;
-    sessionStore.updateSession(targetDs.session);
-
-    if (targetDs.pendingRepo) {
-      const selfBot = getBot(targetDs.larkAppId);
-      const botCfg = selfBot.config;
-      const effectiveCliId = sessionCliId(targetDs);
-      // First-time repo selection — now spawn CLI with the original prompt
-      targetDs.pendingRepo = false;
-      publishAttentionPatch(targetDs);
-      const pendingPrompt = targetDs.pendingPrompt ?? '';
-      const pendingRawInput = targetDs.pendingRawInput;
-      // Raw-input cold start still wraps any input buffered while the repo card
-      // was pending — see the skip_repo branch above for the rationale.
-      const hasBufferedInput =
-        pendingPrompt.trim().length > 0 ||
-        (targetDs.pendingAttachments?.length ?? 0) > 0 ||
-        (targetDs.pendingFollowUps?.length ?? 0) > 0;
-      const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
-        ? buildNewTopicPrompt(
-            pendingPrompt,
-            targetDs.session.sessionId,
-            effectiveCliId,
-            botCfg.cliPathOverride,
-            targetDs.pendingAttachments,
-            targetDs.pendingMentions,
-            await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
-            targetDs.pendingFollowUps,
-            { name: selfBot.botName, openId: selfBot.botOpenId },
-            locTarget,
-            targetDs.pendingSender,
-            { larkAppId: targetDs.larkAppId, chatId: targetDs.chatId },
-          )
-        : '';
-      const prompt = pendingRawInput ? '' : wrappedPrompt;
-      // Last-line defence: prompt prep awaited above — if anything replaced
-      // OR closed the session in that window, forking now would clobber it
-      // (or resurrect a /close'd session).
-      if (!sessionStillActive() || targetDs.session.sessionId !== commitGenSessionId) {
-        logger.warn(`[${tag(targetDs)}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${targetDs.session.sessionId}, active=${sessionStillActive()}) — aborting this fork`);
-        return;
-      }
-      if (pendingRawInput && hasBufferedInput) {
-        targetDs.pendingFollowUpInput = {
-          userPrompt: pendingPrompt || (targetDs.pendingFollowUps?.join('\n\n') ?? ''),
-          cliInput: wrappedPrompt,
-        };
-      }
-      rememberLastCliInput(targetDs, pendingRawInput ?? pendingPrompt, pendingRawInput ?? prompt);
-      targetDs.pendingPrompt = undefined;
-      targetDs.pendingAttachments = undefined;
-      targetDs.pendingMentions = undefined;
-      targetDs.pendingSender = undefined;
-      targetDs.pendingFollowUps = undefined;
-      forkWorker(targetDs, prompt);
-      // A card click has no turn of its own — anchor the confirmation to the
-      // session's current reply-target turn so a shared fold-back topic keeps
-      // it in-thread (same leak as the /repo command path).
-      await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget), undefined, fallbackTurnId(targetDs, undefined));
-      logger.info(`[${tag(targetDs)}] Repo selected: ${dirPath}, spawning CLI`);
-    } else {
-      // Mid-session repo switch — close old session, start fresh.
-      killWorker(targetDs);
-      // Park the current card in `frozenCards` so the next POST under the new
-      // session sweeps it via recall. closeSession() wipes the on-disk
-      // frozen-cards file under the OLD sessionId, but the in-memory Map
-      // travels with `targetDs` into the new session and still carries the
-      // old messageId for deletion. If fork or POST fails, the parked card
-      // stays in the thread instead of vanishing prematurely.
-      parkStreamCard(targetDs);
-      sessionStore.closeSession(targetDs.session.sessionId);
-      const session = sessionStore.createSession(targetDs.chatId, rootId, dirLabel, targetDs.chatType);
-      targetDs.session = session;
-      targetDs.lastUserPrompt = undefined;
-      targetDs.lastCliInput = undefined;
-      // Pin workingDir + larkAppId onto the new session before forkWorker.
-      // Without this, a daemon restart restores the session with an empty
-      // workingDir and the worker spawns in the bot's default cwd, so
-      // `claude --resume` looks in the wrong .claude/projects/<hash>/ dir and
-      // exits code 0 immediately, crash-looping until the rate-limiter trips.
-      targetDs.session.workingDir = dirPath;
-      targetDs.session.larkAppId = targetDs.larkAppId;
-      sessionStore.updateSession(targetDs.session);
-      targetDs.hasHistory = false;
-      // Re-persist the parked card under the NEW sessionId so a daemon crash
-      // before the next POST doesn't strand it. closeSession() above wiped
-      // the on-disk file under the OLD sessionId; without this re-save, the
-      // in-memory Map only survives in process memory.
-      if (targetDs.frozenCards && targetDs.frozenCards.size > 0) {
-        saveFrozenCards(targetDs.session.sessionId, targetDs.frozenCards);
-      }
-      // Drop the old turn's streaming-card reference so worker_ready POSTs a
-      // fresh card for the new session instead of PATCHing the previous one.
-      targetDs.streamCardId = undefined;
-      targetDs.streamCardNonce = undefined;
-      targetDs.streamCardPending = undefined;
-      targetDs.lastScreenContent = undefined;
-      targetDs.lastScreenStatus = undefined;
-      forkWorker(targetDs, '', false);
-      await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
-      logger.info(`[${tag(targetDs)}] Repo switched to ${dirPath}, new session created`);
-    }
-
-    // Withdraw the repo selection card
-    if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
-    targetDs.repoCardMessageId = undefined;
-  };
+  // Shared commit context for a resolved directory — funnels the dropdown,
+  // worktree and manual-entry flows through the same module-level
+  // commitRepoSelection (pin dir, then fork pending CLI or close+recreate).
+  const commitCtx = { ds: targetDs, rootId, cardMessageId, larkAppId, activeSessions, sessionReply };
 
   if (isWorktreeOpen) {
     // Worktree creation involves a `git fetch` that can take many seconds —
@@ -1707,7 +1764,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // right before committing, or we'd kill the session it just spawned.
         if (sessionChanged()) return notSwitched(creation, 'during reply');
         try {
-          await commitSelection(creation.path, `${pathBasename(creation.path)} (${creation.branch})`);
+          await commitRepoSelection(commitCtx, creation.path, `${pathBasename(creation.path)} (${creation.branch})`);
         } catch (e) {
           // The worktree DOES exist at this point — only the switch failed.
           // Don't report it as a creation failure, or the user retries and
@@ -1729,5 +1786,5 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (targetDs.worktreeCreating) {
     return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locTarget) } };
   }
-  await commitSelection(selectedPath, displayName);
+  await commitRepoSelection(commitCtx, selectedPath, displayName);
 }

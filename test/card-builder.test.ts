@@ -716,14 +716,36 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('should have 5 top-level elements: div, hr, action, worktree action, note', () => {
+    it('should have 6 top-level elements: div, hr, action, worktree action, manual form, note', () => {
       const card = parse(buildRepoSelectCard(projects));
-      expect(card.elements).toHaveLength(5);
+      expect(card.elements).toHaveLength(6);
       expect(card.elements[0].tag).toBe('div');
       expect(card.elements[1].tag).toBe('hr');
       expect(card.elements[2].tag).toBe('action');
       expect(card.elements[3].tag).toBe('action');
-      expect(card.elements[4].tag).toBe('note');
+      expect(card.elements[4].tag).toBe('form');
+      expect(card.elements[5].tag).toBe('note');
+    });
+
+    it('manual-entry form carries an input + form_submit button under repo_manual_submit', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_manual_form');
+      expect(form).toBeDefined();
+      const input = form.elements.find((e: any) => e.tag === 'input');
+      expect(input.name).toBe('repo_manual_path');
+      const btn = form.elements.find((e: any) => e.tag === 'button');
+      expect(btn.action_type).toBe('form_submit');
+      expect(btn.value.action).toBe('repo_manual_submit');
+      expect(btn.value.root_id).toBe('om_root');
+    });
+
+    it('keeps the manual-entry form even when no main repos exist (worktree action omitted)', () => {
+      const onlyWorktrees: ProjectInfo[] = [
+        { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
+      ];
+      const card = parse(buildRepoSelectCard(onlyWorktrees));
+      // div, hr, action, form, note — worktree action dropped, form stays
+      expect(card.elements.map((e: any) => e.tag)).toEqual(['div', 'hr', 'action', 'form', 'note']);
     });
   });
 

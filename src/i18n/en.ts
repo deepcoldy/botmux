@@ -15,6 +15,7 @@ export const messages: Record<string, string> = {
   'card.btn.refresh': '🔃 Refresh',
   'card.btn.takeover': '🔄 Take Over',
   'card.btn.skip_repo': '▶️ Start Session Directly',
+  'card.btn.manual_repo': 'Use This Directory',
   'card.btn.half_page_up': '⇞ Page ½ Up',
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
@@ -54,6 +55,8 @@ export const messages: Record<string, string> = {
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
   'card.repo.placeholder_switch': 'Pick a repo to switch to',
+  'card.repo.manual_placeholder': 'Enter any working directory, e.g. /path/to/project or ~/projects/foo',
+  'card.repo.manual_empty': 'Please enter a working directory path',
   'card.repo.current_active': 'Currently active project:',
   'card.repo.current_marker': ' ← current',
   'card.repo.note': 'You can also reply `/repo <N>` (e.g. `/repo 1`), or `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`) to skip this card. `/repo wt <N|name> [branch]` opens a fresh worktree off the remote default branch.',
