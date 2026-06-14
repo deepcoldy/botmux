@@ -29,7 +29,7 @@ import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { CLI_SELECT_OPTIONS, resolveCliSelection } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeDashboardConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig } from './global-config.js';
+import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig } from './global-config.js';
 import { isLocale } from './i18n/types.js';
 import { isLocalDevInstall } from './utils/install-info.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
@@ -511,9 +511,21 @@ const server = createServer(async (req, res) => {
 
     // ─── HD2D office assets (token-gated: download triggers a ~74MB fetch) ──
     if (req.method === 'GET' && url.pathname === '/api/game/status') {
-      return jsonRes(res, 200, hd2dStatus());
+      // `proxy` prefills the office tab's optional proxy input (config value
+      // only; an env-var proxy still works as a silent fallback downstream).
+      return jsonRes(res, 200, { ...hd2dStatus(), proxy: readGlobalConfig().httpProxy ?? '' });
     }
     if (req.method === 'POST' && url.pathname === '/api/game/download') {
+      // Optional `proxy` in the body is persisted (so it survives restart) and
+      // takes effect immediately for this download — Node's fetch ignores the
+      // proxy env vars, so hosts behind a proxy set it here.
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { body = undefined; }
+      if (body && typeof body === 'object' && 'proxy' in body) {
+        const raw = (body as { proxy?: unknown }).proxy;
+        const proxy = typeof raw === 'string' ? raw.trim() : '';
+        mergeGlobalConfig({ httpProxy: proxy || null });
+      }
       return jsonRes(res, 200, startHd2dDownload());
     }
 

@@ -15,6 +15,7 @@ interface GameStatus {
   received: number;
   total: number;
   error?: string;
+  proxy?: string;
 }
 
 // Fallback total used only when /api/game/status is unreachable (e.g. an
@@ -37,6 +38,7 @@ export function renderOfficePage(host: HTMLElement): (() => void) | void {
 
   let disposed = false;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let proxy = ''; // last-known configured proxy, prefilled into the input
   const mb = (n: number) => (n / 1048576).toFixed(0);
 
   function stopPoll() {
@@ -73,17 +75,26 @@ export function renderOfficePage(host: HTMLElement): (() => void) | void {
           </div>
           <div style="font-size:12px;opacity:.7;">下载中… ${mb(s.received)} / ${mb(total)} MB（${pct}%）</div>
         ` : `
+          <input id="hd2d-proxy" type="text" value="${escapeHtml(proxy)}"
+            placeholder="HTTP 代理（可选，如 http://127.0.0.1:7890）"
+            style="width:100%;box-sizing:border-box;margin-bottom:12px;padding:8px 10px;border-radius:6px;border:1px solid rgba(127,127,127,.4);background:transparent;color:inherit;font-size:12px;" />
+          <div style="font-size:11px;opacity:.5;margin-bottom:14px;text-align:left;">连不上 GitHub 时填代理（仅用于下载本资源，会记住）。留空走直连/系统代理环境变量。</div>
           <button id="hd2d-load" style="cursor:pointer;border:none;border-radius:8px;padding:10px 22px;font-size:14px;font-weight:600;background:#4a9eff;color:#fff;">
             ${err ? '重试' : '加载办公室'}（约 ${mb(total)} MB）
           </button>
         `}
       </div>`;
     const btn = host.querySelector<HTMLButtonElement>('#hd2d-load');
-    if (btn) btn.onclick = () => { void startDownload(); };
+    if (btn) btn.onclick = () => {
+      const input = host.querySelector<HTMLInputElement>('#hd2d-proxy');
+      proxy = input?.value.trim() ?? '';
+      void startDownload();
+    };
   }
 
   function route(s: GameStatus) {
     if (disposed) return;
+    if (typeof s.proxy === 'string') proxy = s.proxy;
     if (s.state === 'ready') { showIframe(); return; }
     showLoader(s);
     if (s.state === 'downloading') pollTimer = setTimeout(() => void poll(), 700);
@@ -92,7 +103,11 @@ export function renderOfficePage(host: HTMLElement): (() => void) | void {
   async function startDownload() {
     showLoader({ state: 'downloading', received: 0, total: FALLBACK_TOTAL });
     try {
-      const r = await fetch('/api/game/download', { method: 'POST' });
+      const r = await fetch('/api/game/download', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ proxy }),
+      });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       route(await r.json() as GameStatus);
     } catch (e) {
