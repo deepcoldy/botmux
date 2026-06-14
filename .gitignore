@@ -20,3 +20,8 @@ midscene_run/
 .magic-token
 .magic-apps.json
 docs-site/.magic-token
+
+# HD2D office runtime binaries — downloaded on demand from GitHub Release
+# (hd2d-assets-*), never committed. See src/dashboard/hd2d-assets.ts
+src/dashboard/web/game/index.wasm
+src/dashboard/web/game/index.pck

@@ -176,7 +176,8 @@ export function decideDashboardAuth(opts: {
     pathname.startsWith('/api/workflows/') &&
     !isRawTerminalLog;
   const isStaticShell =
-    method === 'GET' && (pathname === '/' || pathname.startsWith('/assets/'));
+    method === 'GET' &&
+    (pathname === '/' || pathname.startsWith('/assets/') || pathname.startsWith('/game/'));
 
   // Public read-only mode opens ONLY the allow-listed "watch work" reads
   // (PUBLIC_READ_PATHS) — fail-closed: a path not on the list stays token-gated

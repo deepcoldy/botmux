@@ -1,7 +1,7 @@
 // src/dashboard.ts
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import {
-  readFileSync, existsSync, chmodSync, mkdirSync, statSync,
+  readFileSync, existsSync, chmodSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname } from 'node:path';
@@ -35,6 +35,7 @@ import { isLocalDevInstall } from './utils/install-info.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
+import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -194,7 +195,23 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.wasm': 'application/wasm',
+  '.pck': 'application/octet-stream',
 };
+
+/** Stream an absolute file (used for HD2D cache binaries that live outside
+ *  WEB_DIR). Callers pass only vetted paths from `hd2dAssetPath`. */
+function serveFileAbs(res: ServerResponse, fp: string): boolean {
+  let st;
+  try { st = statSync(fp); } catch { return false; }
+  if (!st.isFile()) return false;
+  res.writeHead(200, {
+    'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
+    'content-length': String(st.size),
+  });
+  createReadStream(fp).pipe(res);
+  return true;
+}
 
 function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
@@ -472,19 +489,48 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/*) ──────────────────────────
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/assets/'))) {
-      // Map /assets/foo.js → WEB_DIR/foo.js
+    // ─── Static frontend (index.html + /assets/* + /game/*) ────────────────
+    if (
+      req.method === 'GET' &&
+      (url.pathname === '/' || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/game/'))
+    ) {
+      // HD2D runtime binaries (index.wasm / index.pck) are NOT shipped — they
+      // are downloaded on demand into the cache dir and served from there.
+      // Everything else under /game/ is the small shell shipped in dist.
+      if (url.pathname === '/game/index.wasm' || url.pathname === '/game/index.pck') {
+        const fp = hd2dAssetPath(url.pathname.slice('/game/'.length));
+        if (fp && serveFileAbs(res, fp)) return;
+        res.writeHead(404); res.end(); return;
+      }
+      // Map /assets/foo.js → WEB_DIR/foo.js; /game/* is served as-is.
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
         : url.pathname;
       if (serveStatic(req, res, lookupPath)) return;
     }
 
+    // ─── HD2D office assets (token-gated: download triggers a ~74MB fetch) ──
+    if (req.method === 'GET' && url.pathname === '/api/game/status') {
+      return jsonRes(res, 200, hd2dStatus());
+    }
+    if (req.method === 'POST' && url.pathname === '/api/game/download') {
+      return jsonRes(res, 200, startHd2dDownload());
+    }
+
     // ─── Public API (cookie/token already validated above) ──────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
-      return jsonRes(res, 200, { sessions: aggregator.getSessions() });
+      // Sessions spawned before a bot config carried a display name store the
+      // raw appId as botName — resolve through the live registry so consumers
+      // (dashboard, HD2D office tab) always see the human-facing name.
+      const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
+      const sessions = aggregator.getSessions().map(s => {
+        const n = names.get(s.larkAppId);
+        return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
+          ? { ...s, botName: n }
+          : s;
+      });
+      return jsonRes(res, 200, { sessions });
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       // Public-read carve-out: the row carries CONTENT (prompt = business

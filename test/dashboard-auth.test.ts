@@ -202,6 +202,28 @@ describe('decideDashboardAuth — public surface', () => {
     });
     expect(d.kind).toBe('allow');
   });
+
+  it('GET /game/index.html — HD2D office shell allow without any token', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname: '/game/index.html',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('POST /api/game/download without token → deny401 (gated: triggers a ~74MB fetch)', () => {
+    const d = decideDashboardAuth({
+      method: 'POST',
+      pathname: '/api/game/download',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('deny401');
+  });
 });
 
 describe('decideDashboardAuth — protected surface', () => {
