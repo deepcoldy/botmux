@@ -1180,10 +1180,17 @@ function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
             env: pm2Env(home),
             timeout: 10_000,
           });
-        } catch { /* */ }
+        } catch (e) {
+          // Don't swallow silently — a failed delete here used to leave the
+          // restart half-done with no trace. Surface it (the auto-restart
+          // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
+          console.error(`[restart] pm2 delete ${app.name} failed: ${e instanceof Error ? e.message : e}`);
+        }
       }
     }
-  } catch { /* pm2 not running or no apps */ }
+  } catch (e) {
+    console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 function killPm2GodDaemon(home: string = PM2_HOME): void {
