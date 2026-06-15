@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import {
   globalConfigPath,
   mergeDashboardConfig,
+  mergeGlobalConfig,
   readGlobalConfig,
 } from '../src/global-config.js';
 
@@ -39,6 +40,24 @@ describe('global dashboard config', () => {
     mergeDashboardConfig({ publicReadOnly: false });
     // Same-process read-after-write must not serve the cached pre-merge value.
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
+  });
+
+  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
+    // proxy persisted by mergeGlobalConfig was never read back by the downloader.
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+    mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
+    expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');
+    // Clearing (null) removes it again.
+    mergeGlobalConfig({ httpProxy: null });
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+  });
+
+  it('ignores a non-string / blank httpProxy', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: 123 }));
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+    writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: '   ' }));
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
   });
 
   it('merge writes atomically and leaves no tmp file behind', () => {

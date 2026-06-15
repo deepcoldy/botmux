@@ -238,6 +238,7 @@ export function readGlobalConfig(): GlobalConfig {
   if (worker) out.worker = worker;
   const maintenance = readMaintenance(raw.maintenance);
   if (maintenance) out.maintenance = maintenance;
+  if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   readCache = { path, value: out, at: Date.now() };
   return out;
 }
