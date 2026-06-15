@@ -22,7 +22,7 @@ import { connect as tlsConnect } from 'node:tls';
 import { logger } from '../utils/logger.js';
 import { readGlobalConfig } from '../global-config.js';
 
-export const HD2D_ASSETS_TAG = 'hd2d-assets-v1';
+export const HD2D_ASSETS_TAG = 'hd2d-assets-v2';
 const RELEASE_BASE_URL = `https://github.com/deepcoldy/botmux/releases/download/${HD2D_ASSETS_TAG}`;
 
 interface AssetSpec { name: string; size: number; sha256: string; }
@@ -32,7 +32,7 @@ interface AssetSpec { name: string; size: number; sha256: string; }
 // file rather than serving an unverified wasm blob.
 const ASSETS: readonly AssetSpec[] = [
   { name: 'index.wasm', size: 37700666, sha256: '26b61ce95247012ab3dca3ff51e96d1cdbff44ee91a8c20a83e150afca83f1b6' },
-  { name: 'index.pck', size: 40514160, sha256: 'ad236ce997afeb5cdb2bc2f4207100aa843341d3a380fe06765a4d1911b6419a' },
+  { name: 'index.pck', size: 40521520, sha256: '6016b257075cdfbb6d3ddea881b7a0eea09235d7972921ca73504379c5a29ee3' },
 ];
 
 export const HD2D_CACHE_DIR = join(homedir(), '.botmux', 'cache', 'hd2d', HD2D_ASSETS_TAG);

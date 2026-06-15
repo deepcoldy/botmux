@@ -18,7 +18,7 @@ describe('hd2dStatus', () => {
   it('reports absent with the full total before any download', () => {
     const s = hd2dStatus();
     // In a clean env nothing is cached; total is the sum of both binaries.
-    expect(s.total).toBe(78_214_826);
+    expect(s.total).toBe(78_222_186);
     expect(['absent', 'ready']).toContain(s.state);
   });
 });

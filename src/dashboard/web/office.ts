@@ -20,7 +20,7 @@ interface GameStatus {
 
 // Fallback total used only when /api/game/status is unreachable (e.g. an
 // unauthenticated viewer 401s) so the button still shows a sensible size.
-const FALLBACK_TOTAL = 78_214_826;
+const FALLBACK_TOTAL = 78_222_186;
 
 export function renderOfficePage(host: HTMLElement): (() => void) | void {
   const prev = {
