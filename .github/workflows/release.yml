@@ -147,8 +147,6 @@ jobs:
               echo "$THANKS"
             fi
             echo ""
-            echo "> ℹ️ HD2D「办公室」游戏资产体积大且几乎不随版本变化，不随 npm 包/版本发布；dashboard 进入「办公室」后按需下载自 [hd2d-assets release](https://github.com/${GITHUB_REPOSITORY}/releases/tag/hd2d-assets-v2)。"
-            echo ""
             echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
