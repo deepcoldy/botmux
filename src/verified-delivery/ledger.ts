@@ -66,14 +66,27 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
       const until = Date.now() + 15;
       while (Date.now() < until) { /* spin */ }
     }
+    // NEVER fall through to an unlocked write — that would defeat the
+    // read-check-append serialization (dup seq / broken idempotency). Make the
+    // caller retry instead.
+    if (fd === undefined) throw new Error('verified-delivery ledger lock timeout');
     try {
       return fn();
     } finally {
-      if (fd !== undefined) { closeSync(fd); try { unlinkSync(lockPath); } catch { /* */ } }
+      closeSync(fd);
+      try { unlinkSync(lockPath); } catch { /* */ }
     }
   }
 
   function append(draft: LedgerEventDraft): { event: LedgerEvent; deduped: boolean } {
+    // Contract invariant enforced at the seam: a report with no evidence is not
+    // verifiable, so the ledger refuses it — don't rely on the report CLI alone.
+    if (draft.type === 'TaskReported') {
+      const ev = (draft.payload as import('./types.js').TaskReportedPayload).evidence;
+      if (!Array.isArray(ev) || ev.length === 0) {
+        throw new Error('TaskReported requires at least one evidence item (path or inline)');
+      }
+    }
     return withLock(() => {
       const existing = read();
       const dup = existing.find((e) => e.idempotencyKey === draft.idempotencyKey);
@@ -118,13 +131,16 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         const t = ensure(e.taskId, e.chatId);
         const r = findReport(t, p.reportId);
         if (r) { r.verdict = 'accepted'; r.checkedBy = p.checkedBy; r.evidenceChecked = p.evidenceChecked; r.ranCommands = p.ranCommands; }
-        t.status = 'accepted';
+        // Only the verdict on the CURRENT attempt moves the task. A late verdict
+        // for a superseded report still records on that report, but must not drag
+        // a fresh attempt back to a terminal state.
+        if (p.reportId === t.latestReportId) t.status = 'accepted';
       } else if (e.type === 'TaskRejected') {
         const p = e.payload as import('./types.js').TaskRejectedPayload;
         const t = ensure(e.taskId, e.chatId);
         const r = findReport(t, p.reportId);
         if (r) { r.verdict = 'rejected'; r.reason = p.reason; r.checkedBy = p.checkedBy; }
-        t.status = 'rejected';
+        if (p.reportId === t.latestReportId) t.status = 'rejected';
       }
     }
     return byTask;
