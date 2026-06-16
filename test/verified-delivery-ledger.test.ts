@@ -57,6 +57,30 @@ describe('verified-delivery ledger', () => {
     expect(t.reports[0].verdict).toBe('rejected'); // attempt 1 keeps its verdict
   });
 
+  it('a late verdict for a superseded report does not drag the new attempt back', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-4', idempotencyKey: 'dispatched:task-4', payload: { taskId: 'task-4' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 'task-4', idempotencyKey: 'reported:r1', payload: { taskId: 'task-4', reportId: 'r1', summary: 'a1', evidence: [{ kind: 'path', path: '/tmp/a' }] } }));
+    led.append(draft({ type: 'TaskRejected', taskId: 'task-4', idempotencyKey: 'rejected:task-4:r1', payload: { taskId: 'task-4', reportId: 'r1', reason: 'insufficient' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 'task-4', idempotencyKey: 'reported:r2', payload: { taskId: 'task-4', reportId: 'r2', summary: 'a2', evidence: [{ kind: 'path', path: '/tmp/b' }] } }));
+    // a stray late accept for the OLD report r1 arrives after r2 is the live attempt
+    led.append(draft({ type: 'TaskAccepted', taskId: 'task-4', idempotencyKey: 'accepted:task-4:r1', payload: { taskId: 'task-4', reportId: 'r1' } }));
+
+    const t = led.task('task-4')!;
+    expect(t.status).toBe('reported');       // still on r2, NOT dragged to accepted
+    expect(t.latestReportId).toBe('r2');
+    expect(t.reports.find((r) => r.reportId === 'r1')!.verdict).toBe('accepted'); // r1 still records its (late) verdict
+  });
+
+  it('TaskReported with no evidence is refused at the seam', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-5', idempotencyKey: 'dispatched:task-5', payload: { taskId: 'task-5' } }));
+    expect(() => led.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'task-5', idempotencyKey: 'reported:empty',
+      payload: { taskId: 'task-5', reportId: 'empty', summary: 'no proof', evidence: [] },
+    }))).toThrow(/at least one evidence/);
+  });
+
   it('idempotent append: same key twice is a no-op', () => {
     const led = openLedger({ baseDir });
     const a = led.append(draft({ type: 'TaskDispatched', taskId: 'task-3', idempotencyKey: 'dispatched:task-3', payload: { taskId: 'task-3' } }));

@@ -82,10 +82,23 @@ export interface TaskRejectedPayload {
   taskId: string;
   reportId: string;
   checkedBy?: string;
+  /** Stable enum-like code (see REJECT_REASON); human detail goes in retryBrief. */
   reason: string;
   retryBrief?: string;
   expectedEvidence?: string;
 }
+
+/** Stable reject codes both halves share, so UI / stats can recognise them.
+ *  Detail/instructions ride in retryBrief / expectedEvidence, not in the code. */
+export const REJECT_REASON = {
+  /** Orchestrator could not read the path evidence (P0: not same-host/reachable). */
+  EVIDENCE_UNREACHABLE: 'evidence_unreachable',
+  /** Acceptance check ran and failed (test non-zero / output mismatch). */
+  CHECK_FAILED: 'check_failed',
+  /** Delivered result doesn't meet the brief on inspection. */
+  INSUFFICIENT: 'insufficient',
+} as const;
+export type RejectReason = (typeof REJECT_REASON)[keyof typeof REJECT_REASON];
 
 export type LedgerEventType =
   | 'TaskDispatched'
