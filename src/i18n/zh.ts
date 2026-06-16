@@ -589,6 +589,7 @@ export const messages: Record<string, string> = {
   'setup.next_autostart': '  2. botmux autostart enable   注册开机自启（推荐：{platformName}，无需 sudo）',
   'setup.platform_mac': 'mac launchd',
   'setup.platform_linux': 'linux user systemd',
+  'setup.platform_windows': 'Windows Task Scheduler',
   'setup.platform_other': '当前平台暂不支持',
   'setup.wizard_title': '🤖 botmux 配置向导',
   'setup.config_dir': '配置目录: {path}',

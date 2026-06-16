@@ -19,7 +19,7 @@
  * code injects `forkWorkerJs` (defined below).
  */
 
-import { fork, type ChildProcess } from 'node:child_process';
+import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -41,6 +41,8 @@ import {
   type AttemptTerminalStatus,
 } from './attempt-terminal.js';
 import { logger } from '../utils/logger.js';
+
+type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
 // ─── IPC payloads (subset of WorkerToDaemon we care about) ────────────────
 
@@ -91,10 +93,11 @@ export type WorkerSpawnOptions = {
 export const forkWorkerJsFactory: WorkerProcessFactory = {
   spawn(opts) {
     const child: ChildProcess = fork(opts.workerPath, [], {
+      windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       cwd: opts.cwd,
       env: opts.env,
-    });
+    } as WindowsForkOptions);
     return {
       send: (m) => child.send(m as never),
       on: (event: string, cb: (...args: unknown[]) => void) => {

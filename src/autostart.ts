@@ -6,6 +6,8 @@
  * Linux  — installs a user systemd unit at ~/.config/systemd/user/botmux.service
  *          and enables it (no sudo). Reminds the user to run
  *          `loginctl enable-linger` if the unit needs to survive logout.
+ * Windows — installs a per-user Task Scheduler task, or falls back to the
+ *            current user's Startup folder if task registration is denied.
  *
  * The unit invokes `node <PKG_ROOT>/dist/cli.js start`, which goes through
  * the same pm2 path as `botmux start`. PATH from the install-time shell is
@@ -28,10 +30,12 @@ export interface AutostartOpts {
 
 const LABEL = 'com.botmux.daemon';
 const SERVICE_NAME = 'botmux.service';
+const WINDOWS_TASK_NAME = 'botmux-daemon';
 
-function platform(): 'macos' | 'linux' | 'unsupported' {
+function platform(): 'macos' | 'linux' | 'windows' | 'unsupported' {
   if (process.platform === 'darwin') return 'macos';
   if (process.platform === 'linux') return 'linux';
+  if (process.platform === 'win32') return 'windows';
   return 'unsupported';
 }
 
@@ -314,16 +318,163 @@ function statusLinux(): void {
   console.log(`Linger: ${lingerEnabled() ? 'yes' : 'no（登出后服务会停）'}`);
 }
 
+// ─── Windows (Task Scheduler / Startup folder) ─────────────────────────────
+
+function escapeCmdValue(s: string): string {
+  // Batch files expand %VAR% while parsing. Keep the captured PATH literal.
+  return s.replace(/\^/g, '^^').replace(/%/g, '%%');
+}
+
+function escapeVbsString(s: string): string {
+  return s.replace(/"/g, '""');
+}
+
+function windowsScriptPath(): string {
+  return join(homedir(), '.botmux', 'autostart.cmd');
+}
+
+function windowsStartupDir(): string {
+  return join(
+    process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'),
+    'Microsoft',
+    'Windows',
+    'Start Menu',
+    'Programs',
+    'Startup',
+  );
+}
+
+function windowsStartupLauncherPath(): string {
+  return join(windowsStartupDir(), 'botmux-autostart.vbs');
+}
+
+function windowsLogPath(opts: AutostartOpts, name: string): string {
+  return join(opts.logDir, name);
+}
+
+function windowsScriptContent(opts: AutostartOpts): string {
+  const path = escapeCmdValue(currentPath());
+  const cwd = opts.configDir;
+  const outLog = windowsLogPath(opts, 'autostart-out.log');
+  const errLog = windowsLogPath(opts, 'autostart-err.log');
+  return `@echo off
+setlocal
+set "PATH=${path}"
+cd /d "${cwd}"
+"${nodeBin()}" "${cliJs(opts)}" start >> "${outLog}" 2>> "${errLog}"
+`;
+}
+
+function windowsLauncherContent(scriptPath: string): string {
+  const script = escapeVbsString(scriptPath);
+  return `Set shell = CreateObject("WScript.Shell")
+shell.Run Chr(34) & "${script}" & Chr(34), 0, False
+`;
+}
+
+function windowsTaskExists(): boolean {
+  const r = spawnSync('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME], { stdio: 'pipe' });
+  return r.status === 0;
+}
+
+function createWindowsTask(scriptPath: string): ReturnType<typeof spawnSync> {
+  return spawnSync(
+    'schtasks',
+    ['/Create', '/TN', WINDOWS_TASK_NAME, '/SC', 'ONLOGON', '/TR', `"${scriptPath}"`, '/F'],
+    { stdio: 'pipe' },
+  );
+}
+
+function writeWindowsStartupLauncher(scriptPath: string): string {
+  const launcher = windowsStartupLauncherPath();
+  mkdirSync(dirname(launcher), { recursive: true });
+  writeFileSync(launcher, windowsLauncherContent(scriptPath));
+  return launcher;
+}
+
+function enableWindows(opts: AutostartOpts): void {
+  const script = windowsScriptPath();
+  mkdirSync(dirname(script), { recursive: true });
+  mkdirSync(opts.logDir, { recursive: true });
+  writeFileSync(script, windowsScriptContent(opts));
+  console.log(`✅ 已写入 Windows 启动脚本: ${script}`);
+
+  const r = createWindowsTask(script);
+  if (r.status === 0) {
+    console.log(`✅ 已创建/更新 Windows 任务计划: ${WINDOWS_TASK_NAME}`);
+    const launcher = windowsStartupLauncherPath();
+    if (existsSync(launcher)) {
+      unlinkSync(launcher);
+      console.log(`✅ 已清理 Startup 回退启动器: ${launcher}`);
+    }
+  } else {
+    const msg = (r.stderr.toString() || r.stdout.toString()).trim();
+    console.warn(`⚠️  任务计划创建失败，改用当前用户 Startup 文件夹自启。`);
+    if (msg) console.warn(msg);
+    const launcher = writeWindowsStartupLauncher(script);
+    console.log(`✅ 已写入 Startup 启动器: ${launcher}`);
+  }
+
+  console.log(`   下次登录 Windows 时自动启动。立即启动: botmux start`);
+}
+
+function disableWindows(): void {
+  const r = spawnSync('schtasks', ['/Delete', '/TN', WINDOWS_TASK_NAME, '/F'], { stdio: 'pipe' });
+  if (r.status === 0) {
+    console.log(`✅ 已删除 Windows 任务计划: ${WINDOWS_TASK_NAME}`);
+  } else {
+    console.warn(`⚠️  删除任务计划返回非零（可能本来就未启用）`);
+    const msg = (r.stderr.toString() || r.stdout.toString()).trim();
+    if (msg) console.warn(msg);
+  }
+
+  const launcher = windowsStartupLauncherPath();
+  if (existsSync(launcher)) {
+    unlinkSync(launcher);
+    console.log(`✅ 已删除 ${launcher}`);
+  } else {
+    console.log(`ℹ️  ${launcher} 不存在`);
+  }
+
+  const script = windowsScriptPath();
+  if (existsSync(script)) {
+    unlinkSync(script);
+    console.log(`✅ 已删除 ${script}`);
+  } else {
+    console.log(`ℹ️  ${script} 不存在`);
+  }
+  console.log(`   pm2 daemon 仍在运行；要停止请跑 botmux stop`);
+}
+
+function statusWindows(): void {
+  const script = windowsScriptPath();
+  const launcher = windowsStartupLauncherPath();
+  console.log(`平台: Windows (Task Scheduler / Startup folder)`);
+  console.log(`任务名称: ${WINDOWS_TASK_NAME}`);
+  console.log(`启动脚本: ${script}`);
+  console.log(`启动脚本存在: ${existsSync(script) ? 'yes' : 'no'}`);
+  console.log(`Startup 启动器: ${launcher}`);
+  console.log(`Startup 启动器存在: ${existsSync(launcher) ? 'yes' : 'no'}`);
+
+  const r = spawnSync('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME, '/FO', 'LIST', '/V'], { stdio: 'pipe' });
+  if (r.status === 0) {
+    console.log(`任务计划存在: yes`);
+    const text = r.stdout.toString().trim();
+    if (text) console.log(text);
+  } else {
+    console.log(`任务计划存在: no`);
+  }
+}
+
 // ─── Public dispatch ─────────────────────────────────────────────────────────
 
 export function enableAutostart(opts: AutostartOpts): void {
   switch (platform()) {
     case 'macos': return enableMac(opts);
     case 'linux': return enableLinux(opts);
+    case 'windows': return enableWindows(opts);
     default:
       console.error(`❌ 当前平台 ${process.platform} 暂不支持 botmux autostart。`);
-      console.error(`   Windows 用户可用任务计划程序 (Task Scheduler) 调用:`);
-      console.error(`     ${nodeBin()} ${cliJs(opts)} start`);
       process.exit(1);
   }
 }
@@ -332,6 +483,7 @@ export function disableAutostart(_opts: AutostartOpts): void {
   switch (platform()) {
     case 'macos': return disableMac();
     case 'linux': return disableLinux();
+    case 'windows': return disableWindows();
     default:
       console.error(`❌ 当前平台 ${process.platform} 暂不支持 botmux autostart。`);
       process.exit(1);
@@ -342,6 +494,7 @@ export function autostartStatus(_opts: AutostartOpts): void {
   switch (platform()) {
     case 'macos': return statusMac();
     case 'linux': return statusLinux();
+    case 'windows': return statusWindows();
     default:
       console.log(`平台: ${process.platform} (不支持)`);
   }
@@ -372,6 +525,35 @@ export function refreshAutostart(opts: AutostartOpts): boolean {
         spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
       }
       return true;
+    }
+    case 'windows': {
+      const script = windowsScriptPath();
+      const launcher = windowsStartupLauncherPath();
+      if (!existsSync(script) && !existsSync(launcher) && !windowsTaskExists()) return false;
+
+      mkdirSync(dirname(script), { recursive: true });
+      mkdirSync(opts.logDir, { recursive: true });
+      const next = windowsScriptContent(opts);
+      const prev = existsSync(script) ? readFileSync(script, 'utf-8') : '';
+      let changed = prev !== next;
+      if (changed) writeFileSync(script, next);
+
+      const task = createWindowsTask(script);
+      if (task.status === 0) {
+        if (existsSync(launcher)) {
+          unlinkSync(launcher);
+          changed = true;
+        }
+        return changed;
+      }
+
+      const nextLauncher = windowsLauncherContent(script);
+      const prevLauncher = existsSync(launcher) ? readFileSync(launcher, 'utf-8') : '';
+      if (prevLauncher !== nextLauncher) {
+        writeWindowsStartupLauncher(script);
+        changed = true;
+      }
+      return changed;
     }
     default: return false;
   }

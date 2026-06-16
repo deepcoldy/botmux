@@ -2,7 +2,7 @@
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
  */
-import { fork, execSync, type ChildProcess } from 'node:child_process';
+import { fork, execSync, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
@@ -45,6 +45,8 @@ import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+
+type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1480,6 +1482,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const pathWithBotmux = `${botmuxBinDir}:${process.env.PATH ?? ''}`;
 
   const worker = fork(workerPath, [], {
+    windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
     env: {
@@ -1491,7 +1494,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
-  });
+  } as WindowsForkOptions);
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
   // the unhandled event crashes the daemon. Log and move on.
@@ -2424,6 +2427,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
   const worker = fork(workerPath, [], {
+    windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd: adoptCwd,
     env: {
@@ -2433,7 +2437,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
-  });
+  } as WindowsForkOptions);
 
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.
   worker.on('error', (err) => {

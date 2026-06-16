@@ -586,6 +586,7 @@ export const messages: Record<string, string> = {
   'setup.next_autostart': '  2. botmux autostart enable   enable on-boot autostart (recommended: {platformName}; no sudo)',
   'setup.platform_mac': 'macOS launchd',
   'setup.platform_linux': 'Linux user systemd',
+  'setup.platform_windows': 'Windows Task Scheduler',
   'setup.platform_other': 'current platform not supported',
   'setup.wizard_title': '🤖 botmux setup wizard',
   'setup.config_dir': 'Config dir: {path}',

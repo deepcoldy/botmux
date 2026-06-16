@@ -20,6 +20,20 @@ describe('buildPm2SpawnCommand', () => {
     });
   });
 
+  it('runs package-local pm2.cmd directly through a Windows shell', () => {
+    const pm2Cmd = String.raw`D:\Application\npm-global\node_modules\botmux\node_modules\.bin\pm2.cmd`;
+    expect(buildPm2SpawnCommand(
+      pm2Cmd,
+      ['status'],
+      'win32',
+      String.raw`D:\Application\nodejs\node.exe`,
+    )).toEqual({
+      command: pm2Cmd,
+      args: ['status'],
+      shell: true,
+    });
+  });
+
   it('keeps direct pm2 command unchanged on Windows', () => {
     expect(buildPm2SpawnCommand('pm2', ['status'], 'win32', 'node.exe')).toEqual({
       command: 'pm2',

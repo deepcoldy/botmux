@@ -15,7 +15,7 @@
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
- *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
+ *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
  *   botmux worker-budget status|set|unset — inspect/override idle worker suspension budget
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
@@ -126,6 +126,10 @@ function ensureConfigDir(): void {
  * may belong to an unrelated installation (e.g. IDE remote extensions).
  */
 function pm2Bin(): string {
+  if (process.platform === 'win32') {
+    const cmd = join(PKG_ROOT, 'node_modules', '.bin', 'pm2.cmd');
+    if (existsSync(cmd)) return cmd;
+  }
   try {
     return require.resolve('pm2/bin/pm2');
   } catch { /* fall through */ }
@@ -194,10 +198,13 @@ function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
 }
 
 function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
-  execSync(`${pm2Bin()} ${args.join(' ')}`, {
+  const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
+  const r = spawnSync(pm2.command, pm2.args, {
     stdio: inherit ? 'inherit' : 'pipe',
     env: pm2Env(home),
+    shell: pm2.shell ?? false,
   });
+  if (r.status !== 0) throw new Error(`pm2 ${args.join(' ')} failed with status ${r.status}`);
 }
 
 function loadBotsJson(): any[] {
@@ -827,7 +834,7 @@ async function writeSingleBotConfig(): Promise<boolean> {
   await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot));
   console.log(`下一步:`);
   console.log(`  1. botmux start              启动 daemon`);
-  console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : '当前平台暂不支持'}，无需 sudo）`);
+  console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
   return true;
 }
 
@@ -1378,6 +1385,7 @@ function cmdLogs(): void {
   const child = spawn(pm2.command, pm2.args, {
     stdio: 'inherit',
     env: pm2Env(),
+    shell: pm2.shell ?? false,
   });
   child.on('exit', code => process.exit(code ?? 0));
 }
@@ -2588,7 +2596,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
                    单个活跃会话可省略 id
-  autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
+  autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
   worker-budget [status] 查看 idle worker 自动暂停预算

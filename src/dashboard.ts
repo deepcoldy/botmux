@@ -5,8 +5,9 @@ import {
   readFileSync, existsSync, chmodSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, dirname, extname } from 'node:path';
+import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { randomBytes, createHmac } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
@@ -208,7 +209,7 @@ await Promise.all(registry.list().map(attachDaemon));
 // ─── Static frontend ─────────────────────────────────────────────────────────
 
 // Path to the bundled frontend (sibling of dist/dashboard.js)
-const __dirname = dirname(new URL(import.meta.url).pathname);
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(__dirname, 'dashboard-web');
 
 const MIME: Record<string, string> = {
@@ -241,9 +242,11 @@ function serveFileAbs(res: ServerResponse, fp: string): boolean {
 
 function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const fp = join(WEB_DIR, rel);
-  // Path-traversal guard: resolved path must stay inside WEB_DIR
-  if (!fp.startsWith(WEB_DIR + '/') && fp !== join(WEB_DIR, 'index.html')) return false;
+  const fp = resolve(WEB_DIR, rel);
+  const webRoot = resolve(WEB_DIR);
+  const relToRoot = relative(webRoot, fp);
+  // Path-traversal guard: resolved path must stay inside WEB_DIR.
+  if (relToRoot === '..' || relToRoot.startsWith('..\\') || relToRoot.startsWith('../') || isAbsolute(relToRoot)) return false;
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
