@@ -34,6 +34,8 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
+import { appendVerifiedDeliveryInstructions, buildRejectRetryContent, generateTaskId } from './core/verified-delivery.js';
+import { REJECT_REASON, type RejectReason } from './verified-delivery/types.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -5357,6 +5359,8 @@ import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
+import { openLedger } from './verified-delivery/ledger.js';
+import { buildReport, parseArtifactText } from './verified-delivery/report.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
@@ -6852,7 +6856,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 用法:
   新开话题派活:
     botmux dispatch --title "子项目标题" --bot <open_id[:名字[:角色]]> [--bot ...] \\
-        [--brief "简报" | --brief-file <path>] [--repo <工作目录>] [--standby]
+        [--brief "简报" | --brief-file <path>] [--repo <工作目录>] [--standby] \\
+        [--task-id <id>] [--acceptance-hint <text>]
   往已有话题追加（激活待命 bot / 追加协调）:
     botmux dispatch --into <话题根消息id> --bot <spec> [--bot ...] (--brief ... | --brief-file ...)
 
@@ -6870,6 +6875,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief-file <path>   从文件读取简报
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
+  --task-id <id>        覆盖可信交付任务号（默认自动生成 task-<slug>-<hash8>）
+  --acceptance-hint <t> 主 agent 打算如何验收，随任务简报和账本一起传给 worker
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
   --session-id <id>     指定来源会话（默认自动推断）`);
@@ -6883,6 +6890,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const overrideChatId = argValue(rest, '--chat-id');
   const repo = argValue(rest, '--repo');
   const intoRoot = argValue(rest, '--into');
+  const explicitTaskId = argValue(rest, '--task-id');
+  const acceptanceHint = argValue(rest, '--acceptance-hint');
   const standby = rest.includes('--standby');
   const botSpecs = argValues(rest, '--bot');
 
@@ -6892,15 +6901,23 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     brief = readFileSync(briefFile, 'utf-8');
   }
 
-  // Append the report-back protocol so the dispatched sub-bot reports via
-  // `botmux report` (which routes to the orchestrator's OWN session) rather than
-  // @-ing the orchestrator in its sub-topic — which has no orchestrator session
-  // and would spawn a fresh, context-less one. Skipped for --standby (no brief).
+  const taskId = (!intoRoot && !standby)
+    ? (explicitTaskId?.trim() || generateTaskId({ title: title.trim() || '子项目', brief }))
+    : undefined;
+
+  // Append the verified-delivery protocol so the dispatched sub-bot reports via
+  // `botmux report --task <id>` with evidence the orchestrator can verify. This
+  // still routes to the orchestrator's OWN session rather than @-ing the
+  // orchestrator in the sub-topic. Skipped for --standby / --into follow-ups.
   if (brief.trim()) {
-    brief = brief.trimEnd() +
-      '\n\n— 完成回报 —\n' +
-      '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` 把结果回报给主编排会话；' +
-      '不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+    if (taskId) {
+      brief = appendVerifiedDeliveryInstructions({ brief, taskId, acceptanceHint });
+    } else {
+      brief = brief.trimEnd() +
+        '\n\n— 完成回报 —\n' +
+        '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` 把结果回报给主编排会话；' +
+        '不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+    }
   }
 
   // ── Flag validation ──
@@ -6976,6 +6993,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     // 1. Seed (thread root) — top-level header; gives the thread something to hang off.
     const seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
 
+    if (taskId) {
+      openLedger().append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId,
+        chatId: targetChatId,
+        ts: Date.now(),
+        idempotencyKey: `dispatched:${taskId}`,
+        payload: {
+          taskId,
+          title: title.trim(),
+          workerTopicRoot: seedId,
+          workerOpenIds: built.mentionedOpenIds,
+          brief,
+          acceptanceHint: acceptanceHint?.trim() || undefined,
+        },
+      });
+    }
+
     // Record the orchestrator's coords for this sub-topic, keyed by the seed
     // (which becomes every dispatched sub-bot's session.rootMessageId). The
     // sub-bot's `botmux report` looks this up to route its report back into the
@@ -6992,6 +7028,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         orchScope: s.scope ?? 'thread',
         orchAppId: s.larkAppId,
         title: title.trim(),
+        taskId: taskId ?? undefined,
         bots: built.mentionedOpenIds,
       };
       // 原子写：共享 data dir，其它 bot 的 daemon 会并发读这个注册表。
@@ -7019,6 +7056,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.log(JSON.stringify({
       success: true,
       mode: standby ? 'standby' : 'dispatch',
+      taskId: taskId ?? null,
       seedMessageId: seedId,
       threadRootId: seedId,
       primeMessageId: primeId,
@@ -7054,15 +7092,23 @@ async function cmdReport(rest: string[]): Promise<void> {
 用法:
   botmux report "子项目X 完成，产出在 …"
   botmux report --content-file <path>
+  botmux report --task <taskId> "完成说明" --artifact <产物路径> [--artifact ...]
 
 说明:
   「多话题协作模式」里你（子 bot）干完后不要在本话题 @ 主bot——本话题没有主bot的会话，
   @ 会另起一个无上下文的新会话。本命令把回报发回主编排会话所在的话题、并 @ 主编排 bot，
   使其带完整上下文继续聚合。仅在被 botmux dispatch 派活的子项目会话里可用。
 
+  带 --task：这是「可信交付」回报——把完成记录连同证据落到账本，主 agent 据此验收。
+  没有证据（--artifact / --artifact-text）的 --task 回报会被拒绝（不算完成）。
+
 选项:
-  --content-file <path>  从文件读取回报内容
-  --session-id <id>      指定来源会话（默认自动推断）`);
+  --content-file <path>       从文件读取回报内容（即完成说明 summary）
+  --session-id <id>           指定来源会话（默认自动推断）
+  --task <taskId>             被派活时简报里给你的任务号；带上即走可信交付
+  --artifact <path>           产物路径证据（主 agent 必须读得到），可重复
+  --artifact-text <name=内容>  自包含内容证据（测试输出/文件片段/diff），可重复
+  --id <reportId>             显式 reportId（崩溃重试严格幂等；默认按内容派生）`);
     return;
   }
 
@@ -7093,6 +7139,41 @@ async function cmdReport(rest: string[]): Promise<void> {
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+
+  // Verified delivery: when this report names a task (`--task`), record a
+  // TaskReported on the ledger with evidence BEFORE waking the orchestrator —
+  // the ledger is the durable truth, the wake below is just the trigger.
+  // Backward-compatible: no --task ⇒ legacy free-form report-back, unchanged.
+  const taskId = argValue(rest, '--task');
+  let reportedLedger: { reportId: string; deduped: boolean } | undefined;
+  if (taskId) {
+    const artifacts = argValues(rest, '--artifact');
+    const inline = parseArtifactText(argValues(rest, '--artifact-text'));
+    if (artifacts.length === 0 && inline.length === 0) {
+      console.error(
+        'verified report 需要至少一项证据:\n' +
+        '  --artifact <path>            主 agent 读得到的产物路径\n' +
+        '  --artifact-text <name=内容>   自包含内容(测试输出/文件片段/diff)');
+      process.exit(1);
+    }
+    try {
+      const led = openLedger();
+      const { draft, reportId } = buildReport({
+        taskId,
+        summary: content.trim(),
+        ts: Date.now(),
+        chatId: s.chatId,
+        reportId: argValue(rest, '--id'),
+        artifacts,
+        inline,
+      }, led);
+      const res = led.append(draft);
+      reportedLedger = { reportId, deduped: res.deduped };
+    } catch (err: any) {
+      console.error(`ledger 写入失败: ${err.message}`);
+      process.exit(1);
+    }
+  }
 
   // Resolve where the report goes + who to @. Same-machine: the dispatch registry
   // (keyed by this sub-bot's thread root) carries the orchestrator's exact coords.
@@ -7144,11 +7225,152 @@ async function cmdReport(rest: string[]): Promise<void> {
       orchestrator: tgt.orchOpenId,
       viaRegistry: !!entry,
       messageId: msgId,
+      ...(reportedLedger ? { task: taskId, reportId: reportedLedger.reportId, ledgerDeduped: reportedLedger.deduped } : {}),
     }));
   } catch (err: any) {
     console.error(`report 失败: ${err.message}`);
     process.exit(1);
   }
+}
+
+// ─── Verified delivery accept/reject (orchestrator-as-judge) ────────────────
+
+async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
+  if (!sub || sub === '--help' || sub === '-h' || rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux delivery — 可信交付账本的主 agent 验收/打回
+
+用法:
+  查看任务:
+    botmux delivery show --task <taskId>
+  验收通过:
+    botmux delivery accept --task <taskId> [--report <reportId>] \\
+        [--checked-by <id>] [--note <text>] [--evidence-checked <ref>]... [--ran-command <cmd>]...
+  打回重做:
+    botmux delivery reject --task <taskId> [--report <reportId>] --reason <code> \\
+        [--retry-brief <text>] [--expected-evidence <text>] [--checked-by <id>] [--no-push]
+
+说明:
+  --report 省略时默认使用该任务 latestReportId。
+  常用 reason: ${Object.values(REJECT_REASON).join(' / ')}
+  reject 默认会把 retryBrief/expectedEvidence 回推到派活 worker 话题；--no-push 仅写账本。`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const taskId = argValue(rest, '--task');
+  if (!taskId) {
+    console.error('缺少 --task <taskId>');
+    process.exit(1);
+  }
+
+  const ledger = openLedger();
+  const task = ledger.task(taskId);
+  if (!task) {
+    console.error(`未找到任务: ${taskId}`);
+    process.exit(1);
+  }
+  if (sub === 'show') {
+    console.log(JSON.stringify({ success: true, task }, null, 2));
+    return;
+  }
+
+  if (sub !== 'accept' && sub !== 'reject') {
+    console.error(`delivery: 未知子命令 ${sub}`);
+    process.exit(1);
+  }
+
+  const reportId = argValue(rest, '--report') ?? task.latestReportId;
+  if (!reportId) {
+    console.error(`任务 ${taskId} 还没有 report，无法 ${sub}`);
+    process.exit(1);
+  }
+  const report = task.reports.find((r) => r.reportId === reportId);
+  if (!report) {
+    console.error(`任务 ${taskId} 找不到 report: ${reportId}`);
+    process.exit(1);
+  }
+
+  const sessionIdArg = argValue(rest, '--session-id');
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  const sessions = loadSessions();
+  const s = sid ? sessions.get(sid) : undefined;
+  const checkedBy = argValue(rest, '--checked-by') ?? s?.larkAppId ?? s?.ownerOpenId ?? 'orchestrator';
+
+  if (sub === 'accept') {
+    const note = argValue(rest, '--note');
+    const evidenceChecked = argValues(rest, '--evidence-checked');
+    const ranCommands = argValues(rest, '--ran-command');
+    const result = ledger.append({
+      type: 'TaskAccepted',
+      actor: 'orchestrator',
+      taskId,
+      chatId: task.chatId,
+      ts: Date.now(),
+      idempotencyKey: `accepted:${taskId}:${reportId}`,
+      payload: {
+        taskId,
+        reportId,
+        checkedBy,
+        note: note?.trim() || undefined,
+        evidenceChecked: evidenceChecked.length ? evidenceChecked : undefined,
+        ranCommands: ranCommands.length ? ranCommands : undefined,
+      },
+    });
+    console.log(JSON.stringify({ success: true, taskId, reportId, accepted: true, deduped: result.deduped }));
+    return;
+  }
+
+  const reason = argValue(rest, '--reason') as RejectReason | undefined;
+  if (!reason) {
+    console.error(`缺少 --reason <code>。常用: ${Object.values(REJECT_REASON).join(' / ')}`);
+    process.exit(1);
+  }
+  const retryBrief = argValue(rest, '--retry-brief');
+  const expectedEvidence = argValue(rest, '--expected-evidence');
+  const result = ledger.append({
+    type: 'TaskRejected',
+    actor: 'orchestrator',
+    taskId,
+    chatId: task.chatId,
+    ts: Date.now(),
+    idempotencyKey: `rejected:${taskId}:${reportId}`,
+    payload: {
+      taskId,
+      reportId,
+      checkedBy,
+      reason,
+      retryBrief: retryBrief?.trim() || undefined,
+      expectedEvidence: expectedEvidence?.trim() || undefined,
+    },
+  });
+
+  let retryMessageId: string | undefined;
+  if (!argFlag(rest, '--no-push')) {
+    if (!task.workerTopicRoot) {
+      console.error(`任务 ${taskId} 没有 workerTopicRoot，已写入 rejected 账本，但无法回推重做要求。`);
+      console.log(JSON.stringify({ success: true, taskId, reportId, rejected: true, deduped: result.deduped, pushed: false }));
+      return;
+    }
+    if (!s?.larkAppId) {
+      console.error(`无法推断当前主 agent session/larkAppId，已写入 rejected 账本，但无法回推。可在 Lark 会话内运行或传 --no-push。`);
+      console.log(JSON.stringify({ success: true, taskId, reportId, rejected: true, deduped: result.deduped, pushed: false }));
+      return;
+    }
+    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+    try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+    const { replyMessage } = await import('./im/lark/client.js');
+    const content = buildRejectRetryContent({ task, reportId, reason, retryBrief, expectedEvidence });
+    retryMessageId = await replyMessage(s.larkAppId, task.workerTopicRoot, JSON.stringify({ zh_cn: { title: '', content } }), 'post', true);
+  }
+  console.log(JSON.stringify({
+    success: true,
+    taskId,
+    reportId,
+    rejected: true,
+    deduped: result.deduped,
+    pushed: !!retryMessageId,
+    retryMessageId,
+  }));
 }
 
 // ─── Create-group subcommand ─────────────────────────────────────────────────
@@ -8872,6 +9094,7 @@ switch (command) {
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
+  case 'delivery': await cmdDelivery(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;
