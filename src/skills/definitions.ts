@@ -1001,31 +1001,6 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 
-const WORKER_BUDGET_SKILL = `---
-name: botmux-worker-budget
-description: 查看或调整 botmux idle worker 自动暂停预算。触发场景：用户提到 OOM、内存占用、live worker 太多、闲置会话暂停、maxLiveWorkers、idleSuspendMs，或要求 agent 修改 worker 预算配置。必须使用 botmux worker-budget 命令，不要手写 ~/.botmux/config.json。
----
-
-# botmux-worker-budget — worker 预算配置
-
-当用户要求查看或调整 botmux worker 资源预算时，使用 \`botmux worker-budget\`。不要直接编辑 \`~/.botmux/config.json\`；命令会校验正整数、保留未知配置，并写入 daemon 读取的全局配置。
-
-## 用法
-
-\`\`\`bash
-# 查看自动推导值、当前覆盖值、配置文件路径
-botmux worker-budget status
-
-# 覆盖 live worker 上限；idle 阈值可选
-botmux worker-budget set --max-live-workers 12 --idle-minutes 45
-
-# 清除覆盖，恢复按 CPU/内存自动推导
-botmux worker-budget unset
-\`\`\`
-
-\`maxLiveWorkers\` 控制多少个 live worker 以内保持常驻；超过预算时 daemon 会优先暂停最久未活跃的 worker。\`idleSuspendMs\` 控制 worker 需要闲置多久才允许被暂停。
-`;
-
 const ORCHESTRATE_SKILL = `---
 name: botmux-orchestrate
 description: 作为「主 bot/编排者」把一个大项目拆成多个子项目，在普通群里自动开多话题、把不同 bot（常 coder+reviewer 一组）派进各话题并行干活，用飞书任务清单当共享进度板，收齐结果再汇总。触发：用户提到「多话题协作模式」，或要「把大项目拆给多个机器人并行做」「协调多个 bot」「多话题并行推进」「你当总控/编排」「一个写一个 review 多组并行」，或显式提到 botmux orchestrate / botmux dispatch 派活。
@@ -1109,7 +1084,6 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
-  { name: 'botmux-worker-budget', content: WORKER_BUDGET_SKILL },
   { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
 ];
 
@@ -1121,4 +1095,8 @@ export const RETIRED_SKILL_NAMES: string[] = [
   // Folded into botmux-send as the `--attention` flag. Installer prunes the old
   // standalone skill dir.
   'botmux-needs-help',
+  // Retired in favour of a per-bot "max live sessions" dashboard field
+  // (Groups & Bots → bot card). The CLI subcommand was removed too, so the
+  // skill has nothing to drive — prune it from every CLI's skills dir on upgrade.
+  'botmux-worker-budget',
 ];

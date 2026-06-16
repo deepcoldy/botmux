@@ -100,6 +100,18 @@ export interface BotConfig {
    */
   sandboxHidePaths?: string[];
   backendType?: BackendType;
+  /**
+   * Max simultaneously-LIVE worker processes for this bot. When the bot's live
+   * worker count exceeds this, the idle-worker sweeper suspends its
+   * longest-idle, not-currently-busy sessions (resumable backends only) down to
+   * the cap — the CLI keeps running detached and the session re-forks on the
+   * next message / terminal open. Unset (or ≤0) = no cap = unlimited live
+   * workers (default; old sessions never time out while resources allow).
+   * Pure count-based: there is NO idle-time threshold. Configured per bot from
+   * the dashboard (Groups & Bots → bot card). Adopted sessions are never
+   * suspended. See core/idle-worker-sweeper.ts.
+   */
+  maxLiveWorkers?: number;
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
@@ -752,6 +764,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.sandboxHidePaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
         : [],
       backendType: entry.backendType,
+      // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
+      maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
+        && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
+        ? entry.maxLiveWorkers
+        : undefined,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,

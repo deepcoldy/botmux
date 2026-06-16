@@ -124,6 +124,35 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('number field (maxLiveWorkers) round-trips and clears on null', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('maxLiveWorkers')!;
+    expect(spec.kind).toBe('number');
+    expect(spec.effect).toBe('immediate');
+
+    const r1 = await store.applyConfigField('app_default', spec, 6);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('∅'); expect(r1.newText).toBe('6'); }
+    expect(readConfig().maxLiveWorkers).toBe(6);
+    expect(registry.getBot('app_default').config.maxLiveWorkers).toBe(6);
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().maxLiveWorkers).toBeUndefined();
+    expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('coerceConfigValue(number) accepts positive integers and rejects junk/≤0/fractions', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('maxLiveWorkers')!;
+    expect(store.coerceConfigValue(spec, 4)).toEqual({ ok: true, value: 4 });
+    expect(store.coerceConfigValue(spec, '12')).toEqual({ ok: true, value: 12 });
+    expect(store.coerceConfigValue(spec, 0)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, -3)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1.5)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 'abc')).toEqual({ ok: false, reason: 'invalid_number' });
+  });
+
   it('cli field persists the chosen adapter id', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('cli')!;

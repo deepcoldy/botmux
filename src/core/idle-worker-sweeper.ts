@@ -1,12 +1,14 @@
 import type { DaemonSession } from './types.js';
-import { readGlobalConfig } from '../global-config.js';
-import { DEFAULT_IDLE_SUSPEND_MS, resolveWorkerBudget, type ResolvedWorkerBudget } from './worker-budget.js';
 import { suspendWorker } from './worker-pool.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
 
 export interface IdleWorkerSweepOptions {
-  now?: number;
-  workerBudget?: Pick<ResolvedWorkerBudget, 'maxLiveWorkers' | 'idleSuspendMs'>;
+  /**
+   * Max simultaneously-live workers for THIS bot (one daemon = one bot, so the
+   * whole `activeSessions` map belongs to a single bot). Undefined or ≤0 → no
+   * cap → nothing is ever suspended (the default; old sessions never time out).
+   */
+  maxLiveWorkers?: number;
 }
 
 export interface IdleWorkerSweepResult {
@@ -14,22 +16,32 @@ export interface IdleWorkerSweepResult {
   reason: string;
 }
 
-export const DEFAULT_IDLE_WORKER_MS = DEFAULT_IDLE_SUSPEND_MS;
-
 function liveWorkers(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
   return [...activeSessions.values()].filter(ds => !!ds.worker && !ds.worker.killed);
 }
 
+/**
+ * Count-based live-worker cap. When this bot has more live workers than its
+ * configured `maxLiveWorkers`, suspend its longest-idle (by lastMessageAt),
+ * not-currently-busy, resumable-backend sessions down to the cap. The CLI keeps
+ * running detached; the next message / terminal open re-forks the worker
+ * (daemon.ts worker-null resume path).
+ *
+ * Deliberately has NO idle-time threshold: 申晗's policy is "while resources
+ * allow, never time out an old session" — suspension only kicks in to enforce
+ * an explicit per-bot count cap. The only guard kept is correctness, not a
+ * timeout: a session that is mid-turn (`lastScreenStatus !== 'idle'`) is never
+ * suspended so an in-flight reply is never interrupted. If every over-cap
+ * session is busy, none are suspended this round and the next sweep retries.
+ */
 export function sweepIdleWorkers(
   activeSessions: Map<string, DaemonSession>,
   opts: IdleWorkerSweepOptions = {},
 ): IdleWorkerSweepResult[] {
-  const now = opts.now ?? Date.now();
-  const budget = opts.workerBudget ?? resolveWorkerBudget(readGlobalConfig().worker);
-  const maxLiveWorkers = budget.maxLiveWorkers;
-  const idleMs = budget.idleSuspendMs;
+  const cap = opts.maxLiveWorkers;
+  if (cap === undefined || cap <= 0) return [];
   const running = liveWorkers(activeSessions);
-  if (running.length <= maxLiveWorkers) return [];
+  if (running.length <= cap) return [];
 
   const candidates = running
     // Never suspend an adopted session. forkAdoptWorker stamps its
@@ -42,16 +54,17 @@ export function sweepIdleWorkers(
     // marker so a restored adopt session is excluded too.
     .filter(ds => !ds.adoptedFrom && !ds.session.adoptedFrom)
     .filter(ds => isSuspendableBackendType(ds.initConfig?.backendType))
+    // Correctness guard (not a timeout): never suspend a session that is
+    // currently producing output — that would cut off an in-flight reply.
     .filter(ds => ds.lastScreenStatus === 'idle')
-    .filter(ds => now - (ds.lastMessageAt || 0) >= idleMs)
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 
   const suspended: IdleWorkerSweepResult[] = [];
   let liveCount = running.length;
   for (const ds of candidates) {
-    if (liveCount <= maxLiveWorkers) break;
-    if (!suspendWorker(ds, 'idle_worker_budget')) continue;
-    suspended.push({ sessionId: ds.session.sessionId, reason: 'idle_worker_budget' });
+    if (liveCount <= cap) break;
+    if (!suspendWorker(ds, 'live_worker_cap')) continue;
+    suspended.push({ sessionId: ds.session.sessionId, reason: 'live_worker_cap' });
     liveCount--;
   }
   return suspended;

@@ -17,7 +17,7 @@ import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
-import { findConfigField, applyConfigField } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
 import { config } from '../config.js';
 import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
 import { readRawConfig, findEntryIndex, requireConfigPath } from '../services/config-store.js';
@@ -845,6 +845,11 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
   let p2pMode: 'thread' | 'chat' = 'thread';
   try { if (getBot(cachedLarkAppId).config.p2pMode === 'chat') p2pMode = 'chat'; } catch { /* default thread */ }
+  let maxLiveWorkers: number | null = null;
+  try {
+    const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
+    if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+  } catch { /* default unlimited */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
@@ -864,6 +869,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     p2pMode,
+    maxLiveWorkers,
   });
 });
 
@@ -966,6 +972,37 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, p2pMode: value ?? 'thread' });
+});
+
+// Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:
+//   • 正整数  → 设上限；超过后 idle-worker sweeper 把最久未用的会话休眠到上限内
+//   • null    → 清除（= 不限，默认）
+// 走 applyConfigField（与 /config 同一写盘 + 内存热更新路径）：sweeper 每分钟读
+// 实时 bot.config.maxLiveWorkers，免重启即生效。
+ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const body = raw as { maxLiveWorkers?: unknown };
+  const spec = findConfigField('maxLiveWorkers');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  // null（含 JSON null）= 清除上限；number 走 coerce 校验正整数。
+  let value: number | null;
+  if (body.maxLiveWorkers === null || body.maxLiveWorkers === undefined) {
+    value = null;
+  } else {
+    const c = coerceConfigValue(spec, body.maxLiveWorkers);
+    if (!c.ok || typeof c.value !== 'number') return jsonRes(res, 400, { ok: false, error: 'invalid_number' });
+    value = c.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
 });
 
 // Per-bot file-sandbox toggle. Body `{ enabled: boolean }`. When on, this bot's

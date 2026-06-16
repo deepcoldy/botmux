@@ -141,6 +141,29 @@ describe('parseBotConfigsFromText — brand', () => {
     ]));
     expect(cfg.brand).toBeUndefined();
   });
+
+  it('keeps a positive-integer maxLiveWorkers cap', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', maxLiveWorkers: 8 },
+    ]));
+    expect(cfg.maxLiveWorkers).toBe(8);
+  });
+
+  it('leaves maxLiveWorkers undefined (= unlimited) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('drops ≤0 / fractional / non-numeric maxLiveWorkers to undefined', () => {
+    for (const bad of [0, -2, 1.5, '4', null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', maxLiveWorkers: bad },
+      ]));
+      expect(cfg.maxLiveWorkers).toBeUndefined();
+    }
+  });
 });
 
 // ─── getBot / getBotClient ────────────────────────────────────────────────

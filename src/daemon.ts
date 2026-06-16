@@ -3751,9 +3751,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   const idleWorkerSweepTimer = setInterval(() => {
-    const suspended = sweepIdleWorkers(activeSessions);
+    // Re-read the live per-bot cap each tick so a dashboard edit (which mutates
+    // bot.config in place via applyConfigField) takes effect within 60s without
+    // a restart. Unset / ≤0 → no cap → no-op.
+    const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers });
     if (suspended.length > 0) {
-      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} idle worker(s)`);
+      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} live worker(s) over per-bot cap ${maxLiveWorkers}`);
     }
   }, 60_000);
   idleWorkerSweepTimer.unref?.();

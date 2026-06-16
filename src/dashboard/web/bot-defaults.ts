@@ -207,7 +207,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -377,6 +377,37 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         </div>
       </div>
     </section>`;
+  }
+
+  function sessionCapStateLabel(cap: number | null): string {
+    return cap == null
+      ? t('botDefaults.maxLiveWorkersStateOff')
+      : t('botDefaults.maxLiveWorkersStateOn', { count: cap });
+  }
+
+  // 最大同时活跃会话数（maxLiveWorkers）：数字输入 + 保存/不限按钮（空＝不限）。超过上限时
+  // 最久未用的会话自动休眠，下条消息/打开终端再唤醒。PUT /api/bots/:appId/max-live-workers
+  // 落 bots.json，daemon 每分钟读实时值即时生效。
+  function renderSessionCapSection(b: any): string {
+    const cap: number | null = typeof b.maxLiveWorkers === 'number' ? b.maxLiveWorkers : null;
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionSessionCap')}</h4>
+      <div class="bd-row bd-quota">
+        <label>
+          <span>${t('botDefaults.maxLiveWorkers')}</span>
+          <input type="number" min="1" step="1" data-input="maxLiveWorkers"
+            placeholder="${escapeHtml(t('botDefaults.maxLiveWorkersPlaceholder'))}"
+            value="${cap == null ? '' : cap}">
+        </label>
+        <small data-session-cap-state>${escapeHtml(sessionCapStateLabel(cap))}</small>
+        <small class="bd-help">${t('botDefaults.maxLiveWorkersHelp')}</small>
+        <div class="actions">
+          <button type="button" class="primary" data-action="save-session-cap">${t('botDefaults.maxLiveWorkersSave')}</button>
+          <button type="button" data-action="off-session-cap">${t('botDefaults.maxLiveWorkersOff')}</button>
+          <span class="oncall-status" data-session-cap-status></span>
+        </div>
+      </div>
+    </div>`;
   }
 
   // File sandbox (oncall): a per-bot toggle. ON → this bot's sessions run inside
@@ -963,6 +994,69 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         quotaOffBtn.addEventListener('click', () => {
           quotaInput.value = '';
           putGrantPref({ messageQuotaDefaultLimit: null }, quotaOffBtn);
+        });
+      }
+
+      // ── 最大同时活跃会话数 maxLiveWorkers（空＝不限） ──────────────────
+      const capInput = card.querySelector<HTMLInputElement>('input[data-input=maxLiveWorkers]');
+      const capSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-session-cap]');
+      const capOffBtn = card.querySelector<HTMLButtonElement>('button[data-action=off-session-cap]');
+      const capStatusEl = card.querySelector<HTMLSpanElement>('[data-session-cap-status]');
+      const capStateEl = card.querySelector<HTMLElement>('[data-session-cap-state]');
+
+      // PUT { maxLiveWorkers: number | null } to the bot's daemon (via the
+      // dashboard proxy). null = unlimited. Mirrors putGrantPref.
+      async function putMaxLiveWorkers(value: number | null, selfEl: HTMLInputElement | HTMLButtonElement) {
+        if (!capStatusEl) return;
+        capStatusEl.textContent = '';
+        capStatusEl.className = 'oncall-status';
+        selfEl.disabled = true;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/max-live-workers`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ maxLiveWorkers: value }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok && body.ok) {
+            capStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+            capStatusEl.classList.add('hint-ok');
+            const next: number | null = typeof body.maxLiveWorkers === 'number' ? body.maxLiveWorkers : null;
+            const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+            if (cached) cached.maxLiveWorkers = next;
+            if (capStateEl) capStateEl.textContent = sessionCapStateLabel(next);
+            if (capInput) capInput.value = next == null ? '' : String(next);
+          } else {
+            capStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+            capStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          capStatusEl.textContent = `✗ ${e?.message ?? e}`;
+          capStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          selfEl.disabled = false;
+        }
+      }
+
+      if (capInput && capSaveBtn) {
+        capSaveBtn.addEventListener('click', () => {
+          const raw = capInput.value.trim();
+          if (raw === '') { putMaxLiveWorkers(null, capSaveBtn); return; } // 空＝不限
+          // 只认纯正整数 token（拒 1e2 / 1.0 / 01），与额度输入同口径。
+          if (!/^[1-9]\d*$/.test(raw)) {
+            if (capStatusEl) {
+              capStatusEl.textContent = `✗ ${t('botDefaults.maxLiveWorkersInvalid')}`;
+              capStatusEl.className = 'oncall-status hint-warn-inline';
+            }
+            return;
+          }
+          putMaxLiveWorkers(Number(raw), capSaveBtn);
+        });
+      }
+      if (capInput && capOffBtn) {
+        capOffBtn.addEventListener('click', () => {
+          capInput.value = '';
+          putMaxLiveWorkers(null, capOffBtn);
         });
       }
     });

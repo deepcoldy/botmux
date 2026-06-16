@@ -125,16 +125,10 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
-describe('built-in botmux-worker-budget skill', () => {
-  it('teaches agents to use the CLI command instead of hand-editing JSON', () => {
-    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget');
-    expect(skill).toBeDefined();
-    expect(skill!.content).toContain('botmux worker-budget status');
-    expect(skill!.content).toContain('botmux worker-budget set --max-live-workers');
-    expect(skill!.content).toContain('botmux worker-budget unset');
-    expect(skill!.content).toContain('不要直接编辑 `~/.botmux/config.json`');
-    expect(skill!.content).toContain('maxLiveWorkers');
-    expect(skill!.content).toContain('idleSuspendMs');
+describe('botmux-worker-budget skill retired (moved to per-bot dashboard field)', () => {
+  it('is no longer a standalone skill and is pruned on upgrade', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget')).toBeUndefined();
+    expect(RETIRED_SKILL_NAMES).toContain('botmux-worker-budget');
   });
 });
 

@@ -26,7 +26,7 @@ import { logger } from '../utils/logger.js';
  */
 export type ConfigEffect = 'immediate' | 'next-session';
 
-export type ConfigFieldKind = 'string' | 'boolean' | 'enum' | 'cli' | 'dir' | 'allowedUsers';
+export type ConfigFieldKind = 'string' | 'boolean' | 'number' | 'enum' | 'cli' | 'dir' | 'allowedUsers';
 
 export interface ConfigFieldSpec {
   /** 用户面命令里用的字段名（大小写不敏感匹配，见 {@link findConfigField}）。 */
@@ -64,6 +64,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；chat=扁平连续会话，thread/unset 回默认（每条 DM 独立会话）' },
+  { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大同时活跃会话数；超过后最久未用的会话自动休眠（下条消息/打开终端唤醒）；unset=不限' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -140,7 +141,7 @@ export type ApplyFieldResult =
 export async function applyConfigField(
   larkAppId: string,
   spec: ConfigFieldSpec,
-  value: string | boolean | null,
+  value: string | boolean | number | null,
 ): Promise<ApplyFieldResult> {
   if (spec.kind === 'allowedUsers') return { ok: false, reason: 'use_setBotAllowedUsers' };
   let bot;
@@ -214,8 +215,8 @@ export async function setBotAllowedUsers(
 }
 
 export type CoerceResult =
-  | { ok: true; value: string | boolean }
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'empty' };
+  | { ok: true; value: string | boolean | number }
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'empty' };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -227,6 +228,10 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
     if (typeof raw === 'boolean') return { ok: true, value: raw };
     const b = parseBooleanValue(String(raw ?? ''));
     return b === undefined ? { ok: false, reason: 'invalid_bool' } : { ok: true, value: b };
+  }
+  if (spec.kind === 'number') {
+    const n = typeof raw === 'number' ? raw : Number(String(raw ?? '').trim());
+    return Number.isInteger(n) && n > 0 ? { ok: true, value: n } : { ok: false, reason: 'invalid_number' };
   }
   const s = String(raw ?? '').trim();
   if (!s) return { ok: false, reason: 'empty' };

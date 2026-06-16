@@ -1169,6 +1169,7 @@ const server = createServer(async (req, res) => {
             restrictGrantCommands: j.restrictGrantCommands === true,
             messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
             p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',
+            maxLiveWorkers: typeof j.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
           };
         } catch (e: any) {
           return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
@@ -1274,6 +1275,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
+    // `{ maxLiveWorkers: number | null }` (null / ≤0 = unlimited, the default).
+    let mBotMaxLive: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotMaxLive = url.pathname.match(/^\/api\/bots\/([^/]+)\/max-live-workers$/))) {
+      const appId = decodeURIComponent(mBotMaxLive[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-max-live-workers`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

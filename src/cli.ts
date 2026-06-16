@@ -16,7 +16,6 @@
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
- *   botmux worker-budget status|set|unset — inspect/override idle worker suspension budget
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
@@ -71,8 +70,7 @@ import {
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
-import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
-import { detectWorkerResources, resolveWorkerBudget } from './core/worker-budget.js';
+import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 
@@ -2591,9 +2589,6 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
-  worker-budget [status] 查看 idle worker 自动暂停预算
-       set --max-live-workers N [--idle-minutes N]
-                         覆盖全局 worker 预算，写入 ~/.botmux/config.json（agent 推荐用命令改，不手写 JSON）
        unset             清除 worker 预算覆盖，恢复按机器 CPU/内存自动推导
   lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
        --bot N         仅改 bots.json 中第 N 个 bot 的 lang
@@ -4953,88 +4948,6 @@ async function cmdLang(args: string[]): Promise<void> {
   await reportLocaleApplied();
 }
 
-// ─── botmux worker-budget ───────────────────────────────────────────────────
-
-function parsePositiveInt(value: string | undefined, label: string): number {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n <= 0) {
-    console.error(`${label} must be a positive integer.`);
-    process.exit(1);
-  }
-  return n;
-}
-
-function formatGib(bytes: number): string {
-  return `${(bytes / 1024 ** 3).toFixed(1)}GiB`;
-}
-
-function cmdWorkerBudget(args: string[]): void {
-  const sub = (args[0] ?? 'status').toLowerCase();
-  if (sub === '--help' || sub === '-h' || sub === 'help') {
-    console.log(`Usage:
-  botmux worker-budget [status]
-  botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>]
-  botmux worker-budget unset`);
-    return;
-  }
-
-  if (sub === 'status') {
-    const cfg = readGlobalConfig();
-    const resources = detectWorkerResources();
-    const budget = resolveWorkerBudget(cfg.worker, resources);
-    console.log('Worker budget');
-    console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
-    console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);
-    console.log(`  auto baseline:  ${budget.autoMaxLiveWorkers} from cpu=${resources.cpuCount}, memory=${formatGib(resources.memoryBytes)}`);
-    console.log(`  Config file:    ${globalConfigPath()}`);
-    console.log('');
-    console.log('Agent-safe edit commands:');
-    console.log('  botmux worker-budget set --max-live-workers 12 --idle-minutes 45');
-    console.log('  botmux worker-budget unset');
-    return;
-  }
-
-  if (sub === 'set') {
-    const rest = args.slice(1);
-    const maxLive = argValue(rest, '--max-live-workers', '--max-live');
-    const idleMs = argValue(rest, '--idle-ms', '--idle-suspend-ms');
-    const idleMinutes = argValue(rest, '--idle-minutes', '--idle-min');
-    if (maxLive === undefined && idleMs === undefined && idleMinutes === undefined) {
-      console.error('Usage: botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>]');
-      process.exit(1);
-    }
-    if (idleMs !== undefined && idleMinutes !== undefined) {
-      console.error('Use only one of --idle-ms or --idle-minutes.');
-      process.exit(1);
-    }
-
-    const current = readGlobalConfig().worker ?? {};
-    const next: WorkerConfig = { ...current };
-    if (maxLive !== undefined) next.maxLiveWorkers = parsePositiveInt(maxLive, '--max-live-workers');
-    if (idleMs !== undefined) next.idleSuspendMs = parsePositiveInt(idleMs, '--idle-ms');
-    if (idleMinutes !== undefined) next.idleSuspendMs = parsePositiveInt(idleMinutes, '--idle-minutes') * 60_000;
-
-    mergeGlobalConfig({ worker: next });
-    const budget = resolveWorkerBudget(next);
-    console.log('✅ Updated worker budget.');
-    console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
-    console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);
-    console.log(`  Config file:    ${globalConfigPath()}`);
-    console.log('Daemon reads this on the next idle-worker sweep; restart also picks it up.');
-    return;
-  }
-
-  if (sub === 'unset' || sub === 'clear') {
-    mergeGlobalConfig({ worker: null });
-    console.log('✅ Cleared worker budget override; daemon will use the auto-derived budget.');
-    console.log(`  Config file: ${globalConfigPath()}`);
-    return;
-  }
-
-  console.error('Usage: botmux worker-budget [status|set|unset]');
-  process.exit(1);
-}
-
 // ─── botmux preset ────────────────────────────────────────────────────────────
 
 /**
@@ -5403,7 +5316,6 @@ switch (command) {
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'lang':     await cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;
-  case 'worker-budget': cmdWorkerBudget(process.argv.slice(3)); break;
   case 'thread':   {
     // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
     // pre-rename scripts/skills surface the rename instead of "unknown command".

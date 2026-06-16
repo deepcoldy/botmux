@@ -86,7 +86,7 @@ pnpm test:bench --threshold 30      # 墙钟超 30s 则 exit 1（CI 回归闸）
 
 ## 当前瓶颈 & 后续可优化项
 
-16 核墙钟的下限（~10s）现在由 8 个**真实 spawn `node dist/cli.js`** 的集成测试门控（`workflow-cli` / `workflow-cli-ls-tail` / `preset-export-cli` / `worker-budget-cli` / `workflow-c0-isolation` / `seed-adapter` / `hook-installer` / `tmux-env-isolation`）。它们 **CPU-throughput-bound**：14 个 vitest fork + 每用例再 spawn 一个 node 子进程，16 核被超额订阅，单文件耗时在 5–9s 间抖动。
+16 核墙钟的下限（~10s）现在由 7 个**真实 spawn `node dist/cli.js`** 的集成测试门控（`workflow-cli` / `workflow-cli-ls-tail` / `preset-export-cli` / `workflow-c0-isolation` / `seed-adapter` / `hook-installer` / `tmux-env-isolation`）。它们 **CPU-throughput-bound**：14 个 vitest fork + 每用例再 spawn 一个 node 子进程，16 核被超额订阅，单文件耗时在 5–9s 间抖动。
 
 - **（大杠杆，需取舍）in-process 跑 CLI。** 从 4138 行的 `src/cli.ts` 抽出可测的 `main(argv): Promise<number>` 入口，让这 8 个文件直接进程内调用而非 spawn `node`。能同时砍掉串行总工作量和并行争抢，但牺牲「真实启动二进制 / argv 解析 / 退出码」的保真度，是较大的重构。
 - **（CI 侧）`vitest --shard=i/N`** 跨 runner 分片，缩短 CI 墙钟（不影响本地）。
