@@ -5554,6 +5554,12 @@ switch (command) {
   case 'status':  cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(); break;
+  case 'bind': {
+    // `botmux bind <code>` — 把本机绑定到中心化平台
+    const { cmdBind } = await import('./platform/bind.js');
+    await cmdBind(process.argv.slice(3));
+    break;
+  }
   case 'list':
   case 'ls':      await cmdList(); break;
   case 'delete':
