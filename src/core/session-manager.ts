@@ -796,6 +796,15 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     const probe = probePersistentSession(backendType, backendName);
     if (probe === 'missing') {
       const tag = ds.session.sessionId.substring(0, 8);
+      // Intentionally cold-resume-suspended (idle-worker sweeper killed the
+      // backing session + CLI to reclaim memory over the per-bot live cap). The
+      // 'missing' backing is EXPECTED here, not a zombie — keep the worker-less
+      // active record so the next message cold-resumes from the transcript
+      // (forkWorker(resume=true) clears the marker once the worker is back).
+      if (ds.session.suspendedColdResume) {
+        logger.info(`[${tag}] ${backendType} session was cap-suspended — keeping active for lazy cold-resume`);
+        continue;
+      }
       // 'missing' is ambiguous: it means EITHER this one pane is gone while the
       // server runs (a true solo zombie) OR the whole multiplexer server is down
       // (e.g. machine reboot) and every pane vanished at once. Only the former is

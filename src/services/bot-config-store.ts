@@ -64,7 +64,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；chat=扁平连续会话，thread/unset 回默认（每条 DM 独立会话）' },
-  { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大同时活跃会话数；超过后最久未用的会话自动休眠（下条消息/打开终端唤醒）；unset=不限' },
+  { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大同时活跃会话数；超过后最久未用的会话自动休眠（杀 worker+CLI 回收内存，下条消息冷恢复）；unset=默认 30' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */

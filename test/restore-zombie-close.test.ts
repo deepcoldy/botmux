@@ -228,6 +228,30 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('"missing" + server UP but session was cap-suspended → keeps active for cold-resume (NOT a zombie)', async () => {
+    // The idle-worker sweeper deliberately kills a session's backing pane + CLI
+    // over the per-bot cap. The server stays up (only one pane was killed), so
+    // without the suspend-intent marker this looks exactly like a solo zombie
+    // and would be wrongly closed — losing a session that should lazily
+    // cold-resume on the next message.
+    probe.result = 'missing';
+    server.state = 'running';
+    const s = makeActivePersistentSession('om_cap_suspended');
+    s.suspendedColdResume = true;
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    const ds = map.get(sessionKey('om_cap_suspended', 'app_test'));
+    expect(ds).toBeDefined();              // active record retained…
+    expect(ds!.worker).toBeNull();         // …worker-less, cold-resumes on next message
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('"missing" + server state UNKNOWN → closes (conservative, server may be up)', async () => {
     probe.result = 'missing';
     server.state = 'unknown';

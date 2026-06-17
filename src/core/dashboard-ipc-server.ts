@@ -976,7 +976,7 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:
 //   • 正整数  → 设上限；超过后 idle-worker sweeper 把最久未用的会话休眠到上限内
-//   • null    → 清除（= 不限，默认）
+//   • null    → 清除（回落到内置默认 30）
 // 走 applyConfigField（与 /config 同一写盘 + 内存热更新路径）：sweeper 每分钟读
 // 实时 bot.config.maxLiveWorkers，免重启即生效。
 ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {

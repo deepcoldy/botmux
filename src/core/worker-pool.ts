@@ -1034,6 +1034,16 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.workerPort = null;
   ds.workerToken = null;
   ds.session.webPort = undefined;
+  // The worker's suspend handler destroys the backing session + CLI (frees
+  // memory), so there is no live CLI to reattach to: the next turn MUST
+  // cold-resume from the on-disk transcript. forkWorker(resume=true) builds the
+  // CLI's `--resume <cliSessionId>` args, so mark this session as having history
+  // (the normal `claude_exit` path that sets this never fires on suspend —
+  // process.exit(0) races it). Also persist `suspendedColdResume` so a daemon
+  // restart treats a 'missing' backing session as a deliberate lazy-resume
+  // rather than a zombie to close. See sweepIdleWorkers + restoreActiveSessions.
+  ds.hasHistory = true;
+  ds.session.suspendedColdResume = true;
   sessionStore.updateSessionPid(ds.session.sessionId, null);
   sessionStore.updateSession(ds.session);
 
@@ -1463,6 +1473,14 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     ds.worker = null;
     ds.workerPort = null;
     ds.workerToken = null;
+  }
+
+  // Re-establishing a worker ends the cold-resume-suspended state: clear the
+  // persisted marker so a future restart no longer treats this session's
+  // backing as a deliberate-missing (a genuine later zombie must still close).
+  if (ds.session.suspendedColdResume) {
+    ds.session.suspendedColdResume = undefined;
+    sessionStore.updateSession(ds.session);
   }
 
   ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);

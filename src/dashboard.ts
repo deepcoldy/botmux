@@ -1285,7 +1285,8 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
-    // `{ maxLiveWorkers: number | null }` (null / ≤0 = unlimited, the default).
+    // `{ maxLiveWorkers: number | null }` (null = clear → fall back to the
+    // built-in default of 30; a positive integer overrides it).
     let mBotMaxLive: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotMaxLive = url.pathname.match(/^\/api\/bots\/([^/]+)\/max-live-workers$/))) {
       const appId = decodeURIComponent(mBotMaxLive[1]);

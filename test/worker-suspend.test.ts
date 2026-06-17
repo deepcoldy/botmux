@@ -87,6 +87,11 @@ describe('suspendWorker', () => {
     expect(ds.worker).toBe(null);
     expect(ds.workerPort).toBe(null);
     expect(ds.workerToken).toBe(null);
+    // The worker's suspend handler destroys the backing session + CLI, so the
+    // next turn must cold-resume: mark history (→ forkWorker resume=true builds
+    // --resume) and persist the suspend intent (→ restore won't zombie-close it).
+    expect(ds.hasHistory).toBe(true);
+    expect(ds.session.suspendedColdResume).toBe(true);
   });
 
   it('does not suspend pty workers', () => {

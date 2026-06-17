@@ -106,6 +106,16 @@ export interface Session {
   lastCliInput?: string;
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
+  /**
+   * Set true when the idle-worker sweeper suspends this session over the per-bot
+   * live cap: the worker AND the backing tmux/herdr/zellij session (+ CLI) were
+   * intentionally killed to reclaim memory, but the session stays `active` and
+   * cold-resumes from its on-disk transcript on the next message. Distinguishes
+   * this deliberate state from a real zombie (pane gone while the server runs):
+   * `restoreActiveSessions` must NOT close a suspended session whose backing
+   * session probes 'missing'. Cleared once a live worker is re-established.
+   */
+  suspendedColdResume?: boolean;
   /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
   cliId?: import('./adapters/cli/types.js').CliId;
   /**
