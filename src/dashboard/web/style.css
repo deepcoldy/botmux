@@ -2378,6 +2378,13 @@ input.row-select,
 }
 
 /* ─── Roles Page ─── */
+.roles-heading {
+  align-items: flex-start;
+  gap: 16px;
+}
+.roles-tabs {
+  flex: 0 0 auto;
+}
 .roles-page .roles-layout {
   display: grid;
   grid-template-columns: 320px 1fr;
@@ -2402,6 +2409,12 @@ input.row-select,
   gap: 8px;
 }
 .roles-tree-header input { flex: 1; }
+.roles-profile-create {
+  align-items: stretch;
+}
+.roles-profile-create input {
+  min-width: 0;
+}
 .roles-tree {
   flex: 1;
   overflow-y: auto;
@@ -2512,6 +2525,32 @@ input.row-select,
   background: var(--bg-soft);
   color: var(--faint);
 }
+.roles-profile-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-soft);
+  transition: background 0.12s;
+}
+.roles-profile-row:hover { background: var(--bg-soft); }
+.roles-profile-row.selected {
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  padding-left: 9px;
+}
+.roles-profile-row-main {
+  min-width: 0;
+  flex: 1;
+}
+.roles-profile-name {
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* ─── Editor Panel (right) ─── */
 .roles-editor-panel {
@@ -2560,9 +2599,53 @@ input.row-select,
   color: var(--faint);
   font-family: var(--mono);
 }
+.roles-profile-detail {
+  gap: 16px;
+}
+.roles-profile-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.roles-profile-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  gap: 16px;
+  min-height: 320px;
+}
+.roles-profile-bots,
+.roles-profile-editor,
+.roles-profile-apply {
+  min-width: 0;
+}
+.roles-profile-section-title {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+.roles-profile-bot-list {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.roles-profile-bot-row {
+  padding-left: 12px;
+}
+.roles-profile-bot-row.selected {
+  padding-left: 9px;
+}
+.roles-profile-inline-empty {
+  min-height: 220px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
 
 /* ─── Editor textarea ─── */
-#roles-editor-textarea {
+#roles-editor-textarea,
+#roles-profile-textarea {
   flex: 1;
   min-height: 220px;
   font-family: var(--mono);
@@ -2576,7 +2659,8 @@ input.row-select,
   color: var(--fg);
   tab-size: 2;
 }
-#roles-editor-textarea:focus {
+#roles-editor-textarea:focus,
+#roles-profile-textarea:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
@@ -2596,6 +2680,41 @@ input.row-select,
 .roles-bytecount.warn { color: var(--warning); }
 .roles-bytecount.over { color: var(--danger); font-weight: 700; }
 .roles-editor-actions { display: flex; gap: 8px; }
+.roles-profile-editor .roles-editor-actions,
+.roles-profile-apply .roles-editor-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.roles-profile-apply {
+  border-top: 1px solid var(--border-soft);
+  padding-top: 14px;
+}
+.roles-profile-apply-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.roles-profile-apply-controls select {
+  min-width: 0;
+}
+.roles-profile-force {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.roles-profile-apply-bot {
+  margin-bottom: 6px;
+}
+.roles-profile-status {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  min-height: 18px;
+}
 
 /* ─── Saved flash ─── */
 .roles-saved-flash {
@@ -2643,6 +2762,21 @@ input.row-select,
   .roles-page .roles-layout {
     grid-template-columns: 1fr;
     height: auto;
+  }
+  .roles-heading {
+    flex-direction: column;
+  }
+  .roles-tabs {
+    width: 100%;
+  }
+  .roles-tabs button {
+    flex: 1;
+  }
+  .roles-profile-grid {
+    grid-template-columns: 1fr;
+  }
+  .roles-profile-apply-controls {
+    grid-template-columns: 1fr;
   }
 }
 

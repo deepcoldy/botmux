@@ -59,6 +59,11 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 | `/role delete` | Delete this group's Role |
 | `/role team set <Markdown>` | Set the **default role** (the cross-group default persona; the command name keeps `team`, = dashboard "Bot Config → Default Role") |
 | `/role cap set <one-liner>` / `/role cap clear` | Set/clear the capability tag in the roster |
+| `/role profile list` | List local role profiles |
+| `/role profile show <profile> [--all]` | Show this bot's profile entry, or all local entries known to this daemon |
+| `/role profile set <profile> <Markdown>` | Set this bot's entry in a reusable role profile |
+| `/role profile save <profile>` | Save this bot's current effective role into the profile |
+| `/role profile apply <profile> [--preview] [--force] [--quiet]` | Write this bot's profile entry as this group's Role |
 
 See [Roles & Teams](/en/roles) for details.
 
@@ -84,7 +89,15 @@ See [Session Relay](/en/relay) for details.
 
 ## 🆕 One-Click New Session Group
 
-`/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once. See [One-Click Session Group](/en/group) for details.
+`/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once.
+
+Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot roles:
+
+```bash
+@botA @botB /g --role-profile collab-main War Room
+```
+
+See [One-Click Session Group](/en/group) for details.
 
 ## 📄 Feishu Doc Comment Entry
 

@@ -38,6 +38,16 @@ import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import {
+  deleteRoleProfileEntry,
+  deleteRoleProfileIfEmpty,
+  isValidRoleProfileId,
+  listRoleProfileEntries,
+  listRoleProfiles,
+  MAX_ROLE_PROFILE_ENTRY_BYTES,
+  readRoleProfileEntry,
+  writeRoleProfileEntry,
+} from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
@@ -835,6 +845,97 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   jsonRes(res, 200, { ok: true, existed });
 });
 
+// ─── Role profile management (dashboard) ──────────────────────────────────
+// Profiles are authoring/storage helpers only; applying one writes this bot's
+// entry into the selected chat role and does not alter runtime role layering.
+
+ipcRoute('GET', '/api/role-profiles', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  const profiles = listRoleProfiles(config.session.dataDir).map(p => ({
+    ...p,
+    hasCurrentBotEntry: readRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId) !== null,
+  }));
+  jsonRes(res, 200, { profiles, larkAppId: cachedLarkAppId });
+});
+
+ipcRoute('GET', '/api/role-profiles/:profileId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleProfileId(p.profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+  const entries = listRoleProfileEntries(config.session.dataDir, p.profileId);
+  jsonRes(res, 200, { profileId: p.profileId, entries });
+});
+
+ipcRoute('GET', '/api/role-profiles/:profileId/:larkAppId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (p.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'wrong_daemon' });
+  if (!isValidRoleProfileId(p.profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+  const content = readRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId);
+  jsonRes(res, 200, {
+    profileId: p.profileId,
+    larkAppId: cachedLarkAppId,
+    content,
+    byteLength: content ? Buffer.byteLength(content, 'utf-8') : 0,
+    hasEntry: content !== null,
+  });
+});
+
+ipcRoute('PUT', '/api/role-profiles/:profileId/:larkAppId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (p.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'wrong_daemon' });
+  if (!isValidRoleProfileId(p.profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+  let body: { content?: unknown };
+  try { body = await readJsonBody<{ content?: string }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const content = typeof body.content === 'string' ? body.content.trim() : '';
+  if (!content) return jsonRes(res, 400, { ok: false, error: 'content_required' });
+  try {
+    writeRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId, content);
+    jsonRes(res, 200, { ok: true, byteLength: Math.min(Buffer.byteLength(content, 'utf-8'), MAX_ROLE_PROFILE_ENTRY_BYTES) });
+  } catch (e) {
+    jsonRes(res, 500, { ok: false, error: String(e) });
+  }
+});
+
+ipcRoute('DELETE', '/api/role-profiles/:profileId/:larkAppId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (p.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'wrong_daemon' });
+  if (!isValidRoleProfileId(p.profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+  const existed = deleteRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId);
+  deleteRoleProfileIfEmpty(config.session.dataDir, p.profileId);
+  jsonRes(res, 200, { ok: true, existed });
+});
+
+ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleProfileId(p.profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+  let body: { chatId?: unknown; larkAppId?: unknown; force?: unknown; preview?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const chatId = typeof body.chatId === 'string' && body.chatId.trim() ? body.chatId.trim() : '';
+  const larkAppId = typeof body.larkAppId === 'string' && body.larkAppId.trim() ? body.larkAppId.trim() : '';
+  if (!chatId || !larkAppId) return jsonRes(res, 400, { ok: false, error: 'chatId_and_larkAppId_required' });
+  if (larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'wrong_daemon' });
+  const content = readRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId);
+  if (!content) return jsonRes(res, 200, { ok: false, error: 'missing_entry', changed: false });
+  const existing = resolveRoleFile(cachedLarkAppId, chatId);
+  const preview = body.preview === true;
+  const force = body.force === true;
+  if (preview) {
+    return jsonRes(res, 200, {
+      ok: true,
+      preview: true,
+      changed: false,
+      wouldOverwrite: existing !== null,
+      wouldRefuse: existing !== null && !force,
+      content,
+      byteLength: Buffer.byteLength(content, 'utf-8'),
+    });
+  }
+  if (existing && !force) return jsonRes(res, 409, { ok: false, error: 'chat_role_exists', changed: false });
+  writeRoleFile(cachedLarkAppId, chatId, content);
+  jsonRes(res, 200, { ok: true, changed: true, byteLength: Buffer.byteLength(content, 'utf-8') });
+});
+
 // ─── Per-bot defaultOncall (dashboard) ─────────────────────────────────────
 // GET  /api/bot-default-oncall → returns this daemon's current config
 // PUT  /api/bot-default-oncall  body: { enabled, workingDir }
@@ -1145,6 +1246,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
     transferOwnerTo?: unknown;
     notifyOwnerOpenId?: unknown;
     bindWorkingDir?: unknown;
+    roleProfileId?: unknown;
   };
   try {
     body = await readJsonBody<{
@@ -1155,6 +1257,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       transferOwnerTo?: string;
       notifyOwnerOpenId?: string;
       bindWorkingDir?: string;
+      roleProfileId?: string;
     }>(req);
   } catch {
     return jsonRes(res, 400, { error: 'bad_json' });
@@ -1180,6 +1283,12 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
   const notifyTo = typeof body.notifyOwnerOpenId === 'string' && body.notifyOwnerOpenId.trim()
     ? body.notifyOwnerOpenId.trim()
     : null;
+  const roleProfileId = typeof body.roleProfileId === 'string' && body.roleProfileId.trim()
+    ? body.roleProfileId.trim()
+    : null;
+  if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+  }
   const bindWorkingDir = typeof body.bindWorkingDir === 'string' ? body.bindWorkingDir.trim() : '';
   let bindResolvedPath: string | undefined;
   if (bindWorkingDir) {
@@ -1197,6 +1306,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       transferOwnerTo: transferTo ?? undefined,
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,
+      roleProfileId: roleProfileId ?? undefined,
     });
     jsonRes(res, 200, bindResolvedPath ? { ...r, bindResolvedPath } : r);
   } catch (e) {

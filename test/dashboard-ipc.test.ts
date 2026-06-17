@@ -1,12 +1,16 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -531,5 +535,88 @@ describe('POST /api/groups/create', () => {
     expect(res.status).toBe(400);
     expect(createSpy).not.toHaveBeenCalled();
     createSpy.mockRestore();
+  });
+});
+
+describe('role profile IPC routes', () => {
+  it('rejects encoded traversal profile ids before touching storage', async () => {
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-profile-ipc-'));
+    config.session.dataDir = dataDir;
+    setLarkAppId('cli_profile');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/role-profiles/%2E%2E/cli_profile`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: 'bad' }),
+      });
+      expect([400, 404]).toContain(res.status);
+      expect(res.status).not.toBe(200);
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('stores a profile entry and materializes it into a chat role', async () => {
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-profile-ipc-'));
+    config.session.dataDir = dataDir;
+    setLarkAppId('cli_profile');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const save = await fetch(`${base}/api/role-profiles/collab-main/cli_profile`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Reviewer\nBe strict.' }),
+      });
+      expect(save.status).toBe(200);
+      expect((await save.json()).ok).toBe(true);
+
+      const list = await fetch(`${base}/api/role-profiles`);
+      expect(list.status).toBe(200);
+      expect((await list.json()).profiles).toMatchObject([
+        { profileId: 'collab-main', entryCount: 1, hasCurrentBotEntry: true },
+      ]);
+
+      const preview = await fetch(`${base}/api/role-profiles/collab-main/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_role', larkAppId: 'cli_profile', preview: true }),
+      });
+      expect(preview.status).toBe(200);
+      expect(await preview.json()).toMatchObject({
+        ok: true,
+        preview: true,
+        changed: false,
+        wouldOverwrite: false,
+        wouldRefuse: false,
+        content: '# Reviewer\nBe strict.',
+      });
+
+      const apply = await fetch(`${base}/api/role-profiles/collab-main/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_role', larkAppId: 'cli_profile' }),
+      });
+      expect(apply.status).toBe(200);
+      expect((await apply.json()).changed).toBe(true);
+
+      const role = await fetch(`${base}/api/roles/oc_role`);
+      expect(role.status).toBe(200);
+      expect(await role.json()).toMatchObject({
+        chatId: 'oc_role',
+        content: '# Reviewer\nBe strict.',
+        hasRole: true,
+      });
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });

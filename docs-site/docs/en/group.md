@@ -20,6 +20,16 @@ Bots @-mentioned in the command are **added into the new group together** (the f
 
 The reply lists "Bots in group: Claude, Codex". This makes the new group a natural multi-bot collaboration space — go in and @ whoever you want to do the work.
 
+## Bootstrap a Role Profile
+
+If you keep reusable collaboration personas in a [role profile](/en/roles), add `--role-profile <profile>` when creating the group:
+
+```bash
+@Claude @Codex /g --role-profile collab-main review group authorization
+```
+
+After the group is created, the creator bot applies its own entry directly, then posts `@Codex /role profile apply collab-main --quiet` for the other bots inside the new group. Each bot applies only its own local profile entry, which materializes as that bot's this-group Role. Missing entries are safe and fall back to the default role.
+
 ## Create a Group in the Dashboard
 
 If you'd rather not use commands, the **Groups** panel in `botmux dashboard` can also create groups visually: pull specified bots into the group, automatically transfer ownership, and @-notify. You can also disband a group / have a bot leave a group (associated sessions are cleaned up automatically). See [Dashboard Control Panel](/en/dashboard).

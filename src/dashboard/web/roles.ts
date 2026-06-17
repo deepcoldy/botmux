@@ -1,6 +1,4 @@
-// Roles page: hierarchical group → bot role editor.
-// Displays groups as collapsible sections with bots nested inside.
-// Each bot has its own per-group role definition selectable for editing.
+// Roles page: group role editor + reusable role profile management.
 import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
 
 interface BotInfo {
@@ -9,6 +7,12 @@ interface BotInfo {
   inChat: boolean;
   hasRole: boolean;
   oncallChat: unknown;
+}
+
+interface DashboardBot {
+  larkAppId: string;
+  botName: string;
+  botAvatarUrl?: string;
 }
 
 interface GroupInfo {
@@ -24,24 +28,62 @@ interface RoleData {
   hasRole: boolean;
 }
 
+interface RoleProfileSummary {
+  profileId: string;
+  entryCount: number;
+  updatedAt: number | null;
+  botEntries?: Array<{ larkAppId: string; hasEntry: boolean }>;
+}
+
+interface RoleProfileEntry {
+  profileId: string;
+  larkAppId: string;
+  content: string;
+  byteLength: number;
+  updatedAt: number | null;
+}
+
+interface RoleProfileEntryData {
+  profileId: string;
+  larkAppId: string;
+  content: string | null;
+  byteLength: number;
+  hasEntry: boolean;
+}
+
 const MAX_ROLE_BYTES = 4096;
 
 let cache: GroupInfo[] = [];
+let allBots: DashboardBot[] = [];
+let profiles: RoleProfileSummary[] = [];
+let profileEntries: RoleProfileEntry[] = [];
+
+let activeTab: 'groups' | 'profiles' = 'groups';
 let selectedGroupId: string | null = null;
 let selectedBotId: string | null = null;
 let editingContent = '';
 let expandedGroups = new Set<string>();
 
+let selectedProfileId: string | null = null;
+let selectedProfileBotId: string | null = null;
+let profileEditingContent = '';
+let selectedApplyGroupId: string | null = null;
+
 function pageHtml(): string {
   return `<section class="page roles-page">
-<div class="page-heading">
+<div class="page-heading roles-heading">
   <div>
     <p class="eyebrow">${t('nav.roles')}</p>
     <h1>${t('roles.title')}</h1>
     <p>${t('roles.subtitle')}</p>
   </div>
+  <div class="segmented roles-tabs" role="tablist">
+    <button type="button" id="roles-tab-groups" class="active">${t('roles.tabGroups')}</button>
+    <button type="button" id="roles-tab-profiles">${t('roles.tabProfiles')}</button>
+  </div>
 </div>
-<div class="roles-layout">
+
+<div id="roles-by-group-view" class="roles-layout">
   <div class="roles-tree-panel">
     <div class="roles-tree-header">
       <input type="search" id="roles-search" placeholder="${t('roles.search')}" />
@@ -72,12 +114,35 @@ function pageHtml(): string {
     </div>
   </div>
 </div>
+
+<div id="roles-profiles-view" class="roles-layout roles-profiles-layout" hidden>
+  <div class="roles-tree-panel">
+    <div class="roles-tree-header roles-profile-create">
+      <input type="text" id="roles-profile-id" placeholder="${t('roles.profileIdPlaceholder')}" maxlength="64" />
+      <button type="button" id="roles-profile-select">${t('roles.openProfile')}</button>
+    </div>
+    <div class="roles-tree-header">
+      <input type="search" id="roles-profile-search" placeholder="${t('roles.profileSearch')}" />
+      <button type="button" id="roles-profile-refresh">${t('roles.refresh')}</button>
+    </div>
+    <div id="roles-profile-list" class="roles-tree"></div>
+  </div>
+  <div class="roles-editor-panel">
+    <div id="roles-profile-empty" class="roles-editor-empty">${t('roles.profileSelectHint')}</div>
+    <div id="roles-profile-detail" class="roles-editor-form roles-profile-detail" style="display:none"></div>
+  </div>
+</div>
 </section>`;
 }
 
 async function loadGroups(): Promise<void> {
   const r = await fetch('/api/groups');
   const data = await r.json();
+  allBots = (data.bots ?? []).map((b: any) => ({
+    larkAppId: b.larkAppId,
+    botName: b.botName ?? b.larkAppId,
+    botAvatarUrl: b.botAvatarUrl,
+  }));
   cache = (data.chats ?? []).map((c: any) => ({
     chatId: c.chatId,
     name: c.name ?? c.chatId,
@@ -89,6 +154,18 @@ async function loadGroups(): Promise<void> {
       oncallChat: m.oncallChat ?? null,
     })),
   }));
+}
+
+async function loadProfiles(): Promise<void> {
+  const r = await fetch('/api/role-profiles');
+  const data = await r.json();
+  profiles = data.profiles ?? [];
+}
+
+async function loadProfileEntries(profileId: string): Promise<void> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}`);
+  const data = await r.json();
+  profileEntries = data.entries ?? [];
 }
 
 async function loadRole(larkAppId: string, chatId: string): Promise<RoleData> {
@@ -110,12 +187,51 @@ async function deleteRole(larkAppId: string, chatId: string): Promise<boolean> {
   return r.ok;
 }
 
+async function loadProfileEntry(profileId: string, larkAppId: string): Promise<RoleProfileEntryData> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`);
+  return r.json();
+}
+
+async function saveProfileEntry(profileId: string, larkAppId: string, content: string): Promise<boolean> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  return r.ok;
+}
+
+async function deleteProfileEntry(profileId: string, larkAppId: string): Promise<boolean> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, { method: 'DELETE' });
+  return r.ok;
+}
+
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
+
 function botRoleCount(group: GroupInfo): number {
   return group.memberBots.filter(b => b.inChat && b.hasRole).length;
 }
 
 function botInChatCount(group: GroupInfo): number {
   return group.memberBots.filter(b => b.inChat).length;
+}
+
+function profileHasEntry(profile: RoleProfileSummary, larkAppId: string): boolean {
+  return (profile.botEntries ?? []).some(entry => entry.larkAppId === larkAppId && entry.hasEntry);
+}
+
+function entryForBot(larkAppId: string): RoleProfileEntry | undefined {
+  return profileEntries.find(entry => entry.larkAppId === larkAppId);
+}
+
+function switchTab(tab: 'groups' | 'profiles'): void {
+  activeTab = tab;
+  document.getElementById('roles-by-group-view')?.toggleAttribute('hidden', tab !== 'groups');
+  document.getElementById('roles-profiles-view')?.toggleAttribute('hidden', tab !== 'profiles');
+  document.getElementById('roles-tab-groups')?.classList.toggle('active', tab === 'groups');
+  document.getElementById('roles-tab-profiles')?.classList.toggle('active', tab === 'profiles');
 }
 
 function renderTree(filter: string = ''): void {
@@ -182,21 +298,16 @@ function renderTree(filter: string = ''): void {
       </div>`;
   }).join('');
 
-  // Group row click → toggle expand
   tree.querySelectorAll('.roles-group-row').forEach(row => {
     row.addEventListener('click', () => {
       const gid = (row as HTMLElement).dataset.groupId;
       if (!gid) return;
-      if (expandedGroups.has(gid)) {
-        expandedGroups.delete(gid);
-      } else {
-        expandedGroups.add(gid);
-      }
+      if (expandedGroups.has(gid)) expandedGroups.delete(gid);
+      else expandedGroups.add(gid);
       renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
     });
   });
 
-  // Bot row click → select for editing
   tree.querySelectorAll('.roles-bot-row').forEach(row => {
     row.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -246,7 +357,7 @@ async function selectBot(groupId: string, botId: string): Promise<void> {
 function updateByteCount(): void {
   const el = document.getElementById('roles-editor-bytecount');
   if (!el) return;
-  const len = new TextEncoder().encode(editingContent).length;
+  const len = byteLength(editingContent);
   el.textContent = `${len} / ${MAX_ROLE_BYTES} bytes`;
   el.className = `roles-bytecount ${len > 3800 ? 'warn' : ''} ${len > MAX_ROLE_BYTES ? 'over' : ''}`;
   updateSaveButton(len);
@@ -255,7 +366,7 @@ function updateByteCount(): void {
 function updateSaveButton(byteLen?: number): void {
   const btn = document.getElementById('roles-save') as HTMLButtonElement | null;
   if (!btn) return;
-  const len = byteLen ?? new TextEncoder().encode(editingContent).length;
+  const len = byteLen ?? byteLength(editingContent);
   btn.disabled = len > MAX_ROLE_BYTES || editingContent.trim().length === 0;
 }
 
@@ -285,32 +396,316 @@ function resetEditor(): void {
   if (delBtn) delBtn.style.display = 'none';
 }
 
+function renderProfileList(filter: string = ''): void {
+  const list = document.getElementById('roles-profile-list');
+  if (!list) return;
+  const q = filter.toLowerCase();
+  const filtered = profiles.filter(p => !q || p.profileId.toLowerCase().includes(q));
+
+  if (filtered.length === 0) {
+    list.innerHTML = `<div class="roles-empty">${t('roles.profileEmpty')}</div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(p => {
+    const selected = selectedProfileId === p.profileId;
+    const hasAnyLocal = (p.botEntries ?? []).some(entry => entry.hasEntry);
+    return `
+      <div class="roles-profile-row ${selected ? 'selected' : ''}" data-profile-id="${escapeHtml(p.profileId)}">
+        <div class="roles-profile-row-main">
+          <div class="roles-profile-name">${escapeHtml(p.profileId)}</div>
+          <div class="roles-group-meta">${p.entryCount} ${t('roles.profileEntries')}</div>
+        </div>
+        <span class="roles-badge ${hasAnyLocal ? 'has-role' : 'no-role'}">${hasAnyLocal ? t('roles.configured') : t('roles.profileMissing')}</span>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('.roles-profile-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const profileId = (row as HTMLElement).dataset.profileId;
+      if (profileId) void selectProfile(profileId);
+    });
+  });
+}
+
+async function selectProfile(profileId: string): Promise<void> {
+  selectedProfileId = profileId.trim();
+  selectedProfileBotId = null;
+  profileEditingContent = '';
+  selectedApplyGroupId = selectedApplyGroupId ?? cache[0]?.chatId ?? null;
+  await loadProfileEntries(selectedProfileId);
+  renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
+  renderProfileDetail();
+}
+
+function renderProfileDetail(): void {
+  const empty = document.getElementById('roles-profile-empty');
+  const detail = document.getElementById('roles-profile-detail');
+  if (!empty || !detail) return;
+
+  if (!selectedProfileId) {
+    empty.style.display = '';
+    detail.style.display = 'none';
+    detail.innerHTML = '';
+    return;
+  }
+
+  empty.style.display = 'none';
+  detail.style.display = '';
+  const selectedBot = allBots.find(b => b.larkAppId === selectedProfileBotId);
+  const entry = selectedProfileBotId ? entryForBot(selectedProfileBotId) : undefined;
+
+  detail.innerHTML = `
+    <div class="roles-profile-title">
+      <div>
+        <div class="roles-editor-breadcrumb">
+          <span>${escapeHtml(selectedProfileId)}</span>
+          ${selectedBot ? `<span class="roles-breadcrumb-sep">›</span><span>${escapeHtml(selectedBot.botName ?? selectedBot.larkAppId)}</span>` : ''}
+        </div>
+        <div class="roles-editor-meta-line">${t('roles.profileRuntimeHint')}</div>
+      </div>
+    </div>
+    <div class="roles-profile-grid">
+      <div class="roles-profile-bots">
+        <div class="roles-profile-section-title">${t('roles.profileBots')}</div>
+        <div class="roles-profile-bot-list">
+          ${allBots.map(bot => {
+            const hasEntry = !!entryForBot(bot.larkAppId);
+            const selected = selectedProfileBotId === bot.larkAppId;
+            return `
+              <div class="roles-bot-row roles-profile-bot-row ${selected ? 'selected' : ''}" data-profile-bot-id="${escapeHtml(bot.larkAppId)}">
+                ${botAvatarHtml({ name: bot.botName, larkAppId: bot.larkAppId, size: 'sm' })}
+                <div class="roles-bot-info">
+                  <div class="roles-bot-name">${escapeHtml(bot.botName ?? bot.larkAppId)}</div>
+                  <div class="roles-bot-id">${escapeHtml(bot.larkAppId)}</div>
+                </div>
+                <span class="roles-badge ${hasEntry ? 'has-role' : 'no-role'}">${hasEntry ? t('roles.configured') : t('roles.unconfigured')}</span>
+              </div>`;
+          }).join('')}
+        </div>
+      </div>
+      <div class="roles-profile-editor">
+        ${selectedProfileBotId ? `
+          <textarea id="roles-profile-textarea" placeholder="${t('roles.profileEditorPlaceholder')}" rows="12">${escapeHtml(profileEditingContent || entry?.content || '')}</textarea>
+          <div class="roles-editor-footer">
+            <span id="roles-profile-bytecount" class="roles-bytecount"></span>
+            <div class="roles-editor-actions">
+              <button type="button" id="roles-profile-delete" class="danger" ${entry ? '' : 'style="display:none"'}>${t('roles.delete')}</button>
+              <button type="button" id="roles-profile-save" class="primary">${t('roles.saveEntry')}</button>
+            </div>
+          </div>
+          <div id="roles-profile-preview" class="roles-preview"></div>
+        ` : `<div class="roles-editor-empty roles-profile-inline-empty">${t('roles.profileBotSelectHint')}</div>`}
+      </div>
+    </div>
+    <div class="roles-profile-apply">
+      <div class="roles-profile-section-title">${t('roles.applyToGroup')}</div>
+      <div class="roles-profile-apply-controls">
+        <select id="roles-profile-apply-group">
+          ${cache.map(g => `<option value="${escapeHtml(g.chatId)}" ${selectedApplyGroupId === g.chatId ? 'selected' : ''}>${escapeHtml(g.name ?? g.chatId)}</option>`).join('')}
+        </select>
+        <label class="roles-profile-force"><input type="checkbox" id="roles-profile-apply-force"> ${t('roles.applyForce')}</label>
+      </div>
+      <div id="roles-profile-apply-bots"></div>
+      <div class="roles-editor-actions">
+        <button type="button" id="roles-profile-preview-apply">${t('roles.previewApply')}</button>
+        <button type="button" id="roles-profile-apply" class="primary">${t('roles.applyProfile')}</button>
+      </div>
+      <div id="roles-profile-apply-status" class="roles-profile-status"></div>
+    </div>
+  `;
+
+  detail.querySelectorAll('.roles-profile-bot-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const botId = (row as HTMLElement).dataset.profileBotId;
+      if (botId) void selectProfileBot(botId);
+    });
+  });
+  renderProfileApplyBots();
+  bindProfileEditor();
+}
+
+async function selectProfileBot(botId: string): Promise<void> {
+  if (!selectedProfileId) return;
+  selectedProfileBotId = botId;
+  const entry = await loadProfileEntry(selectedProfileId, botId);
+  profileEditingContent = entry.content ?? '';
+  await loadProfileEntries(selectedProfileId);
+  renderProfileDetail();
+}
+
+function bindProfileEditor(): void {
+  const textarea = document.getElementById('roles-profile-textarea') as HTMLTextAreaElement | null;
+  if (textarea) {
+    profileEditingContent = textarea.value;
+    updateProfileByteCount();
+    updateProfilePreview();
+    textarea.addEventListener('input', (e) => {
+      profileEditingContent = (e.target as HTMLTextAreaElement).value;
+      updateProfileByteCount();
+      updateProfilePreview();
+    });
+  }
+
+  document.getElementById('roles-profile-save')?.addEventListener('click', async function(this: HTMLButtonElement) {
+    if (!selectedProfileId || !selectedProfileBotId) return;
+    this.disabled = true;
+    this.textContent = '...';
+    try {
+      const ok = await saveProfileEntry(selectedProfileId, selectedProfileBotId, profileEditingContent);
+      await loadProfiles();
+      await loadProfileEntries(selectedProfileId);
+      renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
+      renderProfileDetail();
+      flashProfileStatus(ok ? t('roles.saved') : t('roles.saveFailed'), !ok);
+    } finally {
+      this.disabled = false;
+      this.textContent = t('roles.saveEntry');
+    }
+  });
+
+  document.getElementById('roles-profile-delete')?.addEventListener('click', async function(this: HTMLButtonElement) {
+    if (!selectedProfileId || !selectedProfileBotId) return;
+    if (!confirm(t('roles.confirmDeleteProfileEntry'))) return;
+    this.disabled = true;
+    try {
+      await deleteProfileEntry(selectedProfileId, selectedProfileBotId);
+      profileEditingContent = '';
+      await loadProfiles();
+      await loadProfileEntries(selectedProfileId);
+      renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
+      renderProfileDetail();
+    } finally {
+      this.disabled = false;
+    }
+  });
+
+  document.getElementById('roles-profile-apply-group')?.addEventListener('change', (e) => {
+    selectedApplyGroupId = (e.target as HTMLSelectElement).value;
+    renderProfileApplyBots();
+  });
+  document.getElementById('roles-profile-preview-apply')?.addEventListener('click', () => runProfileApply(true));
+  document.getElementById('roles-profile-apply')?.addEventListener('click', () => runProfileApply(false));
+}
+
+function updateProfileByteCount(): void {
+  const el = document.getElementById('roles-profile-bytecount');
+  const btn = document.getElementById('roles-profile-save') as HTMLButtonElement | null;
+  if (!el) return;
+  const len = byteLength(profileEditingContent);
+  el.textContent = `${len} / ${MAX_ROLE_BYTES} bytes`;
+  el.className = `roles-bytecount ${len > 3800 ? 'warn' : ''} ${len > MAX_ROLE_BYTES ? 'over' : ''}`;
+  if (btn) btn.disabled = len > MAX_ROLE_BYTES || profileEditingContent.trim().length === 0;
+}
+
+function updateProfilePreview(): void {
+  const preview = document.getElementById('roles-profile-preview');
+  if (!preview) return;
+  preview.innerHTML = profileEditingContent.trim()
+    ? `<strong>${t('roles.preview')}</strong><pre>${escapeHtml(profileEditingContent)}</pre>`
+    : `<small>${t('roles.previewEmpty')}</small>`;
+}
+
+function renderProfileApplyBots(): void {
+  const wrap = document.getElementById('roles-profile-apply-bots');
+  if (!wrap) return;
+  const groupId = selectedApplyGroupId ?? cache[0]?.chatId ?? '';
+  const group = cache.find(g => g.chatId === groupId);
+  const bots = group?.memberBots.filter(b => b.inChat) ?? [];
+  if (!group || bots.length === 0) {
+    wrap.innerHTML = `<div class="roles-empty">${t('roles.noChats')}</div>`;
+    return;
+  }
+  wrap.innerHTML = bots.map(bot => {
+    const hasEntry = !!entryForBot(bot.larkAppId);
+    return `
+      <label class="checkbox-row roles-profile-apply-bot">
+        <input type="checkbox" name="profile-apply-bot" value="${escapeHtml(bot.larkAppId)}" ${hasEntry ? 'checked' : ''}>
+        <span>${escapeHtml(bot.botName ?? bot.larkAppId)}</span>
+        <small>${hasEntry ? t('roles.configured') : t('roles.profileMissing')}</small>
+      </label>`;
+  }).join('');
+}
+
+async function runProfileApply(preview: boolean): Promise<void> {
+  const profileId = selectedProfileId;
+  if (!profileId) return;
+  const groupId = selectedApplyGroupId ?? cache[0]?.chatId;
+  if (!groupId) return;
+  const force = (document.getElementById('roles-profile-apply-force') as HTMLInputElement | null)?.checked === true;
+  const selected = [...document.querySelectorAll<HTMLInputElement>('input[name=profile-apply-bot]:checked')].map(i => i.value);
+  const status = document.getElementById('roles-profile-apply-status');
+  if (selected.length === 0) {
+    if (status) status.textContent = t('roles.applyPickBots');
+    return;
+  }
+  if (status) status.textContent = '...';
+  const results = await Promise.all(selected.map(async larkAppId => {
+    const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/apply`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: groupId, larkAppId, force, preview }),
+    });
+    const body = await r.json().catch(() => ({}));
+    return { larkAppId, ok: r.ok && body.ok !== false, status: r.status, error: body.error, wouldRefuse: body.wouldRefuse };
+  }));
+  if (status) {
+    status.innerHTML = results.map(r => {
+      const bot = allBots.find(b => b.larkAppId === r.larkAppId);
+      const label = escapeHtml(bot?.botName ?? r.larkAppId);
+      const outcome = r.ok
+        ? (preview ? (r.wouldRefuse ? t('roles.applyWouldRefuse') : t('roles.applyPreviewOk')) : t('roles.applyOk'))
+        : `${t('roles.applyFailed')}: ${escapeHtml(r.error ?? `HTTP ${r.status}`)}`;
+      return `<div>${label}: ${outcome}</div>`;
+    }).join('');
+  }
+  if (!preview) {
+    await loadGroups();
+    renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
+  }
+}
+
+function flashProfileStatus(text: string, isError = false): void {
+  const footer = document.querySelector('#roles-profile-detail .roles-editor-footer');
+  if (!footer) return;
+  const statusEl = document.createElement('span');
+  statusEl.className = `roles-saved-flash ${isError ? 'roles-save-error' : ''}`;
+  statusEl.textContent = ` ${text}`;
+  footer.appendChild(statusEl);
+  setTimeout(() => statusEl.remove(), isError ? 3000 : 2000);
+}
+
 export async function renderRolesPage(root: HTMLElement): Promise<void> {
   root.innerHTML = pageHtml();
   expandedGroups.clear();
   resetEditor();
+  switchTab(activeTab);
 
-  // /api/groups 慢——树区域先亮 loading，避免左栏长时间空白像挂了。
   const treeEl = document.getElementById('roles-tree');
+  const profileListEl = document.getElementById('roles-profile-list');
   if (treeEl) treeEl.innerHTML = loadingHtml();
+  if (profileListEl) profileListEl.innerHTML = loadingHtml();
   await loadGroups();
-  await loadNameMaps(); // 预热共享头像表，让角色树首屏就能出真实头像
-  // Auto-expand groups that have at least one bot with a role
+  await loadProfiles();
+  await loadNameMaps();
+
   for (const g of cache) {
     if (botRoleCount(g) > 0) expandedGroups.add(g.chatId);
   }
   renderTree();
+  renderProfileList();
+  if (selectedProfileId) await selectProfile(selectedProfileId);
 
-  // Search
+  document.getElementById('roles-tab-groups')?.addEventListener('click', () => switchTab('groups'));
+  document.getElementById('roles-tab-profiles')?.addEventListener('click', () => switchTab('profiles'));
+
   document.getElementById('roles-search')?.addEventListener('input', (e) => {
     renderTree((e.target as HTMLInputElement).value);
   });
 
-  // Refresh
   document.getElementById('roles-refresh')?.addEventListener('click', async () => {
     await loadGroups();
     renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-    // Re-fetch current selection if any
     if (selectedGroupId && selectedBotId) {
       const role = await loadRole(selectedBotId, selectedGroupId);
       const textarea = document.getElementById('roles-editor-textarea') as HTMLTextAreaElement;
@@ -323,7 +718,6 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
     }
   });
 
-  // Save
   document.getElementById('roles-save')?.addEventListener('click', async function(this: HTMLButtonElement) {
     if (!selectedGroupId || !selectedBotId) return;
     this.disabled = true;
@@ -335,7 +729,6 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
         renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
         const delBtn = document.getElementById('roles-delete');
         if (delBtn) delBtn.style.display = '';
-        // Brief saved indicator
         const statusEl = document.createElement('span');
         statusEl.className = 'roles-saved-flash';
         statusEl.textContent = ` ${t('roles.saved')}`;
@@ -343,7 +736,6 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
         footer?.appendChild(statusEl);
         setTimeout(() => statusEl.remove(), 2000);
       } else {
-        // Show error feedback
         const statusEl = document.createElement('span');
         statusEl.className = 'roles-saved-flash roles-save-error';
         statusEl.textContent = editingContent.trim().length === 0
@@ -359,7 +751,6 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
     }
   });
 
-  // Delete
   document.getElementById('roles-delete')?.addEventListener('click', async function(this: HTMLButtonElement) {
     if (!selectedGroupId || !selectedBotId) return;
     if (!confirm(t('roles.confirmDelete'))) return;
@@ -378,10 +769,27 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
     }
   });
 
-  // Live edit
   document.getElementById('roles-editor-textarea')?.addEventListener('input', (e) => {
     editingContent = (e.target as HTMLTextAreaElement).value;
     updateByteCount();
     updatePreview();
+  });
+
+  document.getElementById('roles-profile-search')?.addEventListener('input', (e) => {
+    renderProfileList((e.target as HTMLInputElement).value);
+  });
+  document.getElementById('roles-profile-refresh')?.addEventListener('click', async () => {
+    await loadGroups();
+    await loadProfiles();
+    if (selectedProfileId) await loadProfileEntries(selectedProfileId);
+    renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
+    renderProfileDetail();
+  });
+  document.getElementById('roles-profile-select')?.addEventListener('click', async () => {
+    const input = document.getElementById('roles-profile-id') as HTMLInputElement | null;
+    const profileId = input?.value.trim();
+    if (!profileId) return;
+    await selectProfile(profileId);
+    switchTab('profiles');
   });
 }

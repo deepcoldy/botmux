@@ -90,7 +90,7 @@ export async function renderGroupsPage(root: HTMLElement) {
   };
 
   const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
-  createBtn.onclick = () => openCreateModal();
+  createBtn.onclick = () => { void openCreateModal(); };
 
   // /api/groups 要扇出到所有 daemon、逐群查成员，慢——先亮 loading，回来再换表格。
   const loadingEl = root.querySelector<HTMLElement>('#g-loading')!;
@@ -102,12 +102,18 @@ export async function renderGroupsPage(root: HTMLElement) {
     tableWrap.hidden = false;
   }
 
-  function openCreateModal() {
+  async function openCreateModal() {
     const allBots = cache.bots;
     if (allBots.length === 0) {
       alert(t('groups.noBotsOnline'));
       return;
     }
+    let roleProfiles: Array<{ profileId: string }> = [];
+    try {
+      const r = await fetch('/api/role-profiles');
+      const data = await r.json();
+      roleProfiles = data.profiles ?? [];
+    } catch { /* profile selector is optional */ }
     drawer.innerHTML = `
       <article>
         <header><h3>${t('groups.createTitle')}</h3></header>
@@ -121,6 +127,14 @@ export async function renderGroupsPage(root: HTMLElement) {
             <span>${t('groups.bindDir')}</span>
             <input type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/botmux">
             <small>${t('groups.bindDirHelp')}</small>
+          </label>
+          <label class="form-row">
+            <span>${t('groups.roleProfile')}</span>
+            <select name="roleProfileId">
+              <option value="">${t('groups.roleProfileNone')}</option>
+              ${roleProfiles.map(p => `<option value="${escapeHtml(p.profileId)}">${escapeHtml(p.profileId)}</option>`).join('')}
+            </select>
+            <small>${t('groups.roleProfileHelp')}</small>
           </label>
           <fieldset>
             <legend>${t('groups.botPicker')}</legend>
@@ -141,6 +155,7 @@ export async function renderGroupsPage(root: HTMLElement) {
       const fd = new FormData(ev.target as HTMLFormElement);
       const name = ((fd.get('name') as string) ?? '').trim();
       const bindWorkingDir = ((fd.get('bindWorkingDir') as string) ?? '').trim();
+      const roleProfileId = ((fd.get('roleProfileId') as string) ?? '').trim();
       const ids = fd.getAll('bot') as string[];
       if (ids.length === 0) { alert('Pick at least one bot.'); return; }
       const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
@@ -149,7 +164,12 @@ export async function renderGroupsPage(root: HTMLElement) {
         const r = await fetch('/api/groups/create', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ name: name || undefined, larkAppIds: ids, bindWorkingDir: bindWorkingDir || undefined }),
+          body: JSON.stringify({
+            name: name || undefined,
+            larkAppIds: ids,
+            bindWorkingDir: bindWorkingDir || undefined,
+            roleProfileId: roleProfileId || undefined,
+          }),
         });
         const respBody = await r.json();
         if (respBody.ok && respBody.chatId) {
