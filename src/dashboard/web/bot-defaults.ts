@@ -997,7 +997,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
-      // ── 最大同时活跃会话数 maxLiveWorkers（空＝不限） ──────────────────
+      // ── 最大同时活跃会话数 maxLiveWorkers（空＝回落默认 30） ──────────────────
       const capInput = card.querySelector<HTMLInputElement>('input[data-input=maxLiveWorkers]');
       const capSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-session-cap]');
       const capOffBtn = card.querySelector<HTMLButtonElement>('button[data-action=off-session-cap]');
@@ -1041,7 +1041,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (capInput && capSaveBtn) {
         capSaveBtn.addEventListener('click', () => {
           const raw = capInput.value.trim();
-          if (raw === '') { putMaxLiveWorkers(null, capSaveBtn); return; } // 空＝不限
+          if (raw === '') { putMaxLiveWorkers(null, capSaveBtn); return; } // 空＝清回默认 30
           // 只认纯正整数 token（拒 1e2 / 1.0 / 01），与额度输入同口径。
           if (!/^[1-9]\d*$/.test(raw)) {
             if (capStatusEl) {
