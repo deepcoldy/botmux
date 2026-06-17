@@ -6,19 +6,18 @@ import { createClaudeFamilyAdapter } from './claude-code.js';
 import { logger } from '../../utils/logger.js';
 import type { CliAdapter } from './types.js';
 
-/** Relay CLI (`@bytedance-relay/claude-code`, binary `relay`) is the current
- *  release name of what used to ship as Seed — a ByteDance fork of Claude Code.
- *  It is identical to Claude Code in flags, slash commands and on-disk session
- *  layout (per-project JSONL transcripts, `sessions/<pid>.json`, `tasks/` fd
- *  locks, keybindings.json, settings.json hooks); it differs only in the binary
- *  name, its auth (ByteCloud / bytedcli / SuperRelay), and its data root — which
- *  it isolates to a `.claude-runtime` directory *inside its own install package*
- *  (rather than `~/.claude`), respecting `CLAUDE_CONFIG_DIR` when set.
+/** Relay CLI (binary `relay`) is the current release name of what used to ship
+ *  as Seed — a fork of Claude Code. It is identical to Claude Code in flags,
+ *  slash commands and on-disk session layout (per-project JSONL transcripts,
+ *  `sessions/<pid>.json`, `tasks/` fd locks, keybindings.json, settings.json
+ *  hooks); it differs only in the binary name, its auth, and its data root —
+ *  which it isolates to a `.claude-runtime` directory *inside its own install
+ *  package* (rather than `~/.claude`), respecting `CLAUDE_CONFIG_DIR` when set.
  *
  *  Relay and Seed share the same package internals, so this adapter is a near
  *  clone of `seed.ts`; it lives as its own file (and CliId) because they are
- *  distinct binaries with distinct npm packages — a user may have either one,
- *  or both, on PATH, and botmux must spawn/resume each by its real name. */
+ *  distinct binaries — a user may have either one, or both, on PATH, and
+ *  botmux must spawn/resume each by its real name. */
 
 /** Derive Relay's `.claude-runtime` data root from the resolved binary.
  *

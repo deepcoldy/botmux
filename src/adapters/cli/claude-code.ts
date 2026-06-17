@@ -389,9 +389,9 @@ const claudeFirstWriteSeen = new WeakSet<PtyHandle>();
 /** A member of the Claude-family CLIs: Claude Code itself and forks that share
  *  its on-disk session layout (per-project JSONL transcripts, `sessions/<pid>.json`
  *  pid-state, `tasks/` fd locks, keybindings.json, settings.json hooks) but
- *  relocate the data root and/or rename the binary. Seed CLI
- *  (`@bytedance-seed/claude-code`, binary `seed`) is one such fork — it reuses
- *  this entire adapter, only swapping `dataDir`/`stateJsonPath`/binary. */
+ *  relocate the data root and/or rename the binary. Seed CLI (binary `seed`) is
+ *  one such fork — it reuses this entire adapter, only swapping
+ *  `dataDir`/`stateJsonPath`/binary. */
 export interface ClaudeFamilyVariant {
   /** CliId for this variant (`claude-code`, `seed`, …). */
   readonly id: CliId;

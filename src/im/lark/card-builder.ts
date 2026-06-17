@@ -174,7 +174,7 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
 
 const cliDisplayNames: Record<CliId, string> = {
   'claude-code': 'Claude',
-  'seed': 'Seed',
+  'seed': 'Seed/Relay',
   'relay': 'Relay',
   'aiden': 'Aiden',
   'coco': 'CoCo',

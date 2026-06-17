@@ -68,7 +68,7 @@ const CJADK_X_CODEX: CliSelectOption = { key: 'cjadk-x-codex', label: 'CJADK × 
 const CJADK_VARIANTS: ReadonlyArray<CliSelectOption> = [CJADK_X_CLAUDE, CJADK_X_CODEX];
 
 // ─── ttadk 选项 ──────────────────────────────────────────────────────────────
-// ttadk（@byted/ttadk）跟 cjadk 一样是网关装配启动器：`ttadk <子命令>` 是
+// ttadk 跟 cjadk 一样是网关装配启动器：`ttadk <子命令>` 是
 // `ttadk code -t <tool>` 的快捷写法，启动真实 CLI 前注入网关鉴权 env。与 cjadk
 // 的关键差异：ttadk 默认会弹「交互式选模型菜单」卡住 PTY，靠 **`-m <model>`** 跳过
 // （而非 cjadk 的 CJADK_INTERACTIVE env 开关），故模型对 managed 模型类 CLI 必填。

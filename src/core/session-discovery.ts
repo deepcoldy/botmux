@@ -49,6 +49,12 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // from adopting the other's (or claude's) sessions.
   seed: 'seed',
   relay: 'relay',
+  // Seed adapter prefers the `relay` binary when available (Seed has been
+  // rebranded to Relay). When a seed-configured bot scans for adoptable
+  // sessions or resolves wrapperCli child pids, a running `relay` process
+  // should also count as a match — same way mtr accepts opendir processes.
+  // The reverse (relay bot accepting seed processes) is not needed since
+  // relay is the newer name and explicitly-relay configs target relay.
   codex: 'codex',
   aiden: 'aiden',
   coco: 'coco',
@@ -88,6 +94,12 @@ export function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefin
   // native process as "opencode". When an MTR bot asks to adopt, treat that
   // process as MTR so the bot's filter does not hide its own sessions.
   if (filterCliId === 'mtr' && direct === 'opencode') return 'mtr';
+  // Seed adapter prefers the `relay` binary when available (Seed has been
+  // rebranded to Relay). When a seed-configured bot scans for sessions or
+  // resolves wrapperCli child pids, a running `relay` process should also
+  // count as a match. The reverse is not needed — relay is the newer name
+  // and explicitly-relay configs target relay.
+  if (filterCliId === 'seed' && direct === 'relay') return 'seed';
   return direct;
 }
 

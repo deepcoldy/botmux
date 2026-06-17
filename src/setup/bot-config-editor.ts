@@ -41,7 +41,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'hermes': 'Hermes',
   'codex-app': 'Codex App',
   'mira': 'Mira',
-  'seed': 'Seed',
+  'seed': 'Seed/Relay',
   'traex': 'TRAE',
   'pi': 'Pi',
   'copilot': 'Copilot',
