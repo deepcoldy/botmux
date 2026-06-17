@@ -4958,7 +4958,15 @@ process.on('message', async (raw: unknown) => {
       log('Suspend requested');
       stopScreenshotLoop();
       stopBridgeWatcher();
-      try { backend?.kill(); } catch { /* detach best-effort */ }
+      // Free the CLI's memory, not just the worker's: destroySession kills the
+      // backing tmux/herdr/zellij session AND the CLI process inside it (kill()
+      // would only detach the pty viewer and leave the CLI running in the
+      // background — defeating the whole point of a session cap, since the CLI
+      // is the memory hog). On the next message the session cold-resumes via
+      // forkWorker(resume=true) → a fresh `new-session --resume <cliSessionId>`
+      // that rebuilds context from the on-disk transcript (same path the daemon
+      // uses to recover sessions after a reboot kills the tmux server).
+      try { (backend?.destroySession ?? backend?.kill)?.call(backend); } catch { /* best-effort */ }
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the

@@ -1044,7 +1044,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
       body: { sessionId: ds.session.sessionId, reason },
     });
   }
-  logger.info(`[${tag(ds)}] Worker suspended (${reason}); session remains active`);
+  logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
   return true;
 }
 

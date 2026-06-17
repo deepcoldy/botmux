@@ -381,13 +381,13 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
   function sessionCapStateLabel(cap: number | null): string {
     return cap == null
-      ? t('botDefaults.maxLiveWorkersStateOff')
+      ? t('botDefaults.maxLiveWorkersStateDefault')
       : t('botDefaults.maxLiveWorkersStateOn', { count: cap });
   }
 
-  // 最大同时活跃会话数（maxLiveWorkers）：数字输入 + 保存/不限按钮（空＝不限）。超过上限时
-  // 最久未用的会话自动休眠，下条消息/打开终端再唤醒。PUT /api/bots/:appId/max-live-workers
-  // 落 bots.json，daemon 每分钟读实时值即时生效。
+  // 最大同时活跃会话数（maxLiveWorkers）：数字输入 + 保存/恢复默认按钮（空＝用默认 30）。
+  // 超过上限时最久未用的会话自动休眠（worker+CLI 一起杀回收内存），下条消息冷恢复。
+  // PUT /api/bots/:appId/max-live-workers 落 bots.json，daemon 每分钟读实时值即时生效。
   function renderSessionCapSection(b: any): string {
     const cap: number | null = typeof b.maxLiveWorkers === 'number' ? b.maxLiveWorkers : null;
     return `<div class="bd-subsection">

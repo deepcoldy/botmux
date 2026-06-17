@@ -2,11 +2,22 @@ import type { DaemonSession } from './types.js';
 import { suspendWorker } from './worker-pool.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
 
+/**
+ * Default per-bot live-session cap applied when a bot has no explicit
+ * `maxLiveWorkers` configured. Keeps memory bounded out of the box: beyond this
+ * many live sessions, the least-recently-used ones are suspended (CLI freed,
+ * cold-resumes from transcript on the next message). A bot can override it from
+ * the dashboard. NOTE: the dashboard help copy hardcodes this number
+ * ('botDefaults.maxLiveWorkers*' i18n) — keep them in sync.
+ */
+export const DEFAULT_MAX_LIVE_WORKERS = 30;
+
 export interface IdleWorkerSweepOptions {
   /**
-   * Max simultaneously-live workers for THIS bot (one daemon = one bot, so the
-   * whole `activeSessions` map belongs to a single bot). Undefined or ≤0 → no
-   * cap → nothing is ever suspended (the default; old sessions never time out).
+   * Explicit per-bot cap for THIS bot (one daemon = one bot, so the whole
+   * `activeSessions` map belongs to a single bot). `undefined` (bot unset) →
+   * fall back to {@link DEFAULT_MAX_LIVE_WORKERS}. `≤0` → no cap (escape hatch:
+   * never suspend).
    */
   maxLiveWorkers?: number;
 }
@@ -38,8 +49,8 @@ export function sweepIdleWorkers(
   activeSessions: Map<string, DaemonSession>,
   opts: IdleWorkerSweepOptions = {},
 ): IdleWorkerSweepResult[] {
-  const cap = opts.maxLiveWorkers;
-  if (cap === undefined || cap <= 0) return [];
+  const cap = opts.maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS;
+  if (cap <= 0) return [];  // explicit ≤0 = unlimited escape hatch
   const running = liveWorkers(activeSessions);
   if (running.length <= cap) return [];
 

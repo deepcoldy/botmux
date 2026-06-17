@@ -89,7 +89,7 @@ import {
 } from './core/session-manager.js';
 import { beginReplyTargetTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
-import { sweepIdleWorkers } from './core/idle-worker-sweeper.js';
+import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -3753,11 +3753,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const idleWorkerSweepTimer = setInterval(() => {
     // Re-read the live per-bot cap each tick so a dashboard edit (which mutates
     // bot.config in place via applyConfigField) takes effect within 60s without
-    // a restart. Unset / ≤0 → no cap → no-op.
+    // a restart. Unset → DEFAULT_MAX_LIVE_WORKERS; ≤0 → no cap.
     const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
     const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers });
     if (suspended.length > 0) {
-      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} live worker(s) over per-bot cap ${maxLiveWorkers}`);
+      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap ${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}`);
     }
   }, 60_000);
   idleWorkerSweepTimer.unref?.();

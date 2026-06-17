@@ -16,7 +16,7 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-import { sweepIdleWorkers } from '../src/core/idle-worker-sweeper.js';
+import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from '../src/core/idle-worker-sweeper.js';
 
 function ds(sessionId: string, backendType: string, lastMessageAt: number, worker = {}) {
   return {
@@ -42,13 +42,27 @@ function ds(sessionId: string, backendType: string, lastMessageAt: number, worke
 const now = 1_000_000;
 
 describe('sweepIdleWorkers (per-bot count cap)', () => {
-  it('does nothing when no cap is configured (unset / ≤0 = unlimited)', () => {
+  it('falls back to the default cap (30) when the bot has no explicit value', () => {
+    expect(DEFAULT_MAX_LIVE_WORKERS).toBe(30);
+    // DEFAULT_MAX_LIVE_WORKERS + 2 sessions, oldest first by lastMessageAt.
+    const n = DEFAULT_MAX_LIVE_WORKERS + 2;
+    const entries: [string, any][] = [];
+    for (let i = 0; i < n; i++) entries.push([`s${i}`, ds(`s${i}`, 'tmux', now - (n - i) * 60_000)]);
+    const activeSessions = new Map<string, any>(entries);
+
+    // No explicit cap → default 30 → suspend the 2 oldest (s0, s1).
+    const suspended = sweepIdleWorkers(activeSessions, {});
+    expect(suspended.map(s => s.sessionId)).toEqual(['s0', 's1']);
+    expect(activeSessions.get('s0').worker).toBe(null);
+    expect(activeSessions.get('s2').worker).not.toBe(null);
+  });
+
+  it('treats an explicit ≤0 cap as the unlimited escape hatch (never suspends)', () => {
     const make = () => new Map<string, any>([
       ['a', ds('a', 'tmux', now - 90 * 60_000)],
       ['b', ds('b', 'herdr', now - 80 * 60_000)],
       ['c', ds('c', 'zellij', now - 70 * 60_000)],
     ]);
-    expect(sweepIdleWorkers(make(), {})).toEqual([]);
     expect(sweepIdleWorkers(make(), { maxLiveWorkers: 0 })).toEqual([]);
     expect(sweepIdleWorkers(make(), { maxLiveWorkers: -5 })).toEqual([]);
   });
