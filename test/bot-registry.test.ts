@@ -143,6 +143,60 @@ describe('parseBotConfigsFromText — brand', () => {
   });
 });
 
+// ─── per-bot worker parsing ─────────────────────────────────────────────────
+
+describe('parseBotConfigsFromText — per-bot worker', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('parses a per-bot worker override of positive integers', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', worker: { maxLiveWorkers: 30, idleSuspendMs: 600000 } },
+    ]));
+    expect(cfg.worker).toEqual({ maxLiveWorkers: 30, idleSuspendMs: 600000 });
+  });
+
+  it('leaves worker undefined when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.worker).toBeUndefined();
+  });
+
+  it('drops non-positive / non-integer worker fields', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', worker: { maxLiveWorkers: 0, idleSuspendMs: -5 } },
+    ]));
+    expect(cfg.worker).toBeUndefined();
+  });
+
+  it('keeps only the valid field when one is bogus', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', worker: { maxLiveWorkers: 12, idleSuspendMs: 1.5 } },
+    ]));
+    expect(cfg.worker).toEqual({ maxLiveWorkers: 12 });
+  });
+
+  it('exposes this daemon bot worker override via ownBotWorkerConfig', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', worker: { maxLiveWorkers: 24 } },
+    ]));
+    mod.registerBot(cfg);
+    expect(mod.ownBotWorkerConfig()).toEqual({ maxLiveWorkers: 24 });
+  });
+
+  it('ownBotWorkerConfig is undefined when the bot has no worker block', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    mod.registerBot(cfg);
+    expect(mod.ownBotWorkerConfig()).toBeUndefined();
+  });
+});
+
 // ─── getBot / getBotClient ────────────────────────────────────────────────
 
 describe('getBot / getBotClient', () => {

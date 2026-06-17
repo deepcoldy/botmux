@@ -3084,7 +3084,7 @@ function argValues(args: string[], ...flags: string[]): string[] {
 import { buildMentionedPendingResponseCard } from './im/lark/card-builder.js';
 import { buildCardBodyElements, brandFooterSegment } from './im/lark/md-card.js';
 import { COMPLETED_REACTION_EMOJI_TYPE, claimPendingResponseCard, isPendingResponseCardOpen, markPendingResponseCardPatchedIfCurrent, mergePendingResponseState, shouldMarkPendingAsMentionedSend, shouldPatchPendingOnExplicitSend } from './core/pending-response.js';
-import { resolveBrandLabel } from './bot-registry.js';
+import { countConfiguredBots, resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attentionUsageError } from './services/send-policy.js';
 
@@ -4981,11 +4981,12 @@ function cmdWorkerBudget(args: string[]): void {
   if (sub === 'status') {
     const cfg = readGlobalConfig();
     const resources = detectWorkerResources();
-    const budget = resolveWorkerBudget(cfg.worker, resources);
+    const daemonCount = countConfiguredBots();
+    const budget = resolveWorkerBudget(cfg.worker, resources, daemonCount);
     console.log('Worker budget');
     console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
     console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);
-    console.log(`  auto baseline:  ${budget.autoMaxLiveWorkers} from cpu=${resources.cpuCount}, memory=${formatGib(resources.memoryBytes)}`);
+    console.log(`  auto baseline:  ${budget.autoMaxLiveWorkers} from cpu=${resources.cpuCount}, memory=${formatGib(resources.memoryBytes)}, daemons=${daemonCount} (per-daemon share)`);
     console.log(`  Config file:    ${globalConfigPath()}`);
     console.log('');
     console.log('Agent-safe edit commands:');
@@ -5015,7 +5016,7 @@ function cmdWorkerBudget(args: string[]): void {
     if (idleMinutes !== undefined) next.idleSuspendMs = parsePositiveInt(idleMinutes, '--idle-minutes') * 60_000;
 
     mergeGlobalConfig({ worker: next });
-    const budget = resolveWorkerBudget(next);
+    const budget = resolveWorkerBudget(next, undefined, countConfiguredBots());
     console.log('✅ Updated worker budget.');
     console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
     console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);

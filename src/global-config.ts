@@ -186,7 +186,7 @@ function readPositiveInteger(raw: unknown): number | undefined {
   return raw;
 }
 
-function readWorker(raw: unknown): WorkerConfig | undefined {
+export function readWorker(raw: unknown): WorkerConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
   const worker: WorkerConfig = {};

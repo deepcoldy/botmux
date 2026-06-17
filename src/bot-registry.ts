@@ -6,6 +6,7 @@ import type { BackendType } from './adapters/backend/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
+import { readWorker, type WorkerConfig } from './global-config.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
@@ -278,6 +279,16 @@ export interface BotConfig {
    * cards render the "🔊 语音总结" button. See services/voice/types.ts.
    */
   voice?: VoiceConfig;
+  /**
+   * Per-bot live-worker budget override. Fields set here win over the global
+   * `worker` block in ~/.botmux/config.json for THIS bot's idle sweeper, and
+   * are NOT subject to the per-daemon auto split — a bot that configures
+   * `maxLiveWorkers` gets exactly that many, regardless of how many bots share
+   * the box. Unset fields fall through to the global config, then to the
+   * auto-derived (machine-budget ÷ bot-count) baseline. Use it to give a
+   * heavily-used bot a bigger slice without raising every other bot's cap.
+   */
+  worker?: WorkerConfig;
 }
 
 export interface BotState {
@@ -531,6 +542,46 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
   }
 }
 
+// Configured-bot count, mtime-cached like the other disk fallbacks above.
+let botCountCache: { mtimeMs: number; count: number } | null = null;
+
+/**
+ * How many bots the shared bots.json configures — i.e. how many daemons share
+ * this machine (multi-daemon deployments run one bot per process, so the
+ * in-memory registry only sees this daemon's own bot). Used to split the
+ * auto-derived worker budget across daemons. Falls back to the in-memory
+ * registry size (≥1) when no config file is readable, which also covers
+ * single-process/test setups.
+ */
+export function countConfiguredBots(): number {
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const stat = statSync(path);
+      if (!botCountCache || botCountCache.mtimeMs !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(path, 'utf-8'));
+        botCountCache = { mtimeMs: stat.mtimeMs, count: Array.isArray(raw) ? Math.max(1, raw.length) : 1 };
+      }
+      return botCountCache.count;
+    } catch { /* fall through to registry size */ }
+  }
+  return Math.max(1, bots.size);
+}
+
+/**
+ * This daemon's own bot's per-bot worker override, if any. A daemon process
+ * hosts exactly one bot (see daemon.ts — registerBot is called once per
+ * BOTMUX_BOT_INDEX), so the in-memory registry has a single entry whose
+ * `worker` block, when present, governs this bot's idle sweeper. Returns
+ * undefined when unconfigured (caller falls back to global + auto budget).
+ */
+export function ownBotWorkerConfig(): WorkerConfig | undefined {
+  for (const bot of bots.values()) {
+    if (bot.config.worker) return bot.config.worker;
+  }
+  return undefined;
+}
+
 /**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
@@ -731,6 +782,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       }
     }
 
+    // worker：per-bot live-worker 预算覆盖。复用 global-config.readWorker 同口径
+    // 校验（maxLiveWorkers/idleSuspendMs 仅取正整数，非法/缺省 → undefined）。
+    const worker = readWorker(entry.worker);
+
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
@@ -805,6 +860,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // undefined 让 bots.json 保持干净。
       docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
       voice,
+      worker,
     });
   }
 

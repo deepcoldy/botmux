@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/services/session-store.js', () => ({
   updateSessionPid: vi.fn(),
@@ -14,6 +14,16 @@ vi.mock('../src/utils/logger.js', () => ({
     info: vi.fn(),
     warn: vi.fn(),
   },
+}));
+
+const mockReadGlobalConfig = vi.fn();
+const mockOwnBotWorkerConfig = vi.fn();
+vi.mock('../src/global-config.js', () => ({
+  readGlobalConfig: () => mockReadGlobalConfig() ?? {},
+}));
+vi.mock('../src/bot-registry.js', () => ({
+  countConfiguredBots: () => 6,
+  ownBotWorkerConfig: () => mockOwnBotWorkerConfig(),
 }));
 
 import { sweepIdleWorkers } from '../src/core/idle-worker-sweeper.js';
@@ -214,5 +224,56 @@ describe('sweepIdleWorkers', () => {
 
     expect(suspended).toEqual([]);
     expect(activeSessions.get('a').worker).not.toBe(null);
+  });
+});
+
+describe('sweepIdleWorkers per-bot worker override', () => {
+  beforeEach(() => {
+    mockReadGlobalConfig.mockReset();
+    mockOwnBotWorkerConfig.mockReset();
+  });
+
+  const overBudget = (now: number) => new Map<string, any>([
+    ['a', ds('a', 'tmux', now - 90 * 60_000)],
+    ['b', ds('b', 'herdr', now - 80 * 60_000)],
+    ['c', ds('c', 'zellij', now - 70 * 60_000)],
+  ]);
+
+  it("uses this bot's per-bot maxLiveWorkers over the global block (not auto-split)", () => {
+    const now = 1_000_000;
+    // Global says 1, but this bot configured 2 → its own value wins, so only
+    // the single oldest idle worker over its budget of 2 is suspended.
+    mockReadGlobalConfig.mockReturnValue({ worker: { maxLiveWorkers: 1, idleSuspendMs: 30 * 60_000 } });
+    mockOwnBotWorkerConfig.mockReturnValue({ maxLiveWorkers: 2 });
+
+    const activeSessions = overBudget(now);
+    const suspended = sweepIdleWorkers(activeSessions, { now });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['a']);
+  });
+
+  it('falls through to the global block for fields the bot did not set', () => {
+    const now = 1_000_000;
+    // Bot only overrides idleSuspendMs; maxLiveWorkers comes from global (1).
+    mockReadGlobalConfig.mockReturnValue({ worker: { maxLiveWorkers: 1 } });
+    mockOwnBotWorkerConfig.mockReturnValue({ idleSuspendMs: 30 * 60_000 });
+
+    const activeSessions = overBudget(now);
+    const suspended = sweepIdleWorkers(activeSessions, { now });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['a', 'b']);
+  });
+
+  it('keeps an idle worker live when its per-bot idleSuspendMs has not elapsed', () => {
+    const now = 1_000_000;
+    // High idle threshold (2h) → the 90/80-min-idle workers are too recent to
+    // suspend even though they exceed the budget of 1.
+    mockReadGlobalConfig.mockReturnValue({ worker: { maxLiveWorkers: 1 } });
+    mockOwnBotWorkerConfig.mockReturnValue({ idleSuspendMs: 120 * 60_000 });
+
+    const activeSessions = overBudget(now);
+    const suspended = sweepIdleWorkers(activeSessions, { now });
+
+    expect(suspended).toEqual([]);
   });
 });
