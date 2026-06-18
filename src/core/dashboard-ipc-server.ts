@@ -37,7 +37,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
-import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import { isValidRoleChatId, resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
 import {
   deleteRoleProfileEntry,
   deleteRoleProfileIfEmpty,
@@ -815,6 +815,7 @@ ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
 
 ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const content = resolveRoleFile(cachedLarkAppId, p.chatId);
   jsonRes(res, 200, {
     chatId: p.chatId,
@@ -826,6 +827,7 @@ ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
 
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   let body: { content?: unknown };
   try { body = await readJsonBody<{ content?: string }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -841,6 +843,7 @@ ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
 
 ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const existed = deleteRoleFile(cachedLarkAppId, p.chatId);
   jsonRes(res, 200, { ok: true, existed });
 });
@@ -914,6 +917,7 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
   const chatId = typeof body.chatId === 'string' && body.chatId.trim() ? body.chatId.trim() : '';
   const larkAppId = typeof body.larkAppId === 'string' && body.larkAppId.trim() ? body.larkAppId.trim() : '';
   if (!chatId || !larkAppId) return jsonRes(res, 400, { ok: false, error: 'chatId_and_larkAppId_required' });
+  if (!isValidRoleChatId(chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   if (larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'wrong_daemon' });
   const content = readRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId);
   if (!content) return jsonRes(res, 200, { ok: false, error: 'missing_entry', changed: false });

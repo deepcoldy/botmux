@@ -32,7 +32,7 @@
 
 ## 在 Dashboard 里建群
 
-不想用命令的话，`botmux dashboard` 的 **Groups** 面板也能可视化建群、把指定 bot 拉进群、自动转让群主、@ 提醒，还能解散群 / 让 bot 退群（关联会话自动清理）。详见 [Dashboard 管控面](/dashboard)。
+不想用命令的话，`botmux dashboard` 的 **Groups** 面板也能可视化建群、把指定 bot 拉进群、自动转让群主、@ 提醒，还能解散群 / 让 bot 退群（关联会话自动清理）。新建群弹窗可以选择 Role Profile；已有群行里的「应用配置集」会跳到 **角色配置集** 页面，并把该群预选为 Apply 目标。详见 [Dashboard 管控面](/dashboard)。
 
 ![Dashboard 新建群](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300986_dash-newgroup.png)
 <p class="cap">「New Group」：填群名、绑定目录、勾选要拉进群的机器人</p>

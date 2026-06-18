@@ -359,7 +359,7 @@ export const messages: Record<string, string> = {
   'cmd.group.warn_bots_rejected': '⚠️ Some bots could not be added ({bots}) — they may not be in this bot\'s app scope. Please add them manually.',
   'cmd.group.warn_share_link_failed': '⚠️ Couldn\'t fetch a group share link; the link above only opens for members already in the group — the owner should invite non-members manually.',
   'cmd.group.resolve_failed': '⚠️ Could not resolve the @-mentioned bots (chat member info may be temporarily unavailable); group not created. Please retry shortly.',
-  'cmd.group.role_profile_bootstrap_sent': '✅ Role profile `{profile}` bootstrap completed for the new group.',
+  'cmd.group.role_profile_bootstrap_sent': '✅ Role profile `{profile}` bootstrap has been started for the new group.',
   'cmd.group.role_profile_bootstrap_failed': '⚠️ Created the group, but role profile `{profile}` bootstrap failed: {reason}',
 
   // ─── /relay --create ────────────────────────────────────────────────────

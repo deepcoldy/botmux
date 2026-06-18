@@ -42,6 +42,13 @@ How it works:
 - `apply` writes this bot's profile entry into the current group's role file. If the current group already has a role, apply refuses unless `--force` is passed.
 - Missing entries are safe: nothing is written, and the bot keeps falling back to its default role if one exists.
 
+In the Dashboard, **Role Profiles** is a first-class entry:
+
+- Open or create a profile from the left list.
+- Check which bots already have entries and edit each bot's Markdown role.
+- Pick a target group in the Apply panel, **Preview Apply** first, then **Apply Profile** when the overwrite behavior is clear.
+- From the **Groups** page, click a group's "Apply Profile" action to open Role Profiles with that group preselected.
+
 For new collaboration groups, create the group and bootstrap the profile in one command:
 
 ```bash

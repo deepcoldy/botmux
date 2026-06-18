@@ -1236,7 +1236,14 @@ const server = createServer(async (req, res) => {
           }
         } catch { /* skip offline/bad daemon */ }
       }));
-      return jsonRes(res, 200, { profiles: [...merged.values()].sort((a, b) => a.profileId.localeCompare(b.profileId)) });
+      return jsonRes(res, 200, {
+        profiles: [...merged.values()]
+          .map(p => ({
+            ...p,
+            entryCount: Math.max(p.entryCount, p.botEntries.filter(entry => entry.hasEntry).length),
+          }))
+          .sort((a, b) => a.profileId.localeCompare(b.profileId)),
+      });
     }
 
     let mRoleProfileApply: RegExpMatchArray | null;

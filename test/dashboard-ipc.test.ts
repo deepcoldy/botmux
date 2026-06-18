@@ -539,8 +539,79 @@ describe('POST /api/groups/create', () => {
 });
 
 describe('role profile IPC routes', () => {
+  it('rejects wrong-daemon role profile mutations', async () => {
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-profile-ipc-'));
+    config.session.dataDir = dataDir;
+    setLarkAppId('cli_profile');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const saveWrong = await fetch(`${base}/api/role-profiles/collab-main/cli_other`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Other daemon' }),
+      });
+      expect(saveWrong.status).toBe(403);
+      expect((await saveWrong.json()).error).toBe('wrong_daemon');
+
+      const deleteWrong = await fetch(`${base}/api/role-profiles/collab-main/cli_other`, { method: 'DELETE' });
+      expect(deleteWrong.status).toBe(403);
+      expect((await deleteWrong.json()).error).toBe('wrong_daemon');
+
+      const applyWrong = await fetch(`${base}/api/role-profiles/collab-main/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_role', larkAppId: 'cli_other' }),
+      });
+      expect(applyWrong.status).toBe(403);
+      expect((await applyWrong.json()).error).toBe('wrong_daemon');
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid chat ids before role/profile writes', async () => {
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-profile-ipc-'));
+    config.session.dataDir = dataDir;
+    setLarkAppId('cli_profile');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const roleWrite = await fetch(`${base}/api/roles/not-a-chat`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Bad chat' }),
+      });
+      expect(roleWrite.status).toBe(400);
+      expect((await roleWrite.json()).error).toBe('invalid_chat_id');
+
+      const apply = await fetch(`${base}/api/role-profiles/collab-main/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: '../escape', larkAppId: 'cli_profile' }),
+      });
+      expect(apply.status).toBe(400);
+      expect((await apply.json()).error).toBe('invalid_chat_id');
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects encoded traversal profile ids before touching storage', async () => {
     const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-profile-ipc-'));
     config.session.dataDir = dataDir;
     setLarkAppId('cli_profile');
@@ -556,12 +627,14 @@ describe('role profile IPC routes', () => {
     } finally {
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
 
   it('stores a profile entry and materializes it into a chat role', async () => {
     const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-profile-ipc-'));
     config.session.dataDir = dataDir;
     setLarkAppId('cli_profile');
@@ -616,6 +689,7 @@ describe('role profile IPC routes', () => {
     } finally {
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
   });

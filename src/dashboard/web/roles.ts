@@ -52,6 +52,7 @@ interface RoleProfileEntryData {
 }
 
 const MAX_ROLE_BYTES = 4096;
+const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 let cache: GroupInfo[] = [];
 let allBots: DashboardBot[] = [];
@@ -69,21 +70,28 @@ let selectedProfileBotId: string | null = null;
 let profileEditingContent = '';
 let selectedApplyGroupId: string | null = null;
 
-function pageHtml(): string {
+function isValidProfileId(profileId: string): boolean {
+  return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
+}
+
+function hashChatId(): string | null {
+  const [, query = ''] = location.hash.split('?');
+  const chatId = new URLSearchParams(query).get('chatId')?.trim();
+  return chatId || null;
+}
+
+function pageHtml(tab: 'groups' | 'profiles'): string {
+  const isProfiles = tab === 'profiles';
   return `<section class="page roles-page">
 <div class="page-heading roles-heading">
   <div>
-    <p class="eyebrow">${t('nav.roles')}</p>
-    <h1>${t('roles.title')}</h1>
-    <p>${t('roles.subtitle')}</p>
-  </div>
-  <div class="segmented roles-tabs" role="tablist">
-    <button type="button" id="roles-tab-groups" class="active">${t('roles.tabGroups')}</button>
-    <button type="button" id="roles-tab-profiles">${t('roles.tabProfiles')}</button>
+    <p class="eyebrow">${t(isProfiles ? 'nav.roleProfiles' : 'nav.groupRoles')}</p>
+    <h1>${t(isProfiles ? 'roleProfiles.title' : 'roles.title')}</h1>
+    <p>${t(isProfiles ? 'roleProfiles.subtitle' : 'roles.subtitle')}</p>
   </div>
 </div>
 
-<div id="roles-by-group-view" class="roles-layout">
+<div id="roles-by-group-view" class="roles-layout" ${isProfiles ? 'hidden' : ''}>
   <div class="roles-tree-panel">
     <div class="roles-tree-header">
       <input type="search" id="roles-search" placeholder="${t('roles.search')}" />
@@ -115,7 +123,7 @@ function pageHtml(): string {
   </div>
 </div>
 
-<div id="roles-profiles-view" class="roles-layout roles-profiles-layout" hidden>
+<div id="roles-profiles-view" class="roles-layout roles-profiles-layout" ${isProfiles ? '' : 'hidden'}>
   <div class="roles-tree-panel">
     <div class="roles-tree-header roles-profile-create">
       <input type="text" id="roles-profile-id" placeholder="${t('roles.profileIdPlaceholder')}" maxlength="64" />
@@ -429,6 +437,7 @@ function renderProfileList(filter: string = ''): void {
 }
 
 async function selectProfile(profileId: string): Promise<void> {
+  if (!isValidProfileId(profileId.trim())) return;
   selectedProfileId = profileId.trim();
   selectedProfileBotId = null;
   profileEditingContent = '';
@@ -675,8 +684,9 @@ function flashProfileStatus(text: string, isError = false): void {
   setTimeout(() => statusEl.remove(), isError ? 3000 : 2000);
 }
 
-export async function renderRolesPage(root: HTMLElement): Promise<void> {
-  root.innerHTML = pageHtml();
+async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles'): Promise<void> {
+  activeTab = tab;
+  root.innerHTML = pageHtml(tab);
   expandedGroups.clear();
   resetEditor();
   switchTab(activeTab);
@@ -688,6 +698,13 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
   await loadGroups();
   await loadProfiles();
   await loadNameMaps();
+
+  if (tab === 'profiles') {
+    const requestedChatId = hashChatId();
+    if (requestedChatId && cache.some(g => g.chatId === requestedChatId)) {
+      selectedApplyGroupId = requestedChatId;
+    }
+  }
 
   for (const g of cache) {
     if (botRoleCount(g) > 0) expandedGroups.add(g.chatId);
@@ -789,7 +806,24 @@ export async function renderRolesPage(root: HTMLElement): Promise<void> {
     const input = document.getElementById('roles-profile-id') as HTMLInputElement | null;
     const profileId = input?.value.trim();
     if (!profileId) return;
+    if (!isValidProfileId(profileId)) {
+      input?.setCustomValidity(t('roles.profileIdInvalid'));
+      input?.reportValidity();
+      return;
+    }
+    input?.setCustomValidity('');
     await selectProfile(profileId);
     switchTab('profiles');
   });
+  document.getElementById('roles-profile-id')?.addEventListener('input', (e) => {
+    (e.target as HTMLInputElement).setCustomValidity('');
+  });
+}
+
+export async function renderRolesPage(root: HTMLElement): Promise<void> {
+  await renderRolesSurface(root, 'groups');
+}
+
+export async function renderRoleProfilesPage(root: HTMLElement): Promise<void> {
+  await renderRolesSurface(root, 'profiles');
 }
