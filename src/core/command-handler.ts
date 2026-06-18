@@ -396,7 +396,7 @@ async function handleRoleCommand(
         return;
       }
       const content = readRoleProfileEntry(dataDir, profileId, larkAppId);
-      if (!content) {
+      if (content === null) {
         await sessionReply(rootId, t('role.profile.entry_empty', { profile: profileId }, loc));
         return;
       }
@@ -450,7 +450,7 @@ async function handleRoleCommand(
       const force = flags.has('--force');
       const quiet = flags.has('--quiet');
       const content = readRoleProfileEntry(dataDir, profileId, larkAppId);
-      if (!content) {
+      if (content === null) {
         await sessionReply(rootId, t('role.profile.apply_missing', { profile: profileId }, loc));
         return;
       }
@@ -465,6 +465,13 @@ async function handleRoleCommand(
       }
       if (existing && !force) {
         await sessionReply(rootId, t('role.profile.apply_refused', { profile: profileId }, loc));
+        return;
+      }
+      if (!content) {
+        deleteRoleFile(larkAppId, chatId);
+        if (!quiet) {
+          await sessionReply(rootId, t('role.profile.applied', { profile: profileId, bytes, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc));
+        }
         return;
       }
       writeRoleFile(larkAppId, chatId, content);

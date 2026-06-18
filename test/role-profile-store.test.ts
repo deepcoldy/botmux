@@ -64,6 +64,18 @@ describe('role-profile-store', () => {
     expect(Buffer.byteLength(content, 'utf-8')).toBeLessThanOrEqual(MAX_ROLE_PROFILE_ENTRY_BYTES);
   });
 
+  it('can store an explicit empty entry when requested', () => {
+    writeRoleProfileEntry(dataDir, 'collab-main', 'cli_a', '   ', { allowEmpty: true });
+
+    expect(readRoleProfileEntry(dataDir, 'collab-main', 'cli_a')).toBe('');
+    expect(listRoleProfiles(dataDir)).toMatchObject([
+      { profileId: 'collab-main', entryCount: 1 },
+    ]);
+    expect(listRoleProfileEntries(dataDir, 'collab-main')).toMatchObject([
+      { profileId: 'collab-main', larkAppId: 'cli_a', content: '', byteLength: 0 },
+    ]);
+  });
+
   it('throws on empty content and unsafe keys', () => {
     expect(() => writeRoleProfileEntry(dataDir, 'bad/profile', 'cli_a', 'role')).toThrow(/invalid profile id/);
     expect(() => writeRoleProfileEntry(dataDir, '..', 'cli_a', 'role')).toThrow(/invalid profile id/);

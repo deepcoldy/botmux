@@ -274,7 +274,7 @@ async function saveProfileEntry(profileId: string, larkAppId: string, content: s
   const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, allowEmpty: true }),
   });
   return r.ok;
 }

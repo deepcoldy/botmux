@@ -19,7 +19,13 @@ let roleProfileEntriesById = new Map<string, RoleProfileEntryLike[]>();
 let groupRoleContentByBot = new Map<string, EffectiveRoleValue>();
 let roleProfileContextLoaded = false;
 
-type SaveProfileEntry = { larkAppId: string; content: string };
+type SaveProfileEntryStatus = 'chat' | 'team' | 'empty' | 'error';
+type SaveProfileEntry = {
+  larkAppId: string;
+  botName?: string;
+  content: string;
+  status: SaveProfileEntryStatus;
+};
 
 function isValidProfileId(profileId: string): boolean {
   return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
@@ -637,13 +643,26 @@ export async function renderGroupsPage(root: HTMLElement) {
         const body = await r.json().catch(() => ({}));
         const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
         const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
-        const content = hasEffectiveRole ? String(effectiveContent ?? '') : '';
-        return content.trim() ? { larkAppId: bot.larkAppId as string, content } : null;
+        const content = hasEffectiveRole ? String(effectiveContent ?? '').trim() : '';
+        const source = body?.effectiveSource === 'chat' || body?.effectiveSource === 'team'
+          ? body.effectiveSource as SaveProfileEntryStatus
+          : null;
+        return {
+          larkAppId: bot.larkAppId as string,
+          botName: bot.botName,
+          content,
+          status: content ? (source ?? 'chat') : 'empty',
+        };
       } catch {
-        return null;
+        return {
+          larkAppId: bot.larkAppId as string,
+          botName: bot.botName,
+          content: '',
+          status: 'error' as const,
+        };
       }
     }));
-    return roleRows.filter((row): row is SaveProfileEntry => !!row);
+    return roleRows;
   }
 
   function openSaveProfileDialog(
@@ -660,10 +679,24 @@ export async function renderGroupsPage(root: HTMLElement) {
                 data-profile-id="${escapeHtml(profile.profileId)}"
                 aria-pressed="${index === 0 ? 'true' : 'false'}">
           <span>${escapeHtml(profile.profileId)}</span>
-          <small>${t('groups.saveProfileOverwrite')}</small>
+          <small>${escapeHtml(t('groups.saveProfileExistingMeta', { count: profile.entryCount ?? 0 }))}</small>
         </button>`)
       .join('');
     const hasExistingProfiles = sortedProfiles.length > 0;
+    const roleCount = entries.filter(entry => entry.status === 'chat' || entry.status === 'team').length;
+    const emptyCount = entries.filter(entry => entry.status === 'empty').length;
+    const failedCount = entries.filter(entry => entry.status === 'error').length;
+    const canSubmitSnapshot = entries.length > 0 && failedCount === 0;
+    const entryRows = entries.map(entry => `
+      <div class="g-save-profile-entry ${entry.status === 'error' ? 'error' : ''}">
+        <div>
+          <strong>${escapeHtml(entry.botName ?? entry.larkAppId)}</strong>
+          <code>${escapeHtml(entry.larkAppId)}</code>
+        </div>
+        <span class="g-save-profile-entry-status ${entry.status}">
+          ${t(`groups.saveProfileStatus.${entry.status}`)}
+        </span>
+      </div>`).join('');
     drawer.innerHTML = `
       <article class="g-save-profile-dialog">
         <header>
@@ -674,9 +707,28 @@ export async function renderGroupsPage(root: HTMLElement) {
           }))}</p>
         </header>
         <form id="g-save-profile-form">
-          <div class="g-save-profile-switch" role="tablist" aria-label="${t('groups.saveProfileMode')}">
-            <button type="button" class="active" data-save-profile-mode="new">${t('groups.saveProfileNew')}</button>
-            <button type="button" data-save-profile-mode="overwrite" ${hasExistingProfiles ? '' : 'disabled'}>${t('groups.saveProfileOverwrite')}</button>
+          <section class="g-save-profile-panel">
+            <div class="g-save-profile-section-head">
+              <span>${t('groups.saveProfileScope')}</span>
+              <small>${t('groups.saveProfileScopeHelp')}</small>
+            </div>
+            <div class="g-save-profile-stats">
+              <span>${t('groups.saveProfileBotCount')} <strong>${entries.length}</strong></span>
+              <span>${t('groups.saveProfileRoleCount')} <strong>${roleCount}</strong></span>
+              <span>${t('groups.saveProfileEmptyCount')} <strong>${emptyCount}</strong></span>
+              ${failedCount ? `<span class="warn">${t('groups.saveProfileLoadFailed')} <strong>${failedCount}</strong></span>` : ''}
+            </div>
+            <div class="g-save-profile-entry-list">
+              ${entryRows || `<div class="g-save-profile-empty">${t('groups.saveProfileNoRoles')}</div>`}
+            </div>
+          </section>
+
+          <div class="form-row">
+            <span>${t('groups.saveProfileMode')}</span>
+            <div class="g-save-profile-switch" role="tablist" aria-label="${t('groups.saveProfileMode')}">
+              <button type="button" class="active" data-save-profile-mode="new">${t('groups.saveProfileNew')}</button>
+              <button type="button" data-save-profile-mode="overwrite" ${hasExistingProfiles ? '' : 'disabled'}>${t('groups.saveProfileOverwrite')}</button>
+            </div>
           </div>
           <label class="form-row" data-profile-mode-row="new">
             <span>${t('groups.saveProfileIdLabel')}</span>
@@ -695,14 +747,16 @@ export async function renderGroupsPage(root: HTMLElement) {
             <code data-save-profile-target>${escapeHtml(suggestedProfileId)}</code>
             <small data-save-profile-target-mode>${t('groups.saveProfileTargetNew')}</small>
           </div>
-          <div class="g-save-profile-summary ${entries.length ? '' : 'warn'}">
-            ${entries.length
-              ? escapeHtml(t('groups.saveProfileEntrySummary', { count: entries.length }))
+          <div class="g-save-profile-summary ${canSubmitSnapshot ? '' : 'warn'}">
+            ${failedCount
+              ? escapeHtml(t('groups.saveProfileFailedLoadSummary', { count: failedCount }))
+              : entries.length
+              ? escapeHtml(t('groups.saveProfileEntrySummary', { count: entries.length, roleCount, emptyCount }))
               : escapeHtml(t('groups.saveProfileNoRoles'))}
           </div>
           <div class="g-save-profile-status" data-save-profile-status></div>
           <div class="actions">
-            <button type="submit" class="primary" ${entries.length ? '' : 'disabled'}>${t('groups.saveProfileSubmit')}</button>
+            <button type="submit" class="primary" ${canSubmitSnapshot ? '' : 'disabled'}>${t('groups.saveProfileSubmit')}</button>
             <button type="button" id="g-save-profile-cancel">${t('groups.cancel')}</button>
           </div>
         </form>
@@ -744,7 +798,7 @@ export async function renderGroupsPage(root: HTMLElement) {
       submitBtn.textContent = selectedMode === 'overwrite'
         ? t('groups.saveProfileOverwriteSubmit')
         : t('groups.saveProfileSubmit');
-      submitBtn.disabled = !entries.length || (selectedMode === 'overwrite' && !selectedExistingProfileId);
+      submitBtn.disabled = !canSubmitSnapshot || (selectedMode === 'overwrite' && !selectedExistingProfileId);
       targetEl.textContent = currentProfileId() || '-';
       targetModeEl.textContent = selectedMode === 'overwrite'
         ? t('groups.saveProfileTargetOverwrite')
@@ -774,7 +828,7 @@ export async function renderGroupsPage(root: HTMLElement) {
     drawer.querySelector<HTMLButtonElement>('#g-save-profile-cancel')!.onclick = () => drawer.close();
     formEl.onsubmit = async ev => {
       ev.preventDefault();
-      if (!entries.length) return;
+      if (!canSubmitSnapshot) return;
       const profileId = currentProfileId();
       if (!isValidProfileId(profileId)) {
         statusEl.textContent = t('groups.saveProfileInvalid');
@@ -791,7 +845,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(entry.larkAppId)}`, {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ content: entry.content }),
+            body: JSON.stringify({ content: entry.content, allowEmpty: true }),
           });
           return r.ok;
         }));

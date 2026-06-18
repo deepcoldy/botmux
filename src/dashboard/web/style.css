@@ -3264,6 +3264,115 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .g-save-profile-dialog [hidden] {
   display: none !important;
 }
+.g-save-profile-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+.g-save-profile-section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+.g-save-profile-section-head > span {
+  color: var(--fg);
+  font-weight: 700;
+}
+.g-save-profile-section-head > small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.g-save-profile-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.g-save-profile-stats span {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  padding: 3px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
+.g-save-profile-stats strong {
+  color: var(--fg);
+}
+.g-save-profile-stats .warn {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.g-save-profile-entry-list {
+  display: grid;
+  gap: 6px;
+  max-height: 170px;
+  overflow: auto;
+}
+.g-save-profile-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.g-save-profile-entry > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.g-save-profile-entry strong,
+.g-save-profile-entry code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.g-save-profile-entry code {
+  color: var(--muted);
+  background: transparent;
+  padding: 0;
+}
+.g-save-profile-entry.error {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border-soft));
+}
+.g-save-profile-entry-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.g-save-profile-entry-status.chat {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, var(--surface));
+}
+.g-save-profile-entry-status.team {
+  color: var(--info);
+  background: color-mix(in srgb, var(--info) 12%, var(--surface));
+}
+.g-save-profile-entry-status.error {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.g-save-profile-empty {
+  color: var(--muted);
+  font-size: 13px;
+}
 .g-save-profile-switch {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3297,7 +3406,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   gap: 10px;
   align-items: center;
   justify-content: stretch;
-  min-height: 40px;
+  min-height: 38px;
   width: 100%;
   border-radius: var(--radius-sm);
   background: var(--surface-muted);
@@ -3306,7 +3415,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 }
 .g-save-profile-pick.selected {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
   color: var(--accent-strong);
 }
 .g-save-profile-pick span {

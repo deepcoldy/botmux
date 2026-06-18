@@ -724,4 +724,77 @@ describe('role profile IPC routes', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('stores explicit empty profile entries and applies them as no chat role', async () => {
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-profile-ipc-'));
+    config.session.dataDir = dataDir;
+    setLarkAppId('cli_profile');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const save = await fetch(`${base}/api/role-profiles/collab-empty/cli_profile`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '', allowEmpty: true }),
+      });
+      expect(save.status).toBe(200);
+      expect(await save.json()).toMatchObject({ ok: true, byteLength: 0 });
+
+      const entry = await fetch(`${base}/api/role-profiles/collab-empty/cli_profile`);
+      expect(await entry.json()).toMatchObject({
+        profileId: 'collab-empty',
+        larkAppId: 'cli_profile',
+        content: '',
+        byteLength: 0,
+        hasEntry: true,
+      });
+
+      const list = await fetch(`${base}/api/role-profiles`);
+      expect((await list.json()).profiles).toMatchObject([
+        { profileId: 'collab-empty', entryCount: 1, hasCurrentBotEntry: true },
+      ]);
+
+      const applyNoExisting = await fetch(`${base}/api/role-profiles/collab-empty/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_empty', larkAppId: 'cli_profile' }),
+      });
+      expect(applyNoExisting.status).toBe(200);
+      expect(await applyNoExisting.json()).toMatchObject({ ok: true, changed: false, deleted: false });
+
+      const roleWrite = await fetch(`${base}/api/roles/oc_empty`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Existing role' }),
+      });
+      expect(roleWrite.status).toBe(200);
+
+      const applyRefused = await fetch(`${base}/api/role-profiles/collab-empty/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_empty', larkAppId: 'cli_profile' }),
+      });
+      expect(applyRefused.status).toBe(409);
+      expect((await applyRefused.json()).error).toBe('chat_role_exists');
+
+      const applyForce = await fetch(`${base}/api/role-profiles/collab-empty/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_empty', larkAppId: 'cli_profile', force: true }),
+      });
+      expect(applyForce.status).toBe(200);
+      expect(await applyForce.json()).toMatchObject({ ok: true, changed: true, deleted: true });
+
+      const role = await fetch(`${base}/api/roles/oc_empty`);
+      expect(await role.json()).toMatchObject({ chatId: 'oc_empty', content: null, hasRole: false });
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });

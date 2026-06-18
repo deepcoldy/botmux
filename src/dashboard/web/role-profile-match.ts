@@ -1,5 +1,6 @@
 export type RoleProfileSummaryLike = {
   profileId: string;
+  entryCount?: number;
   botEntries?: Array<{ larkAppId: string; hasEntry: boolean }>;
 };
 
@@ -56,7 +57,7 @@ export function summarizeGroupProfileMatches(
   const matches: GroupProfileMatch[] = [];
   for (const profile of profiles) {
     const entries = (entriesByProfile.get(profile.profileId) ?? [])
-      .filter(entry => inChatBotIds.has(entry.larkAppId) && typeof entry.content === 'string');
+      .filter(entry => inChatBotIds.has(entry.larkAppId) && typeof entry.content === 'string' && entry.content !== '');
     if (entries.length === 0) continue;
 
     let matched = 0;

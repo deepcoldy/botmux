@@ -891,13 +891,14 @@ ipcRoute('PUT', '/api/role-profiles/:profileId/:larkAppId', async (req, res, p) 
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (p.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'wrong_daemon' });
   if (!isValidRoleProfileId(p.profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
-  let body: { content?: unknown };
-  try { body = await readJsonBody<{ content?: string }>(req); }
+  let body: { content?: unknown; allowEmpty?: unknown };
+  try { body = await readJsonBody<{ content?: string; allowEmpty?: boolean }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const content = typeof body.content === 'string' ? body.content.trim() : '';
-  if (!content) return jsonRes(res, 400, { ok: false, error: 'content_required' });
+  const allowEmpty = body.allowEmpty === true;
+  if (!content && !allowEmpty) return jsonRes(res, 400, { ok: false, error: 'content_required' });
   try {
-    writeRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId, content);
+    writeRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId, content, { allowEmpty });
     jsonRes(res, 200, { ok: true, byteLength: Math.min(Buffer.byteLength(content, 'utf-8'), MAX_ROLE_PROFILE_ENTRY_BYTES) });
   } catch (e) {
     jsonRes(res, 500, { ok: false, error: String(e) });
@@ -925,7 +926,7 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
   if (!isValidRoleChatId(chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   if (larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'wrong_daemon' });
   const content = readRoleProfileEntry(config.session.dataDir, p.profileId, cachedLarkAppId);
-  if (!content) return jsonRes(res, 200, { ok: false, error: 'missing_entry', changed: false });
+  if (content === null) return jsonRes(res, 200, { ok: false, error: 'missing_entry', changed: false });
   const existing = resolveRoleFile(cachedLarkAppId, chatId);
   const preview = body.preview === true;
   const force = body.force === true;
@@ -941,6 +942,10 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
     });
   }
   if (existing && !force) return jsonRes(res, 409, { ok: false, error: 'chat_role_exists', changed: false });
+  if (!content) {
+    const existed = deleteRoleFile(cachedLarkAppId, chatId);
+    return jsonRes(res, 200, { ok: true, changed: existed, byteLength: 0, deleted: existed });
+  }
   writeRoleFile(cachedLarkAppId, chatId, content);
   jsonRes(res, 200, { ok: true, changed: true, byteLength: Buffer.byteLength(content, 'utf-8') });
 });

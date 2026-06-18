@@ -97,7 +97,6 @@ function readEntryFile(dataDir: string, profileId: string, larkAppId: string): R
   if (!existsSync(filePath)) return null;
   try {
     const content = normalizeContent(readFileSync(filePath, 'utf-8'));
-    if (!content) return null;
     return {
       profileId,
       larkAppId,
@@ -150,9 +149,15 @@ export function readRoleProfileEntry(dataDir: string, profileId: string, larkApp
   return readEntryFile(dataDir, profileId, larkAppId)?.content ?? null;
 }
 
-export function writeRoleProfileEntry(dataDir: string, profileId: string, larkAppId: string, content: string): void {
+export function writeRoleProfileEntry(
+  dataDir: string,
+  profileId: string,
+  larkAppId: string,
+  content: string,
+  options: { allowEmpty?: boolean } = {},
+): void {
   const normalized = normalizeContent(content);
-  if (!normalized) throw new Error('content_required');
+  if (!normalized && !options.allowEmpty) throw new Error('content_required');
   const filePath = entryPath(dataDir, profileId, larkAppId);
   mkdirSync(dirname(filePath), { recursive: true });
   atomicWriteFileSync(filePath, normalized);

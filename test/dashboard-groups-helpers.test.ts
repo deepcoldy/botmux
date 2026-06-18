@@ -98,6 +98,7 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
     ['main', [
       { profileId: 'main', larkAppId: 'botA', content: 'role A' },
       { profileId: 'main', larkAppId: 'botB', content: 'role B' },
+      { profileId: 'main', larkAppId: 'botD', content: '' },
     ]],
     ['partial', [
       { profileId: 'partial', larkAppId: 'botA', content: 'role A' },
@@ -114,6 +115,7 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
         { larkAppId: 'botA', inChat: true },
         { larkAppId: 'botB', inChat: true },
         { larkAppId: 'botC', inChat: false },
+        { larkAppId: 'botD', inChat: true },
       ],
       profiles,
       entries,
