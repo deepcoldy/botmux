@@ -683,7 +683,6 @@ export async function renderGroupsPage(root: HTMLElement) {
         </button>`)
       .join('');
     const hasExistingProfiles = sortedProfiles.length > 0;
-    const roleCount = entries.filter(entry => entry.status === 'chat' || entry.status === 'team').length;
     const emptyCount = entries.filter(entry => entry.status === 'empty').length;
     const failedCount = entries.filter(entry => entry.status === 'error').length;
     const canSubmitSnapshot = entries.length > 0 && failedCount === 0;
@@ -693,8 +692,8 @@ export async function renderGroupsPage(root: HTMLElement) {
           <strong>${escapeHtml(entry.botName ?? entry.larkAppId)}</strong>
           <code>${escapeHtml(entry.larkAppId)}</code>
         </div>
-        <span class="g-save-profile-entry-status ${entry.status}">
-          ${t(`groups.saveProfileStatus.${entry.status}`)}
+        <span class="g-save-profile-entry-status ${entry.status === 'error' ? 'error' : 'ok'}">
+          ${t(entry.status === 'error' ? 'groups.saveProfileStatus.error' : 'groups.saveProfileStatus.entry')}
         </span>
       </div>`).join('');
     drawer.innerHTML = `
@@ -714,8 +713,6 @@ export async function renderGroupsPage(root: HTMLElement) {
             </div>
             <div class="g-save-profile-stats">
               <span>${t('groups.saveProfileBotCount')} <strong>${entries.length}</strong></span>
-              <span>${t('groups.saveProfileRoleCount')} <strong>${roleCount}</strong></span>
-              <span>${t('groups.saveProfileEmptyCount')} <strong>${emptyCount}</strong></span>
               ${failedCount ? `<span class="warn">${t('groups.saveProfileLoadFailed')} <strong>${failedCount}</strong></span>` : ''}
             </div>
             <div class="g-save-profile-entry-list">
@@ -751,7 +748,9 @@ export async function renderGroupsPage(root: HTMLElement) {
             ${failedCount
               ? escapeHtml(t('groups.saveProfileFailedLoadSummary', { count: failedCount }))
               : entries.length
-              ? escapeHtml(t('groups.saveProfileEntrySummary', { count: entries.length, roleCount, emptyCount }))
+              ? escapeHtml(emptyCount
+                ? t('groups.saveProfileEntrySummaryWithEmpty', { count: entries.length, emptyCount })
+                : t('groups.saveProfileEntrySummary', { count: entries.length }))
               : escapeHtml(t('groups.saveProfileNoRoles'))}
           </div>
           <div class="g-save-profile-status" data-save-profile-status></div>

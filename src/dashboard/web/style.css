@@ -3357,13 +3357,9 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   font-weight: 700;
   white-space: nowrap;
 }
-.g-save-profile-entry-status.chat {
+.g-save-profile-entry-status.ok {
   color: var(--success);
   background: color-mix(in srgb, var(--success) 12%, var(--surface));
-}
-.g-save-profile-entry-status.team {
-  color: var(--info);
-  background: color-mix(in srgb, var(--info) 12%, var(--surface));
 }
 .g-save-profile-entry-status.error {
   color: var(--danger);
