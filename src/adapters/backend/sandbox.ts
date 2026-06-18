@@ -20,7 +20,7 @@
  * sandbox-exec approach and is handled elsewhere.
  */
 import { homedir } from 'node:os';
-import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants, realpathSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +29,28 @@ import { spawn, spawnSync } from 'node:child_process';
 /** Host root for the HOME overlay's upper/work — MUST be OUTSIDE the home lower
  *  (overlayfs forbids upper/work inside lower). */
 const VARTMP_ROOT = '/var/tmp/botmux-sbx';
+
+/**
+ * Canonical $HOME for sandbox overlay lower, bwrap bind target, and child HOME.
+ * bwrap cannot bind-mount onto a symlink mountpoint (e.g. /home/u → /data00/home/u);
+ * overlay lower must be the resolved directory too.
+ */
+export function resolveSandboxHome(homeDir: string = homedir()): string {
+  try {
+    return realpathSync(homeDir);
+  } catch {
+    return homeDir;
+  }
+}
+
+/** Resolve an existing path for overlay lower / bwrap bind targets. */
+export function resolveSandboxPath(path: string): string {
+  try {
+    return existsSync(path) ? realpathSync(path) : path;
+  } catch {
+    return path;
+  }
+}
 
 // ───────────────────────────── overlay primitives ────────────────────────────
 
@@ -254,7 +276,14 @@ export interface SandboxSpawn {
  *  sees the sandboxed CLI's writes (which are invisible at the real host path).
  *  Mirrors prepareSandbox's homeUpper layout — keep in sync. */
 export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): string {
-  return join(VARTMP_ROOT, sessionId, 'home-upper', relative(homedir(), realDataDir));
+  const home = resolveSandboxHome();
+  let rel: string;
+  try {
+    rel = relative(home, realpathSync(realDataDir));
+  } catch {
+    rel = relative(homedir(), realDataDir);
+  }
+  return join(VARTMP_ROOT, sessionId, 'home-upper', rel);
 }
 
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
@@ -303,7 +332,8 @@ export function prepareSandbox(opts: {
   const needFuse = process.env.BOTMUX_SANDBOX_FUSE === '1' || process.getuid?.() !== 0;
   if (!ensureSandboxDeps(needFuse)) return null;
 
-  const sessionRoot = join(opts.dataDir, 'sandboxes', opts.sessionId);
+  const dataDir = resolveSandboxPath(opts.dataDir);
+  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
@@ -317,10 +347,10 @@ export function prepareSandbox(opts: {
   const homeWork = join(vartmp, 'home-work');
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
-  const home = homedir();
+  const home = resolveSandboxHome();
   // BOTMUX_SANDBOX_SRC overrides the LOWER project source for spike testing only.
-  const projectSource = process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir;
-  const projectMount = opts.sourceWorkingDir;
+  const projectSource = resolveSandboxPath(process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir);
+  const projectMount = resolveSandboxPath(opts.sourceWorkingDir);
 
   // A same-session re-spawn (e.g. in-pane /clear) re-enters here; unmount any
   // stale merged overlays first so we don't stack a second mount on the same dir.
@@ -358,14 +388,15 @@ export function prepareSandbox(opts: {
   let emptyIdx = 0;
   for (const p of opts.hidePaths ?? []) {
     if (!p || typeof p !== 'string') continue;
+    const resolved = resolveSandboxPath(p);
     let isDir = false;
-    try { isDir = existsSync(p) && statSync(p).isDirectory(); } catch { /* */ }
+    try { isDir = existsSync(resolved) && statSync(resolved).isDirectory(); } catch { /* */ }
     if (isDir) {
-      hideDirs.push(p);
+      hideDirs.push(resolved);
     } else {
       const empty = join(empties, `mask-${emptyIdx++}`);
       try { writeFileSync(empty, ''); } catch { /* */ }
-      hideFiles.push({ path: p, empty });
+      hideFiles.push({ path: resolved, empty });
     }
   }
 
@@ -420,7 +451,7 @@ export function prepareSandbox(opts: {
   // Authoritative child env via bwrap --setenv (works on pty AND tmux — the tmux
   // backend only forwards a fixed whitelist, which excludes HOME/PATH/relay).
   const env: Record<string, string> = {
-    HOME: home,                                      // home overlay is bound AT the real home path
+    HOME: home,                                      // canonical path (not a symlink)
     BOTMUX_SEND_RELAY: outbox,                       // routes `botmux send` to the daemon outbox watcher
     PATH: `/run/sbxbin:${process.env.PATH ?? ''}`,   // /run/sbxbin first so `botmux` = the relay shim
   };

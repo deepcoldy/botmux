@@ -56,7 +56,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock, inlineImageAttachmentsInMessage, formatAttachmentsHint } from '../src/core/session-manager.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -274,6 +274,57 @@ describe('buildFollowUpContent', () => {
   it('does NOT inject <sender_note> for cursor when there is no sender', () => {
     const content = buildFollowUpContent('hi', SESSION_ID, { cliId: 'cursor' });
     expect(content).not.toContain('<sender_note>');
+  });
+});
+
+// ─── Ace inline vision attachments (@path, no Read round-trip) ──────────────
+
+describe('Ace inline vision attachments', () => {
+  const SESSION_ID = 'ace-vision-session';
+  const imgPath = '/tmp/attachments/img_abc.jpg';
+
+  it('replaces [图片 N] with @path in user_message for ace', () => {
+    const attachments = [{ type: 'image' as const, path: imgPath, name: 'img_abc.jpg' }];
+    const prompt = buildNewTopicPrompt('请看 [图片 1]', SESSION_ID, 'ace', undefined, attachments);
+    expect(prompt).toContain(`<user_message>\n请看 @${imgPath}\n</user_message>`);
+    expect(prompt).not.toContain('<image ');
+    expect(prompt).not.toContain('<attachments');
+  });
+
+  it('keeps file attachments in XML for ace when images are inlined', () => {
+    const attachments = [
+      { type: 'image' as const, path: imgPath, name: 'img_abc.jpg' },
+      { type: 'file' as const, path: '/tmp/spec.pdf', name: 'spec.pdf' },
+    ];
+    const prompt = buildFollowUpContent('混合 [图片 1] [文件 1: spec.pdf]', SESSION_ID, {
+      cliId: 'ace',
+      attachments,
+    });
+    expect(prompt).toContain(`@${imgPath}`);
+    expect(prompt).toContain('<file n="1" path="/tmp/spec.pdf"');
+    expect(prompt).not.toContain('<image ');
+  });
+
+  it('does NOT inline images for non-ace CLIs', () => {
+    const attachments = [{ type: 'image' as const, path: imgPath, name: 'img_abc.jpg' }];
+    const prompt = buildNewTopicPrompt('[图片 1]', SESSION_ID, 'codex', undefined, attachments);
+    expect(prompt).toContain('[图片 1]');
+    expect(prompt).not.toContain(`@${imgPath}`);
+    expect(prompt).toContain('<image n="1"');
+  });
+
+  it('inlineImageAttachmentsInMessage appends @path when placeholder missing', () => {
+    const out = inlineImageAttachmentsInMessage('纯文字', [
+      { type: 'image', path: imgPath, name: 'img_abc.jpg' },
+    ]);
+    expect(out).toBe(`纯文字\n\n@${imgPath}`);
+  });
+
+  it('formatAttachmentsHint omits images for ace', () => {
+    const hint = formatAttachmentsHint([
+      { type: 'image', path: imgPath, name: 'img_abc.jpg' },
+    ], 'zh', 'ace');
+    expect(hint).toBe('');
   });
 });
 

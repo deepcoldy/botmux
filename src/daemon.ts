@@ -77,7 +77,7 @@ import {
   getProjectScanDirs,
   expandHome,
   downloadResources,
-  formatAttachmentsHint,
+  enrichContentWithAttachments,
   buildNewTopicPrompt,
   buildFollowUpContent,
   buildBridgeInputContent,
@@ -3074,7 +3074,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (ds?.pendingRepo) {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     let enriched = attachments.length > 0
-      ? `${promptContent}${formatAttachmentsHint(attachments)}`
+      ? enrichContentWithAttachments(
+        promptContent,
+        attachments,
+        localeForBot(larkAppId),
+        getBot(larkAppId).config.cliId,
+      )
       : promptContent;
     if (parsed.mentions && parsed.mentions.length > 0) {
       const mentionLines = parsed.mentions.map(m => {

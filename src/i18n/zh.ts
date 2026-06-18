@@ -501,6 +501,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应',
+  'ai.attach.hint.files_only': '以下为非图片附件，请用 Read 工具查看。图片已通过 @路径 内联，可直接视觉理解。',
   'ai.identity.short_routing': '提醒：让别的 bot 接力干活必须 `botmux send --mention <对方 open_id>`，否则对方 bot 不会被触发。',
   'ai.available_bots.hint': '让这里的某个 bot 接力干活必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.followup.reminder': '回复必须 botmux send，终端输出用户看不到',

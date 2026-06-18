@@ -498,6 +498,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': 'Read these with the Read tool. The index matches the [image N] / [file N] placeholders in the body.',
+  'ai.attach.hint.files_only': 'Non-image files below — use the Read tool. Images were attached inline via @path for vision.',
   'ai.identity.short_routing': 'Reminder: handing work off to another bot REQUIRES `botmux send --mention <their open_id>` — without it, the other bot is not triggered.',
   'ai.available_bots.hint': 'To hand work off to a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.followup.reminder': 'Replies must go via `botmux send` — terminal output does not reach the user.',

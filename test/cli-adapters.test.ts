@@ -36,13 +36,14 @@ import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
+import { createAceAdapter } from '../src/adapters/cli/ace.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'ace'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -75,9 +76,9 @@ describe('createCliAdapterSync factory', () => {
 
 describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
-  // adapters (codex-app/mira) intentionally use process.execPath and are covered
+  // adapters (codex-app/mira/mir) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ace'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -567,6 +568,45 @@ describe('gemini buildArgs', () => {
   it('does not include session id', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false });
     expect(args).not.toContain('sess-5');
+  });
+});
+
+describe('ace buildArgs', () => {
+  const adapter = createAceAdapter('/usr/bin/ace');
+
+  it('basic args include -y', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-ace', resume: false });
+    expect(args).toContain('-y');
+  });
+
+  it('omits -y when disableCliBypass is true while preserving initial prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-ace', resume: false, initialPrompt: 'do something', disableCliBypass: true });
+    expect(args).not.toContain('-y');
+    expect(args).toEqual(['do something']);
+  });
+
+  it('passes initialPrompt as positional arg', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-ace', resume: false, initialPrompt: 'do something' });
+    expect(args.at(-1)).toBe('do something');
+  });
+
+  it('passesInitialPromptViaArgs is true', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('sets spawn env for model and office network', () => {
+    adapter.buildArgs({ sessionId: 'sess-ace', resume: false, model: 'openai/gpt-5.5', workingDir: '/tmp/ws' });
+    expect(adapter.spawnEnv).toEqual({
+      ACE_NETWORK_TYPE: 'office',
+      ACE_ACP_SINGLE_PROVIDER: '1',
+      AIDP_MODEL: 'openai/gpt-5.5',
+    });
+  });
+
+  it('does not include session id or resume', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-ace', resume: true });
+    expect(args).not.toContain('sess-ace');
+    expect(args).not.toContain('--resume');
   });
 });
 

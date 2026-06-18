@@ -224,15 +224,85 @@ export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cl
   return note ? `${tag}\n${note}` : tag;
 }
 
-export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {
+/** CLIs whose @path handler inlines images into the first user turn (Ace vision). */
+export function supportsInlineVisionAttachments(cliId?: CliId): boolean {
+  return cliId === 'ace';
+}
+
+function atPathRef(filePath: string): string {
+  return /[\s]/.test(filePath) ? `@"${filePath}"` : `@${filePath}`;
+}
+
+/**
+ * Replace `[图片 N]` placeholders (or append) with Ace @path refs so handleAtCommand
+ * inlines pixels on the first turn — no Read-tool round trip.
+ */
+export function inlineImageAttachmentsInMessage(message: string, attachments: LarkAttachment[]): string {
+  const images = attachments.filter(a => a.type === 'image');
+  if (images.length === 0) return message;
+
+  let result = message;
+  const appended: string[] = [];
+
+  images.forEach((a, idx) => {
+    const n = idx + 1;
+    const ref = atPathRef(a.path);
+    const numbered = [`[图片 ${n}]`, `[Image ${n}]`, `[image ${n}]`];
+    let replaced = false;
+    for (const pat of numbered) {
+      if (result.includes(pat)) {
+        result = result.replace(pat, ref);
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced && images.length === 1 && result.includes('[图片]') && !result.includes('[图片 1]')) {
+      result = result.replace('[图片]', ref);
+      replaced = true;
+    }
+    if (!replaced) appended.push(ref);
+  });
+
+  if (appended.length > 0) {
+    result = `${result.trimEnd()}\n\n${appended.join('\n')}`;
+  }
+  return result;
+}
+
+export function formatAttachmentsHint(
+  attachments?: LarkAttachment[],
+  locale?: Locale,
+  cliId?: CliId,
+): string {
   if (!attachments || attachments.length === 0) return '';
+
+  const inlineVision = supportsInlineVisionAttachments(cliId);
+  const listed = inlineVision ? attachments.filter(a => a.type !== 'image') : attachments;
+  if (listed.length === 0) return '';
+
   let imgN = 0, fileN = 0;
-  const items = attachments.map(a => {
+  const items = listed.map(a => {
     const tag = a.type === 'image' ? 'image' : 'file';
     const n = a.type === 'image' ? ++imgN : ++fileN;
     return `  <${tag} n="${n}" path="${xmlEscape(a.path)}" />`;
   });
-  return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
+  const hintKey = inlineVision ? 'ai.attach.hint.files_only' : 'ai.attach.hint';
+  return `<attachments hint="${xmlEscape(t(hintKey, undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
+}
+
+/** Enrich raw user text with inline vision refs + attachment XML (repo-select buffer). */
+export function enrichContentWithAttachments(
+  content: string,
+  attachments: LarkAttachment[] | undefined,
+  locale: Locale | undefined,
+  cliId?: CliId,
+): string {
+  if (!attachments || attachments.length === 0) return content;
+  let body = supportsInlineVisionAttachments(cliId)
+    ? inlineImageAttachmentsInMessage(content, attachments)
+    : content;
+  const hint = formatAttachmentsHint(attachments, locale, cliId);
+  return hint ? `${body}${hint}` : body;
 }
 
 function renderRoleContextBlock(larkAppId: string | undefined, chatId: string | undefined): string {
@@ -311,9 +381,12 @@ export function buildNewTopicPrompt(
   // block per message: the deferred spawn is conceptually one opening turn, so
   // one block reads cleanly and the surrounding metadata envelope
   // (sender/mention) isn't repeated for every buffered line.
-  const mergedMessage = followUps && followUps.length > 0
+  let mergedMessage = followUps && followUps.length > 0
     ? [userMessage, ...followUps].join('\n\n')
     : userMessage;
+  if (attachments && attachments.length > 0 && supportsInlineVisionAttachments(cliId)) {
+    mergedMessage = inlineImageAttachmentsInMessage(mergedMessage, attachments);
+  }
   const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
   const parts: string[] = [];
 
@@ -335,7 +408,7 @@ export function buildNewTopicPrompt(
   const senderNote = renderCursorSenderNote(cliId, !!senderBlock, locale);
   if (senderNote) parts.push(senderNote);
 
-  const attachHint = formatAttachmentsHint(attachments, locale);
+  const attachHint = formatAttachmentsHint(attachments, locale, cliId);
   if (attachHint) parts.push(attachHint);
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
@@ -374,7 +447,11 @@ export function buildFollowUpContent(
     parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
   }
 
-  parts.push(`<user_message>\n${content}\n</user_message>`);
+  let userBody = content;
+  if (opts?.attachments && opts.attachments.length > 0 && supportsInlineVisionAttachments(opts.cliId)) {
+    userBody = inlineImageAttachmentsInMessage(userBody, opts.attachments);
+  }
+  parts.push(`<user_message>\n${userBody}\n</user_message>`);
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) parts.push(senderBlock);
@@ -383,7 +460,7 @@ export function buildFollowUpContent(
   if (senderNote) parts.push(senderNote);
 
   const attachHint = opts?.attachments && opts.attachments.length > 0
-    ? formatAttachmentsHint(opts.attachments, opts.locale)
+    ? formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId)
     : '';
   if (attachHint) parts.push(attachHint);
 
