@@ -3261,43 +3261,92 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   display: grid;
   gap: 12px;
 }
-.g-save-profile-mode {
+.g-save-profile-dialog [hidden] {
+  display: none !important;
+}
+.g-save-profile-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+.g-save-profile-switch button {
+  min-width: 0;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+.g-save-profile-switch button.active {
+  background: var(--surface);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border-soft));
+  color: var(--accent-strong);
+  box-shadow: 0 3px 12px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.g-save-profile-picker {
   display: grid;
   gap: 8px;
+  max-height: 220px;
+  overflow: auto;
 }
-.g-save-profile-option {
+.g-save-profile-pick {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
-  align-items: flex-start;
-  padding: 10px 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
+  align-items: center;
+  justify-content: stretch;
+  min-height: 40px;
+  width: 100%;
+  border-radius: var(--radius-sm);
   background: var(--surface-muted);
-  cursor: pointer;
+  box-shadow: none;
+  text-align: left;
 }
-.g-save-profile-option:has(input:checked) {
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+.g-save-profile-pick.selected {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--accent-strong);
 }
-.g-save-profile-option.disabled {
-  cursor: default;
-  opacity: 0.55;
+.g-save-profile-pick span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.g-save-profile-option input {
-  margin-top: 2px;
-}
-.g-save-profile-option strong,
-.g-save-profile-option small {
-  display: block;
-}
-.g-save-profile-option small,
+.g-save-profile-pick small,
 .g-save-profile-summary,
 .g-save-profile-status,
 .form-row small {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
+}
+.g-save-profile-target {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 10px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+}
+.g-save-profile-target > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.g-save-profile-target code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.g-save-profile-target small {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 12px;
 }
 .g-save-profile-summary {
   padding: 8px 10px;

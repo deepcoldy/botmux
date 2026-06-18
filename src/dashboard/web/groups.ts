@@ -653,8 +653,15 @@ export async function renderGroupsPage(root: HTMLElement) {
     profiles: RoleProfileSummaryLike[],
   ): void {
     const sortedProfiles = [...profiles].sort((a, b) => a.profileId.localeCompare(b.profileId));
-    const profileOptions = sortedProfiles
-      .map(profile => `<option value="${escapeHtml(profile.profileId)}">${escapeHtml(profile.profileId)}</option>`)
+    const profileButtons = sortedProfiles
+      .map((profile, index) => `
+        <button type="button"
+                class="g-save-profile-pick ${index === 0 ? 'selected' : ''}"
+                data-profile-id="${escapeHtml(profile.profileId)}"
+                aria-pressed="${index === 0 ? 'true' : 'false'}">
+          <span>${escapeHtml(profile.profileId)}</span>
+          <small>${t('groups.saveProfileOverwrite')}</small>
+        </button>`)
       .join('');
     const hasExistingProfiles = sortedProfiles.length > 0;
     drawer.innerHTML = `
@@ -667,34 +674,27 @@ export async function renderGroupsPage(root: HTMLElement) {
           }))}</p>
         </header>
         <form id="g-save-profile-form">
-          <fieldset class="g-save-profile-mode">
-            <legend>${t('groups.saveProfileMode')}</legend>
-            <label class="g-save-profile-option">
-              <input type="radio" name="mode" value="new" checked>
-              <span>
-                <strong>${t('groups.saveProfileNew')}</strong>
-                <small>${t('groups.saveProfileNewHelp')}</small>
-              </span>
-            </label>
-            <label class="g-save-profile-option ${hasExistingProfiles ? '' : 'disabled'}">
-              <input type="radio" name="mode" value="overwrite" ${hasExistingProfiles ? '' : 'disabled'}>
-              <span>
-                <strong>${t('groups.saveProfileOverwrite')}</strong>
-                <small>${hasExistingProfiles ? t('groups.saveProfileOverwriteHelp') : t('groups.saveProfileExistingEmpty')}</small>
-              </span>
-            </label>
-          </fieldset>
+          <div class="g-save-profile-switch" role="tablist" aria-label="${t('groups.saveProfileMode')}">
+            <button type="button" class="active" data-save-profile-mode="new">${t('groups.saveProfileNew')}</button>
+            <button type="button" data-save-profile-mode="overwrite" ${hasExistingProfiles ? '' : 'disabled'}>${t('groups.saveProfileOverwrite')}</button>
+          </div>
           <label class="form-row" data-profile-mode-row="new">
             <span>${t('groups.saveProfileIdLabel')}</span>
             <input type="text" name="profileId" value="${escapeHtml(suggestedProfileId)}" maxlength="64" autocomplete="off">
             <small>${t('groups.saveProfileInvalid')}</small>
           </label>
-          <label class="form-row" data-profile-mode-row="overwrite" hidden>
+          <div class="form-row" data-profile-mode-row="overwrite" hidden>
             <span>${t('groups.saveProfileExistingLabel')}</span>
-            <select name="existingProfileId" ${hasExistingProfiles ? '' : 'disabled'}>
-              ${profileOptions}
-            </select>
-          </label>
+            ${hasExistingProfiles
+              ? `<div class="g-save-profile-picker">${profileButtons}</div>`
+              : `<div class="g-save-profile-summary warn">${t('groups.saveProfileExistingEmpty')}</div>`}
+            <small>${t('groups.saveProfileOverwriteHelp')}</small>
+          </div>
+          <div class="g-save-profile-target">
+            <span>${t('groups.saveProfileTarget')}</span>
+            <code data-save-profile-target>${escapeHtml(suggestedProfileId)}</code>
+            <small data-save-profile-target-mode>${t('groups.saveProfileTargetNew')}</small>
+          </div>
           <div class="g-save-profile-summary ${entries.length ? '' : 'warn'}">
             ${entries.length
               ? escapeHtml(t('groups.saveProfileEntrySummary', { count: entries.length }))
@@ -713,37 +713,69 @@ export async function renderGroupsPage(root: HTMLElement) {
     const modeRows = [...drawer.querySelectorAll<HTMLElement>('[data-profile-mode-row]')];
     const statusEl = drawer.querySelector<HTMLElement>('[data-save-profile-status]')!;
     const submitBtn = formEl.querySelector<HTMLButtonElement>('button[type=submit]')!;
+    const modeButtons = [...formEl.querySelectorAll<HTMLButtonElement>('[data-save-profile-mode]')];
+    const profilePickButtons = [...formEl.querySelectorAll<HTMLButtonElement>('[data-profile-id]')];
+    const profileIdInput = formEl.querySelector<HTMLInputElement>('input[name=profileId]')!;
+    const targetEl = formEl.querySelector<HTMLElement>('[data-save-profile-target]')!;
+    const targetModeEl = formEl.querySelector<HTMLElement>('[data-save-profile-target-mode]')!;
+    let selectedMode: 'new' | 'overwrite' = 'new';
+    let selectedExistingProfileId = sortedProfiles[0]?.profileId ?? '';
 
-    function currentMode(): string {
-      return (formEl.querySelector<HTMLInputElement>('input[name=mode]:checked')?.value ?? 'new');
+    function currentProfileId(): string {
+      return selectedMode === 'overwrite'
+        ? selectedExistingProfileId
+        : profileIdInput.value.trim();
     }
 
     function updateMode(): void {
-      const mode = currentMode();
       for (const row of modeRows) {
-        row.hidden = row.dataset.profileModeRow !== mode;
+        row.hidden = row.dataset.profileModeRow !== selectedMode;
       }
-      submitBtn.textContent = mode === 'overwrite'
+      for (const button of modeButtons) {
+        const isActive = button.dataset.saveProfileMode === selectedMode;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', String(isActive));
+      }
+      for (const button of profilePickButtons) {
+        const isSelected = button.dataset.profileId === selectedExistingProfileId;
+        button.classList.toggle('selected', isSelected);
+        button.setAttribute('aria-pressed', String(isSelected));
+      }
+      submitBtn.textContent = selectedMode === 'overwrite'
         ? t('groups.saveProfileOverwriteSubmit')
         : t('groups.saveProfileSubmit');
+      submitBtn.disabled = !entries.length || (selectedMode === 'overwrite' && !selectedExistingProfileId);
+      targetEl.textContent = currentProfileId() || '-';
+      targetModeEl.textContent = selectedMode === 'overwrite'
+        ? t('groups.saveProfileTargetOverwrite')
+        : t('groups.saveProfileTargetNew');
       statusEl.textContent = '';
       statusEl.className = 'g-save-profile-status';
     }
 
-    formEl.querySelectorAll<HTMLInputElement>('input[name=mode]').forEach(input => {
-      input.addEventListener('change', updateMode);
+    modeButtons.forEach(button => {
+      button.addEventListener('click', () => {
+        const mode = button.dataset.saveProfileMode === 'overwrite' ? 'overwrite' : 'new';
+        if (mode === 'overwrite' && !hasExistingProfiles) return;
+        selectedMode = mode;
+        updateMode();
+      });
     });
+    profilePickButtons.forEach(button => {
+      button.addEventListener('click', () => {
+        selectedExistingProfileId = button.dataset.profileId ?? '';
+        selectedMode = 'overwrite';
+        updateMode();
+      });
+    });
+    profileIdInput.addEventListener('input', updateMode);
     updateMode();
 
     drawer.querySelector<HTMLButtonElement>('#g-save-profile-cancel')!.onclick = () => drawer.close();
     formEl.onsubmit = async ev => {
       ev.preventDefault();
       if (!entries.length) return;
-      const fd = new FormData(formEl);
-      const mode = currentMode();
-      const profileId = mode === 'overwrite'
-        ? String(fd.get('existingProfileId') ?? '').trim()
-        : String(fd.get('profileId') ?? '').trim();
+      const profileId = currentProfileId();
       if (!isValidProfileId(profileId)) {
         statusEl.textContent = t('groups.saveProfileInvalid');
         statusEl.className = 'g-save-profile-status error';
@@ -768,7 +800,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           statusEl.textContent = t('groups.saveProfileFailed', { saved, total: entries.length });
           statusEl.className = 'g-save-profile-status error';
           submitBtn.disabled = false;
-          submitBtn.textContent = mode === 'overwrite'
+          submitBtn.textContent = selectedMode === 'overwrite'
             ? t('groups.saveProfileOverwriteSubmit')
             : t('groups.saveProfileSubmit');
           return;
@@ -781,7 +813,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         statusEl.textContent = String(err);
         statusEl.className = 'g-save-profile-status error';
         submitBtn.disabled = false;
-        submitBtn.textContent = mode === 'overwrite'
+        submitBtn.textContent = selectedMode === 'overwrite'
           ? t('groups.saveProfileOverwriteSubmit')
           : t('groups.saveProfileSubmit');
       }
