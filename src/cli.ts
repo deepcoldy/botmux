@@ -195,14 +195,42 @@ function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
   return true;
 }
 
-function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
+function runPm2(args: string[], inherit = true, home: string = PM2_HOME, timeoutMs?: number): void {
   const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
   const r = spawnSync(pm2.command, pm2.args, {
     stdio: inherit ? 'inherit' : 'pipe',
     env: pm2Env(home),
     shell: pm2.shell ?? false,
+    timeout: timeoutMs,
   });
-  if (r.status !== 0) throw new Error(`pm2 ${args.join(' ')} failed with status ${r.status}`);
+  if (r.status !== 0) {
+    // r.error is set when the process couldn't be spawned/timed out (status null);
+    // prefer it so failures don't surface as a bare "status null".
+    const detail = r.error?.message ?? `status ${r.status}`;
+    throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+  }
+}
+
+/**
+ * Run a pm2 command and capture stdout. Routes through buildPm2SpawnCommand so
+ * it works on Windows (where pm2Bin() resolves to a `.cmd` that must run through
+ * a shell) as well as macOS/Linux. Throws on non-zero exit / spawn failure.
+ */
+function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000): string {
+  const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
+  const r = spawnSync(pm2.command, pm2.args, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: pm2Env(home),
+    shell: pm2.shell ?? false,
+    timeout: timeoutMs,
+  });
+  if (r.status !== 0) {
+    const detail = r.error?.message
+      ?? ((r.stderr ? String(r.stderr).trim() : '') || `status ${r.status}`);
+    throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+  }
+  return typeof r.stdout === 'string' ? r.stdout : '';
 }
 
 function loadBotsJson(): any[] {
@@ -1061,7 +1089,7 @@ function preflightNodeSanity(): void {
             console.warn(`⚠️  pm2 god daemon (pid ${pm2Pid}) 使用的 Node 二进制已失效: ${cleanPath}`);
             console.warn(`   自动杀掉 pm2 god 以便用当前 Node 重启...`);
             try {
-              execSync(`${pm2Bin()} kill`, { env: pm2Env(), stdio: 'pipe', timeout: 10_000 });
+              runPm2(['kill'], false, PM2_HOME, 10_000);
             } catch {
               try { process.kill(pm2Pid, 'SIGKILL'); } catch { /* ignore */ }
             }
@@ -1173,21 +1201,12 @@ function cleanupStaleDaemonDescriptors(): void {
 /** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
 function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
   try {
-    const output = execSync(`${pm2Bin()} jlist`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: pm2Env(home),
-      timeout: 10_000,
-    });
+    const output = pm2Capture(['jlist'], home);
     const apps = JSON.parse(output) as any[];
     for (const app of apps) {
       if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
         try {
-          execSync(`${pm2Bin()} delete ${app.name}`, {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            env: pm2Env(home),
-            timeout: 10_000,
-          });
+          runPm2(['delete', app.name], false, home, 10_000);
         } catch (e) {
           // Don't swallow silently — a failed delete here used to leave the
           // restart half-done with no trace. Surface it (the auto-restart
@@ -1203,11 +1222,7 @@ function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
 
 function killPm2GodDaemon(home: string = PM2_HOME): void {
   try {
-    execSync(`${pm2Bin()} kill`, {
-      stdio: 'inherit',
-      env: pm2Env(home),
-      timeout: 15_000,
-    });
+    runPm2(['kill'], true, home, 15_000);
     return;
   } catch {
     // Fall back to direct pid cleanup below.
@@ -1249,12 +1264,7 @@ function cmdStop(): void {
   cleanupLegacyPm2();
   let stopped = false;
   try {
-    const output = execSync(`${pm2Bin()} jlist`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: pm2Env(),
-      timeout: 10_000,
-    });
+    const output = pm2Capture(['jlist']);
     const apps = JSON.parse(output) as any[];
     for (const app of apps) {
       if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
@@ -1332,12 +1342,7 @@ function warnIfLegacyBotmuxAlive(): void {
   if (!legacyPid) return;
   try { process.kill(legacyPid, 0); } catch { return; }
   try {
-    const output = execSync(`${pm2Bin()} jlist`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: pm2Env(legacyHome),
-      timeout: 10_000,
-    });
+    const output = pm2Capture(['jlist'], legacyHome);
     const apps = JSON.parse(output) as any[];
     const hasBotmux = apps.some(a => a.name === PM2_NAME || a.name.startsWith(`${PM2_NAME}-`));
     if (hasBotmux) {
