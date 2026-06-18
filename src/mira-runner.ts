@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
@@ -27,8 +27,12 @@ const API_BASE_URL = process.env.MIRA_API_BASE_URL ?? `${MIRA_DOMAIN}/mira/api/v
 const MODEL_METADATA_URL = process.env.MIRA_MODEL_METADATA_URL ?? `${MIRA_DOMAIN}/api/v1/model/metadata`;
 const DEFAULT_DATA_SOURCES = ['manus'];
 const LAST_ROUND_RETRY_DELAYS_MS = [0, 250, 750];
+const DEFAULT_MIRCLI_QUERY_TIMEOUT = '10m';
+const DEFAULT_MIRCLI_RUNNER_TIMEOUT_MS = 12 * 60 * 1000;
 const COOKIE_DB_PATH = process.env.MIRA_COOKIE_DB
   ?? join(homedir(), 'Library', 'Application Support', 'mira', 'Cookies');
+const MIRCLI_CONFIG_PATH = process.env.MIRCLI_CONFIG_PATH
+  ?? join(homedir(), '.mira', 'config.json');
 const OSC_PREFIX = '\x1b]777;botmux:';
 const OSC_END = '\x07';
 
@@ -91,9 +95,19 @@ function runSqliteCookieQuery(dbPath: string): string {
 function readCookieHeader(): string {
   if (process.env.MIRA_COOKIE_HEADER?.trim()) return process.env.MIRA_COOKIE_HEADER.trim();
   if (process.env.MIRA_SESSION?.trim()) return `mira_session=${process.env.MIRA_SESSION.trim()}`;
+  if (existsSync(MIRCLI_CONFIG_PATH)) {
+    try {
+      const config = JSON.parse(readFileSync(MIRCLI_CONFIG_PATH, 'utf8'));
+      if (typeof config.cookies === 'string' && config.cookies.trim()) {
+        return config.cookies.trim();
+      }
+    } catch {
+      // Fall through to the original Mira.app sqlite cookie path.
+    }
+  }
   if (!existsSync(COOKIE_DB_PATH)) {
     throw new Error(
-      `Mira cookie database not found at ${COOKIE_DB_PATH}. Open Mira.app and sign in, or set MIRA_COOKIE_HEADER.`,
+      `Mira cookie database not found at ${COOKIE_DB_PATH}. Open Mira.app and sign in, set MIRA_COOKIE_HEADER, or run mircli login so ${MIRCLI_CONFIG_PATH} contains cookies.`,
     );
   }
 
@@ -126,6 +140,39 @@ function boolEnv(name: string, fallback: boolean): boolean {
   const raw = process.env[name]?.trim().toLowerCase();
   if (!raw) return fallback;
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+function splitEnvArgs(value: string | undefined): string[] {
+  return (value || '').split(/\s+/).map(s => s.trim()).filter(Boolean);
+}
+
+function stripAnsi(text: string): string {
+  return text
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '');
+}
+
+function localPathEnv(): string {
+  const existing = process.env.PATH || '';
+  const localBin = join(homedir(), '.local', 'bin');
+  return existing.split(':').includes(localBin) ? existing : `${localBin}:${existing}`;
+}
+
+function runtimeSystemPrompt(): string {
+  return [
+    'You are invoked by BotMux inside the user machine through the local Mir CLI.',
+    `Actual local runtime cwd: ${process.cwd()}`,
+    `Actual local home: ${homedir()}`,
+    'This BotMux session is not running in /home/mira/.session. Do not report /home/mira/.session as the working directory for this session.',
+    'For filesystem, shell, and git work, use the Mir CLI local tools against the actual local cwd above.',
+    'If the Mir local tools are unavailable, say so explicitly instead of using or reporting a cloud sandbox path.',
+  ].join('\n');
+}
+
+function shouldUseApiRunner(): boolean {
+  const raw = process.env.MIRA_RUNNER_MODE?.trim().toLowerCase();
+  return raw === 'api' || raw === 'web';
 }
 
 function extractMiraMessage(data: string): JsonObject | undefined {
@@ -410,6 +457,99 @@ class MiraClient {
   }
 }
 
+class MircliClient {
+  private readonly cliSessionId: string;
+
+  constructor(args: Args) {
+    // Old API-mode sessions persisted a Mira Web session id in --mira-session-id.
+    // mircli expects a local CLI conversation id, so anchor it to BotMux's own
+    // stable session id instead of reusing a Web API id across runner modes.
+    this.cliSessionId = args.sessionId;
+  }
+
+  async ensureSession(): Promise<string> {
+    emitMarker('thread', { threadId: this.cliSessionId });
+    return this.cliSessionId;
+  }
+
+  async complete(content: string): Promise<CompletionResult> {
+    const sessionId = await this.ensureSession();
+    const startedAt = Date.now();
+    const finalText = await this.runMircli(content, sessionId);
+    return {
+      finalText: finalText.trim(),
+      turnId: `mircli-${startedAt}`,
+    };
+  }
+
+  private runMircli(content: string, sessionId: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const bin = process.env.MIRCLI_BIN || 'mircli';
+      const args = splitEnvArgs(process.env.MIRCLI_EXTRA_ARGS);
+      if (boolEnv('MIRCLI_LEAN', true) && !args.includes('--lean') && !args.includes('--ultra')) {
+        args.push('--lean');
+      }
+      args.push(
+        '-p', content,
+        '--output-format', 'text',
+        '--session-id', sessionId,
+        '--query-timeout', process.env.MIRCLI_QUERY_TIMEOUT || DEFAULT_MIRCLI_QUERY_TIMEOUT,
+        '--append-system-prompt', runtimeSystemPrompt(),
+      );
+      if (boolEnv('MIRCLI_YOLO', true)) args.push('-y');
+
+      let closed = false;
+      let timedOut = false;
+      const child = spawn(bin, args, {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          PATH: localPathEnv(),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+      const timeoutMs = Number(process.env.MIRCLI_RUNNER_TIMEOUT_MS || DEFAULT_MIRCLI_RUNNER_TIMEOUT_MS);
+      const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGTERM');
+          setTimeout(() => {
+            if (!closed) child.kill('SIGKILL');
+          }, 5_000).unref();
+        }, timeoutMs)
+        : undefined;
+      timer?.unref();
+
+      child.stdout.on('data', chunk => {
+        stdout += chunk.toString('utf8');
+      });
+      child.stderr.on('data', chunk => {
+        stderr += chunk.toString('utf8');
+      });
+      child.on('error', err => {
+        if (timer) clearTimeout(timer);
+        reject(new Error(`Failed to start mircli (${bin}): ${errorMessage(err)}. Install mircli or set MIRA_RUNNER_MODE=api to use the legacy Web API runner.`));
+      });
+      child.on('close', (code, signal) => {
+        closed = true;
+        if (timer) clearTimeout(timer);
+        const cleanStdout = stripAnsi(stdout).trim();
+        const cleanStderr = stripAnsi(stderr).trim();
+        if (code === 0) {
+          resolve(cleanStdout || cleanStderr);
+          return;
+        }
+        const detail = (cleanStderr || cleanStdout || `signal ${signal ?? 'unknown'}`).slice(0, 1200);
+        const suffix = timedOut ? ` after ${timeoutMs}ms` : '';
+        reject(new Error(`mircli exited with code ${code ?? 'null'}${suffix}: ${detail}`));
+      });
+    });
+  }
+}
+
 let args: Args;
 try {
   args = parseArgs(process.argv.slice(2));
@@ -418,7 +558,7 @@ try {
   process.exit(2);
 }
 
-const client = new MiraClient(args);
+const client = shouldUseApiRunner() ? new MiraClient(args) : new MircliClient(args);
 const queue: string[] = [];
 let inputBuffer = '';
 let processing = false;
