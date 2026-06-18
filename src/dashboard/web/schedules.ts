@@ -66,7 +66,7 @@ export function renderSchedulesPage(root: HTMLElement) {
       <td>${escapeHtml(s.name ?? s.id)}</td>
       <td>${escapeHtml(s.botName ?? s.larkAppId ?? '-')}</td>
       <td><code>${escapeHtml(s.parsed?.display ?? '?')}</code></td>
-      <td>${s.deliver === 'new-topic' ? `🆕 ${t('schedules.deliveryNewTopic')}` : t('schedules.deliveryOrigin')}</td>
+      <td>${s.deliver === 'new-topic' ? `🆕 ${t('schedules.deliveryNewTopic')}` : s.deliver === 'local' ? `🔕 ${t('schedules.deliveryLocal')}` : t('schedules.deliveryOrigin')}</td>
       <td>${fmtDate(s.nextRunAt)}</td>
       <td>${fmtDate(s.lastRunAt)} ${s.lastStatus === 'error' ? '⚠️' : ''}</td>
       <td>${s.repeat ? `${s.repeat.completed}/${s.repeat.times ?? '∞'}` : '—'}</td>
@@ -76,7 +76,9 @@ export function renderSchedulesPage(root: HTMLElement) {
         ${s.enabled
           ? `<button data-op="pause" type="button">${t('schedules.pause')}</button>`
           : `<button data-op="resume" type="button">${t('schedules.resume')}</button>`}
-        <button data-op="delivery" type="button">${s.deliver === 'new-topic' ? t('schedules.useOrigin') : t('schedules.useNewTopic')}</button>
+        ${s.deliver === 'local'
+          ? ''
+          : `<button data-op="delivery" type="button">${s.deliver === 'new-topic' ? t('schedules.useOrigin') : t('schedules.useNewTopic')}</button>`}
       </td>
     </tr>`).join('') || `<tr><td colspan="9" class="empty">${t('schedules.empty')}</td></tr>`;
   }

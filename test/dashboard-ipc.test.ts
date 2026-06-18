@@ -240,6 +240,17 @@ describe('POST /api/schedules/:id/(run|pause|resume)', () => {
     expect(body.ok).toBe(false);
     expect(body.error).toBe('not_found');
   });
+
+  // The delivery-toggle route must be registered on the IPC server (the outer
+  // dashboard proxy in dashboard.ts forwards /(run|pause|resume|delivery)$ here).
+  it('returns ok=false for unknown id (delivery)', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules/nonexistent/delivery`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('not_found');
+  });
 });
 
 describe('SSE /api/events', () => {

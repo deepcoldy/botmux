@@ -271,9 +271,14 @@ export function parseNaturalSchedule(input: string): ParseNLResult | null {
  * follows it) the prompt is returned unchanged with deliver='origin'.
  */
 export function extractDeliveryMode(prompt: string): { deliver: 'origin' | 'new-topic'; prompt: string } {
-  const zh = prompt.match(/^\s*(?:每次|每回)?新(?:开|起)?(?:一个)?话题[\s,，、:：-]*(.+)$/s);
+  // Match a leading new-topic phrase: optional 每次/每回/每天/每日, then any run of
+  // 开/起/另/一/个/新/的/space fillers that MUST contain 新, immediately followed
+  // by 话题. `新` is mandatory so we don't match a normal prompt like
+  // "总结这个话题…" or "新闻话题…". Covers 新话题 / 新开话题 / 开新话题 /
+  // 每次开新话题 / 每次开一个新话题 / 新开一个话题 等变体。
+  const zh = prompt.match(/^\s*(?:每次|每回|每天|每日)?\s*[开起另一个新的\s]*新[开起另一个新的\s]*话题[\s,，、:：。-]*(.+)$/s);
   if (zh && zh[1].trim()) return { deliver: 'new-topic', prompt: zh[1].trim() };
-  const en = prompt.match(/^\s*new[\s-]?topic[\s,:：-]+(.+)$/is);
+  const en = prompt.match(/^\s*(?:every\s+run\s+in\s+a\s+)?new[\s-]?topic[\s,:：-]+(.+)$/is);
   if (en && en[1].trim()) return { deliver: 'new-topic', prompt: en[1].trim() };
   return { deliver: 'origin', prompt };
 }
@@ -584,13 +589,16 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
 
 /**
  * Toggle a task's delivery mode between 'origin' and 'new-topic' and persist.
- * Any non-'new-topic' value (including 'local'/undefined) flips to 'new-topic';
- * 'new-topic' flips back to 'origin'.  Emits a `schedule.updated` event so the
- * dashboard reflects the change immediately.
+ * Only these two modes participate: 'new-topic' flips to 'origin', anything else
+ * treated as origin flips to 'new-topic'. The 'local' (log-only, no delivery)
+ * mode is REFUSED — toggling it would silently turn a "don't post" task into an
+ * in-chat new-topic poster; 'local' is a CLI-only choice. Emits a
+ * `schedule.updated` event so the dashboard reflects the change immediately.
  */
 export function toggleDelivery(id: string): { ok: boolean; error?: string; deliver?: 'origin' | 'new-topic' } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
+  if (task.deliver === 'local') return { ok: false, error: 'local_not_toggleable' };
   const next: 'origin' | 'new-topic' = task.deliver === 'new-topic' ? 'origin' : 'new-topic';
   scheduleStore.updateTask(id, { deliver: next });
   dashboardEventBus.publish({

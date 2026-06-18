@@ -197,6 +197,31 @@ describe('extractDeliveryMode (新话题 keyword)', () => {
     expect(extractDeliveryMode('新开话题 跑构建')).toEqual({ deliver: 'new-topic', prompt: '跑构建' });
   });
 
+  it('accepts 开新话题 (开 before 新)', () => {
+    expect(extractDeliveryMode('开新话题 生成日报')).toEqual({ deliver: 'new-topic', prompt: '生成日报' });
+  });
+
+  it('accepts 每次开新话题 (Codex P2 missed variant)', () => {
+    expect(extractDeliveryMode('每次开新话题 生成日报')).toEqual({ deliver: 'new-topic', prompt: '生成日报' });
+  });
+
+  it('accepts 每次开一个新话题 (Codex P2 missed variant)', () => {
+    expect(extractDeliveryMode('每次开一个新话题 生成日报')).toEqual({ deliver: 'new-topic', prompt: '生成日报' });
+  });
+
+  it('accepts 新开一个话题 variant', () => {
+    expect(extractDeliveryMode('新开一个话题 跑构建')).toEqual({ deliver: 'new-topic', prompt: '跑构建' });
+  });
+
+  it('accepts 每天/每日 prefix variants', () => {
+    expect(extractDeliveryMode('每天新话题 早报')).toEqual({ deliver: 'new-topic', prompt: '早报' });
+    expect(extractDeliveryMode('每日开新话题 晚报')).toEqual({ deliver: 'new-topic', prompt: '晚报' });
+  });
+
+  it('does NOT match 新闻话题 (新 not immediately tied to 话题)', () => {
+    expect(extractDeliveryMode('新闻话题汇总')).toEqual({ deliver: 'origin', prompt: '新闻话题汇总' });
+  });
+
   it('accepts english new-topic / new topic', () => {
     expect(extractDeliveryMode('new-topic: daily report')).toEqual({ deliver: 'new-topic', prompt: 'daily report' });
     expect(extractDeliveryMode('new topic - run build')).toEqual({ deliver: 'new-topic', prompt: 'run build' });
