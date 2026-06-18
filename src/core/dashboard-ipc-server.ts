@@ -37,7 +37,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
-import { isValidRoleChatId, resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
 import {
   deleteRoleProfileEntry,
   deleteRoleProfileIfEmpty,
@@ -809,7 +809,7 @@ ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
 });
 
 // ─── Role management (dashboard) ───────────────────────────────────────────
-// GET    /api/roles/:chatId  → { chatId, content, byteLength }
+// GET    /api/roles/:chatId  → { chatId, content, byteLength, effectiveContent, effectiveSource }
 // PUT    /api/roles/:chatId  body: {content} → write role file
 // DELETE /api/roles/:chatId  → remove role file
 
@@ -817,11 +817,16 @@ ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const content = resolveRoleFile(cachedLarkAppId, p.chatId);
+  const effective = resolveRole(cachedLarkAppId, p.chatId);
   jsonRes(res, 200, {
     chatId: p.chatId,
     content,
     byteLength: content ? Buffer.byteLength(content, 'utf-8') : 0,
     hasRole: content !== null,
+    effectiveContent: effective.content,
+    effectiveSource: effective.source,
+    effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
+    hasEffectiveRole: effective.content !== null,
   });
 });
 

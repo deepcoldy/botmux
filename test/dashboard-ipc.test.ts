@@ -11,6 +11,7 @@ import * as oncallStore from '../src/services/oncall-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { writeTeamRoleFile } from '../src/core/role-resolver.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -539,6 +540,36 @@ describe('POST /api/groups/create', () => {
 });
 
 describe('role profile IPC routes', () => {
+  it('returns effective team role metadata for dashboard save-as-profile flows', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-role-effective-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    try {
+      process.env.SESSION_DATA_DIR = dataDir;
+      config.session.dataDir = dataDir;
+      setLarkAppId('cli_profile');
+      writeTeamRoleFile('cli_profile', '# Default reviewer\nUse concise bullets.');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const role = await fetch(`${base}/api/roles/oc_effective`);
+      expect(role.status).toBe(200);
+      expect(await role.json()).toMatchObject({
+        chatId: 'oc_effective',
+        content: null,
+        hasRole: false,
+        effectiveContent: '# Default reviewer\nUse concise bullets.',
+        effectiveSource: 'team',
+        hasEffectiveRole: true,
+      });
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects wrong-daemon role profile mutations', async () => {
     const prevDataDir = process.env.SESSION_DATA_DIR;
     const prevConfigDataDir = config.session.dataDir;

@@ -143,7 +143,9 @@ async function loadGroupRoleProfileContext(): Promise<void> {
         try {
           const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
           const body = await r.json().catch(() => ({}));
-          nextGroupRoles.set(key, body?.hasRole ? String(body.content ?? '') : null);
+          const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
+          const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
+          nextGroupRoles.set(key, hasEffectiveRole ? String(effectiveContent ?? '') : null);
         } catch {
           nextGroupRoles.set(key, null);
         }
@@ -667,7 +669,9 @@ export async function renderGroupsPage(root: HTMLElement) {
         try {
           const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
           const body = await r.json().catch(() => ({}));
-          const content = body?.hasRole ? String(body.content ?? '') : '';
+          const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
+          const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
+          const content = hasEffectiveRole ? String(effectiveContent ?? '') : '';
           return content.trim() ? { larkAppId: bot.larkAppId as string, content } : null;
         } catch {
           return null;
