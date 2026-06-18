@@ -9,6 +9,7 @@ interface DashboardSettings {
   repoPickerMode: 'all' | 'repos';
   maintenance: MaintenanceCfg;
   localDevInstall: boolean;
+  whiteboard: { enabled: boolean };
 }
 
 let settings: DashboardSettings | null = null;
@@ -24,6 +25,7 @@ function parseSettings(s: any): DashboardSettings {
     repoPickerMode: s?.repoPickerMode === 'repos' ? 'repos' : 'all',
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
     localDevInstall: s?.localDevInstall === true,
+    whiteboard: { enabled: s?.whiteboard?.enabled === true },
   };
 }
 
@@ -102,6 +104,15 @@ function renderSettingsBody(): string {
           <span class="switch" aria-hidden="true"></span>
           <span class="toggle-tx"><strong>${t('settings.openTerminalInFeishu')}</strong>
           <small>${t('settings.openTerminalInFeishuHelp')}</small></span>
+        </label>
+      </section>
+      <section class="bd-section">
+        <h3 class="bd-section-title">本地白板</h3>
+        <label class="toggle-row">
+          <input type="checkbox" data-whiteboard-enabled ${settings.whiteboard.enabled ? 'checked' : ''} ${dis}>
+          <span class="switch" aria-hidden="true"></span>
+          <span class="toggle-tx"><strong>启用项目白板</strong>
+          <small>默认关闭。开启只启用能力，不会立即创建白板；首次需要时才按群+项目 ensure。</small></span>
         </label>
       </section>
       <section class="bd-section">
@@ -190,6 +201,11 @@ export async function renderSettingsPage(root: HTMLElement): Promise<void> {
         const before = !input.checked;
         void putSettings({ [key]: input.checked }, () => { input.checked = before; }, input);
       });
+    });
+    bodyEl.querySelector<HTMLInputElement>('input[data-whiteboard-enabled]')?.addEventListener('change', (ev) => {
+      const input = ev.currentTarget as HTMLInputElement;
+      const before = !input.checked;
+      void putSettings({ whiteboard: { enabled: input.checked } }, () => { input.checked = before; }, input);
     });
     bodyEl.querySelectorAll<HTMLSelectElement>('select[data-select-setting]').forEach(input => {
       input.addEventListener('change', () => {

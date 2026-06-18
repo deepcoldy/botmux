@@ -30,6 +30,7 @@ import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRole } from './role-resolver.js';
+import { ensureDefaultWhiteboard, getWhiteboard, whiteboardBoardPath, whiteboardEnabled } from '../services/whiteboard-store.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -245,6 +246,32 @@ function renderRoleContextBlock(larkAppId: string | undefined, chatId: string | 
   return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
 }
 
+export function ensureSessionWhiteboard(ds: DaemonSession): void {
+  if (!whiteboardEnabled()) return;
+  if (ds.session.whiteboardId && getWhiteboard(ds.session.whiteboardId)) return;
+  const meta = ensureDefaultWhiteboard({
+    larkAppId: ds.larkAppId,
+    chatId: ds.session.chatId,
+    workingDir: ds.session.workingDir ?? ds.workingDir,
+    sessionId: ds.session.sessionId,
+  });
+  ds.session.whiteboardId = meta.id;
+  sessionStore.updateSession(ds.session);
+}
+
+function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
+  if (!whiteboardEnabled() || !opts?.whiteboardId) return '';
+  const meta = getWhiteboard(opts.whiteboardId);
+  if (!meta || meta.archived) return '';
+  return [
+    `<whiteboard id="${xmlEscape(meta.id)}" path="${xmlEscape(whiteboardBoardPath(meta.id))}">`,
+    '本地项目上下文；需要时读取：`botmux whiteboard read --id ' + xmlEscape(meta.id) + '`。',
+    '沉淀摘要：`botmux whiteboard append --id ' + xmlEscape(meta.id) + '`；本地交接：`botmux whiteboard post --id ' + xmlEscape(meta.id) + '`。',
+    '不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
+    '</whiteboard>',
+  ].join('\n');
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -257,7 +284,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -283,6 +310,7 @@ export function buildNewTopicPrompt(
   }
 
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
 
   let mentionBlock = '';
   if (mentions && mentions.length > 0) {
@@ -319,7 +347,8 @@ export function buildNewTopicPrompt(
 
   // Put stable, instruction-like context before the user's first turn. This
   // improves salience without moving per-turn attribution (sender/mentions)
-  // into the prompt-cache prefix.
+  // into the prompt-cache prefix. The whiteboard block is an optional tool
+  // hint, so keep it after the user's message instead of ahead of the task.
   if (!adapter.injectsSessionContext) {
     if (routingBlock) parts.push(routingBlock);
     if (identityBlock) parts.push(identityBlock);
@@ -328,6 +357,7 @@ export function buildNewTopicPrompt(
   if (roleBlock) parts.push(roleBlock);
 
   parts.push(userBlock);
+  if (whiteboardBlock) parts.push(whiteboardBlock);
 
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
@@ -357,17 +387,18 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string },
 ): string {
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false);
 
   // Put stable context before the user's turn. Follow the new-topic order for
-  // shared blocks: session id first, then role. Keep per-turn attribution and
-  // attachments after <user_message>.
+  // shared blocks: session id first, then role. Keep the optional whiteboard
+  // hint and per-turn attribution after <user_message>.
   if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   if (roleBlock) parts.push(roleBlock);
   if (opts?.cliId !== 'mira') {
@@ -375,6 +406,7 @@ export function buildFollowUpContent(
   }
 
   parts.push(`<user_message>\n${content}\n</user_message>`);
+  if (whiteboardBlock) parts.push(whiteboardBlock);
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) parts.push(senderBlock);
@@ -531,6 +563,7 @@ export function buildReforkPrompt(
     sender: opts?.sender,
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
+    whiteboardId: ds.session.whiteboardId,
   });
 }
 
@@ -1199,8 +1232,18 @@ export async function executeScheduledTask(
   if (isContinuation && existing?.worker && !existing.worker.killed) {
     markSessionActivity(existing);
     try {
-      rememberLastCliInput(existing, task.prompt, task.prompt);
-      existing.worker.send({ type: 'message', content: task.prompt });
+      ensureSessionWhiteboard(existing);
+      const content = buildFollowUpContent(task.prompt, existing.session.sessionId, {
+        isAdoptMode: false,
+        cliId: bot.config.cliId,
+        cliPathOverride: bot.config.cliPathOverride,
+        locale: localeForBot(larkAppId),
+        larkAppId,
+        chatId: task.chatId,
+        whiteboardId: existing.session.whiteboardId,
+      });
+      rememberLastCliInput(existing, task.prompt, content);
+      existing.worker.send({ type: 'message', content });
       logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}`);
       return;
     } catch (err: any) {
@@ -1225,8 +1268,6 @@ export async function executeScheduledTask(
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
 
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId });
-
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -1242,6 +1283,8 @@ export async function executeScheduledTask(
     hasHistory: isContinuation,
     workingDir: task.workingDir,
   };
+  ensureSessionWhiteboard(ds);
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
   rememberLastCliInput(ds, task.prompt, prompt);
   forkWorker(ds, prompt);

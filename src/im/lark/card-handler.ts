@@ -30,7 +30,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { publishAttentionPatch } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
@@ -199,6 +199,7 @@ async function commitRepoSelection(
       pendingPrompt.trim().length > 0 ||
       (ds.pendingAttachments?.length ?? 0) > 0 ||
       (ds.pendingFollowUps?.length ?? 0) > 0;
+    if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
     const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
       ? buildNewTopicPrompt(
           pendingPrompt,
@@ -212,7 +213,7 @@ async function commitRepoSelection(
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locTarget,
           ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId },
+          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
         )
       : '';
     const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -1484,6 +1485,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           pendingPrompt.trim().length > 0 ||
           (ds.pendingAttachments?.length ?? 0) > 0 ||
           (ds.pendingFollowUps?.length ?? 0) > 0;
+        if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
         const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
           ? buildNewTopicPrompt(
               pendingPrompt,
@@ -1497,7 +1499,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               { name: selfBot.botName, openId: selfBot.botOpenId },
               locDs,
               ds.pendingSender,
-              { larkAppId: ds.larkAppId, chatId: ds.chatId },
+              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
             )
           : '';
         const prompt = pendingRawInput ? '' : wrappedPrompt;

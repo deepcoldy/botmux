@@ -48,6 +48,19 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn(),
 }));
 
+vi.mock('../src/services/whiteboard-store.js', () => ({
+  ensureDefaultWhiteboard: vi.fn(),
+  getWhiteboard: vi.fn((id: string) => ({
+    id,
+    title: 'Whiteboard: repo',
+    scope: 'project',
+    createdAt: '2026-06-19T00:00:00.000Z',
+    updatedAt: '2026-06-19T00:00:00.000Z',
+  })),
+  whiteboardBoardPath: vi.fn((id: string) => `/tmp/test-sessions/whiteboards/${id}/board.md`),
+  whiteboardEnabled: vi.fn(() => true),
+}));
+
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
@@ -110,6 +123,30 @@ describe('buildNewTopicPrompt', () => {
     // repo selection merge into the opening turn, blank-line separated.
     expect(prompt).not.toContain('<follow_up_message>');
     expect(prompt).toContain('<user_message>\nfirst message\n\nsecond message\n\nthird message\n</user_message>');
+  });
+
+  it('places the short whiteboard hint after user content', () => {
+    const prompt = buildNewTopicPrompt(
+      'ship this',
+      SESSION_ID,
+      'claude-code',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { whiteboardId: 'wb_test' },
+    );
+
+    expect(prompt).toContain('<whiteboard id="wb_test" path="/tmp/test-sessions/whiteboards/wb_test/board.md">');
+    expect(prompt).toContain('需要时读取：`botmux whiteboard read --id wb_test`');
+    expect(prompt).toContain('用户可见结论仍必须 `botmux send`。');
+    expect(prompt).not.toContain('Do not assume its contents are in context');
+    expect(prompt).not.toContain('When you first create or materially update');
+    expect(prompt.indexOf('<whiteboard ')).toBeGreaterThan(prompt.indexOf('</user_message>'));
   });
 
   it('should include mention metadata in <mentions>', () => {
@@ -217,6 +254,18 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
+  });
+
+  it('places the short whiteboard hint after follow-up user content', () => {
+    const content = buildFollowUpContent('continue', SESSION_ID, {
+      cliId: 'codex',
+      whiteboardId: 'wb_follow',
+    });
+
+    expect(content).toContain('<whiteboard id="wb_follow" path="/tmp/test-sessions/whiteboards/wb_follow/board.md">');
+    expect(content).toContain('沉淀摘要');
+    expect(content).not.toContain('Local project whiteboard is enabled for durable project context');
+    expect(content.indexOf('<whiteboard ')).toBeGreaterThan(content.indexOf('</user_message>'));
   });
 
   it('should omit <session_id> but keep mentions in adopt mode', () => {

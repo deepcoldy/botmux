@@ -1077,6 +1077,88 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 - 失败别硬重试同一招 ≥3 次；上报用户。
 `;
 
+const WHITEBOARD_SKILL = `---
+name: botmux-whiteboard
+description: 使用 botmux 本地项目白板读写跨 agent 的项目摘要、关键决策、已验证命令、阻塞和交接信息。触发场景：用户说白板、上下文、项目记忆、让其他 agent 看本地总结、长任务断点、多 agent 协作、handoff、需要沉淀不适合发飞书的大段上下文时。
+---
+
+# botmux-whiteboard — 本地项目白板
+
+白板是可选能力，默认关闭。它用于保存项目级、可持久化的核心摘要知识和本地 handoff 信息；它不是飞书消息的替代，也不是存秘密的地方。
+
+## 先判断是否启用
+
+\`\`\`bash
+botmux whiteboard status
+\`\`\`
+
+如果未启用，不要尝试隐式开启；告诉用户/dashboard 管理员需要先打开白板能力。关闭时 CLI/agent 读写会拒绝。
+
+## 当前白板
+
+\`\`\`bash
+botmux whiteboard current
+botmux whiteboard current --create   # 仅在用户要求或你确实需要沉淀长期上下文时使用
+botmux whiteboard list
+\`\`\`
+
+默认绑定 key 是当前 bot + 群 + workingDir。白板是项目级，不是 session 级。
+
+## 读取
+
+当用户/其他 agent 让你“看白板”、或你需要恢复项目状态时：
+
+\`\`\`bash
+botmux whiteboard read --id <whiteboardId>
+\`\`\`
+
+不要假设白板正文已经在上下文里；prompt 只会给 id/path/命令说明。
+
+## 写入原则
+
+适合写：
+- 项目背景摘要、当前状态
+- 关键决策和理由
+- 已验证命令/测试结果
+- 阻塞、风险、下一步计划
+- 给其他 agent 的本地交接信息
+
+不要写：密钥、token、个人隐私、未授权外部信息、大段无用日志。
+
+普通更新用 append：
+
+\`\`\`bash
+botmux whiteboard append --id <whiteboardId> <<'EOF'
+## 2026-xx-xx 更新
+- 结论：...
+- 已验证：...
+- 下一步：...
+EOF
+\`\`\`
+
+本地交接消息用 post（只进 log，不改正文摘要）：
+
+\`\`\`bash
+botmux whiteboard post --id <whiteboardId> --to <bot-or-session> <<'EOF'
+请基于 board.md 中的方案继续实现 X，重点检查 Y。
+EOF
+\`\`\`
+
+覆盖正文风险高，必须显式 \`--yes\`，agent 默认不要用：
+
+\`\`\`bash
+botmux whiteboard write --id <whiteboardId> --yes < new-board.md
+\`\`\`
+
+## 飞书提示
+
+白板减少飞书噪音，但不能让人完全不可见：
+- 首次创建白板，或首次写入关键摘要时，用 \`botmux send\` 发一句短提示：\`已建立/更新 whiteboard:<id>，后续关键进展会沉淀在那里。\`
+- 普通小追加不要每次通知。
+- 需要其他 agent 接力时，在飞书 @ 对方并让它读 \`whiteboard:<id>\`；不要复制大段白板内容。
+- 用户可见结论、需要确认的决策、最终结果仍必须 \`botmux send\`。
+`;
+
 export const ASK_SKILL_NAME = 'botmux-ask';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
@@ -1088,6 +1170,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
+  { name: 'botmux-whiteboard', content: WHITEBOARD_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The

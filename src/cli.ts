@@ -16,6 +16,7 @@
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
+ *   botmux whiteboard status|enable|disable|current|list|read|append|post|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
@@ -71,6 +72,17 @@ import {
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
 import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import {
+  appendWhiteboard,
+  createWhiteboard,
+  ensureDefaultWhiteboard,
+  getWhiteboard,
+  listWhiteboards,
+  postWhiteboardMessage,
+  readWhiteboard,
+  whiteboardEnabled,
+  whiteboardPath,
+} from './services/whiteboard-store.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 
@@ -1542,6 +1554,7 @@ interface SessionData {
   pendingResponseCardId?: string;
   pendingResponseCardState?: 'open' | 'patched';
   lastPatchedResponseCardId?: string;
+  whiteboardId?: string;
   // Markers that a real CLI ever ran in this session (vs a daemon-command
   // scratch placeholder). Persisted by the daemon; only presence is checked
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
@@ -2609,6 +2622,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   voice                配置语音总结（高级功能，独立于 setup）— 交互式填 TTS 引擎+凭证
        voice status    查看当前语音配置（凭证打码）
        voice disable   关闭语音功能（移除配置）
+  whiteboard status|enable|disable
+                       本地项目白板（默认关闭；enable 只打开能力，不创建白板）
+       current --create / list / read / append / post / write --yes
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -2756,6 +2772,165 @@ function positionals(args: string[], booleanFlags: string[] = []): string[] {
     out.push(a);
   }
   return out;
+}
+
+function readStdinUtf8(): string {
+  try { return readFileSync(0, 'utf-8'); } catch { return ''; }
+}
+
+function currentWhiteboardContext(args: string[]): { session?: SessionData; larkAppId?: string; chatId?: string; workingDir?: string; sessionId?: string } {
+  const sessionIdArg = argValue(args, '--session-id');
+  const sessions = loadSessions();
+  const sid = sessionIdArg || findAncestorSessionId() || undefined;
+  const session = sid ? sessions.get(sid) : undefined;
+  return {
+    session,
+    sessionId: session?.sessionId ?? sid,
+    larkAppId: argValue(args, '--lark-app-id', '--app-id') ?? session?.larkAppId ?? process.env.LARK_APP_ID,
+    chatId: argValue(args, '--chat-id') ?? session?.chatId,
+    workingDir: argValue(args, '--working-dir', '--repo') ?? session?.workingDir ?? process.cwd(),
+  };
+}
+
+function requireWhiteboardEnabled(): void {
+  if (whiteboardEnabled()) return;
+  console.error('Whiteboard is disabled. Enable it with `botmux whiteboard enable` or the dashboard Settings page.');
+  process.exit(2);
+}
+
+function whiteboardContentFromArgs(args: string[], booleanFlags: string[] = []): string {
+  const file = argValue(args, '--content-file', '--file');
+  if (file) return readFileSync(file, 'utf-8');
+  const pos = positionals(args, booleanFlags);
+  return pos.length > 0 ? pos.join(' ') : readStdinUtf8();
+}
+
+async function cmdWhiteboard(sub: string, rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const action = sub || 'status';
+  if (action === 'help' || action === '--help' || action === '-h') {
+    console.log(`botmux whiteboard <command>
+
+Commands:
+  status                       Show whether whiteboard is enabled
+  enable | disable             Toggle optional whiteboard feature (does not create boards)
+  list                         List local whiteboards (read-only, even when disabled)
+  current [--create]           Show current default board; --create ensures it when enabled
+  create [--id ID] [--title T] Create a board for current/bound context
+  read [--id ID]               Read board.md (requires enabled)
+  path [--id ID]               Print board/meta/log paths
+  append [--id ID] [text...]   Append to board.md (or stdin / --content-file)
+  post [--id ID] [--to X] ...  Append local message to log.jsonl only
+  write --yes [--id ID] ...    Overwrite board.md; --yes required
+
+Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
+    return;
+  }
+
+  if (action === 'status') {
+    console.log(JSON.stringify({ enabled: whiteboardEnabled(), count: listWhiteboards().length }, null, 2));
+    return;
+  }
+  if (action === 'enable' || action === 'on') {
+    mergeGlobalConfig({ whiteboard: { enabled: true } as any });
+    console.log('Whiteboard enabled. No board was created; a board is ensured only when first needed.');
+    return;
+  }
+  if (action === 'disable' || action === 'off') {
+    mergeGlobalConfig({ whiteboard: { enabled: false } as any });
+    console.log('Whiteboard disabled. Existing boards remain on disk and dashboard can show history read-only.');
+    return;
+  }
+  if (action === 'list' || action === 'ls') {
+    const boards = listWhiteboards().map(b => ({ id: b.id, title: b.title, scope: b.scope, larkAppId: b.larkAppId, chatId: b.chatId, workingDir: b.workingDir, updatedAt: b.updatedAt, path: b.path }));
+    console.log(JSON.stringify({ enabled: whiteboardEnabled(), boards }, null, 2));
+    return;
+  }
+
+  if (action === 'current') {
+    requireWhiteboardEnabled();
+    const id = argValue(rest, '--id');
+    if (id) {
+      const meta = getWhiteboard(id);
+      if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+      console.log(JSON.stringify({ enabled: true, current: meta, path: whiteboardPath(id) }, null, 2));
+      return;
+    }
+    const ctx = currentWhiteboardContext(rest);
+    let meta = ctx.session?.whiteboardId ? getWhiteboard(ctx.session.whiteboardId) : undefined;
+    if (!meta && argFlag(rest, '--create')) {
+      meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+      if (ctx.session) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    }
+    if (!meta) {
+      console.log(JSON.stringify({ enabled: true, current: null, hint: 'Run `botmux whiteboard current --create` to ensure the default board.' }, null, 2));
+      return;
+    }
+    console.log(JSON.stringify({ enabled: true, current: meta, path: whiteboardPath(meta.id) }, null, 2));
+    return;
+  }
+
+  if (action === 'create') {
+    requireWhiteboardEnabled();
+    const ctx = currentWhiteboardContext(rest);
+    const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+    if (ctx.session && !ctx.session.whiteboardId) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
+    return;
+  }
+
+  if (['read', 'append', 'post', 'write'].includes(action)) requireWhiteboardEnabled();
+
+  const explicitId = argValue(rest, '--id');
+  const ctx = currentWhiteboardContext(rest);
+  let id = explicitId ?? ctx.session?.whiteboardId;
+  if (!id && whiteboardEnabled() && (action === 'append' || action === 'post')) {
+    const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+    id = meta.id;
+    if (ctx.session) { ctx.session.whiteboardId = id; saveSession(ctx.session); }
+  }
+  if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
+
+  if (action === 'read') {
+    requireWhiteboardEnabled();
+    process.stdout.write(readWhiteboard(id));
+    return;
+  }
+  if (action === 'path') {
+    const meta = getWhiteboard(id);
+    if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+    console.log(JSON.stringify({ board: meta, path: whiteboardPath(id) }, null, 2));
+    return;
+  }
+  if (action === 'append') {
+    requireWhiteboardEnabled();
+    const content = whiteboardContentFromArgs(rest);
+    const meta = appendWhiteboard(id, content, { actor: ctx.sessionId });
+    console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    return;
+  }
+  if (action === 'post') {
+    requireWhiteboardEnabled();
+    const content = whiteboardContentFromArgs(rest);
+    const meta = postWhiteboardMessage(id, content, { actor: ctx.sessionId, to: argValue(rest, '--to') });
+    console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    return;
+  }
+  if (action === 'write') {
+    requireWhiteboardEnabled();
+    if (!argFlag(rest, '--yes')) {
+      console.error('Refusing to overwrite whiteboard without --yes. Prefer `botmux whiteboard append` for agent updates.');
+      process.exit(2);
+    }
+    const content = whiteboardContentFromArgs(rest, ['--yes']);
+    const { writeWhiteboard } = await import('./services/whiteboard-store.js');
+    const meta = writeWhiteboard(id, content, { actor: ctx.sessionId });
+    console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    return;
+  }
+
+  console.error(`Unknown whiteboard command: ${action}`);
+  process.exit(1);
 }
 
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
@@ -5334,6 +5509,8 @@ switch (command) {
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'lang':     await cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;
+  case 'whiteboard':
+  case 'wb':       await cmdWhiteboard(process.argv[3] ?? 'status', process.argv.slice(4)); break;
   case 'thread':   {
     // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
     // pre-rename scripts/skills surface the rename instead of "unknown command".

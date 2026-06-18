@@ -88,6 +88,7 @@ import {
   persistStreamCardState,
   rememberLastCliInput,
   ensureTerminalWorkerPort,
+  ensureSessionWhiteboard,
 } from './core/session-manager.js';
 import { beginReplyTargetTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
@@ -2456,7 +2457,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId });
+    ensureSessionWhiteboard(ds);
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
     rememberLastCliInput(ds, promptContent, prompt);
     await postPendingResponseCard(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
@@ -2487,7 +2489,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId });
+    ensureSessionWhiteboard(ds);
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
     rememberLastCliInput(ds, promptContent, prompt);
     await postPendingResponseCard(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
@@ -2659,12 +2662,13 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
       undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
       { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
-      { larkAppId, chatId },
+      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId },
     );
 
     // Pinned working dir → spawn immediately.
     if (pinnedWorkingDir) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
       rememberLastCliInput(ds, promptBody, prompt);
       await postPendingResponseCard(ds, anchor, promptBody);
@@ -3202,7 +3206,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     if (pinnedWorkingDir) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId });
+      ensureSessionWhiteboard(newDs);
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
       rememberLastCliInput(newDs, promptContent, prompt);
       await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
@@ -3233,7 +3238,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId });
+      ensureSessionWhiteboard(newDs);
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
       rememberLastCliInput(newDs, promptContent, prompt);
       await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
@@ -3255,6 +3261,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // out-of-band.
     const isBridge = !!ds.adoptedFrom;
     const selfBot = getBot(ds.larkAppId);
+    if (!isBridge) ensureSessionWhiteboard(ds);
     const msgContent = isBridge
       ? buildBridgeInputContent(promptContent, {
           attachments,
@@ -3270,6 +3277,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           sender: await getThreadSender(),
           larkAppId,
           chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
         });
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);
@@ -3315,6 +3323,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // because worker=null at that point.
     const dsBotCfgForFork = getBot(ds.larkAppId).config;
     const selfBot = getBot(ds.larkAppId);
+    ensureSessionWhiteboard(ds);
     const wrappedPrompt = buildReforkPrompt(ds, promptContent, {
       attachments,
       mentions: parsed.mentions,
@@ -3374,6 +3383,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
 
   if (ds.worker && !ds.worker.killed) {
     const isBridge = !!ds.adoptedFrom;
+    if (!isBridge) ensureSessionWhiteboard(ds);
     const msgContent = isBridge
       ? buildBridgeInputContent(promptContent, {
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -3385,6 +3395,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
           sender,
           larkAppId,
           chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
         });
     beginNewTurn(ds, text);
     ds.session.currentDocCommentTarget = docTarget; // beginNewTurn 刚清空，这里设本轮落点
@@ -3405,6 +3416,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     ds.streamCardPending = true;
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
+    ensureSessionWhiteboard(ds);
     const wrappedPrompt = buildReforkPrompt(ds, promptContent, {
       cliId: dsBotCfg.cliId,
       cliPathOverride: dsBotCfg.cliPathOverride,

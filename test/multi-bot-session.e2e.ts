@@ -21,6 +21,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
+  ensureSessionWhiteboard: vi.fn(),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   getAvailableBots: vi.fn(async () => []),
   rememberLastCliInput: vi.fn((ds: any, userPrompt: string, cliInput: string) => {

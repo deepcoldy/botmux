@@ -125,6 +125,20 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
+describe('built-in botmux-whiteboard skill', () => {
+  it('is registered and teaches disabled/default-safe usage', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-whiteboard');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux whiteboard status');
+    expect(skill!.content).toContain('默认关闭');
+    expect(skill!.content).toContain('botmux whiteboard append');
+    expect(skill!.content).toContain('botmux whiteboard post');
+    expect(skill!.content).toContain('write --id <whiteboardId> --yes');
+    expect(skill!.content).toContain('不要写');
+    expect(skill!.content).toContain('botmux send');
+  });
+});
+
 describe('botmux-worker-budget skill retired (moved to per-bot dashboard field)', () => {
   it('is no longer a standalone skill and is pruned on upgrade', () => {
     expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget')).toBeUndefined();

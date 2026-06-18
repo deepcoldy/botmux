@@ -21,6 +21,11 @@ import type { VoiceConfig } from './services/voice/types.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 
+export interface WhiteboardConfig {
+  /** Optional local project whiteboard. Off by default; enabling it must not create boards by itself. */
+  enabled?: boolean;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide repo picker display mode. Missing / 'all' preserves legacy
@@ -38,6 +43,8 @@ export interface GlobalConfig {
   /** Machine-wide auto-update / auto-restart schedule. Off unless explicitly
    *  enabled. Only the primary daemon (bot-0) acts on it — see core/maintenance.ts. */
   maintenance?: MaintenanceConfig;
+  /** Optional local project whiteboard. Disabled unless explicitly enabled. */
+  whiteboard?: WhiteboardConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
@@ -194,6 +201,14 @@ function readGlobalSkills(raw: unknown): GlobalSkillConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readWhiteboard(raw: unknown): WhiteboardConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: WhiteboardConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function globalConfigPath(): string {
   return join(homedir(), '.botmux', 'config.json');
 }
@@ -246,6 +261,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (voice) out.voice = voice;
   const maintenance = readMaintenance(raw.maintenance);
   if (maintenance) out.maintenance = maintenance;
+  const whiteboard = readWhiteboard(raw.whiteboard);
+  if (whiteboard) out.whiteboard = whiteboard;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;

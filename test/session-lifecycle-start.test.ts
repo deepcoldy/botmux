@@ -74,6 +74,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 }));
 
 vi.mock('../src/core/session-manager.js', () => ({
+  ensureSessionWhiteboard: vi.fn(),
   persistStreamCardState: vi.fn(),
 }));
 
