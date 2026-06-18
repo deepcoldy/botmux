@@ -2526,10 +2526,6 @@ input.row-select,
   background: var(--bg-soft);
   color: var(--faint);
 }
-.roles-badge.fallback-role {
-  background: var(--warning-soft);
-  color: var(--warning);
-}
 .roles-profile-match {
   display: inline-flex;
   max-width: 100%;

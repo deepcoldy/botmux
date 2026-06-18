@@ -17,7 +17,6 @@ const roleKey = (larkAppId: string, chatId: string) => `${larkAppId}\u0000${chat
 let roleProfiles: RoleProfileSummaryLike[] = [];
 let roleProfileEntriesById = new Map<string, RoleProfileEntryLike[]>();
 let groupRoleContentByBot = new Map<string, EffectiveRoleValue>();
-let roleProfileContextLoading = false;
 let roleProfileContextLoaded = false;
 
 function isValidProfileId(profileId: string): boolean {
@@ -205,8 +204,6 @@ export async function renderGroupsPage(root: HTMLElement) {
   }
 
   async function refreshRoleProfileContext(): Promise<void> {
-    roleProfileContextLoading = true;
-    rerender();
     try {
       await loadGroupRoleProfileContext();
     } catch {
@@ -214,7 +211,6 @@ export async function renderGroupsPage(root: HTMLElement) {
       roleProfileEntriesById = new Map();
       groupRoleContentByBot = new Map();
     } finally {
-      roleProfileContextLoading = false;
       roleProfileContextLoaded = true;
       rerender();
     }
@@ -451,9 +447,6 @@ export async function renderGroupsPage(root: HTMLElement) {
   }
 
   function renderGroupProfileStatus(chat: any): string {
-    if (roleProfileContextLoading && !roleProfileContextLoaded) {
-      return `<div class="g-profile-status muted">${t('groups.profileStatusLoading')}</div>`;
-    }
     if (!roleProfiles.length || !roleProfileContextLoaded) return '';
     const rolesByBot = new Map<string, EffectiveRoleValue>();
     for (const bot of chat.memberBots ?? []) {

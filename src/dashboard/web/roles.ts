@@ -69,7 +69,6 @@ let profiles: RoleProfileSummary[] = [];
 let profileEntries: RoleProfileEntry[] = [];
 let groupProfileEntriesById = new Map<string, RoleProfileEntryLike[]>();
 let groupEffectiveRolesByBot = new Map<string, EffectiveRoleValue>();
-let groupProfileContextLoading = false;
 let groupProfileContextLoaded = false;
 
 let activeTab: 'groups' | 'profiles' = 'groups';
@@ -241,15 +240,12 @@ async function loadGroupProfileContext(): Promise<void> {
 }
 
 async function refreshGroupProfileContext(): Promise<void> {
-  groupProfileContextLoading = true;
-  renderTree((document.getElementById('roles-search') as HTMLInputElement | null)?.value ?? '');
   try {
     await loadGroupProfileContext();
   } catch {
     groupProfileEntriesById = new Map();
     groupEffectiveRolesByBot = new Map();
   } finally {
-    groupProfileContextLoading = false;
     groupProfileContextLoaded = true;
     renderTree((document.getElementById('roles-search') as HTMLInputElement | null)?.value ?? '');
   }
@@ -315,9 +311,6 @@ function switchTab(tab: 'groups' | 'profiles'): void {
 }
 
 function renderRolesGroupProfileStatus(group: GroupInfo): string {
-  if (groupProfileContextLoading && !groupProfileContextLoaded) {
-    return `<div class="roles-profile-match muted">${t('groups.profileStatusLoading')}</div>`;
-  }
   if (!profiles.length || !groupProfileContextLoaded) return '';
   const rolesByBot = new Map<string, EffectiveRoleValue>();
   for (const bot of group.memberBots) {
@@ -367,8 +360,6 @@ function renderTree(filter: string = ''): void {
     const botRows = expanded
       ? inChatBots.map(b => {
           const isSelected = selectedGroupId === g.chatId && selectedBotId === b.larkAppId;
-          const effective = groupEffectiveRolesByBot.get(roleKey(b.larkAppId, g.chatId));
-          const fallbackActive = !b.hasRole && typeof effective === 'object' && effective?.source && effective.source !== 'none';
           return `
             <div class="roles-bot-row ${isSelected ? 'selected' : ''}"
                  data-group-id="${escapeHtml(g.chatId)}"
@@ -379,8 +370,8 @@ function renderTree(filter: string = ''): void {
                 <div class="roles-bot-name">${escapeHtml(b.botName)}</div>
                 <div class="roles-bot-id">${escapeHtml(b.larkAppId)}</div>
               </div>
-              <span class="roles-badge ${b.hasRole ? 'has-role' : fallbackActive ? 'fallback-role' : 'no-role'}">
-                ${b.hasRole ? t('roles.configured') : fallbackActive ? t('roles.fallbackRole') : t('roles.unconfigured')}
+              <span class="roles-badge ${b.hasRole ? 'has-role' : 'no-role'}">
+                ${b.hasRole ? t('roles.configured') : t('roles.unconfigured')}
               </span>
             </div>`;
         }).join('')
@@ -446,12 +437,7 @@ async function selectBot(groupId: string, botId: string): Promise<void> {
 
   if (groupName) groupName.textContent = group?.name ?? groupId;
   if (botName) botName.textContent = bot?.botName ?? botId;
-  if (chatIdEl) {
-    const sourceHint = !role.hasRole && role.hasEffectiveRole && role.effectiveSource === 'team'
-      ? `  ·  ${t('roles.effectiveFromDefault')}`
-      : '';
-    chatIdEl.textContent = `${groupId}  ·  ${botId}${sourceHint}`;
-  }
+  if (chatIdEl) chatIdEl.textContent = `${groupId}  ·  ${botId}`;
 
   editingContent = role.content ?? '';
   if (textarea) {
