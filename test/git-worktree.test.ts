@@ -140,6 +140,19 @@ describe('createRepoWorktree', () => {
     expect(git(res.path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feat/foo');
   });
 
+  it('uses an explicit worktree path when provided', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const target = join(tempRoot, 'feat-parent', 'proj');
+
+    const res = await createRepoWorktree(repo, { branch: 'feat/group', worktreePath: target });
+
+    expect(res.path).toBe(target);
+    expect(res.branch).toBe('feat/group');
+    expect(existsSync(join(target, '.git'))).toBe(true);
+    expect(git(target, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feat/group');
+  });
+
   it('checks out an existing local branch instead of recreating it', async () => {
     const upstream = makeUpstream('upstream');
     const repo = makeClone(upstream, 'proj');

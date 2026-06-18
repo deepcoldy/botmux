@@ -19,6 +19,7 @@ export const messages: Record<string, string> = {
   'card.btn.takeover': '🔄 接管',
   'card.btn.skip_repo': '▶️ 直接开启会话',
   'card.btn.manual_repo': '使用此目录',
+  'card.btn.worktree_repo': '创建 worktree',
   'card.btn.half_page_up': '⇞ 上半屏',
   'card.btn.half_page_down': '⇟ 下半屏',
   'card.btn.send_custom': '📝 发送自定义回复',
@@ -60,10 +61,13 @@ export const messages: Record<string, string> = {
   'card.repo.placeholder_switch': '选择仓库并切换',
   'card.repo.manual_placeholder': '输入任意工作目录，如 /path/to/project 或 ~/projects/foo',
   'card.repo.manual_empty': '请输入工作目录路径',
+  'card.repo.worktree_empty': '请至少选择一个仓库',
+  'card.repo.worktree_branch_placeholder': '分支名（可选；多选时作为父目录名）',
+  'card.repo.worktree_child_conflict': '多个仓库会映射到相同 worktree 子目录：{names}。请先调整项目名或改用单项目创建。',
   'card.repo.current_active': '当前工作目录：',
   'card.repo.current_marker': ' ← 当前',
   'card.repo.note': '也可以回复 `/repo <编号>` 切换（如 `/repo 1`），或直接 `/repo <路径|项目名>`（如 `/repo botmux`、`/repo ~/projects/foo`）跳过本卡片；`/repo wt <编号|项目名> [分支名]` 基于远端默认分支新建 worktree 打开',
-  'card.repo.placeholder_worktree': '🌿 选仓库新建 worktree 打开',
+  'card.repo.placeholder_worktree': '🌿 选择一个或多个仓库新建 worktree',
   'card.repo.toast_worktree_creating': '正在创建 worktree，完成后会在话题里通知…',
 
   // 群内授权卡片

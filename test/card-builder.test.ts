@@ -747,15 +747,16 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('should have 6 top-level elements: dir+skip column_set, hr, switch action, worktree action, manual form, note', () => {
+    it('should have 7 top-level elements: dir+skip, switch, worktree multi-select, worktree submit, manual form, note', () => {
       const card = parse(buildRepoSelectCard(projects));
-      expect(card.elements).toHaveLength(6);
+      expect(card.elements).toHaveLength(7);
       expect(card.elements[0].tag).toBe('column_set'); // 当前工作目录 + 直接开启会话
       expect(card.elements[1].tag).toBe('hr');
       expect(card.elements[2].tag).toBe('action');     // 选择仓库并切换 dropdown
-      expect(card.elements[3].tag).toBe('action');     // worktree dropdown
-      expect(card.elements[4].tag).toBe('form');       // manual entry
-      expect(card.elements[5].tag).toBe('note');
+      expect(card.elements[3].tag).toBe('action');     // worktree multi-select
+      expect(card.elements[4].tag).toBe('form');       // worktree branch + submit
+      expect(card.elements[5].tag).toBe('form');       // manual entry
+      expect(card.elements[6].tag).toBe('note');
     });
 
     it('manual-entry form carries an input + form_submit button (same row via column_set)', () => {
@@ -788,7 +789,7 @@ describe('buildRepoSelectCard', () => {
     function worktreeSelect(card: any): any {
       const actionEls = card.elements.filter((e: any) => e.tag === 'action');
       for (const el of actionEls) {
-        const sel = el.actions.find((a: any) => a.value?.key === 'repo_worktree');
+        const sel = el.actions.find((a: any) => a.value?.key === 'repo_worktree_select');
         if (sel) return sel;
       }
       return undefined;
@@ -797,6 +798,7 @@ describe('buildRepoSelectCard', () => {
     it('should list only main repos (no existing worktrees)', () => {
       const card = parse(buildRepoSelectCard(projects));
       const sel = worktreeSelect(card);
+      expect(sel.tag).toBe('multi_select_static');
       expect(sel.options).toHaveLength(2);
       const labels = sel.options.map((o: any) => o.text.content);
       expect(labels.join()).toContain('alpha');
@@ -809,6 +811,18 @@ describe('buildRepoSelectCard', () => {
       const sel = worktreeSelect(card);
       expect(sel.options[0].value).toBe('/home/user/alpha');
       expect(sel.value.root_id).toBe('om_root');
+    });
+
+    it('renders a branch input and submit button for selected worktree repos', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_worktree_submit_form');
+      expect(form).toBeDefined();
+      const input = deepFind({ elements: [form] }, 'input').find((i: any) => i.name === 'repo_worktree_branch');
+      expect(input).toBeDefined();
+      const btn = deepFind({ elements: [form] }, 'button').find((b: any) => b.name === 'repo_worktree_submit');
+      expect(btn.action_type).toBe('form_submit');
+      expect(btn.value.action).toBe('repo_worktree_submit');
+      expect(btn.value.root_id).toBe('om_root');
     });
 
     it('should be omitted when no main repos exist', () => {
