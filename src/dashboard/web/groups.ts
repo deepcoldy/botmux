@@ -19,6 +19,8 @@ let roleProfileEntriesById = new Map<string, RoleProfileEntryLike[]>();
 let groupRoleContentByBot = new Map<string, EffectiveRoleValue>();
 let roleProfileContextLoaded = false;
 
+type SaveProfileEntry = { larkAppId: string; content: string };
+
 function isValidProfileId(profileId: string): boolean {
   return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
 }
@@ -113,6 +115,12 @@ async function loadGroupRoleProfileContext(): Promise<void> {
   roleProfiles = nextProfiles;
   roleProfileEntriesById = new Map(detailPairs);
   groupRoleContentByBot = nextGroupRoles;
+}
+
+async function fetchRoleProfileSummaries(): Promise<RoleProfileSummaryLike[]> {
+  const r = await fetch('/api/role-profiles');
+  const body = await r.json().catch(() => ({}));
+  return Array.isArray(body.profiles) ? body.profiles as RoleProfileSummaryLike[] : [];
 }
 
 /** True iff every expected bot id appears in the row's memberBots with
@@ -606,61 +614,178 @@ export async function renderGroupsPage(root: HTMLElement) {
     const suggested = suggestedByName === 'profile'
       ? suggestRoleProfileIdFromChat(chat.chatId)
       : suggestedByName;
-    const profileId = prompt(t('groups.saveProfilePrompt'), suggested)?.trim();
-    if (profileId == null) return;
-    if (!isValidProfileId(profileId)) {
-      alert(t('groups.saveProfileInvalid'));
-      return;
-    }
-
-    const inChat = (chat.memberBots ?? []).filter((bot: any) => bot?.inChat && bot?.larkAppId);
-    if (!inChat.length) {
-      alert(t('groups.saveProfileNoRoles'));
-      return;
-    }
-
     btn.disabled = true;
     const originalText = btn.textContent;
     btn.textContent = t('groups.saveProfileSaving');
     try {
-      const roleRows = await Promise.all(inChat.map(async (bot: any) => {
-        try {
-          const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
-          const body = await r.json().catch(() => ({}));
-          const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
-          const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
-          const content = hasEffectiveRole ? String(effectiveContent ?? '') : '';
-          return content.trim() ? { larkAppId: bot.larkAppId as string, content } : null;
-        } catch {
-          return null;
-        }
-      }));
-      const entries = roleRows.filter((row): row is { larkAppId: string; content: string } => !!row);
-      if (!entries.length) {
-        alert(t('groups.saveProfileNoRoles'));
-        return;
-      }
-      if (!confirm(t('groups.saveProfileConfirm', { name: profileId, count: entries.length }))) return;
-
-      const results = await Promise.all(entries.map(async entry => {
-        const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(entry.larkAppId)}`, {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ content: entry.content }),
-        });
-        return r.ok;
-      }));
-      const saved = results.filter(Boolean).length;
-      if (saved !== entries.length) {
-        alert(t('groups.saveProfileFailed', { saved, total: entries.length }));
-      } else {
-        alert(t('groups.saveProfileDone', { name: profileId, count: saved }));
-      }
-      await refreshRoleProfileContext();
+      const [entries, profiles] = await Promise.all([
+        collectGroupProfileEntries(chat),
+        fetchRoleProfileSummaries(),
+      ]);
+      openSaveProfileDialog(chat, suggested, entries, profiles);
     } finally {
       btn.disabled = false;
       btn.textContent = originalText;
     }
+  }
+
+  async function collectGroupProfileEntries(chat: any): Promise<SaveProfileEntry[]> {
+    const inChat = (chat.memberBots ?? []).filter((bot: any) => bot?.inChat && bot?.larkAppId);
+    const roleRows = await Promise.all(inChat.map(async (bot: any) => {
+      try {
+        const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
+        const body = await r.json().catch(() => ({}));
+        const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
+        const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
+        const content = hasEffectiveRole ? String(effectiveContent ?? '') : '';
+        return content.trim() ? { larkAppId: bot.larkAppId as string, content } : null;
+      } catch {
+        return null;
+      }
+    }));
+    return roleRows.filter((row): row is SaveProfileEntry => !!row);
+  }
+
+  function openSaveProfileDialog(
+    chat: any,
+    suggestedProfileId: string,
+    entries: SaveProfileEntry[],
+    profiles: RoleProfileSummaryLike[],
+  ): void {
+    const sortedProfiles = [...profiles].sort((a, b) => a.profileId.localeCompare(b.profileId));
+    const profileOptions = sortedProfiles
+      .map(profile => `<option value="${escapeHtml(profile.profileId)}">${escapeHtml(profile.profileId)}</option>`)
+      .join('');
+    const hasExistingProfiles = sortedProfiles.length > 0;
+    drawer.innerHTML = `
+      <article class="g-save-profile-dialog">
+        <header>
+          <h3>${t('groups.saveProfileTitle')}</h3>
+          <p>${escapeHtml(t('groups.saveProfileIntro', {
+            name: chat.name ?? chat.chatId,
+            count: entries.length,
+          }))}</p>
+        </header>
+        <form id="g-save-profile-form">
+          <fieldset class="g-save-profile-mode">
+            <legend>${t('groups.saveProfileMode')}</legend>
+            <label class="g-save-profile-option">
+              <input type="radio" name="mode" value="new" checked>
+              <span>
+                <strong>${t('groups.saveProfileNew')}</strong>
+                <small>${t('groups.saveProfileNewHelp')}</small>
+              </span>
+            </label>
+            <label class="g-save-profile-option ${hasExistingProfiles ? '' : 'disabled'}">
+              <input type="radio" name="mode" value="overwrite" ${hasExistingProfiles ? '' : 'disabled'}>
+              <span>
+                <strong>${t('groups.saveProfileOverwrite')}</strong>
+                <small>${hasExistingProfiles ? t('groups.saveProfileOverwriteHelp') : t('groups.saveProfileExistingEmpty')}</small>
+              </span>
+            </label>
+          </fieldset>
+          <label class="form-row" data-profile-mode-row="new">
+            <span>${t('groups.saveProfileIdLabel')}</span>
+            <input type="text" name="profileId" value="${escapeHtml(suggestedProfileId)}" maxlength="64" autocomplete="off">
+            <small>${t('groups.saveProfileInvalid')}</small>
+          </label>
+          <label class="form-row" data-profile-mode-row="overwrite" hidden>
+            <span>${t('groups.saveProfileExistingLabel')}</span>
+            <select name="existingProfileId" ${hasExistingProfiles ? '' : 'disabled'}>
+              ${profileOptions}
+            </select>
+          </label>
+          <div class="g-save-profile-summary ${entries.length ? '' : 'warn'}">
+            ${entries.length
+              ? escapeHtml(t('groups.saveProfileEntrySummary', { count: entries.length }))
+              : escapeHtml(t('groups.saveProfileNoRoles'))}
+          </div>
+          <div class="g-save-profile-status" data-save-profile-status></div>
+          <div class="actions">
+            <button type="submit" class="primary" ${entries.length ? '' : 'disabled'}>${t('groups.saveProfileSubmit')}</button>
+            <button type="button" id="g-save-profile-cancel">${t('groups.cancel')}</button>
+          </div>
+        </form>
+      </article>`;
+    drawer.showModal();
+
+    const formEl = drawer.querySelector<HTMLFormElement>('#g-save-profile-form')!;
+    const modeRows = [...drawer.querySelectorAll<HTMLElement>('[data-profile-mode-row]')];
+    const statusEl = drawer.querySelector<HTMLElement>('[data-save-profile-status]')!;
+    const submitBtn = formEl.querySelector<HTMLButtonElement>('button[type=submit]')!;
+
+    function currentMode(): string {
+      return (formEl.querySelector<HTMLInputElement>('input[name=mode]:checked')?.value ?? 'new');
+    }
+
+    function updateMode(): void {
+      const mode = currentMode();
+      for (const row of modeRows) {
+        row.hidden = row.dataset.profileModeRow !== mode;
+      }
+      submitBtn.textContent = mode === 'overwrite'
+        ? t('groups.saveProfileOverwriteSubmit')
+        : t('groups.saveProfileSubmit');
+      statusEl.textContent = '';
+      statusEl.className = 'g-save-profile-status';
+    }
+
+    formEl.querySelectorAll<HTMLInputElement>('input[name=mode]').forEach(input => {
+      input.addEventListener('change', updateMode);
+    });
+    updateMode();
+
+    drawer.querySelector<HTMLButtonElement>('#g-save-profile-cancel')!.onclick = () => drawer.close();
+    formEl.onsubmit = async ev => {
+      ev.preventDefault();
+      if (!entries.length) return;
+      const fd = new FormData(formEl);
+      const mode = currentMode();
+      const profileId = mode === 'overwrite'
+        ? String(fd.get('existingProfileId') ?? '').trim()
+        : String(fd.get('profileId') ?? '').trim();
+      if (!isValidProfileId(profileId)) {
+        statusEl.textContent = t('groups.saveProfileInvalid');
+        statusEl.className = 'g-save-profile-status error';
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = t('groups.saveProfileSaving');
+      statusEl.textContent = t('groups.saveProfileSaving');
+      statusEl.className = 'g-save-profile-status';
+      try {
+        const results = await Promise.all(entries.map(async entry => {
+          const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(entry.larkAppId)}`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: entry.content }),
+          });
+          return r.ok;
+        }));
+        const saved = results.filter(Boolean).length;
+        if (saved !== entries.length) {
+          statusEl.textContent = t('groups.saveProfileFailed', { saved, total: entries.length });
+          statusEl.className = 'g-save-profile-status error';
+          submitBtn.disabled = false;
+          submitBtn.textContent = mode === 'overwrite'
+            ? t('groups.saveProfileOverwriteSubmit')
+            : t('groups.saveProfileSubmit');
+          return;
+        }
+        statusEl.textContent = t('groups.saveProfileDone', { name: profileId, count: saved });
+        statusEl.className = 'g-save-profile-status ok';
+        await refreshRoleProfileContext();
+        setTimeout(() => drawer.close(), 700);
+      } catch (err) {
+        statusEl.textContent = String(err);
+        statusEl.className = 'g-save-profile-status error';
+        submitBtn.disabled = false;
+        submitBtn.textContent = mode === 'overwrite'
+          ? t('groups.saveProfileOverwriteSubmit')
+          : t('groups.saveProfileSubmit');
+      }
+    };
   }
 
   body.addEventListener('click', async e => {
