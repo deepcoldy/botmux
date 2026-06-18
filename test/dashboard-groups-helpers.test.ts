@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { allExpectedInChat, renderBotCheckboxes } from '../src/dashboard/web/groups.js';
+import {
+  allExpectedInChat,
+  renderBotCheckboxes,
+  renderRoleProfileBootstrapSummary,
+} from '../src/dashboard/web/groups.js';
 
 describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
   it('empty expected set → true (degenerate case, nothing to wait for)', () => {
@@ -55,5 +59,29 @@ describe('renderBotCheckboxes — shared bot picker ordering', () => {
     expect(html).not.toContain('cli_a');
     expect(html.indexOf('cli_b')).toBeGreaterThanOrEqual(0);
     expect(html.indexOf('cli_c')).toBeGreaterThan(html.indexOf('cli_b'));
+  });
+});
+
+describe('renderRoleProfileBootstrapSummary — create-group profile feedback', () => {
+  it('renders a sent bootstrap message summary', () => {
+    const html = renderRoleProfileBootstrapSummary('collab-main', 'om_bootstrap', null);
+
+    expect(html).toContain('配置集：collab-main');
+    expect(html).toContain('bootstrap 消息已发送：om_bootstrap');
+    expect(html).toContain('hint-ok');
+  });
+
+  it('renders failure details and escapes interpolated values', () => {
+    const html = renderRoleProfileBootstrapSummary(
+      '<profile>',
+      null,
+      '<script>alert(1)</script>',
+    );
+
+    expect(html).not.toContain('<profile>');
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&lt;profile&gt;');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).toContain('hint-warn');
   });
 });

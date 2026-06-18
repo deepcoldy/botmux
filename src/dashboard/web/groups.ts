@@ -76,6 +76,32 @@ export function renderBotCheckboxes(
     `).join('');
 }
 
+export function renderRoleProfileBootstrapSummary(
+  profileId: string,
+  messageId?: unknown,
+  error?: unknown,
+): string {
+  const cleanProfileId = String(profileId ?? '').trim();
+  if (!cleanProfileId) return '';
+
+  if (error) {
+    return `<p class="hint-warn">${escapeHtml(t('groups.roleProfileBootstrapFailed', {
+      name: cleanProfileId,
+      reason: String(error),
+    }))}</p>`;
+  }
+
+  const cleanMessageId = typeof messageId === 'string' && messageId.trim() ? messageId.trim() : '';
+  if (cleanMessageId) {
+    return `<p class="hint-ok">${escapeHtml(t('groups.roleProfileBootstrapSent', {
+      name: cleanProfileId,
+      messageId: cleanMessageId,
+    }))}</p>`;
+  }
+
+  return `<p class="hint-ok">${escapeHtml(t('groups.roleProfileBootstrapDone', { name: cleanProfileId }))}</p>`;
+}
+
 export async function renderGroupsPage(root: HTMLElement) {
   root.innerHTML = pageHtml();
   const head = root.querySelector<HTMLElement>('#g-head')!;
@@ -299,6 +325,11 @@ export async function renderGroupsPage(root: HTMLElement) {
       invalidBots.length ? `<li>无效 bot id: <code>${invalidBots.map(escapeHtml).join(', ')}</code></li>` : '',
       invalidUsers.length ? `<li>无效用户 open_id: <code>${invalidUsers.map(escapeHtml).join(', ')}</code></li>` : '',
     ].filter(Boolean).join('');
+    const profileNote = renderRoleProfileBootstrapSummary(
+      typeof resp.roleProfileId === 'string' ? resp.roleProfileId : '',
+      resp.roleProfileBootstrapMessageId,
+      resp.roleProfileBootstrapError,
+    );
 
     drawer.innerHTML = `
       <article>
@@ -307,6 +338,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         <p><b>创建者:</b> <code>${escapeHtml(resp.creator ?? '?')}</code></p>
         ${inviteNote}
         ${bindNote}
+        ${profileNote}
         ${invalidNote ? `<ul>${invalidNote}</ul>` : ''}
         <div class="actions">
           <a class="btn-link primary" href="${appLink}" target="_blank" rel="noopener">${t('groups.openGroup')}</a>

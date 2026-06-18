@@ -1752,6 +1752,7 @@ const server = createServer(async (req, res) => {
       let upstreamJson: any = null;
       try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
       if (upstreamJson && typeof upstreamJson === 'object') {
+        if (roleProfileId) upstreamJson.roleProfileId = roleProfileId;
         // If Lark rejected the invite (open_id wrong scope, banned user, etc.)
         // null out autoInvitedOpenId so the frontend doesn't falsely claim
         // success — the user actually isn't a member of the new chat.
