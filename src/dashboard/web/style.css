@@ -2526,6 +2526,40 @@ input.row-select,
   background: var(--bg-soft);
   color: var(--faint);
 }
+.roles-badge.fallback-role {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.roles-profile-match {
+  display: inline-flex;
+  max-width: 100%;
+  margin-top: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.roles-profile-match.full {
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--success) 10%, var(--surface));
+  color: var(--success);
+}
+.roles-profile-match.partial,
+.roles-profile-match.fallback {
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface));
+  color: var(--warning);
+}
+.roles-profile-match.muted {
+  font-weight: 600;
+  color: var(--muted);
+}
 .roles-profile-row {
   display: flex;
   align-items: center;
@@ -2611,14 +2645,20 @@ input.row-select,
 }
 .roles-profile-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  grid-template-columns: minmax(240px, 320px) minmax(420px, 1fr);
   gap: 16px;
-  min-height: 320px;
+  align-items: stretch;
+  min-height: 0;
 }
 .roles-profile-bots,
 .roles-profile-editor,
 .roles-profile-apply {
   min-width: 0;
+}
+.roles-profile-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 .roles-profile-section-title {
   color: var(--muted);
@@ -2630,7 +2670,8 @@ input.row-select,
 .roles-profile-bot-list {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
-  overflow: hidden;
+  max-height: calc(100vh - 360px);
+  overflow: auto;
 }
 .roles-profile-bot-row {
   padding-left: 12px;
@@ -2647,7 +2688,9 @@ input.row-select,
 /* ─── Editor textarea ─── */
 #roles-editor-textarea,
 #roles-profile-textarea {
-  flex: 1;
+  width: 100%;
+  box-sizing: border-box;
+  flex: 0 0 auto;
   min-height: 220px;
   font-family: var(--mono);
   font-size: 13px;
@@ -2659,6 +2702,9 @@ input.row-select,
   background: var(--surface-muted);
   color: var(--fg);
   tab-size: 2;
+}
+#roles-profile-textarea {
+  min-height: 260px;
 }
 #roles-editor-textarea:focus,
 #roles-profile-textarea:focus {
@@ -2744,9 +2790,15 @@ input.row-select,
   max-height: 140px;
   overflow-y: auto;
 }
+.roles-profile-editor .roles-preview {
+  flex: 1 1 auto;
+  min-height: 150px;
+  max-height: 280px;
+}
 .roles-preview pre {
   margin: 8px 0 0 0;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.5;
@@ -3189,6 +3241,11 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .g-profile-status.partial {
   border-color: color-mix(in srgb, var(--warning) 35%, var(--border-soft));
   background: color-mix(in srgb, var(--warning) 12%, var(--surface));
+  color: var(--warning);
+}
+.g-profile-status.fallback {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 14%, var(--surface));
   color: var(--warning);
 }
 .g-profile-status.muted { font-weight: 600; }
@@ -4638,11 +4695,13 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   padding-top: 12px;
   border-top: 1px solid var(--border-soft);
 }
-.bd-profile-roles > summary,
 .bd-profile-role-entry > summary {
   cursor: pointer;
   color: var(--fg);
   font-weight: 700;
+}
+.bd-profile-roles .bd-subsection-title {
+  margin: 0 0 4px;
 }
 .bd-profile-role-list {
   display: grid;

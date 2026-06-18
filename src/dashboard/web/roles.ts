@@ -1,5 +1,10 @@
 // Roles page: group role editor + reusable role profile management.
 import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
+import {
+  summarizeGroupProfileMatches,
+  type EffectiveRoleValue,
+  type RoleProfileEntryLike,
+} from './role-profile-match.js';
 
 interface BotInfo {
   larkAppId: string;
@@ -26,6 +31,9 @@ interface RoleData {
   content: string | null;
   byteLength: number;
   hasRole: boolean;
+  effectiveContent?: string | null;
+  effectiveSource?: string;
+  hasEffectiveRole?: boolean;
 }
 
 interface RoleProfileSummary {
@@ -58,6 +66,10 @@ let cache: GroupInfo[] = [];
 let allBots: DashboardBot[] = [];
 let profiles: RoleProfileSummary[] = [];
 let profileEntries: RoleProfileEntry[] = [];
+let groupProfileEntriesById = new Map<string, RoleProfileEntryLike[]>();
+let groupEffectiveRolesByBot = new Map<string, EffectiveRoleValue>();
+let groupProfileContextLoading = false;
+let groupProfileContextLoaded = false;
 
 let activeTab: 'groups' | 'profiles' = 'groups';
 let selectedGroupId: string | null = null;
@@ -185,6 +197,63 @@ async function loadRole(larkAppId: string, chatId: string): Promise<RoleData> {
   return r.json();
 }
 
+function roleKey(larkAppId: string, chatId: string): string {
+  return `${larkAppId}\u0000${chatId}`;
+}
+
+async function loadGroupProfileContext(): Promise<void> {
+  const detailPairs = await Promise.all(profiles.map(async profile => {
+    try {
+      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
+      const body = await r.json().catch(() => ({}));
+      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntryLike[] : []] as const;
+    } catch {
+      return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
+    }
+  }));
+
+  const nextEffectiveRoles = new Map<string, EffectiveRoleValue>();
+  const seen = new Set<string>();
+  await Promise.all(cache.flatMap(group =>
+    group.memberBots
+      .filter(bot => bot.inChat)
+      .map(async bot => {
+        const key = roleKey(bot.larkAppId, group.chatId);
+        if (seen.has(key)) return;
+        seen.add(key);
+        try {
+          const role = await loadRole(bot.larkAppId, group.chatId);
+          const hasEffectiveRole = role.hasEffectiveRole ?? role.hasRole;
+          const effectiveContent = 'effectiveContent' in role ? role.effectiveContent : role.content;
+          nextEffectiveRoles.set(key, {
+            content: hasEffectiveRole ? String(effectiveContent ?? '') : null,
+            source: role.effectiveSource ?? (role.hasRole ? 'chat' : 'none'),
+          });
+        } catch {
+          nextEffectiveRoles.set(key, null);
+        }
+      }),
+  ));
+
+  groupProfileEntriesById = new Map(detailPairs);
+  groupEffectiveRolesByBot = nextEffectiveRoles;
+}
+
+async function refreshGroupProfileContext(): Promise<void> {
+  groupProfileContextLoading = true;
+  renderTree((document.getElementById('roles-search') as HTMLInputElement | null)?.value ?? '');
+  try {
+    await loadGroupProfileContext();
+  } catch {
+    groupProfileEntriesById = new Map();
+    groupEffectiveRolesByBot = new Map();
+  } finally {
+    groupProfileContextLoading = false;
+    groupProfileContextLoaded = true;
+    renderTree((document.getElementById('roles-search') as HTMLInputElement | null)?.value ?? '');
+  }
+}
+
 async function saveRole(larkAppId: string, chatId: string, content: string): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
     method: 'PUT',
@@ -244,6 +313,38 @@ function switchTab(tab: 'groups' | 'profiles'): void {
   document.getElementById('roles-profiles-view')?.toggleAttribute('hidden', tab !== 'profiles');
 }
 
+function renderRolesGroupProfileStatus(group: GroupInfo): string {
+  if (groupProfileContextLoading && !groupProfileContextLoaded) {
+    return `<div class="roles-profile-match muted">${t('groups.profileStatusLoading')}</div>`;
+  }
+  if (!profiles.length || !groupProfileContextLoaded) return '';
+  const rolesByBot = new Map<string, EffectiveRoleValue>();
+  for (const bot of group.memberBots) {
+    if (!bot.inChat) continue;
+    rolesByBot.set(bot.larkAppId, groupEffectiveRolesByBot.get(roleKey(bot.larkAppId, group.chatId)) ?? null);
+  }
+  const best = summarizeGroupProfileMatches(group.memberBots, profiles, groupProfileEntriesById, rolesByBot)[0];
+  if (!best) return `<div class="roles-profile-match muted">${t('groups.profileStatusUnmatched')}</div>`;
+  const allFallback = best.fallbackMatched === best.total;
+  const allChat = best.chatMatched === best.total;
+  const key = best.kind === 'full'
+    ? allFallback
+      ? 'groups.profileStatusFullFallback'
+      : allChat
+        ? 'groups.profileStatusFullChat'
+        : 'groups.profileStatusFullMixed'
+    : 'groups.profileStatusPartial';
+  return `<div class="roles-profile-match ${best.kind} ${allFallback ? 'fallback' : ''}">
+    ${escapeHtml(t(key, {
+      name: best.profileId,
+      matched: best.matched,
+      total: best.total,
+      chat: best.chatMatched,
+      fallback: best.fallbackMatched,
+    }))}
+  </div>`;
+}
+
 function renderTree(filter: string = ''): void {
   const tree = document.getElementById('roles-tree');
   if (!tree) return;
@@ -273,6 +374,8 @@ function renderTree(filter: string = ''): void {
     const botRows = expanded
       ? inChatBots.map(b => {
           const isSelected = selectedGroupId === g.chatId && selectedBotId === b.larkAppId;
+          const effective = groupEffectiveRolesByBot.get(roleKey(b.larkAppId, g.chatId));
+          const fallbackActive = !b.hasRole && typeof effective === 'object' && effective?.source && effective.source !== 'none';
           return `
             <div class="roles-bot-row ${isSelected ? 'selected' : ''}"
                  data-group-id="${escapeHtml(g.chatId)}"
@@ -283,8 +386,8 @@ function renderTree(filter: string = ''): void {
                 <div class="roles-bot-name">${escapeHtml(b.botName)}</div>
                 <div class="roles-bot-id">${escapeHtml(b.larkAppId)}</div>
               </div>
-              <span class="roles-badge ${b.hasRole ? 'has-role' : 'no-role'}">
-                ${b.hasRole ? t('roles.configured') : t('roles.unconfigured')}
+              <span class="roles-badge ${b.hasRole ? 'has-role' : fallbackActive ? 'fallback-role' : 'no-role'}">
+                ${b.hasRole ? t('roles.configured') : fallbackActive ? t('roles.fallbackRole') : t('roles.unconfigured')}
               </span>
             </div>`;
         }).join('')
@@ -301,6 +404,7 @@ function renderTree(filter: string = ''): void {
             <div class="roles-group-meta">
               ${roleCount}/${totalInChat} ${t('roles.botsWithRoles')}
             </div>
+            ${renderRolesGroupProfileStatus(g)}
           </div>
           <span class="roles-group-chevron"></span>
         </div>
@@ -349,7 +453,12 @@ async function selectBot(groupId: string, botId: string): Promise<void> {
 
   if (groupName) groupName.textContent = group?.name ?? groupId;
   if (botName) botName.textContent = bot?.botName ?? botId;
-  if (chatIdEl) chatIdEl.textContent = `${groupId}  ·  ${botId}`;
+  if (chatIdEl) {
+    const sourceHint = !role.hasRole && role.hasEffectiveRole && role.effectiveSource === 'team'
+      ? `  ·  ${t('roles.effectiveFromDefault')}`
+      : '';
+    chatIdEl.textContent = `${groupId}  ·  ${botId}${sourceHint}`;
+  }
 
   editingContent = role.content ?? '';
   if (textarea) {
@@ -567,6 +676,7 @@ function bindProfileEditor(): void {
       await loadProfiles();
       await loadProfileEntries(selectedProfileId);
       renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
+      void refreshGroupProfileContext();
       renderProfileDetail();
       flashProfileStatus(ok ? t('roles.saved') : t('roles.saveFailed'), !ok);
     } finally {
@@ -585,6 +695,7 @@ function bindProfileEditor(): void {
       await loadProfiles();
       await loadProfileEntries(selectedProfileId);
       renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
+      void refreshGroupProfileContext();
       renderProfileDetail();
     } finally {
       this.disabled = false;
@@ -673,6 +784,7 @@ async function runProfileApply(preview: boolean): Promise<void> {
   if (!preview) {
     await loadGroups();
     renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
+    void refreshGroupProfileContext();
   }
 }
 
@@ -714,6 +826,7 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
   renderTree();
   renderProfileList();
   if (selectedProfileId) await selectProfile(selectedProfileId);
+  void refreshGroupProfileContext();
 
   document.getElementById('roles-search')?.addEventListener('input', (e) => {
     renderTree((e.target as HTMLInputElement).value);
@@ -722,6 +835,7 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
   document.getElementById('roles-refresh')?.addEventListener('click', async () => {
     await loadGroups();
     renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
+    void refreshGroupProfileContext();
     if (selectedGroupId && selectedBotId) {
       const role = await loadRole(selectedBotId, selectedGroupId);
       const textarea = document.getElementById('roles-editor-textarea') as HTMLTextAreaElement;
@@ -743,6 +857,7 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
       if (ok) {
         await loadGroups();
         renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
+        void refreshGroupProfileContext();
         const delBtn = document.getElementById('roles-delete');
         if (delBtn) delBtn.style.display = '';
         const statusEl = document.createElement('span');
@@ -778,6 +893,7 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
         await loadGroups();
         resetEditor();
         renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
+        void refreshGroupProfileContext();
       }
     } finally {
       this.disabled = false;
@@ -797,6 +913,7 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
   document.getElementById('roles-profile-refresh')?.addEventListener('click', async () => {
     await loadGroups();
     await loadProfiles();
+    void refreshGroupProfileContext();
     if (selectedProfileId) await loadProfileEntries(selectedProfileId);
     renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
     renderProfileDetail();

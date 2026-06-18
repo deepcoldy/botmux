@@ -3,29 +3,19 @@
 // by chatId; the dashboard displays this as a matrix where each cell shows
 // whether a bot is a member of a given chat.
 import { chatAvatarHtml, escapeHtml, loadingHtml, t } from './ui.js';
+import {
+  summarizeGroupProfileMatches,
+  type EffectiveRoleValue,
+  type RoleProfileEntryLike,
+  type RoleProfileSummaryLike,
+} from './role-profile-match.js';
 
 let cache: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
-type RoleProfileSummary = {
-  profileId: string;
-  botEntries?: Array<{ larkAppId: string; hasEntry: boolean }>;
-};
-type RoleProfileEntry = {
-  profileId: string;
-  larkAppId: string;
-  content: string | null;
-};
-export type GroupProfileMatch = {
-  profileId: string;
-  matched: number;
-  total: number;
-  kind: 'full' | 'partial';
-};
-
 const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const roleKey = (larkAppId: string, chatId: string) => `${larkAppId}\u0000${chatId}`;
-let roleProfiles: RoleProfileSummary[] = [];
-let roleProfileEntriesById = new Map<string, RoleProfileEntry[]>();
-let groupRoleContentByBot = new Map<string, string | null>();
+let roleProfiles: RoleProfileSummaryLike[] = [];
+let roleProfileEntriesById = new Map<string, RoleProfileEntryLike[]>();
+let groupRoleContentByBot = new Map<string, EffectiveRoleValue>();
 let roleProfileContextLoading = false;
 let roleProfileContextLoaded = false;
 
@@ -41,41 +31,6 @@ export function suggestRoleProfileIdFromChat(value: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 64);
   return isValidProfileId(cleaned) ? cleaned : 'profile';
-}
-
-export function summarizeGroupProfileMatches(
-  memberBots: Array<{ larkAppId: string; inChat?: boolean }>,
-  profiles: RoleProfileSummary[],
-  entriesByProfile: Map<string, RoleProfileEntry[]>,
-  rolesByBot: Map<string, string | null>,
-): GroupProfileMatch[] {
-  const inChatBotIds = new Set(
-    memberBots
-      .filter(bot => bot.inChat)
-      .map(bot => String(bot.larkAppId)),
-  );
-  if (inChatBotIds.size === 0) return [];
-
-  const matches: GroupProfileMatch[] = [];
-  for (const profile of profiles) {
-    const entries = (entriesByProfile.get(profile.profileId) ?? [])
-      .filter(entry => inChatBotIds.has(entry.larkAppId) && typeof entry.content === 'string');
-    if (entries.length === 0) continue;
-    const matched = entries.filter(entry => rolesByBot.get(entry.larkAppId) === entry.content).length;
-    if (matched === entries.length) {
-      matches.push({ profileId: profile.profileId, matched, total: entries.length, kind: 'full' });
-    } else if (matched > 0) {
-      matches.push({ profileId: profile.profileId, matched, total: entries.length, kind: 'partial' });
-    }
-  }
-
-  return matches.sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === 'full' ? -1 : 1;
-    const ratio = (b.matched / b.total) - (a.matched / a.total);
-    if (ratio !== 0) return ratio;
-    if (b.matched !== a.matched) return b.matched - a.matched;
-    return a.profileId.localeCompare(b.profileId);
-  });
 }
 
 function pageHtml(): string {
@@ -119,19 +74,19 @@ async function fetchGroups(): Promise<{ chats: any[]; bots: any[] }> {
 async function loadGroupRoleProfileContext(): Promise<void> {
   const profileResp = await fetch('/api/role-profiles');
   const profileBody = await profileResp.json().catch(() => ({}));
-  const nextProfiles = Array.isArray(profileBody.profiles) ? profileBody.profiles as RoleProfileSummary[] : [];
+  const nextProfiles = Array.isArray(profileBody.profiles) ? profileBody.profiles as RoleProfileSummaryLike[] : [];
 
   const detailPairs = await Promise.all(nextProfiles.map(async profile => {
     try {
       const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
       const body = await r.json().catch(() => ({}));
-      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntry[] : []] as const;
+      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntryLike[] : []] as const;
     } catch {
-      return [profile.profileId, [] as RoleProfileEntry[]] as const;
+      return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
     }
   }));
 
-  const nextGroupRoles = new Map<string, string | null>();
+  const nextGroupRoles = new Map<string, EffectiveRoleValue>();
   const seenRoleKeys = new Set<string>();
   await Promise.all((cache.chats ?? []).flatMap((chat: any) =>
     (chat.memberBots ?? [])
@@ -145,7 +100,10 @@ async function loadGroupRoleProfileContext(): Promise<void> {
           const body = await r.json().catch(() => ({}));
           const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
           const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
-          nextGroupRoles.set(key, hasEffectiveRole ? String(effectiveContent ?? '') : null);
+          nextGroupRoles.set(key, {
+            content: hasEffectiveRole ? String(effectiveContent ?? '') : null,
+            source: body?.effectiveSource ?? (body?.hasRole ? 'chat' : 'none'),
+          });
         } catch {
           nextGroupRoles.set(key, null);
         }
@@ -496,7 +454,7 @@ export async function renderGroupsPage(root: HTMLElement) {
       return `<div class="g-profile-status muted">${t('groups.profileStatusLoading')}</div>`;
     }
     if (!roleProfiles.length || !roleProfileContextLoaded) return '';
-    const rolesByBot = new Map<string, string | null>();
+    const rolesByBot = new Map<string, EffectiveRoleValue>();
     for (const bot of chat.memberBots ?? []) {
       if (!bot?.inChat) continue;
       rolesByBot.set(bot.larkAppId, groupRoleContentByBot.get(roleKey(bot.larkAppId, chat.chatId)) ?? null);
@@ -506,9 +464,23 @@ export async function renderGroupsPage(root: HTMLElement) {
     if (!best) {
       return `<div class="g-profile-status muted">${t('groups.profileStatusUnmatched')}</div>`;
     }
-    const key = best.kind === 'full' ? 'groups.profileStatusFull' : 'groups.profileStatusPartial';
-    return `<div class="g-profile-status ${best.kind}">
-      ${escapeHtml(t(key, { name: best.profileId, matched: best.matched, total: best.total }))}
+    const allFallback = best.fallbackMatched === best.total;
+    const allChat = best.chatMatched === best.total;
+    const key = best.kind === 'full'
+      ? allFallback
+        ? 'groups.profileStatusFullFallback'
+        : allChat
+          ? 'groups.profileStatusFullChat'
+          : 'groups.profileStatusFullMixed'
+      : 'groups.profileStatusPartial';
+    return `<div class="g-profile-status ${best.kind} ${allFallback ? 'fallback' : ''}">
+      ${escapeHtml(t(key, {
+        name: best.profileId,
+        matched: best.matched,
+        total: best.total,
+        chat: best.chatMatched,
+        fallback: best.fallbackMatched,
+      }))}
     </div>`;
   }
 

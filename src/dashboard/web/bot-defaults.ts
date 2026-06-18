@@ -253,11 +253,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <button type="button" data-action="delete-role"${loaded ? '' : ' disabled'}>${t('botDefaults.roleDelete')}</button>
         <span class="oncall-status" data-role-status></span>
       </div>
-      <details class="bd-profile-roles" data-profile-roles>
-        <summary>${t('botDefaults.profileRoles')}</summary>
+      <div class="bd-profile-roles" data-profile-roles>
+        <h4 class="bd-subsection-title">${t('botDefaults.profileRoles')}</h4>
         <p class="bd-section-note">${t('botDefaults.profileRolesHelp')}</p>
         <div class="bd-profile-role-list" data-profile-role-list>${renderProfileRoleList(b.larkAppId)}</div>
-      </details>
+      </div>
     </section>`;
   }
 

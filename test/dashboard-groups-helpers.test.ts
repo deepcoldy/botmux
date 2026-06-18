@@ -3,9 +3,9 @@ import {
   allExpectedInChat,
   renderBotCheckboxes,
   renderRoleProfileBootstrapSummary,
-  summarizeGroupProfileMatches,
   suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
+import { summarizeGroupProfileMatches } from '../src/dashboard/web/role-profile-match.js';
 
 describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
   it('empty expected set → true (degenerate case, nothing to wait for)', () => {
@@ -118,13 +118,27 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
       profiles,
       entries,
       new Map([
-        ['botA', 'role A'],
-        ['botB', 'role B'],
+        ['botA', { content: 'role A', source: 'chat' }],
+        ['botB', { content: 'role B', source: 'team' }],
       ]),
     );
 
-    expect(matches[0]).toEqual({ profileId: 'main', matched: 2, total: 2, kind: 'full' });
-    expect(matches[1]).toEqual({ profileId: 'partial', matched: 1, total: 2, kind: 'partial' });
+    expect(matches[0]).toEqual({
+      profileId: 'main',
+      matched: 2,
+      total: 2,
+      chatMatched: 1,
+      fallbackMatched: 1,
+      kind: 'full',
+    });
+    expect(matches[1]).toEqual({
+      profileId: 'partial',
+      matched: 1,
+      total: 2,
+      chatMatched: 1,
+      fallbackMatched: 0,
+      kind: 'partial',
+    });
     expect(matches.map(m => m.profileId)).not.toContain('unused');
   });
 
