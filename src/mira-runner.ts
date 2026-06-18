@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
 import { extractMiraHistoryFinalText, sanitizeMiraFinalText } from './mira-output.js';
+import { ensureMiramcpSandboxAllows, getMiraRuntimePaths } from './mira-local-runtime.js';
 
 type JsonObject = Record<string, any>;
 
@@ -160,15 +161,31 @@ function localPathEnv(): string {
 }
 
 function runtimeSystemPrompt(): string {
-  return [
+  const paths = getMiraRuntimePaths();
+  const lines = [
     'You are invoked by BotMux inside the user machine through the local Mir CLI.',
-    `Actual local runtime cwd: ${process.cwd()}`,
-    `Actual local home: ${homedir()}`,
+    `Actual local runtime cwd: ${paths.cwd}`,
+    `Actual local home: ${paths.home}`,
+  ];
+  if (paths.logicalCwd && paths.logicalCwd !== paths.cwd) {
+    lines.push(
+      `Local tool path alias for the same cwd: ${paths.logicalCwd}`,
+      'If a local tool reports the physical cwd is outside allowed roots, retry the same operation with this local tool path alias.',
+    );
+  }
+  lines.push(
+    `Local tool allowed path candidates: ${paths.allowedPathCandidates.join(', ')}`,
+    'BotMux invokes you in a non-interactive message bridge. NEVER emit ```ask_user_call``` or ```ask_user_form_call``` fences for local path, permission, or environment issues.',
+    'If the target path is not obvious, use the actual local runtime cwd above. Do not ask the user to choose a path when this cwd is provided.',
     'This BotMux session is not running in /home/mira/.session. Do not report /home/mira/.session as the working directory for this session.',
     'Local filesystem, shell/bash, git, and BotMux CLI tools are available through the Mir CLI local tool bridge for this process.',
     'When the user asks to create, read, list, edit, or inspect local files, run bash/shell commands, inspect git, or operate BotMux, you MUST call the local tools against the actual local cwd above.',
+    'Prefer local bash commands that operate from the current cwd with relative paths first; if an absolute physical cwd fails, retry the same operation from the current cwd and then with the local tool path alias before reporting failure.',
     'Do not say the local MCP bridge is disconnected, that only a cloud sandbox is available, or that the operation is cancelled unless a concrete local tool invocation actually returned that error.',
     'If a local tool invocation fails, report the exact failed operation and error concisely, then stop or ask for the missing input.',
+  );
+  return [
+    ...lines,
   ].join('\n');
 }
 
@@ -622,6 +639,16 @@ class MircliClient {
   private runMircli(content: string, sessionId: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const bin = process.env.MIRCLI_BIN || 'mircli';
+      const runtimePaths = getMiraRuntimePaths();
+      if (boolEnv('MIRCLI_PATCH_MIRAMCP_CONFIG', true)) {
+        try {
+          ensureMiramcpSandboxAllows(runtimePaths.allowedPathCandidates);
+        } catch {
+          // Best effort. The system prompt still gives Mira both physical and
+          // logical path aliases so the model can recover when a live bridge has
+          // not reloaded the persistent miramcp config yet.
+        }
+      }
       const args = splitEnvArgs(process.env.MIRCLI_EXTRA_ARGS);
       if (boolEnv('MIRCLI_LEAN', true) && !args.includes('--lean') && !args.includes('--ultra')) {
         args.push('--lean');
