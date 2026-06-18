@@ -170,6 +170,66 @@ function runtimeSystemPrompt(): string {
   ].join('\n');
 }
 
+function decodeXmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function extractTaggedBlock(content: string, tag: string): string | undefined {
+  const open = new RegExp(`<${tag}\\b[^>]*>`, 'i').exec(content);
+  if (!open) return undefined;
+  const start = open.index + open[0].length;
+  const close = content.toLowerCase().indexOf(`</${tag}>`, start);
+  if (close < 0) return undefined;
+  return content.slice(start, close).trim();
+}
+
+function extractXmlAttribute(attrs: string, name: string): string | undefined {
+  const pattern = new RegExp(`\\b${name}="([^"]*)"`, 'i');
+  const match = pattern.exec(attrs);
+  return match ? decodeXmlEntities(match[1]) : undefined;
+}
+
+function summarizeAttachments(content: string): string[] {
+  const block = extractTaggedBlock(content, 'attachments');
+  if (!block) return [];
+
+  const out: string[] = [];
+  const itemPattern = /<(image|file)\b([^>]*)\/?>/gi;
+  for (const match of block.matchAll(itemPattern)) {
+    const type = match[1].toLowerCase();
+    const attrs = match[2];
+    const n = extractXmlAttribute(attrs, 'n');
+    const path = extractXmlAttribute(attrs, 'path');
+    const name = extractXmlAttribute(attrs, 'name');
+    if (!path) continue;
+    const label = type === 'image' ? 'image' : 'file';
+    const index = n ? ` ${n}` : '';
+    const suffix = name ? ` (${name})` : '';
+    out.push(`${label}${index}: ${path}${suffix}`);
+  }
+  return out;
+}
+
+function normalizeMircliPrompt(content: string): string {
+  const userMessage = extractTaggedBlock(content, 'user_message');
+  if (!userMessage) return content;
+
+  const sections = [decodeXmlEntities(userMessage)];
+  const attachments = summarizeAttachments(content);
+  if (attachments.length > 0) {
+    sections.push([
+      'Attachments available on the local filesystem:',
+      ...attachments.map(item => `- ${item}`),
+    ].join('\n'));
+  }
+  return sections.join('\n\n');
+}
+
 function shouldUseApiRunner(): boolean {
   const raw = process.env.MIRA_RUNNER_MODE?.trim().toLowerCase();
   return raw === 'api' || raw === 'web';
@@ -475,7 +535,7 @@ class MircliClient {
   async complete(content: string): Promise<CompletionResult> {
     const sessionId = await this.ensureSession();
     const startedAt = Date.now();
-    const finalText = await this.runMircli(content, sessionId);
+    const finalText = await this.runMircli(normalizeMircliPrompt(content), sessionId);
     return {
       finalText: finalText.trim(),
       turnId: `mircli-${startedAt}`,
