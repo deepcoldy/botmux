@@ -45,10 +45,60 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
   it('cascades Aiden into a submenu of three variants', () => {
     const aiden = CLI_SELECT_TREE.find((g) => g.key === 'aiden');
     expect(aiden?.children?.map((c) => c.key)).toEqual(['aiden', 'aiden-x-claude', 'aiden-x-codex']);
-    // every non-aiden top entry is a directly-selectable leaf
+    // an ungrouped top entry is a directly-selectable leaf
+    const gemini = CLI_SELECT_TREE.find((g) => g.key === 'gemini');
+    expect(gemini?.option?.cliId).toBe('gemini');
+    expect(gemini?.children).toBeUndefined();
+  });
+
+  it('cascades Codex into one submenu of Codex + Codex App (no top-level codex-app)', () => {
     const codex = CLI_SELECT_TREE.find((g) => g.key === 'codex');
-    expect(codex?.option?.cliId).toBe('codex');
-    expect(codex?.children).toBeUndefined();
+    expect(codex?.children?.map((c) => c.key)).toEqual(['codex', 'codex-app']);
+    expect(codex?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'codex-app')).toBeUndefined();
+    expect(resolveCliSelection('codex')).toEqual({ cliId: 'codex' });
+    expect(resolveCliSelection('codex-app')).toEqual({ cliId: 'codex-app' });
+  });
+
+  it('cascades TRAE (CoCo) into one submenu of coco + traex (no top-level coco/traex)', () => {
+    const trae = CLI_SELECT_TREE.find((g) => g.key === 'trae');
+    expect(trae?.label).toBe('TRAE (CoCo)');
+    expect(trae?.children?.map((c) => c.key)).toEqual(['coco', 'traex']);
+    expect(trae?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'coco')).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'traex')).toBeUndefined();
+    expect(resolveCliSelection('coco')).toEqual({ cliId: 'coco' });
+    expect(resolveCliSelection('traex')).toEqual({ cliId: 'traex' });
+  });
+
+  it('keeps Pi and Oh My Pi as adjacent top-level leaves', () => {
+    const treeKeys = CLI_SELECT_TREE.map((g) => g.key);
+    const i = treeKeys.indexOf('pi');
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(treeKeys[i + 1]).toBe('oh-my-pi');
+    // both remain directly-selectable leaves (not a submenu)
+    expect(CLI_SELECT_TREE[i].option?.cliId).toBe('pi');
+    expect(CLI_SELECT_TREE[i + 1].option?.cliId).toBe('oh-my-pi');
+    const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    const fi = flatKeys.indexOf('pi');
+    expect(flatKeys[fi + 1]).toBe('oh-my-pi');
+  });
+
+  it('cascades Mira into one submenu of Mira App + Mir CLI (no top-level mir)', () => {
+    const mira = CLI_SELECT_TREE.find((g) => g.key === 'mira');
+    expect(mira?.children?.map((c) => c.key)).toEqual(['mira', 'mir']);
+    expect(mira?.option).toBeUndefined();
+    // mir is no longer a separate top-level entry — it lives under the Mira group.
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'mir')).toBeUndefined();
+    // flat list: both resolvable, mir folded under mira (no duplicate top entry)
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('mira');
+    expect(keys).toContain('mir');
+  });
+
+  it('resolves both Mira variants to their native cliIds (no wrapperCli)', () => {
+    expect(resolveCliSelection('mira')).toEqual({ cliId: 'mira' });
+    expect(resolveCliSelection('mir')).toEqual({ cliId: 'mir' });
   });
 
   it('cascades CJADK into a submenu of its two × variants', () => {

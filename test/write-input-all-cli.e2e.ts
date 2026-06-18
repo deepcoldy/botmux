@@ -25,6 +25,7 @@ import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 
@@ -127,6 +128,7 @@ const ADAPTERS = [
   { name: 'mtr', create: () => safeCreate(() => createMtrAdapter()) },
   { name: 'hermes', create: () => safeCreate(() => createHermesAdapter()) },
   { name: 'mira', create: () => safeCreate(() => createMiraAdapter()) },
+  { name: 'mir', create: () => safeCreate(() => createMirAdapter()) },
   { name: 'copilot', create: () => safeCreate(() => createCopilotAdapter()) },
   { name: 'oh-my-pi', create: () => safeCreate(() => createOhMyPiAdapter()) },
 ];

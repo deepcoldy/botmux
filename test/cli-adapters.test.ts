@@ -31,6 +31,7 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
@@ -41,7 +42,7 @@ import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'traex', 'pi', 'copilot', 'oh-my-pi'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -60,7 +61,7 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    if (id === 'codex-app' || id === 'mira') expect(adapter.resolvedBin).toBe(process.execPath);
+    if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -392,6 +393,49 @@ describe('mira buildArgs', () => {
     });
     expect(args).toContain('--mira-session-id');
     expect(args).toContain('mira-session-123');
+  });
+});
+
+describe('mir buildArgs (runner model)', () => {
+  const adapter = createMirAdapter();
+
+  it('spawns the mir-runner via node with --session-id', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-mir', resume: false });
+    expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(args[0]).toMatch(/mir-runner\.js$/);
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-mir');
+  });
+
+  it('forwards bot identity + locale to the runner', () => {
+    const args = adapter.buildArgs({
+      sessionId: 's', resume: false, botName: 'Mir', botOpenId: 'ou_x', locale: 'zh',
+    });
+    expect(args).toContain('--bot-name');
+    expect(args).toContain('Mir');
+    expect(args).toContain('--bot-open-id');
+    expect(args).toContain('ou_x');
+    expect(args).toContain('--locale');
+    expect(args).toContain('zh');
+  });
+
+  it('ignores model (mircli model is a global file, not a flag)', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'opus4.6' });
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('opus4.6');
+  });
+
+  it('has no portable copy-paste resume command (mircli owns the session store)', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-mir', cliSessionId: 'conv-abc' })).toBeNull();
+  });
+
+  it('readyPattern matches the runner prompt indicator', () => {
+    expect(adapter.readyPattern?.test('› ')).toBe(true);
+  });
+
+  it('injectsSessionContext (runner injects its own context) + empty systemHints', () => {
+    expect(adapter.injectsSessionContext).toBe(true);
+    expect(adapter.systemHints).toEqual([]);
   });
 });
 

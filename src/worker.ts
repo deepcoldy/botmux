@@ -159,7 +159,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -2619,7 +2619,7 @@ let trustHandled = false;
 // not pollute the visible terminal. Strip them before xterm rendering and
 // translate them back into worker IPC.
 const CODEX_APP_OSC_PREFIX = '\x1b]777;botmux:';
-const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira']);
+const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira', 'mir']);
 let codexAppOscPending = '';
 
 function decodeCodexAppPayload(payload: string): any | undefined {
@@ -4202,7 +4202,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
   // Set up idle detection
   idleDetector = new IdleDetector(cliAdapter);
-  idleDetector.onIdle(() => {
+  idleDetector.onIdle(async () => {
     log('Prompt detected (idle)');
     // Bridge drain MUST run before markPromptReady() — the latter calls
     // flushPending() which can immediately fire the next queued message

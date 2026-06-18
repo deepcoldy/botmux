@@ -19,6 +19,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '16': 'copilot',
   '17': 'oh-my-pi',
   '18': 'relay',
+  '19': 'mir',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -47,6 +48,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
   'relay': 'Relay',
+  'mir': 'Mir CLI',
 };
 
 /**

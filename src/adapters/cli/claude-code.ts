@@ -5,7 +5,7 @@ import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
-import { t } from '../../i18n/index.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
@@ -529,48 +529,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
-      const unknown = t('ai.identity.unknown', undefined, locale);
-      const identityBlock =
-        botName || botOpenId
-          ? [
-            '',
-            '<identity>',
-            `  <name>${botName ?? unknown}</name>`,
-            `  <open_id>${botOpenId ?? unknown}</open_id>`,
-            '  <routing_rules>',
-            `    ${t('ai.identity.routing_intro', undefined, locale)}`,
-            `    ${t('ai.identity.rule_own_part', undefined, locale)}`,
-            `    ${t('ai.identity.rule_silent_when_other', undefined, locale)}`,
-            `    ${t('ai.identity.rule_no_proactive_pull', undefined, locale)}`,
-            '',
-            `    ${t('ai.identity.mention_intro', undefined, locale)}`,
-            `    ${t('ai.identity.mention_must', undefined, locale)}`,
-            `    ${t('ai.identity.mention_partners', undefined, locale)}`,
-            `    ${t('ai.identity.mention_usage', undefined, locale)}`,
-            `    ${t('ai.identity.mention_when_to', undefined, locale)}`,
-            `    ${t('ai.identity.mention_when_not', undefined, locale)}`,
-            `    ${t('ai.identity.mention_gate', undefined, locale)}`,
-            '  </routing_rules>',
-            '</identity>',
-          ]
-          : [];
-      args.push('--append-system-prompt', [
-        '<botmux_routing>',
-        t('ai.routing.intro', undefined, locale),
-        t('ai.routing.must_use_botmux', undefined, locale),
-        '',
-        t('ai.routing.usage_heading', undefined, locale),
-        t('ai.routing.usage_send_when', undefined, locale),
-        t('ai.routing.usage_send_text', undefined, locale),
-        t('ai.routing.usage_heredoc', undefined, locale),
-        t('ai.routing.heredoc_example', undefined, locale),
-        t('ai.routing.usage_images', undefined, locale),
-        t('ai.routing.usage_files', undefined, locale),
-        t('ai.routing.usage_history', undefined, locale),
-        t('ai.routing.usage_bots_list', undefined, locale),
-        '</botmux_routing>',
-        ...identityBlock,
-      ].join('\n'));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
       return args;
     },
 

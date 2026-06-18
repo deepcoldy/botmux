@@ -59,6 +59,36 @@ const AIDEN_X_CODEX: CliSelectOption = { key: 'aiden-x-codex', label: 'Aiden × 
 
 const AIDEN_VARIANTS: ReadonlyArray<CliSelectOption> = [AIDEN_NATIVE, AIDEN_X_CLAUDE, AIDEN_X_CODEX];
 
+// ─── Mira 选项 ───────────────────────────────────────────────────────────────
+// Mira 有两种形态（都是原生 cliId，无 wrapperCli），合并成一个「Mira」二级菜单：
+//   - Mira App  → cliId `mira`：直连 Mira Web API（云端编排 + 远程沙盒，聊天/搜索）
+//   - Mir CLI   → cliId `mir` ：本地 `mircli -p --lean`（在用户机器上执行、操作工作区）
+const MIRA_APP: CliSelectOption = { key: 'mira', label: 'Mira App（Web API）', cliId: 'mira' };
+const MIRA_CLI: CliSelectOption = { key: 'mir', label: 'Mir CLI（本地 mircli）', cliId: 'mir' };
+
+const MIRA_VARIANTS: ReadonlyArray<CliSelectOption> = [MIRA_APP, MIRA_CLI];
+
+// ─── Codex 选项 ──────────────────────────────────────────────────────────────
+// 两种形态合并成一个「Codex」二级菜单（都是原生 cliId，无 wrapperCli）：
+//   - Codex     → cliId `codex`     ：标准 codex CLI
+//   - Codex App → cliId `codex-app` ：Codex 桌面 app 的 app-server runner
+const CODEX_NATIVE: CliSelectOption = { key: 'codex', label: 'Codex', cliId: 'codex' };
+const CODEX_APP: CliSelectOption = { key: 'codex-app', label: 'Codex App', cliId: 'codex-app' };
+const CODEX_VARIANTS: ReadonlyArray<CliSelectOption> = [CODEX_NATIVE, CODEX_APP];
+
+// ─── TRAE 选项 ───────────────────────────────────────────────────────────────
+// TRAE 家族合并成一个「TRAE (CoCo)」二级菜单（都是原生 cliId，无 wrapperCli）：
+//   - TRAE CLI (CoCo) → cliId `coco`  ：Trae CLI 的 CoCo 形态
+//   - traex           → cliId `traex` ：TRAE CLI（traecli）
+const TRAE_COCO: CliSelectOption = { key: 'coco', label: 'TRAE CLI（CoCo）', cliId: 'coco' };
+const TRAE_X: CliSelectOption = { key: 'traex', label: 'traex', cliId: 'traex' };
+const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_COCO, TRAE_X];
+
+// ─── Pi 选项 ─────────────────────────────────────────────────────────────────
+// Pi 与 Oh My Pi 不合并，但在菜单里相邻摆放（在 Pi 的位置成对发出）。
+const PI_OPTION: CliSelectOption = { key: 'pi', label: 'Pi', cliId: 'pi' };
+const OHMYPI_OPTION: CliSelectOption = { key: 'oh-my-pi', label: 'Oh My Pi', cliId: 'oh-my-pi' };
+
 // ─── cjadk 选项 ──────────────────────────────────────────────────────────────
 // cjadk 没有「原生 agent」模式，只是个装配启动器（`cjadk <agent>`），故只有 × 变体。
 
@@ -122,11 +152,25 @@ const EXTRA_GATEWAY_GROUPS: ReadonlyArray<CliSelectGroup> = [
  * 末尾追加无原生 cliId 的网关分组（CJADK / TTADK）。
  */
 export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
-  ...CLI_OPTIONS.map((o): CliSelectGroup =>
-    o.id === 'aiden'
-      ? { key: 'aiden', label: 'Aiden', children: AIDEN_VARIANTS }
-      : { key: o.id, label: o.label, option: { key: o.id, label: o.label, cliId: o.id } },
-  ),
+  ...CLI_OPTIONS.flatMap((o): CliSelectGroup[] => {
+    if (o.id === 'aiden') return [{ key: 'aiden', label: 'Aiden', children: AIDEN_VARIANTS }];
+    // mira + mir collapse into one「Mira」二级菜单 at mira's position.
+    if (o.id === 'mira') return [{ key: 'mira', label: 'Mira', children: MIRA_VARIANTS }];
+    if (o.id === 'mir') return []; // already a child of the Mira group above
+    // codex + codex-app collapse into one「Codex」二级菜单 at codex's position.
+    if (o.id === 'codex') return [{ key: 'codex', label: 'Codex', children: CODEX_VARIANTS }];
+    if (o.id === 'codex-app') return [];
+    // coco + traex collapse into one「TRAE (CoCo)」二级菜单 at coco's position.
+    if (o.id === 'coco') return [{ key: 'trae', label: 'TRAE (CoCo)', children: TRAE_VARIANTS }];
+    if (o.id === 'traex') return [];
+    // Pi and Oh My Pi are kept as adjacent leaves (emitted together at pi's spot).
+    if (o.id === 'pi') return [
+      { key: 'pi', label: 'Pi', option: PI_OPTION },
+      { key: 'oh-my-pi', label: 'Oh My Pi', option: OHMYPI_OPTION },
+    ];
+    if (o.id === 'oh-my-pi') return [];
+    return [{ key: o.id, label: o.label, option: { key: o.id, label: o.label, cliId: o.id } }];
+  }),
   ...EXTRA_GATEWAY_GROUPS,
 ];
 
@@ -135,11 +179,18 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
  * 末尾依次追加 cjadk×* 与 ttadk×* 项。
  */
 export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
-  ...CLI_OPTIONS.flatMap((o) =>
-    o.id === 'aiden'
-      ? AIDEN_VARIANTS
-      : [{ key: o.id, label: o.label, cliId: o.id }],
-  ),
+  ...CLI_OPTIONS.flatMap((o) => {
+    if (o.id === 'aiden') return AIDEN_VARIANTS;
+    if (o.id === 'mira') return MIRA_VARIANTS;   // expands to Mira App + Mir CLI
+    if (o.id === 'mir') return [];               // already included via MIRA_VARIANTS
+    if (o.id === 'codex') return CODEX_VARIANTS;  // expands to Codex + Codex App
+    if (o.id === 'codex-app') return [];
+    if (o.id === 'coco') return TRAE_VARIANTS;    // expands to TRAE CLI (CoCo) + traex
+    if (o.id === 'traex') return [];
+    if (o.id === 'pi') return [PI_OPTION, OHMYPI_OPTION];  // Pi + Oh My Pi adjacent
+    if (o.id === 'oh-my-pi') return [];
+    return [{ key: o.id, label: o.label, cliId: o.id }];
+  }),
   ...CJADK_VARIANTS,
   ...TTADK_VARIANTS,
 ];

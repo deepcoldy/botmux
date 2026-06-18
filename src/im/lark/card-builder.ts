@@ -189,6 +189,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'mtr': 'MTR',
   'hermes': 'Hermes',
   'mira': 'Mira',
+  'mir': 'Mir CLI',
   'traex': 'TRAE',
   'pi': 'Pi',
   'copilot': 'Copilot',
