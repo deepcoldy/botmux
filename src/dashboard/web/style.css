@@ -2392,6 +2392,7 @@ input.row-select,
   height: calc(100vh - 160px);
   min-height: 400px;
 }
+.roles-page .roles-layout[hidden] { display: none !important; }
 
 /* ─── Tree Panel (left) ─── */
 .roles-tree-panel {
@@ -3164,6 +3165,33 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 /* 群列表名称单元格：群头像 + 群名/ID 横向排列。 */
 .g-chat-cell { display: flex; align-items: center; gap: 8px; }
 .g-chat-meta { min-width: 0; }
+.g-profile-status {
+  display: inline-flex;
+  align-items: center;
+  max-width: 240px;
+  margin-top: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.g-profile-status.full {
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--success) 10%, var(--surface));
+  color: var(--success);
+}
+.g-profile-status.partial {
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface));
+  color: var(--warning);
+}
+.g-profile-status.muted { font-weight: 600; }
 .orb-dot {
   position: absolute;
   right: -1px;
@@ -4603,6 +4631,41 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .bd-tile small.bd-help.open { -webkit-line-clamp: unset; color: var(--muted); }
 @media (prefers-reduced-motion: reduce) {
   .toggle-row .switch, .toggle-row .switch::after { transition: none; }
+}
+
+.bd-profile-roles {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+.bd-profile-roles > summary,
+.bd-profile-role-entry > summary {
+  cursor: pointer;
+  color: var(--fg);
+  font-weight: 700;
+}
+.bd-profile-role-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+.bd-profile-role-entry {
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+}
+.bd-profile-role-content pre {
+  margin: 8px 0 0;
+  padding: 10px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--fg);
+  font: 12px/1.5 var(--mono);
 }
 
 .bd-tile textarea,

@@ -5,6 +5,78 @@
 import { chatAvatarHtml, escapeHtml, loadingHtml, t } from './ui.js';
 
 let cache: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
+type RoleProfileSummary = {
+  profileId: string;
+  botEntries?: Array<{ larkAppId: string; hasEntry: boolean }>;
+};
+type RoleProfileEntry = {
+  profileId: string;
+  larkAppId: string;
+  content: string | null;
+};
+export type GroupProfileMatch = {
+  profileId: string;
+  matched: number;
+  total: number;
+  kind: 'full' | 'partial';
+};
+
+const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const roleKey = (larkAppId: string, chatId: string) => `${larkAppId}\u0000${chatId}`;
+let roleProfiles: RoleProfileSummary[] = [];
+let roleProfileEntriesById = new Map<string, RoleProfileEntry[]>();
+let groupRoleContentByBot = new Map<string, string | null>();
+let roleProfileContextLoading = false;
+let roleProfileContextLoaded = false;
+
+function isValidProfileId(profileId: string): boolean {
+  return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
+}
+
+export function suggestRoleProfileIdFromChat(value: string): string {
+  const cleaned = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return isValidProfileId(cleaned) ? cleaned : 'profile';
+}
+
+export function summarizeGroupProfileMatches(
+  memberBots: Array<{ larkAppId: string; inChat?: boolean }>,
+  profiles: RoleProfileSummary[],
+  entriesByProfile: Map<string, RoleProfileEntry[]>,
+  rolesByBot: Map<string, string | null>,
+): GroupProfileMatch[] {
+  const inChatBotIds = new Set(
+    memberBots
+      .filter(bot => bot.inChat)
+      .map(bot => String(bot.larkAppId)),
+  );
+  if (inChatBotIds.size === 0) return [];
+
+  const matches: GroupProfileMatch[] = [];
+  for (const profile of profiles) {
+    const entries = (entriesByProfile.get(profile.profileId) ?? [])
+      .filter(entry => inChatBotIds.has(entry.larkAppId) && typeof entry.content === 'string');
+    if (entries.length === 0) continue;
+    const matched = entries.filter(entry => rolesByBot.get(entry.larkAppId) === entry.content).length;
+    if (matched === entries.length) {
+      matches.push({ profileId: profile.profileId, matched, total: entries.length, kind: 'full' });
+    } else if (matched > 0) {
+      matches.push({ profileId: profile.profileId, matched, total: entries.length, kind: 'partial' });
+    }
+  }
+
+  return matches.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === 'full' ? -1 : 1;
+    const ratio = (b.matched / b.total) - (a.matched / a.total);
+    if (ratio !== 0) return ratio;
+    if (b.matched !== a.matched) return b.matched - a.matched;
+    return a.profileId.localeCompare(b.profileId);
+  });
+}
 
 function pageHtml(): string {
   return `<section class="page">
@@ -42,6 +114,45 @@ async function loadGroups(): Promise<void> {
 async function fetchGroups(): Promise<{ chats: any[]; bots: any[] }> {
   const r = await fetch('/api/groups');
   return r.json();
+}
+
+async function loadGroupRoleProfileContext(): Promise<void> {
+  const profileResp = await fetch('/api/role-profiles');
+  const profileBody = await profileResp.json().catch(() => ({}));
+  const nextProfiles = Array.isArray(profileBody.profiles) ? profileBody.profiles as RoleProfileSummary[] : [];
+
+  const detailPairs = await Promise.all(nextProfiles.map(async profile => {
+    try {
+      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
+      const body = await r.json().catch(() => ({}));
+      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntry[] : []] as const;
+    } catch {
+      return [profile.profileId, [] as RoleProfileEntry[]] as const;
+    }
+  }));
+
+  const nextGroupRoles = new Map<string, string | null>();
+  const seenRoleKeys = new Set<string>();
+  await Promise.all((cache.chats ?? []).flatMap((chat: any) =>
+    (chat.memberBots ?? [])
+      .filter((bot: any) => bot?.inChat && bot?.larkAppId)
+      .map(async (bot: any) => {
+        const key = roleKey(bot.larkAppId, chat.chatId);
+        if (seenRoleKeys.has(key)) return;
+        seenRoleKeys.add(key);
+        try {
+          const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
+          const body = await r.json().catch(() => ({}));
+          nextGroupRoles.set(key, body?.hasRole ? String(body.content ?? '') : null);
+        } catch {
+          nextGroupRoles.set(key, null);
+        }
+      }),
+  ));
+
+  roleProfiles = nextProfiles;
+  roleProfileEntriesById = new Map(detailPairs);
+  groupRoleContentByBot = nextGroupRoles;
 }
 
 /** True iff every expected bot id appears in the row's memberBots with
@@ -112,7 +223,11 @@ export async function renderGroupsPage(root: HTMLElement) {
 
   refreshBtn.onclick = async () => {
     refreshBtn.disabled = true;
-    try { await loadGroups(); rerender(); } finally { refreshBtn.disabled = false; }
+    try {
+      await loadGroups();
+      rerender();
+      void refreshRoleProfileContext();
+    } finally { refreshBtn.disabled = false; }
   };
 
   const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
@@ -126,6 +241,22 @@ export async function renderGroupsPage(root: HTMLElement) {
   } finally {
     loadingEl.remove();
     tableWrap.hidden = false;
+  }
+
+  async function refreshRoleProfileContext(): Promise<void> {
+    roleProfileContextLoading = true;
+    rerender();
+    try {
+      await loadGroupRoleProfileContext();
+    } catch {
+      roleProfiles = [];
+      roleProfileEntriesById = new Map();
+      groupRoleContentByBot = new Map();
+    } finally {
+      roleProfileContextLoading = false;
+      roleProfileContextLoaded = true;
+      rerender();
+    }
   }
 
   async function openCreateModal() {
@@ -220,6 +351,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           if (typeof respBody.creator === 'string' && respBody.creator) expectedBotIds.add(respBody.creator);
           injectOptimisticChat(respBody.chatId, name || respBody.chatId, validIds, respBody.creator);
           rerender();
+          void refreshRoleProfileContext();
           void refreshUntilSeen(respBody.chatId, expectedBotIds).catch(() => { /* tolerate */ });
         } else {
           alert(`Failed: ${respBody.error ?? r.status}`);
@@ -273,6 +405,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         if (row && allExpectedInChat(row, expectedBotIds)) {
           cache = next;
           rerender();
+          void refreshRoleProfileContext();
           return;
         }
       }
@@ -356,6 +489,27 @@ export async function renderGroupsPage(root: HTMLElement) {
     drawer.querySelector<HTMLButtonElement>('#g-create-close')!.onclick = () => drawer.close();
   }
 
+  function renderGroupProfileStatus(chat: any): string {
+    if (roleProfileContextLoading && !roleProfileContextLoaded) {
+      return `<div class="g-profile-status muted">${t('groups.profileStatusLoading')}</div>`;
+    }
+    if (!roleProfiles.length || !roleProfileContextLoaded) return '';
+    const rolesByBot = new Map<string, string | null>();
+    for (const bot of chat.memberBots ?? []) {
+      if (!bot?.inChat) continue;
+      rolesByBot.set(bot.larkAppId, groupRoleContentByBot.get(roleKey(bot.larkAppId, chat.chatId)) ?? null);
+    }
+    const matches = summarizeGroupProfileMatches(chat.memberBots ?? [], roleProfiles, roleProfileEntriesById, rolesByBot);
+    const best = matches[0];
+    if (!best) {
+      return `<div class="g-profile-status muted">${t('groups.profileStatusUnmatched')}</div>`;
+    }
+    const key = best.kind === 'full' ? 'groups.profileStatusFull' : 'groups.profileStatusPartial';
+    return `<div class="g-profile-status ${best.kind}">
+      ${escapeHtml(t(key, { name: best.profileId, matched: best.matched, total: best.total }))}
+    </div>`;
+  }
+
   function renderHead() {
     head.innerHTML = `<tr>
       <th>${t('groups.chat')}</th>
@@ -389,6 +543,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           <div class="g-chat-meta">
             <strong>${escapeHtml(c.name ?? c.chatId)}</strong><br>
             <small><code>${escapeHtml(c.chatId)}</code></small>
+            ${renderGroupProfileStatus(c)}
           </div>
         </div>
       </td>
@@ -401,11 +556,13 @@ export async function renderGroupsPage(root: HTMLElement) {
       <td>
         <button class="add-bots" type="button">${t('groups.addBots')}</button>
         <a class="btn-link" href="#/roles/profile?chatId=${escapeHtml(encodeURIComponent(c.chatId))}">${t('groups.applyProfile')}</a>
+        <button class="save-profile" type="button">${t('groups.saveAsProfile')}</button>
         <button class="manage-chat" type="button">${t('groups.manage')}</button>
       </td>
     </tr>`).join('');
   }
   rerender();
+  void refreshRoleProfileContext();
 
   body.addEventListener('click', async e => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.add-bots');
@@ -473,6 +630,76 @@ export async function renderGroupsPage(root: HTMLElement) {
       }
     };
   });
+
+  body.addEventListener('click', async e => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.save-profile');
+    if (!btn) return;
+    const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
+    const chatId = tr.dataset.chat!;
+    const chat = cache.chats.find(c => c.chatId === chatId);
+    if (!chat) return;
+    await saveGroupRolesAsProfile(chat, btn);
+  });
+
+  async function saveGroupRolesAsProfile(chat: any, btn: HTMLButtonElement): Promise<void> {
+    const suggestedByName = suggestRoleProfileIdFromChat(chat.name ?? '');
+    const suggested = suggestedByName === 'profile'
+      ? suggestRoleProfileIdFromChat(chat.chatId)
+      : suggestedByName;
+    const profileId = prompt(t('groups.saveProfilePrompt'), suggested)?.trim();
+    if (profileId == null) return;
+    if (!isValidProfileId(profileId)) {
+      alert(t('groups.saveProfileInvalid'));
+      return;
+    }
+
+    const inChat = (chat.memberBots ?? []).filter((bot: any) => bot?.inChat && bot?.larkAppId);
+    if (!inChat.length) {
+      alert(t('groups.saveProfileNoRoles'));
+      return;
+    }
+
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = t('groups.saveProfileSaving');
+    try {
+      const roleRows = await Promise.all(inChat.map(async (bot: any) => {
+        try {
+          const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
+          const body = await r.json().catch(() => ({}));
+          const content = body?.hasRole ? String(body.content ?? '') : '';
+          return content.trim() ? { larkAppId: bot.larkAppId as string, content } : null;
+        } catch {
+          return null;
+        }
+      }));
+      const entries = roleRows.filter((row): row is { larkAppId: string; content: string } => !!row);
+      if (!entries.length) {
+        alert(t('groups.saveProfileNoRoles'));
+        return;
+      }
+      if (!confirm(t('groups.saveProfileConfirm', { name: profileId, count: entries.length }))) return;
+
+      const results = await Promise.all(entries.map(async entry => {
+        const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(entry.larkAppId)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ content: entry.content }),
+        });
+        return r.ok;
+      }));
+      const saved = results.filter(Boolean).length;
+      if (saved !== entries.length) {
+        alert(t('groups.saveProfileFailed', { saved, total: entries.length }));
+      } else {
+        alert(t('groups.saveProfileDone', { name: profileId, count: saved }));
+      }
+      await refreshRoleProfileContext();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
 
   body.addEventListener('click', async e => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.manage-chat');
@@ -582,7 +809,7 @@ export async function renderGroupsPage(root: HTMLElement) {
             statusEl.classList.add('hint-ok');
             // Refresh aggregator cache + matrix; drawer state stays as-is
             // (current row reflects the just-saved values).
-            try { await loadGroups(); rerender(); } catch { /* tolerate */ }
+            try { await loadGroups(); rerender(); void refreshRoleProfileContext(); } catch { /* tolerate */ }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
             statusEl.classList.add('hint-warn-inline');
@@ -619,7 +846,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           return `${x.larkAppId}: OK${note}`;
         }).join('\n');
         alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
-        await loadGroups(); rerender();
+        await loadGroups(); rerender(); void refreshRoleProfileContext();
       } catch (e) {
         alert('Network error: ' + e);
       } finally {
@@ -653,7 +880,7 @@ export async function renderGroupsPage(root: HTMLElement) {
               ? ''
               : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
             alert(`已解散（由 ${m.botName ?? m.larkAppId} 执行）${closedNote}`);
-            await loadGroups(); rerender();
+            await loadGroups(); rerender(); void refreshRoleProfileContext();
             drawer.close();
             return;
           }

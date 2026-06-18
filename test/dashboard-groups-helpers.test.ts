@@ -3,6 +3,8 @@ import {
   allExpectedInChat,
   renderBotCheckboxes,
   renderRoleProfileBootstrapSummary,
+  summarizeGroupProfileMatches,
+  suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
 
 describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
@@ -83,5 +85,67 @@ describe('renderRoleProfileBootstrapSummary — create-group profile feedback', 
     expect(html).toContain('&lt;profile&gt;');
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     expect(html).toContain('hint-warn');
+  });
+});
+
+describe('summarizeGroupProfileMatches — group role/profile status', () => {
+  const profiles = [
+    { profileId: 'main' },
+    { profileId: 'partial' },
+    { profileId: 'unused' },
+  ];
+  const entries = new Map([
+    ['main', [
+      { profileId: 'main', larkAppId: 'botA', content: 'role A' },
+      { profileId: 'main', larkAppId: 'botB', content: 'role B' },
+    ]],
+    ['partial', [
+      { profileId: 'partial', larkAppId: 'botA', content: 'role A' },
+      { profileId: 'partial', larkAppId: 'botB', content: 'different B' },
+    ]],
+    ['unused', [
+      { profileId: 'unused', larkAppId: 'botC', content: 'role C' },
+    ]],
+  ]);
+
+  it('reports full and partial matches for in-chat bots only', () => {
+    const matches = summarizeGroupProfileMatches(
+      [
+        { larkAppId: 'botA', inChat: true },
+        { larkAppId: 'botB', inChat: true },
+        { larkAppId: 'botC', inChat: false },
+      ],
+      profiles,
+      entries,
+      new Map([
+        ['botA', 'role A'],
+        ['botB', 'role B'],
+      ]),
+    );
+
+    expect(matches[0]).toEqual({ profileId: 'main', matched: 2, total: 2, kind: 'full' });
+    expect(matches[1]).toEqual({ profileId: 'partial', matched: 1, total: 2, kind: 'partial' });
+    expect(matches.map(m => m.profileId)).not.toContain('unused');
+  });
+
+  it('returns no match when no profile entry content equals current group roles', () => {
+    const matches = summarizeGroupProfileMatches(
+      [{ larkAppId: 'botA', inChat: true }],
+      profiles,
+      entries,
+      new Map([['botA', 'other']]),
+    );
+
+    expect(matches).toEqual([]);
+  });
+});
+
+describe('suggestRoleProfileIdFromChat — prompt default', () => {
+  it('keeps only backend-valid profile id characters', () => {
+    expect(suggestRoleProfileIdFromChat('AI ChangeLog / Prod 群')).toBe('ai-changelog-prod');
+  });
+
+  it('falls back to a safe id when the group name has no valid ascii token', () => {
+    expect(suggestRoleProfileIdFromChat('项目群')).toBe('profile');
   });
 });
