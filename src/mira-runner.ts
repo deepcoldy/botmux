@@ -165,8 +165,10 @@ function runtimeSystemPrompt(): string {
     `Actual local runtime cwd: ${process.cwd()}`,
     `Actual local home: ${homedir()}`,
     'This BotMux session is not running in /home/mira/.session. Do not report /home/mira/.session as the working directory for this session.',
-    'For filesystem, shell, and git work, use the Mir CLI local tools against the actual local cwd above.',
-    'If the Mir local tools are unavailable, say so explicitly instead of using or reporting a cloud sandbox path.',
+    'Local filesystem, shell/bash, git, and BotMux CLI tools are available through the Mir CLI local tool bridge for this process.',
+    'When the user asks to create, read, list, edit, or inspect local files, run bash/shell commands, inspect git, or operate BotMux, you MUST call the local tools against the actual local cwd above.',
+    'Do not say the local MCP bridge is disconnected, that only a cloud sandbox is available, or that the operation is cancelled unless a concrete local tool invocation actually returned that error.',
+    'If a local tool invocation fails, report the exact failed operation and error concisely, then stop or ask for the missing input.',
   ].join('\n');
 }
 
@@ -186,6 +188,11 @@ function extractTaggedBlock(content: string, tag: string): string | undefined {
   const close = content.toLowerCase().indexOf(`</${tag}>`, start);
   if (close < 0) return undefined;
   return content.slice(start, close).trim();
+}
+
+function extractOpeningTagAttributes(content: string, tag: string): string | undefined {
+  const open = new RegExp(`<${tag}\\b([^>]*)>`, 'i').exec(content);
+  return open ? open[1] : undefined;
 }
 
 function extractXmlAttribute(attrs: string, name: string): string | undefined {
@@ -215,11 +222,81 @@ function summarizeAttachments(content: string): string[] {
   return out;
 }
 
+function summarizeRole(content: string): string | undefined {
+  const block = extractTaggedBlock(content, 'role');
+  if (!block) return undefined;
+  const role = decodeXmlEntities(block).trim();
+  if (!role) return undefined;
+  return ['Role context from BotMux:', role].join('\n');
+}
+
+function summarizeBotmuxRouting(content: string): string | undefined {
+  const block = extractTaggedBlock(content, 'botmux_routing');
+  if (!block) return undefined;
+  const routing = decodeXmlEntities(block).trim();
+  if (!routing) return undefined;
+  return ['BotMux routing instructions:', routing].join('\n');
+}
+
+function summarizeAvailableBots(content: string): string | undefined {
+  const block = extractTaggedBlock(content, 'available_bots');
+  if (!block) return undefined;
+
+  const lines: string[] = [];
+  const attrs = extractOpeningTagAttributes(content, 'available_bots') || '';
+  const hint = extractXmlAttribute(attrs, 'hint');
+  if (hint) lines.push(hint);
+
+  const botPattern = /<bot\b([^>]*)\/?>/gi;
+  for (const match of block.matchAll(botPattern)) {
+    const name = extractXmlAttribute(match[1], 'name');
+    const openId = extractXmlAttribute(match[1], 'open_id');
+    if (!name && !openId) continue;
+    lines.push(`- ${name || '(unnamed bot)'}: ${openId || '(missing open_id)'}`);
+  }
+
+  if (lines.length === 0) return undefined;
+  return [
+    'Available BotMux bots for handoff:',
+    ...lines,
+    'To hand work off to one of these bots, use local bash to run: botmux send --mention <open_id> "message".',
+  ].join('\n');
+}
+
+function summarizeMentions(content: string): string | undefined {
+  const block = extractTaggedBlock(content, 'mentions');
+  if (!block) return undefined;
+
+  const mentions: string[] = [];
+  const mentionPattern = /<mention\b([^>]*)\/?>/gi;
+  for (const match of block.matchAll(mentionPattern)) {
+    const name = extractXmlAttribute(match[1], 'name');
+    const openId = extractXmlAttribute(match[1], 'open_id');
+    if (!name && !openId) continue;
+    mentions.push(`- ${name || '(unnamed mention)'}${openId ? `: ${openId}` : ''}`);
+  }
+
+  if (mentions.length === 0) return undefined;
+  return ['Mentions in this BotMux turn:', ...mentions].join('\n');
+}
+
 function normalizeMircliPrompt(content: string): string {
   const userMessage = extractTaggedBlock(content, 'user_message');
   if (!userMessage) return content;
 
-  const sections = [decodeXmlEntities(userMessage)];
+  const context = [
+    summarizeBotmuxRouting(content),
+    summarizeRole(content),
+    summarizeMentions(content),
+    summarizeAvailableBots(content),
+  ].filter((section): section is string => Boolean(section));
+
+  const sections: string[] = [];
+  if (context.length > 0) {
+    sections.push(['BotMux context:', ...context].join('\n\n'));
+  }
+  sections.push(['User request:', decodeXmlEntities(userMessage)].join('\n'));
+
   const attachments = summarizeAttachments(content);
   if (attachments.length > 0) {
     sections.push([
