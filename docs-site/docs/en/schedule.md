@@ -28,6 +28,23 @@ Supports three schedule types plus natural-language input, posting a follow-up m
 /schedule 2026-05-01T10:00 ...
 ```
 
+## A New Topic Per Run
+
+By default every fire continues in **the original topic where the task was created**. To make each run land in a **brand-new topic** in the same chat with its own isolated session (ideal for daily-report style tasks where each run should stand alone), there are three ways:
+
+```bash
+# Slash command: prefix the prompt with the 新话题 ("new topic") keyword
+/schedule 每日17:30 新话题 generate today's discussion digest
+
+# CLI: --new-topic flag
+botmux schedule add "每日17:30" "generate digest" --new-topic
+
+# CLI: equivalent --deliver form
+botmux schedule add "每日17:30" "generate digest" --deliver new-topic
+```
+
+You can also flip an existing task between "original thread" and "new topic each run" from the **Delivery** column toggle on the dashboard's Schedules page.
+
 ## Management
 
 ```bash
@@ -35,4 +52,4 @@ Supports three schedule types plus natural-language input, posting a follow-up m
 /schedule remove|enable|disable|run <id>
 ```
 
-> Execution behavior: when due, if the session in the original topic is still alive, the prompt is injected directly into the existing session (no new worker is started); otherwise a new worker is spun up to execute in the original working directory.
+> Execution behavior: when due, if the session in the original topic is still alive, the prompt is injected directly into the existing session (no new worker is started); otherwise a new worker is spun up to execute in the original working directory. A `--new-topic` task always opens a fresh topic + new session and never reuses a prior one.

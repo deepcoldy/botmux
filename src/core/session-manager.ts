@@ -1106,7 +1106,15 @@ export async function executeScheduledTask(
   let anchor: string;
   let isContinuation = false;
 
-  if (scope === 'chat') {
+  if (task.deliver === 'new-topic') {
+    // Every fire opens a brand-new topic and runs in a fresh session. A
+    // top-level sendMessage in a topic group creates a new topic; in a plain
+    // group it's just a new top-level message. Either way we never reply
+    // in-thread and never reuse a prior session, so successive runs stay fully
+    // isolated. The returned message_id becomes this run's thread anchor.
+    anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
+    isContinuation = false;
+  } else if (scope === 'chat') {
     // A group may have been converted from 普通群 to 话题群 after the schedule
     // was created. In topic mode, a top-level sendMessage creates a new topic;
     // keep scheduled continuations in the original thread when we have one.
@@ -1202,7 +1210,10 @@ export async function executeScheduledTask(
   // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope). If a
   // formerly chat-scope task was redirected into a converted topic chat, promote
   // the runtime session to thread-scope so follow-up replies stay in-thread.
-  const runtimeScope: 'thread' | 'chat' = scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
+  const runtimeScope: 'thread' | 'chat' =
+    task.deliver === 'new-topic' ? 'thread'
+      : scope === 'chat' && anchor !== task.chatId ? 'thread'
+        : scope;
   const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`);
   const now = Date.now();
   session.larkAppId = larkAppId;

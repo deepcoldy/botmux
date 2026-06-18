@@ -190,6 +190,28 @@ describe('schedule-store', () => {
       expect(listTasks()).toHaveLength(0);
     });
 
+    it('should update the deliver mode (origin ↔ new-topic)', async () => {
+      const { createTask, updateTask, getTask } = await freshImport();
+      const task = createTask({ ...TASK_PARAMS, deliver: 'origin' });
+      expect(task.deliver).toBe('origin');
+
+      updateTask(task.id, { deliver: 'new-topic' });
+      expect(getTask(task.id)!.deliver).toBe('new-topic');
+
+      updateTask(task.id, { deliver: 'origin' });
+      expect(getTask(task.id)!.deliver).toBe('origin');
+    });
+
+    it('should persist a new-topic task created with deliver', async () => {
+      const { createTask, getTask } = await freshImport();
+      const task = createTask({ ...TASK_PARAMS, deliver: 'new-topic' });
+      // Re-read from a fresh module instance to confirm it survives disk round-trip.
+      const { getTask: getTask2 } = await freshImport();
+      expect(getTask2(task.id)!.deliver).toBe('new-topic');
+      // (within same instance too)
+      expect(getTask(task.id)!.deliver).toBe('new-topic');
+    });
+
     it('should persist updates to disk', async () => {
       const { createTask, updateTask } = await freshImport();
       const task = createTask(TASK_PARAMS);

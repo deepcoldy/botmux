@@ -68,7 +68,7 @@ function canonicalScheduleInput(t: {
   scope?: 'thread' | 'chat';
   larkAppId?: string;
   repeat?: { times: number | null; completed?: number };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
 }): unknown {
   return {
     name: t.name,
@@ -247,7 +247,7 @@ export function createTask(params: {
   creatorLarkAppId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
 }): ScheduledTask {
   load();
 
@@ -319,7 +319,7 @@ export function removeTask(id: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'chatType'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'chatType' | 'deliver'
   >>,
 ): void {
   load();

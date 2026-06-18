@@ -263,6 +263,21 @@ export function parseNaturalSchedule(input: string): ParseNLResult | null {
   return { parsed: zh.parsed, prompt, name };
 }
 
+/**
+ * Detect a leading "new topic" delivery keyword in a /schedule prompt and strip
+ * it.  Lets users write `/schedule 每日9:00 新话题 帮我看AI新闻` so every fire
+ * opens a brand-new topic in the chat.  Returns the resolved delivery mode plus
+ * the prompt with the keyword removed.  When no keyword is present (or nothing
+ * follows it) the prompt is returned unchanged with deliver='origin'.
+ */
+export function extractDeliveryMode(prompt: string): { deliver: 'origin' | 'new-topic'; prompt: string } {
+  const zh = prompt.match(/^\s*(?:每次|每回)?新(?:开|起)?(?:一个)?话题[\s,，、:：-]*(.+)$/s);
+  if (zh && zh[1].trim()) return { deliver: 'new-topic', prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*new[\s-]?topic[\s,:：-]+(.+)$/is);
+  if (en && en[1].trim()) return { deliver: 'new-topic', prompt: en[1].trim() };
+  return { deliver: 'origin', prompt };
+}
+
 // ─── next-run computation ───────────────────────────────────────────────────
 
 /** Compute the next run time for a parsed schedule. Returns ISO string, or null if exhausted. */
@@ -435,7 +450,7 @@ export function addTask(params: {
   creatorLarkAppId?: string;
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
 }): ScheduledTask {
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
@@ -565,4 +580,22 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
     body: { id, patch: { enabled } },
   });
   return { ok: true };
+}
+
+/**
+ * Toggle a task's delivery mode between 'origin' and 'new-topic' and persist.
+ * Any non-'new-topic' value (including 'local'/undefined) flips to 'new-topic';
+ * 'new-topic' flips back to 'origin'.  Emits a `schedule.updated` event so the
+ * dashboard reflects the change immediately.
+ */
+export function toggleDelivery(id: string): { ok: boolean; error?: string; deliver?: 'origin' | 'new-topic' } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  const next: 'origin' | 'new-topic' = task.deliver === 'new-topic' ? 'origin' : 'new-topic';
+  scheduleStore.updateTask(id, { deliver: next });
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch: { deliver: next } },
+  });
+  return { ok: true, deliver: next };
 }

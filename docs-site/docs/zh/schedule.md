@@ -28,6 +28,23 @@
 /schedule 2026-05-01T10:00 ...
 ```
 
+## 每次开新话题
+
+默认每次触发都续在**创建任务的原话题**里。如果想让每次执行都落在同群的一个**全新话题**、起一个独立会话（适合日报这类"每天一篇、各自独立"的任务），有三种写法：
+
+```bash
+# 斜杠命令：prompt 前加"新话题"关键字
+/schedule 每日17:30 新话题 生成今天的群讨论日报
+
+# CLI：--new-topic 旗标
+botmux schedule add "每日17:30" "生成日报" --new-topic
+
+# CLI：等价的 --deliver 写法
+botmux schedule add "每日17:30" "生成日报" --deliver new-topic
+```
+
+也可以在 dashboard 的「定时」页用「投递」列的切换按钮，把已有任务在「原话题 / 每次新话题」之间切换。
+
 ## 管理
 
 ```bash
@@ -35,4 +52,4 @@
 /schedule remove|enable|disable|run <id>
 ```
 
-> 执行行为：到点若原话题的会话还活着，prompt 直接注入现有会话（不另起 worker）；否则新拉一个 worker 在原工作目录执行。
+> 执行行为：到点若原话题的会话还活着，prompt 直接注入现有会话（不另起 worker）；否则新拉一个 worker 在原工作目录执行。`--new-topic` 任务则每次都新开话题 + 全新会话，从不复用旧会话。

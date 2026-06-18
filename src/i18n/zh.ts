@@ -402,6 +402,7 @@ export const messages: Record<string, string> = {
   'schedule.disabled': '已禁用定时任务 {id}',
   'schedule.triggered_now': '已触发定时任务 {id} 立即执行',
   'schedule.created': '✅ 定时任务已创建！\n\nID: {id}\n名称: {name}\n规则: {rule}\nPrompt: {prompt}\n工作目录: {dir}\n下次执行: {next}',
+  'schedule.deliver_new_topic': '投递方式: 每次开新话题（独立会话，互不串扰）',
   'schedule.parse_failed': '无法解析定时任务，请使用自然语言格式：\n\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报\n/schedule 每小时 检查服务健康状态\n/schedule 每30分钟 ping一下服务\n/schedule 每月1号9:00 生成月报\n\n管理命令：\n/schedule list — 查看所有任务\n/schedule remove <id> — 删除任务\n/schedule enable <id> — 启用任务\n/schedule disable <id> — 禁用任务\n/schedule run <id> — 立即执行一次',
 
   // ─── /help ───────────────────────────────────────────────────────────────

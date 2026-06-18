@@ -511,28 +511,36 @@ async function handleScheduleCommand(
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
+    // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
+    const { deliver, prompt: schedPrompt } = scheduler.extractDeliveryMode(parsed.prompt);
+    const schedName = deliver === 'new-topic'
+      ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
+      : parsed.name;
     const task = scheduler.addTask({
-      name: parsed.name,
+      name: schedName,
       schedule: trimmed,
       parsed: parsed.parsed,
-      prompt: parsed.prompt,
+      prompt: schedPrompt,
       workingDir,
       chatId,
       rootMessageId: taskScope === 'thread' ? rootId : undefined,
       scope: taskScope,
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
+      deliver,
     });
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString(timeLocale, { timeZone }) : 'N/A';
-    await sessionReply(rootId, t('schedule.created', {
+    const createdMsg = t('schedule.created', {
       id: task.id,
       name: task.name,
       rule: parsed.parsed.display,
       prompt: task.prompt,
       dir: expandHome(workingDir),
       next: nextStr,
-    }, loc));
+    }, loc);
+    const deliverNote = deliver === 'new-topic' ? '\n' + t('schedule.deliver_new_topic', undefined, loc) : '';
+    await sessionReply(rootId, createdMsg + deliverNote);
     return;
   }
 

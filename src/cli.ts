@@ -2600,6 +2600,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
+       --new-topic                     每次触发在同群开一个新话题、起独立会话（不续旧话题）
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
@@ -2779,9 +2780,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest);
+    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR] [--new-topic]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -2797,7 +2798,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const larkAppId = argValue(rest, '--lark-app-id') ?? cur?.larkAppId;
     const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
-    const deliver = (argValue(rest, '--deliver') as 'origin' | 'local' | undefined) ?? 'origin';
+    // --new-topic: every fire opens a brand-new topic in a fresh session.
+    const deliver: 'origin' | 'local' | 'new-topic' = rest.includes('--new-topic')
+      ? 'new-topic'
+      : ((argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined) ?? 'origin');
 
     if (!chatId) {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
@@ -2832,7 +2836,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   规则: ${parsed.display}`);
     console.log(`   下次执行: ${next}`);
     console.log(`   工作目录: ${workingDir}`);
-    console.log(`   话题: ${rootMessageId ?? '(将新开)'}`);
+    console.log(`   话题: ${deliver === 'new-topic' ? '(每次新开话题，独立会话)' : rootMessageId ?? '(将新开)'}`);
     return;
   }
 

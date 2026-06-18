@@ -399,6 +399,7 @@ export const messages: Record<string, string> = {
   'schedule.disabled': 'Disabled scheduled task {id}',
   'schedule.triggered_now': 'Triggered scheduled task {id} now',
   'schedule.created': '✅ Scheduled task created!\n\nID: {id}\nName: {name}\nRule: {rule}\nPrompt: {prompt}\nWorking dir: {dir}\nNext run: {next}',
+  'schedule.deliver_new_topic': 'Delivery: opens a new topic each run (fresh, isolated session)',
   'schedule.parse_failed': 'Cannot parse schedule. Use a natural-language form:\n\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report\n/schedule hourly check service health\n/schedule every 30 minutes ping the service\n/schedule 1st of each month 9:00 generate monthly report\n\nManagement:\n/schedule list — list all tasks\n/schedule remove <id> — delete a task\n/schedule enable <id> — enable a task\n/schedule disable <id> — disable a task\n/schedule run <id> — run once now',
 
   // ─── /help ───────────────────────────────────────────────────────────────

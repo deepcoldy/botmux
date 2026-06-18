@@ -610,6 +610,7 @@ export interface ScheduleRow {
   lastStatus?: 'ok' | 'error';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
+  deliver?: 'origin' | 'local' | 'new-topic';
   feishuChatLink: string;
 }
 
@@ -631,6 +632,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     lastStatus: t.lastStatus,
     lastError: t.lastError,
     repeat: t.repeat,
+    deliver: t.deliver ?? 'origin',
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -646,6 +648,9 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
+// Toggle delivery mode between 'origin' (reply in original thread) and
+// 'new-topic' (open a brand-new topic + fresh session on every fire).
+ipcRoute('POST', '/api/schedules/:id/delivery', (_req, res, p) => jsonRes(res, 200, scheduler.toggleDelivery(p.id)));
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' });

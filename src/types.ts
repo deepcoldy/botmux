@@ -242,8 +242,12 @@ export interface ScheduledTask {
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
   repeat?: { times: number | null; completed: number };
-  /** Delivery target: 'origin' (original thread, default), 'local' (log only, no delivery) */
-  deliver?: 'origin' | 'local';
+  /** Delivery target:
+   *  - 'origin' (default): reply into the original thread, or post to the chat
+   *  - 'new-topic': every fire opens a brand-new topic in the chat and runs in
+   *    a fresh session (never reuses a prior session / never replies in-thread)
+   *  - 'local': log only, no delivery */
+  deliver?: 'origin' | 'local' | 'new-topic';
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
