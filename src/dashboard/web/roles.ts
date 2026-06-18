@@ -85,7 +85,7 @@ function pageHtml(tab: 'groups' | 'profiles'): string {
   return `<section class="page roles-page">
 <div class="page-heading roles-heading">
   <div>
-    <p class="eyebrow">${t('nav.groupRoles')}</p>
+    <p class="eyebrow">${t('nav.roles')}</p>
     <h1>${t('roles.title')}</h1>
     <p>${t('roles.subtitle')}</p>
   </div>
