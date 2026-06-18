@@ -11,11 +11,41 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxHome, resolveSandboxPath, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
+
+describe('resolveSandboxHome', () => {
+  it('follows a symlinked home to its real directory', () => {
+    const root = tmp();
+    const realHome = join(root, 'real-home');
+    const linkHome = join(root, 'link-home');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkHome);
+    expect(resolveSandboxHome(linkHome)).toBe(realHome);
+  });
+
+  it('returns the input when realpath fails', () => {
+    expect(resolveSandboxHome('/nonexistent/home/path')).toBe('/nonexistent/home/path');
+  });
+});
+
+describe('resolveSandboxPath', () => {
+  it('follows symlinks for existing paths', () => {
+    const root = tmp();
+    const realDir = join(root, 'real-proj');
+    const linkDir = join(root, 'link-proj');
+    mkdirSync(realDir);
+    symlinkSync(realDir, linkDir);
+    expect(resolveSandboxPath(linkDir)).toBe(realDir);
+  });
+
+  it('returns the input when the path does not exist', () => {
+    expect(resolveSandboxPath('/nonexistent/project')).toBe('/nonexistent/project');
+  });
+});
 
 function plan(over: Partial<SandboxPlan> = {}): SandboxPlan {
   return {
