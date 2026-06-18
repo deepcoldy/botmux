@@ -85,11 +85,15 @@ function pageHtml(tab: 'groups' | 'profiles'): string {
   return `<section class="page roles-page">
 <div class="page-heading roles-heading">
   <div>
-    <p class="eyebrow">${t(isProfiles ? 'nav.roleProfiles' : 'nav.groupRoles')}</p>
-    <h1>${t(isProfiles ? 'roleProfiles.title' : 'roles.title')}</h1>
-    <p>${t(isProfiles ? 'roleProfiles.subtitle' : 'roles.subtitle')}</p>
+    <p class="eyebrow">${t('nav.groupRoles')}</p>
+    <h1>${t('roles.title')}</h1>
+    <p>${t('roles.subtitle')}</p>
   </div>
 </div>
+<nav class="wf-subnav roles-subnav">
+  <a href="#/roles" ${isProfiles ? '' : 'class="active"'}>${t('roles.tabGroups')}</a>
+  <a href="#/roles/profile" ${isProfiles ? 'class="active"' : ''}>${t('roles.tabProfiles')}</a>
+</nav>
 
 <div id="roles-by-group-view" class="roles-layout" ${isProfiles ? 'hidden' : ''}>
   <div class="roles-tree-panel">
@@ -238,8 +242,6 @@ function switchTab(tab: 'groups' | 'profiles'): void {
   activeTab = tab;
   document.getElementById('roles-by-group-view')?.toggleAttribute('hidden', tab !== 'groups');
   document.getElementById('roles-profiles-view')?.toggleAttribute('hidden', tab !== 'profiles');
-  document.getElementById('roles-tab-groups')?.classList.toggle('active', tab === 'groups');
-  document.getElementById('roles-tab-profiles')?.classList.toggle('active', tab === 'profiles');
 }
 
 function renderTree(filter: string = ''): void {
@@ -713,9 +715,6 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
   renderProfileList();
   if (selectedProfileId) await selectProfile(selectedProfileId);
 
-  document.getElementById('roles-tab-groups')?.addEventListener('click', () => switchTab('groups'));
-  document.getElementById('roles-tab-profiles')?.addEventListener('click', () => switchTab('profiles'));
-
   document.getElementById('roles-search')?.addEventListener('input', (e) => {
     renderTree((e.target as HTMLInputElement).value);
   });
@@ -813,7 +812,11 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
     }
     input?.setCustomValidity('');
     await selectProfile(profileId);
-    switchTab('profiles');
+    if (!location.hash.startsWith('#/roles/profile')) {
+      location.hash = '#/roles/profile';
+    } else {
+      switchTab('profiles');
+    }
   });
   document.getElementById('roles-profile-id')?.addEventListener('input', (e) => {
     (e.target as HTMLInputElement).setCustomValidity('');

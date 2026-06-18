@@ -220,7 +220,10 @@ function highlightNav(hash: string): void {
   for (const a of document.querySelectorAll<HTMLAnchorElement>('.sidebar-nav a')) {
     const href = a.getAttribute('href') ?? '#/';
     const current = hash || '#/';
-    a.classList.toggle('active', href === current || (href !== '#/' && current.startsWith(`${href}?`)));
+    const isActive = href === current || (
+      href !== '#/' && (current.startsWith(`${href}?`) || current.startsWith(`${href}/`))
+    );
+    a.classList.toggle('active', isActive);
   }
 }
 
@@ -253,7 +256,11 @@ function route() {
   else if (hash.startsWith('#/connectors')) renderConnectorsPage(root);
   else if (hash.startsWith('#/team/manage')) renderTeamManagePage(root);
   else if (hash.startsWith('#/team')) renderTeamFederationPage(root);
-  else if (hash.startsWith('#/role-profiles')) renderRoleProfilesPage(root);
+  else if (hash.startsWith('#/role-profiles')) {
+    window.location.replace(`#/roles/profile${hash.slice('#/role-profiles'.length)}`);
+    return;
+  }
+  else if (hash.startsWith('#/roles/profile')) renderRoleProfilesPage(root);
   else if (hash.startsWith('#/roles')) renderRolesPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
   else if (hash.startsWith('#/sessions')) renderSessionsPage(root);
