@@ -4,6 +4,7 @@
 // whether a bot is a member of a given chat.
 import { chatAvatarHtml, escapeHtml, loadingHtml, t } from './ui.js';
 import {
+  hasExplicitChatRole,
   summarizeGroupProfileMatches,
   type EffectiveRoleValue,
   type RoleProfileEntryLike,
@@ -459,27 +460,19 @@ export async function renderGroupsPage(root: HTMLElement) {
       if (!bot?.inChat) continue;
       rolesByBot.set(bot.larkAppId, groupRoleContentByBot.get(roleKey(bot.larkAppId, chat.chatId)) ?? null);
     }
+    if (!hasExplicitChatRole(rolesByBot)) return '';
     const matches = summarizeGroupProfileMatches(chat.memberBots ?? [], roleProfiles, roleProfileEntriesById, rolesByBot);
     const best = matches[0];
     if (!best) {
       return `<div class="g-profile-status muted">${t('groups.profileStatusUnmatched')}</div>`;
     }
-    const allFallback = best.fallbackMatched === best.total;
-    const allChat = best.chatMatched === best.total;
-    const key = best.kind === 'full'
-      ? allFallback
-        ? 'groups.profileStatusFullFallback'
-        : allChat
-          ? 'groups.profileStatusFullChat'
-          : 'groups.profileStatusFullMixed'
-      : 'groups.profileStatusPartial';
-    return `<div class="g-profile-status ${best.kind} ${allFallback ? 'fallback' : ''}">
+    const key = best.kind === 'full' ? 'groups.profileStatusFullChat' : 'groups.profileStatusPartial';
+    return `<div class="g-profile-status ${best.kind}">
       ${escapeHtml(t(key, {
         name: best.profileId,
         matched: best.matched,
         total: best.total,
         chat: best.chatMatched,
-        fallback: best.fallbackMatched,
       }))}
     </div>`;
   }

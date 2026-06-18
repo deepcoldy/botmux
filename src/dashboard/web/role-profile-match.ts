@@ -32,6 +32,14 @@ function normalizeEffectiveRole(value: EffectiveRoleValue | undefined): { conten
   return { content: value.content ?? null, source: value.source ?? 'none' };
 }
 
+export function hasExplicitChatRole(rolesByBot: Map<string, EffectiveRoleValue>): boolean {
+  for (const value of rolesByBot.values()) {
+    const role = normalizeEffectiveRole(value);
+    if (role.source === 'chat' && role.content !== null) return true;
+  }
+  return false;
+}
+
 export function summarizeGroupProfileMatches(
   memberBots: Array<{ larkAppId: string; inChat?: boolean }>,
   profiles: RoleProfileSummaryLike[],
@@ -56,10 +64,10 @@ export function summarizeGroupProfileMatches(
     let fallbackMatched = 0;
     for (const entry of entries) {
       const role = normalizeEffectiveRole(rolesByBot.get(entry.larkAppId));
+      if (role.source !== 'chat') continue;
       if (role.content !== entry.content) continue;
       matched++;
-      if (role.source === 'chat') chatMatched++;
-      else fallbackMatched++;
+      chatMatched++;
     }
 
     if (matched === entries.length) {

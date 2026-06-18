@@ -5,7 +5,7 @@ import {
   renderRoleProfileBootstrapSummary,
   suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
-import { summarizeGroupProfileMatches } from '../src/dashboard/web/role-profile-match.js';
+import { hasExplicitChatRole, summarizeGroupProfileMatches } from '../src/dashboard/web/role-profile-match.js';
 
 describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
   it('empty expected set → true (degenerate case, nothing to wait for)', () => {
@@ -108,7 +108,7 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
     ]],
   ]);
 
-  it('reports full and partial matches for in-chat bots only', () => {
+  it('reports matches from explicit group roles only', () => {
     const matches = summarizeGroupProfileMatches(
       [
         { larkAppId: 'botA', inChat: true },
@@ -123,23 +123,43 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
       ]),
     );
 
-    expect(matches[0]).toEqual({
-      profileId: 'main',
-      matched: 2,
-      total: 2,
-      chatMatched: 1,
-      fallbackMatched: 1,
-      kind: 'full',
-    });
-    expect(matches[1]).toEqual({
-      profileId: 'partial',
-      matched: 1,
-      total: 2,
-      chatMatched: 1,
-      fallbackMatched: 0,
-      kind: 'partial',
-    });
+    expect(matches).toEqual([
+      {
+        profileId: 'main',
+        matched: 1,
+        total: 2,
+        chatMatched: 1,
+        fallbackMatched: 0,
+        kind: 'partial',
+      },
+      {
+        profileId: 'partial',
+        matched: 1,
+        total: 2,
+        chatMatched: 1,
+        fallbackMatched: 0,
+        kind: 'partial',
+      },
+    ]);
     expect(matches.map(m => m.profileId)).not.toContain('unused');
+  });
+
+  it('does not treat fallback/default role content as a displayed profile match', () => {
+    const roles = new Map([
+      ['botA', { content: 'role A', source: 'team' }],
+      ['botB', { content: 'role B', source: 'team' }],
+    ]);
+
+    expect(hasExplicitChatRole(roles)).toBe(false);
+    expect(summarizeGroupProfileMatches(
+      [
+        { larkAppId: 'botA', inChat: true },
+        { larkAppId: 'botB', inChat: true },
+      ],
+      profiles,
+      entries,
+      roles,
+    )).toEqual([]);
   });
 
   it('returns no match when no profile entry content equals current group roles', () => {

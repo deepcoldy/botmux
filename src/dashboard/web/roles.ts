@@ -1,6 +1,7 @@
 // Roles page: group role editor + reusable role profile management.
 import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
 import {
+  hasExplicitChatRole,
   summarizeGroupProfileMatches,
   type EffectiveRoleValue,
   type RoleProfileEntryLike,
@@ -323,24 +324,16 @@ function renderRolesGroupProfileStatus(group: GroupInfo): string {
     if (!bot.inChat) continue;
     rolesByBot.set(bot.larkAppId, groupEffectiveRolesByBot.get(roleKey(bot.larkAppId, group.chatId)) ?? null);
   }
+  if (!hasExplicitChatRole(rolesByBot)) return '';
   const best = summarizeGroupProfileMatches(group.memberBots, profiles, groupProfileEntriesById, rolesByBot)[0];
   if (!best) return `<div class="roles-profile-match muted">${t('groups.profileStatusUnmatched')}</div>`;
-  const allFallback = best.fallbackMatched === best.total;
-  const allChat = best.chatMatched === best.total;
-  const key = best.kind === 'full'
-    ? allFallback
-      ? 'groups.profileStatusFullFallback'
-      : allChat
-        ? 'groups.profileStatusFullChat'
-        : 'groups.profileStatusFullMixed'
-    : 'groups.profileStatusPartial';
-  return `<div class="roles-profile-match ${best.kind} ${allFallback ? 'fallback' : ''}">
+  const key = best.kind === 'full' ? 'groups.profileStatusFullChat' : 'groups.profileStatusPartial';
+  return `<div class="roles-profile-match ${best.kind}">
     ${escapeHtml(t(key, {
       name: best.profileId,
       matched: best.matched,
       total: best.total,
       chat: best.chatMatched,
-      fallback: best.fallbackMatched,
     }))}
   </div>`;
 }
