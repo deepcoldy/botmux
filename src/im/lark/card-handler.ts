@@ -4,7 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync } from 'node:child_process';
-import { basename as pathBasename } from 'node:path';
+import { basename as pathBasename, dirname, join } from 'node:path';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
@@ -39,7 +39,7 @@ import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree } from '../../services/git-worktree.js';
+import { createRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 
@@ -57,7 +57,8 @@ interface CardActionData {
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, string>;
-    option?: string;
+    option?: string | string[];
+    selected_options?: string[];
     form_value?: Record<string, string>;  // V2 form input values
   };
   context?: { open_message_id?: string };
@@ -144,6 +145,43 @@ function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string
     `action=${value?.action ?? '?'} expected=${expected} actual=${actual}`,
   );
   return false;
+}
+
+function stringListFromFormValue(raw: unknown): string[] {
+  const tokens = Array.isArray(raw)
+    ? raw.filter((v): v is string => typeof v === 'string')
+    : typeof raw === 'string'
+      ? raw.split(/[,;]/).map(s => s.trim()).filter(Boolean)
+      : [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const token of tokens) {
+    if (seen.has(token)) continue;
+    seen.add(token);
+    result.push(token);
+  }
+  return result;
+}
+
+function multiWorktreeParentPath(repoPaths: string[], name: string): string {
+  const first = repoPaths[0];
+  const parentRoot = first ? dirname(first) : process.cwd();
+  return join(parentRoot, dirSuffixForBranch(name));
+}
+
+function worktreeChildNameForRepo(repoPath: string, projects: ProjectInfo[] | undefined): string {
+  return projects?.find(p => p.path === repoPath)?.name ?? pathBasename(repoPath);
+}
+
+function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: ProjectInfo[] | undefined): string[] {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const repoPath of repoPaths) {
+    const childName = worktreeChildNameForRepo(repoPath, projects);
+    if (seen.has(childName)) dupes.add(childName);
+    else seen.add(childName);
+  }
+  return [...dupes];
 }
 
 /**
@@ -828,7 +866,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -852,7 +890,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo / 手动填目录
     // 起会话——与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
     const pendingRepoOwnerException =
-      (value.action === 'skip_repo' || value.action === 'repo_manual_submit') && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -1554,13 +1592,64 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         displayName,
       );
     }
+
+    if (actionType === 'repo_worktree_submit' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const selectedPaths = ds.pendingWorktreePaths ?? stringListFromFormValue(action?.form_value?.repo_worktree_paths);
+      if (selectedPaths.length === 0) {
+        return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, locDs) } };
+      }
+      if (ds.worktreeCreating) {
+        return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
+      }
+      ds.pendingWorktreePaths = selectedPaths;
+      const branch = String(action?.form_value?.repo_worktree_branch ?? '').trim() || undefined;
+      const multiParent = selectedPaths.length > 1
+        ? multiWorktreeParentPath(selectedPaths, branch ?? await worktreeSlugFromContextAI(ds.session.title, ds.pendingPrompt) ?? 'worktree')
+        : undefined;
+      if (multiParent) {
+        const duplicateNames = duplicateMultiWorktreeChildNames(selectedPaths, lastRepoScan.get(ds.chatId));
+        if (duplicateNames.length > 0) {
+          return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, locDs) } };
+        }
+      }
+      const rootIdForAction = rootId;
+      void handleCardAction({
+        ...data,
+        action: {
+          value: { key: 'repo_worktree', root_id: rootIdForAction, ...(branch ? { branch } : {}), ...(multiParent ? { parent_path: multiParent } : {}) },
+          option: selectedPaths[0],
+        },
+      }, deps, larkAppId);
+      return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, locDs) } };
+    }
     return;
   }
 
   // Handle dropdown selections (option-based)
   const option = action?.option;
+  if (action?.value?.key === 'repo_worktree_select') {
+    const rootId = action?.value?.root_id;
+    if (!rootId) return;
+    const targetDs = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
+    if (!targetDs) return;
+    const isSessionOwnerOp = !!operatorOpenId && operatorOpenId === targetDs.session.ownerOpenId;
+    const allowRepo = targetDs.pendingRepo
+      ? (isSessionOwnerOp || canOperate(targetDs.larkAppId, targetDs.chatId, operatorOpenId))
+      : canOperate(targetDs.larkAppId, targetDs.chatId, operatorOpenId);
+    if (!allowRepo) {
+      logger.info(`Repo worktree multi-select blocked for ${operatorOpenId} (pending=${targetDs.pendingRepo})`);
+      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
+    }
+    targetDs.pendingWorktreePaths = stringListFromFormValue(action?.selected_options ?? option);
+    return;
+  }
   if (!option) {
     logger.warn('Card action received but no option or action value');
+    return;
+  }
+  if (Array.isArray(option)) {
+    logger.warn('Card action received multi options for a single-select handler');
     return;
   }
 
@@ -1739,6 +1828,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   const cached = lastRepoScan.get(targetDs.chatId);
   const project = cached?.find(p => p.path === selectedPath);
   const displayName = project ? `${project.name} (${project.branch})` : selectedPath;
+  const selectedWorktreePaths = isWorktreeOpen
+    ? (targetDs.pendingWorktreePaths?.length ? targetDs.pendingWorktreePaths : [selectedPath])
+    : [selectedPath];
 
   const locTarget = localeForBot(targetDs.larkAppId);
 
@@ -1764,6 +1856,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // would yank the session the winner just spawned.
       return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locTarget) } };
     }
+    const parentPath = action?.value?.parent_path;
+    if (selectedWorktreePaths.length > 1 && parentPath) {
+      const duplicateNames = duplicateMultiWorktreeChildNames(selectedWorktreePaths, cached);
+      if (duplicateNames.length > 0) {
+        return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, locTarget) } };
+      }
+    }
     targetDs.worktreeCreating = true;
     // Session generation snapshot: if another selection lands while git runs
     // (pendingRepo consumed, or the session swapped), committing this worktree
@@ -1782,8 +1881,25 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       try {
         let creation;
         try {
-          const slug = await worktreeSlugFromContextAI(targetDs.session.title, targetDs.pendingPrompt);
-          creation = await createRepoWorktree(selectedPath, { slug });
+          const branch = action?.value?.branch?.trim() || undefined;
+          const slug = branch ? undefined : await worktreeSlugFromContextAI(targetDs.session.title, targetDs.pendingPrompt);
+          const creations = [];
+          for (const repoPath of selectedWorktreePaths) {
+            creations.push(await createRepoWorktree(repoPath, {
+              branch,
+              slug,
+              worktreePath: selectedWorktreePaths.length > 1 && parentPath
+                ? join(parentPath, worktreeChildNameForRepo(repoPath, cached))
+                : undefined,
+            }));
+          }
+          creation = selectedWorktreePaths.length > 1 && parentPath
+            ? {
+                path: parentPath,
+                branch: branch ?? creations.map(c => c.branch).join(', '),
+                baseRef: Array.from(new Set(creations.map(c => c.baseRef))).join(', '),
+              }
+            : creations[0]!;
         } catch (e) {
           logger.warn(`[${tag(targetDs)}] Worktree creation failed for ${selectedPath}: ${e instanceof Error ? e.message : e}`);
           await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, locTarget));
@@ -1810,6 +1926,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
       } finally {
         targetDs.worktreeCreating = false;
+        targetDs.pendingWorktreePaths = undefined;
       }
     })();
     return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, locTarget) } };

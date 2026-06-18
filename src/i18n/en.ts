@@ -16,6 +16,7 @@ export const messages: Record<string, string> = {
   'card.btn.takeover': '🔄 Take Over',
   'card.btn.skip_repo': '▶️ Start Session Directly',
   'card.btn.manual_repo': 'Use This Directory',
+  'card.btn.worktree_repo': 'Create Worktree',
   'card.btn.half_page_up': '⇞ Page ½ Up',
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
@@ -54,10 +55,13 @@ export const messages: Record<string, string> = {
   'card.repo.placeholder_switch': 'Pick a repo to switch to',
   'card.repo.manual_placeholder': 'Enter any working directory, e.g. /path/to/project or ~/projects/foo',
   'card.repo.manual_empty': 'Please enter a working directory path',
+  'card.repo.worktree_empty': 'Please select at least one repo',
+  'card.repo.worktree_branch_placeholder': 'Branch name (optional; used as parent dir for multi-select)',
+  'card.repo.worktree_child_conflict': 'Multiple repos would map to the same worktree child directory: {names}. Rename the project first or create one worktree at a time.',
   'card.repo.current_active': 'Current working directory:',
   'card.repo.current_marker': ' ← current',
   'card.repo.note': 'You can also reply `/repo <N>` (e.g. `/repo 1`), or `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`) to skip this card. `/repo wt <N|name> [branch]` opens a fresh worktree off the remote default branch.',
-  'card.repo.placeholder_worktree': '🌿 Open a repo as a new worktree',
+  'card.repo.placeholder_worktree': '🌿 Select one or more repos for new worktrees',
   'card.repo.toast_worktree_creating': 'Creating worktree — will post in the thread when done…',
 
   // In-group authorization card
