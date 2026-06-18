@@ -202,13 +202,22 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
 
+/** CLIs whose model→Lark delivery is the daemon's stdout-runner fallback card
+ *  (NOT the model calling `botmux send`): mira (Web API runner) and mir (local
+ *  mircli runner). They can't @-trigger a peer bot themselves, so for bot-to-bot
+ *  handoffs the fallback card must carry the real <at> back to the dispatcher. */
+function isRunnerDeliveryCli(cliId?: string): boolean {
+  return cliId === 'mira' || cliId === 'mir';
+}
+
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
   if (!owner) {
-    // Mira runs through botmux's API runner and cannot execute `botmux send`
-    // itself. For bot-to-bot handoffs, address the daemon fallback card back
-    // to the original dispatcher so orchestration resumes.
-    if (effectiveCliId === 'mira' && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+    // Mira / Mir run through botmux's stdout-runner and cannot execute
+    // `botmux send` to @-trigger a peer bot. For bot-to-bot handoffs, address
+    // the daemon fallback card back to the original dispatcher so orchestration
+    // resumes (the card's real <at> is what re-wakes the dispatching bot).
+    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
       return ds.session.creatorOpenId;
     }
     return undefined;
@@ -217,9 +226,10 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
     if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner)) {
       // `/repo`-primed dispatch records the dispatching bot as owner (unlike
       // the @-mention auto-create path, which nulls ownerOpenId for bot
-      // senders). Same Mira constraint applies: the daemon fallback is Mira's
-      // only reply channel, so address the dispatcher bot here too.
-      return effectiveCliId === 'mira' ? owner : undefined;
+      // senders). Same constraint for the stdout-runner CLIs (mira/mir): the
+      // daemon fallback card is their only @-trigger channel, so address the
+      // dispatcher bot here too.
+      return isRunnerDeliveryCli(effectiveCliId) ? owner : undefined;
     }
     return owner;
   } catch {

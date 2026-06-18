@@ -425,6 +425,19 @@ describe('mir buildArgs (runner model)', () => {
     expect(args).not.toContain('opus4.6');
   });
 
+  it('passes a cliPathOverride to the runner via --mircli-bin (absolute kept as-is)', () => {
+    const overridden = createMirAdapter('/opt/mircli/bin/mircli');
+    const args = overridden.buildArgs({ sessionId: 's', resume: false });
+    const idx = args.indexOf('--mircli-bin');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('/opt/mircli/bin/mircli');
+  });
+
+  it('omits --mircli-bin when no cliPathOverride is configured', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    expect(args).not.toContain('--mircli-bin');
+  });
+
   it('has no portable copy-paste resume command (mircli owns the session store)', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-mir', cliSessionId: 'conv-abc' })).toBeNull();
   });

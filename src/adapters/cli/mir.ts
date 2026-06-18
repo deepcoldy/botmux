@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
+import { resolveCommand } from './registry.js';
 
 /**
  * Mir CLI (mircli) adapter — drives the local `mircli` in non-interactive Print
@@ -35,7 +36,16 @@ function pushOpt(args: string[], key: string, value: string | undefined): void {
   args.push(key, value);
 }
 
-export function createMirAdapter(_pathOverride?: string): CliAdapter {
+export function createMirAdapter(pathOverride?: string): CliAdapter {
+  // A configured cliPathOverride is the mircli binary the runner should spawn
+  // (resolvedBin is the node runner itself). Resolve a bare name to an absolute
+  // path and hand it to the runner via --mircli-bin; the runner falls back to
+  // MIRCLI_BIN / `mircli` on PATH when unset.
+  let cachedMircliBin: string | undefined;
+  const mircliBin = (): string | undefined => {
+    if (!pathOverride || !pathOverride.trim()) return undefined;
+    return (cachedMircliBin ??= resolveCommand(pathOverride.trim()));
+  };
   return {
     id: 'mir',
     resolvedBin: process.execPath,
@@ -45,6 +55,7 @@ export function createMirAdapter(_pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
+      pushOpt(args, '--mircli-bin', mircliBin());
       return args;
     },
 

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import {
   AttemptResumeManager,
+  RESUME_USES_SESSION_ID,
   type AttemptResumeBot,
 } from '../src/workflows/attempt-resume.js';
 import {
@@ -98,6 +99,12 @@ function seedAttempt(tmp: string, opts: { cliSessionId?: string | null; cliId?: 
   );
   return { runId, activityId, attemptId };
 }
+
+describe('RESUME_USES_SESSION_ID', () => {
+  it('treats mir as session-id-resumable (mir runner continues via --session-id)', () => {
+    expect(RESUME_USES_SESSION_ID.has('mir')).toBe(true);
+  });
+});
 
 describe('AttemptResumeManager', () => {
   afterEach(() => {

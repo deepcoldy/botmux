@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -88,5 +88,21 @@ describe('ensureMiramcpSandboxAllows', () => {
     const updated = JSON.parse(readFileSync(configPath, 'utf8'));
     expect(updated.mcps[0].sandbox.write_allow_paths).toEqual(['/data00/home/alice']);
   });
-});
 
+  it('accumulates paths across sequential (locked) calls and cleans up the lockfile', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-miramcp-'));
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      mcps: [{ id: 'mira_local', sandbox: { write_allow_paths: [] } }],
+    }));
+
+    ensureMiramcpSandboxAllows(['/ws/a'], configPath);
+    ensureMiramcpSandboxAllows(['/ws/b'], configPath);
+
+    const updated = JSON.parse(readFileSync(configPath, 'utf8'));
+    // Second call must NOT clobber the first call's addition.
+    expect(updated.mcps[0].sandbox.write_allow_paths).toEqual(['/ws/a', '/ws/b']);
+    // Lock released (no leftover .lock).
+    expect(existsSync(`${configPath}.lock`)).toBe(false);
+  });
+});

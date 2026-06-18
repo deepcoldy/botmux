@@ -35,6 +35,7 @@ interface Args {
   botName?: string;
   botOpenId?: string;
   locale?: string;
+  mircliBin?: string;
 }
 
 const OSC_PREFIX = '\x1b]777;botmux:';
@@ -57,6 +58,7 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
+    else if (key === '--mircli-bin' && val !== undefined) { out.mircliBin = val; i++; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
@@ -245,6 +247,21 @@ function summarizeMentions(content: string): string | undefined {
   return ['Mentions in this BotMux turn:', ...mentions].join('\n');
 }
 
+function summarizeSender(content: string): string | undefined {
+  const attrs = extractOpeningTagAttributes(content, 'sender');
+  if (attrs === undefined) return undefined;
+  const type = extractXmlAttribute(attrs, 'type');
+  const name = extractXmlAttribute(attrs, 'name');
+  const openId = extractXmlAttribute(attrs, 'open_id');
+  if (!name && !openId && !type) return undefined;
+  const who = `${name || '(unknown)'}${openId ? ` (${openId})` : ''}${type ? ` [${type}]` : ''}`;
+  const lines = [`Message sender: ${who}`];
+  if (type === 'bot') {
+    lines.push('The sender is another bot — your reply is delivered back to it automatically; do not worry about @-mentioning to wake it.');
+  }
+  return lines.join('\n');
+}
+
 function normalizeMircliPrompt(content: string): string {
   const userMessage = extractTaggedBlock(content, 'user_message');
   if (!userMessage) return content;
@@ -252,6 +269,7 @@ function normalizeMircliPrompt(content: string): string {
   const context = [
     summarizeBotmuxRouting(content),
     summarizeRole(content),
+    summarizeSender(content),
     summarizeMentions(content),
     summarizeAvailableBots(content),
   ].filter((section): section is string => Boolean(section));
@@ -274,9 +292,11 @@ function normalizeMircliPrompt(content: string): string {
 
 class MircliClient {
   private readonly sessionId: string;
+  private readonly mircliBin?: string;
 
   constructor(args: Args) {
     this.sessionId = args.sessionId;
+    this.mircliBin = args.mircliBin;
   }
 
   async ensureSession(): Promise<string> {
@@ -294,7 +314,8 @@ class MircliClient {
 
   private runMircli(content: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      const bin = process.env.MIRCLI_BIN || 'mircli';
+      // Precedence: adapter cliPathOverride (--mircli-bin) > MIRCLI_BIN env > PATH.
+      const bin = this.mircliBin || process.env.MIRCLI_BIN || 'mircli';
       // Patch the local MCP bridge sandbox so writes to this workspace aren't
       // blocked (workspace may sit outside the default /root,/tmp allow-list).
       if (boolEnv('MIRCLI_PATCH_MIRAMCP_CONFIG', true)) {
