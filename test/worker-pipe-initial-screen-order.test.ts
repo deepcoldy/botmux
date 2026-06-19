@@ -26,6 +26,17 @@ describe('worker pipe initial screen ordering', () => {
     expect(probeIdx).toBeGreaterThan(writeIdx);
   });
 
+  it('rechecks busy-pattern adapters when a Lark message is queued while busy', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const queueLogIdx = source.indexOf('Queued message (${pendingMessages.length} pending)');
+    const queuedProbeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);');
+    const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
+
+    expect(helperIdx).toBeGreaterThan(-1);
+    expect(queueLogIdx).toBeGreaterThan(-1);
+    expect(queuedProbeIdx).toBeGreaterThan(queueLogIdx);
+  });
+
   it('limits the reattach idle probe to adapters with a busy marker', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const helperStart = source.indexOf('function scheduleReattachIdleProbe');

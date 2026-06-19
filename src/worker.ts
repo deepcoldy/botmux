@@ -3156,6 +3156,7 @@ function sendToPty(content: string, turnId?: string): void {
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
     if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
+    scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);
   }
 }
 
