@@ -529,7 +529,6 @@ export async function renderGroupsPage(root: HTMLElement) {
       }).join('')}
       <td>
         <button class="add-bots" type="button">${t('groups.addBots')}</button>
-        <a class="btn-link" href="#/roles/profile?chatId=${escapeHtml(encodeURIComponent(c.chatId))}">${t('groups.applyProfile')}</a>
         <button class="save-profile" type="button">${t('groups.saveAsProfile')}</button>
         <button class="manage-chat" type="button">${t('groups.manage')}</button>
       </td>

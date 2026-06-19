@@ -68,7 +68,7 @@ describe('renderRoleProfileBootstrapSummary — create-group profile feedback', 
   it('renders a sent bootstrap message summary', () => {
     const html = renderRoleProfileBootstrapSummary('collab-main', 'om_bootstrap', null);
 
-    expect(html).toContain('配置集：collab-main');
+    expect(html).toContain('Profile：collab-main');
     expect(html).toContain('bootstrap 消息已发送：om_bootstrap');
     expect(html).toContain('hint-ok');
   });

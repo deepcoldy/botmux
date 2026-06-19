@@ -1209,7 +1209,7 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    // ─── Role Profiles (aggregate/proxy to daemon) ────────────────────────
+    // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
     if (req.method === 'GET' && url.pathname === '/api/role-profiles') {
       type RoleProfileAggregate = {
         profileId: string;
