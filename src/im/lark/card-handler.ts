@@ -57,9 +57,9 @@ interface CardActionData {
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, string>;
-    option?: string | string[];
-    selected_options?: string[];
-    form_value?: Record<string, string>;  // V2 form input values
+    option?: unknown;
+    options?: unknown;
+    form_value?: Record<string, unknown>;  // V2 form input values
   };
   context?: { open_message_id?: string };
   open_message_id?: string;
@@ -147,12 +147,10 @@ function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string
   return false;
 }
 
-function stringListFromFormValue(raw: unknown): string[] {
+function stringListFromLarkMultiSelect(raw: unknown): string[] {
   const tokens = Array.isArray(raw)
-    ? raw.filter((v): v is string => typeof v === 'string')
-    : typeof raw === 'string'
-      ? raw.split(/[,;]/).map(s => s.trim()).filter(Boolean)
-      : [];
+    ? raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
   const seen = new Set<string>();
   const result: string[] = [];
   for (const token of tokens) {
@@ -915,7 +913,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isWorkflowApprovalAction(value?.action)) {
     const locWf = localeForBot(larkAppId);
-    const result = await handleWorkflowApprovalAction(data, deps.workflowApprovalDeps, locWf);
+    const workflowData = data as Parameters<typeof handleWorkflowApprovalAction>[0];
+    const result = await handleWorkflowApprovalAction(workflowData, deps.workflowApprovalDeps, locWf);
     const runId = value?.run_id;
     if (result?.ok && !result.duplicate && runId) {
       await deps.workflowApprovalResolved?.(runId);
@@ -1214,7 +1213,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_text_input' && ds) {
-      const inputText = action?.form_value?.tui_custom_input ?? '';
+      const inputTextRaw = action?.form_value?.tui_custom_input;
+      const inputText = typeof inputTextRaw === 'string' ? inputTextRaw : '';
       let inputKeys: string[] = [];
       try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
       const locDs = localeForBot(ds.larkAppId);
@@ -1595,14 +1595,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (actionType === 'repo_worktree_submit' && ds) {
       const locDs = localeForBot(ds.larkAppId);
-      const selectedPaths = ds.pendingWorktreePaths ?? stringListFromFormValue(action?.form_value?.repo_worktree_paths);
+      const selectedPaths = stringListFromLarkMultiSelect(action?.form_value?.repo_worktree_paths);
       if (selectedPaths.length === 0) {
         return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, locDs) } };
       }
       if (ds.worktreeCreating) {
         return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
       }
-      ds.pendingWorktreePaths = selectedPaths;
       const branch = String(action?.form_value?.repo_worktree_branch ?? '').trim() || undefined;
       const multiParent = selectedPaths.length > 1
         ? multiWorktreeParentPath(selectedPaths, branch ?? await worktreeSlugFromContextAI(ds.session.title, ds.pendingPrompt) ?? 'worktree')
@@ -1617,7 +1616,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       void handleCardAction({
         ...data,
         action: {
-          value: { key: 'repo_worktree', root_id: rootIdForAction, ...(branch ? { branch } : {}), ...(multiParent ? { parent_path: multiParent } : {}) },
+          value: { key: 'repo_worktree', root_id: rootIdForAction, repo_worktree_paths_json: JSON.stringify(selectedPaths), ...(branch ? { branch } : {}), ...(multiParent ? { parent_path: multiParent } : {}) },
           option: selectedPaths[0],
         },
       }, deps, larkAppId);
@@ -1628,28 +1627,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   // Handle dropdown selections (option-based)
   const option = action?.option;
-  if (action?.value?.key === 'repo_worktree_select') {
-    const rootId = action?.value?.root_id;
-    if (!rootId) return;
-    const targetDs = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
-    if (!targetDs) return;
-    const isSessionOwnerOp = !!operatorOpenId && operatorOpenId === targetDs.session.ownerOpenId;
-    const allowRepo = targetDs.pendingRepo
-      ? (isSessionOwnerOp || canOperate(targetDs.larkAppId, targetDs.chatId, operatorOpenId))
-      : canOperate(targetDs.larkAppId, targetDs.chatId, operatorOpenId);
-    if (!allowRepo) {
-      logger.info(`Repo worktree multi-select blocked for ${operatorOpenId} (pending=${targetDs.pendingRepo})`);
-      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
-    }
-    targetDs.pendingWorktreePaths = stringListFromFormValue(action?.selected_options ?? option);
-    return;
-  }
   if (!option) {
     logger.warn('Card action received but no option or action value');
     return;
   }
   if (Array.isArray(option)) {
     logger.warn('Card action received multi options for a single-select handler');
+    return;
+  }
+  if (typeof option !== 'string') {
+    logger.warn('Card action received non-string option for a single-select handler');
     return;
   }
 
@@ -1828,9 +1815,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   const cached = lastRepoScan.get(targetDs.chatId);
   const project = cached?.find(p => p.path === selectedPath);
   const displayName = project ? `${project.name} (${project.branch})` : selectedPath;
-  const selectedWorktreePaths = isWorktreeOpen
-    ? (targetDs.pendingWorktreePaths?.length ? targetDs.pendingWorktreePaths : [selectedPath])
-    : [selectedPath];
+  let selectedWorktreePaths = [selectedPath];
+  if (isWorktreeOpen && typeof action?.value?.repo_worktree_paths_json === 'string') {
+    try {
+      selectedWorktreePaths = stringListFromLarkMultiSelect(JSON.parse(action.value.repo_worktree_paths_json));
+    } catch {
+      selectedWorktreePaths = [];
+    }
+    if (selectedWorktreePaths.length === 0) {
+      return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, localeForBot(targetDs.larkAppId)) } };
+    }
+  }
 
   const locTarget = localeForBot(targetDs.larkAppId);
 
@@ -1926,7 +1921,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
       } finally {
         targetDs.worktreeCreating = false;
-        targetDs.pendingWorktreePaths = undefined;
       }
     })();
     return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, locTarget) } };

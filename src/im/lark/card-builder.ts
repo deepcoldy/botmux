@@ -995,16 +995,6 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
         ],
       },
       ...(worktreeOptions.length > 0 ? [{
-        tag: 'action',
-        actions: [
-          {
-            tag: 'multi_select_static',
-            placeholder: { tag: 'plain_text', content: t('card.repo.placeholder_worktree', undefined, locale) },
-            options: worktreeOptions,
-            value: { key: 'repo_worktree_select', root_id: rootMessageId ?? '' },
-          },
-        ],
-      }, {
         tag: 'form',
         name: 'repo_worktree_submit_form',
         elements: [
@@ -1013,6 +1003,22 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
             flex_mode: 'none',
             horizontal_spacing: 'default',
             columns: [
+              {
+                tag: 'column',
+                width: 'weighted',
+                weight: 2,
+                vertical_align: 'center',
+                elements: [
+                  {
+                    tag: 'multi_select_static',
+                    name: 'repo_worktree_paths',
+                    required: true,
+                    width: 'fill',
+                    placeholder: { tag: 'plain_text', content: t('card.repo.placeholder_worktree', undefined, locale) },
+                    options: worktreeOptions,
+                  },
+                ],
+              },
               {
                 tag: 'column',
                 width: 'weighted',
