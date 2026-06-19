@@ -4,6 +4,7 @@ import { worktreeSlugFromContextAI } from '../src/services/worktree-slug-ai.js';
 
 describe('worktreeSlugFromContextAI', () => {
   const original = { ...config.worktreeSlugAI };
+  const originalDescriptor = Object.getOwnPropertyDescriptor(config, 'worktreeSlugAI');
   let originalFetch: typeof globalThis.fetch;
 
   beforeEach(() => {
@@ -21,7 +22,12 @@ describe('worktreeSlugFromContextAI', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
-    Object.assign(config.worktreeSlugAI, original);
+    const currentConfig = config.worktreeSlugAI;
+    if (currentConfig) {
+      Object.assign(currentConfig, original);
+    } else if (originalDescriptor) {
+      Object.defineProperty(config, 'worktreeSlugAI', { ...originalDescriptor, value: { ...original } });
+    }
     vi.restoreAllMocks();
   });
 
@@ -51,5 +57,13 @@ describe('worktreeSlugFromContextAI', () => {
     config.worktreeSlugAI.enabled = true;
     globalThis.fetch = vi.fn(async () => new Response('bad gateway', { status: 502 })) as any;
     await expect(worktreeSlugFromContextAI('看下新开 worktree 的时候，命名逻辑是啥？')).resolves.toBe('worktree');
+  });
+
+  it('falls back locally when the deployed config has no worktree slug AI section', async () => {
+    Reflect.deleteProperty(config, 'worktreeSlugAI');
+    globalThis.fetch = vi.fn();
+
+    await expect(worktreeSlugFromContextAI('repo test')).resolves.toBe('repo-test');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 });
