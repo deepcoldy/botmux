@@ -72,6 +72,25 @@ function boardItem(r: WhiteboardRow, selectedId?: string): string {
   </a>`;
 }
 
+function deleteModalHtml(selected: SelectedBoard): string {
+  const title = selected.row?.title || selected.id;
+  return `<div class="wb-delete-backdrop" data-delete-modal style="position:fixed;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;z-index:10000;padding:20px">
+    <div role="dialog" aria-modal="true" aria-labelledby="wb-delete-title" style="width:min(520px,92vw);background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:16px;box-shadow:0 18px 60px rgba(0,0,0,.35);padding:22px 24px">
+      <div style="display:flex;gap:14px;align-items:flex-start">
+        <div aria-hidden="true" style="width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:rgba(220,38,38,.14);color:#dc2626;font-weight:800">!</div>
+        <div style="min-width:0;flex:1">
+          <h3 id="wb-delete-title" style="margin:0 0 8px;font-size:18px">删除白板？</h3>
+          <p style="margin:0;color:var(--muted);line-height:1.6">将删除 <strong>${escapeHtml(title)}</strong>（<code>${escapeHtml(selected.id)}</code>）的 board、log、meta，并清理默认绑定和会话引用。此操作不可恢复。</p>
+        </div>
+      </div>
+      <div class="actions" style="display:flex;justify-content:flex-end;gap:10px;margin-top:22px">
+        <button type="button" data-delete-cancel>取消</button>
+        <button type="button" class="danger" data-delete-confirm>确认删除</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function detailHtml(selected: SelectedBoard | undefined, groupNames: GroupNameMap): string {
   const selectedRow = selected?.row;
   const selectedChat = selectedRow?.chatId ? groupLabel(selectedRow.chatId, groupNames) : '未绑定群 / 本地白板';
@@ -187,17 +206,34 @@ function wireDelete(root: HTMLElement, selectedId: string): void {
   const btn = root.querySelector<HTMLButtonElement>('[data-delete-whiteboard]');
   if (!btn || !selectedId) return;
   btn.addEventListener('click', async () => {
-    if (!window.confirm(`确认删除白板 ${selectedId}？此操作会删除 board/log/meta，并清理绑定。`)) return;
-    btn.disabled = true;
+    const row = root.querySelector<HTMLAnchorElement>(`.wb-item[data-whiteboard-id="${CSS.escape(selectedId)}"]`);
+    const selected: SelectedBoard = { id: selectedId, content: '', row: row ? { id: selectedId, title: row.querySelector('strong')?.textContent || selectedId, scope: '', updatedAt: '', path: '', preview: '', logCount: 0 } : undefined };
+    await confirmDelete(root, selectedId, selected);
+  });
+}
+
+async function confirmDelete(root: HTMLElement, selectedId: string, selected: SelectedBoard): Promise<void> {
+  root.querySelector('[data-delete-modal]')?.remove();
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = deleteModalHtml(selected);
+  const modal = wrapper.firstElementChild as HTMLElement;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.querySelector<HTMLElement>('[data-delete-cancel]')?.addEventListener('click', close);
+  modal.addEventListener('click', (ev) => { if (ev.target === modal) close(); });
+  modal.querySelector<HTMLButtonElement>('[data-delete-confirm]')?.addEventListener('click', async () => {
+    const confirmBtn = modal.querySelector<HTMLButtonElement>('[data-delete-confirm]');
+    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = '删除中…'; }
     try {
       const r = await fetch(`/api/whiteboards/${encodeURIComponent(selectedId)}`, { method: 'DELETE' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) throw new Error(body?.error ?? `HTTP ${r.status}`);
+      close();
       location.hash = '#/whiteboards';
       await renderWhiteboardsPage(root);
     } catch (err: any) {
+      close();
       alert(`删除失败：${err?.message ?? String(err)}`);
-      btn.disabled = false;
     }
   });
 }
