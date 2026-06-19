@@ -1465,6 +1465,17 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
   if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
 
+  // Materialise the resolved launch dir on the live session. getSessionWorkingDir()
+  // falls back to the bot-default workingDir, but the usage ledger and dashboard read
+  // `ds.workingDir ?? s.workingDir` RAW (without that fallback). A session that inherits
+  // the bot-default workingDir — i.e. one never pinned via /repo or /cd — therefore leaves
+  // ds.workingDir undefined, so getSessionTokenUsage() is handed cwd=undefined, cannot
+  // locate the CLI transcript, and the session's token usage silently never records.
+  // Pinning the resolved cwd here (it equals what the worker actually forked into) closes
+  // that gap without touching the persisted session.workingDir "unset = follow default"
+  // semantics: this is re-derived on every fork/restore.
+  ds.workingDir = cwd;
+
   // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
   // historical session. A brand-new session (resume=false) with no recorded
