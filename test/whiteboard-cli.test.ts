@@ -84,7 +84,7 @@ describe('botmux whiteboard CLI', () => {
     expect(JSON.parse(again.stdout).current.id).toBe(currentId);
   });
 
-  it('supports explicit multiple boards plus stdin update/post', () => {
+  it('supports explicit multiple boards plus stdin update', () => {
     const created = runCli(['whiteboard', 'create', '--id', 'manual_board', '--title', 'Manual', '--lark-app-id', 'app1', '--chat-id', 'chat1', '--working-dir', join(home, 'repo')]);
     expect(created.status).toBe(0);
     const second = runCli(['whiteboard', 'create', '--id', 'manual_board_2', '--title', 'Manual', '--lark-app-id', 'app2', '--chat-id', 'chat1', '--working-dir', join(home, 'other-repo')]);
@@ -98,9 +98,8 @@ describe('botmux whiteboard CLI', () => {
     expect(read.stdout).toContain('current state from stdin');
 
     const post = runCli(['whiteboard', 'post', '--id', 'manual_board', '--to', 'bot-b'], 'handoff note\n');
-    expect(post.status).toBe(0);
-    const log = readFileSync(join(dataDir, 'whiteboards', 'manual_board', 'log.jsonl'), 'utf-8');
-    expect(log).toContain('handoff note');
+    expect(post.status).not.toBe(0);
+    expect(post.stderr).toContain('Unknown whiteboard command: post');
   });
 
   it('requires --yes for overwrite', () => {
@@ -121,7 +120,7 @@ describe('botmux whiteboard CLI', () => {
     expect(sessions.session1.whiteboardId).toBe(id);
   });
 
-  it('rotates log.jsonl by size into fixed 3 archives without losing post/update entries', () => {
+  it('rotates log.jsonl by size into fixed 3 archives without losing update entries', () => {
     const env = {
       ...process.env,
       HOME: home,
@@ -142,9 +141,7 @@ describe('botmux whiteboard CLI', () => {
 
     expect(run(['whiteboard', 'create', '--id', 'rotate_board', '--title', 'Rotate']).status).toBe(0);
     for (let i = 0; i < 8; i++) {
-      const r = i % 2 === 0
-        ? run(['whiteboard', 'post', '--id', 'rotate_board'], `post-${i}-` + 'x'.repeat(120))
-        : run(['whiteboard', 'update', '--id', 'rotate_board'], `update-${i}-` + 'x'.repeat(120));
+      const r = run(['whiteboard', 'update', '--id', 'rotate_board'], `update-${i}-` + 'x'.repeat(120));
       expect(r.status).toBe(0);
     }
     const dir = join(dataDir, 'whiteboards', 'rotate_board');
@@ -157,11 +154,10 @@ describe('botmux whiteboard CLI', () => {
     const current = readFileSync(join(dir, 'log.jsonl'), 'utf-8');
     expect(current).toContain('overwrite 129 chars');
     const combined = files.map(f => readFileSync(join(dir, f), 'utf-8')).join('\n');
-    expect(combined).toContain('post-6');
     expect(combined).toContain('overwrite 129 chars');
   });
 
-  it('serializes concurrent post writes that trigger log rotation', async () => {
+  it('serializes concurrent update writes that trigger log rotation', async () => {
     const env = {
       ...process.env,
       HOME: home,
@@ -178,7 +174,7 @@ describe('botmux whiteboard CLI', () => {
     expect(create.status).toBe(0);
 
     const runs = Array.from({ length: 10 }, (_, i) => new Promise<{ status: number; stdout: string; stderr: string }>((resolve) => {
-      const child = spawn('node', [CLI_PATH, 'whiteboard', 'post', '--id', 'concurrent_board'], {
+      const child = spawn('node', [CLI_PATH, 'whiteboard', 'update', '--id', 'concurrent_board'], {
         cwd: home,
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -202,8 +198,8 @@ describe('botmux whiteboard CLI', () => {
     const combined = files.map(f => readFileSync(join(dir, f), 'utf-8')).join('\n');
     // With 3 archives + current log and a tiny threshold, only the most recent
     // entries are retained, but every concurrent writer must complete and at
-    // least one late entry must be present in the rotated set.
-    expect(combined).toMatch(/concurrent-[0-9]/);
+    // least one update audit entry must be present in the rotated set.
+    expect(combined).toContain('overwrite 173 chars');
   });
 
   it('deletes board files, bindings, and stale session whiteboard references', async () => {

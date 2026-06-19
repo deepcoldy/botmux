@@ -16,7 +16,7 @@
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
- *   botmux whiteboard status|enable|disable|current|list|read|update|post|write — local project whiteboard
+ *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
@@ -77,7 +77,6 @@ import {
   ensureDefaultWhiteboard,
   getWhiteboard,
   listWhiteboards,
-  postWhiteboardMessage,
   readWhiteboard,
   whiteboardEnabled,
   whiteboardPath,
@@ -2819,7 +2818,6 @@ Commands:
   read [--id ID]               Read board.md (requires enabled)
   path [--id ID]               Print board/meta/log paths
   update [--id ID] [text...]   Replace board.md current state (or stdin / --content-file)
-  post [--id ID] [--to X] ...  Append local message to log.jsonl only
   write --yes [--id ID] ...    Force-overwrite board.md; --yes required
 
 Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
@@ -2878,12 +2876,12 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     return;
   }
 
-  if (['read', 'update', 'post', 'write'].includes(action)) requireWhiteboardEnabled();
+  if (['read', 'update', 'write'].includes(action)) requireWhiteboardEnabled();
 
   const explicitId = argValue(rest, '--id');
   const ctx = currentWhiteboardContext(rest);
   let id = explicitId ?? ctx.session?.whiteboardId;
-  if (!id && whiteboardEnabled() && (action === 'update' || action === 'post')) {
+  if (!id && whiteboardEnabled() && action === 'update') {
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     id = meta.id;
     if (ctx.session) { ctx.session.whiteboardId = id; saveSession(ctx.session); }
@@ -2906,13 +2904,6 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     const content = whiteboardContentFromArgs(rest);
     const { writeWhiteboard } = await import('./services/whiteboard-store.js');
     const meta = writeWhiteboard(id, content, { actor: ctx.sessionId, kind: 'update' });
-    console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
-    return;
-  }
-  if (action === 'post') {
-    requireWhiteboardEnabled();
-    const content = whiteboardContentFromArgs(rest);
-    const meta = postWhiteboardMessage(id, content, { actor: ctx.sessionId, to: argValue(rest, '--to') });
     console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
     return;
   }

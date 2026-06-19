@@ -23,7 +23,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.mention_gate', undefined, locale),
   ];
   if (whiteboardEnabled()) {
-    hints.push('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update/post`；用户可见结论仍用 `botmux send`；不要写密钥/隐私。');
+    hints.push('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私。');
   }
   return hints;
 }
@@ -87,7 +87,7 @@ export function buildBotmuxSystemPromptText(opts: {
   const whiteboardRouting = whiteboardEnabled()
     ? [
       '',
-      '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update/post`；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
+      '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
     ]
     : [];
   return [

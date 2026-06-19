@@ -367,14 +367,6 @@ export function appendLog(id: string, entry: { kind: string; actor?: string; to?
   });
 }
 
-export function postWhiteboardMessage(id: string, content: string, opts?: { actor?: string; to?: string }): WhiteboardMeta {
-  if (!whiteboardEnabled()) throw new Error('whiteboard_disabled');
-  const clean = safeId(id);
-  if (!getWhiteboard(clean)) throw new Error('whiteboard_not_found');
-  appendLog(clean, { kind: 'post', actor: opts?.actor, to: opts?.to, content: content.trimEnd() });
-  return touchWhiteboard(clean);
-}
-
 function clearSessionWhiteboardRefs(id: string): number {
   let cleared = 0;
   let files: string[] = [];

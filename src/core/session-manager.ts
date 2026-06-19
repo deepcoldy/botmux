@@ -266,7 +266,7 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
   return [
     `<whiteboard id="${xmlEscape(meta.id)}">`,
     '本地项目上下文；需要时读取：`botmux whiteboard read --id ' + xmlEscape(meta.id) + '`。',
-    '更新状态：`botmux whiteboard update --id ' + xmlEscape(meta.id) + '`；本地交接：`botmux whiteboard post --id ' + xmlEscape(meta.id) + '`。',
+    '更新状态：`botmux whiteboard update --id ' + xmlEscape(meta.id) + '`。',
     '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
     '</whiteboard>',
   ].join('\n');

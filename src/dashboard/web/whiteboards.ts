@@ -119,7 +119,7 @@ function pageHtml(enabled: boolean, rows: WhiteboardRow[], groupNames: GroupName
       <div>
         <p class="eyebrow">Whiteboards</p>
         <h1>本地白板</h1>
-        <p>按群共享的本地上下文与跨 agent 交接记录。开关关闭时仅只读展示历史白板，不注入 prompt、不允许 agent CLI 读写。</p>
+        <p>按群共享的本地最新状态白板。开关关闭时仅只读展示历史白板，不注入 prompt、不允许 agent CLI 读写。</p>
       </div>
       <span class="pill ${enabled ? 'ok' : 'warn'}">${enabled ? 'Enabled' : 'Disabled'}</span>
     </div>

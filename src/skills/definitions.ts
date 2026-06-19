@@ -1121,7 +1121,7 @@ botmux whiteboard read --id <whiteboardId>
 - 关键决策和理由
 - 已验证命令/测试结果
 - 阻塞、风险、下一步计划
-- 给其他 agent 的本地交接信息
+- 需要其他 agent 继续时的当前状态说明
 
 不要写：密钥、token、个人隐私、未授权外部信息、大段无用日志。
 
@@ -1137,21 +1137,13 @@ botmux whiteboard update --id <whiteboardId> <<'EOF'
 EOF
 \`\`\`
 
-本地交接消息用 post（只进 log，不改正文摘要）：
-
-\`\`\`bash
-botmux whiteboard post --id <whiteboardId> --to <bot-or-session> <<'EOF'
-请基于 board.md 中的方案继续实现 X，重点检查 Y。
-EOF
-\`\`\`
-
 \`write --yes\` 是人工强制覆盖的兼容命令；agent 默认使用 \`update\`。
 
 ## 飞书提示
 
 白板减少飞书噪音，但不能让人完全不可见：
 - 首次创建白板，或首次更新关键状态时，用 \`botmux send\` 发一句短提示：\`已建立/更新 whiteboard:<id>，后续关键状态会维护在那里。\`
-- 普通 post/小更新不要每次通知。
+- 小更新不要每次通知。
 - 需要其他 agent 接力时，在飞书 @ 对方并让它读 \`whiteboard:<id>\`；不要复制大段白板内容。
 - 用户可见结论、需要确认的决策、最终结果仍必须 \`botmux send\`。
 `;
