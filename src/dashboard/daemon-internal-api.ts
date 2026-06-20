@@ -98,9 +98,9 @@ export interface DispatchContext {
   url: URL;
   /**
    * Authenticated caller's bot `larkAppId` — populated by `handle()` from
-   * `verify.appId` (`daemon-internal-auth.ts:232`). Read routes that surface
-   * cross-daemon aggregator state (sessions / schedules) MUST scope their
-   * response to this id so a bot A owner can't peek into bot B's state.
+   * `verify.appId` (`daemon-internal-auth.ts:232`). Aggregated read routes
+   * use this id for their default per-bot view; `?scope=global` explicitly
+   * widens `/dashboard` list reads to the Bot Owner's deployment-wide view.
    * undefined only on the test seam (`dispatchForTest`) where the caller is
    * trusted to assert their own scope.
    */
@@ -242,7 +242,13 @@ const ROUTES: RouteDef[] = [
   {
     method: 'GET',
     pathRe: /^\/__daemon\/sessions-list$/,
-    handle: async (_m, ctx, deps) => ({ status: 200, body: { sessions: scopeByCaller(deps.getSessions(), ctx.callerAppId) } }),
+    handle: async (_m, ctx, deps) => {
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      const sessions = isGlobal
+        ? deps.getSessions()
+        : scopeByCaller(deps.getSessions(), ctx.callerAppId);
+      return { status: 200, body: { sessions } };
+    },
   },
   // PR3 `/dashboard schedules` slice 1 + global-schedules (2026-06-11):
   //   dedicated list endpoint; mirrors `sessions-list` shape.
@@ -275,13 +281,18 @@ const ROUTES: RouteDef[] = [
     method: 'GET',
     pathRe: /^\/__daemon\/groups-matrix$/,
     handle: async (_m, ctx, deps) => {
-      // PR3 groups slice 1: per-bot owner gate. Filter the matrix so the
-      // caller's bot only sees rows where it's actually a member (`inChat`),
-      // and trim each chat's memberBots to the caller's single entry to
-      // avoid leaking other bots' membership state. overview-snapshot still
-      // uses the unscoped buildGroupsMatrix — that's a slice-2 concern.
+      // Default: per-bot owner gate. Filter the matrix so the caller's bot
+      // only sees rows where it's actually a member (`inChat`), and trim
+      // each chat's memberBots to the caller's single entry to avoid leaking
+      // other bots' membership state.
+      //
+      // `?scope=global`: `/dashboard` is a Bot Owner global tool panel, so
+      // return the full matrix. HMAC / owner / invoker gates are unchanged;
+      // only the read row scope widens.
       const matrix = await deps.buildGroupsMatrix();
-      const scoped = scopeGroupsMatrixByCaller(matrix, ctx.callerAppId);
+      const scoped = ctx.url.searchParams.get('scope') === 'global'
+        ? matrix
+        : scopeGroupsMatrixByCaller(matrix, ctx.callerAppId);
       return { status: 200, body: scoped };
     },
   },
@@ -308,11 +319,13 @@ const ROUTES: RouteDef[] = [
         Array.isArray((result.body as { runs?: unknown }).runs)
       ) {
         const runs = (result.body as { runs: ReadonlyArray<unknown> }).runs;
-        const scoped = scopeRowsByCaller(
-          runs,
-          ctx.callerAppId,
-          r => (r as { chatBinding?: { larkAppId?: unknown } })?.chatBinding?.larkAppId as string | undefined,
-        );
+        const scoped = ctx.url.searchParams.get('scope') === 'global'
+          ? runs.slice()
+          : scopeRowsByCaller(
+              runs,
+              ctx.callerAppId,
+              r => (r as { chatBinding?: { larkAppId?: unknown } })?.chatBinding?.larkAppId as string | undefined,
+            );
         return {
           status: 200,
           body: { ...(result.body as Record<string, unknown>), runs: scoped },
@@ -325,22 +338,20 @@ const ROUTES: RouteDef[] = [
     method: 'GET',
     pathRe: /^\/__daemon\/overview-snapshot$/,
     handle: async (_m, ctx, deps) => {
-      // Per-bot owner gate (PR3): the same scoping applied to
-      // sessions-list / schedules-list MUST also apply when the overview
-      // surface bundles those lists, otherwise bot A's owner would observe
-      // bot B's sessions/schedules through the aggregated overview.
+      // Default: apply the same per-bot scoping as the dedicated list
+      // endpoints when overview bundles aggregator state.
       //
-      // global-schedules slice (2026-06-11): when `?scope=global`, the
-      // schedules slice of the bundle is returned cross-bot — matches the
-      // `/dashboard` family's global-tool semantics. Sessions / workflows /
-      // groups still scope per-bot until their own global slices land
-      // (codex slice-cut: don't change too much at once).
+      // `?scope=global`: `/dashboard` is a global tool panel. All list
+      // modules except settings widen their read scope together; settings
+      // remains per-calling-bot until it has an explicit global write model.
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
       const groups = await deps.buildGroupsMatrix();
       return {
         status: 200,
         body: {
-          sessions: scopeByCaller(deps.getSessions(), ctx.callerAppId),
+          sessions: isGlobal
+            ? deps.getSessions()
+            : scopeByCaller(deps.getSessions(), ctx.callerAppId),
           schedules: isGlobal
             ? deps.getSchedules()
             : scopeByCaller(deps.getSchedules(), ctx.callerAppId),
@@ -410,7 +421,8 @@ const ROUTES: RouteDef[] = [
         );
         return { status: upstream.status, body: await readUpstream(upstream) };
       }
-      if (ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      if (!isGlobal && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
         return { status: 403, body: { ok: false, error: 'session_owner_mismatch' } };
       }
       const upstream = await deps.proxyToDaemon(
@@ -500,7 +512,8 @@ const ROUTES: RouteDef[] = [
       );
       if (!snap) return { status: 404, body: { ok: false, error: 'unknown_run' } };
       const owner = snap.chatBinding?.larkAppId;
-      if (owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      if (!isGlobal && owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
         return { status: 403, body: { ok: false, error: 'workflow_owner_mismatch' } };
       }
       return runApproveReject(runId, action, ctx.bodyRaw, deps.workflowsActionDeps);
@@ -521,7 +534,8 @@ const ROUTES: RouteDef[] = [
       );
       if (!snap) return { status: 404, body: { ok: false, error: 'unknown_run' } };
       const owner = snap.chatBinding?.larkAppId;
-      if (owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      if (!isGlobal && owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
         return { status: 403, body: { ok: false, error: 'workflow_owner_mismatch' } };
       }
       return runCancel(runId, ctx.bodyRaw, deps.workflowsActionDeps);

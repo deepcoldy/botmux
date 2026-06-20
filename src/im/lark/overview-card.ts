@@ -475,7 +475,7 @@ export async function handleOverviewCardAction(
     // the cards stay byte-identical no matter which entrypoint reached them.
     let r: Awaited<ReturnType<DaemonClient['request']>>;
     try {
-      r = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
+      r = await client.request({ method: 'GET', path: '/__daemon/sessions-list?scope=global' });
     } catch (e) {
       return errorToast('card.dashboard.sessions.list_failed', { reason: (e as Error).message }, locale);
     }
@@ -484,14 +484,12 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.sessions.list_failed', { reason }, locale);
     }
     const rows = ((r.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
-    // Drilldown subcard — only differs from standalone in `origin: 'overview'`,
-    // which makes buildSessionsCard render the 「🔙 返回总览」 button and
-    // thread `origin=overview` through every callback so the back affordance
-    // persists across page/refresh/detail/detail-back round-trips. Page size
-    // is the default 5 (unified globally on 2026-06-10) — no need to override.
+    // Drilldown subcard — `origin: 'overview'` keeps the back affordance,
+    // `scope: 'global'` keeps the global dashboard semantics across
+    // refresh/page/detail/action round-trips.
     const cardJson = buildSessionsCard(
       rows,
-      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview' },
+      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview', scope: 'global' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -500,10 +498,8 @@ export async function handleOverviewCardAction(
   if (action === OVERVIEW_ACTION_GOTO_SCHEDULES) {
     let r: Awaited<ReturnType<DaemonClient['request']>>;
     try {
-      // global-schedules slice (2026-06-11): `/dashboard` is a global tool
-      // panel — schedules from any bot must surface here, not just the
-      // caller's own. The Route B handler honors `?scope=global` by
-      // skipping `scopeByCaller` for this branch.
+      // `/dashboard` is a global tool panel — schedules from any bot must
+      // surface here, not just the caller's own.
       r = await client.request({ method: 'GET', path: '/__daemon/schedules-list?scope=global' });
     } catch (e) {
       return errorToast('card.dashboard.schedules.list_failed', { reason: (e as Error).message }, locale);
@@ -554,7 +550,7 @@ export async function handleOverviewCardAction(
   if (action === OVERVIEW_ACTION_GOTO_GROUPS) {
     let r: Awaited<ReturnType<DaemonClient['request']>>;
     try {
-      r = await client.request({ method: 'GET', path: '/__daemon/groups-matrix' });
+      r = await client.request({ method: 'GET', path: '/__daemon/groups-matrix?scope=global' });
     } catch (e) {
       return errorToast('card.dashboard.groups.list_failed', { reason: (e as Error).message }, locale);
     }
@@ -564,13 +560,14 @@ export async function handleOverviewCardAction(
     }
     const body = (r.body as { chats?: ReadonlyArray<GroupsChatInput>; bots?: ReadonlyArray<GroupsBotInput> }) ?? {};
     const matrix = { chats: body.chats ?? [], bots: body.bots ?? [] };
-    // Drilldown subcard — only `origin: 'overview'` differs from standalone
-    // (default page size is the unified 5).
+    // Drilldown subcard — `origin` preserves return-to-overview;
+    // `scope: 'global'` keeps full matrix semantics.
     const cardJson = buildGroupsCard(matrix, {
       invokerOpenId: expectedOwner,
       locale,
       page: 1,
       origin: 'overview',
+      scope: 'global',
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -578,11 +575,11 @@ export async function handleOverviewCardAction(
   if (action === OVERVIEW_ACTION_GOTO_WORKFLOWS) {
     let r: Awaited<ReturnType<DaemonClient['request']>>;
     try {
-      // ?all=1 to include terminal runs (default `listRuns` hides them);
-      // matches the workflows refresh action so the cards stay byte-identical.
+      // ?all=1 includes terminal runs; scope=global keeps `/dashboard`
+      // semantics across Overview drilldown and subsequent callbacks.
       r = await client.request({
         method: 'GET',
-        path: '/__daemon/workflows-runs-snapshot?all=1',
+        path: '/__daemon/workflows-runs-snapshot?all=1&scope=global',
       });
     } catch (e) {
       return errorToast('card.dashboard.workflows.list_failed', { reason: (e as Error).message }, locale);
@@ -594,7 +591,7 @@ export async function handleOverviewCardAction(
     const runs = ((r.body as { runs?: ReadonlyArray<WorkflowRunInput> })?.runs) ?? [];
     const cardJson = buildWorkflowsCard(
       runs,
-      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview' },
+      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview', scope: 'global' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -611,9 +608,8 @@ async function rebuildOverview(
 ): Promise<OverviewCardHandlerResult> {
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
-    // global-schedules slice: overview-snapshot's schedules slice is
-    // returned cross-bot under `?scope=global` so the bundled card matches
-    // the standalone `/dashboard schedules` view.
+    // `/dashboard` is global: overview-snapshot widens list modules under
+    // `?scope=global` so first-open, refresh, and drilldown stay consistent.
     r = await client.request({ method: 'GET', path: '/__daemon/overview-snapshot?scope=global' });
   } catch (e) {
     return errorToast('card.dashboard.overview.overview_failed', { reason: (e as Error).message }, locale);

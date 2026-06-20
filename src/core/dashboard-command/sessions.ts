@@ -5,7 +5,8 @@
  *   1. owner gate ran in `handleDashboardCommand` — this function is only
  *      called when the caller IS the per-bot owner (ownerOpenId passed in).
  *   2. fetch the live sessions list via PR2 Route B
- *      (`GET /__daemon/sessions-list`).
+ *      (`GET /__daemon/sessions-list?scope=global`) — `/dashboard` is the
+ *      Bot Owner's global tool panel, not a per-bot view.
  *   3. project through PR1 `composeEntries + sortByStatus + paginate` inside
  *      the card builder; emit a Feishu interactive card.
  *   4. send the card to the OWNER's DM (sendUserMessage), NOT the topic.
@@ -49,7 +50,7 @@ export async function handleDashboardSessions(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let snap;
   try {
-    snap = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
+    snap = await client.request({ method: 'GET', path: '/__daemon/sessions-list?scope=global' });
   } catch (e: any) {
     await deps.sessionReply(
       rootId,
@@ -71,7 +72,11 @@ export async function handleDashboardSessions(
   const rows = ((snap.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
   const nowMs = testDeps.nowMs ? testDeps.nowMs() : Date.now();
   // invokerOpenId = ownerOpenId so subsequent clicks still pass the invoker lock.
-  const cardJson = buildSessionsCard(rows, { invokerOpenId: ownerOpenId, locale, page: 1 }, nowMs);
+  const cardJson = buildSessionsCard(
+    rows,
+    { invokerOpenId: ownerOpenId, locale, page: 1, scope: 'global' },
+    nowMs,
+  );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {

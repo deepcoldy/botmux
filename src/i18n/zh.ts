@@ -666,13 +666,14 @@ export const messages: Record<string, string> = {
 
   // groups card (PR3 slice 1)
   'card.dashboard.groups.title': '🌐 Dashboard 群矩阵',
-  'card.dashboard.groups.count_summary': '总群数 {total} · 已加入 {joined} · 未加入 {missing} · 第 {page}/{totalPages} 页',
+  'card.dashboard.groups.count_summary': '总群数 {total} · 全覆盖 {joined} · 未覆盖 {missing} · 第 {page}/{totalPages} 页',
   'card.dashboard.groups.empty': '_当前没有群_',
   'card.dashboard.groups.refresh': '🔄 刷新',
   'card.dashboard.groups.prev': '← 上一页',
   'card.dashboard.groups.next': '下一页 →',
   'card.dashboard.groups.jump_page': '第 {n} 页',
   'card.dashboard.groups.coverage_label': '覆盖 {status}',
+  'card.dashboard.groups.joined_ratio': '已加入 {joined}/{total}',
   'card.dashboard.groups.oncall_label': 'oncall workingDir={workingDir}',
   'card.dashboard.groups.unnamed': '(未命名)',
   'card.dashboard.groups.status.in': '已加入',

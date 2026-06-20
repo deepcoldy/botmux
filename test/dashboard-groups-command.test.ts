@@ -74,7 +74,7 @@ describe('handleDashboardGroups (command path)', () => {
     );
 
     expect(requestSpy).toHaveBeenCalledOnce();
-    expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/groups-matrix' });
+    expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/groups-matrix?scope=global' });
     expect(dm.calls.length).toBe(1);
     expect(dm.calls[0].openId).toBe(OWNER);
     expect(dm.calls[0].msgType).toBe('interactive');

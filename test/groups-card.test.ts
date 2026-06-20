@@ -1,10 +1,8 @@
 /**
  * PR3 `/dashboard groups` slice 1 — card builder + callback handler tests.
  *
- * Single-column matrix (post per-bot scope): the upstream Route B endpoint
- * filters `bots` and `chats` so the rendered card sees ONLY the caller's
- * bot. This file mirrors sessions-card.test.ts but exercises the
- * groups-specific count summary, escaping, pagination, and handler arms.
+ * Exercises the groups-specific count summary, escaping, pagination, global
+ * matrix aggregation, and handler arms.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -64,7 +62,7 @@ describe('buildGroupsCard', () => {
     expect(json).toContain(GROUPS_ACTION_REFRESH);
   });
 
-  it('count summary "总群数 N · 已加入 M · 未加入 K"', () => {
+  it('count summary "总群数 N · 全覆盖 M · 未覆盖 K"', () => {
     const chats: GroupsChatInput[] = [
       chat({ chatId: 'oc_a1', name: 'in-1', memberBots: [member({ inChat: true })] }),
       chat({ chatId: 'oc_a2', name: 'in-2', memberBots: [member({ inChat: true })] }),
@@ -73,8 +71,8 @@ describe('buildGroupsCard', () => {
     ];
     const json = buildGroupsCard(matrix(chats), baseOpts);
     expect(json).toContain('总群数 4');
-    expect(json).toContain('已加入 2');
-    expect(json).toContain('未加入 2');
+    expect(json).toContain('全覆盖 2');
+    expect(json).toContain('未覆盖 2');
     expect(json).toContain('第 1/1 页');
   });
 
@@ -103,6 +101,28 @@ describe('buildGroupsCard', () => {
     expect(json).toContain('⚪');
     expect(json).toContain('🟡');
     expect(json).toContain('🔴');
+  });
+
+  it('scope=global → values carry dashboard_scope and row summarizes all bot columns', () => {
+    const otherBot: GroupsBotInput = { larkAppId: 'cli_other', botName: 'other-bot' };
+    const chats: GroupsChatInput[] = [
+      chat({
+        chatId: 'oc_global',
+        name: 'global-room',
+        memberBots: [
+          member({ inChat: true }),
+          { larkAppId: 'cli_other', botName: 'other-bot', inChat: false },
+        ],
+      }),
+    ];
+    const json = buildGroupsCard(
+      matrix(chats, [SELF_BOT, otherBot]),
+      { ...baseOpts, scope: 'global' },
+    );
+    expect(json).toContain('"dashboard_scope":"global"');
+    expect(json).toContain('覆盖 未加入');
+    expect(json).toContain('已加入 1/2');
+    expect(json).toContain('全覆盖 0 · 未覆盖 1');
   });
 
   // codex slice-1 blocker: chat.name is user-controlled (group title) and
@@ -381,6 +401,17 @@ describe('handleGroupsCardAction', () => {
     expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/groups-matrix' });
     expect(r.toast).toBeUndefined();
     expect(r.card?.type).toBe('raw');
+  });
+
+  it('refresh with dashboard_scope=global → GET /__daemon/groups-matrix?scope=global and keeps scope on rebuilt card', async () => {
+    const deps = makeDeps();
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER, dashboard_scope: 'global' }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/groups-matrix?scope=global' });
+    expect(JSON.stringify(r.card?.data)).toContain('"dashboard_scope":"global"');
   });
 
   it('page → renders requested page', async () => {

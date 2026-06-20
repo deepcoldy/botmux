@@ -87,10 +87,9 @@ describe('handleDashboardOverview (command path)', () => {
     );
 
     expect(requestSpy).toHaveBeenCalledOnce();
-    // global-schedules slice (2026-06-11): `/dashboard` first-open MUST
-    // request `?scope=global` so the schedules slice surfaces cross-bot
-    // on the initial card, matching the refresh-callback view. Without
-    // this the user would see "0 schedules" until pressing refresh.
+    // Global dashboard scope: `/dashboard` first-open MUST request
+    // `?scope=global` so list modules surface cross-bot on the initial
+    // card, matching the refresh-callback view.
     expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/overview-snapshot?scope=global' });
     expect(dm.calls.length).toBe(1);
     expect(dm.calls[0].openId).toBe(OWNER);

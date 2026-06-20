@@ -112,6 +112,9 @@ export interface BuildSessionsCardOpts {
    *  to keep that affordance across rebuilds. Undefined → standalone card,
    *  no overview link. */
   origin?: 'overview';
+  /** Dashboard scope. `'global'` means `/dashboard` shows sessions from
+   *  every bot, and write callbacks route by the row's true owner. */
+  scope?: 'global';
 }
 
 /** Build the sessions list card JSON from raw rows. Pure (composes + paginates). */
@@ -127,12 +130,12 @@ export function buildSessionsCard(
   const sorted = sortByStatus(composeEntries(rows, nowMs));
   const { items, meta } = paginate(sorted, opts.page, effectivePageSize);
 
-  // Plumb origin + page_size into every button.value so refresh/page/detail/
-  // detail-back rebuilds keep the same drilldown state. Empty values are
-  // omitted so standalone cards stay byte-identical to before this change.
+  // Plumb origin + page_size + scope into every button.value so refresh/
+  // page/detail/detail-back rebuilds keep the same dashboard context.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
   if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   const activeCount = sorted.filter(e => e.status !== 'closed').length;
   const closedCount = sorted.length - activeCount;
@@ -324,6 +327,8 @@ export interface BuildSessionsDetailCardOpts {
    *  button (single back affordance per slice). */
   origin?: 'overview';
   pageSize?: number;
+  /** Dashboard scope. Threaded into locate/close/resume/back buttons. */
+  scope?: 'global';
   /** Slice 2b — Web terminal URL for the openTerminal button. Caller computes
    *  via `buildSessionTerminalUrl(row)`; null when the session has no port
    *  (the button renders disabled with a noPort reason note). */
@@ -432,6 +437,7 @@ export function buildSessionsDetailCard(
   ) {
     backNav.page_size = String(Math.floor(opts.pageSize));
   }
+  if (opts.scope === 'global') backNav.dashboard_scope = 'global';
   // Track reason notes to render below the action row in row order.
   const reasonNotes: { key: string; titleKey?: string }[] = [];
 
@@ -761,6 +767,8 @@ export async function handleSessionsCardAction(
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+  const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
+  const pathSuffix = navScope === 'global' ? '?scope=global' : '';
 
   // ─── 3a) DETAIL — open the per-session detail card ──────────────────
   if (action === SESSIONS_ACTION_DETAIL) {
@@ -768,7 +776,7 @@ export async function handleSessionsCardAction(
     if (typeof sessionId !== 'string' || !sessionId) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
-    const r = await safeGetSessionsList(client, locale);
+    const r = await safeGetSessionsList(client, locale, pathSuffix);
     if ('errorResult' in r) return r.errorResult;
     const row = r.rows.find(s => s.sessionId === sessionId);
     if (!row) {
@@ -781,6 +789,7 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      scope: navScope,
       terminalUrl: buildSessionTerminalUrl(row),
       feishuChatLink: row.feishuChatLink ?? null,
     });
@@ -797,7 +806,7 @@ export async function handleSessionsCardAction(
     // (avoid POSTing a close on something we can't identify) AND to
     // synthesize the closed-state row in-process (codex 2026-06-09 refines:
     // a refetch after close would race with closed→list propagation).
-    const pre = await safeGetSessionsList(client, locale);
+    const pre = await safeGetSessionsList(client, locale, pathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const before = pre.rows.find(s => s.sessionId === sessionId);
     if (!before) {
@@ -829,7 +838,7 @@ export async function handleSessionsCardAction(
     try {
       resp = await client.request({
         method: 'POST',
-        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/close`,
+        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/close${pathSuffix}`,
       });
     } catch (e) {
       return errorToast('card.dashboard.sessions.close_failed', { reason: (e as Error).message }, locale);
@@ -872,6 +881,7 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      scope: navScope,
       terminalUrl: buildSessionTerminalUrl(synth),
       feishuChatLink: synth.feishuChatLink ?? null,
     });
@@ -895,7 +905,7 @@ export async function handleSessionsCardAction(
     if (typeof sessionId !== 'string' || !sessionId) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
-    const pre = await safeGetSessionsList(client, locale);
+    const pre = await safeGetSessionsList(client, locale, pathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const row = pre.rows.find(s => s.sessionId === sessionId);
     if (!row) {
@@ -915,7 +925,7 @@ export async function handleSessionsCardAction(
     try {
       resp = await client.request({
         method: 'POST',
-        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/locate`,
+        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/locate${pathSuffix}`,
       });
     } catch (e) {
       return errorToast('card.dashboard.sessions.locate_failed', { reason: (e as Error).message }, locale);
@@ -938,7 +948,7 @@ export async function handleSessionsCardAction(
     if (typeof sessionId !== 'string' || !sessionId) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
-    const pre = await safeGetSessionsList(client, locale);
+    const pre = await safeGetSessionsList(client, locale, pathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const before = pre.rows.find(s => s.sessionId === sessionId);
     if (!before) {
@@ -958,7 +968,7 @@ export async function handleSessionsCardAction(
     try {
       resp = await client.request({
         method: 'POST',
-        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/resume`,
+        path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/resume${pathSuffix}`,
       });
     } catch (e) {
       return errorToast('card.dashboard.sessions.resume_failed', { reason: (e as Error).message }, locale);
@@ -976,7 +986,7 @@ export async function handleSessionsCardAction(
     // same id), fall back to a synth with cleared closedAt and a hint
     // status. The fresh row may be one render-cycle stale; the next user
     // interaction will converge it.
-    const postRefetch = await safeGetSessionsList(client, locale);
+    const postRefetch = await safeGetSessionsList(client, locale, pathSuffix);
     let after: SessionRow | undefined;
     if (!('errorResult' in postRefetch)) {
       after = postRefetch.rows.find(s => s.sessionId === sessionId);
@@ -995,6 +1005,7 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      scope: navScope,
       terminalUrl: buildSessionTerminalUrl(after),
       feishuChatLink: after.feishuChatLink ?? null,
     });
@@ -1003,7 +1014,7 @@ export async function handleSessionsCardAction(
 
   // ─── 3c) BACK TO LIST — rebuild list card at page 1 ─────────────────
   if (action === SESSIONS_ACTION_BACK_TO_LIST) {
-    const r = await safeGetSessionsList(client, locale);
+    const r = await safeGetSessionsList(client, locale, pathSuffix);
     if ('errorResult' in r) return r.errorResult;
     const cardJson = buildSessionsCard(
       r.rows,
@@ -1013,6 +1024,7 @@ export async function handleSessionsCardAction(
         page: 1,
         pageSize: navPageSize,
         origin: navOrigin,
+        scope: navScope,
       },
       now(),
     );
@@ -1032,7 +1044,7 @@ export async function handleSessionsCardAction(
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
   }
 
-  const r = await safeGetSessionsList(client, locale);
+  const r = await safeGetSessionsList(client, locale, pathSuffix);
   if ('errorResult' in r) return r.errorResult;
   const cardJson = buildSessionsCard(
     r.rows,
@@ -1042,6 +1054,7 @@ export async function handleSessionsCardAction(
       page,
       pageSize: navPageSize,
       origin: navOrigin,
+      scope: navScope,
     },
     now(),
   );
@@ -1065,10 +1078,11 @@ export async function handleSessionsCardAction(
 async function safeGetSessionsList(
   client: DaemonClient,
   locale: Locale,
+  pathSuffix = '',
 ): Promise<{ rows: ReadonlyArray<SessionRow> } | { errorResult: SessionsCardHandlerResult }> {
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
-    r = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
+    r = await client.request({ method: 'GET', path: `/__daemon/sessions-list${pathSuffix}` });
   } catch (e) {
     return { errorResult: errorToast('card.dashboard.sessions.list_failed', { reason: (e as Error).message }, locale) };
   }

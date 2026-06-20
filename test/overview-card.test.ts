@@ -224,14 +224,10 @@ describe('handleOverviewCardAction', () => {
       settings: makeSettings(),
     };
     const requestSpy = vi.fn(async (req: any) => {
-      // global-schedules slice (2026-06-11): overview-snapshot +
-      // schedules-list now carry `?scope=global` for the `/dashboard`
-      // tool-panel; sessions-list still per-bot until its own global
-      // slice lands.
       if (req.path === '/__daemon/overview-snapshot' || req.path === '/__daemon/overview-snapshot?scope=global') {
         return { status: 200, body: overviewBody, raw: '' };
       }
-      if (req.path === '/__daemon/sessions-list') {
+      if (req.path === '/__daemon/sessions-list' || req.path === '/__daemon/sessions-list?scope=global') {
         return { status: 200, body: { sessions: [sessionRow()] }, raw: '' };
       }
       if (req.path === '/__daemon/schedules-list' || req.path === '/__daemon/schedules-list?scope=global') {
@@ -240,10 +236,10 @@ describe('handleOverviewCardAction', () => {
       if (req.path === '/__daemon/settings-snapshot') {
         return { status: 200, body: { settings: makeSettings() }, raw: '' };
       }
-      if (req.path === '/__daemon/groups-matrix') {
+      if (req.path === '/__daemon/groups-matrix' || req.path === '/__daemon/groups-matrix?scope=global') {
         return { status: 200, body: { chats: [], bots: [] }, raw: '' };
       }
-      if (req.path === '/__daemon/workflows-runs-snapshot?all=1') {
+      if (req.path === '/__daemon/workflows-runs-snapshot?all=1' || req.path === '/__daemon/workflows-runs-snapshot?all=1&scope=global') {
         return { status: 200, body: { runs: [] }, raw: '' };
       }
       return { status: 404, body: {}, raw: '' };
@@ -274,8 +270,8 @@ describe('handleOverviewCardAction', () => {
       deps,
     );
     expect(deps.requestSpy).toHaveBeenCalledOnce();
-    // global-schedules slice: overview-snapshot is requested with `?scope=global`
-    // so the schedules slice surfaces cross-bot rows.
+    // Global dashboard scope: overview-snapshot is requested with
+    // `?scope=global` so list modules surface cross-bot rows.
     expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/overview-snapshot?scope=global' });
     expect(r.toast).toBeUndefined();
     expect(r.card?.type).toBe('raw');
@@ -291,7 +287,7 @@ describe('handleOverviewCardAction', () => {
       LARK_APP_ID,
       deps,
     );
-    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list' });
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list?scope=global' });
     expect(r.toast).toBeUndefined();
     expect(r.card?.type).toBe('raw');
     const cardJson = JSON.stringify(r.card?.data);

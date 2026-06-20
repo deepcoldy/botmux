@@ -418,11 +418,10 @@ function cardActionKey(larkAppId: string, data: any): string {
     // dedupe key to keep the invariant when sizes diverge.
     origin: value?.origin,
     pageSize: value?.page_size,
-    // PR3 global-schedules slice (codex 2026-06-11): `dashboard_scope`
-    // distinguishes the global tool-panel card from a per-bot view that
-    // might happen to be open on the same module. Without it a rapid
-    // global→per-bot click sequence within the dedupe window would
-    // hash-collide and the second click would be silently dropped.
+    // `dashboard_scope` distinguishes the global tool-panel card from a
+    // per-bot view that might happen to be open on the same module. Without
+    // it a rapid global→per-bot click sequence within the dedupe window
+    // would hash-collide and the second click would be silently dropped.
     dashboardScope: value?.dashboard_scope,
   })}`;
 }

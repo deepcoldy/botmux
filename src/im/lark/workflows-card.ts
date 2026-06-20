@@ -129,6 +129,9 @@ export interface BuildWorkflowsCardOpts {
    *  "🔙 返回总览" button, and every button.value carries `origin=overview`
    *  to keep that affordance across rebuilds. Undefined → standalone card. */
   origin?: 'overview';
+  /** Dashboard scope. `'global'` means `/dashboard` shows workflow runs
+   *  from every bot, and cancel callbacks route by the run's true owner. */
+  scope?: 'global';
 }
 
 /** Tally counts across the (unfiltered) run pool. Pure.
@@ -202,12 +205,12 @@ export function buildWorkflowsCard(
   // Server order from listRuns is preserved verbatim — paginate directly.
   const paged = paginate(rows, opts.page, effectivePageSize);
 
-  // Plumb origin + page_size into every button.value so refresh/page/detail/
-  // detail-back rebuilds keep the same drilldown state. Empty values are
-  // omitted so standalone cards stay byte-identical to before this change.
+  // Plumb origin + page_size + scope into every button.value so refresh/
+  // page/detail/detail-back rebuilds keep the same dashboard context.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
   if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   const elements: unknown[] = [];
 
@@ -426,6 +429,8 @@ export interface BuildWorkflowsDetailCardOpts {
    *  button (single back affordance per slice). */
   origin?: 'overview';
   pageSize?: number;
+  /** Dashboard scope. Threaded into cancel/back buttons. */
+  scope?: 'global';
 }
 
 /**
@@ -574,6 +579,7 @@ export function buildWorkflowsDetailCard(
   ) {
     backNav.page_size = String(Math.floor(opts.pageSize));
   }
+  if (opts.scope === 'global') backNav.dashboard_scope = 'global';
 
   const cancelButton: Record<string, unknown> = {
     tag: 'button',
@@ -764,6 +770,9 @@ export async function handleWorkflowsCardAction(
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+  const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
+  const listPathSuffix = navScope === 'global' ? '&scope=global' : '';
+  const writePathSuffix = navScope === 'global' ? '?scope=global' : '';
 
   // ─── 3a) DETAIL — open the per-run detail card ──────────────────────
   if (action === WORKFLOWS_ACTION_DETAIL) {
@@ -771,7 +780,7 @@ export async function handleWorkflowsCardAction(
     if (typeof runId !== 'string' || !runId) {
       return errorToast('card.dashboard.workflows.workflow_not_found', undefined, locale);
     }
-    const r = await safeGetWorkflowsList(client, locale);
+    const r = await safeGetWorkflowsList(client, locale, listPathSuffix);
     if ('errorResult' in r) return r.errorResult;
     const row = r.runs.find(x => x.runId === runId);
     if (!row) {
@@ -784,6 +793,7 @@ export async function handleWorkflowsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -799,7 +809,7 @@ export async function handleWorkflowsCardAction(
     // (b) re-run both the PR1 matrix check AND the owner-routability check
     // against the freshest server state. This is the security-defense
     // layer at the IM tier; the Route B handler also gates by callerAppId.
-    const pre = await safeGetWorkflowsList(client, locale);
+    const pre = await safeGetWorkflowsList(client, locale, listPathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const before = pre.runs.find(x => x.runId === runId);
     if (!before) {
@@ -829,7 +839,7 @@ export async function handleWorkflowsCardAction(
     try {
       resp = await client.request({
         method: 'POST',
-        path: `/__daemon/workflows-runs/${encodeURIComponent(runId)}/cancel`,
+        path: `/__daemon/workflows-runs/${encodeURIComponent(runId)}/cancel${writePathSuffix}`,
       });
     } catch (e) {
       return errorToast('card.dashboard.workflows.cancel_failed', { reason: (e as Error).message }, locale);
@@ -847,7 +857,7 @@ export async function handleWorkflowsCardAction(
     // vanished, fall back to `{...before, status: 'cancelled'}` synth — the
     // user may see a one-cycle-stale render before the next refresh catches
     // up, which is preferable to no card at all.
-    const postRefetch = await safeGetWorkflowsList(client, locale);
+    const postRefetch = await safeGetWorkflowsList(client, locale, listPathSuffix);
     let after: WorkflowRunInput | undefined;
     if ('errorResult' in postRefetch) {
       after = undefined;
@@ -864,13 +874,14 @@ export async function handleWorkflowsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
   // ─── 3c) BACK TO LIST — rebuild list card at page 1 ─────────────────
   if (action === WORKFLOWS_ACTION_BACK_TO_LIST) {
-    const r = await safeGetWorkflowsList(client, locale);
+    const r = await safeGetWorkflowsList(client, locale, listPathSuffix);
     if ('errorResult' in r) return r.errorResult;
     const cardJson = buildWorkflowsCard(
       r.runs,
@@ -880,6 +891,7 @@ export async function handleWorkflowsCardAction(
         page: 1,
         pageSize: navPageSize,
         origin: navOrigin,
+        scope: navScope,
       },
       now(),
     );
@@ -899,7 +911,7 @@ export async function handleWorkflowsCardAction(
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
   }
 
-  const r = await safeGetWorkflowsList(client, locale);
+  const r = await safeGetWorkflowsList(client, locale, listPathSuffix);
   if ('errorResult' in r) return r.errorResult;
   const cardJson = buildWorkflowsCard(
     r.runs,
@@ -909,6 +921,7 @@ export async function handleWorkflowsCardAction(
       page,
       pageSize: navPageSize,
       origin: navOrigin,
+      scope: navScope,
     },
     now(),
   );
@@ -928,10 +941,11 @@ export async function handleWorkflowsCardAction(
 async function safeGetWorkflowsList(
   client: DaemonClient,
   locale: Locale,
+  pathSuffix = '',
 ): Promise<{ runs: ReadonlyArray<WorkflowRunInput> } | { errorResult: WorkflowsCardHandlerResult }> {
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
-    r = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1' });
+    r = await client.request({ method: 'GET', path: `/__daemon/workflows-runs-snapshot?all=1${pathSuffix}` });
   } catch (e) {
     return { errorResult: errorToast('card.dashboard.workflows.list_failed', { reason: (e as Error).message }, locale) };
   }

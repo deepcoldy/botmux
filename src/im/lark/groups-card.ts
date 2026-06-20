@@ -7,11 +7,9 @@
  * (optimistic-state + rollback) plus filter UI design which we'll land in
  * later slices.
  *
- * Per-bot scope: the Route B groups-matrix endpoint filters bots to ONLY
- * the caller's bot AND chats to ones where the caller is `inChat=true`,
- * with each retained chat's `memberBots` trimmed to the caller's single
- * entry (no roster leakage of other bots). With that scoping the matrix
- * has exactly ONE column — this card renders a single-column list.
+ * Global dashboard scope: `/dashboard` renders the full groups matrix. The
+ * row view summarizes coverage across all bot columns (joined/total) instead
+ * of pretending the matrix has a single caller-bot column.
  *
  * Identity / security mirrors sessions-card.ts (slice 1):
  *  - `invokerOpenId` is the owner's `ou_*` (invoker-lock anchor).
@@ -27,6 +25,7 @@
 
 import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
 import type {
+  GroupCoverageStatus,
   GroupRowDto,
   GroupsBotInput,
   GroupsChatInput,
@@ -92,10 +91,13 @@ export interface BuildGroupsCardOpts {
    *  to keep that affordance across rebuilds. Undefined → standalone card,
    *  no overview link. */
   origin?: 'overview';
+  /** Dashboard scope. `'global'` returns the full groups matrix rather than
+   *  the caller-bot scoped matrix. */
+  scope?: 'global';
 }
 
 /** Build the groups list card JSON. Pure (composes + paginates + renders).
- *  Single-column matrix (post-scoping). PR1 model owns the sort. */
+ *  PR1 model owns the sort. */
 export function buildGroupsCard(
   matrix: { chats: ReadonlyArray<GroupsChatInput>; bots: ReadonlyArray<GroupsBotInput> },
   opts: BuildGroupsCardOpts,
@@ -107,16 +109,14 @@ export function buildGroupsCard(
 
   // Project EVERY chat into a row DTO ourselves rather than going through
   // `buildGroupRows`, because the pipeline helper also paginates (default
-  // pageSize=20) which would silently clip past the 10-per-page card layout.
-  // The matrix is already scoped to caller's single bot upstream, so the
-  // projection cost is negligible. PR1 model owns the canonical sort — we
-  // walk `matrix.chats` verbatim, no client re-sort.
+  // pageSize=20) which would silently clip the card list. PR1 model owns the
+  // canonical sort — we walk `matrix.chats` verbatim, no client re-sort.
   const allRows: GroupRowDto[] = matrix.chats.map(c => buildGroupRow(c, matrix.bots));
 
   // Header counts before pagination.
   const total = allRows.length;
   const joined = allRows.reduce(
-    (n, r) => (r.coverage[0]?.status === 'in' ? n + 1 : n),
+    (n, r) => (aggregateCoverageStatus(r.coverage) === 'in' ? n + 1 : n),
     0,
   );
   const missing = total - joined;
@@ -129,12 +129,12 @@ export function buildGroupsCard(
   const start = (activePage - 1) * effectivePageSize;
   const pageItems = allRows.slice(start, start + effectivePageSize);
 
-  // Plumb origin + page_size into every button.value so refresh/page rebuilds
-  // keep the same drilldown state. Empty values are omitted so standalone
-  // cards stay byte-identical to before this change.
+  // Plumb origin + page_size + scope into every button.value so refresh/page
+  // rebuilds keep the same dashboard context.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
   if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   const elements: unknown[] = [];
 
@@ -275,9 +275,7 @@ export function buildGroupsCard(
 }
 
 function renderRow(row: GroupRowDto, locale: Locale): unknown {
-  // Single-column matrix: coverage[0] is the caller bot.
-  const cell = row.coverage[0];
-  const status = cell?.status ?? 'unknown';
+  const status = aggregateCoverageStatus(row.coverage);
   const icon = statusIcon(status);
 
   // Primary: status icon + bold name (or unnamed fallback) + grey id suffix.
@@ -288,16 +286,14 @@ function renderRow(row: GroupRowDto, locale: Locale): unknown {
     ? ` <font color="grey">${escapeLarkMd(row.chatIdSuffix)}</font>`
     : '';
 
-  // Secondary: 覆盖 status [· oncall workingDir=<dir>]
-  // PR1 DTO drops `oncallChat` from list-row projection (it lives on the
-  // detail DTO). For slice 1 we surface JUST the per-bot coverage label; the
-  // oncall workingDir hook is the "if present" branch — when the upstream
-  // helper ever threads oncallChat onto the list cell it'll auto-light up,
-  // but today it's a no-op so we deliberately don't reach into
-  // matrix.chats[*].memberBots[0].oncallChat from here (that'd be a layering
-  // violation against the DTO contract).
+  // Secondary: aggregate coverage across all bot columns.
   const secondaryParts: string[] = [
     t('card.dashboard.groups.coverage_label', { status: statusLabel(status, locale) }, locale),
+    t(
+      'card.dashboard.groups.joined_ratio',
+      { joined: String(row.totalBots - row.missingCount), total: String(row.totalBots) },
+      locale,
+    ),
   ];
 
   const secondary = `\n<font color="grey">${escapeLarkMd(secondaryParts.join(' · '))}</font>`;
@@ -310,6 +306,14 @@ function renderRow(row: GroupRowDto, locale: Locale): unknown {
         `${icon} **${escapeLarkMd(displayName)}**${idSuffix}` + secondary,
     },
   };
+}
+
+function aggregateCoverageStatus(cells: ReadonlyArray<GroupRowDto['coverage'][number]>): GroupCoverageStatus {
+  if (cells.length === 0) return 'unknown';
+  if (cells.some(c => c.status === 'error')) return 'error';
+  if (cells.some(c => c.status === 'unknown')) return 'unknown';
+  if (cells.every(c => c.status === 'in')) return 'in';
+  return 'out';
 }
 
 /**
@@ -393,6 +397,8 @@ export async function handleGroupsCardAction(
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+  const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
+  const pathSuffix = navScope === 'global' ? '?scope=global' : '';
 
   // Resolve target page.
   let page = 1;
@@ -412,7 +418,7 @@ export async function handleGroupsCardAction(
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
     const client = deps.createClient(larkAppId);
-    r = await client.request({ method: 'GET', path: '/__daemon/groups-matrix' });
+    r = await client.request({ method: 'GET', path: `/__daemon/groups-matrix${pathSuffix}` });
   } catch (e) {
     return errorToast('card.dashboard.groups.list_failed', { reason: (e as Error).message }, locale);
   }
@@ -434,6 +440,7 @@ export async function handleGroupsCardAction(
     page,
     pageSize: navPageSize,
     origin: navOrigin,
+    scope: navScope,
   });
   return {
     card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },

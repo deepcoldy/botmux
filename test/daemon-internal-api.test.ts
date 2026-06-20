@@ -187,6 +187,14 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     expect(ids).not.toContain('sB');
   });
 
+  it('sessions-list with callerAppId=cli_a AND ?scope=global → ALL rows cross-bot', async () => {
+    const api = createDaemonInternalApi(mixedDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list?scope=global'), '', 'cli_a');
+    expect(r.status).toBe(200);
+    const sessions = (r.body as any).sessions as Array<{ sessionId: string }>;
+    expect(sessions.map(s => s.sessionId).sort()).toEqual(['sA', 'sB', 'sLegacy']);
+  });
+
   it('schedules-list with callerAppId=cli_b → only cli_b rows + legacy (no cli_a)', async () => {
     const api = createDaemonInternalApi(mixedDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list'), '', 'cli_b');
@@ -197,11 +205,11 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     expect(ids).not.toContain('schA');
   });
 
-  /** ─── global-schedules slice (codex 2026-06-11) ──────────────────────
+  /** ─── global dashboard read scope ───────────────────────────────────
    *  `/dashboard` is a Bot-Owner tool panel; `?scope=global` returns the
-   *  schedules slice cross-bot (no `scopeByCaller`). The per-bot default
-   *  is preserved for any caller that doesn't opt in, so existing
-   *  isolation tests stay deterministic. */
+   *  list module cross-bot (no `scopeByCaller`). The per-bot default is
+   *  preserved for callers that don't opt in, so isolation tests remain
+   *  deterministic. */
   it('schedules-list with callerAppId=cli_b AND ?scope=global → ALL rows cross-bot (cli_a + cli_b + legacy)', async () => {
     const api = createDaemonInternalApi(mixedDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list?scope=global'), '', 'cli_b');
@@ -248,21 +256,13 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     expect(body.groups).toBeDefined();
   });
 
-  /** global-schedules slice (codex 2026-06-11) — `?scope=global` widens
-   *  the schedules slice cross-bot AT the overview surface too, matching
-   *  the dedicated schedules-list endpoint. Sessions stay per-bot until
-   *  their own global slice lands (codex scope-cut: don't change too
-   *  much at once). */
-  it('overview-snapshot with callerAppId=cli_b AND ?scope=global → schedules cross-bot; sessions still per-bot', async () => {
+  it('overview-snapshot with callerAppId=cli_b AND ?scope=global → sessions + schedules cross-bot', async () => {
     const api = createDaemonInternalApi(mixedDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/overview-snapshot?scope=global'), '', 'cli_b');
     expect(r.status).toBe(200);
     const body = r.body as any;
-    // Sessions: still per-bot (no slice yet).
     const sessIds = (body.sessions as Array<{ sessionId: string }>).map(s => s.sessionId).sort();
-    expect(sessIds).toEqual(['sB', 'sLegacy']);
-    expect(sessIds).not.toContain('sA');
-    // Schedules: cross-bot.
+    expect(sessIds).toEqual(['sA', 'sB', 'sLegacy']);
     const schedIds = (body.schedules as Array<{ id: string }>).map(s => s.id).sort();
     expect(schedIds).toEqual(['schA', 'schB', 'schLegacy']);
   });
@@ -314,6 +314,14 @@ describe('workflows-runs-snapshot: per-bot scope + query passthrough', () => {
     const ids = runs.map(x => x.runId).sort();
     expect(ids).toEqual(['rB', 'rLegacy']);
     expect(ids).not.toContain('rA');
+  });
+
+  it('callerAppId=cli_b AND ?scope=global → ALL runs cross-bot', async () => {
+    const api = createDaemonInternalApi(mixedWorkflowsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/workflows-runs-snapshot?scope=global'), '', 'cli_b');
+    expect(r.status).toBe(200);
+    const runs = (r.body as any).runs as Array<{ runId: string }>;
+    expect(runs.map(x => x.runId).sort()).toEqual(['rA', 'rB', 'rLegacy']);
   });
 
   it('query passthrough — ?all=1&status=running,waiting reaches listRuns with typed shape; scoping does NOT eat the query', async () => {
@@ -445,6 +453,18 @@ describe('groups-matrix: codex strict per-bot scope', () => {
       'c1', 'c2', 'c3', 'c4_legacy', 'c5_no_members',
     ]);
     // Full bots list (including legacy without larkAppId).
+    expect(body.bots).toHaveLength(3);
+  });
+
+  it('callerAppId=cli_a AND ?scope=global → full unscoped matrix returned', async () => {
+    const api = createDaemonInternalApi(mixedGroupsDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/groups-matrix?scope=global'), '', 'cli_a');
+    expect(r.status).toBe(200);
+    const body = r.body as { chats: Array<{ chatId: string; memberBots?: unknown[] }>; bots: Array<{ larkAppId?: string; name?: string }> };
+    expect(body.chats.map(c => c.chatId).sort()).toEqual([
+      'c1', 'c2', 'c3', 'c4_legacy', 'c5_no_members',
+    ]);
+    expect(body.chats.find(c => c.chatId === 'c1')?.memberBots).toHaveLength(2);
     expect(body.bots).toHaveLength(3);
   });
 
@@ -728,6 +748,23 @@ describe('dispatch: workflows write — cross-bot owner gate', () => {
       );
       expect(r.status).toBe(200);
       expect((deps.workflowsActionDeps as any).proxyToDaemon).toHaveBeenCalledTimes(1);
+      expect((deps.workflowsActionDeps as any).proxyToDaemon).toHaveBeenCalledWith(
+        'cli_b',
+        `/api/workflows/runs/r1/${action}`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
+    it(`?scope=global + callerAppId=cli_a + owner=cli_b → proxyToDaemon called, NOT 403 (${action})`, async () => {
+      const deps = ownerMismatchDeps();
+      const api = createDaemonInternalApi(deps);
+      const r = await api.dispatchForTest(
+        'POST',
+        url(`/__daemon/workflows-runs/r1/${action}?scope=global`),
+        JSON.stringify({}),
+        'cli_a',
+      );
+      expect(r.status).toBe(200);
       expect((deps.workflowsActionDeps as any).proxyToDaemon).toHaveBeenCalledWith(
         'cli_b',
         `/api/workflows/runs/r1/${action}`,
@@ -1221,6 +1258,23 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
         const deps = ownerMismatchDeps();
         const api = createDaemonInternalApi(deps);
         const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-known/${action}`), '', 'cli_b');
+        expect(r.status).toBe(200);
+        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+          'cli_b',
+          `/api/sessions/sess-known/${action}`,
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+
+      it(`?scope=global + callerAppId=cli_a + owner=cli_b → proxy owner cli_b, NOT 403 (${action})`, async () => {
+        const deps = ownerMismatchDeps();
+        const api = createDaemonInternalApi(deps);
+        const r = await api.dispatchForTest(
+          'POST',
+          url(`/__daemon/sessions/sess-known/${action}?scope=global`),
+          '',
+          'cli_a',
+        );
         expect(r.status).toBe(200);
         expect(deps.proxyToDaemon).toHaveBeenCalledWith(
           'cli_b',

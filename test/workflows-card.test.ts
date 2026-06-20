@@ -238,6 +238,20 @@ describe('handleWorkflowsCardAction', () => {
     expect(r.card?.type).toBe('raw');
   });
 
+  it('refresh with dashboard_scope=global → GET ?all=1&scope=global and keeps scope on rebuilt card', async () => {
+    const deps = makeDeps();
+    const r = await handleWorkflowsCardAction(
+      makeAction({ action: WORKFLOWS_ACTION_REFRESH, invoker_open_id: INVOKER, dashboard_scope: 'global' }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({
+      method: 'GET',
+      path: '/__daemon/workflows-runs-snapshot?all=1&scope=global',
+    });
+    expect(JSON.stringify(r.card?.data)).toContain('"dashboard_scope":"global"');
+  });
+
   it('page=2 with 25 rows → 第 2/5 页', async () => {
     // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
     const rows = Array.from({ length: 25 }, (_, i) =>

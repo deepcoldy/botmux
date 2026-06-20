@@ -71,6 +71,7 @@ describe('handleDashboardSessions (command path)', () => {
     );
 
     expect(requestSpy).toHaveBeenCalledOnce();
+    expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list?scope=global' });
     expect(dm.calls.length).toBe(1);
     expect(dm.calls[0].openId).toBe(OWNER);
     expect(dm.calls[0].msgType).toBe('interactive');

@@ -79,8 +79,8 @@ function sampleSnapshotBody() {
 describe('handleCardAction → overview dispatch returns { card } only on success', () => {
   it('dash_overview_refresh: result.card is the rebuilt overview card; updateMessage NOT called', async () => {
     const requestSpy = vi.fn(async (req: any) => {
-      // global-schedules slice (2026-06-11): overview-snapshot is fetched
-      // with `?scope=global` so schedules are returned cross-bot.
+      // Global dashboard scope: overview-snapshot is fetched with
+      // `?scope=global` so list modules are returned cross-bot.
       if (req.method === 'GET' && req.path === '/__daemon/overview-snapshot?scope=global') {
         return { status: 200, raw: '', body: sampleSnapshotBody() };
       }
@@ -107,7 +107,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
 
   it('dash_overview_goto_sessions: result.card is the sessions card body; updateMessage NOT called', async () => {
     const requestSpy = vi.fn(async (req: any) => {
-      if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+      if (req.method === 'GET' && req.path === '/__daemon/sessions-list?scope=global') {
         return {
           status: 200, raw: '',
           body: { sessions: [
@@ -136,6 +136,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
     const cardJson = JSON.stringify(result.card?.data);
     expect(cardJson).toContain('Dashboard 会话');
     expect(cardJson).not.toContain('Dashboard 总览');
+    expect(cardJson).toContain('"dashboard_scope":"global"');
 
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
@@ -269,7 +270,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
         memberBots: [{ larkAppId: LARK_APP_ID, botName: 'self', inChat: true, oncallChat: null }],
       }));
       const requestSpy = vi.fn(async (req: any) => {
-        if (req.path === '/__daemon/groups-matrix') {
+        if (req.path === '/__daemon/groups-matrix?scope=global') {
           return { status: 200, raw: '', body: { chats, bots: [{ larkAppId: LARK_APP_ID, botName: 'self' }] } };
         }
         throw new Error('unexpected: ' + JSON.stringify(req));
@@ -293,6 +294,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
       expect(cardJson).toContain('返回总览');
       expect(cardJson).toContain('"origin":"overview"');
+      expect(cardJson).toContain('"dashboard_scope":"global"');
       // page_size omitted at default.
       expect(cardJson).not.toContain('"page_size"');
     });
@@ -310,7 +312,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       const requestSpy = vi.fn(async (req: any) => {
         // codex 2026-06-09 blocker: must request ?all=1 (default listRuns
         // hides terminal runs). Match path strictly.
-        if (req.method === 'GET' && req.path === '/__daemon/workflows-runs-snapshot?all=1') {
+        if (req.method === 'GET' && req.path === '/__daemon/workflows-runs-snapshot?all=1&scope=global') {
           return { status: 200, raw: '', body: { runs } };
         }
         throw new Error('unexpected: ' + JSON.stringify(req));
@@ -334,6 +336,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
       expect(cardJson).toContain('返回总览');
       expect(cardJson).toContain('"origin":"overview"');
+      expect(cardJson).toContain('"dashboard_scope":"global"');
       // page_size omitted at default.
       expect(cardJson).not.toContain('"page_size"');
     });

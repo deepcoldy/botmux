@@ -663,13 +663,14 @@ export const messages: Record<string, string> = {
 
   // groups card (PR3 slice 1)
   'card.dashboard.groups.title': '🌐 Dashboard Group Matrix',
-  'card.dashboard.groups.count_summary': 'Total {total} · Joined {joined} · Missing {missing} · Page {page}/{totalPages}',
+  'card.dashboard.groups.count_summary': 'Total {total} · Full coverage {joined} · Missing {missing} · Page {page}/{totalPages}',
   'card.dashboard.groups.empty': '_No groups yet_',
   'card.dashboard.groups.refresh': '🔄 Refresh',
   'card.dashboard.groups.prev': '← Prev',
   'card.dashboard.groups.next': 'Next →',
   'card.dashboard.groups.jump_page': 'Page {n}',
   'card.dashboard.groups.coverage_label': 'coverage {status}',
+  'card.dashboard.groups.joined_ratio': 'joined {joined}/{total}',
   'card.dashboard.groups.oncall_label': 'oncall workingDir={workingDir}',
   'card.dashboard.groups.unnamed': '(unnamed)',
   'card.dashboard.groups.status.in': 'in',

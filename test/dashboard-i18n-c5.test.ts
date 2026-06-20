@@ -155,6 +155,7 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.groups.next',
   'card.dashboard.groups.jump_page',
   'card.dashboard.groups.coverage_label',
+  'card.dashboard.groups.joined_ratio',
   'card.dashboard.groups.unnamed',
   'card.dashboard.groups.status.in',
   'card.dashboard.groups.status.out',

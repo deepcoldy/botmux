@@ -3,12 +3,12 @@
  *
  * Mirrors `/dashboard sessions` slice 1: owner gate has ALREADY run in
  * `handleDashboardCommand`; this function only fetches the matrix from PR2
- * Route B (`GET /__daemon/groups-matrix`), builds the card, and DMs the
- * owner with the topic getting a short `dm_sent` confirmation.
+ * Route B (`GET /__daemon/groups-matrix?scope=global`), builds the card,
+ * and DMs the owner with the topic getting a short `dm_sent` confirmation.
+ * `/dashboard` is the Bot Owner's global tool panel, not a per-bot view.
  *
  * Slice 1 is read-only: no leave / add-bots / oncall-bind / oncall-unbind /
- * detail / search / filter / disband. The matrix is per-bot-scoped server
- * side so the rendered card shows ONLY the caller's bot column.
+ * detail / search / filter / disband.
  */
 
 import type { LarkMessage } from '../../types.js';
@@ -46,7 +46,7 @@ export async function handleDashboardGroups(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let snap;
   try {
-    snap = await client.request({ method: 'GET', path: '/__daemon/groups-matrix' });
+    snap = await client.request({ method: 'GET', path: '/__daemon/groups-matrix?scope=global' });
   } catch (e: any) {
     await deps.sessionReply(
       rootId,
@@ -75,7 +75,12 @@ export async function handleDashboardGroups(
     bots: body.bots ?? [],
   };
   // invokerOpenId = ownerOpenId so subsequent clicks still pass the invoker lock.
-  const cardJson = buildGroupsCard(matrix, { invokerOpenId: ownerOpenId, locale, page: 1 });
+  const cardJson = buildGroupsCard(matrix, {
+    invokerOpenId: ownerOpenId,
+    locale,
+    page: 1,
+    scope: 'global',
+  });
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {

@@ -687,6 +687,17 @@ describe('handleSessionsCardAction', () => {
     expect(r.card?.type).toBe('raw');
   });
 
+  it('refresh with dashboard_scope=global → GET /__daemon/sessions-list?scope=global and keeps scope on rebuilt card', async () => {
+    const deps = makeDeps();
+    const r = await handleSessionsCardAction(
+      makeAction({ action: SESSIONS_ACTION_REFRESH, invoker_open_id: INVOKER, dashboard_scope: 'global' }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list?scope=global' });
+    expect(JSON.stringify(r.card?.data)).toContain('"dashboard_scope":"global"');
+  });
+
   it('page → uses the requested page index (clamped)', async () => {
     // 25 rows / PAGE_SIZE=5 = 5 pages.
     const rows = Array.from({ length: 25 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));

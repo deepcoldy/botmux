@@ -3,8 +3,10 @@
  *
  * Mirrors `/dashboard sessions` slice 1: owner gate has ALREADY run in
  * `handleDashboardCommand`; this function only fetches the run list from
- * PR2 Route B (`GET /__daemon/workflows-runs-snapshot`), builds the card,
- * and DMs the owner with the topic getting a short `dm_sent` confirmation.
+ * PR2 Route B (`GET /__daemon/workflows-runs-snapshot?all=1&scope=global`),
+ * builds the card, and DMs the owner with the topic getting a short
+ * `dm_sent` confirmation. `/dashboard` is the Bot Owner's global tool panel,
+ * not a per-bot view.
  *
  * No cancel / approve / reject / search / status filter in slice 1 —
  * read-only listing only.
@@ -49,7 +51,7 @@ export async function handleDashboardWorkflows(
     // "non-terminal list", not the runs history we advertise. The endpoint
     // already transparently forwards `?all`; only the consumer side needs to
     // ask for it.
-    snap = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1' });
+    snap = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1&scope=global' });
   } catch (e: any) {
     await deps.sessionReply(
       rootId,
@@ -72,7 +74,11 @@ export async function handleDashboardWorkflows(
   const rows = ((snap.body as { runs?: ReadonlyArray<WorkflowRunInput> })?.runs) ?? [];
   const nowMs = testDeps.nowMs ? testDeps.nowMs() : Date.now();
   // invokerOpenId = ownerOpenId so subsequent clicks still pass the invoker lock.
-  const cardJson = buildWorkflowsCard(rows, { invokerOpenId: ownerOpenId, locale, page: 1 }, nowMs);
+  const cardJson = buildWorkflowsCard(
+    rows,
+    { invokerOpenId: ownerOpenId, locale, page: 1, scope: 'global' },
+    nowMs,
+  );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
