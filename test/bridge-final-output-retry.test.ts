@@ -17,6 +17,7 @@ const addReactionMock = vi.fn(async () => 'reaction_id');
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
+  removeReaction: vi.fn(async () => {}),
   sendUserMessage: vi.fn(async () => {}),
   deleteMessage: vi.fn(async () => {}),
   getChatInfo: vi.fn(),
@@ -300,7 +301,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('<at id=ou_human></at>');
   });
 
-  it('patches an open pending response card instead of sending a bridge fallback reply', async () => {
+  it('always delivers the answer as a fresh message (never PATCHes a card in place)', async () => {
+    // The placeholder pending-card + its PATCH delivery were removed entirely
+    // (message.patch is silent — no Feishu notification/unread). The bridge
+    // final-output now unconditionally goes out as a brand-new reply.
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -310,8 +314,6 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     });
 
     const ds = makeDs();
-    ds.session.pendingResponseCardId = 'om_pending';
-    ds.session.pendingResponseCardState = 'open';
     ds.session.quoteTargetId = 'om_user';
 
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
@@ -319,42 +321,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(sessionReply).not.toHaveBeenCalled();
-    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_pending', expect.any(String));
-    expect(ds.session.pendingResponseCardId).toBeUndefined();
-    expect(ds.session.pendingResponseCardState).toBe('patched');
-    expect(addReactionMock).toHaveBeenCalledWith('app_test', 'om_user', 'GoGoGo');
-    expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
-  });
-
-  it('does not patch a newer pending card when retrying an older final output', async () => {
-    updateMessageMock.mockRejectedValueOnce(new Error('transient pending patch')).mockResolvedValueOnce(undefined);
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-
-    const ds = makeDs();
-    ds.session.pendingResponseCardId = 'om_a';
-    ds.session.pendingResponseCardState = 'open';
-
-    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
-    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
-
-    await vi.advanceTimersByTimeAsync(10);
-    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_a', expect.any(String));
-    ds.session.pendingResponseCardId = 'om_b';
-    ds.session.pendingResponseCardState = 'open';
-
-    await vi.advanceTimersByTimeAsync(5000);
-
-    expect(updateMessageMock).toHaveBeenCalledTimes(1);
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(ds.session.pendingResponseCardId).toBe('om_b');
-    expect(ds.session.pendingResponseCardState).toBe('open');
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    // Turn reactions are driven off message acceptance (noteTurnReceived) and
+    // the idle edge (finishTurnReactions), not the bridge final-output path.
+    expect(addReactionMock).not.toHaveBeenCalled();
     expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
   });
 

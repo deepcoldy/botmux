@@ -87,6 +87,13 @@ export interface DaemonSession {
    *  command so a user can manually summon a live card in an otherwise-quiet
    *  session. In-memory only (resets on daemon restart). */
   streamingCardForced?: boolean;
+  /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
+   *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
+   *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
+   *  batched messages each get their own reaction). Every pending ✋ here is
+   *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
+   *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
+  pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
@@ -99,9 +106,6 @@ export interface DaemonSession {
   lastCliInput?: string;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
-  pendingResponseCardId?: string; // placeholder card patched by the first botmux send when streaming cards are disabled
-  pendingResponseCardState?: 'open' | 'patched';
-  lastPatchedResponseCardId?: string;
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)

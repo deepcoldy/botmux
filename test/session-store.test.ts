@@ -325,55 +325,6 @@ describe('updateSession()', () => {
     expect(found).toBeDefined();
     expect(found!.title).toBe('Manually Added');
   });
-
-  it('preserves patched pending-response state when a stale in-memory session writes later', () => {
-    const session = createSession('chat1', 'root1', 'Pending Race');
-    session.pendingResponseCardId = 'om_old_open';
-    session.pendingResponseCardState = 'open';
-    updateSession(session);
-
-    const patched = { ...session };
-    patched.pendingResponseCardId = undefined;
-    patched.pendingResponseCardState = 'patched';
-    patched.lastPatchedResponseCardId = 'om_old_open';
-    updateSession(patched);
-
-    const stale = { ...session };
-    stale.title = 'stale writer changed another field';
-    updateSession(stale);
-
-    const found = getSession(session.sessionId)!;
-    expect(found.title).toBe('stale writer changed another field');
-    expect(found.pendingResponseCardId).toBeUndefined();
-    expect(found.pendingResponseCardState).toBe('patched');
-    expect(found.lastPatchedResponseCardId).toBe('om_old_open');
-  });
-
-  it('does not let an old patched write clear a newer open pending-response card', () => {
-    const session = createSession('chat1', 'root1', 'Old Patch New Open');
-    session.pendingResponseCardId = 'om_old_open';
-    session.pendingResponseCardState = 'open';
-    updateSession(session);
-
-    const newOpen = { ...session };
-    newOpen.pendingResponseCardId = 'om_new_open';
-    newOpen.pendingResponseCardState = 'open';
-    newOpen.lastPatchedResponseCardId = 'om_old_open';
-    updateSession(newOpen);
-
-    const oldPatched = { ...session };
-    oldPatched.pendingResponseCardId = undefined;
-    oldPatched.pendingResponseCardState = 'patched';
-    oldPatched.lastPatchedResponseCardId = 'om_old_open';
-    oldPatched.title = 'old patched writer';
-    updateSession(oldPatched);
-
-    const found = getSession(session.sessionId)!;
-    expect(found.title).toBe('old patched writer');
-    expect(found.pendingResponseCardId).toBe('om_new_open');
-    expect(found.pendingResponseCardState).toBe('open');
-    expect(found.lastPatchedResponseCardId).toBe('om_old_open');
-  });
 });
 
 // ─── updateSessionPid() ──────────────────────────────────────────────────
@@ -564,5 +515,34 @@ describe('Edge cases', () => {
     // The .tmp file should not persist after save
     const tmpFp = join(tempDir, 'sessions.json.tmp');
     expect(existsSync(tmpFp)).toBe(false);
+  });
+});
+
+// ─── legacy field sanitization ───────────────────────────────────────────────
+
+describe('legacy placeholder-card field stripping', () => {
+  it('removes pendingResponseCard* fields from disk on the next save', () => {
+    // A session persisted before the「处理中」placeholder card was removed still
+    // carries the three legacy fields on disk. The next save must drop them so
+    // the file converges to clean (nothing reads them anymore).
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions.json'), JSON.stringify({
+      s1: {
+        sessionId: 's1', chatId: 'c1', rootMessageId: 'r1', title: 'Legacy',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+        pendingResponseCardId: 'om_old', pendingResponseCardState: 'open',
+        lastPatchedResponseCardId: 'om_prev',
+      },
+    }));
+
+    init();
+    const loaded = getSession('s1')!;
+    updateSession({ ...loaded, title: 'Touched' });
+
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions.json'), 'utf-8'));
+    expect(onDisk.s1.title).toBe('Touched');
+    expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
+    expect(onDisk.s1).not.toHaveProperty('pendingResponseCardState');
+    expect(onDisk.s1).not.toHaveProperty('lastPatchedResponseCardId');
   });
 });

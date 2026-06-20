@@ -164,6 +164,22 @@ describe('parseBotConfigsFromText — brand', () => {
       expect(cfg.maxLiveWorkers).toBeUndefined();
     }
   });
+
+  it('normalizes startupCommands (adds leading /, keeps args, dedupes)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', startupCommands: ['effort ultracode', '/model opus', '/effort ultracode', '', 7] },
+    ]));
+    expect(cfg.startupCommands).toEqual(['/effort ultracode', '/model opus']);
+  });
+
+  it('leaves startupCommands undefined when unset / empty / non-array', () => {
+    for (const val of [undefined, [], '/effort ultracode', ['', '   ']] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', startupCommands: val },
+      ]));
+      expect(cfg.startupCommands).toBeUndefined();
+    }
+  });
 });
 
 // ─── getBot / getBotClient ────────────────────────────────────────────────

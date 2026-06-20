@@ -3,13 +3,21 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import { mergePendingResponseState } from '../core/pending-response.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+
+// Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
+// no longer exist on Session and nothing reads them, but sessions persisted
+// before the removal still carry them on disk. Strip on write so the file
+// converges to clean on the first save (daemon + CLI both call this).
+const LEGACY_PENDING_CARD_FIELDS = ['pendingResponseCardId', 'pendingResponseCardState', 'lastPatchedResponseCardId'] as const;
+export function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
+  for (const f of LEGACY_PENDING_CARD_FIELDS) delete session[f];
+}
 
 /**
  * Initialise session store for a specific bot (multi-daemon mode).
@@ -86,12 +94,11 @@ function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record
 function save(): void {
   ensureDir();
   const fp = getFilePath();
-  const { raw: existingRaw, parsed: existing } = readExistingSessionsFromDisk(fp);
+  const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
   const obj: Record<string, Session> = {};
   for (const [k, v] of sessions) {
-    const merged = mergePendingResponseState(v, existing[k]);
-    sessions.set(k, merged);
-    obj[k] = merged;
+    stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
+    obj[k] = v;
   }
   const json = JSON.stringify(obj, null, 2);
   // The daemon fires several updateSession()/save() calls per inbound message

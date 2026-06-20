@@ -14,7 +14,7 @@ import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
@@ -42,9 +42,8 @@ import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-pr
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildPendingResponseCard, buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { createPendingResponseQueue, markPendingResponseCardPatched, shouldTreatPendingCardAsPatchedByMarker, startPendingResponseTurn, syncPendingResponseState } from './core/pending-response.js';
-import { readPendingResponsePatchMarker } from './services/pending-response-transaction-store.js';
+import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -333,8 +332,6 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
  * Lark message ids start with `om_` and chat ids with `oc_`, so the two
  * address spaces never collide; the lookup just tries both.
  */
-const pendingResponseQueue = createPendingResponseQueue();
-
 function streamingCardDisabledFor(ds: DaemonSession): boolean {
   if (ds.streamingCardForced) return false;
   try {
@@ -359,40 +356,40 @@ function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import(
   return undefined;
 }
 
-export async function postPendingResponseCard(ds: DaemonSession, replyToMessageId: string, prompt: string, sender?: { name?: string }, turnId?: string): Promise<void> {
-  // Card-off path (streaming card disabled for this session): post a lightweight
-  // 「处理中」 placeholder. The final reply / `botmux send` patches this card in
-  // place — and that patch is also what lets the 完成 emoji land on the user's
-  // original message. When streaming cards are ON the streaming card itself is
-  // the placeholder, so this is a no-op for those sessions.
+export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: string, _prompt?: string, _sender?: { name?: string }, _turnId?: string): Promise<void> {
+  // Replaces the old 「处理中」 placeholder card. That card existed only to be
+  // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
+  // notification / unread) — so card-off answers could land unseen. The
+  // placeholder + patch-delivery was removed; answers now always go out as a
+  // fresh message (deliverFinalOutput / `botmux send`).
+  //
+  // This call site is the per-message acceptance point, so it also drives the
+  // two-phase turn reaction. It's auto-enabled exactly for card-off sessions
+  // (streaming card disabled): those have no live status card, so the ✋→✅ on
+  // the user's message is the only lightweight progress signal. When the
+  // streaming card is on it already shows status, so we stay silent.
+  // React 冲! on the triggering message the instant it's accepted. Binding to the
+  // message — not a worker status edge — means type-ahead / busy-batched messages
+  // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
+  // the worker next goes idle.
   if (!streamingCardDisabledFor(ds)) return;
-  await pendingResponseQueue.run(ds.session.sessionId, async () => {
-    const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
-    syncPendingResponseState(ds, fresh);
-    if (fresh) syncReplyTargetState(ds, fresh);
-    // Reconcile a PATCH that committed at Feishu but whose session save lost the
-    // race, so a stale prior card isn't left dangling as "open".
-    const marker = readPendingResponsePatchMarker(ds.session.sessionId);
-    if (shouldTreatPendingCardAsPatchedByMarker(ds.pendingResponseCardId, marker)) {
-      markPendingResponseCardPatched(ds);
-    }
-    syncPendingResponseState(ds.session, ds);
-    const card = buildPendingResponseCard(localeForBot(ds.larkAppId));
-    try {
-      // Route the placeholder to the same target the final reply will use: a
-      // topic-alias turn (chat-scope + matching turnId) lands in the topic
-      // thread; otherwise it's a plain chat message / thread-scope reply.
-      const target = resolveSessionReplyTarget(ds, turnId);
-      const messageId = target.mode === 'thread'
-        ? await replyMessage(ds.larkAppId, target.rootMessageId, card, 'interactive', true)
-        : await sendMessage(ds.larkAppId, target.chatId, card, 'interactive');
-      startPendingResponseTurn(ds, messageId);
-      startPendingResponseTurn(ds.session, messageId);
-      sessionStore.updateSession(ds.session);
-    } catch (err) {
-      logger.warn(`[${tag(ds)}] failed to post pending response card: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  });
+  // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
+  if (!triggerMessageId.startsWith('om_')) return;
+  if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
+  // Add the ✋ FIRST, register the entry only after it lands. If we pushed the
+  // entry before awaiting addReaction, a previous turn's idle edge
+  // (finishTurnReactions) could detach this half-formed entry mid-flight —
+  // DONE-ing a message that hasn't even reached the worker yet and orphaning its
+  // reactionId. Callers await this before dispatching the message to the worker,
+  // so a registered entry is always in place before its own turn can go idle.
+  let reactionId: string;
+  try {
+    reactionId = await addReaction(ds.larkAppId, triggerMessageId, RECEIVED_REACTION_EMOJI_TYPE);
+  } catch (err) {
+    logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
 }
 
 async function sessionReply(anchor: string, content: string, msgType: string = 'text', larkAppId?: string, turnId?: string): Promise<string> {
@@ -2460,7 +2457,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ensureSessionWhiteboard(ds);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
     rememberLastCliInput(ds, promptContent, prompt);
-    await postPendingResponseCard(ds, messageId, content, newTopicSender, messageId);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -2492,7 +2489,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ensureSessionWhiteboard(ds);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
     rememberLastCliInput(ds, promptContent, prompt);
-    await postPendingResponseCard(ds, messageId, content, newTopicSender, messageId);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -2671,7 +2668,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
       rememberLastCliInput(ds, promptBody, prompt);
-      await postPendingResponseCard(ds, anchor, promptBody);
+      await noteTurnReceived(ds, anchor, promptBody);
       forkWorker(ds, prompt);
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
@@ -2691,7 +2688,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       ds.pendingRepo = false;
       const prompt = await buildPrompt();
       rememberLastCliInput(ds, promptBody, prompt);
-      await postPendingResponseCard(ds, anchor, promptBody);
+      await noteTurnReceived(ds, anchor, promptBody);
       forkWorker(ds, prompt);
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
@@ -3057,8 +3054,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
   if (ds) {
-    syncPendingResponseState(ds, readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId));
-    syncPendingResponseState(ds.session, ds);
     markSessionActivity(ds);
     const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
     // quoteTargetId changes every inbound message (always a new message_id), so
@@ -3209,7 +3204,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       ensureSessionWhiteboard(newDs);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
       rememberLastCliInput(newDs, promptContent, prompt);
-      await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -3241,7 +3236,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       ensureSessionWhiteboard(newDs);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
       rememberLastCliInput(newDs, promptContent, prompt);
-      await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
     }
 
@@ -3281,7 +3276,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         });
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);
-    await postPendingResponseCard(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
     ds.worker.send({ type: 'message', content: msgContent, turnId: parsed.messageId } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
@@ -3333,7 +3328,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       sender: await getThreadSender(),
     });
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
-    await postPendingResponseCard(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
     sessionStore.updateSession(ds.session);
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }
@@ -3401,7 +3396,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     ds.session.currentDocCommentTarget = docTarget; // beginNewTurn 刚清空，这里设本轮落点
     rememberLastCliInput(ds, promptContent, msgContent);
     sessionStore.updateSession(ds.session); // 先落盘，botmux send 子进程才读得到落点
-    await postPendingResponseCard(ds, commentId, text, sender, turnId);
+    await noteTurnReceived(ds, commentId, text, sender, turnId);
     ds.worker.send({ type: 'message', content: msgContent, turnId } as DaemonToWorker);
     logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
   } else {
@@ -3425,7 +3420,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     });
     ds.session.currentDocCommentTarget = docTarget;
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
-    await postPendingResponseCard(ds, commentId, text, sender, turnId);
+    await noteTurnReceived(ds, commentId, text, sender, turnId);
     sessionStore.updateSession(ds.session);
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }

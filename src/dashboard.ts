@@ -1431,6 +1431,7 @@ const server = createServer(async (req, res) => {
             messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
             p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',
             maxLiveWorkers: typeof j.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
+            startupCommands: typeof j.startupCommands === 'string' ? j.startupCommands : '',
             skills: j.skills && typeof j.skills === 'object' ? j.skills : null,
           };
         } catch (e: any) {
@@ -1483,6 +1484,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-brand-label`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/startup-commands — proxy to that bot's daemon. Body
+    // `{ startupCommands: string }` (raw text, comma/newline separated; '' = clear).
+    let mBotStartup: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotStartup = url.pathname.match(/^\/api\/bots\/([^/]+)\/startup-commands$/))) {
+      const appId = decodeURIComponent(mBotStartup[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-startup-commands`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

@@ -207,7 +207,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -406,6 +406,24 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           <button type="button" data-action="off-session-cap">${t('botDefaults.maxLiveWorkersOff')}</button>
           <span class="oncall-status" data-session-cap-status></span>
         </div>
+      </div>
+    </div>`;
+  }
+
+  // 启动命令 startupCommands：开会话后、首条消息前自动按序发给 CLI 的 slash 命令（可带
+  // 参数，如 /effort ultracode）。文本域，逗号/换行分隔，每行一条；空＝不发。next-session
+  // 生效（含 resume，每次新会话重放）。PUT /api/bots/:appId/startup-commands 落 bots.json。
+  function renderStartupCommandsSection(b: any): string {
+    const val: string = typeof b.startupCommands === 'string' ? b.startupCommands : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionStartupCommands')}</h4>
+      <p class="bd-section-note">${t('botDefaults.startupCommandsHelp')}</p>
+      <textarea data-input="startupCommands" rows="3"
+        placeholder="${escapeHtml(t('botDefaults.startupCommandsPlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(val)}</textarea>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-startup-commands">${t('botDefaults.startupCommandsSave')}</button>
+        <span class="oncall-status" data-startup-commands-status></span>
       </div>
     </div>`;
   }
@@ -1057,6 +1075,45 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         capOffBtn.addEventListener('click', () => {
           capInput.value = '';
           putMaxLiveWorkers(null, capOffBtn);
+        });
+      }
+
+      // ── 启动命令 startupCommands（逗号/换行分隔；空＝清除，不发任何命令） ──────────
+      const startupEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=startupCommands]');
+      const startupSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-startup-commands]');
+      const startupStatusEl = card.querySelector<HTMLSpanElement>('[data-startup-commands-status]');
+      if (startupEl && startupSaveBtn) {
+        startupSaveBtn.addEventListener('click', async () => {
+          if (!startupStatusEl) return;
+          startupStatusEl.textContent = '';
+          startupStatusEl.className = 'oncall-status';
+          startupSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/startup-commands`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ startupCommands: startupEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              startupStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              startupStatusEl.classList.add('hint-ok');
+              // Server returns the normalized, newline-joined list — reflect it
+              // back so the textarea shows exactly what was persisted.
+              const next: string = typeof body.startupCommands === 'string' ? body.startupCommands : '';
+              startupEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.startupCommands = next;
+            } else {
+              startupStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              startupStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            startupStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            startupStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            startupSaveBtn.disabled = false;
+          }
         });
       }
     });

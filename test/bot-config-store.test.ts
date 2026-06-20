@@ -249,6 +249,40 @@ describe('bot-config store', () => {
     expect(store2.getConfigCardData('app_default')?.customPassthroughCommands).toBeNull();
   });
 
+  it('startupCommands is a next-session stringList that keeps argument spaces (own parser)', async () => {
+    const { store } = await freshModules();
+    const spec = store.findConfigField('startupCommands')!;
+    expect(spec.kind).toBe('stringList');
+    expect(spec.effect).toBe('next-session');
+    // Comma/newline split (NOT space) — args survive; leading / auto-added; deduped.
+    expect(store.coerceConfigValue(spec, 'effort ultracode, /model opus\n/effort ultracode'))
+      .toEqual({ ok: true, value: ['/effort ultracode', '/model opus'] });
+    expect(store.coerceConfigValue(spec, '   ')).toEqual({ ok: false, reason: 'empty' });
+  });
+
+  it('startupCommands round-trips array to disk + memory; empty clears the key', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('startupCommands')!;
+
+    const r1 = await store.applyConfigField('app_default', spec, ['/effort ultracode', '/model opus']);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.newText).toBe('/effort ultracode, /model opus'); expect(r1.effect).toBe('next-session'); }
+    expect(readConfig().startupCommands).toEqual(['/effort ultracode', '/model opus']);
+    expect(registry.getBot('app_default').config.startupCommands).toEqual(['/effort ultracode', '/model opus']);
+
+    const r2 = await store.applyConfigField('app_default', spec, []);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().startupCommands).toBeUndefined();
+    expect(registry.getBot('app_default').config.startupCommands).toBeUndefined();
+  });
+
+  it('getConfigCardData joins startupCommands with ", " (commands carry space args)', async () => {
+    const { store } = await loaded({ startupCommands: ['/effort ultracode', '/model opus'] });
+    expect(store.getConfigCardData('app_default')?.startupCommands).toBe('/effort ultracode, /model opus');
+    const { store: store2 } = await loaded();
+    expect(store2.getConfigCardData('app_default')?.startupCommands).toBeNull();
+  });
+
   it('getConfigSnapshot reports current values + info', async () => {
     const { store } = await loaded({ model: 'sonnet', disableStreamingCard: true });
     const snap = store.getConfigSnapshot('app_default');

@@ -591,10 +591,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
     JSON.stringify(s.replyThreadAliases ?? {}) === JSON.stringify(ds.replyThreadAliases ?? {}) &&
-    JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null) &&
-    s.pendingResponseCardId === ds.pendingResponseCardId &&
-    s.pendingResponseCardState === ds.pendingResponseCardState &&
-    s.lastPatchedResponseCardId === ds.lastPatchedResponseCardId
+    JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null)
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
@@ -606,9 +603,6 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.lastCliInput = ds.lastCliInput;
   s.replyThreadAliases = ds.replyThreadAliases;
   s.currentReplyTarget = ds.currentReplyTarget;
-  s.pendingResponseCardId = ds.pendingResponseCardId;
-  s.pendingResponseCardState = ds.pendingResponseCardState;
-  s.lastPatchedResponseCardId = ds.lastPatchedResponseCardId;
   // Clear legacy field so it doesn't drift
   s.streamExpanded = undefined;
   sessionStore.updateSession(s);
@@ -739,9 +733,6 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         lastCliInput: session.lastCliInput,
         replyThreadAliases: session.replyThreadAliases,
         currentReplyTarget: session.currentReplyTarget,
-        pendingResponseCardId: session.pendingResponseCardId,
-        pendingResponseCardState: session.pendingResponseCardState,
-        lastPatchedResponseCardId: session.lastPatchedResponseCardId,
         // Restart stays silent for adopt sessions too: forkAdoptWorker shares
         // setupWorkerHandlers, so the recovery ready/screen_update would post a
         // card without this. Cleared on the first real CLI input.
@@ -797,9 +788,6 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       lastCliInput: session.lastCliInput,
       replyThreadAliases: session.replyThreadAliases,
       currentReplyTarget: session.currentReplyTarget,
-      pendingResponseCardId: session.pendingResponseCardId,
-      pendingResponseCardState: session.pendingResponseCardState,
-      lastPatchedResponseCardId: session.lastPatchedResponseCardId,
       // Restart stays silent in the group: the recovery re-fork won't post or
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
@@ -1085,9 +1073,6 @@ export async function resumeSession(
     lastCliInput: session.lastCliInput,
     replyThreadAliases: session.replyThreadAliases,
     currentReplyTarget: session.currentReplyTarget,
-    pendingResponseCardId: session.pendingResponseCardId,
-    pendingResponseCardState: session.pendingResponseCardState,
-    lastPatchedResponseCardId: session.lastPatchedResponseCardId,
   };
 
   messageQueue.ensureQueue(anchor);

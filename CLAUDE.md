@@ -26,6 +26,16 @@ BOTMUX_NO_CLAIM=1 pnpm use:here   # 逃生阀：本次不认领
 - 故意**没**挂进 `build`——review/验证别人 PR 时纯 `pnpm build` 不会悄悄抢走全局指向
 - 实现见 `scripts/claim-botmux-bin.mjs`（与 `daemon.ts` 写的 wrapper 同构、幂等）
 
+### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
+
+当某个改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完并自测绿后，执行：
+
+```bash
+pnpm switch:here && botmux restart
+```
+
+把本 checkout 的 build 部署到 live daemon 供用户测试（`switch:here` = build + 把全局 `botmux` 指向本 checkout；`botmux restart` 从这里重启 daemon 并自动恢复 active sessions）。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免该 review worktree 被删后全局 shim 失效。
+
 ## 模块结构
 
 - `daemon.ts` — 薄编排层，组装各模块并启动

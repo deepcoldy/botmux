@@ -17,10 +17,9 @@ import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { fallbackTurnId } from './reply-target.js';
-import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, MessageWithdrawnError } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
-import { clearPendingResponsePatchMarker, markPendingResponsePatchMarkerPatched, writePendingResponsePatchMarker } from '../services/pending-response-transaction-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
@@ -45,7 +44,7 @@ import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
 import { prepareSkillDelivery } from './skills/delivery.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
-import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
+import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin } from './botmux-wrapper.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -1465,6 +1464,17 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
   if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
 
+  // Materialise the resolved launch dir on the live session. getSessionWorkingDir()
+  // falls back to the bot-default workingDir, but the usage ledger and dashboard read
+  // `ds.workingDir ?? s.workingDir` RAW (without that fallback). A session that inherits
+  // the bot-default workingDir — i.e. one never pinned via /repo or /cd — therefore leaves
+  // ds.workingDir undefined, so getSessionTokenUsage() is handed cwd=undefined, cannot
+  // locate the CLI transcript, and the session's token usage silently never records.
+  // Pinning the resolved cwd here (it equals what the worker actually forked into) closes
+  // that gap without touching the persisted session.workingDir "unset = follow default"
+  // semantics: this is re-derived on every fork/restore.
+  ds.workingDir = cwd;
+
   // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
   // historical session. A brand-new session (resume=false) with no recorded
@@ -1592,6 +1602,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     wrapperCli: botCfg.wrapperCli,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    // Startup commands run on every fresh spawn (incl. resume) so session-only
+    // settings like `/effort ultracode` are re-established. Adopt sessions are
+    // observed, not driven — forkAdoptWorker intentionally omits this.
+    startupCommands: botCfg.startupCommands,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
@@ -1924,10 +1938,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             source: 'screen_update',
             content: msg.content,
           });
-          // Usage ledger: idle/limited edges are turn boundaries — append the
-          // token delta accrued during the turn that just finished.
+          // Usage ledger + turn reactions: idle/limited edges are turn
+          // boundaries. Append the token delta, and flip this turn's pending ✋
+          // reactions to ✅ (best-effort, never blocks the status pipeline).
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
+            void finishTurnReactions(ds);
           }
         }
 
@@ -2308,6 +2324,38 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 
+/**
+ * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
+ * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
+ * acceptance point (`noteTurnReceived`); when the worker next returns to idle we
+ * flip every pending ✋ on this session to ✅ DONE and clear the list. Binding the
+ * start to the message (not a status edge) means type-ahead / busy-batched
+ * messages each get their own reaction and all settle together here.
+ *
+ * Every Feishu call is best-effort — a failure only means a missing emoji, so it
+ * must never throw into the status pipeline (callers invoke as `void`).
+ */
+async function finishTurnReactions(ds: DaemonSession): Promise<void> {
+  const list = ds.pendingAckReactions;
+  if (!list || list.length === 0) return;
+  // Detach the batch first so a second idle edge can't double-flip it.
+  ds.pendingAckReactions = [];
+  for (const ack of list) {
+    if (ack.reactionId) {
+      try {
+        await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
+      } catch (err: any) {
+        logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
+      }
+    }
+    try {
+      await addReaction(ds.larkAppId, ack.messageId, DONE_REACTION_EMOJI_TYPE);
+    } catch (err: any) {
+      logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
+    }
+  }
+}
+
 /** Deliver a bridge `final_output` to Lark. The worker emits each turn
  *  exactly once (it pops the turn off its queue at emit time), so the
  *  daemon owns retries on transient failures. After 3 attempts we log
@@ -2318,16 +2366,12 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
-  lockedPendingCardId?: string,
-  lockedQuoteTargetId?: string,
 ): void {
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const scopedReply = (content: string, msgType?: string, turnId?: string) =>
     cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
   setTimeout(async () => {
-    let pendingCardId: string | undefined;
-    let pendingQuoteTargetId: string | undefined;
     // Guard: if the user closed the session (or it was torn down for any
     // other reason) between attempts, don't post a stale final answer to
     // a closed thread.
@@ -2340,30 +2384,11 @@ function deliverFinalOutput(
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = ds.docCommentTurns?.get(msg.turnId);
       if (docTurn) {
-        const loc = localeForBot(ds.larkAppId);
         // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
         const chunks = chunkCommentText(msg.content);
         for (let i = 0; i < chunks.length; i++) {
           await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
-        }
-        // 收尾飞书侧占位卡（streaming-disabled 会话），避免停在「处理中」。
-        // streaming 卡（若开启）会在 idle 自行冻结，无需在此处理。
-        const donePendingId = lockedPendingCardId ?? claimPendingResponseCard(ds.session);
-        if (donePendingId) {
-          try {
-            await updateMessage(ds.larkAppId, donePendingId, buildMarkdownCard(
-              tr('daemon.doc_comment_replied_card', undefined, loc),
-              daemonCardFooterRecipientOpenId(ds, effectiveCliId),
-              resolveBrandLabel(ds.larkAppId),
-              loc,
-            ));
-            markPendingResponseCardPatchedIfCurrent(ds.session, donePendingId);
-            syncPendingResponseState(ds, ds.session);
-            sessionStore.updateSession(ds.session);
-          } catch (err: any) {
-            if (!(err instanceof MessageWithdrawnError)) logger.warn(`[${t}] failed to finalize 飞书 pending card for doc-comment turn: ${err?.message ?? err}`);
-          }
         }
         ds.docCommentTurns?.delete(msg.turnId);
         ds.lastBridgeEmittedUuid = msg.lastUuid;
@@ -2397,37 +2422,10 @@ function deliverFinalOutput(
           })
         : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId), localeForBot(ds.larkAppId));
 
-      pendingCardId = lockedPendingCardId ?? claimPendingResponseCard(ds.session);
-      pendingQuoteTargetId = lockedQuoteTargetId ?? ds.session.quoteTargetId;
-      if (pendingCardId) {
-        try {
-          if (ds.session.pendingResponseCardId !== pendingCardId) {
-            await scopedReply(cardJson, 'interactive', msg.turnId);
-          } else {
-            writePendingResponsePatchMarker(ds.session.sessionId, pendingCardId);
-            await updateMessage(ds.larkAppId, pendingCardId, cardJson);
-            markPendingResponsePatchMarkerPatched(ds.session.sessionId);
-            markPendingResponseCardPatchedIfCurrent(ds.session, pendingCardId);
-            syncPendingResponseState(ds, ds.session);
-            sessionStore.updateSession(ds.session);
-            clearPendingResponsePatchMarker(ds.session.sessionId);
-            if (pendingQuoteTargetId && ds.session.lastPatchedResponseCardId === pendingCardId) {
-              addReaction(ds.larkAppId, pendingQuoteTargetId, COMPLETED_REACTION_EMOJI_TYPE)
-                .catch((err: any) => logger.warn(`[${t}] failed to add completion reaction to ${pendingQuoteTargetId}: ${err?.message ?? err}`));
-            }
-          }
-        } catch (err: any) {
-          clearPendingResponsePatchMarker(ds.session.sessionId);
-          if (!(err instanceof MessageWithdrawnError)) throw err;
-          logger.warn(`[${t}] Pending response card withdrawn while forwarding final_output; sending a new reply`);
-          await scopedReply(cardJson, 'interactive', msg.turnId);
-          markPendingResponseCardPatchedIfCurrent(ds.session, pendingCardId);
-          syncPendingResponseState(ds, ds.session);
-          sessionStore.updateSession(ds.session);
-        }
-      } else {
-        await scopedReply(cardJson, 'interactive', msg.turnId);
-      }
+      // Always deliver the answer as a fresh message — never PATCH a card in
+      // place. message.patch is silent (no Feishu notification / unread), which
+      // used to swallow the answer; a brand-new message always pings.
+      await scopedReply(cardJson, 'interactive', msg.turnId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
@@ -2439,7 +2437,6 @@ function deliverFinalOutput(
         cb.closeSession(ds);
         return;
       }
-      if (pendingCardId) clearPendingResponsePatchMarker(ds.session.sessionId);
       const next = attempt + 1;
       if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
         logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
@@ -2448,7 +2445,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, pendingCardId, pendingQuoteTargetId);
+      deliverFinalOutput(ds, msg, t, next);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -2458,6 +2455,7 @@ function deliverFinalOutput(
  *  fork. Intentionally underscored to discourage non-test callers. */
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
+export const __testOnly_finishTurnReactions = finishTurnReactions;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 

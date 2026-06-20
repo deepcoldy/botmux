@@ -85,11 +85,6 @@ export interface Session {
   /** Whether the quote-target sender is a bot (vs a human) — drives the
    *  @ hard-gate's context-aware error text. */
   quoteTargetSenderIsBot?: boolean;
-  /** Pending placeholder card used when streaming cards are disabled. The first
-   *  botmux send for the turn PATCHes this card instead of posting a new one. */
-  pendingResponseCardId?: string;
-  pendingResponseCardState?: 'open' | 'patched';
-  lastPatchedResponseCardId?: string;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
@@ -267,7 +262,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; model?: string; disableCliBypass?: boolean; sandbox?: boolean; sandboxHidePaths?: string[]; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; sandbox?: boolean; sandboxHidePaths?: string[]; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string; turnId?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate

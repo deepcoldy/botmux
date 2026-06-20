@@ -857,6 +857,12 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
   } catch { /* default unlimited */ }
+  // startupCommands → newline-joined for the dashboard textarea (one per line).
+  let startupCommands = '';
+  try {
+    const sc = getBot(cachedLarkAppId).config.startupCommands;
+    if (Array.isArray(sc) && sc.length) startupCommands = sc.join('\n');
+  } catch { /* none */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
@@ -877,6 +883,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     p2pMode,
     maxLiveWorkers,
+    startupCommands,
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
 });
@@ -980,6 +987,32 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, p2pMode: value ?? 'thread' });
+});
+
+// Per-bot 启动命令 startupCommands。Body `{ startupCommands: string }`（原始文本，
+// 逗号/换行分隔，每条可带参数如 `/effort ultracode`）：空白 → 清除（不发任何命令）。
+// 走 applyConfigField（与 /botconfig 文本子卡同一写盘 + 内存热更新路径），next-session
+// 生效（下个会话起按序自动发）。
+ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { startupCommands?: unknown };
+  try { body = await readJsonBody<{ startupCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('startupCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.startupCommands === 'string' ? body.startupCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
 });
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:
