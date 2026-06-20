@@ -178,6 +178,9 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     } else {
       try {
         const creatorContent = readRoleProfileEntry(config.session.dataDir, roleProfileId, opts.creatorLarkAppId);
+        // null = no entry; '' = explicit (clear) entry — both skip the write on
+        // a fresh chat, but only a truly missing entry counts as "not applicable".
+        const creatorHasEntry = creatorContent !== null;
         if (creatorContent) {
           writeRoleFile(opts.creatorLarkAppId, r.chatId, creatorContent);
         }
@@ -199,6 +202,12 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
               'text',
             );
           }
+        } else if (!creatorHasEntry) {
+          // Solo group whose creator has no entry in this profile: nothing was
+          // written and no peer bootstrap was sent. Surface it rather than
+          // reporting a misleading "bootstrap started". An explicit empty entry
+          // ('') is still a valid entry (clears on apply), so it is NOT flagged.
+          roleProfileBootstrapError = 'no_applicable_entries';
         }
       } catch (e: any) {
         roleProfileBootstrapError = e?.message ?? String(e);

@@ -369,4 +369,39 @@ describe('createGroupWithBots', () => {
     expect(result.roleProfileBootstrapMessageId).toBeNull();
     expect(result.roleProfileBootstrapError).toBeNull();
   });
+
+  it('reports no_applicable_entries for a solo group whose creator has no profile entry', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_profile_noentry', invalidBotIds: [], invalidUserIds: [] });
+    mockReadRoleProfileEntry.mockReturnValue(null);
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      roleProfileId: 'collab-main',
+    });
+
+    expect(mockWriteRoleFile).not.toHaveBeenCalled();
+    expect(mockListChatBotMembers).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.roleProfileBootstrapMessageId).toBeNull();
+    expect(result.roleProfileBootstrapError).toBe('no_applicable_entries');
+  });
+
+  it('treats a solo group creator with an explicit empty entry as a valid (clear) entry', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_profile_empty', invalidBotIds: [], invalidUserIds: [] });
+    mockReadRoleProfileEntry.mockReturnValue(''); // explicit empty entry = clear, not missing
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      roleProfileId: 'collab-main',
+    });
+
+    // Nothing to write on a fresh chat, but '' is a real entry → not flagged.
+    expect(mockWriteRoleFile).not.toHaveBeenCalled();
+    expect(mockListChatBotMembers).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.roleProfileBootstrapMessageId).toBeNull();
+    expect(result.roleProfileBootstrapError).toBeNull();
+  });
 });

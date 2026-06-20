@@ -131,7 +131,6 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
         matched: 1,
         total: 2,
         chatMatched: 1,
-        fallbackMatched: 0,
         kind: 'partial',
       },
       {
@@ -139,7 +138,6 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
         matched: 1,
         total: 2,
         chatMatched: 1,
-        fallbackMatched: 0,
         kind: 'partial',
       },
     ]);

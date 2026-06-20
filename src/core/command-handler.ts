@@ -464,7 +464,10 @@ async function handleRoleCommand(
         return;
       }
       if (existing && !force) {
-        await sessionReply(rootId, t('role.profile.apply_refused', { profile: profileId }, loc));
+        // An empty entry would *clear* the chat role, not overwrite it — phrase
+        // the --force refusal accordingly so the intent is not misread.
+        const refusedKey = content ? 'role.profile.apply_refused' : 'role.profile.apply_refused_clear';
+        await sessionReply(rootId, t(refusedKey, { profile: profileId }, loc));
         return;
       }
       if (!content) {

@@ -550,6 +550,7 @@ export const messages: Record<string, string> = {
   'role.profile.apply_preview': '预览把 profile `{profile}` 写成本群 chat role（{bytes} / {max} 字节）：',
   'role.profile.apply_would_refuse': '当前群已有 chat role；不带 --force 时 apply 会拒绝覆盖。',
   'role.profile.apply_refused': '当前群已有 chat role。若要覆盖，请重新执行 `/role profile apply {profile} --force`。',
+  'role.profile.apply_refused_clear': 'Profile `{profile}` 的 entry 为空，apply 会清除本群 chat role。若要清除，请重新执行 `/role profile apply {profile} --force`。',
   'role.profile.applied': '✅ 已把 profile `{profile}` 写成本群 chat role（{bytes} / {max} 字节）。新会话生效。',
   'role.help': '/role 用法：\n• /role — 查看当前生效 Role\n• /role set <Markdown> — 设置本群 Role（覆盖团队级）\n• /role delete — 删除本群 Role\n• /role team [set <Markdown>|delete] — 团队级 Role（跨群默认）\n• /role cap [set <一句话>|clear] — 能力标签（花名册展示）\n• /role profile ... — 可复用的多 bot chat role 套装',
   'pair.usage': '用法：/pair <配对码>（在团队平台网页点"登录"会显示配对码）。',

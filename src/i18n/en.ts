@@ -547,6 +547,7 @@ export const messages: Record<string, string> = {
   'role.profile.apply_preview': 'Preview applying profile `{profile}` to this chat role ({bytes} / {max} bytes):',
   'role.profile.apply_would_refuse': 'Current chat already has a role; apply would refuse without --force.',
   'role.profile.apply_refused': 'Current chat already has a role. Re-run `/role profile apply {profile} --force` to overwrite it.',
+  'role.profile.apply_refused_clear': 'Profile `{profile}` has an empty entry that would clear this chat role. Re-run `/role profile apply {profile} --force` to clear it.',
   'role.profile.applied': '✅ Applied profile `{profile}` to this chat role ({bytes} / {max} bytes). New sessions will use it.',
   'role.help': '/role usage:\n• /role — View effective role\n• /role set <Markdown> — Set chat role (overrides team)\n• /role delete — Delete chat role\n• /role team [set <Markdown>|delete] — Team-level role (cross-chat default)\n• /role cap [set <one-liner>|clear] — Capability label (shown in roster)\n• /role profile ... — Reusable per-bot chat role suites',
   'pair.usage': 'Usage: /pair <code> (the code is shown when you click "Log in" on the team platform web UI).',

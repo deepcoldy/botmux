@@ -22,7 +22,6 @@ export type GroupProfileMatch = {
   matched: number;
   total: number;
   chatMatched: number;
-  fallbackMatched: number;
   kind: 'full' | 'partial';
 };
 
@@ -62,7 +61,6 @@ export function summarizeGroupProfileMatches(
 
     let matched = 0;
     let chatMatched = 0;
-    let fallbackMatched = 0;
     for (const entry of entries) {
       const role = normalizeEffectiveRole(rolesByBot.get(entry.larkAppId));
       if (role.source !== 'chat') continue;
@@ -72,9 +70,9 @@ export function summarizeGroupProfileMatches(
     }
 
     if (matched === entries.length) {
-      matches.push({ profileId: profile.profileId, matched, total: entries.length, chatMatched, fallbackMatched, kind: 'full' });
+      matches.push({ profileId: profile.profileId, matched, total: entries.length, chatMatched, kind: 'full' });
     } else if (matched > 0) {
-      matches.push({ profileId: profile.profileId, matched, total: entries.length, chatMatched, fallbackMatched, kind: 'partial' });
+      matches.push({ profileId: profile.profileId, matched, total: entries.length, chatMatched, kind: 'partial' });
     }
   }
 

@@ -3063,6 +3063,18 @@ describe('/role subcommand routing', () => {
     expect(deleteRoleFile).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
     expect(writeRoleFile).not.toHaveBeenCalled();
   });
+
+  it('refuses an empty entry with a clear-specific message (not overwrite) when no --force', async () => {
+    vi.mocked(readRoleProfileEntry).mockReturnValue('');
+    vi.mocked(resolveRoleFile).mockReturnValue('EXISTING_CHAT_ROLE');
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile apply collab-main'), deps, LARK_APP_ID);
+    expect(deleteRoleFile).not.toHaveBeenCalled();
+    expect(writeRoleFile).not.toHaveBeenCalled();
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('--force');
+    expect(reply).toContain('清除'); // clear-intent wording, not the overwrite ('覆盖') message
+  });
 });
 
 describe('/card — operator / canOperate gate', () => {
