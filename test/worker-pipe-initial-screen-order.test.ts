@@ -37,6 +37,20 @@ describe('worker pipe initial screen ordering', () => {
     expect(queuedProbeIdx).toBeGreaterThan(queueLogIdx);
   });
 
+  it('limits busy-pattern idle probes to the active status region', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function busyProbeRegion(content: string): string');
+    const probeStart = source.indexOf('function probeBusyPatternIdle');
+    const probeEnd = source.indexOf('function scheduleReattachIdleProbe');
+    const helper = source.slice(helperStart, probeEnd);
+    const probe = source.slice(probeStart, probeEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
+    expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
+    expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
+  });
+
   it('limits the reattach idle probe to adapters with a busy marker', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const helperStart = source.indexOf('function scheduleReattachIdleProbe');

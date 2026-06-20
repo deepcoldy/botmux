@@ -3396,6 +3396,12 @@ function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 
   return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? '';
 }
 
+function busyProbeRegion(content: string): string {
+  const lines = content.split(/\r?\n/);
+  const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
+  return lines.slice(-tailLineCount).join('\n');
+}
+
 function probeBusyPatternIdle(
   source: string,
   be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>,
@@ -3404,7 +3410,7 @@ function probeBusyPatternIdle(
     const content = captureBackendScreen(be);
     if (!content) return false;
     if (cliAdapter?.busyPattern) {
-      if (cliAdapter.busyPattern.test(content)) return false;
+      if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
       log(`${source} idle probe: busy marker absent, marking prompt ready`);
       markPromptReady();
       return true;
