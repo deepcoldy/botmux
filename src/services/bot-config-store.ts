@@ -18,6 +18,7 @@ import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { statSync } from 'node:fs';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput } from '../core/passthrough-commands.js';
+import { parseStartupCommandsInput } from '../core/startup-commands.js';
 
 /**
  * 生效时机：
@@ -40,6 +41,10 @@ export interface ConfigFieldSpec {
   clearable: boolean;
   /** kind==='enum' 时的合法取值（已小写）。 */
   enumValues?: readonly string[];
+  /** kind==='stringList' 的自定义解析器（自由文本 → 归一化数组）。缺省用
+   *  customPassthroughCommands 的逗号/空格分隔解析；带参数的命令行字段
+   *  （如 startupCommands）须指定按逗号/换行分隔、保留内部空格的解析器。 */
+  parseList?: (raw: string) => string[];
   /** 一句话说明，进 `/config help` / `/config get`。 */
   hint: string;
 }
@@ -68,6 +73,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；chat=扁平连续会话，thread/unset 回默认（每条 DM 独立会话）' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大同时活跃会话数；超过后最久未用的会话自动休眠（杀 worker+CLI 回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
+  { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -250,7 +256,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
   if (!s) return { ok: false, reason: 'empty' };
   switch (spec.kind) {
     case 'stringList': {
-      const arr = parseCustomPassthroughInput(s);
+      const arr = (spec.parseList ?? parseCustomPassthroughInput)(s);
       return arr.length ? { ok: true, value: arr } : { ok: false, reason: 'empty' };
     }
     case 'enum':
@@ -305,6 +311,8 @@ export interface ConfigCardData {
   autoStartPrompt: string | null;
   /** 额外放行透传的 slash 命令（customPassthroughCommands），空格分隔；null = 未设。 */
   customPassthroughCommands: string | null;
+  /** 开会话后自动发的命令（startupCommands），逗号分隔（命令自带空格参数，故不能空格分隔）；null = 未设。 */
+  startupCommands: string | null;
   /** team 级默认角色文本（不在 bots.json，存独立角色文件）。 */
   teamRole: string | null;
   /** messageQuota.defaultLimit（被授权人默认消息额度）；null = 不限。 */
@@ -331,6 +339,8 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     defaultWorkingDir: cfg.defaultWorkingDir ?? null,
     autoStartPrompt: cfg.autoStartOnGroupJoinPrompt ?? null,
     customPassthroughCommands: cfg.customPassthroughCommands?.length ? cfg.customPassthroughCommands.join(' ') : null,
+    // Join with ', ' (not space): each command carries space-delimited args.
+    startupCommands: cfg.startupCommands?.length ? cfg.startupCommands.join(', ') : null,
     teamRole: resolveTeamRoleFile(larkAppId),
     quota: typeof q === 'number' && Number.isInteger(q) && q > 0 ? q : null,
     admins: bot.resolvedAllowedUsers.length,

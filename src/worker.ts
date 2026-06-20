@@ -164,6 +164,12 @@ function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
+/** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
+ *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
+ *  them — needed because session-only settings like `/effort ultracode` are lost
+ *  when the CLI restarts. Consumed inside flushPending right before the first
+ *  user prompt is drained, so the commands always precede it (see runStartupCommands). */
+let hasRunStartupCommands = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
  *  hook fires a true-ready signal, so a cjadk-style startup selector's ❯ (which
  *  falsely matches readyPattern) can't eat the first message. Recreated + armed
@@ -225,6 +231,69 @@ function releaseReadyGate(reason: string): void {
     settleThenFlush(Date.now());
   }
 }
+
+/** Per-startup-command quiescence: how long the PTY must be quiet before sending
+ *  the next command, capped so a slow/redrawing command can't stall the queue. */
+const STARTUP_CMD_QUIET_MS = 500;
+const STARTUP_CMD_CAP_MS = 4_000;
+
+/** Type one literal input LINE into the CLI exactly like a passthrough slash
+ *  command: raw text → a 200ms beat (so the TUI's slash-command picker registers
+ *  the match before submit) → a separate Enter. Non-TUI backends fall back to a
+ *  single write + CR. Shared by the `raw_input` IPC handler and runStartupCommands
+ *  so both stay in lockstep. */
+async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
+  if ('sendText' in be && 'sendSpecialKeys' in be) {
+    (be as any).sendText(content);
+    await new Promise(r => setTimeout(r, 200));
+    (be as any).sendSpecialKeys('Enter');
+  } else {
+    be.write(content + '\r');
+  }
+}
+
+/** Resolve once the PTY has been quiet for `quietMs`, or after `capMs` total.
+ *  Spaces out startup commands so each is processed before the next is typed. */
+function awaitPtyQuiescence(quietMs: number, capMs: number): Promise<void> {
+  return new Promise(resolve => {
+    const startedAt = Date.now();
+    const check = () => {
+      const now = Date.now();
+      if (now - lastPtyOutputAtMs >= quietMs || now - startedAt >= capMs) { resolve(); return; }
+      const wait = Math.min(quietMs - (now - lastPtyOutputAtMs), capMs - (now - startedAt));
+      const t = setTimeout(check, Math.max(50, wait));
+      t.unref?.();
+    };
+    check();
+  });
+}
+
+/** Type this spawn's bot.startupCommands into the CLI in order — one submit each,
+ *  before the first user prompt. Best-effort: a failing command is logged and
+ *  skipped, never blocking the first prompt. Skipped in adopt mode (we observe
+ *  the user's existing session). Invoked once per spawn from flushPending under
+ *  the isFlushing mutex, so no user message can interleave. */
+async function runStartupCommands(): Promise<void> {
+  const cmds = lastInitConfig?.startupCommands;
+  if (!cmds || cmds.length === 0) return;
+  if (lastInitConfig?.adoptMode) return;
+  if (!backend) return;
+  log(`Running ${cmds.length} startup command(s) before first prompt`);
+  for (const cmd of cmds) {
+    if (!backend) break;
+    try {
+      await sendRawCommandLine(backend, cmd);
+      await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+      log(`Startup command sent: ${cmd}`);
+    } catch (e: any) {
+      log(`Startup command failed (${cmd}): ${e?.message ?? e}`);
+    }
+  }
+  // Commands consumed turns and reset idle; treat the first user prompt fresh.
+  isPromptReady = false;
+  idleDetector?.reset();
+}
+
 const pendingMessages: PendingCliInput[] = [];
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
@@ -3035,6 +3104,16 @@ async function flushPending(): Promise<void> {
   }
 
   try {
+    // One-shot per spawn: type the bot's startup commands (e.g. `/effort
+    // ultracode`) into the CLI before the first user prompt drains. Both ready
+    // paths funnel through flushPending — the ready-gate settle for Claude-family
+    // CLIs, markPromptReady for the rest — so this is the single universal
+    // "ready, about to send the first prompt" point, for every CLI. Held by the
+    // isFlushing mutex so no Lark message can interleave between the commands.
+    if (!hasRunStartupCommands) {
+      hasRunStartupCommands = true;
+      await runStartupCommands();
+    }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const item = pendingMessages.shift()!;
       // Track as in-flight until the CLI returns to idle (markPromptReady).
@@ -3460,6 +3539,12 @@ function scheduleBusyPatternIdleProbe(source: string): void {
 }
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  // Re-arm the startup-commands one-shot: a restart/resume re-spawns the CLI, so
+  // session-only settings like `/effort ultracode` must be re-applied (the prior
+  // CLI's effort level is gone). flushPending consumes this before the next first
+  // prompt. (Resume via the daemon forks a fresh worker process where this is
+  // already false; this covers in-process restart.)
+  hasRunStartupCommands = false;
   // Re-deliver inputs that were in-flight when the previous CLI died (see
   // backend.onExit). killCli() already wiped pendingMessages, so these go to
   // the front; the normal flush paths (prompt detect / first-prompt timeout)
@@ -4975,20 +5060,14 @@ process.on('message', async (raw: unknown) => {
       usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       if (backend) {
-        if ('sendText' in backend && 'sendSpecialKeys' in backend) {
-          (backend as any).sendText(msg.content);
-          // Beat between text and Enter so the CLI's slash-command picker has
-          // time to register the match before submit. Without this, Codex
-          // (and likely other Ink-based TUIs) fires Enter while the picker
-          // is still building, dismisses the match, and submits the literal
-          // `/clear` as a regular user prompt — visible to the user as
-          // "/clear + 换行" stuck in conversation history. 200ms mirrors the
-          // codex adapter's own writeInput paste-detection delay.
-          await new Promise(r => setTimeout(r, 200));
-          (backend as any).sendSpecialKeys('Enter');
-        } else {
-          backend.write(msg.content + '\r');
-        }
+        // sendRawCommandLine: literal text → 200ms beat (so the CLI's slash-
+        // command picker registers the match before submit; without it Codex /
+        // other Ink TUIs fire Enter while the picker is still building, dismiss
+        // the match, and submit the literal `/clear` as a regular user prompt —
+        // visible to the user as "/clear + 换行" stuck in history; the 200ms
+        // mirrors the codex adapter's own writeInput paste-detection delay) →
+        // Enter. Shared with runStartupCommands so both stay in lockstep.
+        await sendRawCommandLine(backend, msg.content);
         isPromptReady = false;
         idleDetector?.reset();
         log(`Passthrough slash command: ${msg.content}`);

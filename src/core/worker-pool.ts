@@ -1602,6 +1602,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     wrapperCli: botCfg.wrapperCli,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    // Startup commands run on every fresh spawn (incl. resume) so session-only
+    // settings like `/effort ultracode` are re-established. Adopt sessions are
+    // observed, not driven — forkAdoptWorker intentionally omits this.
+    startupCommands: botCfg.startupCommands,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,

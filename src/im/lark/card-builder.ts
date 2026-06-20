@@ -165,6 +165,8 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
     { tag: 'hr' },
     ...section('card.config.lbl_passthrough', 'customPassthroughCommands', data.customPassthroughCommands),
     { tag: 'hr' },
+    ...section('card.config.lbl_startup', 'startupCommands', data.startupCommands),
+    { tag: 'hr' },
     ...section('card.config.lbl_role', 'teamRole', data.teamRole),
   ];
   return JSON.stringify({

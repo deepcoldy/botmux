@@ -32,16 +32,33 @@ function caseRegion(src: string, marker: string, span = 3000): string {
 describe('worker raw_input handler', () => {
   const region = caseRegion(workerSrc, "case 'raw_input':");
 
-  it('enqueues followUpContent strictly AFTER the slash-command Enter', () => {
-    const enterIdx = region.indexOf("sendSpecialKeys('Enter')");
+  it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
+    // The Enter now lives inside the shared sendRawCommandLine helper (also used
+    // by runStartupCommands). The handler AWAITS it before touching the follow-up,
+    // so the contract still holds: the full text → 200ms beat → Enter completes
+    // before followUpContent is enqueued.
+    const sendIdx = region.indexOf('await sendRawCommandLine(backend, msg.content)');
     const followIdx = region.indexOf('msg.followUpContent');
-    expect(enterIdx).toBeGreaterThanOrEqual(0);
+    expect(sendIdx).toBeGreaterThanOrEqual(0);
     expect(followIdx).toBeGreaterThanOrEqual(0);
-    expect(followIdx).toBeGreaterThan(enterIdx);
+    expect(followIdx).toBeGreaterThan(sendIdx);
   });
 
   it('routes the follow-up through sendToPty (normal busy-queue semantics)', () => {
     expect(region).toContain('sendToPty(msg.followUpContent)');
+  });
+});
+
+describe('worker sendRawCommandLine helper', () => {
+  const helper = caseRegion(workerSrc, 'async function sendRawCommandLine', 500);
+
+  it('submits literal text → 200ms beat → Enter in order (slash-picker safe)', () => {
+    const textIdx = helper.indexOf('sendText(content)');
+    const beatIdx = helper.indexOf('setTimeout(r, 200)');
+    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')");
+    expect(textIdx).toBeGreaterThanOrEqual(0);
+    expect(beatIdx).toBeGreaterThan(textIdx);
+    expect(enterIdx).toBeGreaterThan(beatIdx);
   });
 });
 

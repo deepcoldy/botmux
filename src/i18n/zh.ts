@@ -334,6 +334,7 @@ export const messages: Record<string, string> = {
   'card.config.lbl_brand': '卡片签名（brandLabel）',
   'card.config.lbl_prompt': '入群首轮 prompt',
   'card.config.lbl_passthrough': '额外放行的 slash 命令（逗号/空格分隔，如 /goal /export）',
+  'card.config.lbl_startup': '启动命令（开会话后、首条消息前自动发，逗号/换行分隔，可带参数，如 /effort ultracode）',
   'card.config.lbl_role': '默认角色（team，跨群）',
   'card.config.save': '💾 保存',
   'card.config.back': '⬅ 返回配置',

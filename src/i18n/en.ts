@@ -331,6 +331,7 @@ export const messages: Record<string, string> = {
   'card.config.lbl_brand': 'Card signature (brandLabel)',
   'card.config.lbl_prompt': 'On-join first prompt',
   'card.config.lbl_passthrough': 'Extra passthrough slash commands (comma/space separated, e.g. /goal /export)',
+  'card.config.lbl_startup': 'Startup commands (auto-sent after launch, before the first message; comma/newline separated, args allowed, e.g. /effort ultracode)',
   'card.config.lbl_role': 'Default role (team, cross-chat)',
   'card.config.save': '💾 Save',
   'card.config.back': '⬅ Back to config',

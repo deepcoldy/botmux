@@ -9,6 +9,7 @@ import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
+import { normalizeStartupCommandList } from './core/startup-commands.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 
@@ -184,6 +185,17 @@ export interface BotConfig {
    * 未配置（undefined）→ 仅用内置白名单（保持现状）。
    */
   customPassthroughCommands?: string[];
+  /**
+   * Optional per-bot startup commands: slash-command lines the worker types into
+   * a freshly spawned CLI right after it's ready, BEFORE the user's first prompt
+   * (e.g. `/effort ultracode`, `/model opus`). Sent in order, one submit each,
+   * via the same literal-input path as a passthrough slash command (no prompt
+   * wrapping). Re-applied on every fresh spawn (incl. resume) — so session-only
+   * settings like `/effort ultracode` survive a resume. Skipped in adopt mode
+   * (we observe the user's existing session, not drive a fresh one). Each entry
+   * is trimmed and gets a leading `/` if missing; arguments (spaces) preserved.
+   */
+  startupCommands?: string[];
   /**
    * Optional per-bot priority skill policy. Missing means botmux does not alter
    * the underlying CLI's native skill discovery or spawn arguments.
@@ -729,6 +741,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (uniq.length > 0) customPassthroughCommands = uniq;
     }
 
+    // startupCommands：开会话后、首条 prompt 前自动敲进 CLI 的 slash 命令行（可带
+    // 参数，如 `/effort ultracode`）。归一化：去多余空白、补前导 `/`、去重；空 →
+    // undefined（与 customPassthroughCommands 同款"不写空数组保持干净"）。
+    const startupCommandsList = normalizeStartupCommandList(entry.startupCommands);
+    const startupCommands = startupCommandsList.length > 0 ? startupCommandsList : undefined;
+
     const skills = readBotSkillPolicy(entry.skills);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
@@ -794,6 +812,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       customPassthroughCommands,
+      startupCommands,
       skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
