@@ -51,8 +51,8 @@ describe('buildWorkflowsCard', () => {
     expect(json).toContain('Dashboard 工作流');
     expect(json).toContain('_当前没有工作流运行_');
     // Pagination buttons absent on single page (no rows).
-    expect(json).not.toContain('上一页');
-    expect(json).not.toContain('下一页');
+    expect(json).not.toContain('← 上');
+    expect(json).not.toContain('下 →');
     // Refresh button always present.
     expect(json).toContain(WORKFLOWS_ACTION_REFRESH);
   });
@@ -102,8 +102,8 @@ describe('buildWorkflowsCard', () => {
       run({ runId: `r_${i}`, workflowId: `wf_${i}`, status: 'running', startedAt: 1_000 - i }),
     );
     const json = buildWorkflowsCard(rows, { ...baseOpts, page: 2 }, NOW);
-    expect(json).toContain('上一页');
-    expect(json).toContain('下一页');
+    expect(json).toContain('← 上');
+    expect(json).toContain('下 →');
     expect(json).toContain('第 2/5 页');
     // prev → 1, next → 3
     expect(json).toContain('"page":"1"');
@@ -116,8 +116,8 @@ describe('buildWorkflowsCard', () => {
       // all action elements and pick by button label instead.
       const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
       const allActions = actionRows.flatMap((r: any) => (r.actions as any[]) ?? []);
-      const prev = allActions.find((a: any) => String(a.text?.content ?? '').includes('上一页'));
-      const next = allActions.find((a: any) => String(a.text?.content ?? '').includes('下一页'));
+      const prev = allActions.find((a: any) => String(a.text?.content ?? '').includes('← 上'));
+      const next = allActions.find((a: any) => String(a.text?.content ?? '').includes('下 →'));
       return { prev, next };
     };
 
@@ -433,7 +433,7 @@ describe('buildWorkflowsCard — overview drilldown', () => {
     expect(json).toContain('第 1/3 页');
   });
 
-  it('origin=overview → footer renders 🔙 返回总览 button with dash_overview_refresh action', () => {
+  it('origin=overview → footer renders ↩ 总览 button with dash_overview_refresh action', () => {
     const rows = makeRows(2);
     const json = buildWorkflowsCard(
       rows,
@@ -445,11 +445,11 @@ describe('buildWorkflowsCard — overview drilldown', () => {
     const allBtns = actionRows.flatMap((ar: any) => (ar.actions as any[]) ?? []);
     const backToOverview = allBtns.find((a: any) => a.value?.action === 'dash_overview_refresh');
     expect(backToOverview).toBeDefined();
-    expect(String(backToOverview.text?.content ?? '')).toContain('返回总览');
+    expect(String(backToOverview.text?.content ?? '')).toContain('↩ 总览');
     expect(backToOverview.value.invoker_open_id).toBe(INVOKER);
   });
 
-  it('standalone (no origin) → NO 🔙 返回总览 button', () => {
+  it('standalone (no origin) → NO ↩ 总览 button', () => {
     const rows = makeRows(2);
     const json = buildWorkflowsCard(
       rows,
@@ -457,7 +457,7 @@ describe('buildWorkflowsCard — overview drilldown', () => {
       NOW,
     );
     expect(json).not.toContain('dash_overview_refresh');
-    expect(json).not.toContain('返回总览');
+    expect(json).not.toContain('↩ 总览');
   });
 
   it('origin=overview (default pageSize) → every child button.value carries origin; page_size omitted', () => {
@@ -535,8 +535,8 @@ describe('buildWorkflowsCard — overview drilldown', () => {
     const jumpSelects = allBtns.filter((a: any) => a.tag === 'select_static');
     expect(jumpSelects.length).toBe(0);
     // Prev/next still present.
-    expect(json).toContain('上一页');
-    expect(json).toContain('下一页');
+    expect(json).toContain('← 上');
+    expect(json).toContain('下 →');
   });
 
   it('totalPages <= 2 → NO select_static rendered (prev/next still on totalPages=2)', () => {
@@ -1189,7 +1189,7 @@ describe('handleWorkflowsCardAction — overview drilldown', () => {
     expect(cardJson).toContain('第 3/3 页');
   });
 
-  it('REFRESH with origin=overview → rebuilt list card has 🔙 返回总览', async () => {
+  it('REFRESH with origin=overview → rebuilt list card has ↩ 总览', async () => {
     const runs: WorkflowRunInput[] = [
       run({ runId: 'r_o', workflowId: 'wfOver', status: 'running' }),
     ];
@@ -1205,11 +1205,11 @@ describe('handleWorkflowsCardAction — overview drilldown', () => {
     );
     expect(r.card?.type).toBe('raw');
     const cardJson = JSON.stringify(r.card?.data);
-    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('↩ 总览');
     expect(cardJson).toContain('dash_overview_refresh');
   });
 
-  it('BACK_TO_LIST with origin=overview → rebuilt list has 🔙 返回总览 and threads origin onto child buttons', async () => {
+  it('BACK_TO_LIST with origin=overview → rebuilt list has ↩ 总览 and threads origin onto child buttons', async () => {
     const runs: WorkflowRunInput[] = [
       run({ runId: 'r_b1', workflowId: 'wfB1', status: 'running' }),
     ];
@@ -1225,7 +1225,7 @@ describe('handleWorkflowsCardAction — overview drilldown', () => {
     );
     expect(r.card?.type).toBe('raw');
     const cardJson = JSON.stringify(r.card?.data);
-    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('↩ 总览');
     // Detail button (per-row) and refresh button must both carry origin=overview.
     const card: any = r.card?.data;
     const allBtns = (card.elements as any[])

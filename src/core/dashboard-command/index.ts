@@ -119,7 +119,7 @@ export async function handleDashboardCommand(
     return handleDashboardWorkflows(message, workflowsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.workflows);
   }
 
-  // PR3 groups slice 1: read-only matrix list + pagination + refresh.
+  // PR3 groups: list + pagination + refresh + per-row management detail.
   if (sub === 'groups') {
     const groupsArgs = args.replace(/^groups\s*/, '');
     return handleDashboardGroups(message, groupsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.groups);

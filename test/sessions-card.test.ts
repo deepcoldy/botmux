@@ -54,8 +54,8 @@ describe('buildSessionsCard', () => {
     expect(json).toContain('Dashboard 会话');
     expect(json).toContain('_当前没有会话_');
     // No prev/next buttons when list is empty (totalPages === 1).
-    expect(json).not.toContain('上一页');
-    expect(json).not.toContain('下一页');
+    expect(json).not.toContain('← 上');
+    expect(json).not.toContain('下 →');
     // Refresh button is always present.
     expect(json).toContain(SESSIONS_ACTION_REFRESH);
   });
@@ -97,8 +97,8 @@ describe('buildSessionsCard', () => {
       row({ sessionId: `sess_${i}`, title: `title-${i}`, status: 'idle' }),
     );
     const json = buildSessionsCard(rows, { ...baseOpts, page: 2 }, NOW);
-    expect(json).toContain('上一页');
-    expect(json).toContain('下一页');
+    expect(json).toContain('← 上');
+    expect(json).toContain('下 →');
     expect(json).toContain('第 2/5 页');
     // prev → page=1, next → page=3
     expect(json).toContain('"page":"1"');
@@ -115,8 +115,8 @@ describe('buildSessionsCard', () => {
       // all action elements and pick by button label instead.
       const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
       const allActions = actionRows.flatMap((r: any) => (r.actions as any[]) ?? []);
-      const prev = allActions.find((a: any) => String(a.text?.content ?? '').includes('上一页'));
-      const next = allActions.find((a: any) => String(a.text?.content ?? '').includes('下一页'));
+      const prev = allActions.find((a: any) => String(a.text?.content ?? '').includes('← 上'));
+      const next = allActions.find((a: any) => String(a.text?.content ?? '').includes('下 →'));
       return { prev, next };
     };
     const page1 = buildSessionsCard(rows, { ...baseOpts, page: 1 }, NOW);
@@ -236,7 +236,7 @@ describe('buildSessionsCard', () => {
   /** ─── Overview drilldown (2026-06-10) ───
    *  Standalone and drilldown both use the unified default 5/page; `origin`
    *  is the only thing the drilldown sub-card carries — it controls the
-   *  「🔙 返回总览」 button and is threaded through every callback so the
+   *  「↩ 总览」 button and is threaded through every callback so the
    *  back affordance persists across page/refresh/detail/detail-back/
    *  toggle round-trips. */
   describe('overview drilldown', () => {
@@ -265,7 +265,7 @@ describe('buildSessionsCard', () => {
       expect(detailButtons.length).toBe(3);
     });
 
-    it('origin=overview → footer renders "🔙 返回总览" with action=dash_overview_refresh', () => {
+    it('origin=overview → footer renders "↩ 总览" with action=dash_overview_refresh', () => {
       const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
       const parsed = JSON.parse(json);
       const allButtons = (parsed.elements as any[])
@@ -274,7 +274,7 @@ describe('buildSessionsCard', () => {
       const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
       expect(backBtn).toBeDefined();
       expect(backBtn.value.invoker_open_id).toBe(INVOKER);
-      expect(String(backBtn.text?.content ?? '')).toContain('返回总览');
+      expect(String(backBtn.text?.content ?? '')).toContain('↩ 总览');
     });
 
     it('standalone (no origin) → NO back-to-overview button', () => {
@@ -767,7 +767,7 @@ describe('handleSessionsCardAction', () => {
     expect(cardJson).toContain('第 1/3 页');
     // Back-to-overview button.
     expect(cardJson).toContain('dash_overview_refresh');
-    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('↩ 总览');
   });
 
   it('back_to_list with origin=overview → rebuilt list is drilldown shape (5/page + back btn)', async () => {

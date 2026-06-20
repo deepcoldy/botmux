@@ -88,7 +88,7 @@ describe('handleCardAction → groups dispatch returns { card } only on success'
     expect(result.card).toBeDefined();
     expect(result.card?.type).toBe('raw');
     const cardJson = JSON.stringify(result.card?.data);
-    expect(cardJson).toContain('Dashboard 群矩阵');
+    expect(cardJson).toContain('Dashboard 群组');
     expect(cardJson).toContain('cool-room');
 
     await new Promise(resolve => setImmediate(resolve));

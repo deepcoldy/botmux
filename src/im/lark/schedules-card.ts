@@ -244,7 +244,7 @@ export function buildSchedulesCard(
       const options = Array.from({ length: totalPages }, (_, i) => {
         const n = i + 1;
         return {
-          text: { tag: 'plain_text', content: t('card.dashboard.schedules.jump_page', { n: String(n) }, opts.locale) },
+          text: { tag: 'plain_text', content: t('card.dashboard.schedules.jump_page', { n: String(n), total: String(totalPages) }, opts.locale) },
           value: String(n),
         };
       });
@@ -252,7 +252,7 @@ export function buildSchedulesCard(
         tag: 'select_static',
         placeholder: {
           tag: 'plain_text',
-          content: t('card.dashboard.schedules.jump_page', { n: String(page) }, opts.locale),
+          content: t('card.dashboard.schedules.jump_page', { n: String(page), total: String(totalPages) }, opts.locale),
         },
         initial_option: String(page),
         options,

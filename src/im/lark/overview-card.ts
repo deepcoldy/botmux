@@ -5,12 +5,13 @@
  *  - Sources from the shared `GET /__daemon/overview-snapshot` endpoint
  *    (sessions + schedules now scoped by callerAppId, matching the
  *    per-bot owner gate the dedicated list endpoints already apply).
- *  - Three summary sections (sessions / schedules / settings) each with a
+ *  - Summary sections follow the Web Dashboard navigation order: sessions /
+ *    workflows / groups / schedules / settings.
+ *  - Each section with an implemented sub-card has a
  *    📂 goto button that REBUILDS the target card by reusing the existing
  *    `dash_sessions_refresh` / `dash_schedules_refresh` /
  *    `dash_settings_refresh` handlers — no new endpoints, no `multi_url`
  *    cross-card jumps that lose the invoker-lock chain.
- *  - 群矩阵 / Workflows show only an 即将上线 placeholder (no buttons).
  *  - Footer: refresh + reused `card.dashboard.settings.footer.security`.
  *
  * Identity / security mirrors `sessions-card.ts` slice 1:
@@ -235,6 +236,61 @@ export function buildOverviewCard(
 
   elements.push({ tag: 'hr' });
 
+  // ─── Workflows section ───────────────────────────────────────────────
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: `**${t('card.dashboard.overview.workflows_section', undefined, opts.locale)}**`,
+    },
+  });
+  elements.push({
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        content: t('card.dashboard.overview.goto_workflows', undefined, opts.locale),
+      },
+      type: 'default',
+      value: {
+        action: OVERVIEW_ACTION_GOTO_WORKFLOWS,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    }],
+  });
+
+  elements.push({ tag: 'hr' });
+
+  // ─── Groups section ──────────────────────────────────────────────────
+  // overview-snapshot doesn't carry groups counts yet (would require a
+  // server-side aggregator); the entry button is enough for navigation.
+  // Counts may be backfilled in a later slice without breaking this card.
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: `**${t('card.dashboard.overview.groups_section', undefined, opts.locale)}**`,
+    },
+  });
+  elements.push({
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        content: t('card.dashboard.overview.goto_groups', undefined, opts.locale),
+      },
+      type: 'default',
+      value: {
+        action: OVERVIEW_ACTION_GOTO_GROUPS,
+        invoker_open_id: opts.invokerOpenId,
+      },
+    }],
+  });
+
+  elements.push({ tag: 'hr' });
+
   // ─── Schedules section ───────────────────────────────────────────────
   elements.push({
     tag: 'div',
@@ -290,61 +346,6 @@ export function buildOverviewCard(
       type: 'default',
       value: {
         action: OVERVIEW_ACTION_GOTO_SETTINGS,
-        invoker_open_id: opts.invokerOpenId,
-      },
-    }],
-  });
-
-  elements.push({ tag: 'hr' });
-
-  // ─── Groups section ──────────────────────────────────────────────────
-  // overview-snapshot doesn't carry groups counts yet (would require a
-  // server-side aggregator); the entry button is enough for navigation.
-  // Counts may be backfilled in a later slice without breaking this card.
-  elements.push({
-    tag: 'div',
-    text: {
-      tag: 'lark_md',
-      content: `**${t('card.dashboard.overview.groups_section', undefined, opts.locale)}**`,
-    },
-  });
-  elements.push({
-    tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: {
-        tag: 'plain_text',
-        content: t('card.dashboard.overview.goto_groups', undefined, opts.locale),
-      },
-      type: 'default',
-      value: {
-        action: OVERVIEW_ACTION_GOTO_GROUPS,
-        invoker_open_id: opts.invokerOpenId,
-      },
-    }],
-  });
-
-  elements.push({ tag: 'hr' });
-
-  // ─── Workflows section ───────────────────────────────────────────────
-  elements.push({
-    tag: 'div',
-    text: {
-      tag: 'lark_md',
-      content: `**${t('card.dashboard.overview.workflows_section', undefined, opts.locale)}**`,
-    },
-  });
-  elements.push({
-    tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: {
-        tag: 'plain_text',
-        content: t('card.dashboard.overview.goto_workflows', undefined, opts.locale),
-      },
-      type: 'default',
-      value: {
-        action: OVERVIEW_ACTION_GOTO_WORKFLOWS,
         invoker_open_id: opts.invokerOpenId,
       },
     }],

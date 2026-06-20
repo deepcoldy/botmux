@@ -1,5 +1,5 @@
 /**
- * `/dashboard groups` real sub-handler (PR3 slice 1).
+ * `/dashboard groups` real sub-handler.
  *
  * Mirrors `/dashboard sessions` slice 1: owner gate has ALREADY run in
  * `handleDashboardCommand`; this function only fetches the matrix from PR2
@@ -7,8 +7,8 @@
  * and DMs the owner with the topic getting a short `dm_sent` confirmation.
  * `/dashboard` is the Bot Owner's global tool panel, not a per-bot view.
  *
- * Slice 1 is read-only: no leave / add-bots / oncall-bind / oncall-unbind /
- * detail / search / filter / disband.
+ * The command entry sends the list card; per-row detail cards carry add-bot,
+ * remove-bot, oncall and role actions through card callbacks.
  */
 
 import type { LarkMessage } from '../../types.js';

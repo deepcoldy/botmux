@@ -6,7 +6,7 @@
  *      Reads the body stream EXACTLY ONCE and returns `bodyRaw`.
  *   2) `bodyRaw` is JSON-parsed (empty body → `undefined`); a parse failure
  *      after a valid HMAC returns 400 `bad_json` without re-reading `req`.
- *   3) Dispatch matches `(method, path)` against a typed allowlist of 20
+ *   3) Dispatch matches `(method, path)` against a typed allowlist
  *      endpoints — there is intentionally NO generic forward, so a daemon
  *      can never use Route B as a path-shifting proxy.
  *
@@ -468,6 +468,52 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/groups\/([^/]+)\/oncall\/([^/]+)\/unbind$/,
     handle: async (m, _ctx, deps) =>
       unbindOncall(decodeURIComponent(m[1]), decodeURIComponent(m[2]), deps.groupsActionDeps),
+  },
+  {
+    method: 'GET',
+    pathRe: /^\/__daemon\/groups\/([^/]+)\/roles\/([^/]+)$/,
+    handle: async (m, _ctx, deps) => {
+      const chatId = decodeURIComponent(m[1]);
+      const appId = decodeURIComponent(m[2]);
+      const upstream = await deps.proxyToDaemon(
+        appId,
+        `/api/roles/${encodeURIComponent(chatId)}`,
+        { method: 'GET' },
+      );
+      return { status: upstream.status, body: await readUpstream(upstream) };
+    },
+  },
+  {
+    method: 'PUT',
+    pathRe: /^\/__daemon\/groups\/([^/]+)\/roles\/([^/]+)$/,
+    handle: async (m, ctx, deps) => {
+      const chatId = decodeURIComponent(m[1]);
+      const appId = decodeURIComponent(m[2]);
+      const upstream = await deps.proxyToDaemon(
+        appId,
+        `/api/roles/${encodeURIComponent(chatId)}`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: ctx.bodyRaw.length > 0 ? ctx.bodyRaw : '{}',
+        },
+      );
+      return { status: upstream.status, body: await readUpstream(upstream) };
+    },
+  },
+  {
+    method: 'DELETE',
+    pathRe: /^\/__daemon\/groups\/([^/]+)\/roles\/([^/]+)$/,
+    handle: async (m, _ctx, deps) => {
+      const chatId = decodeURIComponent(m[1]);
+      const appId = decodeURIComponent(m[2]);
+      const upstream = await deps.proxyToDaemon(
+        appId,
+        `/api/roles/${encodeURIComponent(chatId)}`,
+        { method: 'DELETE' },
+      );
+      return { status: upstream.status, body: await readUpstream(upstream) };
+    },
   },
 
   // ── WRITE: workflows × 3 ──────────────

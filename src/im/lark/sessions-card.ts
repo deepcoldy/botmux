@@ -236,7 +236,7 @@ export function buildSessionsCard(
       const options = Array.from({ length: meta.totalPages }, (_, i) => {
         const n = i + 1;
         return {
-          text: { tag: 'plain_text', content: t('card.dashboard.sessions.jump_page', { n: String(n) }, opts.locale) },
+          text: { tag: 'plain_text', content: t('card.dashboard.sessions.jump_page', { n: String(n), total: String(meta.totalPages) }, opts.locale) },
           value: String(n),
         };
       });
@@ -244,7 +244,7 @@ export function buildSessionsCard(
         tag: 'select_static',
         placeholder: {
           tag: 'plain_text',
-          content: t('card.dashboard.sessions.jump_page', { n: String(meta.page) }, opts.locale),
+          content: t('card.dashboard.sessions.jump_page', { n: String(meta.page), total: String(meta.totalPages) }, opts.locale),
         },
         initial_option: String(meta.page),
         options,

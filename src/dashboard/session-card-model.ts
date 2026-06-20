@@ -86,7 +86,7 @@ export function statusToDot(status: string): StatusDot {
     case 'starting':
       return { tone: 'info', pulse: true, label: 'sessions.status.starting' };
     case 'idle':
-      return { tone: 'neutral', pulse: false, label: 'sessions.status.idle' };
+      return { tone: 'success', pulse: false, label: 'sessions.status.idle' };
     case 'limited':
       return { tone: 'warning', pulse: false, label: 'sessions.status.limited' };
     case 'closed':

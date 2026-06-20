@@ -307,7 +307,7 @@ export function buildWorkflowsCard(
       const options = Array.from({ length: paged.totalPages }, (_, i) => {
         const n = i + 1;
         return {
-          text: { tag: 'plain_text', content: t('card.dashboard.workflows.jump_page', { n: String(n) }, opts.locale) },
+          text: { tag: 'plain_text', content: t('card.dashboard.workflows.jump_page', { n: String(n), total: String(paged.totalPages) }, opts.locale) },
           value: String(n),
         };
       });
@@ -315,7 +315,7 @@ export function buildWorkflowsCard(
         tag: 'select_static',
         placeholder: {
           tag: 'plain_text',
-          content: t('card.dashboard.workflows.jump_page', { n: String(paged.page) }, opts.locale),
+          content: t('card.dashboard.workflows.jump_page', { n: String(paged.page), total: String(paged.totalPages) }, opts.locale),
         },
         initial_option: String(paged.page),
         options,

@@ -1,11 +1,8 @@
 /**
- * Groups list card (PR3 `/dashboard groups` slice 1).
+ * Groups card (PR3 `/dashboard groups`).
  *
- * Read-only matrix list + pagination + refresh. NO leave / add-bots /
- * oncall bind/unbind / disband / detail / search / filter in this slice.
- * Codex scope-cut on 2026-06-09: those need an action-state pattern
- * (optimistic-state + rollback) plus filter UI design which we'll land in
- * later slices.
+ * List view + detail/manage view. The list stays compact (5/page); the
+ * detail card carries per-bot membership / oncall / role management actions.
  *
  * Global dashboard scope: `/dashboard` renders the full groups matrix. The
  * row view summarizes coverage across all bot columns (joined/total) instead
@@ -26,11 +23,12 @@
 import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
 import type {
   GroupCoverageStatus,
+  GroupDetailMemberDto,
   GroupRowDto,
   GroupsBotInput,
   GroupsChatInput,
 } from '../../dashboard/groups-card-model.js';
-import { buildGroupRow } from '../../dashboard/groups-card-model.js';
+import { buildGroupDetail, buildGroupRow } from '../../dashboard/groups-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
 
@@ -38,6 +36,15 @@ import type { CardActionData } from './card-handler.js';
 
 export const GROUPS_ACTION_REFRESH = 'dash_groups_refresh' as const;
 export const GROUPS_ACTION_PAGE = 'dash_groups_page' as const;
+export const GROUPS_ACTION_DETAIL = 'dash_groups_detail' as const;
+export const GROUPS_ACTION_BACK_TO_LIST = 'dash_groups_back_to_list' as const;
+export const GROUPS_ACTION_ADD_BOT = 'dash_groups_add_bot' as const;
+export const GROUPS_ACTION_LEAVE_BOT = 'dash_groups_leave_bot' as const;
+export const GROUPS_ACTION_ONCALL_BIND = 'dash_groups_oncall_bind' as const;
+export const GROUPS_ACTION_ONCALL_UNBIND = 'dash_groups_oncall_unbind' as const;
+export const GROUPS_ACTION_ROLE_OPEN = 'dash_groups_role_open' as const;
+export const GROUPS_ACTION_ROLE_SAVE = 'dash_groups_role_save' as const;
+export const GROUPS_ACTION_ROLE_DELETE = 'dash_groups_role_delete' as const;
 /** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
  *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
  *  import). card-handler routes by action prefix, so dispatch lands on the
@@ -96,10 +103,32 @@ export interface BuildGroupsCardOpts {
   scope?: 'global';
 }
 
+interface GroupsNavOpts {
+  invokerOpenId: string;
+  locale: Locale;
+  page?: number;
+  pageSize?: number;
+  origin?: 'overview';
+  scope?: 'global';
+}
+
+type GroupsMatrix = {
+  chats: ReadonlyArray<GroupsChatInput>;
+  bots: ReadonlyArray<GroupsBotInput>;
+};
+
+function buildNavFields(opts: { pageSize?: number; origin?: 'overview'; scope?: 'global' }): Record<string, string> {
+  const navFields: Record<string, string> = {};
+  if (opts.origin === 'overview') navFields.origin = 'overview';
+  if (opts.pageSize !== undefined && opts.pageSize !== PAGE_SIZE) navFields.page_size = String(opts.pageSize);
+  if (opts.scope === 'global') navFields.dashboard_scope = 'global';
+  return navFields;
+}
+
 /** Build the groups list card JSON. Pure (composes + paginates + renders).
  *  PR1 model owns the sort. */
 export function buildGroupsCard(
-  matrix: { chats: ReadonlyArray<GroupsChatInput>; bots: ReadonlyArray<GroupsBotInput> },
+  matrix: GroupsMatrix,
   opts: BuildGroupsCardOpts,
 ): string {
   const effectivePageSize =
@@ -131,10 +160,7 @@ export function buildGroupsCard(
 
   // Plumb origin + page_size + scope into every button.value so refresh/page
   // rebuilds keep the same dashboard context.
-  const navFields: Record<string, string> = {};
-  if (opts.origin === 'overview') navFields.origin = 'overview';
-  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
-  if (opts.scope === 'global') navFields.dashboard_scope = 'global';
+  const navFields = buildNavFields({ pageSize: effectivePageSize, origin: opts.origin, scope: opts.scope });
 
   const elements: unknown[] = [];
 
@@ -169,7 +195,11 @@ export function buildGroupsCard(
     });
   } else {
     for (const row of pageItems) {
-      elements.push(renderRow(row, opts.locale));
+      elements.push(...renderRow(row, opts.locale, {
+        invokerOpenId: opts.invokerOpenId,
+        page: activePage,
+        navFields,
+      }));
     }
   }
 
@@ -211,7 +241,7 @@ export function buildGroupsCard(
       const options = Array.from({ length: totalPages }, (_, i) => {
         const n = i + 1;
         return {
-          text: { tag: 'plain_text', content: t('card.dashboard.groups.jump_page', { n: String(n) }, opts.locale) },
+          text: { tag: 'plain_text', content: t('card.dashboard.groups.jump_page', { n: String(n), total: String(totalPages) }, opts.locale) },
           value: String(n),
         };
       });
@@ -219,7 +249,7 @@ export function buildGroupsCard(
         tag: 'select_static',
         placeholder: {
           tag: 'plain_text',
-          content: t('card.dashboard.groups.jump_page', { n: String(activePage) }, opts.locale),
+          content: t('card.dashboard.groups.jump_page', { n: String(activePage), total: String(totalPages) }, opts.locale),
         },
         initial_option: String(activePage),
         options,
@@ -274,7 +304,273 @@ export function buildGroupsCard(
   });
 }
 
-function renderRow(row: GroupRowDto, locale: Locale): unknown {
+export function buildGroupsDetailCard(
+  matrix: GroupsMatrix,
+  chat: GroupsChatInput,
+  opts: GroupsNavOpts,
+): string {
+  const detail = buildGroupDetail(chat, matrix.bots);
+  const displayName = detail.name && detail.name !== detail.chatId
+    ? detail.name
+    : t('card.dashboard.groups.unnamed', undefined, opts.locale);
+  const navFields = buildNavFields({ pageSize: opts.pageSize, origin: opts.origin, scope: opts.scope });
+  const backValue = {
+    action: GROUPS_ACTION_BACK_TO_LIST,
+    invoker_open_id: opts.invokerOpenId,
+    ...(opts.page ? { page: String(opts.page) } : {}),
+    ...navFields,
+  };
+
+  const elements: unknown[] = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content:
+          `**${escapeLarkMd(displayName)}**` +
+          `\n<font color="grey">${escapeLarkMd(detail.chatId)} · ${escapeLarkMd(
+            t('card.dashboard.groups.joined_ratio', {
+              joined: String(detail.members.filter(m => m.status === 'in').length),
+              total: String(detail.members.length),
+            }, opts.locale),
+          )}</font>`,
+      },
+    },
+    { tag: 'hr' },
+  ];
+
+  for (const member of detail.members) {
+    elements.push(...renderDetailMember(detail.chatId, member, opts, navFields));
+  }
+
+  elements.push({ tag: 'hr' });
+  const footerActions: unknown[] = [{
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.back', undefined, opts.locale) },
+    type: 'default',
+    value: backValue,
+  }];
+  if (opts.origin === 'overview') {
+    footerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.overview.back_button', undefined, opts.locale) },
+      type: 'default',
+      value: { action: BACK_TO_OVERVIEW_ACTION, invoker_open_id: opts.invokerOpenId },
+    });
+  }
+  elements.push({ tag: 'action', actions: footerActions });
+  elements.push({
+    tag: 'note',
+    elements: [
+      { tag: 'lark_md', content: t('card.dashboard.settings.footer.security', undefined, opts.locale) },
+    ],
+  });
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.dashboard.groups.detail.title', undefined, opts.locale) },
+      template: 'blue',
+    },
+    elements,
+  });
+}
+
+function renderDetailMember(
+  chatId: string,
+  member: GroupDetailMemberDto,
+  opts: GroupsNavOpts,
+  navFields: Record<string, string>,
+): unknown[] {
+  const status = member.status;
+  const icon = statusIcon(status);
+  const roleLabel = member.hasRole
+    ? t('card.dashboard.groups.role_configured', undefined, opts.locale)
+    : t('card.dashboard.groups.role_empty', undefined, opts.locale);
+  const oncallLabel = member.oncallWorkingDir !== null
+    ? t('card.dashboard.groups.oncall_enabled', { workingDir: member.oncallWorkingDir || '-' }, opts.locale)
+    : t('card.dashboard.groups.oncall_disabled', undefined, opts.locale);
+  const secondary = [
+    statusLabel(status, opts.locale),
+    roleLabel,
+    oncallLabel,
+    member.isOwnerBot ? t('card.dashboard.groups.owner_bot', undefined, opts.locale) : undefined,
+  ].filter((x): x is string => typeof x === 'string' && x.length > 0);
+  const valueBase = {
+    invoker_open_id: opts.invokerOpenId,
+    chat_id: chatId,
+    app_id: member.larkAppId,
+    ...(opts.page ? { page: String(opts.page) } : {}),
+    ...navFields,
+  };
+  const actions: unknown[] = [];
+
+  const extraElements: unknown[] = [];
+  if (status === 'in') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.role', undefined, opts.locale) },
+      type: 'default',
+      value: { action: GROUPS_ACTION_ROLE_OPEN, ...valueBase },
+    });
+    if (member.oncallWorkingDir !== null) {
+      actions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.oncall_unbind', undefined, opts.locale) },
+        type: 'danger',
+        value: { action: GROUPS_ACTION_ONCALL_UNBIND, ...valueBase },
+      });
+    } else {
+      extraElements.push({
+        tag: 'form',
+        name: 'groups_oncall_form',
+        elements: [
+          {
+            tag: 'input',
+            name: 'working_dir',
+            placeholder: {
+              tag: 'plain_text',
+              content: t('card.dashboard.groups.working_dir_placeholder', undefined, opts.locale),
+            },
+          },
+          {
+            tag: 'action',
+            actions: [{
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.oncall_bind', undefined, opts.locale) },
+              type: 'primary',
+              form_action_type: 'submit',
+              value: { action: GROUPS_ACTION_ONCALL_BIND, ...valueBase },
+            }],
+          },
+        ],
+      });
+    }
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.leave_bot', undefined, opts.locale) },
+      type: 'danger',
+      confirm: {
+        title: { tag: 'plain_text', content: t('card.dashboard.groups.confirm.leave.title', undefined, opts.locale) },
+        text: {
+          tag: 'plain_text',
+          content: t('card.dashboard.groups.confirm.leave.text', { bot: member.botName }, opts.locale),
+        },
+      },
+      value: { action: GROUPS_ACTION_LEAVE_BOT, ...valueBase },
+    });
+  } else {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.add_bot', undefined, opts.locale) },
+      type: 'primary',
+      value: { action: GROUPS_ACTION_ADD_BOT, ...valueBase },
+    });
+  }
+
+  return [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content:
+          `${icon} **${escapeLarkMd(member.botName)}** ` +
+          `<font color="grey">${escapeLarkMd(member.larkAppId.slice(-6))}</font>` +
+          `\n<font color="grey">${escapeLarkMd(secondary.join(' · '))}</font>`,
+      },
+    },
+    {
+      tag: 'action',
+      actions,
+    },
+    ...extraElements,
+  ];
+}
+
+export function buildGroupsRoleCard(
+  chat: GroupsChatInput,
+  member: GroupDetailMemberDto,
+  roleContent: string,
+  opts: GroupsNavOpts,
+): string {
+  const displayName = chat.name && chat.name !== chat.chatId
+    ? chat.name
+    : t('card.dashboard.groups.unnamed', undefined, opts.locale);
+  const navFields = buildNavFields({ pageSize: opts.pageSize, origin: opts.origin, scope: opts.scope });
+  const valueBase = {
+    invoker_open_id: opts.invokerOpenId,
+    chat_id: chat.chatId,
+    app_id: member.larkAppId,
+    ...(opts.page ? { page: String(opts.page) } : {}),
+    ...navFields,
+  };
+  const elements: unknown[] = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content:
+          `**${escapeLarkMd(displayName)} · ${escapeLarkMd(member.botName)}**` +
+          `\n<font color="grey">${escapeLarkMd(chat.chatId)} · ${escapeLarkMd(member.larkAppId)}</font>`,
+      },
+    },
+    {
+      tag: 'form',
+      name: 'groups_role_form',
+      elements: [
+        {
+          tag: 'input',
+          name: 'role',
+          default_value: roleContent,
+          placeholder: { tag: 'plain_text', content: t('card.dashboard.groups.role_placeholder', undefined, opts.locale) },
+        },
+        {
+          tag: 'action',
+          actions: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.role_save', undefined, opts.locale) },
+            type: 'primary',
+            form_action_type: 'submit',
+            value: { action: GROUPS_ACTION_ROLE_SAVE, ...valueBase },
+          }],
+        },
+      ],
+    },
+    {
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.role_delete', undefined, opts.locale) },
+          type: 'danger',
+          disabled: roleContent.trim().length === 0,
+          value: { action: GROUPS_ACTION_ROLE_DELETE, ...valueBase },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.back', undefined, opts.locale) },
+          type: 'default',
+          value: { action: GROUPS_ACTION_DETAIL, ...valueBase },
+        },
+      ],
+    },
+  ];
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.dashboard.groups.role.title', undefined, opts.locale) },
+      template: 'blue',
+    },
+    elements,
+  });
+}
+
+function renderRow(
+  row: GroupRowDto,
+  locale: Locale,
+  ctx: { invokerOpenId: string; page: number; navFields: Record<string, string> },
+): unknown[] {
   const status = aggregateCoverageStatus(row.coverage);
   const icon = statusIcon(status);
 
@@ -298,14 +594,31 @@ function renderRow(row: GroupRowDto, locale: Locale): unknown {
 
   const secondary = `\n<font color="grey">${escapeLarkMd(secondaryParts.join(' · '))}</font>`;
 
-  return {
-    tag: 'div',
-    text: {
-      tag: 'lark_md',
-      content:
-        `${icon} **${escapeLarkMd(displayName)}**${idSuffix}` + secondary,
+  return [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content:
+          `${icon} **${escapeLarkMd(displayName)}**${idSuffix}` + secondary,
+      },
     },
-  };
+    {
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.dashboard.groups.row_manage', undefined, locale) },
+        type: 'default',
+        value: {
+          action: GROUPS_ACTION_DETAIL,
+          invoker_open_id: ctx.invokerOpenId,
+          chat_id: row.chatId,
+          page: String(ctx.page),
+          ...ctx.navFields,
+        },
+      }],
+    },
+  ];
 }
 
 function aggregateCoverageStatus(cells: ReadonlyArray<GroupRowDto['coverage'][number]>): GroupCoverageStatus {
@@ -359,6 +672,103 @@ function errorToast(
   return { toast: { type: 'error', content: t(textKey, params, locale) } };
 }
 
+function cardResult(cardJson: string): GroupsCardHandlerResult {
+  return {
+    card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
+  };
+}
+
+function matrixFromBody(body: unknown): GroupsMatrix {
+  const b = (body as {
+    chats?: ReadonlyArray<GroupsChatInput>;
+    bots?: ReadonlyArray<GroupsBotInput>;
+  }) ?? {};
+  return {
+    chats: b.chats ?? [],
+    bots: b.bots ?? [],
+  };
+}
+
+async function loadGroupsMatrix(
+  client: DaemonClient,
+  pathSuffix: string,
+  locale: Locale,
+): Promise<{ ok: true; matrix: GroupsMatrix } | { ok: false; result: GroupsCardHandlerResult }> {
+  let r: Awaited<ReturnType<DaemonClient['request']>>;
+  try {
+    r = await client.request({ method: 'GET', path: `/__daemon/groups-matrix${pathSuffix}` });
+  } catch (e) {
+    return {
+      ok: false,
+      result: errorToast('card.dashboard.groups.list_failed', { reason: (e as Error).message }, locale),
+    };
+  }
+  if (r.status !== 200) {
+    const reason = String((r.body as any)?.error ?? `http_${r.status}`);
+    return {
+      ok: false,
+      result: errorToast('card.dashboard.groups.list_failed', { reason }, locale),
+    };
+  }
+  return { ok: true, matrix: matrixFromBody(r.body) };
+}
+
+function findChat(matrix: GroupsMatrix, chatId: string | undefined): GroupsChatInput | undefined {
+  if (!chatId) return undefined;
+  return matrix.chats.find(c => c.chatId === chatId);
+}
+
+function findDetailMember(
+  matrix: GroupsMatrix,
+  chat: GroupsChatInput,
+  appId: string | undefined,
+): GroupDetailMemberDto | undefined {
+  if (!appId) return undefined;
+  return buildGroupDetail(chat, matrix.bots).members.find(m => m.larkAppId === appId);
+}
+
+function formValue(data: CardActionData, key: string): string {
+  const raw = data.action?.form_value?.[key];
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function actionFailureReason(body: unknown, status: number): string {
+  const b = body as any;
+  if (b?.ok === false && typeof b.error === 'string') return b.error;
+  if (typeof b?.error === 'string') return b.error;
+  if (Array.isArray(b?.result)) {
+    const failed = b.result.find((x: any) => x?.ok === false);
+    if (failed?.error) return String(failed.error);
+  }
+  return `http_${status}`;
+}
+
+function bodyOk(body: unknown): boolean {
+  const b = body as any;
+  if (b?.ok === false) return false;
+  if (Array.isArray(b?.result)) return b.result.every((x: any) => x?.ok !== false);
+  return true;
+}
+
+async function writeGroupAction(
+  client: DaemonClient,
+  method: 'POST' | 'PUT' | 'DELETE',
+  path: string,
+  body: unknown | undefined,
+  locale: Locale,
+): Promise<GroupsCardHandlerResult | undefined> {
+  let r: Awaited<ReturnType<DaemonClient['request']>>;
+  try {
+    r = await client.request({ method, path, body });
+  } catch (e) {
+    return errorToast('card.dashboard.groups.action_failed', { reason: (e as Error).message }, locale);
+  }
+  if (r.status >= 400 || !bodyOk(r.body)) {
+    return errorToast('card.dashboard.groups.action_failed', { reason: actionFailureReason(r.body, r.status) }, locale);
+  }
+  return undefined;
+}
+
 /** Dispatch a `dash_groups_*` action callback. Mirrors sessions-card. */
 export async function handleGroupsCardAction(
   data: CardActionData,
@@ -399,6 +809,15 @@ export async function handleGroupsCardAction(
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
   const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
   const pathSuffix = navScope === 'global' ? '?scope=global' : '';
+  const navOptsBase: GroupsNavOpts = {
+    invokerOpenId: expectedOwner,
+    locale,
+    pageSize: navPageSize,
+    origin: navOrigin,
+    scope: navScope,
+  };
+  const chatId = value.chat_id;
+  const appId = value.app_id;
 
   // Resolve target page.
   let page = 1;
@@ -409,40 +828,163 @@ export async function handleGroupsCardAction(
     const raw = value.page ?? (data.action as { option?: string } | undefined)?.option ?? '1';
     const parsed = Number.parseInt(raw, 10);
     if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
-  } else if (action !== GROUPS_ACTION_REFRESH) {
+  } else if (value.page) {
+    const parsed = Number.parseInt(value.page, 10);
+    if (Number.isFinite(parsed) && parsed >= 1) page = parsed;
+  }
+
+  const knownActions = new Set<string>([
+    GROUPS_ACTION_REFRESH,
+    GROUPS_ACTION_PAGE,
+    GROUPS_ACTION_DETAIL,
+    GROUPS_ACTION_BACK_TO_LIST,
+    GROUPS_ACTION_ADD_BOT,
+    GROUPS_ACTION_LEAVE_BOT,
+    GROUPS_ACTION_ONCALL_BIND,
+    GROUPS_ACTION_ONCALL_UNBIND,
+    GROUPS_ACTION_ROLE_OPEN,
+    GROUPS_ACTION_ROLE_SAVE,
+    GROUPS_ACTION_ROLE_DELETE,
+  ]);
+  if (!knownActions.has(String(action))) {
     return ackToast('card.dashboard.settings.invalid_action', locale);
   }
 
-  // GET matrix + rebuild card. Same non-200 handling as sessions slice 1
-  // (codex blocker #1, 2026-06-09): 4xx/5xx → error toast, NOT empty list.
-  let r: Awaited<ReturnType<DaemonClient['request']>>;
-  try {
-    const client = deps.createClient(larkAppId);
-    r = await client.request({ method: 'GET', path: `/__daemon/groups-matrix${pathSuffix}` });
-  } catch (e) {
-    return errorToast('card.dashboard.groups.list_failed', { reason: (e as Error).message }, locale);
-  }
-  if (r.status !== 200) {
-    const reason = String((r.body as any)?.error ?? `http_${r.status}`);
-    return errorToast('card.dashboard.groups.list_failed', { reason }, locale);
-  }
-  const body = (r.body as {
-    chats?: ReadonlyArray<GroupsChatInput>;
-    bots?: ReadonlyArray<GroupsBotInput>;
-  }) ?? {};
-  const matrix = {
-    chats: body.chats ?? [],
-    bots: body.bots ?? [],
-  };
-  const cardJson = buildGroupsCard(matrix, {
+  const client = deps.createClient(larkAppId);
+  const load = await loadGroupsMatrix(client, pathSuffix, locale);
+  if (!load.ok) return load.result;
+  const matrix = load.matrix;
+
+  const renderList = (p: number): GroupsCardHandlerResult => cardResult(buildGroupsCard(matrix, {
     invokerOpenId: expectedOwner,
     locale,
-    page,
+    page: p,
     pageSize: navPageSize,
     origin: navOrigin,
     scope: navScope,
-  });
-  return {
-    card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> },
-  };
+  }));
+  const renderDetail = (chat: GroupsChatInput): GroupsCardHandlerResult => cardResult(buildGroupsDetailCard(matrix, chat, {
+    ...navOptsBase,
+    page,
+  }));
+
+  if (action === GROUPS_ACTION_REFRESH || action === GROUPS_ACTION_PAGE || action === GROUPS_ACTION_BACK_TO_LIST) {
+    return renderList(page);
+  }
+
+  const chat = findChat(matrix, chatId);
+  if (!chat) {
+    return errorToast('card.dashboard.groups.chat_not_found', undefined, locale);
+  }
+  if (action === GROUPS_ACTION_DETAIL) return renderDetail(chat);
+
+  const member = findDetailMember(matrix, chat, appId);
+  if (!member) {
+    return errorToast('card.dashboard.groups.bot_not_found', undefined, locale);
+  }
+
+  if (action === GROUPS_ACTION_ADD_BOT) {
+    if (member.status === 'in') {
+      return errorToast('card.dashboard.groups.action_not_allowed', { reason: 'already_in_chat' }, locale);
+    }
+    const failed = await writeGroupAction(
+      client,
+      'POST',
+      `/__daemon/groups/${encodeURIComponent(chat.chatId)}/add-bots`,
+      { larkAppIds: [member.larkAppId] },
+      locale,
+    );
+    if (failed) return failed;
+  } else if (action === GROUPS_ACTION_LEAVE_BOT) {
+    if (member.status !== 'in') {
+      return errorToast('card.dashboard.groups.action_not_allowed', { reason: 'not_in_chat' }, locale);
+    }
+    const failed = await writeGroupAction(
+      client,
+      'POST',
+      `/__daemon/groups/${encodeURIComponent(chat.chatId)}/leave`,
+      { larkAppIds: [member.larkAppId] },
+      locale,
+    );
+    if (failed) return failed;
+  } else if (action === GROUPS_ACTION_ONCALL_BIND) {
+    if (!member.bind.enabled) {
+      return errorToast('card.dashboard.groups.action_not_allowed', { reason: member.bind.reasonKey ?? 'bind_disabled' }, locale);
+    }
+    const workingDir = formValue(data, 'working_dir');
+    if (!workingDir) {
+      return errorToast('card.dashboard.groups.working_dir_required', undefined, locale);
+    }
+    const failed = await writeGroupAction(
+      client,
+      'POST',
+      `/__daemon/groups/${encodeURIComponent(chat.chatId)}/oncall/${encodeURIComponent(member.larkAppId)}/bind`,
+      { workingDir },
+      locale,
+    );
+    if (failed) return failed;
+  } else if (action === GROUPS_ACTION_ONCALL_UNBIND) {
+    if (!member.unbind.enabled) {
+      return errorToast('card.dashboard.groups.action_not_allowed', { reason: member.unbind.reasonKey ?? 'unbind_disabled' }, locale);
+    }
+    const failed = await writeGroupAction(
+      client,
+      'POST',
+      `/__daemon/groups/${encodeURIComponent(chat.chatId)}/oncall/${encodeURIComponent(member.larkAppId)}/unbind`,
+      undefined,
+      locale,
+    );
+    if (failed) return failed;
+  } else if (action === GROUPS_ACTION_ROLE_OPEN) {
+    if (member.status !== 'in') {
+      return errorToast('card.dashboard.groups.action_not_allowed', { reason: 'not_in_chat' }, locale);
+    }
+    let r: Awaited<ReturnType<DaemonClient['request']>>;
+    try {
+      r = await client.request({
+        method: 'GET',
+        path: `/__daemon/groups/${encodeURIComponent(chat.chatId)}/roles/${encodeURIComponent(member.larkAppId)}`,
+      });
+    } catch (e) {
+      return errorToast('card.dashboard.groups.action_failed', { reason: (e as Error).message }, locale);
+    }
+    if (r.status !== 200) {
+      return errorToast('card.dashboard.groups.action_failed', { reason: actionFailureReason(r.body, r.status) }, locale);
+    }
+    const roleContent = typeof (r.body as any)?.content === 'string' ? (r.body as any).content : '';
+    return cardResult(buildGroupsRoleCard(chat, member, roleContent, { ...navOptsBase, page }));
+  } else if (action === GROUPS_ACTION_ROLE_SAVE) {
+    if (member.status !== 'in') {
+      return errorToast('card.dashboard.groups.action_not_allowed', { reason: 'not_in_chat' }, locale);
+    }
+    const role = formValue(data, 'role');
+    if (!role) {
+      return errorToast('card.dashboard.groups.role_required', undefined, locale);
+    }
+    const failed = await writeGroupAction(
+      client,
+      'PUT',
+      `/__daemon/groups/${encodeURIComponent(chat.chatId)}/roles/${encodeURIComponent(member.larkAppId)}`,
+      { content: role },
+      locale,
+    );
+    if (failed) return failed;
+  } else if (action === GROUPS_ACTION_ROLE_DELETE) {
+    if (member.status !== 'in') {
+      return errorToast('card.dashboard.groups.action_not_allowed', { reason: 'not_in_chat' }, locale);
+    }
+    const failed = await writeGroupAction(
+      client,
+      'DELETE',
+      `/__daemon/groups/${encodeURIComponent(chat.chatId)}/roles/${encodeURIComponent(member.larkAppId)}`,
+      undefined,
+      locale,
+    );
+    if (failed) return failed;
+  }
+
+  const fresh = await loadGroupsMatrix(client, pathSuffix, locale);
+  if (!fresh.ok) return fresh.result;
+  const freshChat = findChat(fresh.matrix, chat.chatId) ?? chat;
+  return cardResult(buildGroupsDetailCard(fresh.matrix, freshChat, { ...navOptsBase, page }));
 }

@@ -78,7 +78,7 @@ describe('handleDashboardGroups (command path)', () => {
     expect(dm.calls.length).toBe(1);
     expect(dm.calls[0].openId).toBe(OWNER);
     expect(dm.calls[0].msgType).toBe('interactive');
-    expect(dm.calls[0].content).toContain('Dashboard 群矩阵');
+    expect(dm.calls[0].content).toContain('Dashboard 群组');
     expect(dm.calls[0].content).toContain('cool-room');
 
     const topicCalls = (deps.sessionReply as any).mock.calls;
@@ -118,7 +118,7 @@ describe('handleDashboardGroups (command path)', () => {
     expect(dm.calls.length).toBe(0);
     const topicCalls = (deps.sessionReply as any).mock.calls;
     expect(topicCalls.length).toBe(1);
-    expect(topicCalls[0][1]).toContain('拉取群矩阵失败');
+    expect(topicCalls[0][1]).toContain('拉取群组失败');
     expect(topicCalls[0][1]).toContain('econnrefused');
   });
 
@@ -157,7 +157,7 @@ describe('handleDashboardGroups (command path)', () => {
 });
 
 describe('handleDashboardCommand dispatches `/dashboard groups` to the real handler', () => {
-  it('owner /dashboard groups → real handler invoked (DM contains 群矩阵 title, not stub)', async () => {
+  it('owner /dashboard groups → real handler invoked (DM contains 群组 title, not stub)', async () => {
     const deps = makeDeps();
     const dm = captureDM();
     const createClient = vi.fn(() => ({
@@ -174,7 +174,7 @@ describe('handleDashboardCommand dispatches `/dashboard groups` to the real hand
     );
 
     expect(dm.calls.length).toBe(1);
-    expect(dm.calls[0].content).toContain('Dashboard 群矩阵');
+    expect(dm.calls[0].content).toContain('Dashboard 群组');
     // Real handler renders the empty-state card body, NOT the stub `🚧` text.
     expect(dm.calls[0].content).not.toContain('🚧');
     expect(dm.calls[0].msgType).toBe('interactive');

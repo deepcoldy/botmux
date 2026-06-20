@@ -646,6 +646,47 @@ describe('dispatch: groups write', () => {
     expect(proxySpy.mock.calls[0]![1]).toBe('/api/oncall/oc_x');
     expect((proxySpy.mock.calls[0]![2] as RequestInit).method).toBe('DELETE');
   });
+
+  it('GET /groups/:id/roles/:appId proxies to internal /api/roles/:chatId GET', async () => {
+    const proxySpy = vi.fn(async () => makeUpstream(200, { content: 'role text', hasRole: true }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/groups/oc_x/roles/cli_owner'));
+    expect(r.status).toBe(200);
+    expect((r.body as any).content).toBe('role text');
+    expect(proxySpy).toHaveBeenCalledWith(
+      'cli_owner',
+      '/api/roles/oc_x',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+
+  it('PUT /groups/:id/roles/:appId proxies role body to internal /api/roles/:chatId PUT', async () => {
+    const proxySpy = vi.fn(async () => makeUpstream(200, { ok: true }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+    const api = createDaemonInternalApi(deps);
+    const body = JSON.stringify({ content: 'new role' });
+    const r = await api.dispatchForTest('PUT', url('/__daemon/groups/oc_x/roles/cli_owner'), body);
+    expect(r.status).toBe(200);
+    expect(proxySpy).toHaveBeenCalledWith(
+      'cli_owner',
+      '/api/roles/oc_x',
+      expect.objectContaining({ method: 'PUT', body }),
+    );
+  });
+
+  it('DELETE /groups/:id/roles/:appId proxies to internal /api/roles/:chatId DELETE', async () => {
+    const proxySpy = vi.fn(async () => makeUpstream(200, { ok: true, existed: true }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('DELETE', url('/__daemon/groups/oc_x/roles/cli_owner'));
+    expect(r.status).toBe(200);
+    expect(proxySpy).toHaveBeenCalledWith(
+      'cli_owner',
+      '/api/roles/oc_x',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
 });
 
 /** ─── WORKFLOWS write × 3 ───────────────────────────────────────── */

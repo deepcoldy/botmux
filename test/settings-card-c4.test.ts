@@ -178,21 +178,21 @@ describe('buildSettingsCard', () => {
 
   /** ─── Overview drilldown ───
    *  When opened via `/dashboard overview` → goto settings, the card carries
-   *  `origin=overview` on every action.value AND renders "🔙 返回总览" beside
+   *  `origin=overview` on every action.value AND renders "↩ 总览" beside
    *  the refresh button. Standalone settings command stays byte-identical. */
   describe('overview drilldown', () => {
-    it('origin=overview → footer renders 返回总览 button (dash_overview_refresh)', () => {
+    it('origin=overview → footer renders ↩ 总览 button (dash_overview_refresh)', () => {
       const dto = makeDTO();
       const raw = buildSettingsCard(dto, { invokerOpenId: INVOKER, locale: 'zh', canWrite: true, origin: 'overview' });
       expect(raw).toContain('"action":"dash_overview_refresh"');
-      expect(raw).toContain('返回总览');
+      expect(raw).toContain('↩ 总览');
     });
 
     it('standalone (no origin) → NO back-to-overview button (no regression)', () => {
       const dto = makeDTO();
       const raw = buildSettingsCard(dto, { invokerOpenId: INVOKER, locale: 'zh', canWrite: true });
       expect(raw).not.toContain('"action":"dash_overview_refresh"');
-      expect(raw).not.toContain('返回总览');
+      expect(raw).not.toContain('↩ 总览');
     });
 
     it('origin=overview → toggle/refresh action.value carry origin=overview', () => {
@@ -336,7 +336,7 @@ describe('handleSettingsCardAction', () => {
   });
 
   /** ─── Overview drilldown — handler honors origin on rebuild ─── */
-  it('toggle with origin=overview → rebuilt card still carries 返回总览 button', async () => {
+  it('toggle with origin=overview → rebuilt card still carries ↩ 总览 button', async () => {
     // Mock the PUT response with a real settings shape so composeSections
     // produces non-trivial DTO. The drilldown back-button depends ONLY on
     // opts.origin so even an empty settings would surface it, but using
@@ -363,10 +363,10 @@ describe('handleSettingsCardAction', () => {
     expect((r as any).card).toBeDefined();
     const cardJson = JSON.stringify((r as any).card.data);
     expect(cardJson).toContain('dash_overview_refresh');
-    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('↩ 总览');
   });
 
-  it('refresh with origin=overview → rebuilt card carries 返回总览', async () => {
+  it('refresh with origin=overview → rebuilt card carries ↩ 总览', async () => {
     const reqSpy = vi.fn(async () => ({
       status: 200,
       body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
@@ -387,10 +387,10 @@ describe('handleSettingsCardAction', () => {
     expect((r as any).card).toBeDefined();
     const cardJson = JSON.stringify((r as any).card.data);
     expect(cardJson).toContain('dash_overview_refresh');
-    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('↩ 总览');
   });
 
-  it('toggle WITHOUT origin → rebuilt card does NOT have 返回总览 (no regression)', async () => {
+  it('toggle WITHOUT origin → rebuilt card does NOT have ↩ 总览 (no regression)', async () => {
     const reqSpy = vi.fn(async () => ({
       status: 200,
       body: { settings: { publicReadOnly: true, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
@@ -407,7 +407,7 @@ describe('handleSettingsCardAction', () => {
     expect((r as any).card).toBeDefined();
     const cardJson = JSON.stringify((r as any).card.data);
     expect(cardJson).not.toContain('dash_overview_refresh');
-    expect(cardJson).not.toContain('返回总览');
+    expect(cardJson).not.toContain('↩ 总览');
   });
 
   it('happy set_time → ACK + async PUT with maintenance.autoUpdate.time', async () => {

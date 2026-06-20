@@ -2909,6 +2909,67 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await first;
   });
 
+  // Dashboard groups detail actions share the same action id across many
+  // cells. `chat_id` + `app_id` must both be in the in-flight dedupe key so
+  // managing bot A in chat X doesn't swallow bot B in chat Y.
+  it('concurrent `dash_groups_oncall_bind` clicks on DIFFERENT chat/app cells must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'bind_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'bind_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (chatId: string, appId: string) => ({
+      action: {
+        value: {
+          action: 'dash_groups_oncall_bind',
+          invoker_open_id: USER_OPEN_ID,
+          chat_id: chatId,
+          app_id: appId,
+        },
+      },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_groups_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('oc_A', 'cli_A'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('oc_B', 'cli_B'));
+
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  it('concurrent `dash_groups_oncall_bind` clicks on the SAME chat/app cell WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'bind_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: {
+        value: {
+          action: 'dash_groups_oncall_bind',
+          invoker_open_id: USER_OPEN_ID,
+          chat_id: 'oc_SAME',
+          app_id: 'cli_SAME',
+        },
+      },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_groups_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
   // PR3 overview drilldown (2026-06-10): origin/page_size are now part of the
   // dedupe key so a standalone-shaped click (origin=undefined, page_size=undef)
   // and an overview-drilldown-shaped click (origin=overview, page_size=5) on

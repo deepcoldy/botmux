@@ -47,8 +47,8 @@ describe('buildSchedulesCard', () => {
     const json = buildSchedulesCard([], baseOpts, NOW);
     expect(json).toContain('Dashboard 定时任务');
     expect(json).toContain('_当前没有定时任务_');
-    expect(json).not.toContain('上一页');
-    expect(json).not.toContain('下一页');
+    expect(json).not.toContain('← 上');
+    expect(json).not.toContain('下 →');
     expect(json).toContain(SCHEDULES_ACTION_REFRESH);
   });
 
@@ -120,8 +120,8 @@ describe('buildSchedulesCard', () => {
       const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
       const allActions = actionRows.flatMap((r: any) => (r.actions as any[]) ?? []);
       return {
-        prev: allActions.find((a: any) => String(a.text?.content ?? '').includes('上一页')),
-        next: allActions.find((a: any) => String(a.text?.content ?? '').includes('下一页')),
+        prev: allActions.find((a: any) => String(a.text?.content ?? '').includes('← 上')),
+        next: allActions.find((a: any) => String(a.text?.content ?? '').includes('下 →')),
       };
     };
     const p1 = findPager(buildSchedulesCard(tasks, { ...baseOpts, page: 1 }, NOW));
@@ -244,7 +244,7 @@ describe('buildSchedulesCard', () => {
       expect(detailBtns.length).toBe(3);
     });
 
-    it('origin=overview → footer renders "🔙 返回总览" with dash_overview_refresh', () => {
+    it('origin=overview → footer renders "↩ 总览" with dash_overview_refresh', () => {
       const json = buildSchedulesCard(tasks, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
       const parsed = JSON.parse(json);
       const allButtons = (parsed.elements as any[])
@@ -253,7 +253,7 @@ describe('buildSchedulesCard', () => {
       const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
       expect(backBtn).toBeDefined();
       expect(backBtn.value.invoker_open_id).toBe(INVOKER);
-      expect(String(backBtn.text?.content ?? '')).toContain('返回总览');
+      expect(String(backBtn.text?.content ?? '')).toContain('↩ 总览');
     });
 
     it('standalone (no origin) → no back-to-overview button', () => {
@@ -571,7 +571,7 @@ describe('handleSchedulesCardAction', () => {
     expect(JSON.stringify(r.card?.data)).toContain('第 3/3 页');
   });
 
-  it('refresh with origin=overview → rebuilt list still has 返回总览 + 5/page', async () => {
+  it('refresh with origin=overview → rebuilt list still has ↩ 总览 + 5/page', async () => {
     const tasks = Array.from({ length: 12 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
     const deps = makeDeps({
       createClient: vi.fn(() => ({ request: vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' })) } as any)),
@@ -583,7 +583,7 @@ describe('handleSchedulesCardAction', () => {
     const cardJson = JSON.stringify(r.card?.data);
     expect(cardJson).toContain('第 1/3 页');
     expect(cardJson).toContain('dash_overview_refresh');
-    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('↩ 总览');
   });
 
   it('back_to_list with origin=overview → rebuilt list is drilldown shape', async () => {

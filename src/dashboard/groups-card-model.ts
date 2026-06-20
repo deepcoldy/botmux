@@ -84,6 +84,8 @@ export interface GroupDetailMemberDto {
   oncallChat: GroupsOncallChatInput | null;
   /** Convenience projection of `oncallChat.workingDir` (or null when unbound). */
   oncallWorkingDir: string | null;
+  /** True when this bot has a per-chat role description configured. */
+  hasRole: boolean;
   /** bind action button availability. */
   bind: ButtonState;
   /** unbind action button availability. */
@@ -268,6 +270,7 @@ export function buildGroupDetail(chat: GroupsChatInput, bots: ReadonlyArray<Grou
       isOwnerBot,
       oncallChat,
       oncallWorkingDir,
+      hasRole: member?.hasRole === true,
       bind,
       unbind,
     };

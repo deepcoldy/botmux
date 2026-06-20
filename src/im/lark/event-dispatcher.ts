@@ -423,6 +423,11 @@ function cardActionKey(larkAppId: string, data: any): string {
     // it a rapid global→per-bot click sequence within the dedupe window
     // would hash-collide and the second click would be silently dropped.
     dashboardScope: value?.dashboard_scope,
+    // Groups detail/actions can share the same `dash_groups_*` action within
+    // one card but target different chat/bot cells. Include both ids so
+    // managing bot A in group X doesn't dedupe bot B in group Y.
+    chatId: value?.chat_id,
+    appId: value?.app_id,
   })}`;
 }
 

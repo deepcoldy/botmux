@@ -146,7 +146,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
    *  Verifies the 3 goto handlers thread `origin=overview` into the sub-card
    *  body (no `pageSize` — global default is 5/page after unification, so
    *  drilldown doesn't need to override). The footer of each sub-card
-   *  renders "🔙 返回总览" via the shared `dash_overview_refresh` action so
+   *  renders "↩ 总览" via the shared `dash_overview_refresh` action so
    *  the parent overview rebuilds without a custom return route. */
   describe('overview drilldown — goto threads origin into sub-card', () => {
     function makeRows(n: number) {
@@ -170,7 +170,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       }));
     }
 
-    it('goto_sessions → sessions card has 5/page, 返回总览, origin/page_size on all child buttons', async () => {
+    it('goto_sessions → sessions card has 5/page, ↩ 总览, origin/page_size on all child buttons', async () => {
       // 12 rows → with pageSize=5, 3 pages, select_static jump appears.
       const rows = makeRows(12);
       const requestSpy = vi.fn(async () => ({ status: 200, raw: '', body: { sessions: rows } }));
@@ -191,7 +191,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
 
       // 2) Back-to-overview button present.
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
-      expect(cardJson).toContain('返回总览');
+      expect(cardJson).toContain('↩ 总览');
 
       // 3) Origin threaded onto button.value. page_size is OMITTED when
       //    effective size equals default (5 == PAGE_SIZE) — origin alone is
@@ -203,7 +203,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(cardJson).toContain('select_static');
     });
 
-    it('goto_schedules → schedules card has 5/page, 返回总览, origin threaded (page_size omitted at default)', async () => {
+    it('goto_schedules → schedules card has 5/page, ↩ 总览, origin threaded (page_size omitted at default)', async () => {
       const tasks = Array.from({ length: 12 }, (_, i) => ({
         id: `sch_${i}`,
         name: `daily-${i}`,
@@ -231,13 +231,13 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       // PAGE_SIZE=5 (unified 2026-06-10). 12 / 5 = 3 pages.
       expect(cardJson).toContain('第 1/3 页');
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
-      expect(cardJson).toContain('返回总览');
+      expect(cardJson).toContain('↩ 总览');
       expect(cardJson).toContain('"origin":"overview"');
       // page_size omitted: drilldown uses default (5 == PAGE_SIZE).
       expect(cardJson).not.toContain('"page_size"');
     });
 
-    it('goto_settings → settings card has 返回总览 + origin on every action.value; NO page_size', async () => {
+    it('goto_settings → settings card has ↩ 总览 + origin on every action.value; NO page_size', async () => {
       const requestSpy = vi.fn(async () => ({
         status: 200, raw: '',
         body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
@@ -257,13 +257,13 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(cardJson).toContain('Dashboard 全局设置');
       // Back-to-overview button + origin threaded.
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
-      expect(cardJson).toContain('返回总览');
+      expect(cardJson).toContain('↩ 总览');
       expect(cardJson).toContain('"origin":"overview"');
       // Settings single-layer → never carries page_size.
       expect(cardJson).not.toContain('"page_size"');
     });
 
-    it('goto_groups → groups card has 返回总览 + origin threaded; pageSize at default omits page_size', async () => {
+    it('goto_groups → groups card has ↩ 总览 + origin threaded; pageSize at default omits page_size', async () => {
       const chats = Array.from({ length: 12 }, (_, i) => ({
         chatId: `oc_${String(i).padStart(4, '0')}`,
         name: `chat-${i}`,
@@ -287,19 +287,19 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(result.card).toBeDefined();
       const cardJson = JSON.stringify(result.card?.data);
       // Groups sub-card.
-      expect(cardJson).toContain('Dashboard 群矩阵');
+      expect(cardJson).toContain('Dashboard 群组');
       // PAGE_SIZE=5 → 12 chats / 5 = 3 pages.
       expect(cardJson).toContain('第 1/3 页');
       // Back-to-overview + origin.
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
-      expect(cardJson).toContain('返回总览');
+      expect(cardJson).toContain('↩ 总览');
       expect(cardJson).toContain('"origin":"overview"');
       expect(cardJson).toContain('"dashboard_scope":"global"');
       // page_size omitted at default.
       expect(cardJson).not.toContain('"page_size"');
     });
 
-    it('goto_workflows → workflows card has 返回总览 + origin threaded; ?all=1 query sent', async () => {
+    it('goto_workflows → workflows card has ↩ 总览 + origin threaded; ?all=1 query sent', async () => {
       const runs = Array.from({ length: 12 }, (_, i) => ({
         runId: `r_${i}`,
         workflowId: `wf_${i}`,
@@ -334,7 +334,7 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(cardJson).toContain('第 1/3 页');
       // Back-to-overview + origin.
       expect(cardJson).toContain('"action":"dash_overview_refresh"');
-      expect(cardJson).toContain('返回总览');
+      expect(cardJson).toContain('↩ 总览');
       expect(cardJson).toContain('"origin":"overview"');
       expect(cardJson).toContain('"dashboard_scope":"global"');
       // page_size omitted at default.

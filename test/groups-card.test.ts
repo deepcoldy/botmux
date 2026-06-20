@@ -1,8 +1,8 @@
 /**
- * PR3 `/dashboard groups` slice 1 — card builder + callback handler tests.
+ * PR3 `/dashboard groups` — card builder + callback handler tests.
  *
  * Exercises the groups-specific count summary, escaping, pagination, global
- * matrix aggregation, and handler arms.
+ * matrix aggregation, detail management actions, and handler arms.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -15,9 +15,18 @@ import type {
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildGroupsCard,
+  buildGroupsDetailCard,
   handleGroupsCardAction,
+  GROUPS_ACTION_ADD_BOT,
+  GROUPS_ACTION_DETAIL,
+  GROUPS_ACTION_LEAVE_BOT,
+  GROUPS_ACTION_ONCALL_BIND,
+  GROUPS_ACTION_ONCALL_UNBIND,
   GROUPS_ACTION_PAGE,
   GROUPS_ACTION_REFRESH,
+  GROUPS_ACTION_ROLE_DELETE,
+  GROUPS_ACTION_ROLE_OPEN,
+  GROUPS_ACTION_ROLE_SAVE,
 } from '../src/im/lark/groups-card.js';
 
 const INVOKER = 'ou_owner';
@@ -53,11 +62,11 @@ describe('buildGroupsCard', () => {
 
   it('empty list → renders empty state, refresh button present', () => {
     const json = buildGroupsCard(matrix([], [SELF_BOT]), baseOpts);
-    expect(json).toContain('Dashboard 群矩阵');
+    expect(json).toContain('Dashboard 群组');
     expect(json).toContain('_当前没有群_');
     // No pagination buttons (single page when empty).
-    expect(json).not.toContain('上一页');
-    expect(json).not.toContain('下一页');
+    expect(json).not.toContain('← 上');
+    expect(json).not.toContain('下 →');
     // Refresh button always present.
     expect(json).toContain(GROUPS_ACTION_REFRESH);
   });
@@ -188,8 +197,8 @@ describe('buildGroupsCard', () => {
       chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
     );
     const json = buildGroupsCard(matrix(chats), { ...baseOpts, page: 2 });
-    expect(json).toContain('上一页');
-    expect(json).toContain('下一页');
+    expect(json).toContain('← 上');
+    expect(json).toContain('下 →');
     expect(json).toContain('第 2/5 页');
     // prev → page=1, next → page=3
     expect(json).toContain('"page":"1"');
@@ -197,10 +206,11 @@ describe('buildGroupsCard', () => {
 
     const findPagerButtons = (j: string): { prev: any; next: any } => {
       const parsed = JSON.parse(j);
-      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
-      const actions = actionRow.actions as any[];
-      const prev = actions.find((a: any) => String(a.text?.content ?? '').includes('上一页'));
-      const next = actions.find((a: any) => String(a.text?.content ?? '').includes('下一页'));
+      const actions = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      const prev = actions.find((a: any) => String(a.text?.content ?? '').includes('← 上'));
+      const next = actions.find((a: any) => String(a.text?.content ?? '').includes('下 →'));
       return { prev, next };
     };
 
@@ -238,10 +248,51 @@ describe('buildGroupsCard', () => {
     expect(json).not.toContain('"senderUnionId"');
   });
 
+  it('list row renders a compact 管理 entry carrying chat_id + current page', () => {
+    const json = buildGroupsCard(matrix([chat({ chatId: 'oc_manage', name: 'manage-room' })]), baseOpts);
+    const parsed = JSON.parse(json);
+    const actions = (parsed.elements as any[])
+      .filter((e: any) => e.tag === 'action')
+      .flatMap((e: any) => e.actions ?? []);
+    const manage = actions.find((a: any) => a.value?.action === GROUPS_ACTION_DETAIL);
+    expect(manage).toBeDefined();
+    expect(manage.text.content).toContain('管理');
+    expect(manage.value.chat_id).toBe('oc_manage');
+    expect(manage.value.page).toBe('1');
+    expect(manage.value.invoker_open_id).toBe(INVOKER);
+  });
+
+  it('detail card renders add / remove / oncall / role controls per bot status', () => {
+    const otherBot: GroupsBotInput = { larkAppId: 'cli_other', botName: 'other-bot' };
+    const group = chat({
+      chatId: 'oc_detail',
+      name: 'detail-room',
+      memberBots: [
+        member({ inChat: true, hasRole: true, oncallChat: { chatId: 'oc_detail', workingDir: '/repo' } }),
+        { larkAppId: 'cli_other', botName: 'other-bot', inChat: false, oncallChat: null },
+      ],
+    });
+    const json = buildGroupsDetailCard(
+      matrix([group], [SELF_BOT, otherBot]),
+      group,
+      { invokerOpenId: INVOKER, locale: 'zh', page: 2, origin: 'overview', scope: 'global' },
+    );
+    expect(json).toContain('群组管理');
+    expect(json).toContain('detail-room');
+    expect(json).toContain('Role 已配置');
+    expect(json).toContain('Oncall 开启 /repo');
+    expect(json).toContain(GROUPS_ACTION_ROLE_OPEN);
+    expect(json).toContain(GROUPS_ACTION_ONCALL_UNBIND);
+    expect(json).toContain(GROUPS_ACTION_LEAVE_BOT);
+    expect(json).toContain(GROUPS_ACTION_ADD_BOT);
+    expect(json).toContain('"dashboard_scope":"global"');
+    expect(json).toContain('dash_overview_refresh');
+  });
+
   /** ─── Overview drilldown (2026-06-10) ───
    *  Standalone and drilldown both use the unified default 5/page; `origin`
    *  is the only thing the drilldown sub-card carries — it controls the
-   *  「🔙 返回总览」 button and is threaded through every callback so the
+   *  「↩ 总览」 button and is threaded through every callback so the
    *  back affordance persists across page/refresh round-trips. */
   describe('overview drilldown', () => {
     const chats12: GroupsChatInput[] = Array.from({ length: 12 }, (_, i) =>
@@ -268,7 +319,7 @@ describe('buildGroupsCard', () => {
       expect(rowDivs.length).toBe(3);
     });
 
-    it('origin=overview → footer renders "🔙 返回总览" with action=dash_overview_refresh', () => {
+    it('origin=overview → footer renders "↩ 总览" with action=dash_overview_refresh', () => {
       const json = buildGroupsCard(
         matrix(chats12),
         { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' },
@@ -280,7 +331,7 @@ describe('buildGroupsCard', () => {
       const backBtn = allButtons.find((b: any) => b.value?.action === 'dash_overview_refresh');
       expect(backBtn).toBeDefined();
       expect(backBtn.value.invoker_open_id).toBe(INVOKER);
-      expect(String(backBtn.text?.content ?? '')).toContain('返回总览');
+      expect(String(backBtn.text?.content ?? '')).toContain('↩ 总览');
     });
 
     it('standalone (no origin) → NO back-to-overview button', () => {
@@ -477,7 +528,7 @@ describe('handleGroupsCardAction', () => {
       LARK_APP_ID,
       deps,
     );
-    expect(r.toast?.content).toContain('拉取群矩阵失败');
+    expect(r.toast?.content).toContain('拉取群组失败');
     expect(r.toast?.content).toContain('boom');
     expect(r.card).toBeUndefined();
   });
@@ -554,7 +605,7 @@ describe('handleGroupsCardAction', () => {
     expect(cardJson).toContain('第 3/3 页');
   });
 
-  it('refresh with origin=overview → rebuilt card has 返回总览 button', async () => {
+  it('refresh with origin=overview → rebuilt card has ↩ 总览 button', async () => {
     const chats = Array.from({ length: 12 }, (_, i) =>
       chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
     );
@@ -577,6 +628,243 @@ describe('handleGroupsCardAction', () => {
     expect(cardJson).toContain('第 1/3 页');
     // Back-to-overview button.
     expect(cardJson).toContain('dash_overview_refresh');
-    expect(cardJson).toContain('返回总览');
+    expect(cardJson).toContain('↩ 总览');
+  });
+
+  it('detail action → GET matrix and returns detail card', async () => {
+    const deps = makeDeps({
+      createClient: vi.fn(() => ({
+        request: vi.fn(async () => ({
+          status: 200,
+          body: { chats: [chat({ chatId: 'oc_detail', name: 'detail-room' })], bots: [SELF_BOT] },
+          raw: '',
+        })),
+      } as any)),
+    });
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_DETAIL, invoker_open_id: INVOKER, chat_id: 'oc_detail' }),
+      LARK_APP_ID,
+      deps,
+    );
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('群组管理');
+    expect(cardJson).toContain('detail-room');
+    expect(cardJson).toContain(GROUPS_ACTION_ROLE_OPEN);
+  });
+
+  it('add_bot action → GET matrix, POST add-bots, GET fresh matrix, returns detail card', async () => {
+    const otherBot: GroupsBotInput = { larkAppId: 'cli_other', botName: 'other-bot' };
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET') return { status: 200, body: { chats: [chat({
+        chatId: 'oc_add',
+        name: 'add-room',
+        memberBots: [member({ inChat: true }), { larkAppId: 'cli_other', botName: 'other-bot', inChat: false }],
+      })], bots: [SELF_BOT, otherBot] }, raw: '' };
+      return { status: 200, body: { ok: true }, raw: '{"ok":true}' };
+    });
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      makeAction({
+        action: GROUPS_ACTION_ADD_BOT,
+        invoker_open_id: INVOKER,
+        chat_id: 'oc_add',
+        app_id: 'cli_other',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(requestSpy).toHaveBeenCalledTimes(3);
+    expect(requestSpy.mock.calls[1][0]).toEqual({
+      method: 'POST',
+      path: '/__daemon/groups/oc_add/add-bots',
+      body: { larkAppIds: ['cli_other'] },
+    });
+    expect(JSON.stringify(r.card?.data)).toContain('群组管理');
+  });
+
+  it('leave_bot action → refuses when matrix says bot is already out, POST 0 times', async () => {
+    const otherBot: GroupsBotInput = { larkAppId: 'cli_other', botName: 'other-bot' };
+    const requestSpy = vi.fn(async () => ({
+      status: 200,
+      body: { chats: [chat({
+        chatId: 'oc_leave',
+        memberBots: [member({ inChat: true }), { larkAppId: 'cli_other', botName: 'other-bot', inChat: false }],
+      })], bots: [SELF_BOT, otherBot] },
+      raw: '',
+    }));
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      makeAction({
+        action: GROUPS_ACTION_LEAVE_BOT,
+        invoker_open_id: INVOKER,
+        chat_id: 'oc_leave',
+        app_id: 'cli_other',
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('当前状态不允许');
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('oncall_bind action → requires working_dir before POST', async () => {
+    const requestSpy = vi.fn(async () => ({
+      status: 200,
+      body: { chats: [chat({ chatId: 'oc_oncall', memberBots: [member({ inChat: true, oncallChat: null })] })], bots: [SELF_BOT] },
+      raw: '',
+    }));
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      makeAction({
+        action: GROUPS_ACTION_ONCALL_BIND,
+        invoker_open_id: INVOKER,
+        chat_id: 'oc_oncall',
+        app_id: LARK_APP_ID,
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(r.toast?.content).toContain('工作目录');
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('oncall_bind action → POST bind with form working_dir and keeps global nav on rebuilt detail', async () => {
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET') return {
+        status: 200,
+        body: { chats: [chat({ chatId: 'oc_oncall', memberBots: [member({ inChat: true, oncallChat: null })] })], bots: [SELF_BOT] },
+        raw: '',
+      };
+      return { status: 200, body: { ok: true }, raw: '{"ok":true}' };
+    });
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      {
+        ...makeAction({
+          action: GROUPS_ACTION_ONCALL_BIND,
+          invoker_open_id: INVOKER,
+          chat_id: 'oc_oncall',
+          app_id: LARK_APP_ID,
+          dashboard_scope: 'global',
+        }),
+        action: {
+          value: {
+            action: GROUPS_ACTION_ONCALL_BIND,
+            invoker_open_id: INVOKER,
+            chat_id: 'oc_oncall',
+            app_id: LARK_APP_ID,
+            dashboard_scope: 'global',
+          },
+          form_value: { working_dir: '/repo' },
+        },
+      } as any,
+      LARK_APP_ID,
+      deps,
+    );
+    expect(requestSpy).toHaveBeenCalledTimes(3);
+    expect(requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/groups-matrix?scope=global' });
+    expect(requestSpy.mock.calls[1][0]).toEqual({
+      method: 'POST',
+      path: '/__daemon/groups/oc_oncall/oncall/cli_test/bind',
+      body: { workingDir: '/repo' },
+    });
+    expect(JSON.stringify(r.card?.data)).toContain('"dashboard_scope":"global"');
+  });
+
+  it('role_open action → GET role and returns role edit card with content', async () => {
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.path === '/__daemon/groups-matrix') return {
+        status: 200,
+        body: { chats: [chat({ chatId: 'oc_role', memberBots: [member({ inChat: true, hasRole: true })] })], bots: [SELF_BOT] },
+        raw: '',
+      };
+      return { status: 200, body: { content: 'current role' }, raw: '{"content":"current role"}' };
+    });
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      makeAction({
+        action: GROUPS_ACTION_ROLE_OPEN,
+        invoker_open_id: INVOKER,
+        chat_id: 'oc_role',
+        app_id: LARK_APP_ID,
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(requestSpy.mock.calls[1][0]).toEqual({
+      method: 'GET',
+      path: '/__daemon/groups/oc_role/roles/cli_test',
+    });
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('群组 Role');
+    expect(cardJson).toContain('current role');
+  });
+
+  it('role_save action → PUT role content then refetches detail', async () => {
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET') return {
+        status: 200,
+        body: { chats: [chat({ chatId: 'oc_role', memberBots: [member({ inChat: true })] })], bots: [SELF_BOT] },
+        raw: '',
+      };
+      return { status: 200, body: { ok: true }, raw: '{"ok":true}' };
+    });
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      {
+        ...makeAction({
+          action: GROUPS_ACTION_ROLE_SAVE,
+          invoker_open_id: INVOKER,
+          chat_id: 'oc_role',
+          app_id: LARK_APP_ID,
+        }),
+        action: {
+          value: {
+            action: GROUPS_ACTION_ROLE_SAVE,
+            invoker_open_id: INVOKER,
+            chat_id: 'oc_role',
+            app_id: LARK_APP_ID,
+          },
+          form_value: { role: 'new role' },
+        },
+      } as any,
+      LARK_APP_ID,
+      deps,
+    );
+    expect(requestSpy).toHaveBeenCalledTimes(3);
+    expect(requestSpy.mock.calls[1][0]).toEqual({
+      method: 'PUT',
+      path: '/__daemon/groups/oc_role/roles/cli_test',
+      body: { content: 'new role' },
+    });
+    expect(JSON.stringify(r.card?.data)).toContain('群组管理');
+  });
+
+  it('role_delete action → DELETE role then refetches detail', async () => {
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET') return {
+        status: 200,
+        body: { chats: [chat({ chatId: 'oc_role', memberBots: [member({ inChat: true, hasRole: true })] })], bots: [SELF_BOT] },
+        raw: '',
+      };
+      return { status: 200, body: { ok: true }, raw: '{"ok":true}' };
+    });
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      makeAction({
+        action: GROUPS_ACTION_ROLE_DELETE,
+        invoker_open_id: INVOKER,
+        chat_id: 'oc_role',
+        app_id: LARK_APP_ID,
+      }),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(requestSpy.mock.calls[1][0]).toEqual({
+      method: 'DELETE',
+      path: '/__daemon/groups/oc_role/roles/cli_test',
+      body: undefined,
+    });
+    expect(JSON.stringify(r.card?.data)).toContain('群组管理');
   });
 });
