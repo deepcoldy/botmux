@@ -22,6 +22,7 @@ import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/brid
 import { shouldWriteNow } from './utils/input-gate.js';
 import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
+import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -3539,12 +3540,9 @@ function scheduleBusyPatternIdleProbe(source: string): void {
 }
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  // Re-arm the startup-commands one-shot: a restart/resume re-spawns the CLI, so
-  // session-only settings like `/effort ultracode` must be re-applied (the prior
-  // CLI's effort level is gone). flushPending consumes this before the next first
-  // prompt. (Resume via the daemon forks a fresh worker process where this is
-  // already false; this covers in-process restart.)
-  hasRunStartupCommands = false;
+  // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
+  // prediction — only a genuinely fresh CLI process replays them; see
+  // willReattachPersistent.)
   // Re-deliver inputs that were in-flight when the previous CLI died (see
   // backend.onExit). killCli() already wiped pendingMessages, so these go to
   // the front; the normal flush paths (prompt detect / first-prompt timeout)
@@ -3737,6 +3735,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         : HerdrBackend.hasSession(persistentSessionName)
     : false;
 
+  // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
+  // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
+  // CLI with /effort etc. already applied — replaying would re-type them (and
+  // /clear,/compact would corrupt the recovered context). hasRun=true ⇒ skip.
+  // Fresh spawns (incl. resume that starts a new CLI, where hasSession is false)
+  // arm it. spawnCli is synchronous up to backend spawn, so this lands before
+  // any flushPending consumes the flag.
+  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
+
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
   // → skip --resume, spawn FRESH.
@@ -3818,12 +3825,22 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
   // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
   const ttadkGateway = isTtadkWrapper(cfg.wrapperCli);
+  // When a bot has startupCommands AND this CLI bakes the first prompt into
+  // launch args (passesInitialPromptViaArgs, e.g. Gemini -i), don't bake it —
+  // route it through the input queue instead so startupCommands run first
+  // (flushPending's hook can't precede an args-baked prompt). The init handler
+  // mirrors this when deciding whether to enqueue the prompt.
+  const deferInitialPrompt = shouldDeferInitialPromptForStartup({
+    hasStartupCommands: !!cfg.startupCommands?.length,
+    adoptMode: cfg.adoptMode === true,
+    passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
+  });
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
     workingDir: cfg.workingDir,
     resumeSessionId: effectiveCliSessionId,
-    initialPrompt: cfg.prompt || undefined,
+    initialPrompt: deferInitialPrompt ? undefined : (cfg.prompt || undefined),
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
@@ -4943,10 +4960,17 @@ process.on('message', async (raw: unknown) => {
 
         // Queue the initial prompt — flushed when CLI shows idle.
         // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the
-        // prompt into CLI args, so we skip queuing to avoid double-send.
-        // Bridge mark is deferred to flushPending — see flushPending
-        // comment for why marking at enqueue is wrong.
-        if (msg.prompt && !cliAdapter?.passesInitialPromptViaArgs) {
+        // prompt into CLI args, so we normally skip queuing to avoid double-send.
+        // EXCEPTION: when this bot has startupCommands, spawnCli deliberately did
+        // NOT bake the prompt (deferInitialPrompt) so the commands can precede it
+        // — so we MUST queue it here. shouldDeferInitialPromptForStartup mirrors
+        // spawnCli's decision exactly. Bridge mark is deferred to flushPending.
+        const deferInitialPrompt = shouldDeferInitialPromptForStartup({
+          hasStartupCommands: !!msg.startupCommands?.length,
+          adoptMode: msg.adoptMode === true,
+          passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
+        });
+        if (msg.prompt && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }
 

@@ -58,3 +58,31 @@ export function normalizeStartupCommandList(arr: unknown): string[] {
   }
   return [...new Set(out)];
 }
+
+/**
+ * Whether a spawn should (re-)run startupCommands. They run on a genuinely fresh
+ * CLI process; a reattach to a LIVE persistent (tmux/zellij/herdr) pane — e.g. a
+ * daemon restart recovering an existing session — is the SAME CLI with its
+ * effort/model/context already established, so re-typing `/effort` (idempotent)
+ * or `/clear`,`/compact` (NOT idempotent) would corrupt it. Skip on reattach.
+ */
+export function shouldRunStartupCommandsOnSpawn(opts: { willReattachPersistent: boolean }): boolean {
+  return !opts.willReattachPersistent;
+}
+
+/**
+ * Whether to defer the initial prompt from launch-args to the normal input queue
+ * so startupCommands precede it. Only when commands exist AND the CLI bakes the
+ * first prompt into launch args (passesInitialPromptViaArgs, e.g. Gemini `-i`):
+ * an args-baked prompt would execute BEFORE flushPending's startup-command hook,
+ * breaking the "before the first message" contract. Adopt never spawns fresh.
+ * Default path (no startupCommands) is untouched, so args-CLIs keep their robust
+ * `-i` delivery unless a bot opts in.
+ */
+export function shouldDeferInitialPromptForStartup(opts: {
+  hasStartupCommands: boolean;
+  adoptMode: boolean;
+  passesInitialPromptViaArgs: boolean;
+}): boolean {
+  return opts.hasStartupCommands && !opts.adoptMode && opts.passesInitialPromptViaArgs;
+}
