@@ -434,14 +434,12 @@ function renderDetailMember(
             },
           },
           {
-            tag: 'action',
-            actions: [{
-              tag: 'button',
-              text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.oncall_bind', undefined, opts.locale) },
-              type: 'primary',
-              form_action_type: 'submit',
-              value: { action: GROUPS_ACTION_ONCALL_BIND, ...valueBase },
-            }],
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.oncall_bind', undefined, opts.locale) },
+            type: 'primary',
+            name: 'groups_oncall_bind',
+            action_type: 'form_submit',
+            value: { action: GROUPS_ACTION_ONCALL_BIND, ...valueBase },
           },
         ],
       });
@@ -514,6 +512,26 @@ export function buildGroupsRoleCard(
           `\n<font color="grey">${escapeLarkMd(chat.chatId)} · ${escapeLarkMd(member.larkAppId)}</font>`,
       },
     },
+    { tag: 'hr' },
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content:
+          `**${t('card.dashboard.groups.current_role', undefined, opts.locale)}**` +
+          `\n${roleContent.trim().length > 0
+            ? escapeLarkMd(roleContent)
+            : `_${escapeLarkMd(t('card.dashboard.groups.current_role_empty', undefined, opts.locale))}_`}`,
+      },
+    },
+    { tag: 'hr' },
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: `**${t('card.dashboard.groups.edit_role', undefined, opts.locale)}**`,
+      },
+    },
     {
       tag: 'form',
       name: 'groups_role_form',
@@ -523,16 +541,19 @@ export function buildGroupsRoleCard(
           name: 'role',
           default_value: roleContent,
           placeholder: { tag: 'plain_text', content: t('card.dashboard.groups.role_placeholder', undefined, opts.locale) },
+          input_type: 'multiline_text',
+          rows: 8,
+          max_rows: 12,
+          auto_resize: true,
+          width: 'fill',
         },
         {
-          tag: 'action',
-          actions: [{
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.role_save', undefined, opts.locale) },
-            type: 'primary',
-            form_action_type: 'submit',
-            value: { action: GROUPS_ACTION_ROLE_SAVE, ...valueBase },
-          }],
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.role_save', undefined, opts.locale) },
+          type: 'primary',
+          name: 'groups_role_save',
+          action_type: 'form_submit',
+          value: { action: GROUPS_ACTION_ROLE_SAVE, ...valueBase },
         },
       ],
     },
@@ -728,7 +749,7 @@ function findDetailMember(
 }
 
 function formValue(data: CardActionData, key: string): string {
-  const raw = data.action?.form_value?.[key];
+  const raw = data.action?.form_value?.[key] ?? (key === 'role' ? (data.action as any)?.input_value : undefined);
   return typeof raw === 'string' ? raw.trim() : '';
 }
 

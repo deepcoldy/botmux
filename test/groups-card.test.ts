@@ -16,6 +16,7 @@ import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildGroupsCard,
   buildGroupsDetailCard,
+  buildGroupsRoleCard,
   handleGroupsCardAction,
   GROUPS_ACTION_ADD_BOT,
   GROUPS_ACTION_DETAIL,
@@ -650,6 +651,19 @@ describe('handleGroupsCardAction', () => {
     expect(cardJson).toContain('群组管理');
     expect(cardJson).toContain('detail-room');
     expect(cardJson).toContain(GROUPS_ACTION_ROLE_OPEN);
+    const card = r.card?.data as any;
+    const form = card.elements.find((e: any) => e?.tag === 'form' && e?.name === 'groups_oncall_form');
+    expect(form).toBeTruthy();
+    expect(form.elements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ tag: 'input', name: 'working_dir' }),
+      expect.objectContaining({
+        tag: 'button',
+        name: 'groups_oncall_bind',
+        action_type: 'form_submit',
+        value: expect.objectContaining({ action: GROUPS_ACTION_ONCALL_BIND }),
+      }),
+    ]));
+    expect(form.elements.some((e: any) => e?.tag === 'action')).toBe(false);
   });
 
   it('add_bot action → GET matrix, POST add-bots, GET fresh matrix, returns detail card', async () => {
@@ -797,7 +811,48 @@ describe('handleGroupsCardAction', () => {
     });
     const cardJson = JSON.stringify(r.card?.data);
     expect(cardJson).toContain('群组 Role');
+    expect(cardJson).toContain('当前 Role');
+    expect(cardJson).toContain('编辑 Role');
     expect(cardJson).toContain('current role');
+    const card = r.card?.data as any;
+    const form = card.elements.find((e: any) => e?.tag === 'form' && e?.name === 'groups_role_form');
+    expect(form).toBeTruthy();
+    expect(form.elements).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        tag: 'input',
+        name: 'role',
+        default_value: 'current role',
+        input_type: 'multiline_text',
+        rows: 8,
+      }),
+      expect.objectContaining({
+        tag: 'button',
+        name: 'groups_role_save',
+        action_type: 'form_submit',
+        value: expect.objectContaining({ action: GROUPS_ACTION_ROLE_SAVE }),
+      }),
+    ]));
+    expect(form.elements.some((e: any) => e?.tag === 'action')).toBe(false);
+  });
+
+  it('buildGroupsRoleCard shows an explicit empty current-role state', () => {
+    const json = buildGroupsRoleCard(
+      chat({ chatId: 'oc_empty_role', name: 'empty-role-room' }),
+      {
+        botName: 'self-bot',
+        larkAppId: LARK_APP_ID,
+        status: 'in',
+        hasRole: false,
+        oncallWorkingDir: null,
+        isOwnerBot: true,
+        bind: { enabled: true },
+        unbind: { enabled: false, reasonKey: 'not_bound' },
+      },
+      '',
+      { invokerOpenId: INVOKER, locale: 'zh', page: 1 },
+    );
+    expect(json).toContain('当前 Role');
+    expect(json).toContain('当前未配置 Role');
   });
 
   it('role_save action → PUT role content then refetches detail', async () => {
@@ -838,6 +893,44 @@ describe('handleGroupsCardAction', () => {
       body: { content: 'new role' },
     });
     expect(JSON.stringify(r.card?.data)).toContain('群组管理');
+  });
+
+  it('role_save action accepts input_value callback fallback', async () => {
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET') return {
+        status: 200,
+        body: { chats: [chat({ chatId: 'oc_role', memberBots: [member({ inChat: true })] })], bots: [SELF_BOT] },
+        raw: '',
+      };
+      return { status: 200, body: { ok: true }, raw: '{"ok":true}' };
+    });
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    await handleGroupsCardAction(
+      {
+        ...makeAction({
+          action: GROUPS_ACTION_ROLE_SAVE,
+          invoker_open_id: INVOKER,
+          chat_id: 'oc_role',
+          app_id: LARK_APP_ID,
+        }),
+        action: {
+          value: {
+            action: GROUPS_ACTION_ROLE_SAVE,
+            invoker_open_id: INVOKER,
+            chat_id: 'oc_role',
+            app_id: LARK_APP_ID,
+          },
+          input_value: 'role from input behavior',
+        },
+      } as any,
+      LARK_APP_ID,
+      deps,
+    );
+    expect(requestSpy.mock.calls[1][0]).toEqual({
+      method: 'PUT',
+      path: '/__daemon/groups/oc_role/roles/cli_test',
+      body: { content: 'role from input behavior' },
+    });
   });
 
   it('role_delete action → DELETE role then refetches detail', async () => {

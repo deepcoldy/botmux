@@ -12,6 +12,7 @@ pnpm daemon:logs          # 查看日志
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
 - 如果改动会影响 daemon / 飞书卡片运行效果，不能只跑 `tsc` 或测试后直接重启；PM2 入口是 `dist/cli.js`，必须先构建并用 `rg dist` 或实际卡片 JSON 验证 `dist/` 已包含目标文案 / action，再声称“本机可测”。
+- 飞书卡片里需要自由文本编辑时，优先使用已验证的 `form.elements = [input, button(action_type='form_submit')]` 结构；不要把提交按钮包在 `action` 容器里，否则移动端可能不渲染输入框。
 
 ## 模块结构
 
