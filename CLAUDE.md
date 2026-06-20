@@ -11,8 +11,30 @@ pnpm daemon:logs          # 查看日志
 ```
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
-- 如果改动会影响 daemon / 飞书卡片运行效果，不能只跑 `tsc` 或测试后直接重启；PM2 入口是 `dist/cli.js`，必须先构建并用 `rg dist` 或实际卡片 JSON 验证 `dist/` 已包含目标文案 / action，再声称“本机可测”。
-- 飞书卡片里需要自由文本编辑时，优先使用已验证的 `form.elements = [input, button(action_type='form_submit')]` 结构；不要把提交按钮包在 `action` 容器里，否则移动端可能不渲染输入框。
+
+### 全局 `botmux` 指向哪个 checkout（多 checkout 切换）
+
+全局 `botmux` 命令走 `~/.botmux/bin/botmux` 这个瘦 wrapper（需 `~/.botmux/bin` 在 PATH 上，一次性写进 shell rc：`export PATH="$HOME/.botmux/bin:$PATH"`）。wrapper 指向哪个 checkout 的 `dist/cli.js`，由「最后写它的人」决定——daemon 启动时会写，本地多 checkout 间切换时用下面命令显式认领：
+
+```bash
+pnpm use:here             # 把全局 botmux wrapper 指向「当前 checkout」（仅改指向，不重启 daemon）
+pnpm switch:here          # = build + use:here 一步到位
+botmux restart            # use:here 后裸命令已解析到本 checkout，daemon 也从这重启
+BOTMUX_NO_CLAIM=1 pnpm use:here   # 逃生阀：本次不认领
+```
+
+- 故意**没**挂进 `build`——review/验证别人 PR 时纯 `pnpm build` 不会悄悄抢走全局指向
+- 实现见 `scripts/claim-botmux-bin.mjs`（与 `daemon.ts` 写的 wrapper 同构、幂等）
+
+### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
+
+当某个改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完并自测绿后，执行：
+
+```bash
+pnpm switch:here && botmux restart
+```
+
+把本 checkout 的 build 部署到 live daemon 供用户测试（`switch:here` = build + 把全局 `botmux` 指向本 checkout；`botmux restart` 从这里重启 daemon 并自动恢复 active sessions）。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免该 review worktree 被删后全局 shim 失效。
 
 ## 模块结构
 

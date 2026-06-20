@@ -1,46 +1,21 @@
 /**
- * Sessions list card (PR3 `/dashboard sessions` slices 1 + 2a + 2b).
+ * Sessions dashboard card.
  *
- * Slice 1 — read-only list + pagination + refresh.
- * Slice 2a — per-row "📂 详情" button opens a detail card; detail card has
- *           "⏏ 关闭" (with Feishu confirm dialog) + "🔙 返回" actions.
- * Slice 2b — detail card now matches the Web dashboard's four primary
- *           actions: 📍 定位话题 / 🌐 终端 / (active=⏏ 关闭 OR closed=▶ 恢复)
- *           / 🔙 返回. Locate/terminal use Feishu multi_url where possible
- *           (chat-scope locate jumps into the group, terminal opens the
- *           Web Terminal via PC sidebar / direct URL); close + resume go
- *           through Route B with a server-side composeDetail matrix check.
+ * The list view is compact, paginated, refreshable, and read-only except for
+ * per-row detail entry. The detail view exposes locate, terminal, close/resume,
+ * and back actions.
  *
- * Sync write actions (close / resume):
- *  - The callback awaits the Route B POST inline.
- *  - On 200 → close synthesizes the closed-state row in-process (pre-POST
- *    snapshot + status:'closed' + cleared webPort/proxyPort so the rebuilt
- *    card never advertises a dead Web Terminal); resume issues a 2nd GET
- *    to read the fresh status/webPort/proxyPort (fallback synth with
- *    status:'idle' when the row vanished from the listing).
- *  - On non-200 → return ONLY a toast. We do NOT redraw the card so the
- *    user keeps their current state for retry (codex 2026-06-09).
+ * Close/resume callbacks block on Route B and return a rebuilt card on success.
+ * Failures return toast-only and leave the visible card unchanged for retry.
+ * Chat-scope locate uses a direct `multi_url`; thread-scope locate posts a
+ * Route B notification and returns toast-only.
  *
- * Locate (slice 2b):
- *  - Chat-scope rows render `multi_url(feishuChatLink)` — no callback.
- *  - Thread-scope rows render an action callback that POSTs Route B
- *    locate (sends a @mention into the original topic); chat-scope
- *    crafted callbacks are server-side rejected before the POST.
- *
- * Identity / security:
- *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
- *  - sender union_id NEVER lands on `action.value` (red line).
- *  - Admin gate runs at the command entry AND on every callback.
- *  - `value.session_id` is read but NEVER trusted for identity — only used
- *    as the routing key. The admin gate is the IM authority. The Route B
- *    upstream further enforces `ownerOf(sessionId)` scope.
- *  - close + resume re-run the PR1 composeDetail matrix against the
- *    pre-POST snapshot and fail-closed if the action is not enabled there
- *    — keeps client paint and server enforce in lock-step.
- *
- * Response shape mirrors `/dashboard settings` slice 3: success path returns
- * ONLY `{ card }` (no toast for close/resume) so Lark renders the card in a
- * single pass. Locate returns a toast-only result (no card change).
+ * Security:
+ *  - `invokerOpenId` pins callbacks to the admin who opened the card.
+ *  - sender union_id never lands on `action.value`.
+ *  - command entry and callbacks both enforce the dashboard admin gate.
+ *  - row ids are routing keys only; Route B still enforces row ownership.
+ *  - write actions re-run the model availability matrix before POSTing.
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
@@ -59,13 +34,9 @@ export const SESSIONS_ACTION_PAGE = 'dash_sessions_page' as const;
 export const SESSIONS_ACTION_DETAIL = 'dash_sessions_detail' as const;
 export const SESSIONS_ACTION_CLOSE = 'dash_sessions_close' as const;
 export const SESSIONS_ACTION_BACK_TO_LIST = 'dash_sessions_back_to_list' as const;
-/** slice 2b: thread-scope locate sends a @mention into the original topic.
- *  chat-scope locate uses the row's `feishuChatLink` as a `multi_url` and
- *  doesn't go through this action at all. */
+/** Thread-scope locate sends a mention into the original topic. */
 export const SESSIONS_ACTION_LOCATE = 'dash_sessions_locate' as const;
-/** slice 2b: replaces the close button when status === 'closed'. Routed
- *  through Route B `/__daemon/sessions/:id/resume`; 2nd GET fetches the
- *  fresh row so the rebuilt detail card reflects the post-resume state. */
+/** Replaces close when status === 'closed'; refetches after resume. */
 export const SESSIONS_ACTION_RESUME = 'dash_sessions_resume' as const;
 /** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
  *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
@@ -73,11 +44,7 @@ export const SESSIONS_ACTION_RESUME = 'dash_sessions_resume' as const;
  *  overview handler regardless of which sub-card emitted it. */
 const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for `/dashboard sessions` (standalone AND overview
- *  drilldown — unified at 5/page on user request 2026-06-10 so the
- *  standalone card matches drilldown behavior; both are mobile-friendly).
- *  The `pageSize` opt still works as an override for callers that need a
- *  different size in the future. */
+/** Default page size for standalone and overview-drilldown list cards. */
 const PAGE_SIZE = 5;
 
 /** Hard cap on `select_static` option count for the "jump to page" picker.
@@ -101,10 +68,7 @@ export interface BuildSessionsCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
-  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
-   *  drilldown 2026-06-10). Override only when a caller needs a different
-   *  size. Threaded through every button.value so the size persists across
-   *  page/refresh/detail-back round-trips. */
+  /** Page size override, threaded through every button value. */
   pageSize?: number;
   /** Navigation origin. `'overview'` means this card was opened via
    *  `/dashboard overview` → goto sessions; the footer renders an extra
@@ -174,7 +138,7 @@ export function buildSessionsCard(
     for (const e of items) {
       // Row text element.
       elements.push(renderRow(e, opts.locale));
-      // Per-row action element holding ONLY the "📂 详情" button (slice 2a).
+      // Per-row action element holding ONLY the "📂 详情" button.
       // Keeping each row's actions in its own `action` element (rather than
       // one shared element for the whole page) makes the visual layout
       // align with the row above and lets us pass the row's sessionId
@@ -329,26 +293,15 @@ export interface BuildSessionsDetailCardOpts {
   pageSize?: number;
   /** Dashboard scope. Threaded into locate/close/resume/back buttons. */
   scope?: 'global';
-  /** Slice 2b — Web terminal URL for the openTerminal button. Caller computes
-   *  via `buildSessionTerminalUrl(row)`; null when the session has no port
-   *  (the button renders disabled with a noPort reason note). */
+  /** Web terminal URL for the openTerminal button; null renders it disabled. */
   terminalUrl?: string | null;
-  /** Slice 2b — `feishuChatLink` from the SessionRow, used when
-   *  `detail.actions.locateMode === 'openChat'` (chat-scope sessions skip
-   *  the POST-and-toast flow and jump straight into the group chat via
-   *  `multi_url`). null/undefined for thread-scope. */
+  /** Direct chat link for chat-scope locate; absent for thread-scope rows. */
   feishuChatLink?: string | null;
 }
 
 /**
- * Build the detail card (slice 2a). Status dot + bold title + sessionId
- * monospace; secondary key/value lines for cli/workingDir/chat/status/lastMessage;
- * action row with close + back.
- *
- * The close button is disabled when `detail.actions.close.enabled === false`
- * (per PR1 composeDetail: status==='closed' or 'starting'). When disabled
- * we show a small note next to the disabled button with the i18n key from
- * `reasonKey`.
+ * Build the session detail card: metadata, locate/terminal controls, close or
+ * resume depending on status, and the back button.
  */
 export function buildSessionsDetailCard(
   detail: SessionDetailDto,
@@ -590,7 +543,7 @@ export function buildSessionsDetailCard(
   });
 }
 
-/** Map composeDetail's reasonKey to the slice-2a i18n key surfaced next to a disabled close button. */
+/** Map composeDetail close reason keys to card i18n keys. */
 function mapCloseDisabledReason(reasonKey: string | undefined): string | undefined {
   switch (reasonKey) {
     case 'sessions.action.close.starting':
@@ -602,7 +555,7 @@ function mapCloseDisabledReason(reasonKey: string | undefined): string | undefin
   }
 }
 
-/** Slice 2b — map PR1 openTerminal reasonKey to the i18n note shown next to a disabled terminal button. */
+/** Map open-terminal reason keys to card i18n keys. */
 function mapTerminalDisabledReason(reasonKey: string | undefined): string | undefined {
   switch (reasonKey) {
     case 'sessions.action.terminal.noPort':
@@ -612,8 +565,7 @@ function mapTerminalDisabledReason(reasonKey: string | undefined): string | unde
   }
 }
 
-/** Slice 2b — map PR1 resume reasonKey to the i18n note shown when resume is the
- *  failed candidate (e.g. POST replay against an active session). */
+/** Map resume reason keys to card i18n keys. */
 function mapResumeDisabledReason(reasonKey: string | undefined): string | undefined {
   switch (reasonKey) {
     case 'sessions.action.resume.onlyClosed':
@@ -623,15 +575,13 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
   }
 }
 
-/** Slice 2b — compute the Web Terminal URL for a SessionRow. Mirrors
+/** Compute the Web Terminal URL for a SessionRow. Mirrors
  *  `src/dashboard/web/sessions.ts:terminalHref`: proxy port wins (with the
  *  `/s/{sessionId}` suffix); otherwise direct worker port. Returns null when
  *  the session has no port at all (e.g. closed / starting).
  *
- *  Codex 2026-06-11 defense-in-depth: closed sessions can carry a stale
- *  webPort (the daemon's closeSession doesn't null it). Even if the matrix
- *  check passes upstream, this helper hard-rejects closed rows so a
- *  fence-line build can never advertise a dead URL. */
+ *  Closed sessions can carry a stale webPort, so closed rows are always
+ *  rejected here even if the raw row still has a port value. */
 export function buildSessionTerminalUrl(row: SessionRow): string | null {
   if (row.status === 'closed') return null;
   const host = config.web.externalHost;
@@ -661,9 +611,8 @@ function formatRelativeForDetail(fromMs: number, nowMs: number): string {
  * Sanitize user/filesystem-supplied text for inclusion in a Lark `lark_md`
  * element — particularly inside our `<font color="grey">…</font>` wrapper.
  *
- * codex slice-1 blocker #3: title comes from session.title (user-controlled
- * chat content) and workingDir comes from the filesystem. Both flow into a
- * span we wrap with `<font>`; without escaping, a payload containing
+ * Session titles come from chat content and workingDir comes from the
+ * filesystem. Both flow into a span we wrap with `<font>`; without escaping, a payload containing
  * `</font><at id=ou_x></at>` would close our wrapper and inject a
  * @mention-looking element. We also need to handle `*_~\``-style markdown
  * controls so plain filenames don't render as bold/italic.
@@ -740,9 +689,7 @@ export async function handleSessionsCardAction(
   }
 
   // Validate the action BEFORE creating the Route B client — an unknown
-  // action shouldn't even open a connection (defensive, also keeps the
-  // slice-1 invariant that the unknown-action path doesn't touch the
-  // client).
+  // action shouldn't even open a connection.
   const validActions = new Set<string>([
     SESSIONS_ACTION_REFRESH,
     SESSIONS_ACTION_PAGE,
@@ -801,10 +748,8 @@ export async function handleSessionsCardAction(
     if (typeof sessionId !== 'string' || !sessionId) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
-    // Pre-POST snapshot — needed both to confirm the session still exists
-    // (avoid POSTing a close on something we can't identify) AND to
-    // synthesize the closed-state row in-process (codex 2026-06-09 refines:
-    // a refetch after close would race with closed→list propagation).
+    // Pre-POST snapshot confirms the row still exists and lets us synthesize
+    // the closed-state card without racing list propagation.
     const pre = await safeGetSessionsList(client, locale, pathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const before = pre.rows.find(s => s.sessionId === sessionId);
@@ -812,17 +757,12 @@ export async function handleSessionsCardAction(
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
 
-    // codex 2026-06-10 SECURITY BLOCKER: client-side `disabled` on the
-    // close button is UX only — a replayed event, an old card still open,
-    // or a hand-crafted payload can still hit this callback. Server-side
-    // we MUST re-run the PR1 action-availability matrix against the fresh
-    // snapshot and fail-closed on `enabled === false`. This re-uses the
-    // SAME composeDetail logic the builder used to decide whether to
-    // disable the button in the first place — keeping the rules in one
-    // place avoids drift between client paint and server enforce.
+    // Client-side `disabled` is UX only; replayed or crafted callbacks can
+    // still arrive. Re-run the same availability matrix server-side and
+    // fail closed before POSTing.
     const beforeDetail = composeDetail(before, now());
     if (beforeDetail.actions.close.enabled !== true) {
-      // Reuse the SAME PR1 reasonKey → i18n key mapping the builder uses
+      // Reuse the same reasonKey → i18n mapping the builder uses
       // for the inline disabled-button note (`mapCloseDisabledReason`) so
       // toast text matches what the user already sees on the card. NEVER
       // POST; NEVER redraw the card.
@@ -860,12 +800,8 @@ export async function handleSessionsCardAction(
         : (typeof body.closedAt === 'string' && Number.isFinite(Date.parse(body.closedAt))
             ? Date.parse(body.closedAt)
             : (before.closedAt ?? now()));
-    // Codex 2026-06-11 blocker #1: clear port fields on the synth so the
-    // closed-state detail card never advertises a dead Web Terminal URL
-    // (the daemon's closeSession doesn't null webPort itself, so a synth
-    // that re-uses pre-POST values would carry stale ports). The
-    // composeDetail status gate already prevents the matrix from enabling
-    // openTerminal on closed rows; this is defense in depth.
+    // Clear port fields so the closed-state detail card never advertises a
+    // dead Web Terminal URL even if the daemon row still has stale ports.
     const synth: SessionRow = {
       ...before,
       status: 'closed',
@@ -892,13 +828,9 @@ export async function handleSessionsCardAction(
   // network throw). Card is NEVER redrawn — UX matches the Web dashboard's
   // "fire a locate notification" behavior.
   //
-  // Codex 2026-06-11 blocker #2: chat-scope sessions should NEVER hit this
-  // POST path. The builder uses `multi_url(feishuChatLink)` for chat-scope
-  // and only emits `dash_sessions_locate` for thread-scope; but a hand-
-  // crafted / replayed callback could still target a chat-scope row. We
-  // pre-GET + re-run composeDetail and reject when locateMode==='openChat'
-  // (the user already has a button that jumps into the chat directly —
-  // pinging a thread message would be misleading).
+  // Chat-scope sessions must not hit the notification POST path. Builder
+  // output uses a direct `multi_url`, but replayed or crafted callbacks can
+  // still arrive, so re-check the fresh row before posting.
   if (action === SESSIONS_ACTION_LOCATE) {
     const sessionId = value.session_id;
     if (typeof sessionId !== 'string' || !sessionId) {
@@ -953,9 +885,8 @@ export async function handleSessionsCardAction(
     if (!before) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
-    // codex 2026-06-10 SECURITY: re-run the PR1 matrix against the fresh
-    // snapshot. A replayed event on a not-closed session must be rejected
-    // here — never POST resume against an active row.
+    // Re-run the availability matrix against the fresh snapshot. A replayed
+    // event on an active session must not POST resume.
     const beforeDetail = composeDetail(before, now());
     if (beforeDetail.actions.resume.enabled !== true) {
       const mappedKey = mapResumeDisabledReason(beforeDetail.actions.resume.reasonKey)
@@ -1068,11 +999,9 @@ export async function handleSessionsCardAction(
  * caller-facing error toasts. Returns either `{ rows }` or
  * `{ errorResult }` — exactly one is set.
  *
- * codex slice-1 blocker #1: createDaemonClient.request does NOT throw on
- * 4xx/5xx — it resolves with the response. If we only catch throws we'd
- * silently render an empty list when Route B returns 500/401, masking
- * a real backend failure as "no sessions". So check `status !== 200`
- * explicitly and surface as an error toast.
+ * createDaemonClient.request resolves 4xx/5xx responses, so status must be
+ * checked explicitly. Otherwise a backend failure would look like an empty
+ * sessions list.
  */
 async function safeGetSessionsList(
   client: DaemonClient,

@@ -238,10 +238,7 @@ function directMultiUrl(url: string): Record<string, string> {
   };
 }
 
-/** Exported for `/dashboard sessions` slice 2b — the dashboard detail card
- *  needs the same PC-sidebar / direct-URL multi-url shape that streaming /
- *  private snapshot cards already use, so users get a consistent terminal
- *  open behavior. No behavior change in this file. */
+/** Shared terminal multi-url behavior for streaming and dashboard cards. */
 export function terminalMultiUrl(url: string): Record<string, string> {
   return readGlobalConfig().dashboard?.openTerminalInFeishu === true
     ? sidebarMultiUrl(url)

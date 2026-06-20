@@ -56,17 +56,15 @@ export interface CardHandlerDeps {
 /**
  * Lark card action callback envelope.
  *
- * Exported (PR3 C2) so module-specific handlers — `settings-card.ts` (PR3 C4),
- * future per-module callback files (PR4-PR8) — can share the type without
- * redeclaring.
+ * Exported so module-specific dashboard handlers can share the callback type
+ * without redeclaring it.
  *
  * Trust model:
  *   - `operator.open_id` and `operator.union_id` are Lark-verified payload
  *     fields. Treat them as the only legitimate source of caller identity.
  *   - `action.value` is round-tripped from the card schema and IS NOT
  *     verified by Lark. NEVER read identity fields (`union_id`, `open_id`,
- *     `user_id`, …) from `action.value` — see plan v1.3 §7 safety red line
- *     and the PR3 C2 unit tests that pin this contract.
+ *     `user_id`, …) from `action.value`.
  */
 export interface CardActionData {
   operator?: {
@@ -573,9 +571,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
-  // PR3 C4: /dashboard settings card callbacks — dispatch BEFORE the session
-  // lookup. These actions never need an active DaemonSession; they go
-  // straight through the dashboard-internal `/__daemon/settings-*` route.
+  // Dashboard callbacks dispatch before session lookup. They do not require an
+  // active DaemonSession and use dashboard-internal Route B endpoints.
   if (
     typeof value?.action === 'string' &&
     value.action.startsWith('dash_settings_') &&
@@ -584,22 +581,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const { handleSettingsCardAction } = await import('./settings-card.js');
     const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
     const settingsLocale = localeForBot(larkAppId);
-    // PR3 UI revision pass 3 (codex A/B): handler returns ONLY `{ card }`
-    // on the success path so the event-dispatcher passes the rebuilt card
-    // body straight back to Lark in the SAME callback response. Returning
-    // a toast alongside the card makes the client render in two passes,
-    // flashing the OLD card state in the gap (the bug user hit on pass 2).
-    // No `patchCard` callback is needed; the slow-fallback path is handled
-    // by `event-dispatcher.patchTimedOutCardActionResult` (it sees the
-    // shaped `{card}` and calls `updateMessage` only when the handler
-    // exceeded the ACK-safe timeout).
+    // Success returns `{ card }` only so Lark replaces the card in the same
+    // callback response. Slow fallback is handled by the event dispatcher.
     return handleSettingsCardAction(data, larkAppId, {
       createClient: (appId: string) => createDaemonClientFor(appId),
       locale: settingsLocale,
     });
   }
 
-  // ─── PR3 `/dashboard sessions` slice 1: refresh + page callbacks ──────
+  // ─── `/dashboard sessions` callbacks ─────────────────────────────────
   // Same response shape as dash_settings_*: success returns `{ card }` only,
   // no toast, so Lark renders the new list in a single pass.
   if (
@@ -616,7 +606,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
-  // ─── PR3 `/dashboard schedules` slice 1: refresh + page callbacks ─────
+  // ─── `/dashboard schedules` callbacks ────────────────────────────────
   if (
     typeof value?.action === 'string' &&
     value.action.startsWith('dash_schedules_') &&
@@ -631,7 +621,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
-  // ─── PR3 `/dashboard workflows` slice 1: refresh + page callbacks ─────
+  // ─── `/dashboard workflows` callbacks ────────────────────────────────
   if (
     typeof value?.action === 'string' &&
     value.action.startsWith('dash_workflows_') &&
@@ -646,7 +636,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
-  // ─── PR3 `/dashboard groups` slice 1: refresh + page callbacks ────────
+  // ─── `/dashboard groups` callbacks ───────────────────────────────────
   if (
     typeof value?.action === 'string' &&
     value.action.startsWith('dash_groups_') &&
@@ -661,7 +651,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
-  // ─── PR3 `/dashboard overview` slice 1: refresh + goto callbacks ──────
+  // ─── `/dashboard overview` callbacks ─────────────────────────────────
   // Goto buttons rebuild the TARGET card by re-fetching the corresponding
   // dedicated Route B endpoint (sessions-list / schedules-list /
   // settings-snapshot). No new endpoints, no multi_url cross-card jumps.

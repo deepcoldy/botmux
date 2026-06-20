@@ -1,48 +1,22 @@
 /**
- * Workflows list card (PR3 `/dashboard workflows` slice 1 + slice 2a).
+ * Workflows dashboard card.
  *
- * Slice 1 — read-only list + pagination + refresh.
- * Slice 2a — per-row "📂 详情" button opens a detail card; detail card has
- *           "⏏ 取消" (with Feishu confirm dialog) + "🔙 返回" actions.
+ * The list view is compact, paginated, refreshable, and read-only except for
+ * per-row detail entry. The detail view exposes cancel and back actions.
  *
- * Detail-card pattern (codex 2026-06-10 scope-cut):
- *  - List card stays read-only beyond the "📂 详情" inline button.
- *  - All action buttons live on the detail card.
- *  - Cancel is the ONLY write action this slice. Approve/Reject land in
- *    slice 2b/2c (they need an ask-token context for resolver routing).
+ * Cancel callbacks block on Route B and then refetch because a workflow can
+ * land in its terminal state asynchronously. If refetch fails or the row
+ * disappears, the card falls back to a cancelled-state synth so the user still
+ * gets a usable detail view, possibly stale for one render. Failures return
+ * toast-only.
  *
- * Sync cancel (refetch — NOT optimistic state):
- *  - The cancel callback awaits the Route B POST inline.
- *  - On 200 → cancel may land terminal asynchronously (the helper signals
- *    the run; the actual transition can happen on a separate tick). Do a
- *    2nd GET `/__daemon/workflows-runs-snapshot?all=1` and re-project the
- *    fresh row. If the 2nd GET fails OR the row vanished from the listing,
- *    fall back to a `{...before, status: 'cancelled'}` synth — the user may
- *    see a one-cycle-stale render before the next refresh catches up.
- *    Closer to schedules slice 2a RESUME (which 2nd-GETs to let
- *    `scheduler.computeNextRun` produce nextRunAt) than to PAUSE (pure
- *    synth) — workflow cancel is asymmetric the same way.
- *  - On non-200 / network throw → return ONLY a toast. We do NOT redraw the
- *    card so the user keeps their current state for retry.
- *
- * Identity / security:
- *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
- *  - sender union_id NEVER lands on `action.value` (red line).
- *  - Admin gate runs at the command entry AND on every callback.
- *  - `value.run_id` is read but NEVER trusted for identity — only used as
- *    the routing key. The admin gate is the IM authority. The Route B
- *    upstream further enforces `chatBinding.larkAppId` scope (and as of
- *    2026-06-10 also gates cross-bot cancel/approve/reject by
- *    `callerAppId`).
- *  - Before any POST we re-run the PR1 `computeActionAvailability` matrix
- *    against the fresh snapshot AND check `chatBinding.larkAppId` is
- *    routable. Both fail-closed defensively: a replayed event or an old
- *    card could otherwise drive a state-violating POST that the Route B
- *    gate would later reject — surface the disabled reason inline so the
- *    user sees the same string they would see on the disabled button.
- *
- * Response shape: success path returns ONLY `{ card }` (no toast) so Lark
- * renders the card in a single pass.
+ * Security:
+ *  - `invokerOpenId` pins callbacks to the admin who opened the card.
+ *  - sender union_id never lands on `action.value`.
+ *  - command entry and callbacks both enforce the dashboard admin gate.
+ *  - row ids are routing keys only; Route B still enforces row ownership.
+ *  - cancel re-runs the model availability matrix and owner-routability check
+ *    before POSTing.
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
@@ -74,8 +48,7 @@ export const WORKFLOWS_ACTION_BACK_TO_LIST = 'dash_workflows_back_to_list' as co
  *  emitted it. */
 const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for `/dashboard workflows` — unified at 5/page across
- *  all dashboard list cards on user request 2026-06-10. */
+/** Default page size for standalone and overview-drilldown list cards. */
 const PAGE_SIZE = 5;
 
 /** Hard cap on `select_static` jump-page option count. Lark caps select
@@ -120,9 +93,7 @@ export interface BuildWorkflowsCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
-  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
-   *  drilldown 2026-06-10). Threaded through every button.value so the
-   *  size persists across page/refresh/detail-back round-trips. */
+  /** Page size override, threaded through every button value. */
   pageSize?: number;
   /** Navigation origin. `'overview'` means this card was opened via
    *  `/dashboard overview` → goto workflows; the footer renders an extra
@@ -134,8 +105,8 @@ export interface BuildWorkflowsCardOpts {
   scope?: 'global';
 }
 
-/** Tally counts across the (unfiltered) run pool. Pure.
- *  Buckets follow slice 1 spec:
+/** Tally counts across the run pool.
+ *
  *    running = pending | running | waiting
  *    done    = succeeded
  *    failed  = failed | cancelled
@@ -162,14 +133,7 @@ function countByStatus(rows: ReadonlyArray<WorkflowRunInput>): {
   return { running, done, failed };
 }
 
-/** Paginate a row list. Mirrors paginateSchedules semantics.
- *
- *  codex 2026-06-09 refinement: workflows slice 1 deliberately does NOT
- *  re-sort. The Route B `listWorkflowRuns` already returns rows in the
- *  canonical order used by the dashboard web UI; resorting here would
- *  silently diverge from that order, which is harder to reason about than
- *  having the daemon own the canonical sort. Slice 2 may revisit if a
- *  ranking model is introduced for action buttons. */
+/** Paginate without re-sorting; Route B owns the canonical workflow order. */
 function paginate<T>(
   items: ReadonlyArray<T>,
   page: number,
@@ -247,9 +211,9 @@ export function buildWorkflowsCard(
     for (const run of paged.items) {
       const dto = projectRunRowDto(run);
       elements.push(renderRow(dto, opts.locale, nowMs));
-      // Per-row action element holding ONLY the "📂 详情" button (slice 2a).
+      // Per-row action element holding ONLY the "📂 详情" button.
       // Each row owns its own action block so its run_id can flow through
-      // `value.run_id` as the routing key (same shape as schedules slice 2a).
+      // `value.run_id` as the routing key.
       elements.push({
         tag: 'action',
         actions: [
@@ -426,7 +390,7 @@ export interface BuildWorkflowsDetailCardOpts {
   /** Overview drilldown nav state — threaded into the "🔙 返回" button so the
    *  list rebuilt by `BACK_TO_LIST` is still drilldown-shaped (5/page +
    *  return-to-overview). Detail itself does NOT render a return-to-overview
-   *  button (single back affordance per slice). */
+   *  button. */
   origin?: 'overview';
   pageSize?: number;
   /** Dashboard scope. Threaded into cancel/back buttons. */
@@ -434,13 +398,11 @@ export interface BuildWorkflowsDetailCardOpts {
 }
 
 /**
- * Build the detail card (slice 2a). Status icon + bold workflow label + runId
- * monospace; key/value block for status / startedAt / updatedAt / finishedAt /
- * elapsed / progress / chatBinding; optional node-progress section; action row
- * with cancel + back.
+ * Build the workflow detail card: run metadata, optional node progress, cancel
+ * action, and back action.
  *
  * The cancel button is disabled when EITHER:
- *   - PR1 `computeActionAvailability(status).cancel.enabled === false`
+ *   - `computeActionAvailability(status).cancel.enabled === false`
  *     (terminal status: succeeded / failed / cancelled), OR
  *   - `chatBinding.larkAppId` is missing — no routable owner for Route B to
  *     proxy to. The `runCancel` helper would 409 `needs_cli_cancel` here, so
@@ -665,7 +627,7 @@ export function buildWorkflowsDetailCard(
   });
 }
 
-/** Map PR1 cancel-disabled reasonKey to the slice-2a i18n key. */
+/** Map cancel-disabled reason keys to card i18n keys. */
 function mapCancelDisabledReason(reasonKey: string | undefined): string | undefined {
   switch (reasonKey) {
     case 'workflows.action.cancel.terminal':
@@ -745,9 +707,7 @@ export async function handleWorkflowsCardAction(
   }
 
   // Validate the action BEFORE creating the Route B client — an unknown
-  // action shouldn't even open a connection (defensive, also keeps the
-  // slice-1 invariant that the unknown-action path doesn't touch the
-  // client).
+  // action shouldn't even open a connection.
   const validActions = new Set<string>([
     WORKFLOWS_ACTION_REFRESH,
     WORKFLOWS_ACTION_PAGE,
@@ -804,10 +764,8 @@ export async function handleWorkflowsCardAction(
       return errorToast('card.dashboard.workflows.workflow_not_found', undefined, locale);
     }
 
-    // Pre-POST snapshot — needed to (a) confirm the run still exists and
-    // (b) re-run both the PR1 matrix check AND the owner-routability check
-    // against the freshest server state. This is the security-defense
-    // layer at the IM tier; the Route B handler also gates by callerAppId.
+    // Pre-POST snapshot confirms the run still exists and lets us re-run the
+    // action matrix plus owner-routability checks against fresh state.
     const pre = await safeGetWorkflowsList(client, locale, listPathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const before = pre.runs.find(x => x.runId === runId);
@@ -815,12 +773,10 @@ export async function handleWorkflowsCardAction(
       return errorToast('card.dashboard.workflows.workflow_not_found', undefined, locale);
     }
 
-    // codex 2026-06-10 SECURITY REFINEMENT #3: TWO disabled conditions.
-    // Both fail-closed BEFORE any POST.
-    //   (a) PR1 matrix says cancel is enabled for this status
-    //   (b) chatBinding.larkAppId is present (routable owner)
-    // Surface the same i18n key the builder uses for the inline note so
-    // the toast and disabled-button reason agree.
+    // Both disabled conditions fail closed before POSTing:
+    //   (a) the model matrix allows cancel for this status,
+    //   (b) chatBinding.larkAppId is present so Route B can route to an owner.
+    // Surface the same i18n keys the builder uses for disabled-button notes.
     const availability = computeActionAvailability(before.status);
     if (availability.cancel.enabled !== true) {
       const mappedKey = mapCancelDisabledReason(availability.cancel.reasonKey)
@@ -850,12 +806,9 @@ export async function handleWorkflowsCardAction(
       return errorToast('card.dashboard.workflows.cancel_failed', { reason }, locale);
     }
 
-    // codex 2026-06-10 refinement #2: cancel may land terminal on a separate
-    // tick (the helper signals the run; the actual transition is async). Do
-    // a 2nd GET and re-project the fresh row. If the GET fails OR the row
-    // vanished, fall back to `{...before, status: 'cancelled'}` synth — the
-    // user may see a one-cycle-stale render before the next refresh catches
-    // up, which is preferable to no card at all.
+    // Cancel may land terminal on a separate tick. Refetch and re-project the
+    // fresh row; fall back to a possibly stale cancelled synth if the row is
+    // temporarily absent.
     const postRefetch = await safeGetWorkflowsList(client, locale, listPathSuffix);
     let after: WorkflowRunInput | undefined;
     if ('errorResult' in postRefetch) {
@@ -931,8 +884,8 @@ export async function handleWorkflowsCardAction(
 
 /**
  * GET `/__daemon/workflows-runs-snapshot?all=1` and surface non-200 / network
- * errors as caller-facing error toasts. `?all=1` is the slice 1 invariant —
- * default listRuns hides terminal runs (succeeded/failed/cancelled), so the
+ * errors as caller-facing error toasts. `?all=1` is required because default
+ * listRuns hides terminal runs (succeeded/failed/cancelled), so the
  * counters and the detail/cancel paths would miss recently-terminated runs
  * without it. Returns either `{ runs }` or `{ errorResult }` — exactly one
  * is set.

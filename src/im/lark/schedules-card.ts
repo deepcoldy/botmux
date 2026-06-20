@@ -1,47 +1,22 @@
 /**
- * Schedules list card (PR3 `/dashboard schedules` slice 1 + slice 2a/2b).
+ * Schedules dashboard card.
  *
- * Slice 1 — read-only list + pagination + refresh.
- * Slice 2a — per-row "📂 详情" button opens a detail card; detail card has
- *           "⏸ 暂停" / "▶ 恢复" (mutually exclusive) + "🔙 返回" actions.
- * Slice 2b — detail card adds delivery-mode switching between "原话题" and
- *           "每次新话题" (mutually exclusive). `local` is read-only here.
+ * The list view is compact, paginated, refreshable, and read-only except for
+ * per-row detail entry. The detail view exposes pause/resume, delivery-mode
+ * switching, and back actions. Run-now remains outside this card because it is
+ * a one-shot side effect rather than a reversible state change.
  *
- * Detail-card pattern (codex 2026-06-10 scope-cut):
- *  - List card stays read-only beyond the "📂 详情" inline button.
- *  - All action buttons live on the detail card.
- *  - Pause/Resume landed first; delivery-mode switching is the next reversible
- *    state toggle. Run-now stays out because it is a one-shot side effect.
+ * Pause/resume callbacks block on Route B and return a rebuilt card on success.
+ * Pause can be rendered from the pre-POST snapshot plus `enabled:false`; resume
+ * refetches because scheduler-owned nextRunAt calculation must remain
+ * authoritative. Failures return toast-only and leave the card unchanged.
  *
- * Sync pause/resume (NOT optimistic state):
- *  - The pause/resume callback awaits the Route B POST inline.
- *  - On 200 → synthesize the new-state row in-process (snapshot from the
- *    pre-POST GET overlaid with `enabled: !before.enabled`), then rebuild the
- *    detail card. NO toast on success — single-pass card render.
- *    Asymmetry: pause makes nextRunAt irrelevant (scheduler stops emitting),
- *    so synth is fine. Resume needs a fresh nextRunAt (computeNextRun cron /
- *    interval logic lives in scheduler.ts, NOT here), so we do a 2nd GET and
- *    fall back to synth+log if the GET fails (the row stays functional, just
- *    with a possibly-stale nextRunAt for one render cycle).
- *  - On non-200 / network throw → return ONLY a toast. We do NOT redraw the
- *    card so the user keeps their current state for retry.
- *
- * Identity / security:
- *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
- *  - sender union_id NEVER lands on `action.value` (red line).
- *  - Admin gate runs at the command entry AND on every callback.
- *  - `value.schedule_id` is read but NEVER trusted for identity — only used
- *    as the routing key. The admin gate is the IM authority. The Route B
- *    upstream further enforces `ownerOf(schedule_id)` scope (and as of
- *    2026-06-10 also gates cross-bot schedule writes by `callerAppId`).
- *  - Before any POST we re-run the PR1 `computeButtonAvailability` matrix
- *    against the fresh snapshot and fail-closed if the chosen action is
- *    disabled — client-side `disabled` is UX only and a replayed event or an
- *    old card could otherwise drive a state-violating POST.
- *
- * Response shape mirrors `/dashboard settings` slice 3: success path returns
- * ONLY `{ card }` (no toast) so Lark renders the card in a single pass
- * (toast + card would trigger a two-pass render and flash the stale list).
+ * Security:
+ *  - `invokerOpenId` pins callbacks to the admin who opened the card.
+ *  - sender union_id never lands on `action.value`.
+ *  - command entry and callbacks both enforce the dashboard admin gate.
+ *  - row ids are routing keys only; Route B still enforces row ownership.
+ *  - write actions re-run the model availability matrix before POSTing.
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
@@ -76,9 +51,7 @@ export const SCHEDULES_ACTION_BACK_TO_LIST = 'dash_schedules_back_to_list' as co
  *  to avoid a circular dep). */
 const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for `/dashboard schedules` (standalone AND overview
- *  drilldown — unified at 5/page across all dashboard list cards on user
- *  request 2026-06-10). `pageSize` opt still works as an override. */
+/** Default page size for standalone and overview-drilldown list cards. */
 const PAGE_SIZE = 5;
 
 /** Hard cap on `select_static` jump-page option count. */
@@ -119,18 +92,13 @@ export interface BuildSchedulesCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
-  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
-   *  drilldown 2026-06-10). Threaded through every button.value. */
+  /** Page size override, threaded through every button value. */
   pageSize?: number;
   /** Navigation origin. `'overview'` → footer renders "🔙 返回总览" and every
    *  button.value carries `origin=overview`. Undefined → standalone card. */
   origin?: 'overview';
-  /** Dashboard scope. `'global'` (2026-06-11): the `/dashboard` command
-   *  family is a tool panel for Bot admins; schedules from any bot show
-   *  up regardless of which bot dispatched the callback. Threaded onto
-   *  every button.value so refresh/page/detail/back keep the scope; the
-   *  handler appends `?scope=global` to every Route B GET/POST. Undefined
-   *  → per-bot (back-compat default). */
+  /** Dashboard scope. `'global'` shows schedules from every bot and threads
+   *  `?scope=global` through reads/writes so row-owner routing is preserved. */
   scope?: 'global';
 }
 
@@ -191,7 +159,7 @@ export function buildSchedulesCard(
       const dto = toScheduleRowDto(task, { nowMs });
       // Row text element.
       elements.push(renderRow(dto, opts.locale, opts.scope === 'global'));
-      // Per-row action element holding ONLY the "📂 详情" button (slice 2a).
+      // Per-row action element holding ONLY the "📂 详情" button.
       // Keeping each row's actions in its own `action` element (rather than
       // one shared element for the whole page) makes the visual layout
       // align with the row above and lets us pass the row's schedule id
@@ -336,9 +304,8 @@ function renderRow(row: ScheduleRowDto, locale: Locale, showBotLabel: boolean): 
   if (repeatStr) {
     secondaryParts.push(t('card.dashboard.schedules.repeat_label', { repeat: repeatStr }, locale));
   }
-  // Global-scope (2026-06-11): prefix the secondary line with the owning
-  // bot so the user can tell which bot a schedule belongs to (different
-  // bots can share schedule names; per-bot scope didn't need this).
+  // In global scope, prefix rows with the owning bot so same-name schedules
+  // remain distinguishable.
   // Preference: row.raw.botName → larkAppId short-suffix → '—'.
   if (showBotLabel) {
     const botLabel = botLabelFromRow(row);
@@ -392,18 +359,15 @@ export interface BuildSchedulesDetailCardOpts {
    *  return-to-overview). Detail itself does NOT render return-to-overview. */
   origin?: 'overview';
   pageSize?: number;
-  /** Global-scope flag (2026-06-11) — threaded into action buttons so
-   *  the rebuilt list and follow-on writes keep `?scope=global` semantics. */
+  /** Global-scope flag threaded into action buttons and rebuilt cards. */
   scope?: 'global';
 }
 
 /**
- * Build the detail card (slice 2a). Status icon + bold title + id monospace;
- * key/value block for name/enabled/kind/displayExpr/delivery/nextRunAt/
- * lastRunAt/lastStatus/repeat/prompt; next-N runs list; action row with
- * pause/resume + delivery + back.
+ * Build the schedule detail card: task metadata, next-run preview, reversible
+ * state controls, delivery-mode switch, and back action.
  *
- * Pause and resume are MUTUALLY EXCLUSIVE per the PR1 matrix:
+ * Pause and resume are mutually exclusive per the model matrix:
  *   enabled === true → pause clickable, resume disabled (alreadyEnabled)
  *   enabled === false → pause disabled (alreadyPaused), resume clickable
  *
@@ -615,8 +579,8 @@ export function buildSchedulesDetailCard(
   });
 
   // Surface reasonKey notes for whichever button is disabled. Pause/resume
-  // are mutually exclusive in this slice — only one will be disabled at a
-  // time — but render both branches defensively in case the matrix evolves.
+  // are mutually exclusive today, but render both branches defensively in case
+  // the matrix evolves.
   if (!pauseEnabled) {
     const reasonKey = mapPauseDisabledReason(detail.actions.pause.reasonKey);
     if (reasonKey) {
@@ -669,7 +633,7 @@ export function buildSchedulesDetailCard(
   });
 }
 
-/** Map PR1 pause-disabled reasonKey to the slice-2a i18n key. */
+/** Map pause-disabled reason keys to card i18n keys. */
 function mapPauseDisabledReason(reasonKey: string | undefined): string | undefined {
   switch (reasonKey) {
     case 'schedules.action.pause.alreadyPaused':
@@ -679,7 +643,7 @@ function mapPauseDisabledReason(reasonKey: string | undefined): string | undefin
   }
 }
 
-/** Map PR1 resume-disabled reasonKey to the slice-2a i18n key. */
+/** Map resume-disabled reason keys to card i18n keys. */
 function mapResumeDisabledReason(reasonKey: string | undefined): string | undefined {
   switch (reasonKey) {
     case 'schedules.action.resume.alreadyEnabled':
@@ -768,9 +732,7 @@ export async function handleSchedulesCardAction(
   }
 
   // Validate the action BEFORE creating the Route B client — an unknown
-  // action shouldn't even open a connection (defensive, also keeps the
-  // slice-1 invariant that the unknown-action path doesn't touch the
-  // client).
+  // action shouldn't even open a connection.
   const validActions = new Set<string>([
     SCHEDULES_ACTION_REFRESH,
     SCHEDULES_ACTION_PAGE,
@@ -844,19 +806,13 @@ export async function handleSchedulesCardAction(
       return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
     }
 
-    // codex 2026-06-10 SECURITY BLOCKER: client-side `disabled` on the
-    // pause/resume button is UX only — a replayed event, an old card
-    // still open, or a hand-crafted payload can still hit this callback.
-    // Server-side we MUST re-run the PR1 action-availability matrix
-    // against the fresh snapshot and fail-closed on `enabled === false`.
-    // This re-uses the SAME computeButtonAvailability logic the builder
-    // used to decide whether to disable the button in the first place —
-    // keeping the rules in one place avoids drift between client paint
-    // and server enforce.
+    // Client-side `disabled` is UX only; replayed or crafted callbacks can
+    // still arrive. Re-run the same availability matrix server-side and
+    // fail closed before POSTing.
     const beforeMatrix = computeButtonAvailability(before);
     const buttonState = verb === 'pause' ? beforeMatrix.pause : beforeMatrix.resume;
     if (buttonState.enabled !== true) {
-      // Reuse the SAME PR1 reasonKey → i18n key mapping the builder uses
+      // Reuse the same reasonKey → i18n mapping the builder uses
       // for the inline disabled-button note so toast text matches what
       // the user already sees on the card. NEVER POST; NEVER redraw.
       const mappedKey = verb === 'pause'
@@ -866,8 +822,7 @@ export async function handleSchedulesCardAction(
     }
 
     // Route B owner routing is the authority on whether this schedule can be
-    // toggled; we only sanitize the routing key above. As of
-    // 2026-06-10 the Route B handler also gates cross-bot writes.
+    // toggled; the IM layer only sanitizes the routing key and state matrix.
     let resp: Awaited<ReturnType<DaemonClient['request']>>;
     try {
       resp = await client.request({
@@ -915,9 +870,8 @@ export async function handleSchedulesCardAction(
       after = postRefetch.tasks.find(t => t.id === scheduleId);
     }
     if (!after) {
-      // codex fall-back: resume succeeded upstream but refetch couldn't
-      // surface the new row. Render synth-with-enabled:true so the user
-      // gets a valid card; nextRunAt may be stale until the next refresh.
+      // Resume succeeded upstream but refetch could not surface the new row.
+      // Render a valid card; nextRunAt may be stale until the next refresh.
       after = { ...before, enabled: true };
     }
     const detail = toScheduleDetailDto(after, { nowMs: now() });

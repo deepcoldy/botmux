@@ -1,17 +1,10 @@
 /**
- * `/dashboard <module>` command-group entry (PR3 C1).
+ * `/dashboard <module>` command-group entry.
  *
- * Pipeline:
- *  1. Admin gate: the entire `/dashboard *` group is restricted to the
- *     bot's resolved `allowedUsers`, matching `/botconfig`. Any sub (help /
- *     unknown / overview / sessions / workflows / groups / schedules /
- *     settings) that bypasses the gate is a security regression — see the
- *     dispatch tests for the explicit guarantee.
- *  2. Subcommand dispatch by the first whitespace-delimited token; empty
- *     args default to `overview` to match v1.3 §0 routing rules.
- *  3. C1: every module subcommand replies with `not_implemented_yet`. C4
- *     replaces the `'settings'` arm with the real handler. C2 / C3 add no
- *     dispatch entries here; they only wire imports & infrastructure.
+ * The entire command group is restricted to the bot's resolved `allowedUsers`,
+ * matching `/botconfig`. Any subcommand that bypasses this gate is a security
+ * regression. Empty args default to `overview`; successful cards are DM'd to
+ * the invoking admin and the topic receives only a short confirmation.
  */
 
 import type { LarkMessage } from '../../types.js';
@@ -34,7 +27,7 @@ import { handleDashboardOverview, type DashboardOverviewCommandDeps } from './ov
 import { handleDashboardWorkflows, type DashboardWorkflowsCommandDeps } from './workflows.js';
 import { handleDashboardGroups, type DashboardGroupsCommandDeps } from './groups.js';
 
-/** Optional test seam — production omits and uses the real PR2 helper. */
+/** Optional test seam. Production omits these overrides. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   /** Override for `sendUserMessage` (DM to invoking admin). Production omits. */
   sendUserMessage?: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
@@ -95,37 +88,31 @@ export async function handleDashboardCommand(
     return;
   }
 
-  // PR3 C4: settings dispatched to the real handler.
   if (sub === 'settings') {
     const settingsArgs = args.replace(/^settings\s*/, '');
     return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.settings);
   }
 
-  // PR3 sessions slice 1: read-only list + pagination + refresh.
   if (sub === 'sessions') {
     const sessionsArgs = args.replace(/^sessions\s*/, '');
     return handleDashboardSessions(message, sessionsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.sessions);
   }
 
-  // PR3 schedules slice 1: read-only list + pagination + refresh.
   if (sub === 'schedules') {
     const schedulesArgs = args.replace(/^schedules\s*/, '');
     return handleDashboardSchedules(message, schedulesArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.schedules);
   }
 
-  // PR3 workflows slice 1: read-only list + pagination + refresh.
   if (sub === 'workflows') {
     const workflowsArgs = args.replace(/^workflows\s*/, '');
     return handleDashboardWorkflows(message, workflowsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.workflows);
   }
 
-  // PR3 groups: list + pagination + refresh + per-row management detail.
   if (sub === 'groups') {
     const groupsArgs = args.replace(/^groups\s*/, '');
     return handleDashboardGroups(message, groupsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.groups);
   }
 
-  // PR3 overview slice 1: read-only summary card + goto buttons.
   if (sub === 'overview') {
     const overviewArgs = args.replace(/^overview\s*/, '');
     return handleDashboardOverview(message, overviewArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.overview);

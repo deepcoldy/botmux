@@ -1,15 +1,9 @@
 /**
- * `/dashboard workflows` real sub-handler (PR3 slice 1).
+ * `/dashboard workflows` sub-handler.
  *
- * Mirrors `/dashboard sessions` slice 1: admin gate has ALREADY run in
- * `handleDashboardCommand`; this function only fetches the run list from
- * PR2 Route B (`GET /__daemon/workflows-runs-snapshot?all=1&scope=global`),
- * builds the card, and DMs the admin with the topic getting a short
- * `dm_sent` confirmation. `/dashboard` is the Bot admin's global tool panel,
- * not a per-bot view.
- *
- * No cancel / approve / reject / search / status filter in slice 1 —
- * read-only listing only.
+ * The command-level admin gate has already passed. This handler fetches the
+ * global workflow run list, builds the Feishu list card, and DMs the invoking
+ * admin. Per-run actions are handled by card callbacks from the detail view.
  */
 
 import type { LarkMessage } from '../../types.js';
@@ -45,12 +39,8 @@ export async function handleDashboardWorkflows(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let snap;
   try {
-    // codex 2026-06-09 blocker: listRuns default hides TERMINAL_RUN_STATUSES
-    // (succeeded/failed/cancelled). Without `all=1` the "完成 M · 失败 K"
-    // counts in the card would basically always be 0 — the user would see
-    // "non-terminal list", not the runs history we advertise. The endpoint
-    // already transparently forwards `?all`; only the consumer side needs to
-    // ask for it.
+    // listRuns defaults to non-terminal runs. `all=1` is required so the
+    // completed/failed counters and history rows include terminal runs.
     snap = await client.request({ method: 'GET', path: '/__daemon/workflows-runs-snapshot?all=1&scope=global' });
   } catch (e: any) {
     await deps.sessionReply(

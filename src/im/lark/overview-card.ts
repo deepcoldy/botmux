@@ -1,27 +1,13 @@
 /**
- * Dashboard overview card (PR3 `/dashboard overview` slice 1).
+ * Dashboard overview card.
  *
- * Slice 1 scope:
- *  - Sources from the shared `GET /__daemon/overview-snapshot` endpoint
- *    (dashboard list reads use `?scope=global` where implemented; write
- *    actions still route to each row's true owner daemon).
- *  - Summary sections follow the Web Dashboard navigation order: sessions /
- *    workflows / groups / schedules / settings.
- *  - Each section with an implemented sub-card has a
- *    📂 goto button that REBUILDS the target card by reusing the existing
- *    `dash_sessions_refresh` / `dash_schedules_refresh` /
- *    `dash_settings_refresh` handlers — no new endpoints, no `multi_url`
- *    cross-card jumps that lose the invoker-lock chain.
- *  - Footer: refresh + reused `card.dashboard.settings.footer.security`.
+ * Sources from the shared overview endpoint and presents the same navigation
+ * order as the Web Dashboard: sessions, workflows, groups, schedules, settings.
+ * Drilldown buttons rebuild the target Feishu card in-place rather than using
+ * external links, preserving invoker-lock and callback state.
  *
- * Identity / security mirrors `sessions-card.ts` slice 1:
- *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
- *  - Admin gate runs at the command entry AND on every callback.
- *  - sender union_id NEVER lands on `action.value` (red line).
- *  - non-200 from Route B becomes an error toast — NOT an empty card.
- *
- * Response shape mirrors sessions/schedules/settings: success returns ONLY
- * `{ card }` (no toast) so Lark renders in a single pass.
+ * Non-200 Route B responses become error toasts, never empty cards. Successful
+ * callbacks return card-only so Lark replaces the card in a single pass.
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
@@ -96,7 +82,7 @@ export function countSessions(rows: ReadonlyArray<SessionRow>): SessionCounts {
  * paused/enabled state, and `schedules-card.ts:180+208` paints the ⚠️ glyph
  * on any such row. Keeping the same definition prevents an undercount where
  * overview reads "上次错误 0" while drilling into schedules surfaces a
- * paused task with ⚠️ (codex review 2026-06-09 blocker).
+ * paused task with ⚠️.
  */
 export function countSchedules(tasks: ReadonlyArray<ScheduleCardTaskInput>): ScheduleCounts {
   let enabled = 0;
@@ -169,8 +155,8 @@ function formatTime(time: string | undefined | null): string {
 }
 
 /**
- * Sanitize user/filesystem-supplied text for inclusion in lark_md (PR3
- * shared idiom; see sessions-card.ts:escapeLarkMd for the order rationale).
+ * Sanitize user/filesystem-supplied text for inclusion in lark_md. See
+ * sessions-card.ts:escapeLarkMd for the escaping order rationale.
  */
 function escapeLarkMd(text: string): string {
   return text
@@ -426,9 +412,8 @@ interface OverviewSnapshotBody {
 }
 
 /**
- * Dispatch a `dash_overview_*` action callback. Same fail-closed identity
- * pipeline as sessions/schedules slice 1; success path returns
- * `{ card }` only (single-pass render).
+ * Dispatch a `dash_overview_*` action callback. Uses the same fail-closed
+ * identity pipeline as other dashboard cards; success returns `{ card }` only.
  *
  * Goto callbacks rebuild the TARGET module's card by re-fetching its own
  * dedicated endpoint (sessions-list / schedules-list / settings-snapshot)
@@ -509,10 +494,8 @@ export async function handleOverviewCardAction(
       return errorToast('card.dashboard.schedules.list_failed', { reason }, locale);
     }
     const tasks = ((r.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
-    // See sessions branch above for drilldown opts. `scope: 'global'` is
-    // 2026-06-11's `/dashboard` global tool-panel semantics: the sub-card
-    // threads scope onto every button.value so refresh/page/detail/back/
-    // pause/resume keep the global view + cross-bot owner-routing.
+    // See sessions branch above for drilldown opts. `scope: 'global'` threads
+    // global view semantics through refresh/page/detail/back/pause/resume.
     const cardJson = buildSchedulesCard(
       tasks,
       { invokerOpenId: operatorOpenId, locale, page: 1, origin: 'overview', scope: 'global' },

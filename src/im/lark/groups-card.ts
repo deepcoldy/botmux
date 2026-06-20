@@ -1,5 +1,5 @@
 /**
- * Groups card (PR3 `/dashboard groups`).
+ * Groups dashboard card.
  *
  * List view + detail/manage view. The list stays compact (5/page); the
  * detail card carries per-bot membership / oncall / role management actions.
@@ -8,7 +8,7 @@
  * row view summarizes coverage across all bot columns (joined/total) instead
  * of pretending the matrix has a single caller-bot column.
  *
- * Identity / security mirrors sessions-card.ts (slice 1):
+ * Security:
  *  - `invokerOpenId` is the invoking admin's `ou_*` (invoker-lock anchor).
  *  - Admin gate runs at the command entry AND on every callback.
  *  - sender union_id NEVER lands on action.value.
@@ -16,8 +16,8 @@
  * Response: success returns `{ card }` only (no toast) — single-pass render,
  * no stale-frame flash. Errors / permission denials return `{ toast }`.
  *
- * Sort order: KEEP `buildGroupRows` output order verbatim — the PR1 model
- * owns the canonical ordering; resorting in the card would silently diverge.
+ * Sort order: keep model output order verbatim; resorting in the card would
+ * silently diverge from the Web Dashboard.
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
@@ -51,8 +51,7 @@ export const GROUPS_ACTION_ROLE_DELETE = 'dash_groups_role_delete' as const;
  *  overview handler regardless of which sub-card emitted it. */
 const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for `/dashboard groups` — unified at 5/page across
- *  all dashboard list cards on user request 2026-06-10. */
+/** Default page size for standalone and overview-drilldown list cards. */
 const PAGE_SIZE = 5;
 
 /** Hard cap on `select_static` option count for the "jump to page" picker.
@@ -87,10 +86,7 @@ export interface BuildGroupsCardOpts {
   locale: Locale;
   /** 1-based page index. Caller clamps; this just renders what's given. */
   page: number;
-  /** Page size override. Omit → PAGE_SIZE (5; unified for standalone and
-   *  drilldown 2026-06-10). Override only when a caller needs a different
-   *  size. Threaded through every button.value so the size persists across
-   *  page/refresh round-trips. */
+  /** Page size override, threaded through every button value. */
   pageSize?: number;
   /** Navigation origin. `'overview'` means this card was opened via
    *  `/dashboard overview` → goto groups; the footer renders an extra
@@ -137,8 +133,8 @@ export function buildGroupsCard(
       : PAGE_SIZE;
 
   // Project EVERY chat into a row DTO ourselves rather than going through
-  // `buildGroupRows`, because the pipeline helper also paginates (default
-  // pageSize=20) which would silently clip the card list. PR1 model owns the
+  // `buildGroupRows`, because the pipeline helper also paginates and would
+  // silently clip the card list. The model owns the
   // canonical sort — we walk `matrix.chats` verbatim, no client re-sort.
   const allRows: GroupRowDto[] = matrix.chats.map(c => buildGroupRow(c, matrix.bots));
 

@@ -143,10 +143,8 @@ function bodyField<T = unknown>(body: unknown, name: string): T | undefined {
  * Generic per-bot scoping helper — restricts aggregator rows to those owned
  * by the authenticated caller's bot.
  *
- * Per-bot owner gate (PR3) means a bot A owner viewing `/dashboard
- * sessions` against bot A must never see bot B's sessions. The aggregator
- * mixes rows from all daemons (`aggregator.ts:62-63`), so we filter at the
- * Route B read layer using the caller's `verify.appId`.
+ * Default list reads are per-bot: a caller authenticated as bot A should not
+ * see bot B rows unless the route explicitly opts into `?scope=global`.
  *
  * Rows whose owner getter returns undefined / empty string (legacy
  * persistence shape) are KEPT so they don't disappear from a freshly-
@@ -189,11 +187,11 @@ function scopeByCaller(
 }
 
 /**
- * Per-bot scoping for the `groups-matrix` endpoint (PR3 groups slice 1).
+ * Per-bot scoping for the `groups-matrix` endpoint.
  *
  * The groups matrix returns `{ chats, bots }` where neither container has a
  * top-level `larkAppId`, so the generic `scopeByCaller` / `scopeRowsByCaller`
- * helpers don't fit. Codex strict-scope rules (2026-06-09):
+ * helpers don't fit. Default fail-closed rules:
  *
  *   - bots: filter to ONLY entries whose `larkAppId === callerAppId`.
  *   - chats: keep ONLY chats where some memberBots entry has
@@ -250,17 +248,8 @@ const ROUTES: RouteDef[] = [
       return { status: 200, body: { sessions } };
     },
   },
-  // PR3 `/dashboard schedules` slice 1 + global-schedules (2026-06-11):
-  //   dedicated list endpoint; mirrors `sessions-list` shape.
-  //
-  //   Global scope (`?scope=global`): the `/dashboard` command family is a
-  //   user-facing tool panel for the Bot Owner, not a per-bot view. When the
-  //   caller marks the request global, we skip the per-bot row filter so
-  //   `/dashboard schedules` against bot B can still see schedules owned by
-  //   bot A. The user-owner / HMAC / invoker lock gates upstream are NOT
-  //   relaxed — only the row scope changes. Per-bot scope remains the
-  //   default for any caller that doesn't opt in (back-compat with internal
-  //   tests + future per-bot views).
+  // Dedicated schedules list endpoint. `?scope=global` widens only the read
+  // row set; HMAC, admin, invoker, and write owner-routing gates are unchanged.
   {
     method: 'GET',
     pathRe: /^\/__daemon\/schedules-list$/,
@@ -304,13 +293,9 @@ const ROUTES: RouteDef[] = [
         all: ctx.url.searchParams.get('all') === '1',
         statuses: parseStatusesParam(ctx.url.searchParams.get('status')),
       };
-      // PR3 workflows slice 1: listWorkflowRuns returns
-      // `{ status, body: { runs } }` (HandlerResult), NOT a raw array.
-      // Only filter on a 200 with a runs array; pass through other shapes
-      // verbatim (errors, non-runs bodies) so callers see the real failure
-      // instead of an empty list. Owner getter reaches into nested
-      // `chatBinding.larkAppId` — workflow rows differ from sessions /
-      // schedules where larkAppId is top-level.
+      // listWorkflowRuns returns HandlerResult, not a raw array. Filter only
+      // successful `{ runs }` bodies; pass through errors and malformed bodies
+      // so callers see the real failure instead of an empty list.
       const result = await listWorkflowRuns(query, deps.workflowsActionDeps);
       if (
         result.status === 200 &&
@@ -388,18 +373,14 @@ const ROUTES: RouteDef[] = [
       const sessionId = decodeURIComponent(m[1]);
       const action = m[2];
 
-      // Three-state routing — mirrors the schedules write gate
-      // (codex 2026-06-10 hardening, follow-up to schedules slice 2a):
+      // Three-state routing mirrors schedules:
       //  - owner !== undefined + caller mismatch → 403 session_owner_mismatch
       //  - owner !== undefined + caller match (or test seam) → proxy owner
       //  - owner === undefined + sessionExists + callerAppId set → legacy,
       //    proxy to caller's bot (same bot that fetched the row via the
       //    scoped read endpoint).
       //  - row genuinely missing → 404 unknown_session
-      // Without the cross-bot gate, a bot A owner with a hand-crafted
-      // callback could pass bot B's sessionId and have Route B proxy to
-      // bot B's daemon. The owner-gate at the IM layer rejected this for
-      // *normal* clients, but Route B itself was not fail-closed.
+      // Route B fails closed too, not only the IM card layer.
       const owner = deps.ownerOf(sessionId);
       if (owner === undefined) {
         if (!deps.sessionExists(sessionId)) {
@@ -518,17 +499,11 @@ const ROUTES: RouteDef[] = [
 
   // ── WRITE: workflows × 3 ──────────────
   //
-  // Cross-bot owner gate (codex 2026-06-10, follow-up to sessions /
-  // schedules slice 2a hardening): the helpers (`runApproveReject` /
-  // `runCancel`) only know the run's chatBinding via `readRunSnapshot`,
-  // so without an upfront snapshot read here, a bot A owner with a
-  // hand-crafted callback could pass bot B's runId and the helper would
-  // happily proxy to bot B's daemon. Unlike sessions / schedules, there
-  // is NO legacy "proxy to caller" fallback for workflows: a run without
-  // chatBinding lacks a routable owner entirely and the existing helper
-  // returns 409 needs_lark_or_cli / needs_cli_cancel for that case —
-  // preserve that semantic by NOT intercepting (fall through to the
-  // helper which produces the 409 with its existing error code).
+  // Cross-bot owner gate. The workflow helpers resolve routing from
+  // readRunSnapshot, so Route B checks the owner before proxying. Unlike
+  // sessions/schedules, workflows have no legacy "proxy to caller" fallback:
+  // a run without chatBinding has no routable owner and should fall through to
+  // the helper's existing 409 (`needs_lark_or_cli` / `needs_cli_cancel`).
   //
   //   - snapshot null → 404 unknown_run (don't expose the helper's
   //     non-existent run path)
@@ -536,19 +511,16 @@ const ROUTES: RouteDef[] = [
   //   - owner !== undefined + caller match (or test seam) → fall through
   //   - owner === undefined → fall through (helper returns 409)
   //
-  // The slice 2a UI only exposes cancel; approve/reject get the same
-  // treatment so a follow-up slice doesn't ship the same hole again.
+  // Apply the same gate to approve/reject even if the current card only
+  // exposes cancel.
   {
     method: 'POST',
     pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/(approve|reject)$/,
     handle: async (m, ctx, deps) => {
       const runId = decodeURIComponent(m[1]);
       const action = m[2] as 'approve' | 'reject';
-      // codex 2026-06-10 compat blocker: helper used to return 400 bad_run_id
-      // on invalid ids; without this check readRunSnapshot would null on a
-      // bad id and the gate would shadow the bad-input case into 404
-      // unknown_run, breaking callers that distinguish bad input from missing
-      // run (helper tests + dashboard-workflow-api.test lock this semantics).
+      // Preserve bad-input semantics: invalid ids return 400 bad_run_id rather
+      // than being shadowed as 404 unknown_run by the owner snapshot lookup.
       if (!deps.workflowsActionDeps.isValidRunId(runId)) {
         return { status: 400, body: { ok: false, error: 'bad_run_id' } };
       }
@@ -570,7 +542,7 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/cancel$/,
     handle: async (m, ctx, deps) => {
       const runId = decodeURIComponent(m[1]);
-      // codex 2026-06-10 compat blocker (see approve/reject above).
+      // Preserve the same bad-input semantics as approve/reject.
       if (!deps.workflowsActionDeps.isValidRunId(runId)) {
         return { status: 400, body: { ok: false, error: 'bad_run_id' } };
       }
@@ -596,7 +568,7 @@ const ROUTES: RouteDef[] = [
       const id = decodeURIComponent(m[1]);
       const action = m[2];
 
-      // Three-state routing (codex 2026-06-10 blocker fix):
+      // Three-state routing:
       //  - row missing entirely → 404 unknown_schedule
       //  - row present with larkAppId → cross-bot gate (403 on mismatch)
       //  - row present WITHOUT larkAppId (legacy, e.g. pre-v0.4 persistence)
@@ -605,16 +577,15 @@ const ROUTES: RouteDef[] = [
       //    undefined OR when the row has no owner) AND continue to be
       //    executed by `scheduler.belongsToOwner` on the primary daemon.
       //    Without this branch, the user would see the row + actionable
-      //    buttons but every POST would 404 — the read/write disconnect
-      //    codex flagged. With it, the caller's bot proxies the action
-      //    just like an explicit-owner row would.
+      //    buttons but every POST would 404. With this branch, the caller's
+      //    bot proxies the action just like an explicit-owner row would.
       const owner = deps.scheduleOwnerOf(id);
       if (owner === undefined) {
         if (!deps.scheduleExists(id)) {
           return { status: 404, body: { ok: false, error: 'unknown_schedule' } };
         }
         // Legacy row. Production: route to the authenticated caller's bot.
-        // Test seam (callerAppId undefined): preserve pre-blocker behaviour
+        // Test seam (callerAppId undefined): preserve historical behaviour
         // (404) so existing dispatchForTest tests stay deterministic.
         if (ctx.callerAppId === undefined) {
           return { status: 404, body: { ok: false, error: 'unknown_schedule' } };
@@ -633,13 +604,9 @@ const ROUTES: RouteDef[] = [
       // Owned row. Cross-bot guard: refuse when the caller is not the
       // owning bot. test seam keeps the historical pass-through.
       //
-      // global-schedules slice (2026-06-11): when the request is marked
-      // `?scope=global`, the cross-bot guard is intentionally bypassed —
-      // global cards are a tool-panel surface that can show rows from any
-      // bot. We still proxy to the row's TRUE owner daemon (not the
-      // caller), so the write reaches the right scheduler. Three-state
-      // semantics around legacy / missing rows are preserved; global only
-      // changes "owner exists + caller mismatch" from 403 to "proxy owner".
+      // In global dashboard scope, the card can show rows from any bot. We
+      // still proxy to the row's true owner daemon, so global only changes
+      // "owner exists + caller mismatch" from 403 to "proxy owner".
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
       if (!isGlobal && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
         return { status: 403, body: { ok: false, error: 'schedule_owner_mismatch' } };

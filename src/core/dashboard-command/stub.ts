@@ -1,14 +1,8 @@
 /**
- * `/dashboard <module>` stub replies (PR3 C1).
+ * `/dashboard <module>` module registry, help text, and fallback replies.
  *
- * The six visible modules (overview / sessions / workflows / groups /
- * schedules / settings) all return `not_implemented_yet` at C1; PR4-PR8
- * replace each in turn. `help` and `unknown_module` are handled by the
- * caller — this module only knows about the six concrete modules.
- *
- * v3 B7 / v4 B1: `settings` is also a stub here. C4 replaces the dispatch
- * arm for `settings` with the real `handleDashboardSettings`; the stub
- * implementation below stays available as a fallback during refactors.
+ * The concrete handlers live in sibling files. `buildStubText` remains as a
+ * defensive fallback for future modules or partial refactors.
  */
 
 import { t, type Locale } from '../../i18n/index.js';

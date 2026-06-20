@@ -133,9 +133,8 @@ export function composeSections(
   const autoRestartEnabledUi = canWrite && !autoRestartBlocked;
   const timeValue = formatTimeForDisplay(settings.maintenance?.autoUpdate?.time);
 
-  // Per-toggle disable reasons (PR3 revision): codex C4 — autoRestart's reason
-  // MUST cite the autoUpdate dependency, not a generic "currently disabled".
-  // autoUpdate's reason MUST cite local-dev install, not a generic note.
+  // Per-toggle disabled reasons stay specific so the card can tell users what
+  // dependency must change before a control becomes writable.
   const autoUpdateReasonKey = autoUpdateBlocked ? 'settings.autoUpdate.disabled.localDev' : undefined;
   const autoRestartReasonKey = autoRestartBlocked ? 'settings.autoRestart.disabled.needsAutoUpdate' : undefined;
 

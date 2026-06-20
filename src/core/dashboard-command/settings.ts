@@ -1,19 +1,11 @@
 /**
- * `/dashboard settings` real sub-handler (PR3 C4 + revision).
+ * `/dashboard settings` sub-handler.
  *
- * Pipeline:
- *   1. admin gate has ALREADY run in `handleDashboardCommand` — this function
- *      is called only when the caller IS the per-bot admin (adminOpenId is
- *      passed in by the dispatch).
- *   2. fetch the live settings snapshot via PR2 Route B
- *      (`GET /__daemon/settings-snapshot`).
- *   3. project through PR1 `composeSections` and emit a Feishu card.
- *   4. PR3 revision: send the card to the ADMIN'S DM (sendUserMessage), NOT
- *      the topic. Topic only receives a confirmation line (card_dmd idiom).
- *
- * The card builder NEVER receives `senderUnionId` — identity stays inside
- * this closure (plan v3 B5). `invokerOpenId` is the admin open_id itself,
- * which both binds the card to the operator and ensures invoker-lock holds.
+ * The command-level admin gate has already passed. This handler fetches the
+ * live settings snapshot, projects it into a Feishu card, and DMs the invoking
+ * admin. The topic receives only a confirmation line. The card builder never
+ * receives sender union identity; `invokerOpenId` is the admin open_id used by
+ * callback invoker-lock.
  */
 
 import type { LarkMessage } from '../../types.js';
@@ -78,16 +70,14 @@ export async function handleDashboardSettings(
   }
 
   const dto = composeSections(settings as any, { canWrite: true });
-  // PR3 revision: invokerOpenId = adminOpenId (NOT message.senderId). This
-  // doubles as the invoker-lock anchor, so any future click MUST come from
-  // the same admin open_id.
+  // invokerOpenId doubles as the callback invoker-lock anchor.
   const cardJson = buildSettingsCard(dto, {
     invokerOpenId: adminOpenId,
     locale,
     canWrite: true,
   });
 
-  // PR3 revision: DM the card to the bot admin; the topic gets only a
+  // DM the card to the bot admin; the topic gets only a
   // short confirmation. Matches `/card` (cmd.config.card_dmd) idiom.
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {

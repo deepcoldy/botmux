@@ -418,41 +418,19 @@ function cardActionKey(larkAppId: string, data: any): string {
     action: value?.action ?? action?.option ?? action?.tag,
     rootId: value?.root_id,
     sessionId: value?.session_id,
-    // PR3 schedules slice 2a (codex 2026-06-10): pause/resume share action
-    // labels (`dash_schedules_pause` / `dash_schedules_resume`) but apply to
-    // different schedule ids. Without including `scheduleId` here, two rapid
-    // clicks on different schedules' buttons would hash-collide and the
-    // second would be silently dropped. Same rationale as `sessionId` above.
+    // Detail actions can share action labels across rows; include row ids so
+    // rapid clicks on different rows do not collide in the in-flight dedupe key.
     scheduleId: value?.schedule_id,
-    // PR3 workflows slice 2a (codex 2026-06-10): detail/cancel/back share
-    // action labels per verb (`dash_workflows_detail` / `dash_workflows_cancel`)
-    // but apply to different run ids. Same dedupe-collision rationale as
-    // `sessionId` / `scheduleId` above.
     runId: value?.run_id,
     nonce: value?.card_nonce ?? value?.nonce,
     option: action?.option,
     key: value?.key,
-    // PR3 UI revision: settings toggles share `action: dash_settings_toggle`,
-    // so without distinguishing `field` + `next_value` a rapid sequence of
-    // distinct toggle clicks (e.g. flip A then immediately flip B) hashes
-    // to the same in-flight key and the second click would be deduped.
+    // Settings toggles share one action; distinguish the target field/value.
     field: value?.field,
     next_value: value?.next_value,
-    // PR3 sessions slice 1 (codex blocker #2): prev/next pagination share
-    // `action: dash_sessions_page`, only `page` distinguishes them. Without
-    // including `page` here a quick prev→next sequence (e.g. user lands on
-    // page 5 and immediately decides they meant page 4) would be deduped
-    // as "in-flight" and the second click silently dropped.
+    // Pagination actions share one action; distinguish the target page.
     page: value?.page,
-    // PR3 overview drilldown (codex 2026-06-10): `origin` distinguishes
-    // navigation context (overview-drilldown sub-card vs standalone list
-    // card) — the two can target the same module within the dedupe window
-    // (e.g. user has both cards open and clicks page in each), so without
-    // `origin` the second click would hash-collide. `page_size` covers the
-    // future case where a caller overrides the default size — currently
-    // all list cards share PAGE_SIZE=5 globally (2026-06-10 unification)
-    // so this field is typically absent on the wire, but stays in the
-    // dedupe key to keep the invariant when sizes diverge.
+    // Navigation context and page size affect the card that will be rebuilt.
     origin: value?.origin,
     pageSize: value?.page_size,
     // `dashboard_scope` distinguishes the global tool-panel card from a

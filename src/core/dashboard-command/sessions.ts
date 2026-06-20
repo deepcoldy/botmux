@@ -1,19 +1,10 @@
 /**
- * `/dashboard sessions` real sub-handler (PR3 slice 1).
+ * `/dashboard sessions` sub-handler.
  *
- * Pipeline (mirrors `/dashboard settings`):
- *   1. admin gate ran in `handleDashboardCommand` — this function is only
- *      called when the caller IS the per-bot admin (adminOpenId passed in).
- *   2. fetch the live sessions list via PR2 Route B
- *      (`GET /__daemon/sessions-list?scope=global`) — `/dashboard` is the
- *      Bot admin's global tool panel, not a per-bot view.
- *   3. project through PR1 `composeEntries + sortByStatus + paginate` inside
- *      the card builder; emit a Feishu interactive card.
- *   4. send the card to the ADMIN's DM (sendUserMessage), NOT the topic.
- *      Topic only receives a short confirmation line.
- *
- * Slice 1 is read-only: no close/restart/locate buttons. Those need
- * optimistic-state + rollback design which slice 2 will own.
+ * The command-level admin gate has already passed. This handler fetches the
+ * global sessions list, builds the Feishu list card, and DMs the invoking
+ * admin. Per-session actions are handled by card callbacks from the detail
+ * view.
  */
 
 import type { LarkMessage } from '../../types.js';

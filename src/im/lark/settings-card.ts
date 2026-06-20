@@ -1,11 +1,10 @@
 /**
- * Settings card builder + callback handlers (PR3 C4 + revision).
+ * Settings dashboard card.
  *
- * Consumes the PR1 `composeSections` DTO and emits a Feishu interactive card
- * JSON. The handler chain is:
+ * Consumes the settings DTO and emits a Feishu interactive card. The handler
+ * chain is:
  *
- *   1. invoker lock: `action.value.invoker_open_id === operator.open_id`
- *      (plan §7 idiom — only the user who saw the card is allowed to mutate).
+ *   1. invoker lock: `action.value.invoker_open_id === operator.open_id`.
  *   2. per-bot admin gate: `operator.open_id` MUST be one of this bot's
  *      resolved `allowedUsers`, matching `/botconfig`. Each callback is
  *      scoped to the bot that received it; an admin of bot A cannot use
@@ -13,7 +12,7 @@
  *   3. noop short-circuit: `dash_settings_noop` (current-value button in the
  *      segmented control) returns a toast WITHOUT calling the Route B client.
  *      Fail-safe for clients that don't suppress `disabled` callbacks.
- *   4. Sync handler (PR3 UI revision pass 2):
+ *   4. Sync handler:
  *        - await the Route B PUT/GET (resolves the admin's union_id via
  *          `resolveUserUnionId` first, since the server-side write API
  *          still requires `ownerUnionId` in the body),
@@ -25,8 +24,7 @@
  *          card-only avoids that. Errors/permission denials/noop still
  *          return a plain toast (they have no card to render).
  *
- * Write actions are NEVER retried — the C7 client retry policy already
- * disables non-GET retries, and toggling a setting twice is a real-world
+ * Write actions are never retried; toggling a setting twice is a real-world
  * effect.
  *
  * Sender identity (`unionId`) NEVER lands on `action.value`. The only field
@@ -45,11 +43,7 @@ import type { CardActionData } from './card-handler.js';
 export const SETTINGS_ACTION_TOGGLE = 'dash_settings_toggle' as const;
 export const SETTINGS_ACTION_SET_TIME = 'dash_settings_set_time' as const;
 export const SETTINGS_ACTION_REFRESH = 'dash_settings_refresh' as const;
-/**
- * PR3 UI revision (codex C4): segmented control sends a noop for the current
- * value button as a fail-safe — even if a Lark client doesn't respect
- * `disabled: true` and still fires the callback, the handler short-circuits.
- */
+/** Current-value segmented-control buttons send noop as a fail-safe. */
 export const SETTINGS_ACTION_NOOP = 'dash_settings_noop' as const;
 /** Action emitted by "🔙 返回总览" on overview-origin settings cards. Same
  *  string as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't
@@ -64,7 +58,7 @@ const TOGGLE_FIELDS: ReadonlySet<string> = new Set([
   'autoRestart',
 ]);
 
-/** v3 B5: builder opts intentionally exclude any sender identity. */
+/** Builder opts intentionally exclude sender union identity. */
 export interface BuildSettingsCardOpts {
   invokerOpenId: string;
   locale: Locale;
@@ -76,7 +70,7 @@ export interface BuildSettingsCardOpts {
   origin?: 'overview';
 }
 
-/** Build a Feishu interactive card JSON string from the PR1 DTO. */
+/** Build a Feishu interactive card JSON string from the settings DTO. */
 export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardOpts): string {
   const elements: unknown[] = [];
 
@@ -149,8 +143,7 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
   }
   elements.push({ tag: 'action', actions: footerActions });
 
-  // Footer security note (PR3 UI revision) — communicates that the card is
-  // admin-private and ACK-refreshing, so users know clicks self-heal.
+  // Footer security note: the card is admin-private and refreshable.
   elements.push({
     tag: 'note',
     elements: [
@@ -169,7 +162,7 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
 }
 
 /**
- * Build a segmented control row for one toggle (PR3 UI revision):
+ * Build a segmented control row for one toggle:
  *  - Current value button: `type: primary` + `disabled: true` + `✓ 已开启/已关闭`
  *    + carries `dash_settings_noop` action (belt-and-suspenders short-circuit).
  *  - Target value button: `type: default` + clickable + `dash_settings_toggle` action.
@@ -257,9 +250,8 @@ function buildSegmentedRow(
     { tag: 'action', actions: [onBtn, offBtn] },
   ];
 
-  // Per-toggle reason — surfaced ONLY when this specific toggle is disabled.
-  // codex C4: autoRestart's reason cites the autoUpdate dependency; autoUpdate's
-  // reason cites local-dev install. We never fall back to the generic key here.
+  // Surface only this toggle's precise disabled reason; do not fall back to a
+  // generic key that would hide the actionable dependency.
   if (!writable && toggle.state.reasonKey) {
     row.push({
       tag: 'note',
@@ -354,13 +346,10 @@ async function resolveVerifiedOperatorUnionId(
  * Lark card-callback result envelope. event-dispatcher pass-through expects
  * either `{ toast }`, `{ card }`, or both — see `event-dispatcher.ts:390-395`.
  *
- * PR3 UI revision pass 3 (codex A/B, 2026-06-09): the handler awaits the
- * GET/PUT inline. On the SUCCESS path it returns ONLY `{ card }` (no
- * toast). Why card-only:
- *  - Pass 2 returned both `{toast, card}`. Lark's client rendered the toast
- *    (hide spinner, pop toast) and the card replacement as TWO separate
- *    passes; users saw the OLD card state flash for a few frames between
- *    them.
+ * The handler awaits GET/PUT inline. On the success path it returns ONLY
+ * `{ card }` (no toast). Why card-only:
+ *  - Lark's client renders toast and card replacement as two separate passes;
+ *    users briefly see the old card state between them.
  *  - Card-only collapses that to a single pass — the card body itself
  *    (`✓ 已开启` / `✓ 已关闭`) is the feedback signal; users learn the
  *    write succeeded from the new state, not from a toast.
@@ -436,11 +425,9 @@ function errorToast(textKey: string, params: Record<string, string> | undefined,
 /**
  * Build a `{ card }` envelope from a Route B settings response.
  *
- * Per codex 2026-06-09: returning toast + card together makes Lark's client
- * render the toast/spinner-removal and the card-replacement as two separate
- * passes — that's the stale-flash users see between the two passes. Drop
- * the toast and return ONLY the card; the card body itself carries the
- * "✓ 已开启 / ✓ 已关闭" signal so the user knows the write succeeded.
+ * Returning toast + card together makes Lark render spinner removal and card
+ * replacement as separate passes, causing a stale-frame flash. Return only
+ * the card; the new card state is the success signal.
  *
  * If the payload carries no settings (malformed response), fall back to a
  * generic success toast so the user gets *some* feedback. Error paths still
@@ -514,7 +501,7 @@ export async function handleSettingsCardAction(
   const navOrigin: 'overview' | undefined =
     (value as Record<string, unknown>).origin === 'overview' ? 'overview' : undefined;
 
-  // ─── 3) Noop short-circuit (PR3 UI revision, codex C4) ───────────────
+  // ─── 3) Noop short-circuit ───────────────────────────────────────────
   // The current-value button in the segmented control is rendered with
   // `disabled: true` but ALSO carries `dash_settings_noop` as a fail-safe:
   // if any Lark client doesn't suppress disabled callbacks, we just toast

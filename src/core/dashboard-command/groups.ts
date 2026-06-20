@@ -1,14 +1,10 @@
 /**
- * `/dashboard groups` real sub-handler.
+ * `/dashboard groups` sub-handler.
  *
- * Mirrors `/dashboard sessions` slice 1: admin gate has ALREADY run in
- * `handleDashboardCommand`; this function only fetches the matrix from PR2
- * Route B (`GET /__daemon/groups-matrix?scope=global`), builds the card,
- * and DMs the admin with the topic getting a short `dm_sent` confirmation.
- * `/dashboard` is the Bot admin's global tool panel, not a per-bot view.
- *
- * The command entry sends the list card; per-row detail cards carry add-bot,
- * remove-bot, oncall and role actions through card callbacks.
+ * The command-level admin gate has already passed. This handler fetches the
+ * global groups matrix, builds the Feishu list card, and DMs the invoking
+ * admin. Per-row detail cards carry add-bot, leave-bot, oncall, and role
+ * actions through card callbacks.
  */
 
 import type { LarkMessage } from '../../types.js';

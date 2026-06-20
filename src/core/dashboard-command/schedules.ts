@@ -1,12 +1,10 @@
 /**
- * `/dashboard schedules` real sub-handler (PR3 slice 1).
+ * `/dashboard schedules` sub-handler.
  *
- * Mirrors `/dashboard sessions` slice 1: admin gate has ALREADY run in
- * `handleDashboardCommand`; this function only fetches the list from PR2
- * Route B (`GET /__daemon/schedules-list`), builds the card, and DMs the
- * admin with the topic getting a short `dm_sent` confirmation.
- *
- * No CRUD / no run-now / no pause / no resume in slice 1.
+ * The command-level admin gate has already passed. This handler fetches the
+ * global schedules list, builds the Feishu list card, and DMs the invoking
+ * admin. Per-schedule actions are handled by card callbacks from the detail
+ * view.
  */
 
 import type { LarkMessage } from '../../types.js';
@@ -41,10 +39,8 @@ export async function handleDashboardSchedules(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let snap;
   try {
-    // global-schedules slice (2026-06-11): `/dashboard schedules` is part
-    // of the global tool-panel — surface schedules owned by any bot, not
-    // just the caller. `?scope=global` makes the Route B handler skip
-    // `scopeByCaller`; write actions (pause/resume) route to row owner.
+    // `/dashboard` is a global tool panel: show schedules from any bot while
+    // keeping write routing on the row owner.
     snap = await client.request({ method: 'GET', path: '/__daemon/schedules-list?scope=global' });
   } catch (e: any) {
     await deps.sessionReply(
@@ -67,10 +63,8 @@ export async function handleDashboardSchedules(
 
   const tasks = ((snap.body as { schedules?: ReadonlyArray<ScheduleCardTaskInput> })?.schedules) ?? [];
   const nowMs = testDeps.nowMs ? testDeps.nowMs() : Date.now();
-  // Standalone `/dashboard schedules` is the global tool-panel surface
-  // (2026-06-11): `scope: 'global'` threads `dashboard_scope=global` onto
-  // every callback so refresh/page/detail/back/pause/resume keep the
-  // global view and route writes to the row's true owner.
+  // Thread global scope through callbacks so refresh/page/detail/back/actions
+  // keep the global view and route writes to the row's true owner.
   const cardJson = buildSchedulesCard(
     tasks,
     { invokerOpenId: adminOpenId, locale, page: 1, scope: 'global' },
