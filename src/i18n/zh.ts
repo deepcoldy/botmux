@@ -573,7 +573,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.not_implemented_yet': '🚧 `/dashboard schedules` 定时任务卡片尚未实现，将在后续 PR 中上线。',
   'card.dashboard.settings.not_implemented_yet': '🚧 `/dashboard settings` 设置卡片尚未实现，将在后续 PR 中上线。',
   'card.dashboard.help.body':
-    '⚙️ `/dashboard <module>` — 操控本 dashboard。\n\n' +
+    '⚙️ `/dashboard <module>` — 操控全局 Dashboard。\n\n' +
     '可用模块：\n' +
     '• `overview`   — 跨 bot 总览\n' +
     '• `sessions`   — 会话列表 / 详情\n' +
@@ -621,8 +621,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.locate_failed': '⚠️ 定位失败：{reason}',
   'card.dashboard.sessions.resume_failed': '⚠️ 恢复失败：{reason}',
   'card.dashboard.sessions.confirm.resume.title': '确认恢复会话？',
-  'card.dashboard.sessions.confirm.resume.text': '恢复后将重新创建 worker 并继续会话。会话：{title}',
-  'card.dashboard.sessions.terminal.disabled.noPort': '会话尚无 Web Terminal 端口（未启动或已关闭）',
+  'card.dashboard.sessions.confirm.resume.text': '恢复后将重新创建工作进程并继续会话。会话：{title}',
+  'card.dashboard.sessions.terminal.disabled.noPort': '会话尚无 Web 终端端口（未启动或已关闭）',
   'card.dashboard.sessions.resume.disabled.onlyClosed': '仅可恢复已关闭的会话',
 
   // schedules card (PR3 slice 1)
@@ -651,7 +651,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.detail.last_label': '上次：{rel}',
   'card.dashboard.schedules.detail.status_label': '上次结果：{status}',
   'card.dashboard.schedules.detail.repeat_label': '已跑：{repeat}',
-  'card.dashboard.schedules.detail.prompt_label': 'Prompt：{prompt}',
+  'card.dashboard.schedules.detail.prompt_label': '提示词：{prompt}',
   'card.dashboard.schedules.detail.next_runs_header': '即将运行：',
   'card.dashboard.schedules.detail.enabled.active': '🟢 启用',
   'card.dashboard.schedules.detail.enabled.paused': '⚪ 暂停',
@@ -674,7 +674,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.groups.jump_page': '{n}/{total}',
   'card.dashboard.groups.coverage_label': '覆盖 {status}',
   'card.dashboard.groups.joined_ratio': '已加入 {joined}/{total}',
-  'card.dashboard.groups.oncall_label': 'oncall workingDir={workingDir}',
+  'card.dashboard.groups.oncall_label': 'Oncall 工作目录={workingDir}',
   'card.dashboard.groups.unnamed': '(未命名)',
   'card.dashboard.groups.status.in': '已加入',
   'card.dashboard.groups.status.out': '未加入',
@@ -731,7 +731,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.workflows.row_detail': '📂 详情',
   'card.dashboard.workflows.detail.title': '🧩 工作流详情',
   'card.dashboard.workflows.detail.workflow_label': '工作流：{workflowId}',
-  'card.dashboard.workflows.detail.run_label': 'Run：{runId}',
+  'card.dashboard.workflows.detail.run_label': '运行 ID：{runId}',
   'card.dashboard.workflows.detail.status_label': '状态：{status}',
   'card.dashboard.workflows.detail.started_label': '启动：{rel}',
   'card.dashboard.workflows.detail.updated_label': '上次：{rel}',
@@ -742,15 +742,15 @@ export const messages: Record<string, string> = {
   'card.dashboard.workflows.detail.nodes_header': '节点进度：',
   'card.dashboard.workflows.btn.cancel': '⏏ 取消',
   'card.dashboard.workflows.btn.back': '🔙 返回',
-  'card.dashboard.workflows.confirm.cancel.title': '确认取消此 run？',
-  'card.dashboard.workflows.confirm.cancel.text': '取消后该 run 将终止，已有进度可能丢失。Run：{runId}',
-  'card.dashboard.workflows.cancel.disabled.alreadyTerminal': 'run 已处于终态，无法取消',
-  'card.dashboard.workflows.cancel.disabled.noOwner': 'run 缺少 chatBinding，无法从 dashboard 取消',
+  'card.dashboard.workflows.confirm.cancel.title': '确认取消此运行？',
+  'card.dashboard.workflows.confirm.cancel.text': '取消后该运行将终止，已有进度可能丢失。运行 ID：{runId}',
+  'card.dashboard.workflows.cancel.disabled.alreadyTerminal': '运行已处于终态，无法取消',
+  'card.dashboard.workflows.cancel.disabled.noOwner': '运行缺少所属群信息，无法从 Dashboard 取消',
   'card.dashboard.workflows.cancel_failed': '⚠️ 取消失败：{reason}',
-  'card.dashboard.workflows.workflow_not_found': '⚠️ Run 不存在或已被清理。',
+  'card.dashboard.workflows.workflow_not_found': '⚠️ 运行不存在或已被清理。',
 
-  'card.dashboard.settings.dm_sent': '📬 Dashboard settings 卡片已私信给 Bot Owner。',
-  'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送 settings 卡片失败：{reason}',
+  'card.dashboard.settings.dm_sent': '📬 Dashboard 设置卡片已私信给 Bot Owner。',
+  'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送设置卡片失败：{reason}',
 
   // overview card (PR3 slice 1)
   'card.dashboard.overview.title': '⚙️ Dashboard 总览',
@@ -761,13 +761,13 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.settings_section': '⚙️ 设置',
   'card.dashboard.overview.settings_summary': '{publicReadOnlyLabel} · {openTerminalLabel} · {autoUpdateLabel}',
   'card.dashboard.overview.groups_section': '🧑‍🤝‍🧑 群组',
-  'card.dashboard.overview.workflows_section': '🌀 Workflows',
+  'card.dashboard.overview.workflows_section': '🌀 工作流',
   'card.dashboard.overview.refresh': '🔄 刷新',
   'card.dashboard.overview.goto_sessions': '📂 会话列表',
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
   'card.dashboard.overview.goto_groups': '📂 群组',
-  'card.dashboard.overview.goto_workflows': '📂 Workflows',
+  'card.dashboard.overview.goto_workflows': '📂 工作流',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.
@@ -798,7 +798,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.refreshed': '✅ 已刷新',
   'card.dashboard.settings.save_failed': '⚠️ 保存失败：{reason}',
   'card.dashboard.settings.not_invoker': '🔒 此卡片只能由发起者操作。',
-  'card.dashboard.settings.owner_only': '🔒 settings 仅 Bot Owner 可改。',
+  'card.dashboard.settings.owner_only': '🔒 设置仅 Bot Owner 可改。',
   'card.dashboard.settings.invalid_field': '⚠️ 字段不支持修改。',
   'card.dashboard.settings.invalid_value': '⚠️ 取值非法。',
   'card.dashboard.settings.invalid_time': '⚠️ 时间格式必须是 HH:MM。',

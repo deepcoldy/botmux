@@ -209,7 +209,7 @@ describe('handleCardAction → workflows dispatch returns { card } only on succe
     expect(cardJson).toContain('工作流详情');
     // cancelled state → cancel button disabled with alreadyTerminal note.
     expect(cardJson).toContain('"disabled":true');
-    expect(cardJson).toContain('run 已处于终态，无法取消');
+    expect(cardJson).toContain('运行已处于终态，无法取消');
 
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
@@ -248,7 +248,7 @@ describe('handleCardAction → workflows dispatch returns { card } only on succe
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
 
     expect(result.toast).toBeDefined();
-    expect(result.toast?.content).toContain('run 已处于终态，无法取消');
+    expect(result.toast?.content).toContain('运行已处于终态，无法取消');
     expect(result.card).toBeUndefined();
 
     // Defense-in-depth: NO POST was issued.

@@ -306,3 +306,106 @@ describe('PR3 i18n placeholders', () => {
     expect(en).toContain('foo');
   });
 });
+
+describe('PR3 zh dashboard copy sanity', () => {
+  it('overview workflow entry uses Chinese module labels', () => {
+    expect(zhMessages['card.dashboard.overview.workflows_section']).toBe('🌀 工作流');
+    expect(zhMessages['card.dashboard.overview.goto_workflows']).toBe('📂 工作流');
+  });
+
+  it('zh dashboard dictionary does not expose English module names in UI labels', () => {
+    const allowedEnglish = [
+      // Product / permission terms kept as-is in the Chinese UI.
+      'Dashboard',
+      'Bot Owner',
+      'CLI',
+      'Web',
+      'ACK',
+      'Oncall',
+      'Role',
+      'HH:MM',
+      // Command syntax marker users may type; command words are stripped
+      // only when they appear in explicit `/dashboard ...` snippets below.
+      '/dashboard',
+      'beta',
+    ];
+    const allowedPlaceholders = new Set([
+      'active',
+      'autoUpdateLabel',
+      'bot',
+      'chat',
+      'closed',
+      'dir',
+      'done',
+      'enabled',
+      'errors',
+      'expr',
+      'failed',
+      'idle',
+      'joined',
+      'kind',
+      'module',
+      'name',
+      'n',
+      'openTerminalLabel',
+      'page',
+      'paused',
+      'prompt',
+      'publicReadOnlyLabel',
+      'reason',
+      'rel',
+      'repeat',
+      'running',
+      'scheduleId',
+      'status',
+      'time',
+      'title',
+      'total',
+      'totalPages',
+      'workflowId',
+      'workingDir',
+      'runId',
+    ]);
+    const forbiddenWords = new Set([
+      'Workflows',
+      'Workflow',
+      'Sessions',
+      'Session',
+      'Schedules',
+      'Schedule',
+      'Groups',
+      'Group',
+      'Settings',
+      'settings',
+      'workingDir',
+      'chatBinding',
+    ]);
+    const commandWords = [
+      'overview',
+      'sessions',
+      'schedules',
+      'settings',
+      'groups',
+      'workflows',
+      'help',
+    ];
+
+    for (const [key, value] of Object.entries(zhMessages)) {
+      if (!key.startsWith('card.dashboard.')) continue;
+      let scrubbed = value;
+      scrubbed = scrubbed.replace(/`\/dashboard(?:\s+[a-z]+)?`/g, '');
+      for (const word of commandWords) {
+        scrubbed = scrubbed.replaceAll(`\`${word}\``, '');
+      }
+      for (const word of allowedEnglish) {
+        scrubbed = scrubbed.replaceAll(word, '');
+      }
+      scrubbed = scrubbed.replace(/\{([A-Za-z][A-Za-z0-9_]*)\}/g, (match, name) => (
+        allowedPlaceholders.has(name) ? '' : match
+      ));
+      for (const word of forbiddenWords) {
+        expect(scrubbed, `${key} should not expose ${word} in zh copy: ${value}`).not.toContain(word);
+      }
+    }
+  });
+});

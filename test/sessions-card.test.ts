@@ -544,7 +544,7 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
       const terminalBtn = (actionRow.actions as any[])[1];
       expect(terminalBtn.disabled).toBe(true);
       expect(terminalBtn.multi_url).toBeUndefined();
-      expect(json).toContain('Web Terminal 端口');
+      expect(json).toContain('Web 终端端口');
     });
 
     it('terminal: has webPort → button has multi_url, NOT disabled', () => {
@@ -1127,7 +1127,7 @@ describe('handleSessionsCardAction', () => {
       // Codex 2026-06-11 blocker #1: terminal must be disabled and have no
       // multi_url on the closed synth (port cleared, status gate fires).
       expect(cardJson).not.toContain('multi_url');
-      expect(cardJson).toContain('Web Terminal 端口');
+      expect(cardJson).toContain('Web 终端端口');
     });
 
     it('POST 404 → toast close_failed, NO card (state preserved)', async () => {

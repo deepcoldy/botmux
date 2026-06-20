@@ -19,6 +19,8 @@ import {
   OVERVIEW_ACTION_GOTO_SESSIONS,
   OVERVIEW_ACTION_GOTO_SCHEDULES,
   OVERVIEW_ACTION_GOTO_SETTINGS,
+  OVERVIEW_ACTION_GOTO_GROUPS,
+  OVERVIEW_ACTION_GOTO_WORKFLOWS,
 } from '../src/im/lark/overview-card.js';
 
 const INVOKER = 'ou_owner';
@@ -120,6 +122,35 @@ describe('buildOverviewCard', () => {
     expect(json).toContain('终端在飞书内打开');
   });
 
+  it('zh overview localizes all module sections and folder buttons', () => {
+    const json = buildOverviewCard(
+      { sessions: [], schedules: [], settings: makeSettings() },
+      baseOpts,
+    );
+    const parsed = JSON.parse(json);
+    const visible = JSON.stringify(parsed);
+    expect(visible).toContain('🖥️ 会话');
+    expect(visible).toContain('📂 会话列表');
+    expect(visible).toContain('⏰ 定时任务');
+    expect(visible).toContain('📂 定时任务');
+    expect(visible).toContain('⚙️ 设置');
+    expect(visible).toContain('📂 设置');
+    expect(visible).toContain('🧑‍🤝‍🧑 群组');
+    expect(visible).toContain('📂 群组');
+    expect(visible).toContain('🌀 工作流');
+    expect(visible).toContain('📂 工作流');
+    expect(visible).not.toContain('Workflows');
+  });
+
+  it('en overview keeps workflows labels in English', () => {
+    const json = buildOverviewCard(
+      { sessions: [], schedules: [], settings: makeSettings() },
+      { invokerOpenId: INVOKER, locale: 'en' as const },
+    );
+    expect(json).toContain('🌀 Workflows');
+    expect(json).toContain('📂 Workflows');
+  });
+
   // codex 2026-06-09 blocker: a paused task with lastStatus='error' must
   // also count toward `上次错误`. Otherwise overview under-reports while the
   // schedules list-card still draws ⚠️ on the same paused row — that
@@ -208,11 +239,13 @@ describe('buildOverviewCard', () => {
     expect(json).not.toContain('"owner_id"');
     // Only `invoker_open_id`, never raw `open_id`.
     expect(json).not.toContain('"open_id"');
-    // All four named actions appear in the rendered JSON.
+    // All overview navigation actions appear in the rendered JSON.
     expect(json).toContain(OVERVIEW_ACTION_REFRESH);
     expect(json).toContain(OVERVIEW_ACTION_GOTO_SESSIONS);
     expect(json).toContain(OVERVIEW_ACTION_GOTO_SCHEDULES);
     expect(json).toContain(OVERVIEW_ACTION_GOTO_SETTINGS);
+    expect(json).toContain(OVERVIEW_ACTION_GOTO_GROUPS);
+    expect(json).toContain(OVERVIEW_ACTION_GOTO_WORKFLOWS);
   });
 });
 

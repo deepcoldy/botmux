@@ -622,7 +622,7 @@ describe('buildWorkflowsDetailCard (slice 2a)', () => {
       );
       expect(cancel.disabled).toBe(true);
       // Inline reason note rendered (already-terminal message string from i18n)
-      expect(json).toContain('run 已处于终态，无法取消');
+      expect(json).toContain('运行已处于终态，无法取消');
     },
   );
 
@@ -780,7 +780,7 @@ describe('handleWorkflowsCardAction — dash_workflows_detail', () => {
       LARK_APP_ID,
       deps,
     );
-    expect(r.toast?.content).toContain('Run 不存在');
+    expect(r.toast?.content).toContain('运行不存在');
     expect(r.card).toBeUndefined();
   });
 
@@ -908,7 +908,7 @@ describe('handleWorkflowsCardAction — dash_workflows_cancel', () => {
     // Detail rendered with cancelled status → cancel button disabled.
     expect(cardJson).toContain('工作流详情');
     expect(cardJson).toContain('"disabled":true');
-    expect(cardJson).toContain('run 已处于终态，无法取消');
+    expect(cardJson).toContain('运行已处于终态，无法取消');
   });
 
   it('2nd GET cannot find runId (vanished) → falls back to synth {...before, status: cancelled}', async () => {
@@ -931,7 +931,7 @@ describe('handleWorkflowsCardAction — dash_workflows_cancel', () => {
     // Synth fallback renders cancelled state.
     expect(cardJson).toContain('工作流详情');
     expect(cardJson).toContain('"disabled":true');
-    expect(cardJson).toContain('run 已处于终态，无法取消');
+    expect(cardJson).toContain('运行已处于终态，无法取消');
   });
 
   it('inline comment in impl flags the stale-render risk of the synth fallback', () => {
@@ -956,7 +956,7 @@ describe('handleWorkflowsCardAction — dash_workflows_cancel', () => {
       LARK_APP_ID,
       deps,
     );
-    expect(r.toast?.content).toContain('run 已处于终态，无法取消');
+    expect(r.toast?.content).toContain('运行已处于终态，无法取消');
     expect(r.card).toBeUndefined();
     const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
     expect(postCalls.length).toBe(0);
@@ -975,7 +975,7 @@ describe('handleWorkflowsCardAction — dash_workflows_cancel', () => {
       LARK_APP_ID,
       deps,
     );
-    expect(r.toast?.content).toContain('run 缺少 chatBinding');
+    expect(r.toast?.content).toContain('运行缺少所属群信息');
     expect(r.card).toBeUndefined();
     const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
     expect(postCalls.length).toBe(0);
@@ -1097,7 +1097,7 @@ describe('handleWorkflowsCardAction — dash_workflows_cancel', () => {
       LARK_APP_ID,
       deps,
     );
-    expect(r.toast?.content).toContain('Run 不存在');
+    expect(r.toast?.content).toContain('运行不存在');
     expect(r.card).toBeUndefined();
     const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
     expect(postCalls.length).toBe(0);
