@@ -108,44 +108,34 @@ jobs:
           fi
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
 
-          # '本次合并'只列 PR 标题（合并/squash commit subject 形如 "xxx (#123)"），
-          # 不把 PR 内部的逐条 commit 全倒进 changelog——那会让区间含整条分支时长到吓人，
-          # 而且手写的 tag message 已经讲清本次发了什么。直接走 git log 过滤 (#N)，
-          # 不再用 git-cliff（它按区间内每个 tag 重复堆叠'本次合并'段、且翻全仓做 PR 关联
-          # 偶发触发 GitHub 二级限流 401）。
-          PRLIST=$(git log --no-merges --reverse --pretty='- %s' "${PREV_TAG}..${GITHUB_REF_NAME}" | grep -E '\(#[0-9]+\)' || true)
-          if [ -n "$PRLIST" ]; then
-            CLIFF=$(printf -- '---\n\n## 本次合并（PR）\n%s' "$PRLIST")
-          else
-            CLIFF=""
-          fi
-
-          # '感谢贡献者'独立用 gh 按区间内每个 commit 反查所属 PR 作者：有界调用（约等于区间 commit 数），
-          # 不翻全仓、不会触发上面那种限流；去重并排除仓库 owner。不再依赖 git-cliff 的
-          # github.contributors —— 那个只收录'首次贡献者'，会漏掉之前贡献过的人。
-          THANKS=""
-          declare -A SEEN
+          # 区间内每个非 merge commit → 反查所属 PR（gh api，有界：约等于区间 commit 数，
+          # 不翻全仓、不触发 git-cliff 那种二级限流 401）。squash 与 merge-commit 两种合并
+          # 都覆盖：squash 时区间含该 commit；merge-commit（"Merge pull request #N"）时区间
+          # 含其子 commit，子 commit 的 /pulls 仍指向同一 PR——靠 PR number 在 node 侧去重。
+          # （旧逻辑只 grep "(#N)" squash subject，merge-commit 的 PR 整条隐身，是真 bug。）
+          # 无关联 PR 的直推 commit 回退用自身 subject。结果 TSV 交给 changelog-sections.mjs
+          # 按约定式 `type(scope):` 前缀分桶成 ✨新功能/🐛修复/… 段落 + 去重的贡献者名单。
+          # 单次遍历同时兼顾 PR 列表与致谢，gh 调用量与旧版致谢循环持平。
+          RAW=$(mktemp)
           for sha in $(git rev-list --no-merges --reverse "${PREV_TAG}..${GITHUB_REF_NAME}"); do
-            for login in $(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" --jq '.[].user.login' 2>/dev/null); do
-              if [ "$login" != "${GITHUB_REPOSITORY_OWNER}" ] && [ -z "${SEEN[$login]:-}" ]; then
-                SEEN[$login]=1
-                THANKS="$THANKS @$login"
-              fi
-            done
+            PULLS=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" \
+              --jq '.[] | [.number, .title, .user.login] | @tsv' 2>/dev/null || true)
+            if [ -n "$PULLS" ]; then
+              printf '%s\n' "$PULLS" | while IFS=$'\t' read -r num title login; do
+                printf 'pr\t%s\t%s\t%s\n' "$num" "$title" "$login"
+              done >> "$RAW"
+            else
+              printf 'commit\t%s\t%s\t\n' "${sha:0:7}" "$(git log -1 --pretty=%s "$sha")" >> "$RAW"
+            fi
           done
-          THANKS="${THANKS# }"
+          SECTIONS=$(node .github/scripts/changelog-sections.mjs < "$RAW")
 
           {
             echo 'body<<CHANGELOG_EOF'
-            # TAG_MSG 后必须空一行再接 CLIFF：CLIFF 以 '---' 开头，紧贴正文末行会被
-            # markdown 当成 setext 标题（末行变 H2），空行后才渲染成分隔线。
+            # TAG_MSG 后必须空一行再接自动段落：分隔线 '---' 紧贴正文末行会被 markdown
+            # 当成 setext 标题（末行变 H2），空行后才渲染成分隔线。
             if [ -n "$TAG_MSG" ]; then echo "$TAG_MSG"; echo ""; fi
-            [ -n "$CLIFF" ] && echo "$CLIFF"
-            if [ -n "$THANKS" ]; then
-              echo ""
-              echo "## 感谢贡献者"
-              echo "$THANKS"
-            fi
+            if [ -n "$SECTIONS" ]; then echo "---"; echo ""; echo "$SECTIONS"; fi
             echo ""
             echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo 'CHANGELOG_EOF'

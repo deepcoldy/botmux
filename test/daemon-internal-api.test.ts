@@ -1047,10 +1047,10 @@ describe('dispatch: workflows write — cross-bot owner gate regression (proxy +
   }
 });
 
-/** ─── SCHEDULES write × 3 ───────────────────────────────────────── */
+/** ─── SCHEDULES write × 4 ───────────────────────────────────────── */
 
 describe('dispatch: schedules write', () => {
-  it.each(['run', 'pause', 'resume'] as const)('POST /schedules/:id/%s happy', async (action) => {
+  it.each(['run', 'pause', 'resume', 'delivery'] as const)('POST /schedules/:id/%s happy', async (action) => {
     const deps = makeDeps();
     const api = createDaemonInternalApi(deps);
     const r = await api.dispatchForTest('POST', url(`/__daemon/schedules/sched-known/${action}`));
@@ -1077,9 +1077,9 @@ describe('dispatch: schedules write', () => {
  *  refuse with 403 schedule_owner_mismatch and NEVER touch
  *  `proxyToDaemon`. The test seam (no callerAppId) keeps the historical
  *  pass-through for `dispatchForTest`.
- *  The Route B gate covers all three verbs (run|pause|resume) — the UI
- *  only exposes pause/resume in slice 2a, but the underlying route table
- *  shares one handler, so run is tested for completeness. */
+ *  The Route B gate covers all four verbs (run|pause|resume|delivery) — the
+ *  UI exposes pause/resume/delivery in slices 2a/2b, but the underlying route
+ *  table shares one handler, so run is tested for completeness. */
 describe('dispatch: schedules write — cross-bot owner gate', () => {
   function ownerMismatchDeps() {
     return makeDeps({
@@ -1089,7 +1089,7 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
     });
   }
 
-  for (const action of ['pause', 'resume', 'run'] as const) {
+  for (const action of ['pause', 'resume', 'run', 'delivery'] as const) {
     it(`callerAppId=cli_a + owner=cli_b → 403 schedule_owner_mismatch, proxyToDaemon NOT called (${action})`, async () => {
       const deps = ownerMismatchDeps();
       const api = createDaemonInternalApi(deps);
@@ -1145,7 +1145,7 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
       });
     }
 
-    for (const action of ['pause', 'resume'] as const) {
+    for (const action of ['pause', 'resume', 'delivery'] as const) {
       it(`legacy row + callerAppId=cli_caller → proxy to caller (${action})`, async () => {
         const deps = legacyDeps();
         const api = createDaemonInternalApi(deps);
@@ -1198,7 +1198,7 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
       });
     }
 
-    for (const action of ['pause', 'resume', 'run'] as const) {
+    for (const action of ['pause', 'resume', 'run', 'delivery'] as const) {
       it(`?scope=global + callerAppId=cli_a + owner=cli_b → proxy to OWNER (cli_b), NOT 403 (${action})`, async () => {
         const deps = ownedDeps();
         const api = createDaemonInternalApi(deps);

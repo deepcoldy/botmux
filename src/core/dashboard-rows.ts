@@ -11,6 +11,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
+import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -32,6 +33,10 @@ export interface SessionRow {
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
   title?: string;
+  /** 看板视图的手动放置（列 id / 列内排序位置），用户拖拽后持久化在 Session 上。
+   *  未设置时前端按运行状态推导默认列。 */
+  kanbanColumn?: string;
+  kanbanPosition?: number;
   ownerOpenId?: string;
   webPort: number | null;
   /** Owning daemon's advertised reverse-proxy port — WEB_EXTERNAL_PORT + botIndex
@@ -48,6 +53,14 @@ export interface SessionRow {
   /** A TUI prompt card is open and waiting for the user's choice.
    *  Feeds the board view's needs-you column. */
   tuiPromptActive?: boolean;
+  /** The agent raised a hand (`botmux send --attention`) — it hit a blocker
+   *  needing human intervention. Carries the human-readable reason so the
+   *  board/overview can show *why* at a glance, plus `at` (epoch ms when it
+   *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
+   *  which a silent raise never bumps. Feeds the needs-you column. */
+  agentAttention?: { kind: string; reason: string; at: number };
+  /** Native Agent CLI token usage for this session. Null means unavailable. */
+  tokenUsage?: SessionTokenUsage | null;
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -72,6 +85,15 @@ export function sessionLastActivityAtMs(s: Session): number {
   return parseSessionTime(s.lastMessageAt) ?? sessionCreatedAtMs(s);
 }
 
+function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage | null {
+  return getSessionTokenUsage({
+    cliId: s.cliId ?? 'unknown',
+    sessionId: s.sessionId,
+    cliSessionId: s.cliSessionId,
+    cwd: workingDir ?? s.workingDir,
+  });
+}
+
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
   return {
     sessionId: ds.session.sessionId,
@@ -87,6 +109,8 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     rootMessageId: ds.session.rootMessageId,
     scope: ds.session.scope,
     title: ds.session.title,
+    kanbanColumn: ds.session.kanbanColumn,
+    kanbanPosition: ds.session.kanbanPosition,
     // Read from the persisted Session — single source of truth.
     // ds.ownerOpenId is a parallel in-memory copy that gets cleared on
     // restoreActiveSessions (which builds a fresh DaemonSession from disk
@@ -100,6 +124,10 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     feishuChatLink: feishuChatLink(ds.chatId, getBotBrand(ds.larkAppId)),
     pendingRepo: !!ds.pendingRepo,
     tuiPromptActive: !!ds.tuiPromptCardId,
+    agentAttention: ds.agentAttention
+      ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+      : undefined,
+    tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
   };
 }
 
@@ -119,8 +147,11 @@ export function composeRowFromClosed(s: Session): SessionRow {
     rootMessageId: s.rootMessageId,
     scope: s.scope,
     title: s.title,
+    kanbanColumn: s.kanbanColumn,
+    kanbanPosition: s.kanbanPosition,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
     feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
+    tokenUsage: sessionTokenUsage(s),
   };
 }

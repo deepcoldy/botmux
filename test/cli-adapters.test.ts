@@ -24,21 +24,25 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
-import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
+import { createMirAdapter } from '../src/adapters/cli/mir.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'pi', 'copilot'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -57,7 +61,7 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    if (id === 'codex-app' || id === 'mira') expect(adapter.resolvedBin).toBe(process.execPath);
+    if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -70,11 +74,12 @@ describe('createCliAdapterSync factory', () => {
 // ---------------------------------------------------------------------------
 
 describe('lazy binary resolution', () => {
-  // Adapters whose resolvedBin is the resolved CLI (codex-app/mira use
-  // process.execPath and never probe, so they're excluded).
-  const PROBING_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'copilot'];
+  // Direct CLI adapters resolve their actual executable lazily. Runner-backed
+  // adapters (codex-app/mira) intentionally use process.execPath and are covered
+  // by their own buildArgs tests below.
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot'];
 
-  it.each(PROBING_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
+  it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
     const probe = vi.mocked(spawnSync);
     probe.mockClear();
@@ -94,6 +99,19 @@ describe('lazy binary resolution', () => {
     void adapter.resolvedBin; // resolve + cache
     probe.mockClear();
     void adapter.resolvedBin; // cached → no probe
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('codex buildArgs reuses the lazily resolved CLI path', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const probe = vi.mocked(spawnSync);
+    probe.mockClear();
+    const adapter = createCliAdapterSync('codex');
+    expect(probe).not.toHaveBeenCalled();
+    void adapter.resolvedBin;
+    expect(probe).toHaveBeenCalled();
+    probe.mockClear();
+    adapter.buildArgs({ sessionId: 's', resume: false });
     expect(probe).not.toHaveBeenCalled();
   });
 
@@ -138,11 +156,14 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
-  it('omits dangerous permission flags/settings when disableCliBypass is true', () => {
+  it('omits dangerous permission flags/keys AND --settings entirely when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');
-    expect(args).not.toContain('--settings');
     expect(args).toContain('--disallowed-tools');
+    // SessionStart 就绪 hook 改走全局 settings.json（见 hookInstall.sessionStartCommand），
+    // 不再注入进程级 --settings；bypass 键也没有 → 没东西可传 → 干脆不带 --settings。
+    expect(args).not.toContain('--settings');
+    expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
   it('ignores initialPrompt (not passed via args)', () => {
@@ -247,7 +268,32 @@ describe('coco buildArgs', () => {
 describe('codex buildArgs', () => {
   const adapter = createCodexAdapter('/usr/bin/codex');
 
-  it('always returns fixed args regardless of session/resume', () => {
+  it('spawns the Codex binary directly', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(adapter.resolvedBin).toBe('/usr/bin/codex');
+    expect(args[0]).toBe('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).not.toContain('--codex-bin');
+  });
+
+  it('injects botmux session id through Codex shell environment policy', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    const idx = args.indexOf('-c');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
+  });
+
+  it('does not inject a stale turn id into Codex shell environment policy', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(args.join('\n')).not.toContain('BOTMUX_TURN_ID');
+  });
+
+  it('keeps Codex home untouched', () => {
+    expect(adapter.buildSpawnEnv).toBeUndefined();
+    expect(adapter.authPaths).toEqual(['~/.codex/auth.json']);
+    expect(adapter.skillsDir).toBe('~/.codex/skills');
+  });
+
+  it('passes fixed Codex args regardless of session/resume when no resume target is known', () => {
     const args1 = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     const args2 = adapter.buildArgs({ sessionId: 'sess-4', resume: true });
     expect(args1).toEqual(args2);
@@ -255,9 +301,10 @@ describe('codex buildArgs', () => {
     expect(args1).toContain('--no-alt-screen');
   });
 
-  it('does not include session id', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
-    expect(args).not.toContain('sess-4');
+  it('TOML-quotes session id values for Codex config override', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess with "quote"', resume: false });
+    const idx = args.indexOf('-c');
+    expect(args[idx + 1]).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess with \\"quote\\""');
   });
 
   it('passes the effective working directory as Codex agent root', () => {
@@ -265,6 +312,8 @@ describe('codex buildArgs', () => {
     expect(args).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-C',
       '/repo/root',
     ]);
@@ -272,7 +321,13 @@ describe('codex buildArgs', () => {
 
   it('omits approval/sandbox bypass flag when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
-    expect(args).toEqual(['--no-alt-screen', '-C', '/repo/root']);
+    expect(args).toEqual([
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-C',
+      '/repo/root',
+    ]);
   });
 
   it('passes configured model with --model', () => {
@@ -341,6 +396,62 @@ describe('mira buildArgs', () => {
   });
 });
 
+describe('mir buildArgs (runner model)', () => {
+  const adapter = createMirAdapter();
+
+  it('spawns the mir-runner via node with --session-id', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-mir', resume: false });
+    expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(args[0]).toMatch(/mir-runner\.js$/);
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-mir');
+  });
+
+  it('forwards bot identity + locale to the runner', () => {
+    const args = adapter.buildArgs({
+      sessionId: 's', resume: false, botName: 'Mir', botOpenId: 'ou_x', locale: 'zh',
+    });
+    expect(args).toContain('--bot-name');
+    expect(args).toContain('Mir');
+    expect(args).toContain('--bot-open-id');
+    expect(args).toContain('ou_x');
+    expect(args).toContain('--locale');
+    expect(args).toContain('zh');
+  });
+
+  it('ignores model (mircli model is a global file, not a flag)', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'opus4.6' });
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('opus4.6');
+  });
+
+  it('passes a cliPathOverride to the runner via --mircli-bin (absolute kept as-is)', () => {
+    const overridden = createMirAdapter('/opt/mircli/bin/mircli');
+    const args = overridden.buildArgs({ sessionId: 's', resume: false });
+    const idx = args.indexOf('--mircli-bin');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('/opt/mircli/bin/mircli');
+  });
+
+  it('omits --mircli-bin when no cliPathOverride is configured', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    expect(args).not.toContain('--mircli-bin');
+  });
+
+  it('has no portable copy-paste resume command (mircli owns the session store)', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-mir', cliSessionId: 'conv-abc' })).toBeNull();
+  });
+
+  it('readyPattern matches the runner prompt indicator', () => {
+    expect(adapter.readyPattern?.test('› ')).toBe(true);
+  });
+
+  it('injectsSessionContext (runner injects its own context) + empty systemHints', () => {
+    expect(adapter.injectsSessionContext).toBe(true);
+    expect(adapter.systemHints).toEqual([]);
+  });
+});
+
 describe('copilot buildArgs', () => {
   const adapter = createCopilotAdapter('/usr/bin/copilot');
 
@@ -385,6 +496,38 @@ describe('copilot buildArgs', () => {
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('claude-sonnet-4');
     expect(adapter.modelChoices).toContain('gpt-5');
+  });
+});
+
+describe('cursor buildArgs', () => {
+  const adapter = createCursorAdapter('/usr/bin/cursor-agent');
+
+  it('fresh session passes force/model flags without resume flags', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    expect(args).toContain('--force');
+    expect(args).toContain('--model');
+    expect(args).toContain('gpt-5');
+    expect(args).not.toContain('--resume');
+    expect(args).not.toContain('--continue');
+  });
+
+  it('resume with persisted Cursor chatId passes --resume <chatId>', () => {
+    const chatId = 'c8c78608-0eef-4930-8007-c41ba71ba05d';
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: true,
+      resumeSessionId: chatId,
+    });
+    expect(args).toContain('--resume');
+    const idx = args.indexOf('--resume');
+    expect(args[idx + 1]).toBe(chatId);
+    expect(args).not.toContain('--continue');
+  });
+
+  it('resume without a persisted chatId falls back to --continue', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: true });
+    expect(args).toContain('--continue');
+    expect(args).not.toContain('--resume');
   });
 });
 
@@ -463,16 +606,69 @@ describe('opencode buildArgs', () => {
 describe('pi buildArgs', () => {
   const adapter = createPiAdapter('/usr/bin/pi');
 
-  it('launches Pi native TUI with session id and tools', () => {
+  it('launches Pi native TUI with session id, no --tools restriction (keeps MCP usable)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false, initialPrompt: 'hello pi' });
     expect(adapter.resolvedBin).toBe('/usr/bin/pi');
     expect(args).toContain('--session-id');
     expect(args[args.indexOf('--session-id') + 1]).toBe('sess-pi');
-    expect(args).toContain('--tools');
-    expect(args[args.indexOf('--tools') + 1]).toBe('read,bash,edit,write,grep,find,ls');
+    // Pi must NOT receive a --tools allowlist: pinning the built-in tools shadows
+    // MCP tools. Let Pi use its default tool set so MCP servers stay usable.
+    expect(args).not.toContain('--tools');
     expect(args.at(-1)).toBe('hello pi');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
     expect(adapter.altScreen).toBe(true);
+  });
+});
+
+describe('oh-my-pi buildArgs', () => {
+  const adapter = createOhMyPiAdapter('/usr/bin/omp');
+
+  it('launches omp TUI with tools, approval-mode, and no-title', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, initialPrompt: 'hello omp' });
+    expect(adapter.resolvedBin).toBe('/usr/bin/omp');
+    expect(args).toContain('--tools');
+    expect(args).toContain('read,bash,edit,write,browser,web_search,ast_grep,ast_edit,lsp,debug,find,eval,search,task,ask');
+    expect(args).toContain('--approval-mode');
+    expect(args[args.indexOf('--approval-mode') + 1]).toBe('yolo');
+    expect(args).toContain('--no-title');
+    expect(args.at(-1)).toBe('hello omp');
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.altScreen).toBe(true);
+  });
+
+  it('does not include --session-id (oh-my-pi has none)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false });
+    expect(args).not.toContain('--session-id');
+    expect(args).not.toContain('sess-omp');
+  });
+
+  it('omits --approval-mode yolo when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--approval-mode');
+    expect(args).not.toContain('yolo');
+    expect(args).toContain('--no-title');
+  });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, model: 'opus' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('opus');
+  });
+
+  it('passes working directory with --cwd', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, workingDir: '/repo/root' });
+    const idx = args.indexOf('--cwd');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('/repo/root');
+  });
+
+  it('skillsDir points to ~/.omp/agent/skills', () => {
+    expect(adapter.skillsDir).toBe('~/.omp/agent/skills');
+  });
+
+  it('has no modelChoices (setup skips model prompt)', () => {
+    expect(adapter.modelChoices).toBeUndefined();
   });
 });
 
@@ -678,6 +874,21 @@ describe('completionPattern', () => {
     expect(createHermesAdapter('/bin/hermes').completionPattern).toBeUndefined();
   });
 
+  it('hermes readyPattern matches the ❯ prompt symbol', () => {
+    // Hermes TUI's prompt_symbol is "❯" (see skin_engine.py: prompt_symbol).
+    // We match it so the IdleDetector can fire idle as soon as the input box
+    // appears, instead of waiting 2s quiescence + 3s spinner-guard. Mirrors
+    // claude-code.ts:840 which also uses /❯/. This regression test guards
+    // against someone "tidying" the field back to undefined.
+    const p = createHermesAdapter('/bin/hermes').readyPattern;
+    expect(p).toBeInstanceOf(RegExp);
+    expect(p!.test('…spinner ⟪⚔ ▲✢\n\n  ❯ ')).toBe(true);
+    // Must not false-positive on common decorative characters used elsewhere
+    // in the TUI.
+    expect(p!.test('┊ 🌐 preparing browser_navigate…')).toBe(false);
+    expect(p!.test('·')).toBe(false);
+  });
+
   it('pi has no completionPattern', () => {
     expect(createPiAdapter('/bin/pi').completionPattern).toBeUndefined();
   });
@@ -707,6 +918,15 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern).toBeDefined();
     expect(adapter.readyPattern!.test('›')).toBe(true);
     expect(adapter.readyPattern!.test('97% left')).toBe(true);
+  });
+
+  it('traex matches prompt and context indicators', () => {
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('›')).toBe(true);
+    expect(adapter.readyPattern!.test('❯ Run /review on my current changes')).toBe(true);
+    expect(adapter.readyPattern!.test('GPT-5.5 · Context 100% left')).toBe(true);
+    expect(adapter.readyPattern!.test('❯ 1. Continue into TRAE CLI')).toBe(false);
   });
 
   it('codex-app matches runner prompt indicator', () => {
@@ -741,8 +961,17 @@ describe('readyPattern', () => {
     expect(createMtrAdapter('/bin/mtr').readyPattern).toBeUndefined();
   });
 
-  it('hermes has no readyPattern', () => {
-    expect(createHermesAdapter('/bin/hermes').readyPattern).toBeUndefined();
+  it('hermes readyPattern is set (Hermes TUI exposes ❯ as the prompt symbol)', () => {
+    // Previously undefined — that forced every Hermes turn to wait the full
+    // 2s quiescence + 3s spinner-guard cycle before botmux could deliver the
+    // next user message, which compounded across parallel sessions to 2-3
+    // minute delays. Setting readyPattern to /❯/ brings Hermes in line with
+    // claude-code/codex-app and recovers the same prompt-detection path they
+    // already use. The "matches ❯" assertion lives in the dedicated test
+    // below; this one is a coarse regression guard so the field cannot be
+    // silently cleared back to undefined.
+    const p = createHermesAdapter('/bin/hermes').readyPattern;
+    expect(p).toBeInstanceOf(RegExp);
   });
 
   it('pi has no readyPattern', () => {
@@ -963,6 +1192,12 @@ describe('buildResumeCommand', () => {
     const a = createPiAdapter('/bin/pi');
     expect(a.buildResumeCommand?.({ sessionId: 'bm-pi', cliSessionId: 'ignored' }))
       .toBe('pi --session-id bm-pi');
+  });
+
+  it('oh-my-pi emits `omp --continue` (best-effort, ignores sessionId)', () => {
+    const a = createOhMyPiAdapter('/bin/omp');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-omp', cliSessionId: 'ignored' }))
+      .toBe('omp --continue');
   });
 
   it('copilot emits `copilot --resume <cliSessionId>` when known, null otherwise', () => {

@@ -2,9 +2,12 @@ import { existsSync, statSync, openSync, readSync, closeSync, readFileSync, read
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
+import { sessionReadyHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
-import { t } from '../../i18n/index.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { delay, scaleMs } from '../../utils/timing.js';
+import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -78,10 +81,10 @@ function deltaHasSubmit(path: string, fromByte: number): boolean {
 }
 
 async function waitForSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     if (deltaHasSubmit(path, baseByte)) return true;
-    await new Promise(r => setTimeout(r, 100));
+    await delay(100);
   }
   return false;
 }
@@ -409,11 +412,14 @@ export interface ClaudeFamilyVariant {
    *  aliases; forks whose model set is gateway-defined
    *  pass undefined so setup skips the prompt. */
   readonly modelChoices?: readonly string[];
+  /** Auth/login paths kept real+writable in the file sandbox (see CliAdapter.authPaths). */
+  readonly authPaths?: readonly string[];
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   return createClaudeFamilyAdapter({
     id: 'claude-code',
+    authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
@@ -435,6 +441,39 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     claudeDataDir: variant.dataDir,
     claudeStateJsonPath: variant.stateJsonPath,
     spawnEnv: variant.spawnEnv,
+    authPaths: variant.authPaths,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
+
+    /** Prove the resume JSONL exists (or at least the project dir does, so the
+     *  sessionId lookup will find it). Conservative: only returns true when we
+     *  can stat the exact file; false when the file is provably absent;
+     *  undefined on any weirdness (caller will still try the spawn and rely on
+     *  the secondary guard).
+     *
+     *  The `dataDir` parameter carries the EFFECTIVE data root, i.e. after any
+     *  sandbox overlay redirection — the worker mirrors the same calculation
+     *  into `(backend).claudeJsonlPath = claudeJsonlPathForSession(...)` so
+     *  this probe sees the same filesystem the spawned CLI will write to. */
+    checkResumeTargetExists({ sessionId, cliSessionId, workingDir, dataDir }) {
+      if (!workingDir) return undefined;
+      const effectiveDataDir = dataDir ?? variant.dataDir;
+      const sid = cliSessionId ?? sessionId;
+      if (!sid) return undefined;
+      try {
+        const p = claudeJsonlPathForSession(sid, workingDir, effectiveDataDir);
+        if (existsSync(p)) return true;
+        // Also try the project directory (allows partial matches): absent
+        // projectDir means no resume target could possibly exist — Claude
+        // writes `<sid>.jsonl` there on first submit and never moves it.
+        if (!existsSync(dirname(p))) return false;
+        // Project dir exists but this specific sid doesn't. Could be a
+        // mid-session rotation the adapter's pid resolver would catch — don't
+        // block, let spawn try; the secondary guard still covers it.
+        return undefined;
+      } catch {
+        return undefined;
+      }
+    },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
       // Claude resumes by reading <id>.jsonl, so we need the most recently
@@ -443,7 +482,14 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return `${variant.resumeBin} --resume ${cliSessionId ?? sessionId}`;
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass }) {
+    /** Import path: scan this variant's data root (`<dataDir>/projects/<hash>/<id>.jsonl`)
+     *  for resumable sessions. The session id is the jsonl basename; cwd + first
+     *  prompt come from the transcript. */
+    listResumableSessions({ limit, exclude }) {
+      return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
+    },
+
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -455,62 +501,37 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       }
       if (!disableCliBypass) {
         args.push('--dangerously-skip-permissions');
-        // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
-        // 注意：askUserQuestion hook 不在这里注入——它要写全局 settings.json（见下方
-        // hookInstall），这样 adopt 模式（botmux 接管的是别处已启动、拿不到本 --settings
-        // 的 claude 会话）才能让那条会话读到 hook。
-        args.push('--settings', JSON.stringify({
-          skipDangerousModePermissionPrompt: true,
-          permissions: { defaultMode: 'bypassPermissions' },
-        }));
+      }
+      // 进程级 --settings JSON：作用域仅限本次 spawn，与用户自有 settings.json 合并
+      // （Claude 把多个 settings 源按事件 **合并** hooks 数组，不互相覆盖）。这里只承载
+      // bypass 权限相关键（仅 !disableCliBypass）。
+      //
+      // SessionStart 就绪 hook（→ `botmux session-ready`）**不**再注入这里，改走全局
+      // settings.json（见下方 hookInstall.sessionStartCommand）。原因有二：
+      //   1. wrapperCli=`aiden x claude` 会剥掉本 --settings（aiden 硬拒），进程级那份它拿
+      //      不到；全局是它唯一能读到就绪 hook 的渠道。
+      //   2. 若进程级和全局**同时**注入 SessionStart，Claude 会等两条 hook 都退出才渲染输入框，
+      //      但 worker 在第一条 hook 发来的信号就放行首条 prompt → 首条 prompt 抢在输入框渲染前
+      //      落地 → 触发 Claude 的 paste-burst 启发式 → 多行里的软换行 `\` 被当字面量保留。
+      //      单一来源（全局）消除这个竞态，恢复原先单 hook 的时序。
+      // 全局即足够：Claude（含 cjadk / aiden 等启动器跑的真 claude）默认读 ~/.claude/settings.json，
+      // 与 askUserQuestion hook 同源同渠道，比进程级更稳（还覆盖 adopt / 剥 --settings 的场景）。
+      const inlineSettings: Record<string, unknown> = {};
+      if (!disableCliBypass) {
+        inlineSettings.skipDangerousModePermissionPrompt = true;
+        inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
+      }
+      // 仅在有内容（bypass 键）时才传 --settings；disableCliBypass 下没东西可传就不传。
+      if (Object.keys(inlineSettings).length > 0) {
+        args.push('--settings', JSON.stringify(inlineSettings));
       }
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
-      const unknown = t('ai.identity.unknown', undefined, locale);
-      const identityBlock =
-        botName || botOpenId
-          ? [
-            '',
-            '<identity>',
-            `  <name>${botName ?? unknown}</name>`,
-            `  <open_id>${botOpenId ?? unknown}</open_id>`,
-            '  <routing_rules>',
-            `    ${t('ai.identity.routing_intro', undefined, locale)}`,
-            `    ${t('ai.identity.rule_own_part', undefined, locale)}`,
-            `    ${t('ai.identity.rule_silent_when_other', undefined, locale)}`,
-            `    ${t('ai.identity.rule_no_proactive_pull', undefined, locale)}`,
-            '',
-            `    ${t('ai.identity.mention_intro', undefined, locale)}`,
-            `    ${t('ai.identity.mention_must', undefined, locale)}`,
-            `    ${t('ai.identity.mention_partners', undefined, locale)}`,
-            `    ${t('ai.identity.mention_usage', undefined, locale)}`,
-            `    ${t('ai.identity.mention_when_to', undefined, locale)}`,
-            `    ${t('ai.identity.mention_when_not', undefined, locale)}`,
-            `    ${t('ai.identity.mention_gate', undefined, locale)}`,
-            '  </routing_rules>',
-            '</identity>',
-          ]
-          : [];
-      args.push('--append-system-prompt', [
-        '<botmux_routing>',
-        t('ai.routing.intro', undefined, locale),
-        t('ai.routing.must_use_botmux', undefined, locale),
-        '',
-        t('ai.routing.usage_heading', undefined, locale),
-        t('ai.routing.usage_send_when', undefined, locale),
-        t('ai.routing.usage_send_text', undefined, locale),
-        t('ai.routing.usage_heredoc', undefined, locale),
-        t('ai.routing.heredoc_example', undefined, locale),
-        t('ai.routing.usage_images', undefined, locale),
-        t('ai.routing.usage_files', undefined, locale),
-        t('ai.routing.usage_history', undefined, locale),
-        t('ai.routing.usage_bots_list', undefined, locale),
-        '</botmux_routing>',
-        ...identityBlock,
-      ].join('\n'));
+      if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
       return args;
     },
 
@@ -546,11 +567,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       const isFirstWrite = !claudeFirstWriteSeen.has(pty);
       if (isFirstWrite) {
         claudeFirstWriteSeen.add(pty);
-        await new Promise(r => setTimeout(r, 200));
+        await delay(200);
       }
       const TYPING_THROTTLE_MS = isFirstWrite ? 80 : 30;
 
-      const tick = () => new Promise<void>(r => setTimeout(r, TYPING_THROTTLE_MS));
+      const tick = () => delay(TYPING_THROTTLE_MS);
       const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
 
       const sendSubmit = (): boolean => {
@@ -627,7 +648,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // we control the markers directly.
         pty.write('\x1b[200~' + content + '\x1b[201~');
       }
-      await new Promise(r => setTimeout(r, submitDelay));
+      await delay(submitDelay);
       if (!sendSubmit()) {
         return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
       }
@@ -778,6 +799,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
+    // Claude 家族在 spawn 时注入 SessionStart hook（见 buildArgs），回调
+    // `botmux session-ready` 给出「真就绪」信号。worker 据此武装 ready-gate：
+    // 收到信号前不投首条 prompt，绕开 cjadk 启动选择器吞首条消息的 bug。
+    injectsReadyHook: true,
+    defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
     systemHints: [],
     altScreen: false,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT
@@ -795,6 +821,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     hookInstall: {
       configPath: join(variant.dataDir, 'settings.json'),
       format: 'claude-settings',
+      // SessionStart 就绪 hook 也写全局：进程级 --settings 那份会被 wrapperCli=`aiden x
+      // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
+      // 避免首条 prompt 空等 45s。原生 claude 会同时收到进程级+全局两份，幂等无害。
+      sessionStartCommand: sessionReadyHookCommand(),
     },
     asksViaHook: true,
   };

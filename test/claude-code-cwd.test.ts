@@ -12,7 +12,7 @@
  * Run:  pnpm vitest run test/claude-code-cwd.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, symlinkSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { claudeJsonlPathForSession } from '../src/adapters/cli/claude-code.js';
@@ -24,7 +24,10 @@ let realDir: string;
 let symDir: string;
 
 beforeEach(() => {
-  tmpRoot = mkdtempSync(join(tmpdir(), 'bmx-cwd-'));
+  // realpathSync: on macOS os.tmpdir() is a symlink (/var → /private/var). The
+  // helper realpath-resolves cwd, so the "already a real path" case must start
+  // from an already-resolved root or the expected hash would lack /private.
+  tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'bmx-cwd-')));
   realDir = join(tmpRoot, 'real-target');
   symDir = join(tmpRoot, 'sym-link');
   mkdirSync(realDir);

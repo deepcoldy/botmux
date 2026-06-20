@@ -19,9 +19,10 @@
  * code injects `forkWorkerJs` (defined below).
  */
 
-import { fork, type ChildProcess } from 'node:child_process';
+import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +41,8 @@ import {
   type AttemptTerminalStatus,
 } from './attempt-terminal.js';
 import { logger } from '../utils/logger.js';
+
+type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
 // ─── IPC payloads (subset of WorkerToDaemon we care about) ────────────────
 
@@ -90,10 +93,11 @@ export type WorkerSpawnOptions = {
 export const forkWorkerJsFactory: WorkerProcessFactory = {
   spawn(opts) {
     const child: ChildProcess = fork(opts.workerPath, [], {
+      windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       cwd: opts.cwd,
       env: opts.env,
-    });
+    } as WindowsForkOptions);
     return {
       send: (m) => child.send(m as never),
       on: (event: string, cb: (...args: unknown[]) => void) => {
@@ -252,6 +256,9 @@ async function runOneShotImpl(
     larkAppSecret: creds.larkAppSecret,
     botName: input.botName,
     locale: 'zh' as const,
+    ...(input.botSnapshot?.cliPathOverride
+      ? { cliPathOverride: input.botSnapshot.cliPathOverride }
+      : {}),
   };
   logOneShotMemory(input, 'after-init-object');
 
@@ -565,10 +572,10 @@ function writeAttemptTerminalSidecar(
       updatedAt: now,
       ...(status === 'closed' ? { closedAt: now } : {}),
     };
-    writeFileSync(
+    // 原子写：daemon 重启后 attempt-resume 会读这个 sidecar 恢复会话。
+    atomicWriteFileSync(
       join(dir, ATTEMPT_TERMINAL_SIDECAR),
       JSON.stringify(sidecar, null, 2),
-      'utf-8',
     );
   } catch (err) {
     appendAttemptLog(

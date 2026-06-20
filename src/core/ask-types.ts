@@ -82,8 +82,8 @@ export interface AskJsonOutput {
 }
 
 /** Input accepted by broker.registerAsk. Caller (CLI subcommand → daemon IPC
- *  handler) is responsible for env validation, parameter parsing, and resolving
- *  the approver allowlist before reaching the broker.
+ *  handler) is responsible for env validation and parameter parsing. Click
+ *  authorization is the bot's canTalk gate, injected via `setCanTalkChecker`.
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
@@ -93,10 +93,6 @@ export interface CreateAskInput {
   rootMessageId: string | null;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
-  /** Pre-resolved open_id allowlist. Empty set means no one can answer; the
-   *  caller (not the broker) must enforce the §6 approver fallback chain so the
-   *  broker stays IM-agnostic. */
-  approvers: ReadonlySet<string>;
   /** 问题列表，调用方保证每问 `options.length ≥ 2` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
@@ -118,7 +114,6 @@ export interface PendingAsk {
   chatId: string;
   rootMessageId: string | null;
   sessionId: string;
-  approvers: ReadonlySet<string>;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */
@@ -137,7 +132,7 @@ export interface PendingAsk {
 export type AskClickOutcome =
   /** First valid click — caller's Promise resolves with `kind:'answered'`. */
   | 'accepted'
-  /** Clicker's open_id not in approvers — caller shows "你没有权限". */
+  /** Clicker can't canTalk to the bot in this chat — caller shows "你没有权限". */
   | 'unauthorized'
   /** No such askId, nonce mismatch, or unknown option — caller shows
    *  "此 ask 已失效（daemon 重启）". Covers the §8 stale-card case. */

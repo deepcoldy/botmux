@@ -19,6 +19,7 @@
  */
 
 import type { Snapshot, RunStatus, NodeStatus, ActivityStatus } from '../../workflows/events/replay.js';
+import { t, type Locale } from '../../i18n/index.js';
 import { workflowRunDetailUrl } from './workflow-cards.js';
 
 export { workflowRunDetailUrl };
@@ -49,6 +50,9 @@ export type WorkflowProgressCardOptions = {
    * longer workflows.
    */
   totalNodes?: number;
+  /** UI locale for card chrome (labels/sections). Falls back to the process
+   *  default when omitted. */
+  locale?: Locale;
 };
 
 const DEFAULT_MAX_INLINE_ROWS = 6;
@@ -64,6 +68,7 @@ export function buildWorkflowStartingCard(input: {
   runId: string;
   workflowId: string;
   webDetailUrl?: string;
+  locale?: Locale;
 }): string {
   const webDetailUrl = input.webDetailUrl ?? workflowRunDetailUrl(input.runId);
   return JSON.stringify({
@@ -77,10 +82,10 @@ export function buildWorkflowStartingCard(input: {
         tag: 'div',
         fields: [
           { is_short: true, text: { tag: 'lark_md', content: `**runId**\n${escapeMd(short(input.runId, 28))}` } },
-          { is_short: true, text: { tag: 'lark_md', content: '**状态**\n⏳ starting' } },
+          { is_short: true, text: { tag: 'lark_md', content: `**${t('card.wf.field.status', undefined, input.locale)}**\n⏳ starting` } },
         ],
       },
-      detailButton(webDetailUrl),
+      detailButton(webDetailUrl, input.locale),
     ],
   });
 }
@@ -95,6 +100,7 @@ export function buildWorkflowProgressCard(
 ): string {
   const webDetailUrl = opts.webDetailUrl ?? workflowRunDetailUrl(snapshot.run.runId);
   const maxRows = opts.maxInlineRows ?? DEFAULT_MAX_INLINE_ROWS;
+  const loc = opts.locale;
   const status = snapshot.run.status;
   const template = headerTemplateForStatus(status);
   const title = `${headerEmoji(status)} Workflow · ${snapshot.run.workflowId ?? 'unknown'}`;
@@ -116,17 +122,17 @@ export function buildWorkflowProgressCard(
   const runningRows = isTerminal ? [] : collectRunningRows(snapshot);
   const waitingRows = isTerminal ? [] : collectWaitingRows(snapshot);
   const loopRows = isTerminal ? [] : collectLoopRows(snapshot);
-  const failureSummary = summarizeFailure(snapshot);
+  const failureSummary = summarizeFailure(snapshot, loc);
 
   const elements: Array<Record<string, unknown>> = [
     {
       tag: 'div',
       fields: [
         { is_short: true, text: { tag: 'lark_md', content: `**runId**\n${escapeMd(short(snapshot.run.runId, 28))}` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**状态**\n${statusBadge(status)}` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**进度**\n${counts.succeeded} / ${denominator} 节点完成` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**失败**\n${counts.failed}` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**已取消**\n${counts.cancelled}` } },
+        { is_short: true, text: { tag: 'lark_md', content: `**${t('card.wf.field.status', undefined, loc)}**\n${statusBadge(status)}` } },
+        { is_short: true, text: { tag: 'lark_md', content: `**${t('card.wf.field.progress', undefined, loc)}**\n${t('card.wf.progress_value', { done: counts.succeeded, total: denominator }, loc)}` } },
+        { is_short: true, text: { tag: 'lark_md', content: `**${t('card.wf.field.failed', undefined, loc)}**\n${counts.failed}` } },
+        { is_short: true, text: { tag: 'lark_md', content: `**${t('card.wf.resolved.cancelled', undefined, loc)}**\n${counts.cancelled}` } },
       ],
     },
   ];
@@ -135,7 +141,7 @@ export function buildWorkflowProgressCard(
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: `**🏃 进行中** (${runningRows.length})` },
+      text: { tag: 'lark_md', content: `**🏃 ${t('card.wf.section.running', undefined, loc)}** (${runningRows.length})` },
     });
     appendRows(elements, runningRows, maxRows, opts);
   }
@@ -144,7 +150,7 @@ export function buildWorkflowProgressCard(
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: `**⏸ 等待审批** (${waitingRows.length})` },
+      text: { tag: 'lark_md', content: `**⏸ ${t('card.wf.section.waiting', undefined, loc)}** (${waitingRows.length})` },
     });
     appendRows(elements, waitingRows, maxRows, opts);
   }
@@ -157,7 +163,7 @@ export function buildWorkflowProgressCard(
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: `**🔁 循环节点** (${loopRows.length})` },
+      text: { tag: 'lark_md', content: `**🔁 ${t('card.wf.section.loop', undefined, loc)}** (${loopRows.length})` },
     });
     appendLoopRows(elements, loopRows);
   }
@@ -170,7 +176,7 @@ export function buildWorkflowProgressCard(
     });
   }
 
-  elements.push(detailButton(webDetailUrl));
+  elements.push(detailButton(webDetailUrl, loc));
 
   return JSON.stringify({
     config: { wide_screen_mode: true },
@@ -285,12 +291,12 @@ function appendLoopRows(
   });
 }
 
-function summarizeFailure(snap: Snapshot): string | undefined {
+function summarizeFailure(snap: Snapshot, locale?: Locale): string | undefined {
   if (snap.run.status === 'failed' && snap.run.failedNodeId) {
-    return `**💥 失败摘要**\nnode: \`${escapeMd(snap.run.failedNodeId)}\``;
+    return `**💥 ${t('card.wf.failure_summary', undefined, locale)}**\nnode: \`${escapeMd(snap.run.failedNodeId)}\``;
   }
   if (snap.run.status === 'cancelled' && snap.run.cancelOriginEventId) {
-    return `**🛑 已取消**\norigin: \`${escapeMd(short(snap.run.cancelOriginEventId, 32))}\``;
+    return `**🛑 ${t('card.wf.resolved.cancelled', undefined, locale)}**\norigin: \`${escapeMd(short(snap.run.cancelOriginEventId, 32))}\``;
   }
   return undefined;
 }
@@ -309,7 +315,7 @@ function appendRows(
         ? safeEnrich(opts.enrichWithTerminalLink, row.activityId, row.attemptId)
         : undefined;
     const linkText = terminalLink
-      ? ` · [${escapeMd(terminalLink.label ?? defaultTerminalLabel(terminalLink.kind))}](${terminalLink.url})`
+      ? ` · [${escapeMd(terminalLink.label ?? defaultTerminalLabel(terminalLink.kind, opts.locale))}](${terminalLink.url})`
       : '';
     lines.push(`• \`${escapeMd(row.nodeId)}\` (${row.status})${linkText}`);
   }
@@ -336,17 +342,19 @@ function safeEnrich(
   }
 }
 
-function defaultTerminalLabel(kind: WorkflowProgressCardTerminalLink['kind']): string {
-  return kind === 'live-terminal' ? '查看当前终端' : '查看执行日志';
+function defaultTerminalLabel(kind: WorkflowProgressCardTerminalLink['kind'], locale?: Locale): string {
+  return kind === 'live-terminal'
+    ? t('card.wf.terminal.live', undefined, locale)
+    : t('card.wf.terminal.log', undefined, locale);
 }
 
-function detailButton(url: string): Record<string, unknown> {
+function detailButton(url: string, locale?: Locale): Record<string, unknown> {
   return {
     tag: 'action',
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: t('card.wf.btn_web_detail', undefined, locale) },
         type: 'default',
         multi_url: { url, pc_url: url, android_url: url, ios_url: url },
       },

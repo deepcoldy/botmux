@@ -1,6 +1,10 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
+import { verifyHmac } from '../dashboard/auth.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -8,18 +12,29 @@ import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
+import * as sandboxStore from '../services/sandbox-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import * as observedBotsStore from '../services/observed-bots-store.js';
+import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
-import { findConfigField, applyConfigField } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
+import { config } from '../config.js';
+import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
+import { readRawConfig, findEntryIndex, requireConfigPath } from '../services/config-store.js';
+import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
+import { isLocale, type Locale } from '../i18n/types.js';
+import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
+import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
+import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
@@ -42,8 +57,11 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot } from '../bot-registry.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
+import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
+import type { ScheduledTask, ParsedSchedule, Session } from '../types.js';
+import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
+import { readSkillRegistry } from '../services/skill-registry-store.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -84,6 +102,38 @@ export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T
   for await (const c of req) chunks.push(c as Buffer);
   if (chunks.length === 0) return {} as T;
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+// ─── Token-route auth (loopback HMAC) ───────────────────────────────────────
+//
+// Most IPC routes are loopback-trusted: the codebase's threat model treats a
+// local botmux process as already root-equivalent on the box (see the
+// migrate-to-chat route below), so close/resume/sandbox-diff carry no per-route
+// auth. The two write-link routes are different — they HAND OUT a reusable
+// terminal-control credential (the worker write token: GET /write-link returns
+// the URL, POST /write-link-card delivers it as a private Lark card), so they
+// additionally require the caller to prove it can read ~/.botmux/.dashboard-secret.
+// That keeps a sandboxed worker, or a random local process that merely discovered
+// the ipcPort, from minting write tokens for sessions it doesn't own. The legit
+// callers — the dashboard proxy and `botmux term-link` — sign with the same secret
+// + scheme as `botmux dashboard` → /__cli/rotate. (A same-user process that can
+// read the secret is out of scope: it's already trusted.)
+let injectedIpcSecret: string | null = null;
+/** Test seam: override the secret used to verify token-route HMAC. */
+export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
+function ipcAuthSecret(): string | null {
+  if (injectedIpcSecret) return injectedIpcSecret;
+  try { return readFileSync(join(homedir(), '.botmux', '.dashboard-secret'), 'utf8').trim() || null; }
+  catch { return null; }
+}
+function tokenRouteAuthorized(req: IncomingMessage): boolean {
+  const secret = ipcAuthSecret();
+  if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
+  const ts = req.headers['x-botmux-cli-ts'];
+  const nonce = req.headers['x-botmux-cli-nonce'];
+  const sig = req.headers['x-botmux-cli-auth'];
+  if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') return false;
+  return verifyHmac(secret, { ts, nonce, sig }, req.socket.remoteAddress ?? '').ok;
 }
 
 ipcRoute('GET', '/__health', (_req, res) => {
@@ -130,6 +180,187 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+/** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
+ *  store 持有同一对象，改字段后 updateSession 即落盘。 */
+function findSessionRecord(sessionId: string): Session | undefined {
+  return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
+}
+
+// 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
+// 改完广播 session.update，所有打开的 dashboard 实时同步。
+ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
+  let body: { column?: unknown; position?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const column = normalizeKanbanColumn(body.column);
+  const position = normalizeKanbanPosition(body.position);
+  if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (column) session.kanbanColumn = column;
+  if (position !== null) session.kanbanPosition = position;
+  sessionStore.updateSession(session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: params.sessionId,
+      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition },
+    },
+  });
+  jsonRes(res, 200, { ok: true });
+});
+
+// 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，
+// 消息体不落盘），给 dashboard 的会话历史弹窗。复杂卡片的「请升级」兜底文本
+// 用 message.get 的完整表示补齐；merge_forward 保持占位符（原型不展开）。
+ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => {
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const appId = session.larkAppId || cachedLarkAppId;
+  if (!appId) return jsonRes(res, 422, { ok: false, error: 'no_lark_app' });
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '80', 10) || 80, 1), 200);
+  try {
+    const raw = session.scope === 'chat'
+      ? await listChatMessages(appId, session.chatId, limit)
+      : await listThreadMessages(appId, session.chatId, session.rootMessageId, limit);
+    const messages = await Promise.all(raw.map(async (m: any) => {
+      const parsed = parseApiMessage(m);
+      if (parsed.msgType === 'interactive' && cardContentHasUpgradeFallback(parsed.content)) {
+        const merged = await resolveMergedCardContent(appId, parsed.messageId).catch(() => null);
+        if (merged) parsed.content = merged.text;
+      }
+      return {
+        messageId: parsed.messageId,
+        senderId: parsed.senderId,
+        senderType: parsed.senderType,
+        msgType: parsed.msgType,
+        content: parsed.content,
+        // Lark create_time 是毫秒 epoch 字符串——规范成数字，前端 new Date 直接用
+        createTime: Number(parsed.createTime) || undefined,
+      };
+    }));
+    // 真人发送者补名字+头像（contact API，带缓存；不在可见范围的回退占位）
+    const senders = new Map<string, { name: string; avatarUrl?: string } | null>();
+    await Promise.all(
+      [...new Set(messages.filter(m => m.senderType === 'user' && m.senderId).map(m => m.senderId))]
+        .map(async id => { senders.set(id, await getUserProfile(appId, id)); }),
+    );
+    jsonRes(res, 200, {
+      ok: true,
+      scope: session.scope ?? 'thread',
+      ownerOpenId: session.ownerOpenId,
+      messages: messages.map(m => {
+        const p = m.senderType === 'user' ? senders.get(m.senderId) : null;
+        return p ? { ...m, senderName: p.name, senderAvatar: p.avatarUrl } : m;
+      }),
+    });
+  } catch (err: any) {
+    jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// 部署 owner 的资料（名字 + 头像）——dashboard 左上角和历史弹窗展示「我」。
+// owner 身份来自 deployment identity（ownerUnionId），头像经 contact API 查询
+// （带缓存）；未绑定 owner 或查不到时回退名字/null。
+ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const me = getDeploymentIdentity(config.session.dataDir);
+  if (!me.ownerUnionId) return jsonRes(res, 200, { ok: false, error: 'owner_unbound', name: me.ownerName ?? null });
+  const p = await getUserProfile(cachedLarkAppId, me.ownerUnionId, 'union_id');
+  jsonRes(res, 200, { ok: true, name: p?.name ?? me.ownerName ?? null, avatarUrl: p?.avatarUrl ?? null });
+});
+
+// 会话重命名：dashboard 看板卡片就地编辑标题。title 只是展示元数据（飞书话题
+// 标题不受影响），但全视图（看板/状态板/表格/抽屉）读同一字段，改一处全变。
+ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
+  let body: { title?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const title = normalizeSessionTitle(body.title);
+  if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  session.title = title;
+  sessionStore.updateSession(session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { title } },
+  });
+  jsonRes(res, 200, { ok: true, title });
+});
+
+/**
+ * Mint the WRITABLE web-terminal link for a live session — the dashboard
+ * counterpart to the Lark card's "🔑 获取操作链接" button. Returns the URL with
+ * the worker's write `?token=` appended, built daemon-side via buildTerminalUrl
+ * so it picks up this process's live terminal-proxy state (the dashboard
+ * aggregator can't see it). The token is returned ONLY here, on demand —
+ * deliberately never embedded in /api/sessions rows or the SSE stream.
+ *
+ * Two gates protect it: at the dashboard's HTTP boundary this path is absent
+ * from the public allow-list, so an anonymous browser 401s; and here on the
+ * daemon IPC, tokenRouteAuthorized requires a loopback-HMAC signed with
+ * .dashboard-secret, so a local process that merely knows the ipcPort still
+ * can't pull a write token.
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
+  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port || !ds.workerToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { write: true }) });
+});
+
+/**
+ * Deliver the writable-terminal card privately to the bot's owner(s) — the
+ * `botmux term-link <id>` CLI command's backend. Unlike the GET route above
+ * (which returns the URL to its single authenticated caller), this POSTs the
+ * card into the owners' private Lark channels (ephemeral → DM fallback) and
+ * returns ONLY delivery counts: the write token never crosses back to the CLI /
+ * stdout. Same loopback-HMAC gate as write-link — it still hands out a control
+ * credential, just into Lark rather than into the HTTP response.
+ */
+ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, params) => {
+  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const r = await deliverWriteLinkCardToOwners(ds);
+  const status = r.ok ? 200
+    : r.error === 'terminal_unavailable' ? 409
+    : r.error === 'no_owner' ? 422
+    : 502;
+  jsonRes(res, status, r);
+});
+
+// ─── Sandbox landing (owner reviews the clone's diff then applies it back) ───
+function workingDirForSession(sessionId: string): string | undefined {
+  const ds = findActiveBySessionId(sessionId);
+  if (ds) return ds.session.workingDir;
+  return sessionStore.listSessions().find(s => s.sessionId === sessionId)?.workingDir;
+}
+
+ipcRoute('GET', '/api/sessions/:sessionId/sandbox-diff', (_req, res, params) => {
+  const d = computeSandboxDiff(config.session.dataDir, params.sessionId, localeForBot(cachedLarkAppId));
+  if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
+  jsonRes(res, 200, {
+    ok: true, empty: d.empty, files: d.files, insertions: d.insertions, deletions: d.deletions,
+    statText: d.statText, patch: d.patch, workingDir: workingDirForSession(params.sessionId) ?? null,
+  });
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/sandbox-land/:action', (_req, res, params) => {
+  if (params.action === 'discard') return jsonRes(res, 200, { ok: true, discarded: true });
+  if (params.action !== 'apply') return jsonRes(res, 400, { ok: false, error: 'unknown action' });
+  const locLand = localeForBot(cachedLarkAppId);
+  const wd = workingDirForSession(params.sessionId);
+  if (!wd) return jsonRes(res, 404, { ok: false, error: t('sandbox.workingdir_not_found', undefined, locLand) });
+  const d = computeSandboxDiff(config.session.dataDir, params.sessionId, locLand);
+  if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
+  if (d.empty) return jsonRes(res, 200, { ok: false, error: t('sandbox.no_changes_left', undefined, locLand) });
+  const a = applySandboxDiff(wd, config.session.dataDir, params.sessionId, locLand);
+  jsonRes(res, 200, a.ok ? { ok: true, files: d.files, insertions: d.insertions, deletions: d.deletions, workingDir: wd } : { ok: false, error: a.error });
 });
 
 /**
@@ -304,8 +535,8 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   }
 
   // Target chat was built by the leader's /relay --create — by
-  // construction a regular group. The peer inherits that guarantee.
-  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group');
+  // construction a regular group, chat-scope (M1 is the audit anchor).
+  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group', 'chat');
   if (!result.ok) {
     return jsonRes(res, 500, { ok: false, error: result.error });
   }
@@ -381,6 +612,7 @@ export interface ScheduleRow {
   lastStatus?: 'ok' | 'error';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
+  deliver?: 'origin' | 'local' | 'new-topic';
   feishuChatLink: string;
 }
 
@@ -402,6 +634,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     lastStatus: t.lastStatus,
     lastError: t.lastError,
     repeat: t.repeat,
+    deliver: t.deliver ?? 'origin',
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -417,6 +650,9 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
+// Toggle delivery mode between 'origin' (reply in original thread) and
+// 'new-topic' (open a brand-new topic + fresh session on every fire).
+ipcRoute('POST', '/api/schedules/:id/delivery', (_req, res, p) => jsonRes(res, 200, scheduler.toggleDelivery(p.id)));
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' });
@@ -470,7 +706,12 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const enriched = chats.map(c => {
       const oncall = oncallStore.getOncallStatus(cachedLarkAppId, c.chatId);
       const hasRole = resolveRoleFile(cachedLarkAppId, c.chatId) !== null;
-      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole };
+      // /introduce 记录的外部 botmux 机器人（按名字）——dashboard 团队看板用
+      // 它识别「介绍过同团队机器人的协作群」。
+      const observedBotNames = observedBotsStore
+        .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
+        .map(b => b.name);
+      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, observedBotNames };
     });
     jsonRes(res, 200, { chats: enriched });
   } catch (e) {
@@ -611,12 +852,24 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
   let p2pMode: 'thread' | 'chat' = 'thread';
   try { if (getBot(cachedLarkAppId).config.p2pMode === 'chat') p2pMode = 'chat'; } catch { /* default thread */ }
+  let maxLiveWorkers: number | null = null;
+  try {
+    const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
+    if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+  } catch { /* default unlimited */ }
+  // startupCommands → newline-joined for the dashboard textarea (one per line).
+  let startupCommands = '';
+  try {
+    const sc = getBot(cachedLarkAppId).config.startupCommands;
+    if (Array.isArray(sc) && sc.length) startupCommands = sc.join('\n');
+  } catch { /* none */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
+    sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
@@ -625,9 +878,13 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
+    docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     p2pMode,
+    maxLiveWorkers,
+    startupCommands,
+    skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
 });
 
@@ -638,7 +895,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   let body: {
     disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
-    regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown;
+    regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -647,6 +904,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never';
+    docSubscribeDefaultMode?: 'mention-only' | 'all';
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
@@ -660,6 +918,9 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   }
   if (body.regularGroupMentionMode === 'always' || body.regularGroupMentionMode === 'topic' || body.regularGroupMentionMode === 'never') {
     patch.regularGroupMentionMode = body.regularGroupMentionMode;
+  }
+  if (body.docSubscribeDefaultMode === 'mention-only' || body.docSubscribeDefaultMode === 'all') {
+    patch.docSubscribeDefaultMode = body.docSubscribeDefaultMode;
   }
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
@@ -726,6 +987,157 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, p2pMode: value ?? 'thread' });
+});
+
+// Per-bot 启动命令 startupCommands。Body `{ startupCommands: string }`（原始文本，
+// 逗号/换行分隔，每条可带参数如 `/effort ultracode`）：空白 → 清除（不发任何命令）。
+// 走 applyConfigField（与 /botconfig 文本子卡同一写盘 + 内存热更新路径），next-session
+// 生效（下个会话起按序自动发）。
+ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { startupCommands?: unknown };
+  try { body = await readJsonBody<{ startupCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('startupCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.startupCommands === 'string' ? body.startupCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:
+//   • 正整数  → 设上限；超过后 idle-worker sweeper 把最久未用的会话休眠到上限内
+//   • null    → 清除（回落到内置默认 30）
+// 走 applyConfigField（与 /config 同一写盘 + 内存热更新路径）：sweeper 每分钟读
+// 实时 bot.config.maxLiveWorkers，免重启即生效。
+ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const body = raw as { maxLiveWorkers?: unknown };
+  const spec = findConfigField('maxLiveWorkers');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  // null（含 JSON null）= 清除上限；number 走 coerce 校验正整数。
+  let value: number | null;
+  if (body.maxLiveWorkers === null || body.maxLiveWorkers === undefined) {
+    value = null;
+  } else {
+    const c = coerceConfigValue(spec, body.maxLiveWorkers);
+    if (!c.ok || typeof c.value !== 'number') return jsonRes(res, 400, { ok: false, error: 'invalid_number' });
+    value = c.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
+});
+
+// Per-bot skill policy. Dashboard uses this for attach/detach; JSON policy
+// still shares the same applyConfigField path as /botconfig.
+ipcRoute('PUT', '/api/bot-skills', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const body = raw as { action?: unknown; name?: unknown; policy?: unknown };
+  const spec = findConfigField('skills');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  const current = getBot(cachedLarkAppId).config.skills;
+  let next = current;
+  if (body.action === 'attach') {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name) return jsonRes(res, 400, { ok: false, error: 'name_required' });
+    if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
+    next = attachSkillPolicy(current, name);
+  } else if (body.action === 'detach') {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name) return jsonRes(res, 400, { ok: false, error: 'name_required' });
+    next = detachSkillPolicy(current, name);
+  } else if (body.action === 'set') {
+    if (body.policy === null) {
+      next = undefined;
+    } else {
+      const parsed = readBotSkillPolicy(body.policy);
+      if (!parsed) return jsonRes(res, 400, { ok: false, error: 'invalid_policy' });
+      next = parsed;
+    }
+  } else {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+  }
+
+  const r = await applyConfigField(cachedLarkAppId, spec, next ?? null);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, skills: getBot(cachedLarkAppId).config.skills ?? null });
+});
+
+// Per-bot file-sandbox toggle. Body `{ enabled: boolean }`. When on, this bot's
+// CLI sessions run inside a per-session bwrap file sandbox (Linux). For oncall
+// bots shared with semi-trusted users.
+ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { enabled?: unknown };
+  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+});
+
+// 实时切换 UI 语言（locale），无需重启 daemon。`botmux lang` / Dashboard 语言开关
+// 写盘后 POST 这个端点，让本 daemon 从磁盘重新读 locale 并热更新：
+//   • 全局默认（~/.botmux/config.json 的 `lang`）→ setDefaultLocale（缺省回落 'zh'）；
+//   • 本 bot 的 per-bot 覆盖（bots.json 的 `lang`）→ 同步进内存 bot.config.lang
+//     （与 applyConfigField 同口径），让 `botmux lang --bot N` 跨进程写入也免重启。
+// 卡片都在 daemon 端按消息实时渲染（localeForBot），所以下一条消息/卡片立即生效。
+// 文件是单一事实源，本端点只是“立即重读”信号——不在此落盘（写入方已落盘）。
+ipcRoute('POST', '/api/locale/reload', async (_req, res) => {
+  const globalLang = readGlobalConfig().lang;
+  const resolvedDefault: Locale = isLocale(globalLang) ? globalLang : 'zh';
+  setDefaultLocale(resolvedDefault);
+
+  let botLang: Locale | null = null;
+  if (cachedLarkAppId) {
+    try {
+      const raw = await readRawConfig(requireConfigPath());
+      const idx = findEntryIndex(raw, cachedLarkAppId);
+      const entryLang = idx >= 0 ? raw[idx]?.lang : undefined;
+      botLang = isLocale(entryLang) ? entryLang : null;
+      getBot(cachedLarkAppId).config.lang = botLang ?? undefined;
+    } catch { /* bot 未注册 / 读盘失败：全局已应用，per-bot 维持原值 */ }
+  }
+
+  // Push the resolved locale to this bot's live workers too. Cards render on the
+  // daemon (already switched above), but a few user-facing strings originate in
+  // the worker process (submit notices, CoCo adopt notes) — without this they'd
+  // stay in the spawn-time language until the session restarts.
+  const workerLocale: Locale = botLang ?? resolvedDefault;
+  const reg = getActiveSessionsRegistry();
+  if (cachedLarkAppId && reg) {
+    for (const ds of reg.values()) {
+      if (ds.larkAppId !== cachedLarkAppId || !ds.worker || ds.worker.killed) continue;
+      try { ds.worker.send({ type: 'set_locale', locale: workerLocale }); } catch { /* worker gone */ }
+    }
+  }
+
+  jsonRes(res, 200, { ok: true, defaultLocale: resolvedDefault, botLang });
 });
 
 ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {

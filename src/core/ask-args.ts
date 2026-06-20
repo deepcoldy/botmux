@@ -1,9 +1,9 @@
 /**
  * Pure helpers for `botmux ask` argument parsing.
  *
- * Kept in its own file (no I/O, no env reads) so the CSV / timeout / approver
- * parsing can be unit-tested without spinning up a daemon. The actual CLI
- * dispatch (`cmdAsk`) lives in cli.ts and calls these helpers.
+ * Kept in its own file (no I/O, no env reads) so the CSV / timeout parsing can
+ * be unit-tested without spinning up a daemon. The actual CLI dispatch
+ * (`cmdAsk`) lives in cli.ts and calls these helpers.
  */
 
 import type { AskOption } from './ask-types.js';

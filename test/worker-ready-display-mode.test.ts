@@ -68,6 +68,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 
 vi.mock('../src/core/session-manager.js', () => ({
   persistStreamCardState: vi.fn(),
+  rememberLastCliInput: vi.fn(),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -282,5 +283,82 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.streamCardId).toBe('om_new_card');
     // Flag cleared → a later screen_update will PATCH, not POST a 2nd card.
     expect(ds.streamCardPending).toBe(false);
+  });
+
+  it('prompt_ready sends a pending raw slash command once', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      pendingRawInput: '/goal ship the onboarding flow',
+    } as Partial<DaemonSession>);
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(fakeWorker.send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/goal ship the onboarding flow',
+    });
+    expect(ds.pendingRawInput).toBeUndefined();
+
+    fakeWorker.send.mockClear();
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(fakeWorker.send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'raw_input' }),
+    );
+  });
+
+  it('prompt_ready bundles the buffered follow-up ONTO the raw_input IPC (single atomic message)', async () => {
+    // Two separate IPCs would race inside the worker: its async message
+    // handlers don't serialize, and raw_input awaits 200ms between sendText
+    // and Enter — a separate `message` IPC could write into that window. The
+    // follow-up must therefore ride on the raw_input message itself.
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      pendingRawInput: '/goal ship the onboarding flow',
+      pendingFollowUpInput: {
+        userPrompt: '另外帮我顺手看下 CI',
+        cliInput: '<user_message>另外帮我顺手看下 CI</user_message>',
+      },
+    } as Partial<DaemonSession>);
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    // Exactly ONE outbound IPC carrying both payloads — never a separate
+    // `message` IPC that could race the raw_input handler.
+    expect(fakeWorker.send).toHaveBeenCalledTimes(1);
+    expect(fakeWorker.send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/goal ship the onboarding flow',
+      followUpContent: '<user_message>另外帮我顺手看下 CI</user_message>',
+    });
+    expect(ds.pendingRawInput).toBeUndefined();
+    expect(ds.pendingFollowUpInput).toBeUndefined();
+
+    fakeWorker.send.mockClear();
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(fakeWorker.send).not.toHaveBeenCalled();
+  });
+
+  it('prompt_ready without pending raw input never emits the buffered follow-up alone', async () => {
+    const fakeWorker = makeFakeWorker();
+    // Follow-up input only exists alongside pendingRawInput (built at the same
+    // fork site); if state drifts, it must not fire without the raw command.
+    const ds = makeDs({
+      worker: fakeWorker,
+      pendingFollowUpInput: { userPrompt: 'x', cliInput: '<user_message>x</user_message>' },
+    } as Partial<DaemonSession>);
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(fakeWorker.send).not.toHaveBeenCalled();
   });
 });

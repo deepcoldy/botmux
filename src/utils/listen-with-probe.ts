@@ -7,6 +7,8 @@ export interface ListenWithProbeOpts {
   host: string;
   /** Max upward probes on EADDRINUSE before rejecting (default 20). */
   maxProbe?: number;
+  /** Optional caller-specific availability gate before attempting a bind. */
+  portAvailable?: (port: number) => boolean | Promise<boolean>;
   log?: (msg: string) => void;
 }
 
@@ -27,6 +29,7 @@ export interface ListenWithProbeOpts {
 export function listenWithProbe(opts: ListenWithProbeOpts): Promise<number> {
   const { server, host } = opts;
   const maxProbe = opts.maxProbe ?? 20;
+  const portAvailable = opts.portAvailable;
   const log = opts.log ?? (() => { /* noop */ });
 
   return new Promise<number>((resolve, reject) => {
@@ -54,13 +57,44 @@ export function listenWithProbe(opts: ListenWithProbeOpts): Promise<number> {
       server.on('error', (e) => log(`server error: ${(e as Error).message}`));
       resolve(bound);
     };
+    const rejectUnavailable = () => {
+      const err = new Error(`No usable port found starting at ${opts.port}`) as NodeJS.ErrnoException;
+      err.code = 'EADDRINUSE';
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    const tryNext = (reason: string): boolean => {
+      if (attempts >= maxProbe) return false;
+      attempts++;
+      log(`port ${port} ${reason}, trying ${port + 1}`);
+      port++;
+      setImmediate(attemptListen);
+      return true;
+    };
+    const attemptListen = () => {
+      if (settled) return;
+      if (port !== 0 && portAvailable) {
+        Promise.resolve(portAvailable(port)).then((ok) => {
+          if (settled) return;
+          if (!ok) {
+            if (!tryNext('unavailable')) rejectUnavailable();
+            return;
+          }
+          server.listen(port, host);
+        }).catch((err) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(err);
+        });
+        return;
+      }
+      server.listen(port, host);
+    };
     const onError = (err: NodeJS.ErrnoException) => {
       if (settled) return;
-      if (err.code === 'EADDRINUSE' && attempts < maxProbe) {
-        attempts++;
-        log(`port ${port} in use, trying ${port + 1}`);
-        port++;
-        setImmediate(() => { if (!settled) server.listen(port, host); });
+      if (err.code === 'EADDRINUSE' && tryNext('in use')) {
         return;
       }
       settled = true;
@@ -70,6 +104,6 @@ export function listenWithProbe(opts: ListenWithProbeOpts): Promise<number> {
 
     server.on('listening', onListening);
     server.on('error', onError);
-    server.listen(port, host);
+    attemptListen();
   });
 }

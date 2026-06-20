@@ -2,7 +2,7 @@
 // The aggregator at /api/groups fans out to all online daemons and merges chats
 // by chatId; the dashboard displays this as a matrix where each cell shows
 // whether a bot is a member of a given chat.
-import { chatAvatarHtml, escapeHtml, t } from './ui.js';
+import { chatAvatarHtml, escapeHtml, loadingHtml, t } from './ui.js';
 
 let cache: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
 
@@ -21,10 +21,13 @@ function pageHtml(): string {
   <button type="button" id="g-refresh">${t('groups.refresh')}</button>
   <button type="button" id="g-create" class="primary">${t('groups.create')}</button>
 </form>
-<table>
-  <thead id="g-head"></thead>
-  <tbody id="g-body"></tbody>
-</table>
+<div id="g-loading">${loadingHtml()}</div>
+<div class="table-scroll matrix-scroll" id="g-table-wrap" hidden>
+  <table>
+    <thead id="g-head"></thead>
+    <tbody id="g-body"></tbody>
+  </table>
+</div>
 <dialog id="g-drawer"></dialog>
 </section>`;
 }
@@ -89,7 +92,15 @@ export async function renderGroupsPage(root: HTMLElement) {
   const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
   createBtn.onclick = () => openCreateModal();
 
-  await loadGroups();
+  // /api/groups 要扇出到所有 daemon、逐群查成员，慢——先亮 loading，回来再换表格。
+  const loadingEl = root.querySelector<HTMLElement>('#g-loading')!;
+  const tableWrap = root.querySelector<HTMLElement>('#g-table-wrap')!;
+  try {
+    await loadGroups();
+  } finally {
+    loadingEl.remove();
+    tableWrap.hidden = false;
+  }
 
   function openCreateModal() {
     const allBots = cache.bots;

@@ -119,6 +119,22 @@ export class ZellijBackend implements SessionBackend {
     return probe.sessions.includes(name) ? 'exists' : 'missing';
   }
 
+  /**
+   * Tri-state liveness of the zellij SERVER (not a specific session). Mirrors
+   * TmuxBackend.serverState — see that doc for why 'missing' must be
+   * disambiguated before driving a destructive restore-time close.
+   *
+   *   - 'running' — list-sessions succeeded with ≥1 live session.
+   *   - 'down'    — list-sessions succeeded with ZERO live sessions, i.e. nothing
+   *                 survives (a machine reboot wipes every session at once).
+   *   - 'unknown' — list-sessions failed/timed out (can't tell).
+   */
+  static serverState(): 'running' | 'down' | 'unknown' {
+    const probe = ZellijBackend.probeLiveSessions();
+    if (!probe.ok) return 'unknown';
+    return probe.sessions.length > 0 ? 'running' : 'down';
+  }
+
   /** Kill + purge a session (so no resurrectable corpse accumulates). */
   static killSession(name: string): void {
     try {

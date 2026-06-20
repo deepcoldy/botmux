@@ -10,6 +10,7 @@ import type { RestartKind } from '../services/restart-intent-store.js';
 import { consumeRestartIntent } from '../services/restart-intent-store.js';
 import { countActiveSessionsOnDisk } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
+import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 export const GITHUB_REPO = 'deepcoldy/botmux';
 
@@ -31,36 +32,38 @@ function vtag(v: string): string {
 }
 
 /** The human-facing markdown body of the report. Pure — unit tested. */
-export function buildRestartReportText(input: RestartReportInput): string {
+export function buildRestartReportText(input: RestartReportInput, locale?: Locale): string {
   const lines: string[] = [];
-  lines.push(input.kind === 'update' ? '🔄 **botmux 已更新并重启**' : '🔄 **botmux 已重启**');
+  lines.push(input.kind === 'update'
+    ? t('restart.updated_restarted', undefined, locale)
+    : t('restart.restarted', undefined, locale));
 
   if (input.kind === 'update' && input.oldVersion && input.newVersion) {
-    lines.push(`版本：${vtag(input.oldVersion)} → ${vtag(input.newVersion)}`);
+    lines.push(t('restart.version_delta', { old: vtag(input.oldVersion), new: vtag(input.newVersion) }, locale));
   } else {
-    lines.push(`版本：${vtag(input.version)}`);
+    lines.push(t('restart.version', { version: vtag(input.version) }, locale));
   }
 
-  lines.push(`未结束会话：${input.sessionCount} 个`);
-  if (input.dashboardUrl) lines.push(`Dashboard：${input.dashboardUrl}`);
+  lines.push(t('restart.unfinished_sessions', { count: input.sessionCount }, locale));
+  if (input.dashboardUrl) lines.push(t('restart.dashboard', { url: input.dashboardUrl }, locale));
 
   if (input.kind === 'update' && input.changelog && input.changelog.trim()) {
     lines.push('');
-    lines.push('更新内容：');
+    lines.push(t('restart.changelog_label', undefined, locale));
     lines.push(input.changelog.trim());
   }
   return lines.join('\n');
 }
 
 /** Wrap the report body in a minimal Lark interactive card (JSON string). */
-export function buildRestartReportCard(input: RestartReportInput): string {
+export function buildRestartReportCard(input: RestartReportInput, locale?: Locale): string {
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
       template: input.kind === 'update' ? 'green' : 'blue',
-      title: { tag: 'plain_text', content: 'botmux 维护通知' },
+      title: { tag: 'plain_text', content: t('restart.card_title', undefined, locale) },
     },
-    elements: [{ tag: 'markdown', content: buildRestartReportText(input) }],
+    elements: [{ tag: 'markdown', content: buildRestartReportText(input, locale) }],
   });
 }
 
@@ -92,11 +95,13 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
   if (!intent) return; // no breadcrumb → crash/reboot → stay silent
   if (!w.ownerOpenId) { log('restart-report: no owner configured — skipping DM'); return; }
 
+  const locale = localeForBot(w.primaryLarkAppId);
   const sessionCount = countActiveSessionsOnDisk();
   const version = botmuxVersion();
   let changelog: string | undefined;
   if (intent.kind === 'update' && intent.newVersion) {
-    changelog = (await fetchChangelog(intent.newVersion)) ?? `详情：${releasesUrl(intent.newVersion)}`;
+    changelog = (await fetchChangelog(intent.newVersion))
+      ?? t('restart.changelog_link_fallback', { url: releasesUrl(intent.newVersion) }, locale);
   }
   const card = buildRestartReportCard({
     kind: intent.kind,
@@ -106,7 +111,7 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
     oldVersion: intent.oldVersion,
     newVersion: intent.newVersion,
     changelog,
-  });
+  }, locale);
   try {
     await w.sendCard(w.ownerOpenId, card);
     log(`restart-report sent (kind=${intent.kind}, sessions=${sessionCount})`);

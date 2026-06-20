@@ -35,6 +35,26 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
 const pending = new Map<string, InternalPending>();
 let dispatcher: AskCardDispatcher | null = null;
 
+/** IM-side canTalk predicate, wired by the daemon at bootstrap. Lets the broker
+ *  honour the bot's canTalk gate without importing Lark types: whoever may
+ *  address the bot in this chat may answer its `botmux ask`. Returns false until
+ *  wired, so an unwired broker authorizes no one (daemon always wires it). */
+let canTalkChecker: ((larkAppId: string, chatId: string, openId: string) => boolean) | null = null;
+
+/** Wire the canTalk predicate. Called once during daemon bootstrap. */
+export function setCanTalkChecker(
+  fn: (larkAppId: string, chatId: string, openId: string) => boolean,
+): void {
+  canTalkChecker = fn;
+}
+
+/** A click is authorized iff the clicker may `canTalk` to the bot in this chat.
+ *  `botmux ask` is a talk-level interaction (answering the agent's question),
+ *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers. */
+function isAuthorizedToAnswer(ask: InternalPending, by: string): boolean {
+  return canTalkChecker?.(ask.larkAppId, ask.chatId, by) ?? false;
+}
+
 /** Window during which a settled ask is still queryable so race-losers get a
  *  precise `already_settled` outcome (and the card click handler can show
  *  "已被 X 答了" instead of a generic "已失效"). After this window expires,
@@ -97,7 +117,6 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
       sessionId: input.sessionId,
-      approvers: input.approvers,
       questions: input.questions,
       createdAt,
       deadlineAt,
@@ -153,7 +172,7 @@ export function toggleAsk(args: {
   if (!ask) return 'stale';
   if (ask.nonce !== args.nonce) return 'stale';
   if (ask.settled) return 'already_settled';
-  if (!ask.approvers.has(args.by)) return 'unauthorized';
+  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
 
   const question = ask.questions[args.questionIndex];
   if (!question) return 'stale';
@@ -197,7 +216,7 @@ export function submitAsk(args: {
   if (!ask) return 'stale';
   if (ask.nonce !== args.nonce) return 'stale';
   if (ask.settled) return 'already_settled';
-  if (!ask.approvers.has(args.by)) return 'unauthorized';
+  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
 
   // 构建最终答案数组（按问题顺序）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
@@ -239,7 +258,7 @@ export function submitAsk(args: {
 /**
  * 提交一段自定义回复（用户在话题里直接打字作答，替代点按钮）并 settle。
  *
- * 校验：askId 存在 / 未 settle / `by` 在 approvers / text trim 后非空。
+ * 校验：askId 存在 / 未 settle / `by` 可 canTalk / text trim 后非空。
  * settle 为 `kind:'answered'`，各问 `answers` 为空数组、`comment` 携带 trim 后原文
  * （替代语义：没有任何选项被选中，CLI 侧 formatAnswer 用 comment 回落作答）。
  *
@@ -257,7 +276,7 @@ export function submitCustomReply(args: {
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
-  if (!ask.approvers.has(args.by)) return 'unauthorized';
+  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
   const text = args.text.trim();
   if (!text) return 'stale';
 
@@ -439,4 +458,5 @@ export function _resetForTest(): void {
   for (const ask of pending.values()) clearTimeout(ask.timeoutHandle);
   pending.clear();
   dispatcher = null;
+  canTalkChecker = null;
 }

@@ -21,8 +21,13 @@ export interface DaemonInfo {
 }
 
 const STALE_MS = 90_000;
+const DEFAULT_REFRESH_MS = 15_000;
 
 export type RegistryListener = (online: DaemonInfo[]) => void;
+
+export interface DaemonRegistryOptions {
+  refreshIntervalMs?: number;
+}
 
 /**
  * Watches the dashboard-daemons descriptor directory and exposes the
@@ -32,11 +37,19 @@ export class DaemonRegistry {
   private items = new Map<string, DaemonInfo>();
   private listeners = new Set<RegistryListener>();
   private watcher?: FSWatcher;
+  private poller?: ReturnType<typeof setInterval>;
+  private refreshIntervalMs: number;
 
-  constructor(private dir: string) {}
+  constructor(private dir: string, options: DaemonRegistryOptions = {}) {
+    this.refreshIntervalMs = options.refreshIntervalMs ?? DEFAULT_REFRESH_MS;
+  }
 
   async start(): Promise<void> {
     this.refresh();
+    if (!this.poller && this.refreshIntervalMs > 0) {
+      this.poller = setInterval(() => this.refresh(), this.refreshIntervalMs);
+      this.poller.unref?.();
+    }
     try {
       this.watcher = watch(this.dir, { persistent: true }, () => this.refresh());
     } catch {
@@ -48,6 +61,10 @@ export class DaemonRegistry {
   stop(): void {
     this.watcher?.close();
     this.watcher = undefined;
+    if (this.poller) {
+      clearInterval(this.poller);
+      this.poller = undefined;
+    }
   }
 
   list(): DaemonInfo[] {

@@ -77,12 +77,16 @@ export class TmuxBackend implements SessionBackend {
   /**
    * Tri-state existence probe. `tmux has-session` exits 0 when the session
    * exists and exits 1 (clean status, no signal) when the server answered but
-   * the session is absent — including "no server running", which means every
-   * pane is genuinely gone. That is an authoritative 'missing'. Anything else —
-   * a timeout (signal/killed) or a spawn failure (binary not on PATH → ENOENT,
-   * not executable → EACCES; neither carries a numeric exit status) — means we
-   * never got an answer → 'unknown', so a flaky/unavailable tmux can't be
-   * mistaken for a gone session.
+   * the session is absent — INCLUDING "no server running". Both collapse to
+   * 'missing' here. The caller MUST disambiguate before treating 'missing' as a
+   * destructive signal: a single gone pane (server still up) is a true zombie,
+   * but "no server running" means the *whole* server died (e.g. machine reboot)
+   * and every pane vanished at once — those sessions are still resumable from
+   * the CLI transcript on disk. Use `serverState()` to tell the two apart (the
+   * restore path does exactly this). Anything else — a timeout (signal/killed)
+   * or a spawn failure (binary not on PATH → ENOENT, not executable → EACCES;
+   * neither carries a numeric exit status) — means we never got an answer →
+   * 'unknown', so a flaky/unavailable tmux can't be mistaken for a gone session.
    *
    * Uses execFileSync (NOT a shell string): running tmux directly keeps a
    * missing/unrunnable binary as ENOENT/EACCES. A shell would instead surface
@@ -95,6 +99,35 @@ export class TmuxBackend implements SessionBackend {
       return 'exists';
     } catch (e: any) {
       if (e && typeof e.status === 'number' && !e.signal) return 'missing';
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Tri-state liveness of the tmux SERVER itself (not a specific session).
+   *
+   *   - 'running' — `tmux list-sessions` exited 0, so the server is up with ≥1
+   *                 session. (A tmux server with zero sessions doesn't exist —
+   *                 it self-terminates when its last session closes — so exit 0
+   *                 is an authoritative "server alive".)
+   *   - 'down'    — clean non-zero exit (no signal): "no server running on …".
+   *                 Every pane the server held is gone *at once*.
+   *   - 'unknown' — timeout / signal / spawn failure (ENOENT/EACCES): no answer.
+   *
+   * Why this matters: `probeSession` returns 'missing' BOTH when the server is
+   * up but one session is gone AND when the whole server is down (machine
+   * reboot). Those are very different — a reboot wipes every bmx-* pane
+   * simultaneously, but the CLI transcripts on disk are still resumable. The
+   * restore path uses this to avoid mass-closing every session on the first
+   * boot after a reboot (which would otherwise read each pane as an
+   * authoritative 'missing' zombie and tear it down).
+   */
+  static serverState(): 'running' | 'down' | 'unknown' {
+    try {
+      execFileSync('tmux', ['list-sessions'], { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 });
+      return 'running';
+    } catch (e: any) {
+      if (e && typeof e.status === 'number' && !e.signal) return 'down';
       return 'unknown';
     }
   }
@@ -502,6 +535,11 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   // Seed CLI（Claude Code fork）的数据根目录。worker 为 seed 注入它指向 seed 自己的
   // `.claude-runtime`，bridge 才能盯对文件；不进白名单 tmux pane 就拿不到。
   'CLAUDE_CONFIG_DIR',
+  // cjadk wrapperCli（`cjadk <agent>`）启动时 worker 注入 `0`，让 cjadk 跑非交互模式
+  // （跳过启动选择器、清掉吃首条/碎裂多行的输入怪癖），对齐 cjadk 官方 `cjadk feishu`
+  // wrapper。只有 cjadk 启动会被设上此值，其它 bot 不带 → 不进白名单 tmux pane 拿不到，
+  // cjadk 就回到交互模式（本次 bug 的根因）。
+  'CJADK_INTERACTIVE',
 ] as const;
 
 /**

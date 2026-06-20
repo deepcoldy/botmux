@@ -38,3 +38,16 @@ export function hookCommandFor(cliId: string): string {
   const { cmd, args } = hookCommandParts(cliId);
   return `"${cmd}" "${args[0]}" ${args.slice(1).join(' ')}`;
 }
+
+/**
+ * 构造 Claude 家族 `SessionStart` hook 的 **shell 命令字符串** → `botmux session-ready`。
+ * 与 `hookCommandFor` 同源的路径解析与加引号策略（仅可执行路径与 cli.js 路径加引号），
+ * 因为它被写进 Claude 进程级 `--settings` 的 `command` 字段、由 Claude 经 shell 执行。
+ *
+ * 无 cliId 参数：session-ready 只靠 hook 子进程继承的 `BOTMUX_SESSION_ID` /
+ * `BOTMUX_LARK_APP_ID` env 定位会话与 daemon，不需要 CLI 类型。
+ */
+export function sessionReadyHookCommand(): string {
+  const cliEntry = join(__dirname, '..', 'cli.js');
+  return `"${process.execPath}" "${cliEntry}" session-ready`;
+}

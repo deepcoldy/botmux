@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/scheduler.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseNaturalSchedule, parseSchedule, computeNextRun } from '../src/core/scheduler.js';
+import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode } from '../src/core/scheduler.js';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
@@ -183,6 +183,62 @@ describe('Minute-based schedules', () => {
 });
 
 // ─── Prompt cleaning (给我/帮我 prefix removal, quote stripping) ─────────────
+
+describe('extractDeliveryMode (新话题 keyword)', () => {
+  it('strips leading 新话题 and resolves new-topic', () => {
+    expect(extractDeliveryMode('新话题 帮我看AI新闻')).toEqual({ deliver: 'new-topic', prompt: '帮我看AI新闻' });
+  });
+
+  it('accepts 每次新话题 variant', () => {
+    expect(extractDeliveryMode('每次新话题：生成日报')).toEqual({ deliver: 'new-topic', prompt: '生成日报' });
+  });
+
+  it('accepts 新开话题 variant', () => {
+    expect(extractDeliveryMode('新开话题 跑构建')).toEqual({ deliver: 'new-topic', prompt: '跑构建' });
+  });
+
+  it('accepts 开新话题 (开 before 新)', () => {
+    expect(extractDeliveryMode('开新话题 生成日报')).toEqual({ deliver: 'new-topic', prompt: '生成日报' });
+  });
+
+  it('accepts 每次开新话题 (Codex P2 missed variant)', () => {
+    expect(extractDeliveryMode('每次开新话题 生成日报')).toEqual({ deliver: 'new-topic', prompt: '生成日报' });
+  });
+
+  it('accepts 每次开一个新话题 (Codex P2 missed variant)', () => {
+    expect(extractDeliveryMode('每次开一个新话题 生成日报')).toEqual({ deliver: 'new-topic', prompt: '生成日报' });
+  });
+
+  it('accepts 新开一个话题 variant', () => {
+    expect(extractDeliveryMode('新开一个话题 跑构建')).toEqual({ deliver: 'new-topic', prompt: '跑构建' });
+  });
+
+  it('accepts 每天/每日 prefix variants', () => {
+    expect(extractDeliveryMode('每天新话题 早报')).toEqual({ deliver: 'new-topic', prompt: '早报' });
+    expect(extractDeliveryMode('每日开新话题 晚报')).toEqual({ deliver: 'new-topic', prompt: '晚报' });
+  });
+
+  it('does NOT match 新闻话题 (新 not immediately tied to 话题)', () => {
+    expect(extractDeliveryMode('新闻话题汇总')).toEqual({ deliver: 'origin', prompt: '新闻话题汇总' });
+  });
+
+  it('accepts english new-topic / new topic', () => {
+    expect(extractDeliveryMode('new-topic: daily report')).toEqual({ deliver: 'new-topic', prompt: 'daily report' });
+    expect(extractDeliveryMode('new topic - run build')).toEqual({ deliver: 'new-topic', prompt: 'run build' });
+  });
+
+  it('leaves normal prompt as origin, unchanged', () => {
+    expect(extractDeliveryMode('帮我看AI新闻')).toEqual({ deliver: 'origin', prompt: '帮我看AI新闻' });
+  });
+
+  it('does not treat a prompt that merely mentions 话题 mid-sentence as new-topic', () => {
+    expect(extractDeliveryMode('总结这个话题的讨论')).toEqual({ deliver: 'origin', prompt: '总结这个话题的讨论' });
+  });
+
+  it('keyword with nothing after it stays origin (degenerate)', () => {
+    expect(extractDeliveryMode('新话题')).toEqual({ deliver: 'origin', prompt: '新话题' });
+  });
+});
 
 describe('Prompt cleaning', () => {
   it('removes 给我 prefix', () => {

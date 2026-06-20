@@ -38,10 +38,19 @@ type OnboardingJob = {
   message?: string;
 };
 
-type CliOption = { id: string; label: string };
+type CliOption = {
+  id: string;
+  label: string;
+  // ttadk 网关项 (后端 /api/cli-options 标注): 选中时模型框默认成 ttadk 默认模型 + 挂候选.
+  gateway?: 'ttadk';
+  acceptsModel?: boolean; // ttadk 子命令是否接受 -m (CoCo 为 false)
+};
 
 let dialog: HTMLDialogElement | null = null;
 let pollTimer: number | null = null;
+// ttadk 模型默认值 + 候选 (随 /api/cli-options 一起拉取, 单一事实源在 cli-selection).
+let ttadkModelDefault = 'glm-5.1';
+let ttadkModelSuggestions: string[] = [];
 
 function stopPolling(): void {
   if (pollTimer !== null) {
@@ -138,9 +147,56 @@ async function fetchCliOptions(): Promise<CliOption[]> {
   try {
     const res = await fetch('/api/cli-options');
     const body = await res.json();
-    if (res.ok && Array.isArray(body?.options)) return body.options as CliOption[];
+    if (res.ok && Array.isArray(body?.options)) {
+      if (typeof body.ttadkModelDefault === 'string' && body.ttadkModelDefault.trim()) {
+        ttadkModelDefault = body.ttadkModelDefault.trim();
+      }
+      if (Array.isArray(body.ttadkModelSuggestions)) {
+        ttadkModelSuggestions = body.ttadkModelSuggestions.filter((s: unknown): s is string => typeof s === 'string');
+      }
+      return body.options as CliOption[];
+    }
   } catch { /* fall through to default */ }
   return [{ id: 'claude-code', label: 'Claude' }];
+}
+
+/**
+ * 根据当前选中的 CLI 调整模型输入框：
+ *   - ttadk 网关 (接受 -m): 候选下拉 + 默认值 (空框时回填 ttadk 默认模型)
+ *   - ttadk CoCo (不接受 -m): 禁用并提示无需模型
+ *   - 其它 CLI: 普通占位, 留空走 CLI 默认模型
+ * 仅在切换到「之前不是同类」时回填默认值, 不覆盖用户已手填的内容。
+ */
+function syncModelFieldForCli(opts: CliOption[]): void {
+  const d = dialog;
+  if (!d) return;
+  const cli = d.querySelector<HTMLSelectElement>('#ob-cli');
+  const model = d.querySelector<HTMLInputElement>('#ob-model');
+  const list = d.querySelector<HTMLDataListElement>('#ob-model-suggestions');
+  if (!cli || !model) return;
+  const opt = opts.find(o => o.id === cli.value);
+  const isTtadk = opt?.gateway === 'ttadk';
+  const acceptsModel = isTtadk && opt?.acceptsModel !== false;
+
+  if (isTtadk && !acceptsModel) {
+    // CoCo: ttadk 不接受 -m
+    model.value = '';
+    model.disabled = true;
+    model.placeholder = t('botOnboarding.modelTtadkCocoPlaceholder');
+    return;
+  }
+  model.disabled = false;
+  if (acceptsModel) {
+    if (list) list.innerHTML = ttadkModelSuggestions.map(m => `<option value="${escapeHtml(m)}"></option>`).join('');
+    model.placeholder = t('botOnboarding.modelTtadkPlaceholder').replace('{model}', ttadkModelDefault);
+    // 切到 ttadk 且用户没手填 → 回填默认模型, 让「不写 wrapper、开箱即用」成立.
+    if (!model.value.trim()) model.value = ttadkModelDefault;
+  } else {
+    if (list) list.innerHTML = '';
+    model.placeholder = t('botOnboarding.modelPlaceholder');
+    // 从 ttadk 切回普通 CLI: 清掉之前回填的 ttadk 默认模型, 避免误带.
+    if (model.value.trim() === ttadkModelDefault) model.value = '';
+  }
 }
 
 function renderForm(options: CliOption[], errorMsg?: string): void {
@@ -165,7 +221,8 @@ function renderForm(options: CliOption[], errorMsg?: string): void {
       </label>
       <label class="onboarding-field">
         <span>${t('botOnboarding.modelLabel')}</span>
-        <input id="ob-model" type="text" placeholder="${t('botOnboarding.modelPlaceholder')}" autocomplete="off" spellcheck="false">
+        <input id="ob-model" type="text" list="ob-model-suggestions" placeholder="${t('botOnboarding.modelPlaceholder')}" autocomplete="off" spellcheck="false">
+        <datalist id="ob-model-suggestions"></datalist>
       </label>
       ${errorHtml}
       <menu class="onboarding-actions">
@@ -178,6 +235,10 @@ function renderForm(options: CliOption[], errorMsg?: string): void {
   const form = d.querySelector<HTMLFormElement>('#onboarding-form');
   const cancel = d.querySelector<HTMLButtonElement>('#ob-cancel');
   cancel?.addEventListener('click', () => d.close());
+  // ttadk 网关项: 选中时把模型框默认成 ttadk 默认模型 + 挂候选 (CoCo 禁用).
+  const cliSelect = d.querySelector<HTMLSelectElement>('#ob-cli');
+  cliSelect?.addEventListener('change', () => syncModelFieldForCli(options));
+  syncModelFieldForCli(options);
   form?.addEventListener('submit', ev => {
     ev.preventDefault();
     const cliId = d.querySelector<HTMLSelectElement>('#ob-cli')?.value ?? '';

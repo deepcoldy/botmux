@@ -16,7 +16,7 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-import { sweepIdleWorkers } from '../src/core/idle-worker-sweeper.js';
+import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from '../src/core/idle-worker-sweeper.js';
 
 function ds(sessionId: string, backendType: string, lastMessageAt: number, worker = {}) {
   return {
@@ -39,9 +39,35 @@ function ds(sessionId: string, backendType: string, lastMessageAt: number, worke
   } as any;
 }
 
-describe('sweepIdleWorkers', () => {
-  it('does nothing while live workers are at or under the resolved budget', () => {
-    const now = 1_000_000;
+const now = 1_000_000;
+
+describe('sweepIdleWorkers (per-bot count cap)', () => {
+  it('falls back to the default cap (30) when the bot has no explicit value', () => {
+    expect(DEFAULT_MAX_LIVE_WORKERS).toBe(30);
+    // DEFAULT_MAX_LIVE_WORKERS + 2 sessions, oldest first by lastMessageAt.
+    const n = DEFAULT_MAX_LIVE_WORKERS + 2;
+    const entries: [string, any][] = [];
+    for (let i = 0; i < n; i++) entries.push([`s${i}`, ds(`s${i}`, 'tmux', now - (n - i) * 60_000)]);
+    const activeSessions = new Map<string, any>(entries);
+
+    // No explicit cap → default 30 → suspend the 2 oldest (s0, s1).
+    const suspended = sweepIdleWorkers(activeSessions, {});
+    expect(suspended.map(s => s.sessionId)).toEqual(['s0', 's1']);
+    expect(activeSessions.get('s0').worker).toBe(null);
+    expect(activeSessions.get('s2').worker).not.toBe(null);
+  });
+
+  it('treats an explicit ≤0 cap as the unlimited escape hatch (never suspends)', () => {
+    const make = () => new Map<string, any>([
+      ['a', ds('a', 'tmux', now - 90 * 60_000)],
+      ['b', ds('b', 'herdr', now - 80 * 60_000)],
+      ['c', ds('c', 'zellij', now - 70 * 60_000)],
+    ]);
+    expect(sweepIdleWorkers(make(), { maxLiveWorkers: 0 })).toEqual([]);
+    expect(sweepIdleWorkers(make(), { maxLiveWorkers: -5 })).toEqual([]);
+  });
+
+  it('does nothing while live workers are at or under the cap', () => {
     const activeSessions = new Map<string, any>([
       ['a', ds('a', 'tmux', now - 60 * 60_000)],
       ['b', ds('b', 'herdr', now - 50 * 60_000)],
@@ -49,20 +75,14 @@ describe('sweepIdleWorkers', () => {
       ['d', ds('d', 'tmux', now - 2 * 60_000)],
     ]);
 
-    const suspended = sweepIdleWorkers(activeSessions, {
-      now,
-      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000 },
-    });
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 4 });
 
     expect(suspended).toEqual([]);
     expect(activeSessions.get('a').worker).not.toBe(null);
-    expect(activeSessions.get('b').worker).not.toBe(null);
-    expect(activeSessions.get('c').worker).not.toBe(null);
     expect(activeSessions.get('d').worker).not.toBe(null);
   });
 
-  it('uses the resolved policy and suspends oldest idle workers over the live-worker budget', () => {
-    const now = 1_000_000;
+  it('suspends the oldest (by lastMessageAt) sessions down to the cap', () => {
     const activeSessions = new Map<string, any>([
       ['a', ds('a', 'tmux', now - 90 * 60_000)],
       ['b', ds('b', 'herdr', now - 80 * 60_000)],
@@ -70,74 +90,52 @@ describe('sweepIdleWorkers', () => {
       ['d', ds('d', 'tmux', now - 60 * 60_000)],
       ['e', ds('e', 'herdr', now - 50 * 60_000)],
       ['f', ds('f', 'zellij', now - 40 * 60_000)],
-      ['g', ds('g', 'tmux', now - 35 * 60_000)],
-      ['h', ds('h', 'herdr', now - 31 * 60_000)],
-      ['i', ds('i', 'zellij', now - 30 * 60_000)],
-      ['j', ds('j', 'tmux', now - 2 * 60_000)],
     ]);
 
-    const suspended = sweepIdleWorkers(activeSessions, {
-      now,
-      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000 },
-    });
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 4 });
 
     expect(suspended.map(s => s.sessionId)).toEqual(['a', 'b']);
-    expect(activeSessions.get('a').session.status).toBe('active');
-    expect(activeSessions.get('b').session.status).toBe('active');
-    expect(activeSessions.get('c').worker).not.toBe(null);
-    expect(activeSessions.get('j').worker).not.toBe(null);
-  });
-
-  it('honors configured max live workers and idle suspend threshold', () => {
-    const now = 1_000_000;
-    const activeSessions = new Map<string, any>([
-      ['a', ds('a', 'tmux', now - 120 * 60_000)],
-      ['b', ds('b', 'herdr', now - 90 * 60_000)],
-      ['c', ds('c', 'zellij', now - 45 * 60_000)],
-      ['d', ds('d', 'tmux', now - 20 * 60_000)],
-      ['e', ds('e', 'herdr', now - 10 * 60_000)],
-      ['f', ds('f', 'zellij', now - 5 * 60_000)],
-    ]);
-
-    const suspended = sweepIdleWorkers(activeSessions, {
-      now,
-      workerBudget: { maxLiveWorkers: 4, idleSuspendMs: 30 * 60_000 },
-    });
-
-    expect(suspended.map(s => s.sessionId)).toEqual(['a', 'b']);
+    expect(suspended.every(s => s.reason === 'live_worker_cap')).toBe(true);
     expect(activeSessions.get('a').worker).toBe(null);
     expect(activeSessions.get('b').worker).toBe(null);
     expect(activeSessions.get('c').worker).not.toBe(null);
-    expect(activeSessions.get('d').worker).not.toBe(null);
+    expect(activeSessions.get('f').worker).not.toBe(null);
   });
 
-  it('never suspends pty workers', () => {
-    const now = 1_000_000;
+  it('is purely count-based: suspends a recently-active session with NO idle-time threshold', () => {
+    // Both sessions are only a couple minutes idle. The old budget had a 30-min
+    // idle gate that would have suspended nothing here; the new policy caps by
+    // count alone, so the single oldest session is suspended down to the cap.
+    const activeSessions = new Map<string, any>([
+      ['a', ds('a', 'tmux', now - 2 * 60_000)],
+      ['b', ds('b', 'herdr', now - 1 * 60_000)],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 1 });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['a']);
+    expect(activeSessions.get('a').worker).toBe(null);
+    expect(activeSessions.get('b').worker).not.toBe(null);
+  });
+
+  it('never suspends pty (non-resumable) workers', () => {
     const activeSessions = new Map<string, any>([
       ['a', ds('a', 'pty', now - 60 * 60_000)],
       ['b', ds('b', 'pty', now - 60 * 60_000)],
       ['c', ds('c', 'pty', now - 60 * 60_000)],
-      ['d', ds('d', 'pty', now - 60 * 60_000)],
-      ['e', ds('e', 'pty', now - 60 * 60_000)],
-      ['f', ds('f', 'pty', now - 60 * 60_000)],
-      ['g', ds('g', 'pty', now - 60 * 60_000)],
-      ['h', ds('h', 'pty', now - 60 * 60_000)],
-      ['i', ds('i', 'pty', now - 60 * 60_000)],
-      ['j', ds('j', 'tmux', now - 60 * 60_000)],
+      ['d', ds('d', 'tmux', now - 60 * 60_000)],
     ]);
 
-    const suspended = sweepIdleWorkers(activeSessions, {
-      now,
-      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000 },
-    });
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 1 });
 
-    expect(suspended.map(s => s.sessionId)).toEqual(['j']);
+    // Cap 1, 4 live → wants to drop 3, but only the single tmux session is
+    // resumable, so only 'd' can be suspended.
+    expect(suspended.map(s => s.sessionId)).toEqual(['d']);
     expect(activeSessions.get('a').worker).not.toBe(null);
-    expect(activeSessions.get('i').worker).not.toBe(null);
+    expect(activeSessions.get('c').worker).not.toBe(null);
   });
 
-  it('does not suspend workers that are not idle', () => {
-    const now = 1_000_000;
+  it('never suspends a session that is mid-turn (lastScreenStatus !== idle)', () => {
     const activeSessions = new Map<string, any>([
       ['a', { ...ds('a', 'tmux', now - 90 * 60_000), lastScreenStatus: 'working' }],
       ['b', { ...ds('b', 'herdr', now - 80 * 60_000), lastScreenStatus: 'analyzing' }],
@@ -145,32 +143,20 @@ describe('sweepIdleWorkers', () => {
       ['d', { ...ds('d', 'tmux', now - 60 * 60_000), lastScreenStatus: undefined }],
       ['e', ds('e', 'herdr', now - 50 * 60_000)],
       ['f', ds('f', 'zellij', now - 40 * 60_000)],
-      ['g', ds('g', 'tmux', now - 35 * 60_000)],
-      ['h', ds('h', 'herdr', now - 31 * 60_000)],
-      ['i', ds('i', 'zellij', now - 30 * 60_000)],
-      ['j', ds('j', 'tmux', now - 2 * 60_000)],
     ]);
 
-    const suspended = sweepIdleWorkers(activeSessions, {
-      now,
-      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000 },
-    });
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 4 });
 
+    // a–d are busy → only the two idle ones (e, f) are eligible.
     expect(suspended.map(s => s.sessionId)).toEqual(['e', 'f']);
     expect(activeSessions.get('a').worker).not.toBe(null);
-    expect(activeSessions.get('b').worker).not.toBe(null);
-    expect(activeSessions.get('c').worker).not.toBe(null);
     expect(activeSessions.get('d').worker).not.toBe(null);
   });
 
-  it('never suspends adopt sessions even when idle, over-budget, and on a suspendable backend', () => {
-    const now = 1_000_000;
-    // 'a' and 'b' are the oldest idle workers — without the adopt guard they
-    // would be the first picked. They are adopt sessions (one marked via the
-    // runtime mirror ds.adoptedFrom, one via the persisted ds.session.adoptedFrom)
-    // so they must be skipped; the sweeper falls through to the oldest *normal*
-    // sessions ('c', 'd') instead. Suspending an adopt session would break it:
-    // the worker-null resume path re-forks via forkWorker, not forkAdoptWorker.
+  it('never suspends adopt sessions even when oldest and over cap', () => {
+    // 'a' (runtime mirror) and 'b' (persisted marker) are the oldest, but are
+    // adopt sessions → skipped; the sweeper falls through to the oldest normal
+    // sessions ('c', 'd').
     const adoptRuntime = { ...ds('a', 'tmux', now - 90 * 60_000), adoptedFrom: { tmuxTarget: 'user:0.1' } };
     const adoptPersisted = ds('b', 'herdr', now - 80 * 60_000);
     adoptPersisted.session.adoptedFrom = { herdrTarget: 'user-herdr' };
@@ -181,36 +167,23 @@ describe('sweepIdleWorkers', () => {
       ['d', ds('d', 'tmux', now - 60 * 60_000)],
       ['e', ds('e', 'herdr', now - 50 * 60_000)],
       ['f', ds('f', 'zellij', now - 40 * 60_000)],
-      ['g', ds('g', 'tmux', now - 35 * 60_000)],
-      ['h', ds('h', 'herdr', now - 31 * 60_000)],
-      ['i', ds('i', 'zellij', now - 30 * 60_000)],
-      ['j', ds('j', 'tmux', now - 2 * 60_000)],
     ]);
 
-    const suspended = sweepIdleWorkers(activeSessions, {
-      now,
-      workerBudget: { maxLiveWorkers: 8, idleSuspendMs: 30 * 60_000 },
-    });
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 4 });
 
     expect(suspended.map(s => s.sessionId)).toEqual(['c', 'd']);
     expect(activeSessions.get('a').worker).not.toBe(null);
     expect(activeSessions.get('b').worker).not.toBe(null);
   });
 
-  it('does not suspend an adopt session even if it is the only over-budget candidate', () => {
-    const now = 1_000_000;
-    // Budget 1, but the single eligible-looking over-budget worker is an adopt
-    // session → nothing is suspended (an adopt session is never a candidate).
+  it('does not suspend an adopt session even if it is the only over-cap candidate', () => {
     const adopt = { ...ds('a', 'tmux', now - 90 * 60_000), adoptedFrom: { tmuxTarget: 'user:0.1' } };
     const activeSessions = new Map<string, any>([
       ['a', adopt],
-      ['b', ds('b', 'tmux', now - 2 * 60_000)], // recent, under idle threshold
+      ['b', ds('b', 'pty', now - 2 * 60_000)], // pty → also never suspendable
     ]);
 
-    const suspended = sweepIdleWorkers(activeSessions, {
-      now,
-      workerBudget: { maxLiveWorkers: 1, idleSuspendMs: 30 * 60_000 },
-    });
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 1 });
 
     expect(suspended).toEqual([]);
     expect(activeSessions.get('a').worker).not.toBe(null);

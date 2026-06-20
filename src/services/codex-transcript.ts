@@ -28,7 +28,7 @@ import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readl
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
-import { codexSessionsRoot } from './codex-paths.js';
+import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 
 const IS_LINUX = platform() === 'linux';
 
@@ -198,6 +198,65 @@ export function findCodexRolloutBySessionId(cliSessionId: string): string | unde
         return full;
       }
     }
+  }
+  return undefined;
+}
+
+function codexHistoryCliSessionId(parsed: unknown): string | undefined {
+  return parsed && typeof parsed === 'object' && typeof (parsed as any).session_id === 'string'
+    ? (parsed as any).session_id
+    : undefined;
+}
+
+/** history.jsonl grows without bound; recent sessions live at the end, so a
+ *  bounded tail window keeps the lookup O(window) instead of O(file). */
+const HISTORY_TAIL_BYTES = 4 * 1024 * 1024;
+
+/** Find the newest Codex session whose history entry includes a botmux
+ *  session id. Fresh dashboard rows often only know botmux's UUID; Codex's
+ *  rollout filename uses its own UUID, and history.jsonl is the durable bridge
+ *  between the two. Only the trailing `maxTailBytes` of the file is scanned. */
+export function findCodexSessionIdByBotmuxSessionId(
+  botmuxSessionId: string,
+  opts?: { maxTailBytes?: number },
+): string | undefined {
+  if (!botmuxSessionId) return undefined;
+  const historyPath = codexHistoryPath();
+  if (!existsSync(historyPath)) return undefined;
+  try {
+    const size = statSync(historyPath).size;
+    const maxTailBytes = Math.max(1, opts?.maxTailBytes ?? HISTORY_TAIL_BYTES);
+    const start = Math.max(0, size - maxTailBytes);
+    const length = size - start;
+    const fd = openSync(historyPath, 'r');
+    const buf = Buffer.alloc(length);
+    try {
+      readSync(fd, buf, 0, length, start);
+    } finally {
+      closeSync(fd);
+    }
+    let text = buf.toString('utf8');
+    if (start > 0) {
+      // The window almost certainly opens mid-line — drop the partial line.
+      const firstNewline = text.indexOf('\n');
+      text = firstNewline === -1 ? '' : text.slice(firstNewline + 1);
+    }
+    const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
+    const lines = text.trimEnd().split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!;
+      if (!line.includes(marker)) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
+          return codexHistoryCliSessionId(parsed);
+        }
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    return undefined;
   }
   return undefined;
 }

@@ -400,6 +400,43 @@ describe('scanProjects', () => {
     expect(wt.branch).toBe('feature-branch');
   });
 
+  it('should omit linked worktrees when includeWorktrees is false', () => {
+    const repoPath = mkRepo('my-repo');
+    const worktreePath = '/tmp/my-repo-worktree-abc';
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --abbrev-ref HEAD')) {
+        return 'main\n';
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        if (opts?.cwd === repoPath) {
+          return [
+            `worktree ${repoPath}`,
+            'branch refs/heads/main',
+            '',
+            `worktree ${worktreePath}`,
+            'branch refs/heads/feature-branch',
+            '',
+          ].join('\n');
+        }
+        return `worktree ${opts?.cwd}\nbranch refs/heads/main\n\n`;
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot, 3, { includeWorktrees: false });
+
+    expect(results).toEqual([
+      {
+        name: 'my-repo',
+        path: repoPath,
+        type: 'repo',
+        branch: 'main',
+      },
+    ]);
+  });
+
   it('should not include the main worktree as a separate entry', () => {
     const repoPath = mkRepo('my-repo');
 
@@ -765,6 +802,36 @@ describe('scanMultipleProjects', () => {
       const firstWtIdx = results.findIndex(r => r.type === 'worktree');
       expect(lastRepoIdx).toBeLessThan(firstWtIdx);
     }
+  });
+
+  it('should pass includeWorktrees to individual scanProjects calls', () => {
+    const repoPath = mkRepo('repo-with-worktree');
+    const worktreePath = '/tmp/repo-with-worktree-feature';
+
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --abbrev-ref HEAD')) {
+        return 'main\n';
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        if (opts?.cwd === repoPath) {
+          return [
+            `worktree ${repoPath}`,
+            'branch refs/heads/main',
+            '',
+            `worktree ${worktreePath}`,
+            'branch refs/heads/feature',
+            '',
+          ].join('\n');
+        }
+        return `worktree ${opts?.cwd}\nbranch refs/heads/main\n\n`;
+      }
+      return '';
+    });
+
+    const results = scanMultipleProjects([tempRoot], 3, { includeWorktrees: false });
+
+    expect(results.map(r => r.path)).toEqual([repoPath]);
   });
 
   it('should handle empty baseDirs array', () => {

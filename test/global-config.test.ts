@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import {
   globalConfigPath,
   mergeDashboardConfig,
+  mergeGlobalConfig,
   readGlobalConfig,
 } from '../src/global-config.js';
 
@@ -33,12 +34,60 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ openTerminalInFeishu: true });
   });
 
+  it('reads repoPickerMode as a top-level global enum', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      repoPickerMode: 'repos',
+      dashboard: {
+        openTerminalInFeishu: true,
+      },
+    }));
+
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('drops invalid repoPickerMode values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ repoPickerMode: 'grouped' }));
+    expect(readGlobalConfig().repoPickerMode).toBeUndefined();
+  });
+
+  it('reads global skill project trust policy and delivery default', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      skills: {
+        trustProjectSkills: 'trusted',
+        delivery: 'prompt',
+      },
+    }));
+
+    expect(readGlobalConfig().skills).toEqual({
+      trustProjectSkills: 'trusted',
+      delivery: 'prompt',
+    });
+  });
+
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }));
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(true); // primes the TTL cache
     mergeDashboardConfig({ publicReadOnly: false });
     // Same-process read-after-write must not serve the cached pre-merge value.
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
+  });
+
+  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
+    // proxy persisted by mergeGlobalConfig was never read back by the downloader.
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+    mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
+    expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');
+    // Clearing (null) removes it again.
+    mergeGlobalConfig({ httpProxy: null });
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+  });
+
+  it('ignores a non-string / blank httpProxy', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: 123 }));
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+    writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: '   ' }));
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
   });
 
   it('merge writes atomically and leaves no tmp file behind', () => {

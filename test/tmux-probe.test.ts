@@ -81,3 +81,26 @@ describe('TmuxBackend.probeSession', () => {
     expect(TmuxBackend.hasSession(NAME)).toBe(false);
   });
 });
+
+describe('TmuxBackend.serverState', () => {
+  it('returns "running" when list-sessions succeeds (exit 0 ⇒ server up with ≥1 session)', () => {
+    mockedExecFileSync.mockImplementation((() => '') as any);
+    expect(TmuxBackend.serverState()).toBe('running');
+  });
+
+  it('returns "down" on clean non-zero exit ("no server running")', () => {
+    // This is the host-reboot signal: the whole tmux server is gone.
+    mockedExecFileSync.mockImplementation((() => { throw err({ status: 1, signal: null }); }) as any);
+    expect(TmuxBackend.serverState()).toBe('down');
+  });
+
+  it('returns "unknown" when tmux is not found (ENOENT), NOT "down"', () => {
+    mockedExecFileSync.mockImplementation((() => { throw err({ code: 'ENOENT', status: null, signal: null }); }) as any);
+    expect(TmuxBackend.serverState()).toBe('unknown');
+  });
+
+  it('returns "unknown" on timeout (killed by signal), NOT "down"', () => {
+    mockedExecFileSync.mockImplementation((() => { throw err({ signal: 'SIGTERM', status: null, killed: true }); }) as any);
+    expect(TmuxBackend.serverState()).toBe('unknown');
+  });
+});

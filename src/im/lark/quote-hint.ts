@@ -11,14 +11,17 @@
  * (no active session yet → handleNewTopic) surface the same hint as follow-ups
  * in an existing session (handleThreadReply).
  */
+import { t, type Locale } from '../../i18n/index.js';
+
 export function buildQuoteHint(
   parsed: { parentId?: string; messageId: string },
   scope: 'thread' | 'chat',
   anchor: string,
+  locale?: Locale,
 ): string {
   const quotedId = parsed.parentId;
   if (!quotedId) return '';
   const threadRoot = scope === 'thread' ? anchor : null;
   if (quotedId === threadRoot || quotedId === parsed.messageId) return '';
-  return `[用户引用了消息 用 botmux quoted ${quotedId} 查看]\n`;
+  return `${t('prompt.quote_hint', { id: quotedId }, locale)}\n`;
 }

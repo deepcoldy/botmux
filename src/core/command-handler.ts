@@ -2,38 +2,52 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
+import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
+import { createRepoWorktree } from '../services/git-worktree.js';
+import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
+import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
+import type { CliId, ResumableSession } from '../adapters/cli/types.js';
+import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
+import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { UserTokenMissingError } from '../im/lark/client.js';
+import {
+  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession,
+  type CommentTriggerMode,
+} from '../services/doc-subs-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
-  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, type ConfigEffect,
+  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, coerceConfigValue, type ConfigEffect,
 } from '../services/bot-config-store.js';
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
+import { buildClosedSessionCard } from './closed-session-card.js';
+import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
+import { canOperate } from '../im/lark/event-dispatcher.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
 import { writeRoleFile, deleteRoleFile, resolveRole, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
 import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
@@ -41,10 +55,17 @@ import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { runSkillsImCommand } from './skills/im-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/dashboard']);
+// DAEMON_COMMANDS / PASSTHROUGH_COMMANDS / normalizePassthroughCommand now live
+// in the leaf ./passthrough-commands.js so the config store can share the
+// normalization without a circular import; imported for internal use and
+// re-exported to keep callers (daemon.ts, tests) importing from command-handler
+// unchanged.
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, normalizePassthroughCommand, parseCustomPassthroughInput } from './passthrough-commands.js';
+export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -54,39 +75,41 @@ export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help'
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills']);
 
-/**
- * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
- * Claude Code's `/compact`, `/model`, `/usage`). The daemon does NOT handle
- * these — it just relays them to the worker via a raw_input IPC message,
- * bypassing the normal prompt-wrapping and bracketed-paste path so the CLI's
- * own slash-command parser sees them.
- */
-export const PASSTHROUGH_COMMANDS = new Set([
-  '/compact', '/model', '/clear', '/plugin', '/usage',
-  // 只读 / 低副作用，飞书卡片里能直接吐文本：
-  '/context', '/cost', '/mcp', '/diff',
-  '/code-review', '/security-review', '/review',
-  // Codex：/btw 向当前会话追加一条旁注/引导消息
-  '/btw',
-]);
+export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
+  if (!larkAppId) return [];
+  try {
+    const bot = getBot(larkAppId);
+    const adapter = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride);
+    const normalized = (adapter.defaultPassthroughCommands ?? [])
+      .map(normalizePassthroughCommand)
+      .filter((c): c is string => !!c);
+    return [...new Set(normalized)];
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Effective passthrough set for a bot: the fixed {@link PASSTHROUGH_COMMANDS}
- * plus the bot's `customPassthroughCommands` (bots.json). Entries that would
- * shadow a botmux daemon command are dropped — daemon commands must keep their
- * daemon semantics, and passthrough is checked BEFORE DAEMON_COMMANDS in the
- * router, so an un-filtered custom `/status` would hijack the daemon's own.
+ * plus adapter-scoped defaults and the bot's `customPassthroughCommands`
+ * (bots.json). Entries that would shadow a botmux daemon command are dropped —
+ * daemon commands must keep their daemon semantics, and passthrough is checked
+ * BEFORE DAEMON_COMMANDS in the router, so an un-filtered custom `/status`
+ * would hijack the daemon's own.
  * Unknown / no bot → falls back to the builtin set unchanged.
  */
 export function resolvePassthroughCommands(larkAppId?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
+  for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId)) {
+    effective.add(c);
+  }
   try {
     for (const c of getBot(larkAppId).config.customPassthroughCommands ?? []) {
-      if (DAEMON_COMMANDS.has(c)) continue; // never shadow a daemon command
-      effective.add(c);
+      const normalized = normalizePassthroughCommand(c);
+      if (normalized) effective.add(normalized);
     }
   } catch {
     /* unknown bot — builtin set only */
@@ -285,11 +308,12 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
   });
 }
 
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
 }
@@ -489,28 +513,36 @@ async function handleScheduleCommand(
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
+    // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
+    const { deliver, prompt: schedPrompt } = scheduler.extractDeliveryMode(parsed.prompt);
+    const schedName = deliver === 'new-topic'
+      ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
+      : parsed.name;
     const task = scheduler.addTask({
-      name: parsed.name,
+      name: schedName,
       schedule: trimmed,
       parsed: parsed.parsed,
-      prompt: parsed.prompt,
+      prompt: schedPrompt,
       workingDir,
       chatId,
       rootMessageId: taskScope === 'thread' ? rootId : undefined,
       scope: taskScope,
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
+      deliver,
     });
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString(timeLocale, { timeZone }) : 'N/A';
-    await sessionReply(rootId, t('schedule.created', {
+    const createdMsg = t('schedule.created', {
       id: task.id,
       name: task.name,
       rule: parsed.parsed.display,
       prompt: task.prompt,
       dir: expandHome(workingDir),
       next: nextStr,
-    }, loc));
+    }, loc);
+    const deliverNote = deliver === 'new-topic' ? '\n' + t('schedule.deliver_new_topic', undefined, loc) : '';
+    await sessionReply(rootId, createdMsg + deliverNote);
     return;
   }
 
@@ -619,8 +651,14 @@ async function handleConfigCommand(
   const cardLoc = cardLocaleArg(sub);
   if (!sub || cardLoc) {
     const renderLoc: Locale = cardLoc ?? loc;
-    let modelChoices: readonly string[] = [];
-    try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    // ttadk 网关 bot：模型候选用 ttadk 网关模型（glm-5.1…），不是底层适配器的
+    // opus/gpt-5（那会被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
+    // 非 ttadk（返回 null）才回落底层适配器自己的 modelChoices。
+    const ttadkChoices = ttadkConfigModelChoices(bot.config.wrapperCli);
+    let modelChoices: readonly string[] = ttadkChoices ?? [];
+    if (ttadkChoices === null) {
+      try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    }
     const data = getConfigCardData(larkAppId, modelChoices);
     if (!data) { await reply(buildConfigHelp(renderLoc)); return; }
     const cardJson = buildConfigCard(data, renderLoc);
@@ -664,8 +702,22 @@ async function handleConfigCommand(
     const rawValue = parts.slice(2).join(' ').trim();
     if (!rawValue) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
 
-    let value: string | boolean;
+    let value: unknown;
     switch (spec.kind) {
+      case 'stringList': {
+        const arr = parseCustomPassthroughInput(rawValue);
+        if (arr.length === 0) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
+        value = arr;
+        break;
+      }
+      case 'number': {
+        // 统一走 coerceConfigValue 的 number 校验（正整数），避免文字路径把 '6'
+        // 当字符串写进 maxLiveWorkers（与 card/API 路径同口径）。
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.invalid_number', { field: spec.key, value: rawValue }, loc)); return; }
+        value = coerced.value;
+        break;
+      }
       case 'boolean': {
         const b = parseBooleanValue(rawValue);
         if (b === undefined) { await reply(t('cmd.config.invalid_bool', { field: spec.key, value: rawValue }, loc)); return; }
@@ -695,6 +747,12 @@ async function handleConfigCommand(
         value = rawValue; // 存原始（保留 ~），与 workingDir 落盘一致；使用处再 expandHome
         break;
       }
+      case 'json': {
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.write_failed', { reason: coerced.reason }, loc)); return; }
+        value = coerced.value;
+        break;
+      }
       default: // 'string'
         value = rawValue;
     }
@@ -711,7 +769,7 @@ async function handleConfigCommand(
 // ─── Main command handler ────────────────────────────────────────────────────
 
 /**
- * Handle `/card` (owner-only). Resolves the active session itself, so off/on
+ * Handle `/card` (operator-only). Resolves the active session itself, so off/on
  * work WITHOUT one -- they only toggle the per-chat `noCardChats` config. A
  * summon (show/bare) needs a live session.
  *
@@ -734,9 +792,12 @@ export async function handleCardCommand(
   const loc = localeForBot(larkAppId);
   const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
 
-  const ownerOpenId = getOwnerOpenId(larkAppId);
-  if (!ownerOpenId || !senderOpenId || senderOpenId !== ownerOpenId) {
-    await reply(t('cmd.card.owner_only', undefined, loc));
+  // /card is an operator command — gate on canOperate, the same model every other
+  // daemon command uses. Open mode (no owner/allowlist) → canOperate passes for
+  // everyone; configured → any allowedUser (owner or co-owner); talk-only grantees
+  // (chatGrant/globalGrant/oncall members) are never operators.
+  if (!canOperate(larkAppId, chatId, senderOpenId)) {
+    await reply(t('cmd.card.operator_only', undefined, loc));
     return;
   }
 
@@ -790,6 +851,54 @@ export async function handleCardCommand(
   await reply(t('cmd.card.usage', undefined, loc));
 }
 
+/**
+ * Handle `/term` (operator-only) — the slash-command twin of the "🔑 获取操作链接"
+ * card button. Privately hands the operator a writable (token-bearing) terminal
+ * card: an in-chat visible-to-you ephemeral card in plain groups, auto-falling back
+ * to a DM in topic / p2p chats. The link rides only that private channel — never the
+ * group. Gated identically to /card (`canOperate`), and strictly needs a live
+ * session whose terminal is up. Routed for both the new-topic path (daemon.ts) and
+ * the existing-session switch below.
+ */
+export async function handleTermLinkCommand(
+  rootId: string,
+  larkAppId: string,
+  chatId: string,
+  senderOpenId: string | undefined,
+  _content: string,
+  deps: CommandHandlerDeps,
+): Promise<void> {
+  const loc = localeForBot(larkAppId);
+  const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
+
+  // /term is an operator command that hands out a *writable* terminal link — gate
+  // on canOperate (same model as other daemon commands). senderOpenId must be
+  // present: open-mode canOperate passes even an undefined sender, but the writable
+  // card is delivered privately to that exact open_id.
+  if (!senderOpenId || !canOperate(larkAppId, chatId, senderOpenId)) {
+    await reply(t('cmd.term.operator_only', undefined, loc));
+    return;
+  }
+
+  const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+  if (!ds) {
+    await reply(t('cmd.term.no_session', undefined, loc));
+    return;
+  }
+
+  const channel = await deliverWritableTerminalCardTo(ds, senderOpenId);
+  if (channel === 'not_ready') {
+    await reply(t('cmd.term.not_ready', undefined, loc));
+  } else if (channel === 'failed') {
+    await reply(t('cmd.term.failed', undefined, loc));
+  } else if (channel === 'dm') {
+    // The card landed in DM (topic / p2p) — nothing showed in the topic, so drop a
+    // visible breadcrumb pointing the owner at their DM. (No token, safe to show.)
+    await reply(t('cmd.term.sent_dm', undefined, loc));
+  }
+  // channel === 'ephemeral': the visible-to-you card IS the response; no extra msg.
+}
+
 export async function handleCommand(
   cmd: string,
   rootId: string,
@@ -798,8 +907,12 @@ export async function handleCommand(
   larkAppId?: string,
 ): Promise<void> {
   const { activeSessions, getActiveCount, lastRepoScan } = deps;
+  // Command replies carry the triggering messageId as the turnId so a shared
+  // (chat-scope) session triggered from inside a Lark thread anchors them into
+  // that thread (resolveSessionReplyTarget turnId gate) instead of leaking a
+  // plain top-level message.
   const sessionReply = (rid: string, content: string, msgType?: string) =>
-    deps.sessionReply(rid, content, msgType, larkAppId);
+    deps.sessionReply(rid, content, msgType, larkAppId, message.messageId);
   const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
   const logTag = ds ? tag(ds) : rootId.substring(0, 12);
   const loc: Locale = localeForBot(ds?.larkAppId ?? larkAppId);
@@ -811,33 +924,12 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
-          const closedSessionId = ds.session.sessionId;
-          const closedTitle = ds.session.title;
-          const botCfg = getBot(ds.larkAppId).config;
-          const closedCliId = ds.session.cliId ?? botCfg.cliId;
-          const closedAnchor = sessionAnchorId(ds);
-          const closedWorkingDir = ds.session.workingDir;
-          const cliResumeCommand = (() => {
-            try {
-              const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
-              return adapter.buildResumeCommand?.({
-                sessionId: closedSessionId,
-                cliSessionId: ds.session.cliSessionId,
-              }) ?? null;
-            } catch { return null; }
-          })();
+          // Capture the closed-session card BEFORE killWorker/closeSession —
+          // it reads the live session's identity off `ds`.
+          const card = buildClosedSessionCard(ds, loc);
           killWorker(ds);
-          sessionStore.closeSession(closedSessionId);
+          sessionStore.closeSession(ds.session.sessionId);
           activeSessions.delete(sessionKey(rootId, larkAppId!));
-          const card = buildSessionClosedCard(
-            closedSessionId,
-            closedAnchor,
-            closedTitle,
-            closedCliId,
-            closedWorkingDir,
-            cliResumeCommand,
-            loc,
-          );
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
@@ -852,6 +944,42 @@ export async function handleCommand(
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
+        break;
+      }
+
+      case '/land': {
+        // 把沙盒会话副本里 agent 的改动落回真实仓库。owner 审阅 diff 卡后点「应用到磁盘」。
+        // agent 在沙盒里无感（以为改的就是真文件），所以只能由 owner 在此手动触发。
+        if (!ds) { await sessionReply(rootId, t('cmd.no_active_session', undefined, loc)); break; }
+        const sid = ds.session.sessionId;
+        const wd = ds.session.workingDir;
+        if (!wd) { await sessionReply(rootId, t('cmd.land.no_workingdir', undefined, loc)); break; }
+        const d = computeSandboxDiff(config.session.dataDir, sid, loc);
+        if (!d.ok) { await sessionReply(rootId, t('cmd.land.cannot', { error: d.error }, loc)); break; }
+        if (d.empty) { await sessionReply(rootId, t('cmd.land.empty', undefined, loc)); break; }
+        // In-card preview: cap by lines AND chars (Lark card size limit); the FULL
+        // diff goes to an attached .patch file (better for large changesets).
+        const MAX_LINES = 60, MAX_CHARS = 4000;
+        const allLines = d.patch.split('\n');
+        let preview = allLines.slice(0, MAX_LINES).join('\n');
+        let truncated = allLines.length > MAX_LINES;
+        if (preview.length > MAX_CHARS) { preview = preview.slice(0, MAX_CHARS); truncated = true; }
+        // Attach the full .patch (git apply-able) — sent as a file message first,
+        // then the review card below it.
+        let patchAttached = false;
+        if (larkAppId) {
+          try {
+            const patchName = `botmux-land-${sid.slice(0, 8)}.patch`;
+            const patchPath = join(config.session.dataDir, 'sandboxes', sid, patchName);
+            writeFileSync(patchPath, d.patch);
+            const fileKey = await uploadFile(larkAppId, patchPath);
+            await sendMessage(larkAppId, ds.session.chatId, JSON.stringify({ file_key: fileKey }), 'file');
+            patchAttached = true;
+          } catch (e) { logger.warn(`[${logTag}] /land patch attach failed: ${(e as Error).message}`); }
+        }
+        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview, truncated, patchAttached }, loc);
+        await sessionReply(rootId, card, 'interactive');
+        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → card${patchAttached ? ' + .patch' : ''}`);
         break;
       }
 
@@ -930,9 +1058,11 @@ export async function handleCommand(
         const forkPendingCli = async (replyText: string) => {
           const selfBot = getBot(ds!.larkAppId);
           const botCfg = selfBot.config;
+          const commitGenSessionId = ds!.session.sessionId;
           ds!.pendingRepo = false;
           publishAttentionPatch(ds!);
           const pendingPrompt = ds!.pendingPrompt ?? '';
+          const pendingRawInput = ds!.pendingRawInput;
           // Was there an actual buffered user message to deliver? A session
           // launched *via* `/repo` (the command itself is the first message) has
           // none — so boot the CLI idle and let the user's NEXT message be the
@@ -941,7 +1071,34 @@ export async function handleCommand(
             pendingPrompt.trim().length > 0 ||
             (ds!.pendingAttachments?.length ?? 0) > 0 ||
             (ds!.pendingFollowUps?.length ?? 0) > 0;
-          if (hasBufferedInput) {
+          if (pendingRawInput) {
+            // Messages buffered while the repo card was pending must not be
+            // dropped: wrap them now (full prompt-building context lives here)
+            // and stash for delivery right after the raw input on prompt_ready.
+            if (hasBufferedInput) {
+              const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+              const followUpPrompt = buildNewTopicPrompt(
+                pendingPrompt,
+                ds!.session.sessionId,
+                botCfg.cliId,
+                botCfg.cliPathOverride,
+                ds!.pendingAttachments,
+                ds!.pendingMentions,
+                await getAvailableBots(ds!.larkAppId, ds!.chatId),
+                ds!.pendingFollowUps,
+                { name: selfBot.botName, openId: selfBot.botOpenId },
+                loc,
+                ds!.pendingSender,
+                { larkAppId, chatId: ds!.chatId },
+              );
+              ds!.pendingFollowUpInput = {
+                userPrompt: pendingPrompt || (ds!.pendingFollowUps?.join('\n\n') ?? ''),
+                cliInput: followUpPrompt,
+              };
+            }
+            rememberLastCliInput(ds!, pendingRawInput, pendingRawInput);
+            forkWorker(ds!, '', false);
+          } else if (hasBufferedInput) {
             const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
             const prompt = buildNewTopicPrompt(
               pendingPrompt,
@@ -957,6 +1114,15 @@ export async function handleCommand(
               ds!.pendingSender,
               { larkAppId, chatId: ds!.chatId },
             );
+            // Last-line defence: prompt prep awaited above — if anything
+            // replaced OR closed the session in that window (`/close` deletes
+            // the active-map entry without touching sessionId), forking now
+            // would clobber it or resurrect a closed session.
+            const stillActive = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds;
+            if (!stillActive || ds!.session.sessionId !== commitGenSessionId) {
+              logger.warn(`[${logTag}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds!.session.sessionId}, active=${stillActive}) — aborting this fork`);
+              return;
+            }
             rememberLastCliInput(ds!, pendingPrompt, prompt);
             forkWorker(ds!, prompt);
           } else {
@@ -977,19 +1143,45 @@ export async function handleCommand(
         // close + recreate the session (mid-session switch). Used by both the
         // numeric `/repo <N>` form and the `/repo <path|name>` form.
         const commitRepoSelection = async (selectedPath: string, displayName: string, how: string) => {
-          ds!.workingDir = selectedPath;
-          ds!.session.workingDir = selectedPath;
-          sessionStore.updateSession(ds!.session);
-
           if (ds!.pendingRepo) {
+            // First spawn: pin the new cwd onto the CURRENT session, then fork.
+            ds!.workingDir = selectedPath;
+            ds!.session.workingDir = selectedPath;
+            sessionStore.updateSession(ds!.session);
             await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
+            // Safety net: a mid-session `/repo` switch closes the running
+            // session and spawns a fresh one on the SAME anchor. Without a
+            // trace, the old context silently vanishes (relay/adopt/resume all
+            // hit `anchor_occupied` once the new session holds the anchor).
+            // So, before displacing it, post the same "session closed" card
+            // `/close` emits — it keeps the old session visible and carries the
+            // terminal `claude --resume` command. (Its in-card resume button
+            // still hits anchor_occupied while the new session occupies this
+            // anchor — expected; `/close` the new one first, or use the
+            // command.) Mirrors the `/close` case above.
+            //
+            // The new cwd is NOT written onto the old session here — it would
+            // pollute the displaced session's stored workingDir (and the closed
+            // card), so `claude --resume` later would reopen the old context in
+            // the new repo's cwd. The new repo is pinned onto the fresh session
+            // below instead.
+            const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
+            await deliverEphemeralOrReply(
+              ds!,
+              message.senderId,
+              closedCard,
+              'interactive',
+              () => sessionReply(rootId, closedCard, 'interactive'),
+            );
+
             const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
             ds!.lastCliInput = undefined;
+            ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
             ds!.session.larkAppId = ds!.larkAppId;
             sessionStore.updateSession(ds!.session);
@@ -1003,6 +1195,111 @@ export async function handleCommand(
           }
           logger.info(`[${logTag}] Repo selected via ${how}: ${selectedPath}`);
         };
+
+        // `/repo wt <N|name|path> [branch]` → create a worktree off the repo's
+        // remote default branch and open THAT as the session repo. Without a
+        // branch arg the branch/dir are auto-named from the topic title / first
+        // pending prompt when possible (fallback: wt/N, <repo>-wt-N).
+        if (ds && /^wt(\s|$)/i.test(repoArg)) {
+          const rest = repoArg.replace(/^wt\s*/i, '').trim().split(/\s+/).filter(Boolean);
+          if (rest.length < 1 || rest.length > 2) {
+            await sessionReply(rootId, t('cmd.repo.worktree_usage', undefined, loc));
+            break;
+          }
+          const [targetArg, branchArg] = rest;
+          let repoPath: string;
+          if (/^\d+$/.test(targetArg!)) {
+            const cached = lastRepoScan.get(ds.chatId);
+            if (!cached || cached.length === 0) {
+              await sessionReply(rootId, t('cmd.repo.no_prior_scan', undefined, loc));
+              break;
+            }
+            const repoIndex = parseInt(targetArg!, 10);
+            if (repoIndex < 1 || repoIndex > cached.length) {
+              await sessionReply(rootId, t('cmd.repo.index_out_of_range', { max: cached.length }, loc));
+              break;
+            }
+            repoPath = cached[repoIndex - 1]!.path;
+          } else {
+            const resolved = resolveRepoSelection(targetArg!, getProjectScanDirs(ds));
+            if (!resolved) {
+              await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: targetArg! }, loc));
+              break;
+            }
+            repoPath = resolved.path;
+          }
+          if (ds.worktreeCreating) {
+            await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
+            break;
+          }
+          ds.worktreeCreating = true;
+          // Session generation snapshot — another selection can land while the
+          // (awaited) git fetch runs; committing afterwards would kill the
+          // session it just spawned. Mirror of the card-side guard.
+          const startSessionId = ds.session.sessionId;
+          const wasPending = !!ds.pendingRepo;
+          // Identity against the active map catches `/close` (which deletes
+          // the entry without touching sessionId/pendingRepo) alongside the
+          // generation snapshots.
+          const wtSessionChanged = () =>
+            activeSessions.get(sessionKey(rootId, larkAppId!)) !== ds ||
+            ds!.session.sessionId !== startSessionId || !!ds!.pendingRepo !== wasPending;
+          // Hold the in-flight lock through commit (matching the card path) —
+          // releasing it right after `git` would let a second `/repo wt` start
+          // while this one is still replying/committing.
+          try {
+            await sessionReply(rootId, t('cmd.repo.worktree_creating', { repo: repoPath }, loc));
+            let creation;
+            try {
+              const slug = branchArg ? undefined : await worktreeSlugFromContextAI(ds!.session.title, ds!.pendingPrompt);
+              creation = await createRepoWorktree(repoPath, {
+                branch: branchArg,
+                slug,
+              });
+            } catch (e) {
+              await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, loc));
+              break;
+            }
+            if (wtSessionChanged()) {
+              logger.info(`[${logTag}] Worktree ${creation.path} created but session changed mid-flight — not switching`);
+              await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, loc));
+              break;
+            }
+            await sessionReply(rootId, t('cmd.repo.worktree_created', {
+              path: creation.path, branch: creation.branch, base: creation.baseRef,
+            }, loc));
+            // The reply above awaited a Lark round-trip — a plain selection
+            // (not gated by worktreeCreating) can land in that window. Re-check
+            // right before committing. Mirror of the card-side double guard.
+            if (wtSessionChanged()) {
+              logger.info(`[${logTag}] Worktree ${creation.path} created but session changed during reply — not switching`);
+              await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, loc));
+              break;
+            }
+            try {
+              await commitRepoSelection(creation.path, `${basename(creation.path)} (${creation.branch})`, `/repo wt`);
+            } catch (e) {
+              // The worktree DOES exist — only the switch failed. Don't report
+              // it as a creation failure, or a retry trips over "already exists".
+              logger.warn(`[${logTag}] Worktree ${creation.path} created but switching failed: ${e instanceof Error ? e.message : e}`);
+              await sessionReply(rootId, t('cmd.repo.worktree_switch_failed', { path: creation.path, error: e instanceof Error ? e.message : String(e) }, loc));
+            }
+          } finally {
+            ds.worktreeCreating = false;
+          }
+          break;
+        }
+
+        // Plain selections are blocked while a worktree creation/commit is in
+        // flight: the worktree commit awaits (Lark replies, prompt prep) after
+        // its generation checks, and a plain selection interleaving there
+        // would double-fork. One lock gates both kinds until the commit
+        // settles. (Bare `/repo` without pending only posts the picker card —
+        // harmless, so it stays open.)
+        if (ds?.worktreeCreating && (repoArg || ds.pendingRepo)) {
+          await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
+          break;
+        }
 
         // Numeric arg → pick by 1-based index from the last scan.
         if (repoArg && ds && /^\d+$/.test(repoArg)) {
@@ -1072,7 +1369,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
           break;
         }
-        const projects = scanMultipleProjects(validDirs);
+        const projects = scanMultipleProjects(validDirs, 3, repoPickerScanOptions());
         if (projects.length === 0) {
           await sessionReply(rootId, t('cmd.repo.no_git_repos', { dirs: validDirs.join(', ') }, loc));
           break;
@@ -1155,6 +1452,26 @@ export async function handleCommand(
         break;
       }
 
+      case '/skills': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
+          break;
+        }
+        const sub = message.content.replace(/^\/skills\s*/i, '').trim().split(/\s+/, 1)[0]?.toLowerCase();
+        if (sub === 'attach' || sub === 'detach') {
+          let bot;
+          try { bot = getBot(appId); } catch { await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc)); break; }
+          const admins = bot.resolvedAllowedUsers ?? [];
+          if (admins.length === 0) { await sessionReply(rootId, t('cmd.config.no_owner', undefined, loc)); break; }
+          if (!message.senderId || !admins.includes(message.senderId)) { await sessionReply(rootId, t('cmd.config.not_admin', undefined, loc)); break; }
+        }
+        const result = await runSkillsImCommand(appId, message.content);
+        await sessionReply(rootId, result.message);
+        logger.info(`[${logTag}] Skills command handled: ${result.ok ? 'ok' : 'error'}`);
+        break;
+      }
+
       case '/pair': {
         const code = message.content.replace(/^\/pair\s*/, '').trim();
         if (!larkAppId) { await sessionReply(rootId, t('role.no_chat', undefined, loc)); break; }
@@ -1199,6 +1516,87 @@ export async function handleCommand(
         break;
       }
 
+      case '/subscribe-lark-doc': {
+        if (!ds || !larkAppId) { await sessionReply(rootId, t('cmd.subdoc.no_session', undefined, loc)); break; }
+        const arg = message.content.replace(/^\/subscribe-lark-doc\s*/i, '').trim();
+        const anchor = sessionAnchorId(ds);
+        const dataDir = config.session.dataDir;
+        const modeLabel = (m: CommentTriggerMode) =>
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+
+        if (arg === 'list' || arg === '列表') {
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          if (!subs.length) { await sessionReply(rootId, t('cmd.subdoc.none', undefined, loc)); break; }
+          const lines = subs.map(s => `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）`);
+          await sessionReply(rootId, [t('cmd.subdoc.list_title', undefined, loc), ...lines].join('\n'));
+          break;
+        }
+
+        if (arg === 'off' || arg === 'stop' || arg === '退订') {
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          for (const s of subs) {
+            await unsubscribeDocFile(larkAppId, { fileToken: s.fileToken, fileType: s.fileType });
+            removeDocSubscription(dataDir, larkAppId, s.fileToken);
+          }
+          await sessionReply(rootId, t('cmd.subdoc.unsubscribed', { count: subs.length }, loc));
+          break;
+        }
+
+        if (!arg) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
+
+        // 评论事件官方推荐用户身份订阅，tenant 订阅大概率收不到推送 → 需要带文档 scope
+        // 的 User Token。文档 scope 不在通用 /login 里（避免污染所有 bot 的登录），
+        // 这里按需生成带 DOC_COMMENT_OAUTH_SCOPES 的专用授权链接。
+        const subCfg = getBot(larkAppId).config;
+        const replyDocLogin = async () => {
+          const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
+          await sessionReply(rootId, [
+            t('cmd.subdoc.need_login', undefined, loc),
+            '',
+            t('cmd.login.step1', undefined, loc),
+            authUrl,
+            '',
+            t('cmd.login.step2', undefined, loc),
+            t('cmd.login.step3', undefined, loc),
+          ].join('\n'));
+        };
+        const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand));
+        if (!userTok) { await replyDocLogin(); break; }
+
+        try {
+          const file = await resolveDocFile(larkAppId, arg);
+          await subscribeDocFile(larkAppId, file);
+          const mode: CommentTriggerMode = subCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
+          const { previous } = putDocSubscription(dataDir, larkAppId, {
+            fileToken: file.fileToken,
+            fileType: file.fileType,
+            sessionAnchor: anchor,
+            sessionId: ds.session.sessionId,
+            scope: ds.scope,
+            chatId: ds.chatId,
+            commentTriggerMode: mode,
+            ownerOpenId: message.senderId,
+            createdAt: Date.now(),
+          });
+          const title = file.fileToken.slice(0, 12);
+          const rebound = previous && previous.sessionAnchor !== anchor;
+          await sessionReply(rootId, t(
+            rebound ? 'cmd.subdoc.subscribed_moved' : 'cmd.subdoc.subscribed',
+            { title, mode: modeLabel(mode) },
+            loc,
+          ));
+          logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${rebound ? ' (rebound)' : ''}`);
+        } catch (err) {
+          // token 缺失 / 失效 / 缺文档 scope（403）→ 给带文档 scope 的重新授权链接。
+          if (err instanceof UserTokenMissingError) {
+            await replyDocLogin();
+          } else {
+            await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
+          }
+        }
+        break;
+      }
+
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
         if (ds?.adoptedFrom) {
@@ -1232,7 +1630,13 @@ export async function handleCommand(
           ...discoverAdoptableZellijSessions(botCliId),
         ];
 
-        if (sessions.length === 0) {
+        // Second filter: sessions resumable from disk (paseo-style import).
+        // Only the bot's OWN CLI is offered (resume needs that CLI's binary).
+        const resumable = botCliId
+          ? await discoverResumableSessionsForBot(botCliId, botCfgForAdopt?.cliPathOverride, activeSessions)
+          : [];
+
+        if (sessions.length === 0 && resumable.length === 0) {
           await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
           break;
         }
@@ -1247,15 +1651,21 @@ export async function handleCommand(
               ? `${s.zellijSession}:${s.zellijPaneId}` === zellijNorm
               : adoptTargetLabel(s) === directTarget || adoptTargetKey(s) === directTarget || s.tmuxTarget === directTarget || s.herdrPaneId === directTarget,
           );
-          if (!target) {
-            await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
+          if (target) {
+            if (ds) await startAdoptSession(target, ds, deps, larkAppId);
             break;
           }
-          if (ds) await startAdoptSession(target, ds, deps, larkAppId);
+          // Fall back to a resumable session matched by its CLI-native id.
+          const resumeTarget = resumable.find(r => r.cliSessionId === directTarget);
+          if (resumeTarget) {
+            if (ds) await startResumeImportSession(resumeTarget, ds, deps, larkAppId);
+            break;
+          }
+          await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
           break;
         }
 
-        const cardJson = buildAdoptSelectCard(sessions, rootId, loc);
+        const cardJson = buildAdoptSelectCard(sessions, rootId, loc, resumable);
         await sessionReply(rootId, cardJson, 'interactive');
         break;
       }
@@ -1576,57 +1986,45 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
             break;
           }
-          // ── Chat-type guard ───────────────────────────────────────────────
-          // Picker mode only makes sense in regular group chats. p2p (1:1 with
-          // bot) has no relay concept — there's no other participant to
-          // collaborate with — and topic chats route per-thread, so a chat-
-          // scope session pulled in would have no thread anchor.
-          //
-          // p2p is detectable from `ds.chatType` locally (cheap). Topic vs
-          // regular group is NOT captured in chatType — both record 'group'
-          // — so we hit the Lark API (getChatNameAndMode) to resolve the
-          // mode. One API call per /relay invocation; picker is user-
-          // triggered so latency is acceptable.
-          if (ds?.chatType === 'p2p') {
-            await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
-            break;
-          }
-          {
+          // ── Target-routing resolution ─────────────────────────────────────
+          // Resolve the chat mode once, then compute WHERE the relayed session
+          // should land via resolveRelayTargetRouting (mirrors decideRouting;
+          // 话题群 / 线程内 / 普通群 new-topic·shared → thread-scope, 普通群
+          // flat → chat-scope; DM 扁平(p2pMode chat) → chat-scope, DM 话题模式
+          // → thread-scope seeded on the /relay message).
+          // p2p is authoritative from `ds.chatType` (recorded off the Lark
+          // event payload — doesn't drift, and the API's safe-default 'group'
+          // on failure would misclassify a DM); only group chats need the API
+          // call to split topic-vs-regular (both record chatType 'group').
+          const targetIsP2p = ds?.chatType === 'p2p';
+          const targetChatType: 'group' | 'p2p' = targetIsP2p ? 'p2p' : 'group';
+          let targetChatMode: 'group' | 'topic' | 'p2p' = 'p2p';
+          if (!targetIsP2p) {
             const { getChatNameAndMode } = await import('../im/lark/client.js');
             const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
-            if (info?.mode === 'p2p') {
-              await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
-              break;
-            }
-            if (info?.mode === 'topic') {
-              await sessionReply(rootId, t('cmd.relay.picker_topic_unsupported', undefined, loc));
-              break;
-            }
+            targetChatMode = info?.mode ?? 'group';
           }
-          // ── Existing-session guard ────────────────────────────────────────
-          // If this bot already runs a real session in the target chat, pulling
-          // another session in would collide on sessionKey(targetChatId, larkAppId)
-          // — Map.set would silently overwrite, orphaning the existing worker.
-          // Refuse upfront with an actionable message.
-          //
-          // Scratch sessions (the placeholder a `/relay` typed in a fresh chat
-          // gets routed through) are filtered by `!!c.worker` — they have no
-          // worker process. We do NOT exclude `ds` by sessionId: when `/relay`
-          // rides an EXISTING real session (daemon.ts:2034's "existing-session
-          // DAEMON_COMMANDS" path skips the scratch and binds `ds` to the
-          // chat's real session), `ds` itself IS the conflict — excluding it
-          // would let the picker render and the user pick a remote session
-          // that the eventual transferSession would have to refuse anyway.
+          const { resolveRelayTargetRouting } = await import('../im/lark/relay-target-routing.js');
+          const targetRouting = resolveRelayTargetRouting({
+            larkAppId: myAppId,
+            chatId: targetChatId,
+            message: { messageId: message.messageId, rootId: message.rootId || undefined, threadId: message.threadId },
+            chatMode: targetChatMode,
+          });
+          const targetScope = targetRouting.scope;
+          const targetAnchor = targetRouting.anchor;
+          // ── Existing-session guard (anchor-based) ─────────────────────────
+          // A real session already sitting AT the target anchor would collide
+          // on sessionKey(targetAnchor, larkAppId) after transfer — Map.set
+          // would orphan its worker. Scratch placeholders (worker:null, e.g.
+          // the /relay command's own record at this anchor) are NOT a conflict;
+          // transferSession closes them inline. We do NOT exclude `ds`: if
+          // /relay rides an existing real session at the anchor, `ds` itself IS
+          // the conflict. Anchor-based so同群 other-topic sessions (different
+          // anchor) don't false-positive — that's what enables 同群话题间搬运.
           const conflict = [...activeSessions.values()].find(c =>
             c.larkAppId === myAppId
-            && c.chatId === targetChatId
-            // chat-scope only: thread-scope sessions (e.g. a `/t` force-topic
-            // session in a regular group) live at a different sessionKey
-            // anchor (rootMessageId), so they don't collide on transfer.
-            // transferSession's own pre-flight (worker-pool.ts) and card-
-            // handler's confirm both filter the same way; align here so the
-            // picker doesn't false-positive a thread-scope live session.
-            && c.scope === 'chat'
+            && sessionAnchorId(c) === targetAnchor
             && !!c.worker   // real running session, not a placeholder
           );
           if (conflict) {
@@ -1636,12 +2034,12 @@ export async function handleCommand(
           // Shared candidate-collection logic — used here at initial render
           // and again in card-handler when the user clicks a card to switch
           // selection (the card re-render needs the same filtered list).
-          // Filters out: other bots / current chat / non-owned / adopt
-          // sessions. Resolves friendly chat names + modes in parallel.
+          // Excludes (by anchor) the target itself; keeps cross-group + 同群
+          // other-topic sessions. Resolves friendly chat names + modes.
           const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
-          const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetChatId, operatorOpenId);
+          const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetAnchor, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
-          const card = buildRelayPickerCard(entries, targetChatId, rootId, operatorOpenId, loc);
+          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope, targetChatType);
           await sessionReply(rootId, card, 'interactive');
           break;
         }
@@ -1846,8 +2244,8 @@ export async function handleCommand(
         if (leaderHasRealSession) {
           const { transferSession } = await import('./worker-pool.js');
           // Target chat was just built by createGroupWithBots — by
-          // construction a regular group.
-          const leaderResult = await transferSession(ds.session.sessionId, newChatId, placeholderRootMessageId, 'group');
+          // construction a regular group, chat-scope.
+          const leaderResult = await transferSession(ds.session.sessionId, newChatId, placeholderRootMessageId, 'group', 'chat');
           if (!leaderResult.ok) {
             // Real session, real failure (worker busy / unsupported target
             // / tmux issue). Abort the entire --create flow — the new chat
@@ -1992,12 +2390,25 @@ export async function handleCommand(
         break;
       }
 
+      case '/term': {
+        // Existing-session path. New topics route /term via handleTermLinkCommand
+        // at the router (daemon.ts) so no phantom worker=null session is created.
+        const appId = ds?.larkAppId ?? larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        await handleTermLinkCommand(rootId, appId, ds?.chatId ?? '', message.senderId, message.content, deps);
+        break;
+      }
+
       case '/list-slash-command':
       case '/slash': {
-        // 列出本 bot 当前可用的 slash 命令，分三段：
+        // 列出本 bot 当前可用的 slash 命令，分四段：
         //   ① botmux 固定放行的透传白名单（PASSTHROUGH_COMMANDS）
-        //   ② 用户在 bots.json 自定义配置的额外透传命令（customPassthroughCommands）
-        //   ③ 文件系统自动发现的 CLI 自定义命令 / skill / 插件
+        //   ② 当前 CLI adapter 默认透传命令（defaultPassthroughCommands）
+        //   ③ 用户在 bots.json 自定义配置的额外透传命令（customPassthroughCommands）
+        //   ④ 文件系统自动发现的 CLI 自定义命令 / skill / 插件
         // MCP 的 /mcp__<server>__<prompt> 需运行时握手才能枚举，这里仅按 .mcp.json 提示 server 名。
         const botCfg = ds
           ? getBot(ds.larkAppId).config
@@ -2006,7 +2417,15 @@ export async function handleCommand(
         const cliName = getCliDisplayName(cliId);
         const workingDir = getSessionWorkingDir(ds);
         const builtin = [...PASSTHROUGH_COMMANDS];
-        const custom = botCfg?.customPassthroughCommands ?? [];
+        const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
+        // 只展示「实际生效」的 custom 命令：用与 resolvePassthroughCommands 同一套
+        // normalize 过滤掉手写 bots.json 里遮蔽 daemon 命令 / 非法的项（parser 出于
+        // 兼容会保留它们，但路由会丢弃），避免 `/status` 之类被展示成可用却走 daemon。
+        const custom = [...new Set(
+          (botCfg?.customPassthroughCommands ?? [])
+            .map(normalizePassthroughCommand)
+            .filter((c): c is string => !!c),
+        )];
         let cliAdapter;
         try {
           cliAdapter = createCliAdapterSync(cliId, botCfg?.cliPathOverride);
@@ -2020,7 +2439,7 @@ export async function handleCommand(
         const mcpServers = listMcpServerNames(workingDir);
 
         const card = buildSlashListCard(
-          { cliName, builtin, custom, discovered, workingDir, mcpServers, discoverySupported },
+          { cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
           loc,
         );
         await sessionReply(rootId, card, 'interactive');
@@ -2039,8 +2458,11 @@ export async function handleCommand(
           t('help.repo_list', undefined, loc),
           t('help.repo_n', undefined, loc),
           t('help.repo_path', undefined, loc),
+          t('help.repo_wt', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
+          t('help.term', undefined, loc),
+          t('help.subscribe_doc', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移
@@ -2220,4 +2642,68 @@ export async function startAdoptSession(
 
   const cliName = getCliDisplayName(target.cliId);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
+}
+
+/** Discover the sessions resumable from disk for `cliId`, excluding any whose
+ *  CLI-native id is already live in a botmux session (so a session botmux
+ *  already runs isn't offered for re-import). Returns [] when the adapter has
+ *  no on-disk store. */
+export async function discoverResumableSessionsForBot(
+  cliId: CliId,
+  cliPathOverride: string | undefined,
+  activeSessions: Map<string, DaemonSession>,
+  limit = 20,
+): Promise<ResumableSession[]> {
+  let adapter: ReturnType<typeof createCliAdapterSync>;
+  try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
+  if (!adapter.listResumableSessions) return [];
+  // Exclude every session botmux already manages — live OR closed — so the
+  // picker surfaces only genuinely external sessions (a CLI the user ran
+  // standalone). botmux's own closed sessions stay resumable via their
+  // session-closed cards, so hiding them here avoids a redundant, confusing
+  // duplicate. The identity set spans all bot stores and includes both the
+  // botmux sessionId (= the claude jsonl filename) and the cliSessionId
+  // (codex/traex rollout id), covering every CLI's id shape. Passed INTO the
+  // adapter so exclusion happens BEFORE the `limit` truncation.
+  const exclude = sessionStore.collectBotmuxSessionIdentities() ?? new Set<string>();
+  // Belt-and-suspenders: also fold in the in-memory active map (freshest).
+  for (const ds of activeSessions.values()) {
+    if (ds.session.sessionId) exclude.add(ds.session.sessionId);
+    if (ds.session.cliSessionId) exclude.add(ds.session.cliSessionId);
+  }
+  try {
+    return await adapter.listResumableSessions({ limit, exclude });
+  } catch {
+    return [];
+  }
+}
+
+/** Import (resume) a stored session into the current topic: re-spawn the bot's
+ *  CLI via `--resume <cliSessionId>` in `cwd`. Mirrors the manual resume path —
+ *  the worker owns the CLI (NOT an observe-adopt), so no `adoptedFrom` is set. */
+export async function startResumeImportSession(
+  target: ResumableSession,
+  ds: DaemonSession,
+  deps: CommandHandlerDeps,
+  larkAppId?: string,
+): Promise<void> {
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+  const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const project = target.cwd.split('/').pop() || target.cwd;
+
+  ds.workingDir = target.cwd;
+  ds.session.workingDir = target.cwd;
+  ds.session.cliSessionId = target.cliSessionId;
+  ds.session.title = target.title || `Import: ${project}`;
+  // Resume sandbox decision is left to forkWorker (resume=true → not sandboxed,
+  // matching restore semantics). Mark history so the session is treated as a
+  // resume, not a fresh spawn.
+  ds.hasHistory = true;
+  sessionStore.updateSession(ds.session);
+
+  forkWorker(ds, '', true);
+
+  const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
 }

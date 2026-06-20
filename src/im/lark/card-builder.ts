@@ -1,5 +1,5 @@
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import type { CliId } from '../../adapters/cli/types.js';
+import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
@@ -163,6 +163,10 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
     { tag: 'hr' },
     ...section('card.config.lbl_prompt', 'autoStartPrompt', data.autoStartPrompt),
     { tag: 'hr' },
+    ...section('card.config.lbl_passthrough', 'customPassthroughCommands', data.customPassthroughCommands),
+    { tag: 'hr' },
+    ...section('card.config.lbl_startup', 'startupCommands', data.startupCommands),
+    { tag: 'hr' },
     ...section('card.config.lbl_role', 'teamRole', data.teamRole),
   ];
   return JSON.stringify({
@@ -175,6 +179,7 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
 const cliDisplayNames: Record<CliId, string> = {
   'claude-code': 'Claude',
   'seed': 'Seed',
+  'relay': 'Relay',
   'aiden': 'Aiden',
   'coco': 'CoCo',
   'codex': 'Codex',
@@ -186,9 +191,11 @@ const cliDisplayNames: Record<CliId, string> = {
   'mtr': 'MTR',
   'hermes': 'Hermes',
   'mira': 'Mira',
+  'mir': 'Mir CLI',
   'traex': 'TRAE',
   'pi': 'Pi',
   'copilot': 'Copilot',
+  'oh-my-pi': 'Oh My Pi',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -368,24 +375,6 @@ export function buildSessionClosedCard(
   return JSON.stringify(card);
 }
 
-/** Build the lightweight placeholder shown while a no-streaming-card bot works. */
-export function buildPendingResponseCard(locale?: Locale): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.pending.title', undefined, locale) },
-    },
-    body: {
-      direction: 'vertical',
-      elements: [
-        { tag: 'markdown', content: t('card.pending.body', undefined, locale) },
-      ],
-    },
-  });
-}
-
 /** Collapse whitespace and clip a discovered-command description for a table cell. */
 function clipDesc(desc?: string): string {
   if (!desc) return '—';
@@ -394,15 +383,17 @@ function clipDesc(desc?: string): string {
 }
 
 /**
- * Build the `/list-slash-command` card (schema 2.0): a coloured header and three
- * sections — ① fixed passthrough allowlist, ② user-configured custom passthrough,
- * ③ auto-discovered CLI commands/skills/plugins rendered as a paginated native
- * table (command | description). An optional MCP-servers note is appended.
+ * Build the `/list-slash-command` card (schema 2.0): a coloured header and four
+ * sections — ① fixed passthrough allowlist, ② adapter-default passthrough,
+ * ③ user-configured custom passthrough, ④ auto-discovered CLI commands/skills/plugins
+ * rendered as a paginated native table (command | description). An optional MCP
+ * servers note is appended.
  */
 export function buildSlashListCard(
   params: {
     cliName: string;
     builtin: string[];
+    adapterDefaults?: string[];
     custom: string[];
     discovered: { name: string; description?: string }[];
     workingDir: string;
@@ -411,7 +402,7 @@ export function buildSlashListCard(
   },
   locale?: Locale,
 ): string {
-  const { cliName, builtin, custom, discovered, workingDir, mcpServers, discoverySupported = true } = params;
+  const { cliName, builtin, adapterDefaults = [], custom, discovered, workingDir, mcpServers, discoverySupported = true } = params;
   const asCode = (cmds: string[]) => cmds.map((c) => `\`${c}\``).join('  ');
   const elements: any[] = [];
 
@@ -422,7 +413,14 @@ export function buildSlashListCard(
   });
   elements.push({ tag: 'hr' });
 
-  // ② 用户自定义配置
+  // ② 当前 CLI adapter 默认透传
+  elements.push({
+    tag: 'markdown',
+    content: `**${t('slashlist.part_adapter', undefined, locale)}**\n${adapterDefaults.length ? asCode(adapterDefaults) : '—'}`,
+  });
+  elements.push({ tag: 'hr' });
+
+  // ③ 用户自定义配置
   elements.push({
     tag: 'markdown',
     content: `**${t('slashlist.part_custom', undefined, locale)}**\n${
@@ -431,7 +429,7 @@ export function buildSlashListCard(
   });
   elements.push({ tag: 'hr' });
 
-  // ③ 自动发现（命令 / skill / 插件）
+  // ④ 自动发现（命令 / skill / 插件）
   const discHeading = `**${t('slashlist.part_discovered', { cliName }, locale)}**`;
   if (!discoverySupported) {
     elements.push({
@@ -508,23 +506,6 @@ export function buildDetouredPendingResponseCard(locale?: Locale): string {
       direction: 'vertical',
       elements: [
         { tag: 'markdown', content: t('card.pending.detoured_body', undefined, locale) },
-      ],
-    },
-  });
-}
-
-export function buildMentionedPendingResponseCard(locale?: Locale): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      template: 'grey',
-      title: { tag: 'plain_text', content: t('card.pending.detoured_title', undefined, locale) },
-    },
-    body: {
-      direction: 'vertical',
-      elements: [
-        { tag: 'markdown', content: t('card.pending.mentioned_body', undefined, locale) },
       ],
     },
   });
@@ -944,6 +925,16 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
     };
   });
 
+  // Second dropdown: open a repo as a NEW worktree (branched off its remote
+  // default branch). Only main checkouts make sense as sources — existing
+  // worktrees of the same repo would just duplicate the list.
+  const worktreeOptions = projects
+    .filter(p => p.type === 'repo')
+    .map(p => ({
+      text: { tag: 'plain_text' as const, content: `${p.name} (${p.branch})` },
+      value: p.path,
+    }));
+
   const card = {
     config: { wide_screen_mode: true },
     header: {
@@ -951,12 +942,47 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
       title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
     },
     elements: [
+      // Current working directory + 「直接开启会话」on the same row: the skip
+      // button means "use this directory as-is, don't pick a repo", so it pairs
+      // with the current-dir line rather than the switch dropdown below.
       {
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`,
-        },
+        tag: 'column_set',
+        // flow: columns sit side-by-side on desktop and reflow (button wraps
+        // below) on narrow mobile instead of squeezing the button until its
+        // label truncates. auto-width columns size to content, so the text and
+        // button hug each other (no wide desktop gap) and the button always
+        // shows its full label.
+        flex_mode: 'flow',
+        horizontal_spacing: 'default',
+        columns: [
+          {
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              {
+                tag: 'div',
+                text: {
+                  tag: 'lark_md',
+                  content: `${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`,
+                },
+              },
+            ],
+          },
+          {
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              {
+                tag: 'button',
+                text: { tag: 'plain_text', content: t('card.btn.skip_repo', undefined, locale) },
+                type: 'primary',
+                value: { action: 'skip_repo', root_id: rootMessageId ?? '' },
+              },
+            ],
+          },
+        ],
       },
       {
         tag: 'hr',
@@ -970,11 +996,67 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
             options,
             value: { key: 'repo_switch', root_id: rootMessageId ?? '' },
           },
+        ],
+      },
+      ...(worktreeOptions.length > 0 ? [{
+        tag: 'action',
+        actions: [
           {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.btn.skip_repo', undefined, locale) },
-            type: 'primary',
-            value: { action: 'skip_repo', root_id: rootMessageId ?? '' },
+            tag: 'select_static',
+            placeholder: { tag: 'plain_text', content: t('card.repo.placeholder_worktree', undefined, locale) },
+            options: worktreeOptions,
+            value: { key: 'repo_worktree', root_id: rootMessageId ?? '' },
+          },
+        ],
+      }] : []),
+      // Manual entry: type any existing local directory the scan didn't surface
+      // (mirrors `/repo <path>`). form_submit hands the input back under
+      // value.action='repo_manual_submit' with form_value.repo_manual_path.
+      {
+        tag: 'form',
+        name: 'repo_manual_form',
+        elements: [
+          // Input + 「使用此目录」on one row (column_set), mirroring the
+          // dropdown+button rhythm above. form_submit still collects
+          // form_value.repo_manual_path from the enclosing form.
+          {
+            tag: 'column_set',
+            // flex_mode 'none' keeps the weighted input filling the row while
+            // the auto-width button hugs its label — input stays usable on
+            // mobile (not squeezed by a flow reflow) and the button never
+            // truncates. (flow mode collapsed the input on narrow screens.)
+            flex_mode: 'none',
+            horizontal_spacing: 'default',
+            columns: [
+              {
+                tag: 'column',
+                width: 'weighted',
+                weight: 1,
+                vertical_align: 'center',
+                elements: [
+                  {
+                    tag: 'input',
+                    name: 'repo_manual_path',
+                    placeholder: { tag: 'plain_text', content: t('card.repo.manual_placeholder', undefined, locale) },
+                  },
+                ],
+              },
+              {
+                tag: 'column',
+                width: 'auto',
+                vertical_align: 'center',
+                elements: [
+                  {
+                    tag: 'button',
+                    name: 'repo_manual_submit',
+                    text: { tag: 'plain_text', content: t('card.btn.manual_repo', undefined, locale) },
+                    type: 'default',
+                    action_type: 'form_submit',
+                    value: { action: 'repo_manual_submit', root_id: rootMessageId ?? '' },
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -1040,10 +1122,26 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   return JSON.stringify(card);
 }
 
-/** 授权成功后给被授权人的通知卡（@ 对方，独立消息）。支持一次 @ 多个被授权人；带额度时追加"（额度 N 条）"。 */
-export function buildGrantNotifyCard(kind: 'chat' | 'global', targetOpenId: string | string[], locale?: Locale, quota?: number): string {
-  const ids = Array.isArray(targetOpenId) ? targetOpenId : [targetOpenId];
-  const at = ids.map(id => `<at id=${id}></at>`).join(' ');
+/** 授权成功后给被授权人的通知卡（独立消息）。支持一次通知多个被授权人；带额度时追加"（额度 N 条）"。
+ *
+ *  **真人 grantee 用 `<at>` 点名，bot grantee 只用纯文本名字**：卡片里的 `<at id=botOpenId>` 会被
+ *  对方 bot 的 daemon 当成一次「被 @」消息，从而凭新授权/同伴 peer 关系在本群误拉起一个空会话
+ *  （申晗实测 bug：手动 /grant 后面没有 prompt，不该触发自动会话）。纯文本名字不产生 mention 事件，
+ *  既保留「谁被授权」的可读信息，又不会唤醒对方 bot。传 string/string[]（无 isBot 信息）时按真人
+ *  处理（@ 全部），保持旧调用方/单测兼容。 */
+export function buildGrantNotifyCard(
+  kind: 'chat' | 'global',
+  target: string | string[] | Array<{ openId: string; name?: string; isBot?: boolean }>,
+  locale?: Locale,
+  quota?: number,
+): string {
+  const entries = (Array.isArray(target) ? target : [target]).map(tt =>
+    typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
+  const at = entries.map(e =>
+    e.isBot
+      ? (e.name && e.name.length > 0 ? e.name : e.openId)   // bot：纯文本名字，绝不 <at>（否则唤醒对方 bot）
+      : `<at id=${e.openId}></at>`,                          // 真人：@ 点名（真人被 @ 不会自动开会话）
+  ).join(' ');
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
   const card = {
@@ -1337,6 +1435,17 @@ export function buildRelayPickerCard(
   invokerOpenId: string,
   locale?: Locale,
   state?: RelayPickerState,
+  /** Target routing scope baked into every button value so the confirm /
+   *  re-render handlers know whether to land the relayed session as a 话题
+   *  (thread, reply_in_thread to `root_id`) or flat chat-scope. Default 'chat'
+   *  preserves the legacy普通群-flat behavior. */
+  targetScope: 'thread' | 'chat' = 'chat',
+  /** Target chat type baked into every button value so relay_confirm can pass
+   *  the right chatType to transferSession (a DM target must flip the session
+   *  to p2p, or post-relay inbound routing misclassifies it as a group).
+   *  Authoritative from the /relay command's session chatType. Default 'group'
+   *  covers legacy cards rendered before this field existed. */
+  targetChatType: 'group' | 'p2p' = 'group',
 ): string {
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
@@ -1358,6 +1467,8 @@ export function buildRelayPickerCard(
   const stateValue = {
     target_chat_id: targetChatId,
     root_id: targetRootMessageId,
+    target_scope: targetScope,
+    target_chat_type: targetChatType,
     invoker_open_id: invokerOpenId,
     search: searchQuery,
     page,
@@ -1393,14 +1504,14 @@ export function buildRelayPickerCard(
   // ─── Empty / no-match notice ────────────────────────────────────────
   if (entries.length === 0) {
     elements.push({ tag: 'markdown', content: t('card.relay.empty', undefined, locale) });
-    return JSON.stringify(wrapCard(elements, locale));
+    return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
   if (filtered.length === 0) {
     elements.push({
       tag: 'markdown',
       content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
     });
-    return JSON.stringify(wrapCard(elements, locale));
+    return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
 
   // ─── Session cards (current page) ───────────────────────────────────
@@ -1555,7 +1666,7 @@ export function buildRelayPickerCard(
           elements: [
             {
               tag: 'button',
-              text: { tag: 'plain_text', content: t('card.relay.btn_confirm', undefined, locale) },
+              text: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.btn_confirm_p2p' : 'card.relay.btn_confirm', undefined, locale) },
               type: 'primary',
               behaviors: [
                 {
@@ -1575,15 +1686,15 @@ export function buildRelayPickerCard(
     });
   }
 
-  return JSON.stringify(wrapCard(elements, locale));
+  return JSON.stringify(wrapCard(elements, locale, targetChatType));
 }
 
-function wrapCard(elements: any[], locale?: Locale): any {
+function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p2p' = 'group'): any {
   return {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: t('card.relay.title', undefined, locale) },
+      title: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.title_p2p' : 'card.relay.title', undefined, locale) },
       template: 'blue',
     },
     body: { direction: 'vertical', elements },
@@ -1594,6 +1705,7 @@ export function buildAdoptSelectCard(
   sessions: Array<AdoptableSession | ZellijAdoptableSession>,
   rootMessageId?: string,
   locale?: Locale,
+  resumable?: ResumableSession[],
 ): string {
   const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
   const options = sessions.map((s) => {
@@ -1611,25 +1723,65 @@ export function buildAdoptSelectCard(
     };
   });
 
+  // Second filter: sessions resumable from disk (paseo-style import). Picking
+  // one re-spawns the CLI via `--resume <id>` in its recorded cwd — no live
+  // pane required.
+  const resumeOptions = (resumable ?? []).map((r) => {
+    const project = compactPlainText(r.cwd.split('/').pop() || r.cwd, 18);
+    const title = compactPlainText(r.title || r.cliSessionId.slice(0, 8), 40);
+    const when = formatThreadUpdatedAt(r.lastActivityAt || undefined, locale);
+    return {
+      text: { tag: 'plain_text' as const, content: `${title} · ${project} · ${when}` },
+      value: JSON.stringify({ cliSessionId: r.cliSessionId, cwd: r.cwd }),
+    };
+  });
+
+  const elements: any[] = [
+    {
+      tag: 'div',
+      text: { tag: 'lark_md', content: t('card.adopt.section_live', undefined, locale) },
+    },
+    {
+      tag: 'action',
+      actions: [
+        {
+          tag: 'select_static',
+          placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_select', undefined, locale) },
+          options,
+          value: { key: 'adopt_select', root_id: rootMessageId ?? '' },
+        },
+      ],
+    },
+  ];
+
+  if (resumeOptions.length > 0) {
+    elements.push(
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: t('card.adopt.section_resume', undefined, locale) },
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'select_static',
+            placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_resume', undefined, locale) },
+            options: resumeOptions,
+            value: { key: 'adopt_resume_select', root_id: rootMessageId ?? '' },
+          },
+        ],
+      },
+    );
+  }
+
   const card = {
     config: { wide_screen_mode: true },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },
     },
-    elements: [
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'select_static',
-            placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_select', undefined, locale) },
-            options,
-            value: { key: 'adopt_select', root_id: rootMessageId ?? '' },
-          },
-        ],
-      },
-    ],
+    elements,
   };
   return JSON.stringify(card);
 }
@@ -1686,4 +1838,56 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
     ],
   };
   return JSON.stringify(card);
+}
+
+// ── Sandbox landing card (owner reviews the sandbox clone's diff, then applies
+//    it back to the real repo). Owner-gated apply; the agent never sees this. ──
+export interface LandCardOpts {
+  sessionId: string;
+  workingDir: string;
+  statText: string;
+  files: number;
+  insertions: number;
+  deletions: number;
+  preview: string;        // patch text for the in-card preview (already truncated)
+  truncated?: boolean;    // preview was cut → full diff is in the attached .patch
+  patchAttached?: boolean; // a .patch file message accompanies this card
+}
+
+export function buildLandCard(o: LandCardOpts, locale?: Locale): string {
+  const v = { sessionId: o.sessionId, workingDir: o.workingDir };
+  const body = t('card.land.body', { files: o.files, ins: o.insertions, del: o.deletions, dir: escapeMd(o.workingDir) }, locale);
+  const elements: any[] = [{ tag: 'div', text: { tag: 'lark_md', content: body } }];
+  // Use the card v2 `markdown` element (NOT a lark_md div) for the stat + diff —
+  // it renders ``` fenced code blocks as real monospace blocks, which lark_md
+  // divs do not. Paths are already project-relative (computeSandboxDiff).
+  if (o.statText) elements.push({ tag: 'markdown', content: `**${t('card.land.files_header', undefined, locale)}**\n` + '```text\n' + o.statText.slice(0, 2000) + '\n```' });
+  if (o.preview) {
+    const note = o.truncated ? `\n\n_${t('card.land.truncated', undefined, locale)}_` : '';
+    elements.push({ tag: 'markdown', content: `**${t('card.land.preview_header', undefined, locale)}**\n` + '```diff\n' + o.preview + '\n```' + note });
+  }
+  if (o.patchAttached) elements.push({ tag: 'note', elements: [{ tag: 'lark_md', content: t('card.land.patch_note', undefined, locale) }] });
+  elements.push(
+    { tag: 'hr' },
+    { tag: 'action', actions: [
+      { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.land.btn_apply', undefined, locale) }, value: { action: 'land_apply', ...v } },
+      { tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.land.btn_discard', undefined, locale) }, value: { action: 'land_discard', ...v } },
+    ] },
+    { tag: 'note', elements: [{ tag: 'lark_md', content: t('card.land.note', undefined, locale) }] },
+  );
+  return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'turquoise', title: { tag: 'plain_text', content: t('card.land.title', undefined, locale) } }, elements });
+}
+
+export function buildLandResultCard(kind: 'applied' | 'discarded' | 'failed', detail: string, locale?: Locale): string {
+  const meta = {
+    applied: { template: 'green', titleKey: 'card.land.applied_title' },
+    discarded: { template: 'grey', titleKey: 'card.land.discarded_title' },
+    failed: { template: 'red', titleKey: 'card.land.failed_title' },
+  }[kind];
+  const body = detail || (kind === 'discarded' ? t('card.land.discarded_body', undefined, locale) : '');
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: meta.template, title: { tag: 'plain_text', content: t(meta.titleKey, undefined, locale) } },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content: body } }],
+  });
 }

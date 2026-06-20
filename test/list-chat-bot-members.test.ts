@@ -268,4 +268,59 @@ describe('listChatBotMembers', () => {
     });
     expect(bots.find(b => b.openId === 'ou_stale')).toBeUndefined();
   });
+
+  it('prefers a same-name bot-openids cross-ref over a stale observed external handle', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), '[]');
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({
+      NasCodex: 'ou_current_cross_ref',
+    }));
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      'ou_stale_observed': { name: 'NasCodex', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    const nasEntries = bots.filter(b => b.displayName === 'NasCodex');
+    expect(nasEntries).toHaveLength(1);
+    expect(nasEntries[0]).toMatchObject({
+      larkAppId: '',
+      openId: 'ou_current_cross_ref',
+      source: 'introduce',
+      mentionable: true,
+      mentionSource: 'cross-ref',
+    });
+    expect(bots.find(b => b.openId === 'ou_stale_observed')).toBeUndefined();
+  });
+
+  it('cross-ref name matching trims whitespace but stays case-sensitive', async () => {
+    // The unified name-key normalizer is trim-only. A cross-ref key with stray
+    // surrounding whitespace still matches an observed name (trim), but a
+    // case-only difference does NOT — "Claude" and "claude" stay distinct bots.
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), '[]');
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({
+      '  NasCodex  ': 'ou_cross_ref_padded', // whitespace-padded → must still match
+      'Claude': 'ou_cross_ref_claude',       // capital C → must NOT match observed "claude"
+    }));
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      'ou_obs_nas': { name: 'NasCodex', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+      'ou_obs_claude': { name: 'claude', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    // Trim: padded cross-ref key matched the observed "NasCodex" → cross-ref openId wins.
+    const nas = bots.find(b => b.displayName === 'NasCodex')!;
+    expect(nas).toMatchObject({ openId: 'ou_cross_ref_padded', mentionSource: 'cross-ref' });
+
+    // Case-sensitive: observed "claude" must NOT pick up the "Claude" cross-ref id;
+    // it stays an observed external row with its own observed open_id.
+    const claude = bots.find(b => b.displayName === 'claude')!;
+    expect(claude).toMatchObject({ openId: 'ou_obs_claude', mentionSource: 'observed' });
+  });
 });

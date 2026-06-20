@@ -125,6 +125,43 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain('name="Alice"');
     expect(prompt).toContain('open_id="ou_alice"');
   });
+
+  it('puts stable routing and bot identity before the first user message for non-injecting CLIs', () => {
+    const prompt = buildNewTopicPrompt(
+      'hello',
+      SESSION_ID,
+      'codex',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { name: 'Codex Bot', openId: 'ou_bot' },
+    );
+
+    expect(prompt.indexOf('<botmux_routing>')).toBeLessThan(prompt.indexOf('<identity>'));
+    expect(prompt.indexOf('<identity>')).toBeLessThan(prompt.indexOf('<user_message>'));
+    expect(prompt.indexOf(`<session_id>${SESSION_ID}</session_id>`)).toBeLessThan(prompt.indexOf('<user_message>'));
+  });
+
+  it('keeps per-turn sender and mentions after the first user message', () => {
+    const prompt = buildNewTopicPrompt(
+      'hello',
+      SESSION_ID,
+      'codex',
+      undefined,
+      undefined,
+      [{ name: 'Alice', openId: 'ou_alice' }],
+      undefined,
+      undefined,
+      { name: 'Codex Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user', name: 'Sender' },
+    );
+
+    expect(prompt.indexOf('<sender ')).toBeGreaterThan(prompt.indexOf('<user_message>'));
+    expect(prompt.indexOf('<mentions>')).toBeGreaterThan(prompt.indexOf('<user_message>'));
+  });
 });
 
 describe('buildFollowUpContent', () => {
@@ -167,6 +204,19 @@ describe('buildFollowUpContent', () => {
     expect(content).toContain('<mentions>');
     expect(content).toContain('name="Bob"');
     expect(content).toContain('open_id="ou_bob"');
+  });
+
+  it('places stable reminder before follow-up user content', () => {
+    const content = buildFollowUpContent('hello', SESSION_ID, {
+      cliId: 'codex',
+      sender: { openId: 'ou_sender', type: 'user', name: 'Sender' },
+      mentions: [{ name: 'Bob', openId: 'ou_bob' }],
+    });
+
+    expect(content.indexOf('<session_id>')).toBeLessThan(content.indexOf('<botmux_reminder>'));
+    expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
+    expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
+    expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
   });
 
   it('should omit <session_id> but keep mentions in adopt mode', () => {
@@ -265,6 +315,7 @@ describe('buildReforkPrompt', () => {
     expect(out).toContain('</user_message>');
     expect(out).toContain('<botmux_reminder>');
     expect(out).toContain('botmux send');
+    expect(out.indexOf('<botmux_reminder>')).toBeLessThan(out.indexOf('<user_message>'));
   });
 
   it('embeds <session_id> for CLIs without injectsSessionContext (codex)', () => {

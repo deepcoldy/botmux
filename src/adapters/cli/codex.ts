@@ -2,16 +2,14 @@ import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { codexHistoryPath } from '../../services/codex-paths.js';
+import { codexHistoryPath, codexSessionsRoot } from '../../services/codex-paths.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
  *  file, which Codex creates lazily at the first submit (chicken-and-egg:
  *  you can't use it to verify the *first* submit that we're trying to fix). */
-function delay(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
@@ -68,7 +66,7 @@ function matchHistoryDelta(path: string, fromByte: number, expectedText: string)
 async function waitForHistoryAppend(
   path: string, fromByte: number, expectedText: string, timeoutMs: number,
 ): Promise<HistoryMatch> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     const match = matchHistoryDelta(path, fromByte, expectedText);
     if (match.found) return match;
@@ -126,12 +124,15 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
+    authPaths: ['~/.codex/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
       const baseArgs = [
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
         '--no-alt-screen',
+        '-c',
+        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
       ];
       if (model && model.trim()) {
         // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
@@ -141,11 +142,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const freshArgs = workingDir
         ? [...baseArgs, '-C', workingDir]
         : baseArgs;
-      if (!resume) return freshArgs;
-
-      const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
-      if (!codexSessionId) return freshArgs;
-      return ['resume', ...baseArgs, codexSessionId];
+      const codexSessionId = resume
+        ? resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId)
+        : undefined;
+      const codexArgs = codexSessionId
+        ? ['resume', ...baseArgs, codexSessionId]
+        : freshArgs;
+      return codexArgs;
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
@@ -156,6 +159,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const sid = cliSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
       if (!sid) return null;
       return `codex resume ${sid}`;
+    },
+
+    /** Import path: scan the rollout files under `<CODEX_HOME>/sessions` for
+     *  resumable sessions (session_meta carries the resume id + cwd). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -239,6 +248,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    defaultPassthroughCommands: ['/goal'],
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an

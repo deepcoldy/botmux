@@ -4,14 +4,22 @@
  *
  * Run:  pnpm vitest run test/inherit-peer.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const mockFindByRoot = vi.fn();
 const mockFindByChat = vi.fn();
+const mockLoggerWarn = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/services/session-store.js', () => ({
   findActiveSessionsByRoot: (...args: unknown[]) => mockFindByRoot(...args),
   findActiveChatScopeSessionsByChat: (...args: unknown[]) => mockFindByChat(...args),
+}));
+
+vi.mock('../src/utils/logger.js', () => ({
+  logger: { warn: mockLoggerWarn },
 }));
 
 import { findInheritablePeer } from '../src/core/inherit-peer.js';
@@ -27,16 +35,30 @@ function makePeer(overrides: Partial<{ sessionId: string; rootMessageId: string;
   };
 }
 
+let tmpRoot = '';
+
+function tempDir(name: string): string {
+  const dir = join(tmpRoot, name);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  tmpRoot = mkdtempSync(join(tmpdir(), 'botmux-inherit-peer-'));
   mockFindByRoot.mockReturnValue([]);
   mockFindByChat.mockReturnValue([]);
 });
 
+afterEach(() => {
+  rmSync(tmpRoot, { recursive: true, force: true });
+});
+
 describe('findInheritablePeer — layer 1 (cross-bot same-anchor)', () => {
   it('returns a thread-scope peer pinned at the same root by another bot', () => {
+    const workingDir = tempDir('repo-a');
     mockFindByRoot.mockReturnValue([
-      makePeer({ sessionId: 'peer-1', rootMessageId: 'om_root', workingDir: '/repo/a', larkAppId: 'app-other' }),
+      makePeer({ sessionId: 'peer-1', rootMessageId: 'om_root', workingDir, larkAppId: 'app-other' }),
     ]);
     const result = findInheritablePeer({
       scope: 'thread',
@@ -45,7 +67,7 @@ describe('findInheritablePeer — layer 1 (cross-bot same-anchor)', () => {
       chatType: 'group',
       selfAppId: 'app-self',
     });
-    expect(result).toEqual({ sessionId: 'peer-1', larkAppId: 'app-other', workingDir: '/repo/a' });
+    expect(result).toEqual({ sessionId: 'peer-1', larkAppId: 'app-other', workingDir });
   });
 
   it('skips peer that belongs to the same bot (would be self-inherit)', () => {
@@ -63,8 +85,9 @@ describe('findInheritablePeer — layer 1 (cross-bot same-anchor)', () => {
   });
 
   it('returns chat-scope peer pinned at the same chat by another bot', () => {
+    const workingDir = tempDir('repo-b');
     mockFindByChat.mockReturnValue([
-      makePeer({ sessionId: 'peer-2', chatId: 'oc_chat', scope: 'chat', workingDir: '/repo/b', larkAppId: 'app-other' }),
+      makePeer({ sessionId: 'peer-2', chatId: 'oc_chat', scope: 'chat', workingDir, larkAppId: 'app-other' }),
     ]);
     const result = findInheritablePeer({
       scope: 'chat',
@@ -73,7 +96,48 @@ describe('findInheritablePeer — layer 1 (cross-bot same-anchor)', () => {
       chatType: 'group',
       selfAppId: 'app-self',
     });
-    expect(result).toEqual({ sessionId: 'peer-2', larkAppId: 'app-other', workingDir: '/repo/b' });
+    expect(result).toEqual({ sessionId: 'peer-2', larkAppId: 'app-other', workingDir });
+  });
+
+  it('skips a stale same-anchor peer workingDir and inherits the next valid peer', () => {
+    const missingDir = join(tmpRoot, 'missing-repo');
+    const validDir = tempDir('repo-c');
+    mockFindByRoot.mockReturnValue([
+      makePeer({ sessionId: 'stale-peer', rootMessageId: 'om_root', workingDir: missingDir, larkAppId: 'app-other' }),
+      makePeer({ sessionId: 'valid-peer', rootMessageId: 'om_root', workingDir: validDir, larkAppId: 'app-third' }),
+    ]);
+
+    const result = findInheritablePeer({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      selfAppId: 'app-self',
+    });
+
+    expect(result).toEqual({ sessionId: 'valid-peer', larkAppId: 'app-third', workingDir: validDir });
+    expect(mockLoggerWarn).toHaveBeenCalledWith(expect.stringContaining('ignored inherited peer workingDir'));
+    expect(mockLoggerWarn).toHaveBeenCalledWith(expect.stringContaining(missingDir));
+  });
+
+  it('returns null and logs when every same-anchor peer workingDir is invalid', () => {
+    const filePath = join(tmpRoot, 'not-a-directory');
+    writeFileSync(filePath, 'not a directory', 'utf-8');
+    mockFindByRoot.mockReturnValue([
+      makePeer({ sessionId: 'file-peer', rootMessageId: 'om_root', workingDir: filePath, larkAppId: 'app-other' }),
+    ]);
+
+    const result = findInheritablePeer({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      selfAppId: 'app-self',
+    });
+
+    expect(result).toBeNull();
+    expect(mockLoggerWarn).toHaveBeenCalledWith(expect.stringContaining('ignored inherited peer workingDir'));
+    expect(mockLoggerWarn).toHaveBeenCalledWith(expect.stringContaining(filePath));
   });
 });
 

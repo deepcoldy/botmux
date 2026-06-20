@@ -72,6 +72,8 @@ export interface BotOnboardingSnapshot {
 /** 调用方 (dashboard) 已校验过的表单输入: CLI / 工作目录 / model. */
 export interface BotOnboardingInput {
   cliId?: CliId;
+  /** 通用启动前缀（如 "aiden x claude"）；aiden×* 选项解析所得，普通 CLI 为空。 */
+  wrapperCli?: string;
   workingDir?: string;
   model?: string;
 }
@@ -216,6 +218,8 @@ export class BotOnboardingManager {
       larkAppId: result.appId,
       larkAppSecret: result.appSecret,
       cliId,
+      // aiden × claude/codex 等启动前缀；普通 CLI 不写此字段。
+      ...(input.wrapperCli ? { wrapperCli: input.wrapperCli } : {}),
       workingDir,
     };
     if (input.model && input.model.trim()) bot.model = input.model.trim();

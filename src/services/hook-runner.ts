@@ -346,6 +346,12 @@ async function runHookCommand(
       });
     });
 
+    // Hooks that don't drain stdin and exit fast (touch/echo/notify-send,
+    // `botmux send`, …) close their read end before this write flushes →
+    // EPIPE on the stdin socket. Without a listener that 'error' is unhandled;
+    // in the long-lived daemon (no global uncaughtException handler) it would
+    // crash the whole process. The hook already spawned, so swallow it.
+    child.stdin?.on('error', () => { /* EPIPE: fast-exiting hook closed stdin */ });
     child.stdin?.end(JSON.stringify(payload), () => {
       if (options.fireAndForget) (child.stdin as any)?.unref?.();
     });
@@ -365,31 +371,60 @@ export function emitHookEvent(event: HookEvent, body: Record<string, unknown> = 
     // can't enforce timeouts itself — fireAndForget unrefs the timer, so a
     // runaway hook would survive as an orphan. The daemon stays alive, its
     // timer fires reliably, and `process.kill(-pid)` cleans the whole group.
-    // Daemon process doesn't have BOTMUX_SESSION_ID set, so this gate
-    // naturally avoids recursive forward when emitHookEvent runs daemon-side.
+    // The daemon itself must never take this branch — it boots with
+    // session-scoped env scrubbed (index-daemon.ts) and its /api/hooks/emit
+    // handler calls emitHookEventLocal, so the gate can't self-forward even
+    // if leaked env survives somewhere.
     if (process.env.BOTMUX_SESSION_ID && process.env.BOTMUX_LARK_APP_ID) {
       void forwardEmitToDaemon(event, payload, process.env.BOTMUX_LARK_APP_ID);
       return;
     }
 
-    const hooks = loadHookConfigs().filter(hook => hook.event === event && filterMatches(hook.filter, payload));
-    if (hooks.length === 0) return;
-
-    for (const [i, hook] of hooks.entries()) {
-      const hookPayload = prepareHookPayload(hook, payload);
-      const tag = `${event}[${i}] (${hook.command.slice(0, 60)})`;
-      void runHookCommand(hook, hookPayload, { fireAndForget: true }).then(result => {
-        if (!result.ok) {
-          logger.warn(`[hooks] ${tag} failed: ${result.error ?? `code=${result.code} signal=${result.signal ?? 'none'}`}`);
-        } else {
-          logger.debug(`[hooks] ${tag} completed`);
-        }
-      }).catch((err: any) => {
-        logger.warn(`[hooks] ${tag} crashed: ${err?.message ?? String(err)}`);
-      });
-    }
+    runHooksLocally(payload);
   } catch (err: any) {
     logger.warn(`[hooks] Failed to emit ${event}: ${err?.message ?? String(err)}`);
+  }
+}
+
+/**
+ * Daemon-side emit: always run hooks in-process, never forward. The
+ * /api/hooks/emit handler MUST use this instead of emitHookEvent — re-entering
+ * the CLI gate there means a daemon that accidentally carries session-scoped
+ * env (e.g. `botmux restart` issued from inside a botmux session: pm2
+ * startOrRestart injects the caller's environment into the restarted daemon)
+ * would POST every event back to itself in an infinite loop — one core pegged
+ * and hundreds of self-connections on the IPC port, with nothing in the logs.
+ */
+export function emitHookEventLocal(event: HookEvent, body: Record<string, unknown> = {}): void {
+  try {
+    const payload: HookPayload = {
+      ...body,
+      event,
+      emittedAt: new Date().toISOString(),
+    };
+    runHooksLocally(payload);
+  } catch (err: any) {
+    logger.warn(`[hooks] Failed to emit ${event}: ${err?.message ?? String(err)}`);
+  }
+}
+
+function runHooksLocally(payload: HookPayload): void {
+  const event = payload.event;
+  const hooks = loadHookConfigs().filter(hook => hook.event === event && filterMatches(hook.filter, payload));
+  if (hooks.length === 0) return;
+
+  for (const [i, hook] of hooks.entries()) {
+    const hookPayload = prepareHookPayload(hook, payload);
+    const tag = `${event}[${i}] (${hook.command.slice(0, 60)})`;
+    void runHookCommand(hook, hookPayload, { fireAndForget: true }).then(result => {
+      if (!result.ok) {
+        logger.warn(`[hooks] ${tag} failed: ${result.error ?? `code=${result.code} signal=${result.signal ?? 'none'}`}`);
+      } else {
+        logger.debug(`[hooks] ${tag} completed`);
+      }
+    }).catch((err: any) => {
+      logger.warn(`[hooks] ${tag} crashed: ${err?.message ?? String(err)}`);
+    });
   }
 }
 

@@ -21,6 +21,7 @@ import {
 } from './session-discovery.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
+import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { findServerPid } from '../adapters/backend/zellij-backend.js';
 import {
   listLiveSessions, parseListPanesJson,
@@ -166,6 +167,10 @@ function resolveSessionId(cliId: CliId, pid: number): { sessionId?: string; star
   if (cliId === 'coco') {
     const coco = findCocoSessionByPid(pid);
     return { sessionId: coco?.sessionId };
+  }
+  if (cliId === 'traex') {
+    const rollout = findTraexRolloutByPid(pid);
+    return { sessionId: rollout?.cliSessionId };
   }
   return {};
 }

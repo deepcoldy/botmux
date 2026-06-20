@@ -108,6 +108,59 @@ describe('parseGrantTargets (multi)', () => {
     };
     expect(parseGrantTargets(barePost, 'ou_bot')).toEqual([]);
   });
+
+  // ── 位置过滤：命令词之前的 @ 是「点名操作 bot」，不是 grantee（申晗实测 bug 回归）─────────
+  // `@Claude @Codex /grant`（两 bot 都前导 @、命令后无目标）：每个 daemon 都不该把「另一个 bot」
+  // 当成 grantee，否则两 bot 互相授权。
+  it('text: co-addressed operator bot BEFORE /grant is NOT a target (no mutual grant)', () => {
+    // 从 Claude(ou_bot) 这个 daemon 看：自己 + Codex 都在命令词之前 → 0 个目标。
+    const msg = {
+      content: JSON.stringify({ text: '@_user_1 @_user_2 /grant' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Claude' },   // 本 bot（前导）
+        { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },  // 另一操作 bot（前导）
+      ],
+    };
+    expect(parseGrantTargets(msg, 'ou_bot')).toEqual([]);
+  });
+
+  it('text: only mentions AFTER /grant count as targets; leading operator dropped', () => {
+    const msg = {
+      content: JSON.stringify({ text: '@_user_1 /grant @_user_2 @_user_3' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_op' }, name: 'OperatorBot' },  // 前导操作 bot → 剔除
+        { key: '@_user_2', id: { open_id: 'ou_a' }, name: '张三' },
+        { key: '@_user_3', id: { open_id: 'ou_b' }, name: '李四' },
+      ],
+    };
+    expect(parseGrantTargets(msg, 'ou_bot')).toEqual([
+      { openId: 'ou_a', name: '张三' },
+      { openId: 'ou_b', name: '李四' },
+    ]);
+  });
+
+  it('text: key-prefix collision (@_user_1 leading vs @_user_10 trailing) resolved by position', () => {
+    const msg = {
+      content: JSON.stringify({ text: '@_user_10 /grant @_user_1' }),
+      mentions: [
+        { key: '@_user_10', id: { open_id: 'ou_op' }, name: 'OperatorBot' },  // 前导 → 剔除
+        { key: '@_user_1', id: { open_id: 'ou_a' }, name: '张三' },           // 命令后 → 目标
+      ],
+    };
+    expect(parseGrantTargets(msg, 'ou_bot')).toEqual([{ openId: 'ou_a', name: '张三' }]);
+  });
+
+  it('post: co-addressed operator bot BEFORE /grant node is NOT a target', () => {
+    const postMsg = {
+      content: JSON.stringify({ zh_cn: { content: [[
+        { tag: 'at', user_id: 'ou_bot', user_name: 'Claude' },    // 本 bot（前导）
+        { tag: 'at', user_id: 'ou_codex', user_name: 'Codex' },   // 另一操作 bot（前导）
+        { tag: 'text', text: ' /grant' },
+      ]] } }),
+      mentions: [],
+    };
+    expect(parseGrantTargets(postMsg, 'ou_bot')).toEqual([]);
+  });
 });
 
 describe('tryHandleGrantCommand (@bot /grant @user)', () => {
@@ -361,6 +414,51 @@ describe('tryHandleGrantCommand bot-as-target (@operator /grant @thisBot)', () =
     expect(handled).toBe(true);
     const [, , , msgType] = replyMock.mock.calls.at(-1)!;
     expect(msgType).toBe('interactive');                         // card still pops for the operator
+  });
+});
+
+describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', () => {
+  // 申晗实测 bug：`@Claude @Codex /grant`（两 bot 都在命令词之前、命令后无目标）。从本 bot=ou_bot
+  // 的 daemon 看，另一个 bot 在命令词之前 = 操作 bot 点名，不是 grantee → 绝不能弹「授权对方 bot」
+  // 的卡（那会导致两 bot 互相授权 + 唤醒对方拉空会话）。命令后无目标 → 落进裸 /grant 整群分支。
+  function coAddressedMsg() {
+    return {
+      message_id: 'om_co', chat_id: 'oc_room',
+      content: JSON.stringify({ text: '@_user_1 @_user_2 /grant' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Claude' },    // 本 bot（前导）
+        { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },   // 另一操作 bot（前导）
+      ],
+    };
+  }
+
+  let configPath: string;
+  beforeEach(() => {
+    replyMock.mockClear();
+    pending._resetForTest();
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-grant-co-'));
+    configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([
+      { larkAppId: 'bco', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+    ], null, 2), 'utf-8');
+    loadBotConfigs().forEach(c => registerBot(c));
+    const bot = getBot('bco');
+    bot.botOpenId = 'ou_bot';
+    bot.resolvedAllowedUsers = ['ou_owner'];
+  });
+  afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
+
+  it('owner: does NOT grant the other bot — no per-target card, no chatGrants entry', async () => {
+    const handled = await tryHandleGrantCommand('bco', coAddressedMsg(), 'ou_owner');
+    expect(handled).toBe(true);
+    // 没有针对「另一个 bot」开 pending（互相授权的核心症状）→ pending 表为空。
+    expect(pending._tableSizeForTest()).toBe(0);
+    // 对方 bot 绝不被写进 chatGrants（互相授权的落库症状）。
+    expect(getBot('bco').config.chatGrants?.['oc_room'] ?? []).not.toContain('ou_codex');
+    // 落进裸 /grant 整群分支：纯文本回执，不是「授权对方 bot」的授权卡。
+    const [, , , msgType] = replyMock.mock.calls.at(-1)!;
+    expect(msgType ?? 'text').not.toBe('interactive');
   });
 });
 

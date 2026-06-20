@@ -1,0 +1,356 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  CLI_SELECT_OPTIONS,
+  CLI_SELECT_TREE,
+  resolveCliSelection,
+  lookupCliSelection,
+  selectionKeyForBot,
+  stripSettingsArgs,
+  buildWrappedLaunch,
+  parseWrapperCli,
+  decorateResumeForWrapper,
+  isTtadkWrapper,
+  ttadkAcceptsModel,
+  ttadkConfigModelChoices,
+  TTADK_DEFAULT_MODEL,
+  TTADK_MODEL_SUGGESTIONS,
+} from '../src/setup/cli-selection.js';
+
+describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
+  it('includes the two aiden gateway options right after native aiden', () => {
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('aiden');
+    expect(keys).toContain('aiden-x-claude');
+    expect(keys).toContain('aiden-x-codex');
+    const i = keys.indexOf('aiden');
+    expect(keys[i + 1]).toBe('aiden-x-claude');
+    expect(keys[i + 2]).toBe('aiden-x-codex');
+  });
+
+  it('appends the two cjadk gateway options after the native CLIs', () => {
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('cjadk-x-claude');
+    expect(keys).toContain('cjadk-x-codex');
+    const i = keys.indexOf('cjadk-x-claude');
+    expect(keys[i + 1]).toBe('cjadk-x-codex');
+  });
+
+  it('keeps every plain CliId selectable by its own key', () => {
+    expect(lookupCliSelection('claude-code')?.cliId).toBe('claude-code');
+    expect(lookupCliSelection('codex')?.cliId).toBe('codex');
+    expect(lookupCliSelection('codex')?.wrapperCli).toBeUndefined();
+  });
+
+  it('cascades Aiden into a submenu of three variants', () => {
+    const aiden = CLI_SELECT_TREE.find((g) => g.key === 'aiden');
+    expect(aiden?.children?.map((c) => c.key)).toEqual(['aiden', 'aiden-x-claude', 'aiden-x-codex']);
+    // an ungrouped top entry is a directly-selectable leaf
+    const gemini = CLI_SELECT_TREE.find((g) => g.key === 'gemini');
+    expect(gemini?.option?.cliId).toBe('gemini');
+    expect(gemini?.children).toBeUndefined();
+  });
+
+  it('cascades Codex into one submenu of Codex + Codex App (no top-level codex-app)', () => {
+    const codex = CLI_SELECT_TREE.find((g) => g.key === 'codex');
+    expect(codex?.children?.map((c) => c.key)).toEqual(['codex', 'codex-app']);
+    expect(codex?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'codex-app')).toBeUndefined();
+    expect(resolveCliSelection('codex')).toEqual({ cliId: 'codex' });
+    expect(resolveCliSelection('codex-app')).toEqual({ cliId: 'codex-app' });
+  });
+
+  it('cascades TRAE (CoCo) into one submenu of coco + traex (no top-level coco/traex)', () => {
+    const trae = CLI_SELECT_TREE.find((g) => g.key === 'trae');
+    expect(trae?.label).toBe('TRAE (CoCo)');
+    expect(trae?.children?.map((c) => c.key)).toEqual(['coco', 'traex']);
+    expect(trae?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'coco')).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'traex')).toBeUndefined();
+    expect(resolveCliSelection('coco')).toEqual({ cliId: 'coco' });
+    expect(resolveCliSelection('traex')).toEqual({ cliId: 'traex' });
+  });
+
+  it('keeps Pi and Oh My Pi as adjacent top-level leaves', () => {
+    const treeKeys = CLI_SELECT_TREE.map((g) => g.key);
+    const i = treeKeys.indexOf('pi');
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(treeKeys[i + 1]).toBe('oh-my-pi');
+    // both remain directly-selectable leaves (not a submenu)
+    expect(CLI_SELECT_TREE[i].option?.cliId).toBe('pi');
+    expect(CLI_SELECT_TREE[i + 1].option?.cliId).toBe('oh-my-pi');
+    const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    const fi = flatKeys.indexOf('pi');
+    expect(flatKeys[fi + 1]).toBe('oh-my-pi');
+  });
+
+  it('cascades Mira into one submenu of Mira App + Mir CLI (no top-level mir)', () => {
+    const mira = CLI_SELECT_TREE.find((g) => g.key === 'mira');
+    expect(mira?.children?.map((c) => c.key)).toEqual(['mira', 'mir']);
+    expect(mira?.option).toBeUndefined();
+    // mir is no longer a separate top-level entry — it lives under the Mira group.
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'mir')).toBeUndefined();
+    // flat list: both resolvable, mir folded under mira (no duplicate top entry)
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('mira');
+    expect(keys).toContain('mir');
+  });
+
+  it('resolves both Mira variants to their native cliIds (no wrapperCli)', () => {
+    expect(resolveCliSelection('mira')).toEqual({ cliId: 'mira' });
+    expect(resolveCliSelection('mir')).toEqual({ cliId: 'mir' });
+  });
+
+  it('cascades CJADK into a submenu of its two × variants', () => {
+    const cjadk = CLI_SELECT_TREE.find((g) => g.key === 'cjadk');
+    expect(cjadk?.children?.map((c) => c.key)).toEqual(['cjadk-x-claude', 'cjadk-x-codex']);
+    expect(cjadk?.option).toBeUndefined();
+  });
+
+  it('appends the six ttadk gateway options after cjadk', () => {
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('ttadk-x-claude');
+    const i = keys.indexOf('ttadk-x-claude');
+    expect(keys.slice(i, i + 6)).toEqual([
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+    ]);
+    // ttadk comes after the cjadk block
+    expect(keys.indexOf('ttadk-x-claude')).toBeGreaterThan(keys.indexOf('cjadk-x-codex'));
+  });
+
+  it('cascades TTADK into a submenu of its six × variants', () => {
+    const ttadk = CLI_SELECT_TREE.find((g) => g.key === 'ttadk');
+    expect(ttadk?.children?.map((c) => c.key)).toEqual([
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+    ]);
+    expect(ttadk?.option).toBeUndefined();
+  });
+});
+
+describe('resolveCliSelection', () => {
+  it('maps a plain cli key to just its cliId', () => {
+    expect(resolveCliSelection('claude-code')).toEqual({ cliId: 'claude-code' });
+    expect(resolveCliSelection('gemini')).toEqual({ cliId: 'gemini' });
+  });
+
+  it('maps aiden×claude to claude-code + wrapperCli "aiden x claude"', () => {
+    expect(resolveCliSelection('aiden-x-claude')).toEqual({ cliId: 'claude-code', wrapperCli: 'aiden x claude' });
+  });
+
+  it('maps aiden×codex to codex + wrapperCli "aiden x codex"', () => {
+    expect(resolveCliSelection('aiden-x-codex')).toEqual({ cliId: 'codex', wrapperCli: 'aiden x codex' });
+  });
+
+  it('maps native aiden to plain aiden (no wrapper)', () => {
+    expect(resolveCliSelection('aiden')).toEqual({ cliId: 'aiden' });
+  });
+
+  it('maps cjadk×claude to claude-code + wrapperCli "cjadk claude"', () => {
+    expect(resolveCliSelection('cjadk-x-claude')).toEqual({ cliId: 'claude-code', wrapperCli: 'cjadk claude' });
+  });
+
+  it('maps cjadk×codex to codex + wrapperCli "cjadk codex"', () => {
+    expect(resolveCliSelection('cjadk-x-codex')).toEqual({ cliId: 'codex', wrapperCli: 'cjadk codex' });
+  });
+
+  it('maps ttadk variants to their underlying cliId + "ttadk <sub>" wrapperCli', () => {
+    expect(resolveCliSelection('ttadk-x-claude')).toEqual({ cliId: 'claude-code', wrapperCli: 'ttadk claude' });
+    expect(resolveCliSelection('ttadk-x-codex')).toEqual({ cliId: 'codex', wrapperCli: 'ttadk codex' });
+    expect(resolveCliSelection('ttadk-x-opencode')).toEqual({ cliId: 'opencode', wrapperCli: 'ttadk opencode' });
+    expect(resolveCliSelection('ttadk-x-coco')).toEqual({ cliId: 'coco', wrapperCli: 'ttadk coco' });
+    // Cursor uses ttadk's `cursor-cli` subcommand but the botmux adapter is still `cursor`.
+    expect(resolveCliSelection('ttadk-x-cursor')).toEqual({ cliId: 'cursor', wrapperCli: 'ttadk cursor-cli' });
+    expect(resolveCliSelection('ttadk-x-gemini')).toEqual({ cliId: 'gemini', wrapperCli: 'ttadk gemini' });
+  });
+
+  it('throws on an unknown key', () => {
+    expect(() => resolveCliSelection('nope')).toThrow(/未知 CLI 选择项/);
+  });
+});
+
+describe('selectionKeyForBot', () => {
+  it('round-trips aiden gateway bots back to their selection key', () => {
+    expect(selectionKeyForBot('claude-code', 'aiden x claude')).toBe('aiden-x-claude');
+    expect(selectionKeyForBot('codex', 'aiden x codex')).toBe('aiden-x-codex');
+  });
+
+  it('round-trips cjadk gateway bots back to their selection key', () => {
+    expect(selectionKeyForBot('claude-code', 'cjadk claude')).toBe('cjadk-x-claude');
+    expect(selectionKeyForBot('codex', 'cjadk codex')).toBe('cjadk-x-codex');
+  });
+
+  it('round-trips ttadk gateway bots back to their selection key', () => {
+    expect(selectionKeyForBot('claude-code', 'ttadk claude')).toBe('ttadk-x-claude');
+    expect(selectionKeyForBot('coco', 'ttadk coco')).toBe('ttadk-x-coco');
+    expect(selectionKeyForBot('cursor', 'ttadk cursor-cli')).toBe('ttadk-x-cursor');
+  });
+
+  it('falls back to cliId for plain bots or unrecognised prefixes', () => {
+    expect(selectionKeyForBot('codex')).toBe('codex');
+    expect(selectionKeyForBot('claude-code', '')).toBe('claude-code');
+    expect(selectionKeyForBot('claude-code', 'ccr')).toBe('claude-code');
+  });
+});
+
+describe('stripSettingsArgs', () => {
+  it('drops --settings <value> (two tokens)', () => {
+    expect(stripSettingsArgs(['--session-id', 'x', '--settings', '{"a":1}', '--model', 'm']))
+      .toEqual(['--session-id', 'x', '--model', 'm']);
+  });
+
+  it('drops --settings=<value> (single token)', () => {
+    expect(stripSettingsArgs(['--settings={"a":1}', '--plugin-dir', '/p']))
+      .toEqual(['--plugin-dir', '/p']);
+  });
+
+  it('leaves args untouched when there is no --settings', () => {
+    expect(stripSettingsArgs(['--resume', 'id', '--model', 'm'])).toEqual(['--resume', 'id', '--model', 'm']);
+  });
+});
+
+describe('parseWrapperCli', () => {
+  it('splits on whitespace and drops blanks', () => {
+    expect(parseWrapperCli('  aiden   x claude ')).toEqual(['aiden', 'x', 'claude']);
+    expect(parseWrapperCli('')).toEqual([]);
+  });
+});
+
+describe('buildWrappedLaunch', () => {
+  it('prepends the prefix and strips --settings for aiden x claude', () => {
+    const out = buildWrappedLaunch('aiden x claude', ['--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p']);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'claude', '--session-id', 'sid', '--plugin-dir', '/p']);
+  });
+
+  it('prepends the prefix but keeps args verbatim for aiden x codex', () => {
+    const out = buildWrappedLaunch('aiden x codex', ['resume', 'cid', '--model', 'm']);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'codex', 'resume', 'cid', '--model', 'm']);
+  });
+
+  it('keeps --settings for cjadk claude (forwarded verbatim to real claude)', () => {
+    const out = buildWrappedLaunch('cjadk claude', ['--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p']);
+    expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['claude', '--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p']);
+  });
+
+  it('prepends the prefix for cjadk codex', () => {
+    const out = buildWrappedLaunch('cjadk codex', ['resume', 'cid']);
+    expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['codex', 'resume', 'cid']);
+  });
+
+  it('works for a generic single-token prefix (ccr) without stripping --settings', () => {
+    const out = buildWrappedLaunch('ccr', ['--settings', '{}', '--resume', 'x']);
+    expect(out.bin).toBe('ccr');
+    expect(out.args).toEqual(['--settings', '{}', '--resume', 'x']);
+  });
+
+  it('resolves the bin via the provided resolver', () => {
+    const out = buildWrappedLaunch('aiden x claude', ['--resume', 'x'], (b) => `/abs/${b}`);
+    expect(out.bin).toBe('/abs/aiden');
+  });
+
+  it('returns empty bin for a blank prefix so callers can skip', () => {
+    expect(buildWrappedLaunch('   ', ['--resume', 'x'])).toEqual({ bin: '', args: ['--resume', 'x'] });
+  });
+
+  describe('ttadk gateway', () => {
+    it('injects `-m <model> --skip-check` and forwards CLI args verbatim (keeps --settings)', () => {
+      const out = buildWrappedLaunch('ttadk claude', ['--session-id', 'sid', '--settings', '{}'], (b) => b, { ttadkModel: 'glm-5.1' });
+      expect(out.bin).toBe('ttadk');
+      expect(out.args).toEqual(['claude', '-m', 'glm-5.1', '--skip-check', '--session-id', 'sid', '--settings', '{}']);
+    });
+
+    it('falls back to the default model when none is provided', () => {
+      const out = buildWrappedLaunch('ttadk codex', ['--resume', 'cid']);
+      expect(out.args).toEqual(['codex', '-m', TTADK_DEFAULT_MODEL, '--skip-check', '--resume', 'cid']);
+    });
+
+    it('treats blank/whitespace model as unset and uses the default', () => {
+      const out = buildWrappedLaunch('ttadk claude', ['--x'], (b) => b, { ttadkModel: '   ' });
+      expect(out.args).toEqual(['claude', '-m', TTADK_DEFAULT_MODEL, '--skip-check', '--x']);
+    });
+
+    it('does NOT inject -m for CoCo (requiresManagedModel=false), only --skip-check', () => {
+      const out = buildWrappedLaunch('ttadk coco', ['--session-id', 'sid'], (b) => b, { ttadkModel: 'glm-5.1' });
+      expect(out.args).toEqual(['coco', '--skip-check', '--session-id', 'sid']);
+      expect(out.args).not.toContain('-m');
+    });
+
+    it('uses the cursor-cli subcommand for ttadk × cursor', () => {
+      const out = buildWrappedLaunch('ttadk cursor-cli', ['--resume', 'x'], (b) => b, { ttadkModel: 'glm-5.1' });
+      expect(out.args).toEqual(['cursor-cli', '-m', 'glm-5.1', '--skip-check', '--resume', 'x']);
+    });
+
+    it('resolves the ttadk bin via the provided resolver', () => {
+      const out = buildWrappedLaunch('ttadk claude', [], (b) => `/abs/${b}`, { ttadkModel: 'glm-5' });
+      expect(out.bin).toBe('/abs/ttadk');
+    });
+  });
+});
+
+describe('isTtadkWrapper / ttadkAcceptsModel', () => {
+  it('detects the ttadk prefix only', () => {
+    expect(isTtadkWrapper('ttadk claude')).toBe(true);
+    expect(isTtadkWrapper('ttadk coco')).toBe(true);
+    expect(isTtadkWrapper('cjadk claude')).toBe(false);
+    expect(isTtadkWrapper('aiden x claude')).toBe(false);
+    expect(isTtadkWrapper('')).toBe(false);
+    expect(isTtadkWrapper(undefined)).toBe(false);
+  });
+
+  it('reports which ttadk subcommands accept -m', () => {
+    expect(ttadkAcceptsModel('ttadk claude')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk cursor-cli')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk gemini')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk coco')).toBe(false);
+    expect(ttadkAcceptsModel('cjadk claude')).toBe(false);
+    expect(ttadkAcceptsModel(undefined)).toBe(false);
+  });
+});
+
+describe('ttadkConfigModelChoices', () => {
+  it('returns the ttadk model suggestions for a managed-model ttadk bot', () => {
+    expect(ttadkConfigModelChoices('ttadk claude')).toEqual([...TTADK_MODEL_SUGGESTIONS]);
+    expect(ttadkConfigModelChoices('ttadk cursor-cli')).toEqual([...TTADK_MODEL_SUGGESTIONS]);
+  });
+
+  it('returns an empty list for ttadk CoCo (no model dropdown)', () => {
+    expect(ttadkConfigModelChoices('ttadk coco')).toEqual([]);
+  });
+
+  it('returns null for non-ttadk bots so callers fall back to the adapter choices', () => {
+    expect(ttadkConfigModelChoices('cjadk claude')).toBeNull();
+    expect(ttadkConfigModelChoices('aiden x claude')).toBeNull();
+    expect(ttadkConfigModelChoices(undefined)).toBeNull();
+    expect(ttadkConfigModelChoices('')).toBeNull();
+  });
+});
+
+describe('decorateResumeForWrapper', () => {
+  it('rewrites the leading bin to the wrapper prefix', () => {
+    expect(decorateResumeForWrapper('claude --resume ID', 'aiden x claude')).toBe('aiden x claude --resume ID');
+    expect(decorateResumeForWrapper('codex resume ID', 'aiden x codex')).toBe('aiden x codex resume ID');
+  });
+
+  it('returns the command unchanged when no wrapper is set', () => {
+    expect(decorateResumeForWrapper('claude --resume ID', undefined)).toBe('claude --resume ID');
+    expect(decorateResumeForWrapper('claude --resume ID', '   ')).toBe('claude --resume ID');
+  });
+
+  it('keeps ttadk non-interactive flags (-m / --skip-check) in the resume command', () => {
+    expect(decorateResumeForWrapper('claude --resume ID', 'ttadk claude', { ttadkModel: 'glm-5.1' }))
+      .toBe('ttadk claude -m glm-5.1 --skip-check --resume ID');
+  });
+
+  it('uses the default ttadk model in the resume command when none is set', () => {
+    expect(decorateResumeForWrapper('codex resume ID', 'ttadk codex'))
+      .toBe(`ttadk codex -m ${TTADK_DEFAULT_MODEL} --skip-check resume ID`);
+  });
+
+  it('omits -m for ttadk CoCo resume (still adds --skip-check)', () => {
+    expect(decorateResumeForWrapper('coco --resume ID', 'ttadk coco', { ttadkModel: 'glm-5.1' }))
+      .toBe('ttadk coco --skip-check --resume ID');
+  });
+});

@@ -12,6 +12,7 @@ import {
   buildSchedulesDetailCard,
   handleSchedulesCardAction,
   SCHEDULES_ACTION_BACK_TO_LIST,
+  SCHEDULES_ACTION_DELIVERY,
   SCHEDULES_ACTION_DETAIL,
   SCHEDULES_ACTION_PAGE,
   SCHEDULES_ACTION_PAUSE,
@@ -29,6 +30,7 @@ function task(over: Partial<ScheduleCardTaskInput> = {}): ScheduleCardTaskInput 
     prompt: 'say hi',
     parsed: { kind: 'cron', display: '0 9 * * *', expr: '0 9 * * *' } as any,
     enabled: true,
+    deliver: 'origin',
     larkAppId: LARK_APP_ID,
     chatId: 'oc_chat',
     nextRunAt: '2026-06-09T13:00:00.000Z',
@@ -385,7 +387,7 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(json).toContain('sch_detail_123');
   });
 
-  it('renders pause + resume + back buttons (all 3 present, invoker_open_id bound)', () => {
+  it('renders pause + resume + delivery + back buttons (all 4 present, invoker_open_id bound)', () => {
     const detail = detailFor({ id: 'sch_btns', enabled: true });
     const json = buildSchedulesDetailCard(detail, baseOpts);
     const parsed = JSON.parse(json);
@@ -393,15 +395,61 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     const acts = actionRow.actions as any[];
     const pause = acts.find(a => a.value?.action === SCHEDULES_ACTION_PAUSE);
     const resume = acts.find(a => a.value?.action === SCHEDULES_ACTION_RESUME);
+    const delivery = acts.find(a => a.value?.action === SCHEDULES_ACTION_DELIVERY);
     const back = acts.find(a => a.value?.action === SCHEDULES_ACTION_BACK_TO_LIST);
     expect(pause).toBeDefined();
     expect(resume).toBeDefined();
+    expect(delivery).toBeDefined();
     expect(back).toBeDefined();
     expect(pause.value.schedule_id).toBe('sch_btns');
     expect(resume.value.schedule_id).toBe('sch_btns');
+    expect(delivery.value.schedule_id).toBe('sch_btns');
+    expect(delivery.value.target_delivery).toBe('new-topic');
     expect(pause.value.invoker_open_id).toBe(INVOKER);
     expect(resume.value.invoker_open_id).toBe(INVOKER);
+    expect(delivery.value.invoker_open_id).toBe(INVOKER);
     expect(back.value.invoker_open_id).toBe(INVOKER);
+  });
+
+  it('delivery=origin → shows current delivery and use-new-topic button', () => {
+    const detail = detailFor({ id: 'sch_origin', deliver: 'origin' });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    expect(json).toContain('投递：原话题');
+    expect(json).toContain('改为每次新话题');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery.disabled).not.toBe(true);
+    expect(delivery.value.target_delivery).toBe('new-topic');
+  });
+
+  it('delivery=new-topic → shows current delivery and use-origin button', () => {
+    const detail = detailFor({ id: 'sch_new_topic', deliver: 'new-topic' });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    expect(json).toContain('投递：每次新话题');
+    expect(json).toContain('改为原话题');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery.disabled).not.toBe(true);
+    expect(delivery.value.target_delivery).toBe('origin');
+  });
+
+  it('delivery=local → shows local mode and disables delivery switch', () => {
+    const detail = detailFor({ id: 'sch_local', deliver: 'local' });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    expect(json).toContain('投递：本地不发送');
+    expect(json).toContain('本地投递模式不支持在卡片中切换');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery.disabled).toBe(true);
   });
 
   it('enabled=true → pause enabled / resume disabled with alreadyEnabled note', () => {
@@ -423,8 +471,8 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(json).toContain('任务已启用');
   });
 
-  /** ─── Overview drilldown — detail back/pause/resume propagate nav ─── */
-  it('detail with origin=overview (default page size) → back/pause/resume carry origin (page_size omitted)', () => {
+  /** ─── Overview drilldown — detail actions propagate nav ─── */
+  it('detail with origin=overview (default page size) → all actions carry origin (page_size omitted)', () => {
     // PAGE_SIZE=5 default after 2026-06-10. pageSize=5 == default → omitted.
     const detail = detailFor({ id: 'sch_nav', enabled: true });
     const json = buildSchedulesDetailCard(detail, { ...baseOpts, origin: 'overview', pageSize: 5 });
@@ -437,7 +485,7 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     }
   });
 
-  it('detail with origin=overview AND overridden pageSize=3 → back/pause/resume carry origin AND page_size', () => {
+  it('detail with origin=overview AND overridden pageSize=3 → all actions carry origin AND page_size', () => {
     const detail = detailFor({ id: 'sch_override', enabled: true });
     const json = buildSchedulesDetailCard(detail, { ...baseOpts, origin: 'overview', pageSize: 3 });
     const parsed = JSON.parse(json);
@@ -1067,6 +1115,207 @@ describe('handleSchedulesCardAction', () => {
       expect(r.card).toBeUndefined();
       const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
       expect(postCalls.length).toBe(0);
+    });
+  });
+
+  // ─── Slice 2b: DELIVERY (origin ↔ new-topic) ─────────────────────────
+  describe('action=dash_schedules_delivery', () => {
+    function makeDeliveryDeps(
+      scheduleId = 'sch_a',
+      deliver: ScheduleCardTaskInput['deliver'] = 'origin',
+      postResp?: { status: number; body?: any },
+      postRefetchTasks?: ScheduleCardTaskInput[],
+    ) {
+      const initial = [task({ id: scheduleId, name: 'delivery me', deliver })];
+      let getCalls = 0;
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+          getCalls += 1;
+          if (getCalls === 1) return { status: 200, body: { schedules: initial }, raw: '' };
+          return {
+            status: 200,
+            body: {
+              schedules: postRefetchTasks ?? initial.map(t => ({
+                ...t,
+                deliver: t.deliver === 'new-topic' ? 'origin' : 'new-topic',
+              })),
+            },
+            raw: '',
+          };
+        }
+        if (req.method === 'GET' && req.path === '/__daemon/schedules-list?scope=global') {
+          getCalls += 1;
+          if (getCalls === 1) return { status: 200, body: { schedules: initial }, raw: '' };
+          return {
+            status: 200,
+            body: {
+              schedules: postRefetchTasks ?? initial.map(t => ({
+                ...t,
+                deliver: t.deliver === 'new-topic' ? 'origin' : 'new-topic',
+              })),
+            },
+            raw: '',
+          };
+        }
+        if (req.method === 'POST' && req.path.startsWith('/__daemon/schedules/')) {
+          return postResp ?? {
+            status: 200,
+            body: { ok: true, deliver: deliver === 'new-topic' ? 'origin' : 'new-topic' },
+            raw: '',
+          };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
+      return {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
+        requestSpy,
+      };
+    }
+
+    it('origin → POST delivery + refetch, card shows new-topic state', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'origin');
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'new-topic',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ method: 'POST', path: '/__daemon/schedules/sch_a/delivery' }),
+      );
+      expect(deps.requestSpy.mock.calls[2][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
+      expect(r.toast).toBeUndefined();
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('投递：每次新话题');
+      expect(cardJson).toContain('改为原话题');
+    });
+
+    it('new-topic → POST delivery + refetch, card shows origin state', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'new-topic');
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'origin',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ method: 'POST', path: '/__daemon/schedules/sch_a/delivery' }),
+      );
+      expect(r.toast).toBeUndefined();
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('投递：原话题');
+      expect(cardJson).toContain('改为每次新话题');
+    });
+
+    it('scope=global → GET/POST/refetch all keep ?scope=global', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'origin');
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'new-topic',
+          dashboard_scope: 'global',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast).toBeUndefined();
+      expect(deps.requestSpy.mock.calls.map((c: any[]) => c[0].path)).toEqual([
+        '/__daemon/schedules-list?scope=global',
+        '/__daemon/schedules/sch_a/delivery?scope=global',
+        '/__daemon/schedules-list?scope=global',
+      ]);
+    });
+
+    it('snapshot already at target → toast alreadyNewTopic, POST 0 times', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'new-topic');
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'new-topic',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('已是每次新话题投递');
+      expect(r.card).toBeUndefined();
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+
+    it('snapshot local → toast local disabled, POST 0 times', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'local');
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'new-topic',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('本地投递模式不支持');
+      expect(r.card).toBeUndefined();
+      const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
+      expect(postCalls.length).toBe(0);
+    });
+
+    it('invalid target_delivery → invalid_action toast, no GET/POST', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'origin');
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'local',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('⚠️');
+      expect(r.card).toBeUndefined();
+      expect(deps.requestSpy).not.toHaveBeenCalled();
+    });
+
+    it('POST 500 → toast delivery_failed, no card', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'origin', { status: 500, body: { error: 'delivery_boom' } });
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'new-topic',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('修改投递方式失败');
+      expect(r.toast?.content).toContain('delivery_boom');
+      expect(r.card).toBeUndefined();
+    });
+
+    it('refetch missing after successful POST → fallback synth renders target delivery', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'origin', { status: 200, body: { ok: true, deliver: 'new-topic' } }, []);
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'new-topic',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast).toBeUndefined();
+      expect(JSON.stringify(r.card?.data)).toContain('投递：每次新话题');
     });
   });
 

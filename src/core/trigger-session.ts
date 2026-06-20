@@ -4,7 +4,7 @@ import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
 import { getBot } from '../bot-registry.js';
 import { getChatMode, sendMessage } from '../im/lark/client.js';
-import { localeForBot } from '../i18n/index.js';
+import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpContent, buildNewTopicPrompt, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
@@ -151,7 +151,7 @@ export async function triggerSessionTurn(
   let scope: 'thread' | 'chat' = 'chat';
   let anchor = chatId;
   if (chatMode === 'topic') {
-    anchor = await sendMessage(larkAppId, chatId, `外部事件触发：${req.envelope.sourceName}`);
+    anchor = await sendMessage(larkAppId, chatId, t('trigger.external_event', { source: req.envelope.sourceName }, localeForBot(larkAppId)));
     scope = 'thread';
   }
 

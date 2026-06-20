@@ -22,6 +22,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {} }));
 const sendMessageMock = vi.fn(async () => 'om_M1');
 const deleteMessageMock = vi.fn(async () => true);
 const getChatNameMock = vi.fn(async (): Promise<string | null> => 'Friendly Source Chat Name');
+const replyMessageMock = vi.fn(async () => 'om_M1_thread');
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
@@ -29,7 +30,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
     sendMessage: (...a: any[]) => sendMessageMock(...a),
     deleteMessage: (...a: any[]) => deleteMessageMock(...a),
     getChatName: (...a: any[]) => getChatNameMock(...a),
-    replyMessage: vi.fn(),
+    replyMessage: (...a: any[]) => replyMessageMock(...a),
     sendUserMessage: vi.fn(),
     updateMessage: vi.fn(),
   };
@@ -88,7 +89,7 @@ function makeDs(overrides: Partial<Session> & { chatId?: string } = {}): DaemonS
 }
 
 // Confirm button click shape — value carries full context after selection.
-function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id?: string; operator?: string } = {}) {
+function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id?: string; operator?: string; target_scope?: 'thread' | 'chat'; target_chat_type?: 'group' | 'p2p' } = {}) {
   return {
     operator: { open_id: opts.operator ?? OWNER },
     action: {
@@ -97,6 +98,8 @@ function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id
         session_id: opts.sessionId ?? 'sess-source-1',
         target_chat_id: opts.target_chat_id ?? 'oc_target',
         root_id: opts.root_id ?? 'om_target_root',
+        ...(opts.target_scope ? { target_scope: opts.target_scope } : {}),
+        ...(opts.target_chat_type ? { target_chat_type: opts.target_chat_type } : {}),
       },
     },
   };
@@ -115,6 +118,8 @@ beforeEach(() => {
   deleteMessageMock.mockClear();
   getChatNameMock.mockClear();
   getChatNameMock.mockResolvedValue('Friendly Source Chat Name');
+  replyMessageMock.mockClear();
+  replyMessageMock.mockResolvedValue('om_M1_thread');
   transferSessionMock.mockClear();
   transferSessionMock.mockResolvedValue({ ok: true });
 });
@@ -173,12 +178,19 @@ describe('relay_confirm button click', () => {
     expect(transferSessionMock).not.toHaveBeenCalled();
   });
 
-  it('refuses to relay into the same chat the session is already in', async () => {
-    const ds = makeDs({ chatId: 'oc_target' });
+  it('refuses to relay a session onto its own anchor (same_anchor)', async () => {
+    // Thread-scope source anchored at om_source_root; targeting that same 话题
+    // root → same anchor → refuse (relaying onto itself). A different chat /
+    // different 话题 would be allowed (anchor-based, enables 同群话题间搬运).
+    const ds = makeDs();  // scope 'thread', anchor om_source_root
     const map = new Map<string, DaemonSession>();
     map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
 
-    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+    const r = await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_source', root_id: 'om_source_root', target_scope: 'thread' }),
+      deps(map),
+      LARK_APP_ID,
+    );
 
     expect(r?.toast?.type).toBe('error');
     expect(transferSessionMock).not.toHaveBeenCalled();
@@ -205,9 +217,95 @@ describe('relay_confirm button click', () => {
     expect(m1Payload).toContain('Friendly Source Chat Name');
     expect(m1Payload).not.toContain('oc_source');
 
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1', 'group');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1', 'group', 'chat');
     expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_picker_card');
     expect(r?.toast?.type).toBe('success');
+  });
+
+  it('thread-scope target: M1 sent reply_in_thread to the 话题 root, transferSession gets (group, thread) anchored at root_id', async () => {
+    const ds = makeDs();  // source in oc_source, thread anchor om_source_root
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    const r = await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_topic_root', target_scope: 'thread' }),
+      deps(map),
+      LARK_APP_ID,
+    );
+
+    // M1 goes via replyMessage(reply_in_thread=true) into the 话题 root, NOT
+    // sendMessage; sendMessage must not be used for the announcement.
+    expect(replyMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_topic_root', expect.any(String), 'text', true);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    // Session anchors on the 话题 root (NOT the M1 id), scope 'thread'.
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_topic_root', 'group', 'thread');
+    expect(r?.toast?.type).toBe('success');
+  });
+
+  it('DM flat target (p2p + chat scope): M1 via sendMessage with the DM copy, transferSession gets (p2p, chat)', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    const r = await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_dm', root_id: 'oc_dm', target_scope: 'chat', target_chat_type: 'p2p' }),
+      deps(map),
+      LARK_APP_ID,
+    );
+
+    // M1 is a plain message into the DM; copy must be the DM variant (no
+    // "@ 对应机器人" instruction — you can't @ a bot in its own DM).
+    expect(sendMessageMock).toHaveBeenCalled();
+    expect(sendMessageMock.mock.calls[0][1]).toBe('oc_dm');
+    expect(sendMessageMock.mock.calls[0][2]).toContain('直接发消息继续对话');
+    // chatType flips to p2p; flat DM anchors chat-scope on the M1 id (audit-only).
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_dm', 'om_M1', 'p2p', 'chat');
+    expect(r?.toast?.type).toBe('success');
+  });
+
+  it('DM topic target (p2p + thread scope): M1 reply_in_thread into the DM 话题, transferSession gets (p2p, thread)', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    const r = await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_dm', root_id: 'om_dm_topic_root', target_scope: 'thread', target_chat_type: 'p2p' }),
+      deps(map),
+      LARK_APP_ID,
+    );
+
+    expect(replyMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_dm_topic_root', expect.stringContaining('直接发消息继续对话'), 'text', true);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_dm', 'om_dm_topic_root', 'p2p', 'thread');
+    expect(r?.toast?.type).toBe('success');
+  });
+
+  it('p2p SOURCE session: M1 uses the 单聊 label instead of a raw chatId and skips getChatName', async () => {
+    const ds = makeDs();
+    (ds as any).chatType = 'p2p';
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    expect(getChatNameMock).not.toHaveBeenCalled();
+    const m1Payload = sendMessageMock.mock.calls[0][2];
+    expect(m1Payload).toContain('单聊');
+    expect(m1Payload).not.toContain('oc_source');
+  });
+
+  it('legacy card without target_chat_type defaults to group', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_topic_root', target_scope: 'thread' }),
+      deps(map),
+      LARK_APP_ID,
+    );
+
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_topic_root', 'group', 'thread');
   });
 
   it('falls back to chatId in the M1 body when getChatName returns null', async () => {

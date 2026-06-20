@@ -21,6 +21,8 @@
  * tmux command would fail. Functional probe + soft fallback fixes both.
  */
 import { execSync, spawnSync } from 'node:child_process';
+import { unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
 
 export interface TmuxResult {
@@ -102,6 +104,18 @@ export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
   };
 }
 
+function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = process.env): void {
+  if (typeof process.getuid !== 'function') return;
+
+  const baseDir = env.TMUX_TMPDIR || '/tmp';
+  const socketPath = join(baseDir, `tmux-${process.getuid()}`, sockName);
+  try {
+    unlinkSync(socketPath);
+  } catch {
+    // Best-effort: some tmux builds unlink the socket themselves.
+  }
+}
+
 /**
  * Functional tmux probe — actually starts a tmux server and tears it down.
  *
@@ -131,13 +145,16 @@ export function probeTmuxFunctional(): { ok: true; version: string } | { ok: fal
     env: tmuxEnv(),
   });
   if (run.status !== 0) {
+    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+    cleanupTmuxProbeSocket(sockName);
     const stderr = (run.stderr?.toString() ?? '').trim();
     return { ok: false, reason: stderr || `tmux new-session 失败 (exit ${run.status})` };
   }
-  // Tear down the probe server. Best-effort — if this leaks, the kernel
-  // will GC the abstract socket when the (now-empty) tmux server exits on
-  // its own once the only client (which we didn't attach) goes away.
+  // Tear down the probe server and remove the socket file. Some platforms leave
+  // bmx-probe-* sockets behind after the server exits; thousands of stale
+  // entries make later probe storms slower and easier to time out.
   spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+  cleanupTmuxProbeSocket(sockName);
   return { ok: true, version };
 }
 

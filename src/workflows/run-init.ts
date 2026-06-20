@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
+import { atomicWriteFile } from '../utils/atomic-write.js';
 import { loadBotConfigs } from '../bot-registry.js';
 import { canonicalJsonStringify, computeRevisionId } from './definition.js';
 import type { WorkflowDefinition } from './definition.js';
@@ -108,7 +109,8 @@ async function writeRunInputBlob(
   const hash = createHash('sha256').update(buf).digest('hex');
   const path = join(log.blobDir, hash);
   // Content-addressed: same input ⇒ same path; re-writes are harmless.
-  await fs.writeFile(path, buf);
+  // 原子写：路径即 sha256，裸写半截会留下「名字对、内容错」的 blob。
+  await atomicWriteFile(path, buf);
   return {
     outputHash: `sha256:${hash}`,
     outputPath: path,

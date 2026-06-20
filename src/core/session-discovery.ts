@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, Pi) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -11,6 +11,7 @@ import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
+import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
@@ -40,6 +41,14 @@ export interface AdoptableSession {
 
 const CLI_COMM_MAP: Record<string, CliId> = {
   claude: 'claude-code',
+  // Seed / Relay are ByteDance Claude Code forks (Relay is Seed's new release
+  // name). Both rebrand process.title to their product name, so a running
+  // session's `/proc/<pid>/comm` is literally `seed` / `relay` (verified on a
+  // live host) — map them so `/adopt` can discover live panes by comm, the same
+  // way `claude` resolves to claude-code. filterCliId keeps a seed/relay bot
+  // from adopting the other's (or claude's) sessions.
+  seed: 'seed',
+  relay: 'relay',
   codex: 'codex',
   aiden: 'aiden',
   coco: 'coco',
@@ -49,11 +58,15 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // 改写过；macOS 下 `ps -o comm=` 拿到的是真实 argv[0]，因此这里需要
   // 把别名 traecli 也识别成 coco，否则 /adopt 扫不到这种会话。
   traecli: 'coco',
+  // TRAE（traex）是另一套 Codex 系 CLI，可执行就叫 `traex`，与上面 CoCo 的
+  // traecli 别名是两个不同的二进制（traecli 是 coco 的软链）。
+  traex: 'traex',
   gemini: 'gemini',
   opencode: 'opencode',
   mtr: 'mtr',
   hermes: 'hermes',
   pi: 'pi',
+  omp: 'oh-my-pi',
 };
 
 /** Interpreters and native launchers that may hide the CLI identity in argv.
@@ -316,6 +329,120 @@ function findCliProcess(
 }
 
 /**
+ * Resolve the REAL CLI pid spawned underneath a wrapperCli launcher
+ * (e.g. `aiden x claude`, where the launcher forks real Claude Code as a child).
+ *
+ * The worker's `backend.getChildPid()` returns the LAUNCHER's pid, but it's the
+ * forked child — not the launcher — that writes `~/.claude/sessions/<pid>.json`
+ * and owns the transcript jsonl. Tracking the launcher pid therefore breaks
+ * session-id discovery and leaves the JSONL bridge watching a path the real CLI
+ * never writes. This walks the launcher's DESCENDANTS to find the actual CLI.
+ *
+ * Matching is by process `comm` ONLY — deliberately NOT argv. The launcher's own
+ * argv carries the target name as a literal token (`aiden x claude` → "claude"
+ * is in argv), so argv-scanning (cliIdFromCommArgv) would misidentify the
+ * launcher itself as the CLI. The real CLI process has the binary as its comm
+ * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`).
+ *
+ * BFS starts at the launcher's children (never the launcher node) and returns
+ * the shallowest descendant recognized as `targetCliId`, or null if none exists
+ * yet — the launcher may not have forked the CLI at call time, so callers retry.
+ */
+export function findLaunchedCliPid(
+  launcherPid: number,
+  targetCliId: CliId,
+  maxDepth = 6,
+  // Injectable process probes (defaults hit the real OS); tests pass fakes.
+  probes: { childrenOf?: (pid: number) => number[]; commOf?: (pid: number) => string | undefined } = {},
+): number | null {
+  const childrenOf = probes.childrenOf ?? getChildPids;
+  const commOf = probes.commOf ?? readComm;
+  let frontier = childrenOf(launcherPid);
+  const seen = new Set<number>([launcherPid]);
+  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
+    const next: number[] = [];
+    for (const pid of frontier) {
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      const comm = commOf(pid);
+      if (comm && cliIdForComm(comm, targetCliId) === targetCliId) return pid;
+      next.push(...childrenOf(pid));
+    }
+    frontier = next;
+  }
+  return null;
+}
+
+/**
+ * Guard for the async wrapperCli pid-resolver retry. The retry closure starts
+ * for ONE spawn and captures that spawn's `backendAtSpawn` instance + the
+ * launcher pid it observed. A worker restart (CLI crash → in-worker respawn)
+ * during the ~6s retry window tears down the backend and forks a NEW launcher,
+ * so a stale tick must NOT apply its result — doing so would overwrite the NEW
+ * session's `backend.cliPid` / global `bridgeCliPid` with a pid resolved from
+ * the OLD launcher tree, mis-pointing the new session's bridge + discovery.
+ *
+ * A tick may apply only when (a) the backend instance is still the very one the
+ * retry was scheduled for (respawn replaces it: `backend = null` then a fresh
+ * object), and (b) that backend's current child pid is still the captured
+ * launcher pid (defends against a same-instance pane-child change / pid reuse).
+ */
+export function launcherRetryStillValid(
+  currentBackend: unknown,
+  backendAtSpawn: unknown,
+  currentChildPid: number | null | undefined,
+  launcherPid: number,
+): boolean {
+  if (!currentBackend) return false;
+  if (currentBackend !== backendAtSpawn) return false;
+  return currentChildPid === launcherPid;
+}
+
+export interface WrapperRealPidResolveDeps {
+  /** Find the real CLI descendant pid under the launcher (null until forked). */
+  findRealPid: (launcherPid: number) => number | null;
+  /** Current backend instance (identity-compared against the spawn snapshot). */
+  getBackend: () => unknown;
+  /** Backend's current child pid (the launcher while unchanged). */
+  getChildPid: () => number | null | undefined;
+  /** Apply the resolved real pid: rewire backend.cliPid + bridgeCliPid. */
+  applyRealPid: (realPid: number) => void;
+  /** Timer scheduler (injectable for tests). */
+  schedule: (fn: () => void, ms: number) => void;
+  intervalMs?: number;
+  maxAttempts?: number;
+}
+
+/**
+ * Drive the wrapperCli real-CLI-pid resolution as a bounded retry loop. Shared
+ * by BOTH worker spawn paths — the synchronous one (tmux/pty, where
+ * getChildPid() is the launcher immediately) and the late-pid fallback (zellij,
+ * where getChildPid() is null at spawn and only resolves to the launcher
+ * asynchronously). Either way the launcher forks the real CLI a beat later, so
+ * we poll until findRealPid returns a descendant, then rewire.
+ *
+ * Every tick is gated by launcherRetryStillValid: a worker restart that swapped
+ * the backend (or changed its child pid) aborts the loop so a stale resolution
+ * can't clobber the new session's bridge/discovery.
+ */
+export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperRealPidResolveDeps): void {
+  const backendAtSpawn = deps.getBackend();
+  const intervalMs = deps.intervalMs ?? 200;
+  const maxAttempts = deps.maxAttempts ?? 30;
+  let attempts = 0;
+  const tick = () => {
+    if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
+    const realPid = deps.findRealPid(launcherPid);
+    if (realPid && realPid !== launcherPid) {
+      deps.applyRealPid(realPid);
+      return;
+    }
+    if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
+  };
+  deps.schedule(tick, intervalMs);
+}
+
+/**
  * Try to read Claude Code session metadata from ~/.claude/sessions/<PID>.json.
  * Returns { sessionId, cwd, startedAt } or undefined.
  */
@@ -559,6 +686,12 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
         // re-probes too, so undefined here is acceptable.
         const cocoSession = findCocoSessionByPid(match.pid);
         if (cocoSession) sessionId = cocoSession.sessionId;
+      } else if (match.cliId === 'traex') {
+        // TRAE: same open-rollout-fd probe as Codex, with a TRAE-specific
+        // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
+        // pid as a fallback, so undefined here is acceptable.
+        const rollout = findTraexRolloutByPid(match.pid);
+        if (rollout) sessionId = rollout.cliSessionId;
       }
 
       // 5b. Fall back to the CLI process's own start time for uptime. Without

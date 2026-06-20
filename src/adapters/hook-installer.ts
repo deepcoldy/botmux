@@ -4,7 +4,8 @@
  * 把 botmux 的 askUserQuestion hook 写入各 CLI 的配置文件。
  * 幂等：写前比对内容，相同则跳过；展开 ~ 路径；出错只 warn 不抛。
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
@@ -15,6 +16,10 @@ import { hookCommandParts } from './hook-command.js';
 export interface HookInstallConfig {
   readonly configPath: string;
   readonly format: 'claude-settings' | 'opencode-plugin';
+  /** 可选（claude-settings）：同时把 SessionStart 就绪 hook 命令写进全局 settings.json。
+   *  见 adapters/cli/types.ts 的同名字段说明（为 wrapperCli=aiden x claude 这类剥 --settings
+   *  的启动器提供就绪信号）。 */
+  readonly sessionStartCommand?: string;
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -42,7 +47,9 @@ function writeIfChanged(filePath: string, content: string): boolean {
       if (existing === content) return false; // 内容相同，无需写入
     }
     mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, content, 'utf-8');
+    // 原子写：目标是 ~/.claude/settings.json 这类被 CLI 并发读写的热配置，
+    // 裸写半截会让并发读者拿到坏 JSON 再整文件覆写回来（cjadk 事故同类）。
+    atomicWriteFileSync(filePath, content);
     return true;
   } catch (err: any) {
     throw new Error(`写入 ${filePath} 失败：${err.message}`);
@@ -111,12 +118,37 @@ function removeBotmuxAskHookGroups(
 }
 
 /**
+ * 判断某 hook group 是否是 botmux SessionStart 就绪 hook（用于幂等替换）。
+ * 同 ask hook：结构化识别（命令引用 botmux 的 cli.js 且尾部是 `session-ready`），
+ * 不按完整字符串比对——dev checkout 与 npm global 的 cli.js 绝对路径不同。
+ */
+function isBotmuxReadyHookGroup(group: ClaudeHookGroup): boolean {
+  return group.hooks.some(
+    (e) =>
+      e.type === 'command' &&
+      e.command.includes('cli.js') &&
+      e.command.trimEnd().endsWith('session-ready'),
+  );
+}
+
+function removeBotmuxReadyHookGroups(hooks: Record<string, ClaudeHookGroup[]>, eventName: string): void {
+  const existing = hooks[eventName] ?? [];
+  const filtered = existing.filter((g) => !isBotmuxReadyHookGroup(g));
+  if (filtered.length === 0) delete hooks[eventName];
+  else hooks[eventName] = filtered;
+}
+
+/**
  * 向 Claude settings.json 的 hooks.PreToolUse 合并 botmux ask hook entry。
  * AskUserQuestion 在 bypassPermissions 模式下不会经过 PermissionRequest，
  * 但 PreToolUse 仍会在工具执行前触发，因此这里必须挂 PreToolUse。
  * 保留其他事件和 entry，不破坏无关配置。
+ *
+ * 若提供 sessionStartCommand，再把 SessionStart「真就绪」hook 也写进全局 settings.json
+ * （为 wrapperCli=`aiden x claude` 这类剥 --settings 的启动器提供就绪信号；原生 claude
+ * 会同时收到进程级 --settings 那份，二者幂等无害）。
  */
-function installClaudeSettings(configPath: string, hookCommand: string): void {
+function installClaudeSettings(configPath: string, hookCommand: string, sessionStartCommand?: string): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   const existingHooks = settings.hooks ?? {};
 
@@ -128,6 +160,15 @@ function installClaudeSettings(configPath: string, hookCommand: string): void {
   removeBotmuxAskHookGroups(existingHooks, 'PermissionRequest', hookCommand);
   removeBotmuxAskHookGroups(existingHooks, 'PreToolUse', hookCommand);
   existingHooks['PreToolUse'] = [...(existingHooks['PreToolUse'] ?? []), newGroup];
+
+  // SessionStart 就绪 hook（幂等替换旧的 botmux 条目）
+  if (sessionStartCommand) {
+    removeBotmuxReadyHookGroups(existingHooks, 'SessionStart');
+    existingHooks['SessionStart'] = [
+      ...(existingHooks['SessionStart'] ?? []),
+      { hooks: [{ type: 'command', command: sessionStartCommand }] },
+    ];
+  }
 
   settings.hooks = existingHooks;
   const content = JSON.stringify(settings, null, 2) + '\n';
@@ -218,7 +259,7 @@ export function installHook(
     const configPath = expandHome(hookInstall.configPath);
     switch (hookInstall.format) {
       case 'claude-settings':
-        installClaudeSettings(configPath, hookCommand);
+        installClaudeSettings(configPath, hookCommand, hookInstall.sessionStartCommand);
         break;
       case 'opencode-plugin':
         // OpenCode 插件走 argv parts（spawnSync），不复用 shell 字符串，避免被 split 拆坏。

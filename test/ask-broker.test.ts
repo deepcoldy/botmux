@@ -1,6 +1,7 @@
 /**
- * Contract tests for the ask broker — covers §3 lifecycle, §6 approver, §7
- * timeout, §8 invalidation. Card dispatch is mocked via a fake AskCardDispatcher
+ * Contract tests for the ask broker — covers §3 lifecycle, canTalk-based click
+ * authorization, §7 timeout, §8 invalidation. Card dispatch is mocked via a fake
+ * AskCardDispatcher
  * so these tests stay IM-agnostic and run in pure node.
  *
  * Run:  pnpm vitest run test/ask-broker.test.ts
@@ -16,6 +17,7 @@ import {
   invalidateAll,
   registerAsk,
   setCardDispatcher,
+  setCanTalkChecker,
   submitAsk,
   submitCustomReply,
   toggleAsk,
@@ -40,7 +42,6 @@ function makeInput(over: Partial<CreateAskInput> = {}): CreateAskInput {
     chatId: 'oc_chat',
     rootMessageId: 'om_root',
     sessionId: 'sess-1',
-    approvers: new Set(['ou_owner']),
     questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: false }],
     timeoutMs: 5_000,
     ...over,
@@ -73,9 +74,14 @@ function mockDispatcher(
   };
 }
 
+// 默认 canTalk 放行集：模拟「这些 open_id 能在该 chat 跟 bot 说话」。
+// 答复鉴权 = canTalk，故凡在此集合内者可作答，其余（ou_stranger / ou_other）拒绝。
+const DEFAULT_TALKERS = new Set(['ou_owner', 'ou_a', 'ou_b', 'ou_u', 'ou_talker']);
+
 beforeEach(() => {
   vi.useFakeTimers();
   _resetForTest();
+  setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
 });
 
 afterEach(() => {
@@ -98,7 +104,6 @@ describe('registerAsk happy path', () => {
     expect(d.sendCalls).toHaveLength(1);
     const [dispatched] = d.sendCalls;
     expect(dispatched.questions).toEqual([{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: false }]);
-    expect(dispatched.approvers.has('ou_owner')).toBe(true);
 
     const outcome = tryResolveAsk({
       askId: dispatched.askId,
@@ -170,13 +175,14 @@ describe('tryResolveAsk gating', () => {
     ).toBe('stale');
   });
 
-  it('returns "unauthorized" when clicker is not in approver allowlist', async () => {
+  it('returns "unauthorized" when clicker cannot canTalk in this chat', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);
-    registerAsk(makeInput({ approvers: new Set(['ou_owner']) }));
+    registerAsk(makeInput());
     await Promise.resolve();
     await Promise.resolve();
     const { askId, nonce } = d.sendCalls[0]!;
+    // ou_stranger 不在默认 canTalk 放行集 → unauthorized
     expect(
       tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_stranger' }),
     ).toBe('unauthorized');
@@ -199,9 +205,7 @@ describe('tryResolveAsk gating', () => {
   it('returns "already_settled" for a second click after race winner', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);
-    registerAsk(
-      makeInput({ approvers: new Set(['ou_a', 'ou_b']) }),
-    );
+    registerAsk(makeInput());
     await Promise.resolve();
     await Promise.resolve();
     const { askId, nonce } = d.sendCalls[0]!;
@@ -212,6 +216,60 @@ describe('tryResolveAsk gating', () => {
     expect(
       tryResolveAsk({ askId, nonce, selected: 'no', by: 'ou_b' }),
     ).toBe('already_settled');
+  });
+});
+
+describe('canTalk authorization (遵循 canTalk 权限)', () => {
+  it('canTalk 命中 → 可作答（不依赖任何 approver 名单）', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    // 仅 ou_talker 能在该 chat 对话，其余拒绝（覆盖默认放行集）
+    setCanTalkChecker((_app, chatId, openId) => chatId === 'oc_chat' && openId === 'ou_talker');
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+    expect(tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_talker' })).toBe('accepted');
+  });
+
+  it('canTalk 未命中 → unauthorized，ask 仍 pending', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    setCanTalkChecker(() => false);
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+    expect(tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_stranger' })).toBe('unauthorized');
+    expect(_pendingCount()).toBe(1);
+  });
+
+  it('checker 未注入（degraded）→ 谁都不能答', async () => {
+    const d = mockDispatcher();
+    _resetForTest();        // 清空 beforeEach 注入的默认 checker
+    setCardDispatcher(d);
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+    expect(tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_owner' })).toBe('unauthorized');
+  });
+
+  it('canTalk 放行覆盖 toggle / submitCustomReply 路径', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    setCanTalkChecker((_app, _chat, openId) => openId === 'ou_talker');
+    registerAsk(makeInput({
+      questions: [{ prompt: '多选？', options: OPTIONS, multiSelect: true }],
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+    // 非 canTalk 用户被拒（先于 settle 验证）
+    expect(toggleAsk({ askId, nonce, questionIndex: 0, key: 'no', by: 'ou_stranger' })).toBe('unauthorized');
+    // canTalk 用户可 toggle + 自定义文字作答
+    expect(toggleAsk({ askId, nonce, questionIndex: 0, key: 'yes', by: 'ou_talker' })).toBe('toggled');
+    expect(submitCustomReply({ askId, by: 'ou_talker', text: '我直接打字答' })).toBe('accepted');
   });
 });
 
@@ -343,10 +401,10 @@ describe('onSettle hook is best-effort', () => {
 describe('toggleAsk + submitAsk', () => {
   it('多选：toggle 累积，submit 才 settle', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     const p = registerAsk({
       larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
-      approvers: new Set(['ou_u']),
       questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
       timeoutMs: 60_000,
     });
@@ -366,10 +424,10 @@ describe('toggleAsk + submitAsk', () => {
 
   it('toggle 取消选中（再次 toggle 同一 key 去除）', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     const p = registerAsk({
       larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
-      approvers: new Set(['ou_u']),
       questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
       timeoutMs: 60_000,
     });
@@ -386,10 +444,10 @@ describe('toggleAsk + submitAsk', () => {
 
   it('单选：toggle 后再 toggle 同一 key，set 内只保留该 key', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     const p = registerAsk({
       larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
-      approvers: new Set(['ou_u']),
       questions: [{ prompt: 'go', options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }], multiSelect: false }],
       timeoutMs: 60_000,
     });
@@ -405,10 +463,10 @@ describe('toggleAsk + submitAsk', () => {
 
   it('单问单选：submit 携带显式 selections', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     const p = registerAsk({
       larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
-      approvers: new Set(['ou_u']),
       questions: [{ prompt: 'go', options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }], multiSelect: false }],
       timeoutMs: 60_000,
     });
@@ -421,10 +479,10 @@ describe('toggleAsk + submitAsk', () => {
 
   it('未授权 toggle/submit 不改变状态', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     registerAsk({
       larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
-      approvers: new Set(['ou_u']),
       questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
       timeoutMs: 60_000,
     });
@@ -440,22 +498,24 @@ describe('toggleAsk + submitAsk', () => {
 
   it('toggleAsk 返回 stale（未知 askId）', () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     expect(toggleAsk({ askId: 'no-such', nonce: 'x', questionIndex: 0, key: 'a', by: 'ou_u' })).toBe('stale');
   });
 
   it('submitAsk 返回 stale（未知 askId）', () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     expect(submitAsk({ askId: 'no-such', nonce: 'x', by: 'ou_u' })).toBe('stale');
   });
 
   it('toggleAsk 返回 stale（options 中不存在的 key）', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     registerAsk({
       larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
-      approvers: new Set(['ou_u']),
       questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }], multiSelect: true }],
       timeoutMs: 60_000,
     });
@@ -466,10 +526,10 @@ describe('toggleAsk + submitAsk', () => {
 
   it('submitAsk 单选问题未选任何项时返回 stale', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     registerAsk({
       larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
-      approvers: new Set(['ou_u']),
       questions: [{ prompt: 'go', options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }], multiSelect: false }],
       timeoutMs: 60_000,
     });
@@ -482,6 +542,7 @@ describe('toggleAsk + submitAsk', () => {
 
   it('_allAskIds 返回所有未 settle 及已 settle(retention 内)的 askId', async () => {
     _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
     setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
     registerAsk(makeInput({ sessionId: 'sx' }));
     registerAsk(makeInput({ sessionId: 'sy' }));

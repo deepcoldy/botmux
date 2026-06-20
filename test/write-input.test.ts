@@ -46,11 +46,31 @@ import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { codexHistoryPath } from '../src/services/codex-paths.js';
+
+// ── Speed: collapse the adapters' real-time submit waits ───────────────────
+// writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
+// history/transcript with real wall-clock budgets — ~0.5–3s per case across
+// 90+ tests, which made this the single slowest file in the whole suite.
+// BOTMUX_TIME_SCALE (read lazily by src/utils/timing.ts) shrinks every
+// delay/poll budget by this factor WITHOUT changing which branch the code
+// takes: memfs writes are synchronous, so the submit marker is already present
+// the instant the poll starts. The few tests that choreograph their OWN
+// real-time events (a transcript append fired on a timer) scale those delays by
+// TIME_SCALE as well, so the relative ordering against the (now shrunken) poll
+// budget is preserved.
+// Default to 0.1, but honor an externally-set BOTMUX_TIME_SCALE so the
+// benchmark (scripts/bench-tests.ts) can measure the un-scaled "before" timing
+// by exporting BOTMUX_TIME_SCALE=1. TIME_SCALE always reflects the *effective*
+// scale, so the choreographed delay below stays consistent with the adapter's
+// (equally scaled) confirm budget.
+process.env.BOTMUX_TIME_SCALE ??= '0.05';
+const TIME_SCALE = Number(process.env.BOTMUX_TIME_SCALE);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -152,13 +172,14 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI and Codex. See coco.ts for the Trae 0.120.31
+ *  delayed Enter — CoCo / Trae CLI, Codex, and Pi. See coco.ts for the Trae 0.120.31
  *  burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
  *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
  *  bracketed paste" note was true only for a much earlier build). */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
   ['codex', createCodexAdapter('/bin/codex')],
+  ['pi', createPiAdapter('/bin/pi')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
@@ -470,6 +491,26 @@ describe('supportsTypeAhead flag', () => {
 
   it('codex: true (0.134.0+ parks submit-while-busy, writes rollout user event at dequeue time)', () => {
     expect(createCodexAdapter('/bin/codex').supportsTypeAhead).toBe(true);
+  });
+
+  it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
+    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
+  });
+
+  it('pi: exposes Working... as the explicit busy marker', () => {
+    const adapter = createPiAdapter('/bin/pi');
+    expect(adapter.busyPattern?.test('⠙ Working...')).toBe(true);
+    expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
+  });
+
+  it('pi: does not squash queued botmux turns', () => {
+    expect(createPiAdapter('/bin/pi').mergeQueuedInput).toBeUndefined();
+  });
+
+  it('non-pi type-ahead adapters do not squash queued botmux turns', () => {
+    expect(createClaudeCodeAdapter('/bin/claude').mergeQueuedInput).toBeUndefined();
+    expect(createCocoAdapter('/bin/coco').mergeQueuedInput).toBeUndefined();
+    expect(createCodexAdapter('/bin/codex').mergeQueuedInput).toBeUndefined();
   });
 
   it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex'))('%s: undefined (default behavior)', (_name, adapter) => {
@@ -791,12 +832,15 @@ describe('claude-code writeInput submission confirmation', () => {
         if (key !== 'Enter' || scheduledAppend) return;
         scheduledAppend = true;
         writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
+        // Scaled to match the adapter's (now BOTMUX_TIME_SCALE-shrunken) confirm
+        // budget — the append must still land WITHIN the poll window, as it does
+        // in production where the real 850ms < the real 4×800ms budget.
         setTimeout(() => {
           appendFileSync(
             rotatedPath,
             JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
           );
-        }, 850);
+        }, 850 * TIME_SCALE);
       }),
     };
 
@@ -881,6 +925,8 @@ describe('codex writeInput submission confirmation', () => {
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -898,6 +944,8 @@ describe('codex writeInput submission confirmation', () => {
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -913,6 +961,8 @@ describe('codex writeInput submission confirmation', () => {
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       'new-codex-session',
     ]);
   });
@@ -929,6 +979,8 @@ describe('codex writeInput submission confirmation', () => {
         'resume',
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
+        '-c',
+        'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         'custom-codex-session',
       ]);
 
@@ -950,6 +1002,8 @@ describe('codex writeInput submission confirmation', () => {
     expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
     ]);
   });
 
@@ -964,6 +1018,8 @@ describe('codex writeInput submission confirmation', () => {
     })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-C',
       '/repo/root',
     ]);

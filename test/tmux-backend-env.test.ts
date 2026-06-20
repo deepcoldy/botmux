@@ -74,6 +74,21 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards CJADK_INTERACTIVE so cjadk runs non-interactive in the tmux pane', () => {
+    // The worker injects CJADK_INTERACTIVE=0 for `cjadk <agent>` wrapperCli
+    // launches (mirrors cjadk's own `cjadk feishu` wrapper). Like every other
+    // injected key it ONLY reaches the pane via this allowlist — without it the
+    // pane inherits an interactive cjadk (startup selector + input quirks).
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      CJADK_INTERACTIVE: '0',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('CJADK_INTERACTIVE=0');
+    // Non-cjadk bots don't set it → it must not appear.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('CJADK_INTERACTIVE='))).toBe(false);
+  });
+
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

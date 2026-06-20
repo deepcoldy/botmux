@@ -18,8 +18,11 @@ import { coerceWorkflowParamsFromStrings as coerceWorkflowParams } from '../../w
 export { coerceWorkflowParams };
 import type { BotSnapshot } from '../../workflows/events/payloads.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from '../../workflows/runtime.js';
+import { t, localeForBot, type Locale } from '../../i18n/index.js';
 
-const USAGE = '用法：/workflow run <id> [key=value ...]\n或：/workflow cancel <runId>';
+function workflowUsage(locale?: Locale): string {
+  return t('card.wf.usage', undefined, locale);
+}
 const WORKFLOW_ID_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
 export type WorkflowCommand =
@@ -93,7 +96,7 @@ export type ExecuteWorkflowCommandInput = {
   initiator: string;
 };
 
-export function parseWorkflowCommand(content: string): WorkflowCommand | null {
+export function parseWorkflowCommand(content: string, locale?: Locale): WorkflowCommand | null {
   const trimmed = content.trim();
   if (!trimmed.startsWith('/workflow')) return null;
 
@@ -102,34 +105,34 @@ export function parseWorkflowCommand(content: string): WorkflowCommand | null {
   const sub = parts[1];
   if (sub === 'cancel') {
     const runId = parts[2];
-    if (!runId) return invalid('缺少 runId');
-    if (parts.length > 3) return invalid('/workflow cancel 只接受 runId');
+    if (!runId) return invalid(t('wf.err.missing_run_id', undefined, locale), locale);
+    if (parts.length > 3) return invalid(t('wf.err.cancel_only_run_id', undefined, locale), locale);
     if (!WORKFLOW_ID_PATTERN.test(runId)) {
-      return invalid('runId 只能包含字母、数字、下划线、点和短横线');
+      return invalid(t('wf.err.run_id_charset', undefined, locale), locale);
     }
     return { kind: 'cancel', runId };
   }
   if (sub !== 'run') {
-    return invalid('只支持 /workflow run / cancel 子命令');
+    return invalid(t('wf.err.unknown_subcommand', undefined, locale), locale);
   }
 
   const workflowId = parts[2];
-  if (!workflowId) return invalid('缺少 workflow id');
+  if (!workflowId) return invalid(t('wf.err.missing_workflow_id', undefined, locale), locale);
   if (!WORKFLOW_ID_PATTERN.test(workflowId)) {
-    return invalid('workflow id 只能包含字母、数字、下划线、点和短横线');
+    return invalid(t('wf.err.workflow_id_charset', undefined, locale), locale);
   }
 
   const rawParams: Record<string, string> = {};
   for (const token of parts.slice(3)) {
     const eq = token.indexOf('=');
-    if (eq <= 0) return invalid(`参数必须是 key=value 形式：${token}`);
+    if (eq <= 0) return invalid(t('wf.err.param_format', { token }, locale), locale);
     const key = token.slice(0, eq);
     const value = token.slice(eq + 1);
     if (!WORKFLOW_ID_PATTERN.test(key)) {
-      return invalid(`参数名只能包含字母、数字、下划线、点和短横线：${key}`);
+      return invalid(t('wf.err.param_name_charset', { key }, locale), locale);
     }
     if (Object.prototype.hasOwnProperty.call(rawParams, key)) {
-      return invalid(`重复参数：${key}`);
+      return invalid(t('wf.err.duplicate_param', { key }, locale), locale);
     }
     rawParams[key] = value;
   }
@@ -142,7 +145,8 @@ export async function executeWorkflowCommand(
   input: ExecuteWorkflowCommandInput,
   deps: WorkflowCommandDeps = {},
 ): Promise<WorkflowCommandResult> {
-  const command = parseWorkflowCommand(input.content);
+  const locale = localeForBot(input.larkAppId);
+  const command = parseWorkflowCommand(input.content, locale);
   if (!command) return { handled: false };
   if (command.kind === 'invalid') {
     return { handled: true, ok: false, error: command.error, usage: command.usage };
@@ -153,7 +157,7 @@ export async function executeWorkflowCommand(
         handled: true,
         ok: false,
         error: '/workflow cancel requires daemon runtime context',
-        usage: USAGE,
+        usage: workflowUsage(locale),
       };
     }
     const result = await deps.cancelWorkflowRunFn(
@@ -162,7 +166,7 @@ export async function executeWorkflowCommand(
       { expectedChatId: input.chatId, by: input.initiator },
     );
     if (!result.ok) {
-      return { handled: true, ok: false, error: formatCancelError(result.error), usage: USAGE };
+      return { handled: true, ok: false, error: formatCancelError(result.error), usage: workflowUsage(locale) };
     }
     return {
       handled: true,
@@ -223,7 +227,7 @@ export async function executeWorkflowCommand(
       handled: true,
       ok: false,
       error: err instanceof Error ? err.message : String(err),
-      usage: USAGE,
+      usage: workflowUsage(locale),
     };
   }
 }
@@ -248,8 +252,8 @@ export function resolveBotSnapshot(botName: string): BotSnapshot | undefined {
   }
 }
 
-function invalid(error: string): WorkflowCommand {
-  return { kind: 'invalid', error, usage: USAGE };
+function invalid(error: string, locale?: Locale): WorkflowCommand {
+  return { kind: 'invalid', error, usage: workflowUsage(locale) };
 }
 
 function formatCancelError(error: string): string {
@@ -268,6 +272,7 @@ function snapshotFromConfig(
     cliId: string;
     name?: string;
     workingDir?: string;
+    cliPathOverride?: string;
   },
 ): BotSnapshot {
   return {
@@ -275,6 +280,7 @@ function snapshotFromConfig(
     cliId: cfg.cliId,
     displayName: cfg.name ?? requestedName,
     ...(cfg.workingDir ? { workingDir: cfg.workingDir } : {}),
+    ...(cfg.cliPathOverride ? { cliPathOverride: cfg.cliPathOverride } : {}),
   };
 }
 

@@ -29,6 +29,23 @@ describe('listenWithProbe', () => {
     expect(port).toBeGreaterThan(0);
   });
 
+  it('skips ports rejected by caller-specific availability checks', async () => {
+    const tmp = mk();
+    const start = await rawListen(tmp, 0);
+    await new Promise<void>(r => tmp.close(() => r()));
+    open.splice(open.indexOf(tmp), 1);
+    const logs: string[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      portAvailable: p => p !== start,
+      log: m => logs.push(m),
+    });
+    expect(bound).toBe(start + 1);
+    expect(logs.join('\n')).toContain(`${start} unavailable`);
+  });
+
   it('probes to the next port without crashing when the requested port is busy', async () => {
     const busy = await rawListen(mk(), 0);
     const logs: string[] = [];

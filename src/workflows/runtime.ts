@@ -19,6 +19,7 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
+import { atomicWriteFile } from '../utils/atomic-write.js';
 import { writeEffectInputSidecar } from './effect-input.js';
 import { writeBlob, writeJsonBlob } from './blob.js';
 import type { WorkflowDefinition } from './definition.js';
@@ -231,7 +232,7 @@ async function writeSessionSidecar(
 ): Promise<void> {
   const dir = await attemptSidecarDir(log, activityId, attemptId);
   const file = join(dir, 'session.json');
-  await fs.writeFile(file, JSON.stringify(session, null, 2), 'utf-8');
+  await atomicWriteFile(file, JSON.stringify(session, null, 2));
 }
 
 function withAttemptLogPath(

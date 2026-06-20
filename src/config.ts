@@ -138,6 +138,29 @@ export const config = {
       catch { return {}; }
     })() as Record<string, unknown>,
   },
+  worktreeSlugAI: {
+    /**
+     * Optional AI slugger for `/repo wt` auto branch/worktree naming. Disabled
+     * by default because it sends the topic title / first prompt to the
+     * configured OpenAI-compatible endpoint. When disabled or misconfigured,
+     * botmux falls back to deterministic local slugification.
+     */
+    enabled: (process.env.BOTMUX_WORKTREE_SLUG_AI_ENABLED ?? '').toLowerCase() === 'true',
+    baseUrl: process.env.BOTMUX_WORKTREE_SLUG_AI_BASE_URL ?? '',
+    apiKey: process.env.BOTMUX_WORKTREE_SLUG_AI_API_KEY ?? '',
+    model: process.env.BOTMUX_WORKTREE_SLUG_AI_MODEL ?? '',
+    timeoutMs: Number(process.env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS) || 5_000,
+    /** Extra headers for the API request (JSON string). */
+    extraHeaders: (() => {
+      try { return JSON.parse(process.env.BOTMUX_WORKTREE_SLUG_AI_EXTRA_HEADERS ?? '{}'); }
+      catch { return {}; }
+    })() as Record<string, string>,
+    /** Extra body params for the API request (JSON string). */
+    extraBody: (() => {
+      try { return JSON.parse(process.env.BOTMUX_WORKTREE_SLUG_AI_EXTRA_BODY ?? '{}'); }
+      catch { return {}; }
+    })() as Record<string, unknown>,
+  },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

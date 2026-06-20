@@ -21,6 +21,11 @@ export interface Session {
   scope?: 'thread' | 'chat';
   title: string;
   status: 'active' | 'closed';
+  /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
+   *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
+  kanbanColumn?: string;
+  /** 看板列内手动排序位置（拖拽时取相邻卡片中点，允许小数）。 */
+  kanbanPosition?: number;
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
@@ -68,16 +73,18 @@ export interface Session {
    * topic target from being confused with a later group-top-level turn.
    */
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
+  /**
+   * 文档评论入口（/subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
+   * 触发时，`botmux send` 的用户可见回复要回到该文档评论（而非飞书）。因 botmux
+   * send 跑在独立 CLI 子进程、只能从磁盘读会话态，故把当前轮的回评论落点持久化
+   * 在这里。每开新轮重置（beginNewTurn 清空；handleDocComment 设值）。
+   */
+  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
   /** open_id of the quote-target message's sender — used by --mention-back. */
   quoteTargetSenderOpenId?: string;
   /** Whether the quote-target sender is a bot (vs a human) — drives the
    *  @ hard-gate's context-aware error text. */
   quoteTargetSenderIsBot?: boolean;
-  /** Pending placeholder card used when streaming cards are disabled. The first
-   *  botmux send for the turn PATCHes this card instead of posting a new one. */
-  pendingResponseCardId?: string;
-  pendingResponseCardState?: 'open' | 'patched';
-  lastPatchedResponseCardId?: string;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
@@ -94,8 +101,28 @@ export interface Session {
   lastCliInput?: string;
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
+  /**
+   * Set true when the idle-worker sweeper suspends this session over the per-bot
+   * live cap: the worker AND the backing tmux/herdr/zellij session (+ CLI) were
+   * intentionally killed to reclaim memory, but the session stays `active` and
+   * cold-resumes from its on-disk transcript on the next message. Distinguishes
+   * this deliberate state from a real zombie (pane gone while the server runs):
+   * `restoreActiveSessions` must NOT close a suspended session whose backing
+   * session probes 'missing'. Cleared once a live worker is re-established.
+   */
+  suspendedColdResume?: boolean;
   /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
   cliId?: import('./adapters/cli/types.js').CliId;
+  /**
+   * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
+   * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
+   * sandbox status is frozen here at creation so a restore/restart never
+   * retroactively sandboxes (or un-sandboxes) a historical session. Undefined on
+   * sessions created before this field existed → treated as not sandboxed.
+   */
+  sandbox?: boolean;
+  /** Per-bot privacy masks recorded alongside `sandbox` at session creation. */
+  sandboxHidePaths?: string[];
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
    *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
   adoptedFrom?: {
@@ -210,8 +237,12 @@ export interface ScheduledTask {
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
   repeat?: { times: number | null; completed: number };
-  /** Delivery target: 'origin' (original thread, default), 'local' (log only, no delivery) */
-  deliver?: 'origin' | 'local';
+  /** Delivery target:
+   *  - 'origin' (default): reply into the original thread, or post to the chat
+   *  - 'new-topic': every fire opens a brand-new topic in the chat and runs in
+   *    a fresh session (never reuses a prior session / never replies in-thread)
+   *  - 'local': log only, no delivery */
+  deliver?: 'origin' | 'local' | 'new-topic';
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -229,17 +260,33 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; model?: string; disableCliBypass?: boolean; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; sandbox?: boolean; sandboxHidePaths?: string[]; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string; turnId?: string }
-  | { type: 'raw_input'; content: string }
+  /** Literal slash-command passthrough. `followUpContent` rides along so the
+   *  worker enqueues it strictly AFTER the slash command's Enter — two separate
+   *  IPCs would race: process.on('message') handlers don't serialize, and the
+   *  raw_input branch awaits 200ms between sendText and Enter, a window where
+   *  a separate `message` IPC could write into the PTY first. */
+  | { type: 'raw_input'; content: string; followUpContent?: string }
   | { type: 'close' }
   | { type: 'suspend' }
   | { type: 'restart' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
   | { type: 'tui_text_input'; keys: string[]; text: string }
+  // CoCo AskUserQuestion 作答：daemon 在 ask 结算后下发，worker 等原生 picker 渲染后
+  // 用 navKeys 驱动它选择+导航。needsReviewSubmit=true（多题）时 navKeys 停在 Review
+  // 屏，worker 再补一记 Enter 提交；单题 navKeys 直接提交（无 Review）。comment 非空
+  // 表示用户用自由文本作答：navKeys 把光标移到第一题 "Type something"，worker 输入
+  // 文本后补一记 Enter 提交（多题自由文本不完整支持）。
+  | { type: 'coco_drive_picker'; navKeys: string[]; needsReviewSubmit: boolean; comment?: string | null }
   | { type: 'set_display_mode'; mode: DisplayMode }
+  | { type: 'set_locale'; locale: 'zh' | 'en' }
   | { type: 'term_action'; key: TermActionKey }
-  | { type: 'refresh_screen' };
+  | { type: 'refresh_screen' }
+  // Claude-family「真就绪」信号：CLI 的 SessionStart hook 经 `botmux session-ready`
+  // 调到 daemon，daemon 转发给本会话 worker，放行被 ready-gate 门控的首条 prompt
+  // （绕开 cjadk 启动选择器吞首条消息）。source = SessionStart 的 startup/resume/… 。
+  | { type: 'session_ready'; source?: string };
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =

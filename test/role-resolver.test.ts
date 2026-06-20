@@ -137,3 +137,26 @@ describe('buildNewTopicPrompt team-role injection', () => {
     expect(prompt).toContain('TEAM_PERSONA');
   });
 });
+
+describe('buildFollowUpContent role injection', () => {
+  it('places stable role context before the follow-up user message', async () => {
+    await fresh();
+    const { writeRoleFile } = await import('../src/core/role-resolver.js');
+    writeRoleFile('app1', 'oc_follow', 'FOLLOWUP_PERSONA');
+    const { buildFollowUpContent } = await import('../src/core/session-manager.js');
+    const prompt = buildFollowUpContent('follow up', 'sess-follow', {
+      larkAppId: 'app1',
+      chatId: 'oc_follow',
+      sender: { openId: 'ou_sender', type: 'user', name: 'Sender' },
+      mentions: [{ name: 'Reviewer', openId: 'ou_reviewer' }],
+    });
+
+    expect(prompt).toContain('<role context="group" chat_id="oc_follow">');
+    expect(prompt).toContain('FOLLOWUP_PERSONA');
+    expect(prompt.indexOf('<session_id>')).toBeLessThan(prompt.indexOf('<role '));
+    expect(prompt.indexOf('<role ')).toBeLessThan(prompt.indexOf('<botmux_reminder>'));
+    expect(prompt.indexOf('<botmux_reminder>')).toBeLessThan(prompt.indexOf('<user_message>'));
+    expect(prompt.indexOf('<sender ')).toBeGreaterThan(prompt.indexOf('</user_message>'));
+    expect(prompt.indexOf('<mentions>')).toBeGreaterThan(prompt.indexOf('</user_message>'));
+  });
+});

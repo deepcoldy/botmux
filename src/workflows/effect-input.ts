@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
+import { atomicWriteFile } from '../utils/atomic-write.js';
 import type { EventLog } from './events/append.js';
 
 export async function writeEffectInputSidecar(
@@ -11,7 +12,7 @@ export async function writeEffectInputSidecar(
 ): Promise<string> {
   const dir = await effectInputDir(log, activityId, attemptId);
   const path = join(dir, 'effect-input.json');
-  await fs.writeFile(path, JSON.stringify(input, null, 2), 'utf-8');
+  await atomicWriteFile(path, JSON.stringify(input, null, 2));
   return path;
 }
 

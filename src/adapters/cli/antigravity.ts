@@ -3,7 +3,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -53,10 +55,6 @@ import type { CliAdapter, PtyHandle } from './types.js';
  */
 
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
@@ -117,7 +115,7 @@ function historyDeltaContains(path: string, fromByte: number, marker: string): b
 async function waitForHistoryAppend(
   path: string, fromByte: number, marker: string, timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     if (historyDeltaContains(path, fromByte, marker)) return true;
     await delay(100);
@@ -133,6 +131,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'antigravity',
+    authPaths: ['~/.gemini/oauth_creds.json', '~/.gemini/antigravity-cli/antigravity-oauth-token'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ resume, resumeSessionId, disableCliBypass }) {
@@ -170,6 +169,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // ~/.gemini/antigravity-cli/conversations/.
       if (!cliSessionId) return null;
       return `agy --conversation ${cliSessionId}`;
+    },
+
+    /** Import path: the submit log `~/.gemini/antigravity-cli/history.jsonl`
+     *  records `{display, timestamp, workspace, conversationId}` per submit —
+     *  enough to discover resumable conversations (deduped by conversationId). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverAntigravitySessions(HISTORY_PATH, limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {

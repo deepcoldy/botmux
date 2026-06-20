@@ -9,6 +9,16 @@ import { existsSync } from 'node:fs';
 const globalEnv = join(homedir(), '.botmux', '.env');
 dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 
+// A daemon is never a session. pm2 startOrRestart injects the caller's
+// environment into restarted apps, so a `botmux restart` issued from inside a
+// botmux session leaks session-scoped vars into this long-lived process —
+// hook-runner's CLI gate would then mistake the daemon for CLI context and
+// forward every hook event to the daemon itself (/api/hooks/emit) in an
+// infinite self-loop. Scrub unconditionally at boot.
+for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_ROOT_MESSAGE_ID']) {
+  delete process.env[k];
+}
+
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading
   // daemon code — `bot-registry`, `card-builder`, etc. read `t()` against

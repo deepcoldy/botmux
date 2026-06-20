@@ -22,7 +22,7 @@ function pageHtml(): string {
 </form>
 <table>
   <thead><tr>
-    <th>${t('schedules.name')}</th><th>${t('schedules.bot')}</th><th>${t('schedules.schedule')}</th><th>${t('schedules.next')}</th><th>${t('schedules.last')}</th>
+    <th>${t('schedules.name')}</th><th>${t('schedules.bot')}</th><th>${t('schedules.schedule')}</th><th>${t('schedules.delivery')}</th><th>${t('schedules.next')}</th><th>${t('schedules.last')}</th>
     <th>${t('schedules.repeat')}</th><th>${t('schedules.enabled')}</th><th>${t('schedules.actions')}</th>
   </tr></thead>
   <tbody id="schedules-tbody"></tbody>
@@ -66,6 +66,7 @@ export function renderSchedulesPage(root: HTMLElement) {
       <td>${escapeHtml(s.name ?? s.id)}</td>
       <td>${escapeHtml(s.botName ?? s.larkAppId ?? '-')}</td>
       <td><code>${escapeHtml(s.parsed?.display ?? '?')}</code></td>
+      <td>${s.deliver === 'new-topic' ? `🆕 ${t('schedules.deliveryNewTopic')}` : s.deliver === 'local' ? `🔕 ${t('schedules.deliveryLocal')}` : t('schedules.deliveryOrigin')}</td>
       <td>${fmtDate(s.nextRunAt)}</td>
       <td>${fmtDate(s.lastRunAt)} ${s.lastStatus === 'error' ? '⚠️' : ''}</td>
       <td>${s.repeat ? `${s.repeat.completed}/${s.repeat.times ?? '∞'}` : '—'}</td>
@@ -75,8 +76,11 @@ export function renderSchedulesPage(root: HTMLElement) {
         ${s.enabled
           ? `<button data-op="pause" type="button">${t('schedules.pause')}</button>`
           : `<button data-op="resume" type="button">${t('schedules.resume')}</button>`}
+        ${s.deliver === 'local'
+          ? ''
+          : `<button data-op="delivery" type="button">${s.deliver === 'new-topic' ? t('schedules.useOrigin') : t('schedules.useNewTopic')}</button>`}
       </td>
-    </tr>`).join('') || `<tr><td colspan="8" class="empty">${t('schedules.empty')}</td></tr>`;
+    </tr>`).join('') || `<tr><td colspan="9" class="empty">${t('schedules.empty')}</td></tr>`;
   }
 
   tbody.addEventListener('click', async e => {

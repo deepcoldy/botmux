@@ -374,7 +374,7 @@ const ROUTES: RouteDef[] = [
       );
       if (!allowed) return { status: 403, body: { ok: false, error: 'owner_only' } };
       const patch = bodyField<unknown>(ctx.body, 'patch');
-      const r = applySettingsWrite(patch, deps.settingsApplierDeps);
+      const r = await applySettingsWrite(patch, deps.settingsApplierDeps);
       if (!r.ok) return { status: 400, body: { ok: false, error: r.error } };
       return { status: 200, body: { ok: true, settings: r.settings } };
     },
@@ -588,10 +588,10 @@ const ROUTES: RouteDef[] = [
     },
   },
 
-  // ── WRITE: schedules × 3 ──────────────
+  // ── WRITE: schedules × 4 ──────────────
   {
     method: 'POST',
-    pathRe: /^\/__daemon\/schedules\/([^/]+)\/(run|pause|resume)$/,
+    pathRe: /^\/__daemon\/schedules\/([^/]+)\/(run|pause|resume|delivery)$/,
     handle: async (m, ctx, deps) => {
       const id = decodeURIComponent(m[1]);
       const action = m[2];

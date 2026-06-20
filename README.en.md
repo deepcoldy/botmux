@@ -64,7 +64,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 20
-- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `pi`, `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), or `agy` (Antigravity) in PATH)
+- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), or `agy` (Antigravity) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
@@ -258,10 +258,11 @@ BACKEND_TYPE=pty botmux start
 Seamlessly connect Botmux to CLI processes already running in tmux — monitor and interact from your phone via Lark.
 
 ```
-/adopt              # Scan tmux, show selection card
-/adopt 0:2.0        # Directly adopt a specific tmux pane
+/adopt              # Selection card: ① take over a running session ② resume a past session from disk
+/adopt 0:2.0        # Directly adopt a tmux pane (or pass a past session id to resume-import it)
 ```
 
+- **Import past sessions** — The card's second filter lists this host's past sessions for the CLI (claude-code / seed / codex / traex / antigravity); pick one to rebuild it as a standard Botmux session via `--resume` in its original working dir — no live process required, no need to move it into tmux first
 - **Shared mode** — After adopting, iTerm2 and Lark stay in sync: streaming card shows real-time terminal output, Lark chat input is forwarded directly to the terminal
 - **One-click takeover** — Click the "Takeover" button on the streaming card to rebuild the session with `--resume` and convert to a standard Botmux session
 - **Safe disconnect** — Click "Disconnect" to detach Botmux without affecting the original CLI

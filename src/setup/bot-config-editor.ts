@@ -17,6 +17,9 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '14': 'traex',
   '15': 'pi',
   '16': 'copilot',
+  '17': 'oh-my-pi',
+  '18': 'relay',
+  '19': 'mir',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -43,11 +46,14 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'traex': 'TRAE',
   'pi': 'Pi',
   'copilot': 'Copilot',
+  'oh-my-pi': 'Oh My Pi',
+  'relay': 'Relay',
+  'mir': 'Mir CLI',
 };
 
 /**
- * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号
- * 1..16) 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
+ * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号)
+ * 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
  * 列表. 单一事实源: CLI_ID_CHOICES 的值序.
  */
 export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
@@ -56,7 +62,7 @@ export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
  *   - 空 → undefined (调用方决定 "preserve current" 还是套默认 'claude-code')
- *   - "1".."16" → CLI_ID_CHOICES 映射
+ *   - 序号 (CLI_ID_CHOICES 的键) → 映射成 cliId
  *   - 已是合法 cliId 字面值 → 原样返回
  *   - 其它 → throw (typo 不该静默落盘成 cliId)
  */
@@ -66,8 +72,10 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   const mapped = CLI_ID_CHOICES[raw];
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
+  // 序号上界从 CLI_ID_CHOICES 派生, 新增 CLI 时自动跟随, 不再手写硬编码区间.
+  const maxChoice = Object.keys(CLI_ID_CHOICES).length;
   throw new Error(
-    `Unknown CLI 适配器 "${raw}"。请输入序号 1-16 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-${maxChoice} 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
 }
 
@@ -106,8 +114,18 @@ export interface BotConfigEditInput {
   cliChoice?: string;
   cliPathOverride?: string;
   /**
-   * Model 字段三态语义：
-   *   - undefined → 这次编辑没问过 model（adapter 没声明 modelChoices 自动跳过），保持原值
+   * 通用启动前缀（如 "aiden x claude"）。三态：
+   *   - undefined → 不动
+   *   - string    → 设置（空串 / "-" 视为清空）
+   *   - null      → 清空（选了普通 CLI 时清掉旧的 aiden×* 前缀）
+   * 调用方（setup picker / dashboard）用 resolveCliSelection 解析选择项后传入，
+   * 避免 bot-config-editor 反向依赖 cli-selection（会成循环 import）。
+   */
+  wrapperCli?: string | null;
+  /**
+   * Model 字段三态语义（setup 不再交互式询问 model，此字段仅由切换 CLI 时的
+   * 强制清空逻辑设 null；改 model 走 /config 卡片或手动编辑 bots.json）：
+   *   - undefined → 这次编辑不动 model，保持原值
    *   - string    → 设为这个 model
    *   - null      → 清空（删字段，回到 CLI 默认）
    */
@@ -287,8 +305,16 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
 
   applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
 
-  // Model 字段：null = 清空，string = 设置，undefined = 不动。promptModel 已经
-  // 把"adapter 不支持 model"折叠成 undefined 直接跳过；这里不再去查 adapter。
+  // wrapperCli 三态：null = 清空，string = 设置（空 / "-" 也清空），undefined = 不动。
+  if (input.wrapperCli === null) {
+    delete out.wrapperCli;
+  } else if (typeof input.wrapperCli === 'string') {
+    const v = input.wrapperCli.trim();
+    if (!v || v === '-') delete out.wrapperCli;
+    else out.wrapperCli = v;
+  }
+
+  // Model 字段：null = 清空，string = 设置，undefined = 不动。
   if (input.model === null) {
     delete out.model;
   } else if (typeof input.model === 'string') {

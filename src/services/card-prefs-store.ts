@@ -33,6 +33,8 @@ export interface BotCardPrefs {
   regularGroupReplyMode: ChatReplyMode;
   /** Per-bot 3-tier @-requirement policy for regular groups (default 'always'). */
   regularGroupMentionMode: 'always' | 'topic' | 'never';
+  /** 文档订阅新订阅默认评论触发范围（default 'mention-only'）。 */
+  docSubscribeDefaultMode: 'mention-only' | 'all';
 }
 
 /** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
@@ -49,6 +51,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat',
       regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never'
         ? c.regularGroupMentionMode : 'always',
+      docSubscribeDefaultMode: c.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     };
   } catch {
     return {
@@ -60,6 +63,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnNewTopic: false,
       regularGroupReplyMode: 'chat',
       regularGroupMentionMode: 'always',
+      docSubscribeDefaultMode: 'mention-only',
     };
   }
 }
@@ -102,6 +106,12 @@ export async function updateBotCardPrefs(
     if (val === 'topic' || val === 'never') entry[key] = val;
     else delete entry[key];
   };
+  // 文档订阅默认触发范围：只存 'all'；'mention-only'（默认）删键保持 bots.json 干净。
+  const applyDocMode = (entry: any, key: keyof BotCardPrefs, val: 'mention-only' | 'all' | undefined) => {
+    if (val === undefined) return;
+    if (val === 'all') entry[key] = 'all';
+    else delete entry[key];
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
@@ -112,6 +122,7 @@ export async function updateBotCardPrefs(
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
     applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
     applyMention(entry, 'regularGroupMentionMode', patch.regularGroupMentionMode);
+    applyDocMode(entry, 'docSubscribeDefaultMode', patch.docSubscribeDefaultMode);
     return {
       write: true,
       result: {
@@ -127,6 +138,7 @@ export async function updateBotCardPrefs(
         regularGroupMentionMode: (entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never')
           ? entry.regularGroupMentionMode
           : 'always',
+        docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
       },
     };
   });
@@ -160,6 +172,9 @@ export async function updateBotCardPrefs(
     bot.config.regularGroupMentionMode = (patch.regularGroupMentionMode === 'topic' || patch.regularGroupMentionMode === 'never')
       ? patch.regularGroupMentionMode
       : undefined;
+  }
+  if (patch.docSubscribeDefaultMode !== undefined) {
+    bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +

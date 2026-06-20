@@ -126,7 +126,10 @@ describe('message quota enforcement', () => {
       oc_oncall: ['ou_oncall'],
     };
 
-    for (const content of ['/clear', '/btw note', '/somecliskill arg']) {
+    // 含 `/foo:bar`（冒号）与 `/1cmd`（首位数字）—— 它们是合法的 custom passthrough
+    // 形状，受限闸的 shape 正则必须与 passthrough 同口径才拦得住，否则 grant-only
+    // 用户能借已配置的此类命令绕过 restrictGrantCommands 直达 raw passthrough。
+    for (const content of ['/clear', '/btw note', '/somecliskill arg', '/foo:bar x', '/1cmd y']) {
       const invocation = parseSlashCommandInvocation(content);
       expect(invocation).not.toBeNull();
       expect(grantRestrictedSlashCommandText('quota_slash_restrict', 'oc_1', 'ou_chat', invocation!.cmd)).toContain(invocation!.cmd);

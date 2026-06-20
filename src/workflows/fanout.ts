@@ -10,6 +10,7 @@ import { isPayloadRef } from './events/schema.js';
 import { getRunsDir } from './runs-dir.js';
 import { readRunChatBinding, type RunChatBinding } from './loader.js';
 import { buildWorkflowApprovalCard } from '../im/lark/workflow-cards.js';
+import { localeForBot } from '../i18n/index.js';
 import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 
@@ -127,7 +128,7 @@ export async function handleWorkflowFanoutEvent(
   const binding = deps.binding ?? (await readRunChatBinding(event.runId, { runsDir }));
   const snapshot =
     deps.snapshot ?? replay(await new EventLog(event.runId, runsDir).readAll());
-  const cardJson = buildWorkflowApprovalCard(waitEvent, snapshot);
+  const cardJson = buildWorkflowApprovalCard(waitEvent, snapshot, {}, localeForBot(binding.larkAppId));
   const sendCard = deps.sendCard ?? defaultSendWorkflowCard;
   const messageId = await sendCard(binding.larkAppId, binding.chatId, cardJson, 'interactive');
   logger.info(`[workflow:${event.runId}] approval card sent to ${binding.chatId}: ${messageId}`);

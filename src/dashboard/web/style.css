@@ -89,6 +89,7 @@ a { color: inherit; }
   height: 100vh;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   padding: 18px 14px;
   background: var(--surface);
   border-right: 1px solid var(--border);
@@ -131,6 +132,7 @@ a { color: inherit; }
 .sidebar-nav {
   display: grid;
   gap: 4px;
+  min-width: 0;
   margin-top: 24px;
 }
 
@@ -158,6 +160,77 @@ a { color: inherit; }
 .sidebar-foot {
   margin-top: auto;
   padding: 10px 8px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sidebar-toggle {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.sidebar-toggle:hover {
+  background: var(--surface-muted);
+  color: var(--fg);
+}
+
+.sidebar-toggle svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 160ms ease;
+}
+
+/* 收起态：侧栏收窄成图标栏（只在桌面布局生效；窄屏侧栏本来就折成顶栏） */
+@media (min-width: 981px) {
+  :root[data-sidebar="collapsed"] {
+    --sidebar-width: 68px;
+  }
+  :root[data-sidebar="collapsed"] .sidebar {
+    padding: 18px 10px;
+  }
+  :root[data-sidebar="collapsed"] .brand {
+    justify-content: center;
+    padding: 8px 0;
+  }
+  :root[data-sidebar="collapsed"] .brand > span:not(.brand-mark) {
+    display: none;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-nav a {
+    justify-content: center;
+    padding: 8px;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-nav a span {
+    display: none;
+  }
+  :root[data-sidebar="collapsed"] .connection-status {
+    display: none;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-foot {
+    justify-content: center;
+    padding: 10px 0 4px;
+  }
+  :root[data-sidebar="collapsed"] .sidebar-toggle svg {
+    transform: rotate(180deg);
+  }
 }
 
 .connection-status {
@@ -315,7 +388,8 @@ a { color: inherit; }
 
 main {
   width: 100%;
-  max-width: 1480px;
+  /* 不设上限：收起侧栏腾出的宽度交还内容区（看板/表格都按容器弹性布局）。 */
+  max-width: none;
   padding: 24px;
 }
 
@@ -684,11 +758,87 @@ th {
 }
 
 tbody tr:last-child td { border-bottom: 0; }
+
+/* ── 首尾列固定的横向滚动矩阵（群组与 Bot）─────────────────────────────
+   bot 一多中间的成员列就溢出视口，操作按钮被顶出屏幕。把圆角/阴影挪到
+   滚动容器上，表格本体放开宽度横向滚，首列（群）和尾列（操作）sticky 钉住。 */
+.table-scroll { overflow-x: auto; }
+.matrix-scroll {
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.matrix-scroll table {
+  width: max-content;
+  min-width: 100%;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible; /* 基础样式的 overflow:hidden 会把 sticky 列钉死在表格自身 */
+}
+.matrix-scroll th:first-child,
+.matrix-scroll td:first-child { position: sticky; left: 0; z-index: 2; }
+.matrix-scroll th:last-child,
+.matrix-scroll td:last-child { position: sticky; right: 0; z-index: 2; }
+.matrix-scroll th:first-child,
+.matrix-scroll th:last-child { z-index: 3; }
+/* sticky 单元格必须有不透明底色，否则中间列会从底下透出来 */
+.matrix-scroll td:first-child,
+.matrix-scroll td:last-child { background: var(--surface); }
+/* 暗色主题下表格本体有一层 3% 白的提亮，sticky 格子补同款混色保持一致 */
+:root[data-theme="dark"] .matrix-scroll td:first-child,
+:root[data-theme="dark"] .matrix-scroll td:last-child {
+  background: color-mix(in srgb, #ffffff 3%, var(--surface));
+}
+/* 暗色主题 th 也是半透明提亮（4% 白）——sticky 表头必须不透明，否则横滚时
+   中间列标题会从「群聊」「操作」底下透出来。7% ≈ 表格 3% + th 4% 的叠加效果 */
+:root[data-theme="dark"] .matrix-scroll th:first-child,
+:root[data-theme="dark"] .matrix-scroll th:last-child {
+  background: color-mix(in srgb, #ffffff 7%, var(--surface));
+}
+.matrix-scroll tr[data-chat]:hover td:first-child,
+.matrix-scroll tr[data-chat]:hover td:last-child { background: var(--surface-muted); }
+/* 滚动边界提示线 */
+.matrix-scroll th:first-child,
+.matrix-scroll td:first-child { box-shadow: 1px 0 0 var(--border-soft); }
+.matrix-scroll th:last-child,
+.matrix-scroll td:last-child { box-shadow: -1px 0 0 var(--border-soft); }
+
+/* ── 慢接口在途的页面级 loading 占位：在内容区水平垂直居中 ── */
+.page-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  width: 100%;
+  min-height: 220px;
+  padding: 40px 20px;
+  color: var(--muted);
+  font-size: 13px;
+  animation: page-loading-in 0.25s ease-out;
+}
+.page-loading-spin {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 50%;
+  border: 2.5px solid var(--border-soft);
+  border-top-color: var(--accent);
+  animation: page-loading-rotate 0.8s linear infinite;
+}
+@keyframes page-loading-rotate { to { transform: rotate(360deg); } }
+@keyframes page-loading-in { from { opacity: 0; } }
 th[data-sort] { cursor: pointer; user-select: none; }
 th[data-sort]:hover,
 th.sorted { color: var(--fg); background: var(--bg-soft); }
 tr[data-id]:hover,
 tr[data-chat]:hover { background: var(--surface-muted); cursor: pointer; }
+.token-cell {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
 
 button,
 .btn-link {
@@ -1036,15 +1186,18 @@ button.primary {
 .session-signal {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
+  justify-self: start;
+  max-width: 100%;
   min-height: 22px;
-  padding: 0 8px;
+  padding: 3px 8px;
   color: var(--danger);
   font-family: var(--mono);
   font-weight: 700;
   font-size: 11px;
-  line-height: 1;
+  line-height: 1.35;
   letter-spacing: 0.04em;
+  text-align: left;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--danger) 9%, transparent);
   border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
@@ -1061,6 +1214,691 @@ button.primary {
   padding: 0 9px;
   font-size: 12px;
 }
+
+/* ── 看板视图（multica Issues 风格）：横排状态列 + 简洁卡片 ─────────────────── */
+.sessions-kanban {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 4px 2px 12px;
+}
+
+.sessions-kanban[hidden] {
+  display: none;
+}
+
+.kanban-column {
+  /* 弹性等分而非固定 280px：5 列在任何视口宽度下收缩到容器内，
+     不再把页面撑出横向滚动条（极窄屏由媒体查询改纵向堆叠兜底）。 */
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 320px;
+  max-height: calc(100vh - 250px);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-muted) 72%, transparent);
+}
+
+.kanban-column > header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 12px 8px;
+}
+
+.kanban-col-icon {
+  display: inline-flex;
+  flex: none;
+}
+
+.kanban-col-icon svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.kanban-column h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.kanban-col-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 视图控件排布：团队筛选 + 分组维度切换 + 视图切换并排（窄屏自动换行） */
+.sessions-view-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* .segmented 自带 display:inline-flex 会盖掉 [hidden] 的 UA 样式——显式补回 */
+.sessions-view-controls [hidden] {
+  display: none !important;
+}
+
+/* 团队下拉做成与右侧 .segmented 同款胶囊：同高、同边框、圆角 999，
+   去掉原生箭头换内嵌 chevron */
+.kanban-team-select {
+  appearance: none;
+  -webkit-appearance: none;
+  max-width: 200px;
+  min-height: 38px;
+  padding: 0 30px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background-color: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.6 4.4 6 7.8l3.4-3.4' fill='none' stroke='%238b98aa' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px;
+}
+
+.kanban-team-select:hover {
+  background-color: var(--surface-muted);
+}
+
+.kanban-team-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 团队筛选范围统计：让"筛掉了什么"可见 */
+.kanban-team-stats {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 团队清单加载中的整板占位（替代裸文本） */
+.kanban-loading {
+  flex: 1;
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  font-size: 13px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+}
+
+.kanban-team-select:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+
+/* 对方部署的会话卡：来源徽章 + 虚线边框区分快照身份 */
+.kanban-remote-badge {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-muted));
+  color: var(--accent-strong);
+  white-space: nowrap;
+  flex: none;
+}
+
+.kanban-card-remote {
+  border-style: dashed;
+}
+
+/* 机器人视角：bot 多时列不再无限压缩——固定列宽 + 容器横向滚动 */
+.sessions-kanban.kanban-mode-bot .kanban-column {
+  flex: 0 0 264px;
+}
+
+/* 整簇拖拽 */
+.kanban-cluster > header {
+  cursor: grab;
+}
+
+.kanban-cluster.dragging {
+  opacity: 0.45;
+}
+
+/* 同群聚簇容器：虚线框 + 群名头，一眼看出卡片同属一个群 */
+.kanban-cluster {
+  display: grid;
+  gap: 6px;
+  padding: 6px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 38%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 3%, transparent);
+}
+
+.kanban-cluster > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.kanban-cluster-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kanban-cluster-count {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 团队模式列头：bot 头像替代状态图标 */
+.kanban-col-avatar {
+  display: inline-flex;
+  flex: none;
+}
+
+.kanban-backlog .kanban-col-icon { color: var(--faint); }
+.kanban-todo .kanban-col-icon { color: var(--muted); }
+.kanban-in_progress .kanban-col-icon { color: var(--warning); }
+.kanban-in_review .kanban-col-icon { color: var(--success); }
+.kanban-done .kanban-col-icon { color: var(--accent); }
+
+/* 拖拽视觉：目标列描边、插入位置在目标卡上沿画一条插入线、拖拽源半透明 */
+.kanban-column.drag-over {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.kanban-card.dragging {
+  opacity: 0.45;
+}
+
+.kanban-card.drop-before {
+  box-shadow: 0 -2px 0 0 var(--accent);
+}
+
+.kanban-col-list {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 2px 8px 10px;
+  overflow-y: auto;
+}
+
+.kanban-col-empty {
+  padding: 32px 0;
+  color: var(--faint);
+  font-size: 12px;
+  text-align: center;
+}
+
+.kanban-col-more {
+  padding: 6px 0 2px;
+  color: var(--faint);
+  font-size: 11px;
+  text-align: center;
+}
+
+.kanban-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.kanban-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface-raised));
+}
+
+.kanban-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.kanban-card-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* CLI 徽章别折行（claude-code 之类带连字符的会被 280px 卡片拆成两行） */
+.kanban-card-top .badge {
+  white-space: nowrap;
+  flex: none;
+}
+
+/* 右上角动作区：运行状态点常显；重命名/详情按钮平时隐身，悬停/聚焦才浮现 */
+.kanban-card-top-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kanban-card-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: none;
+}
+
+.kanban-card-dot[data-status="working"],
+.kanban-card-dot[data-status="analyzing"],
+.kanban-card-dot[data-status="active"] {
+  background: var(--success);
+}
+
+.kanban-card-dot[data-status="starting"] {
+  background: var(--warning);
+}
+
+.kanban-card-dot[data-status="limited"] {
+  background: var(--danger);
+}
+
+.kanban-card-dot[data-status="closed"] {
+  background: var(--border);
+}
+
+/* 选择器带上 .kanban-card 提特异性：通用 .card-act 基础规则（display/尺寸）
+   定义在本节之后，同特异性会反杀这里的覆盖。 */
+.kanban-card .kanban-card-act {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  /* 不悬停时彻底不占位（opacity:0 仍会把短 ID 永久挤成省略号） */
+  display: none;
+}
+
+.kanban-card:hover .kanban-card-act,
+.kanban-card:focus-within .kanban-card-act {
+  display: inline-flex;
+}
+
+/* 标题就地编辑输入框：占标题原位，不撑破卡片 */
+.kanban-rename-input {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.kanban-card-title {
+  margin: 0;
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.kanban-card-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kanban-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+  min-width: 0;
+}
+
+.kanban-card-owner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.kanban-card-owner > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kanban-card-updated {
+  flex: none;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* ── 页面内终端弹窗（看板卡片点击落点）───────────────────────────────────── */
+.term-modal {
+  width: min(1560px, 96vw);
+  height: min(88vh, 1100px);
+  max-height: calc(100vh - 24px);
+  padding: 0;
+  overflow: hidden;
+}
+
+.term-modal[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.term-modal-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.term-modal-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.term-modal-title strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 终端弹窗标题旁的铅笔：常显小尺寸，与 card-act 一致 */
+.term-modal-title .card-act {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  flex: none;
+}
+
+/* 标题就地编辑输入框：宽度由 JS 按内容实测设定（fitInput），这里只给兜底上限 */
+.term-modal-name-input {
+  max-width: 60vw;
+  margin: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.term-modal-actions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.term-modal-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.term-modal-frame {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #000;
+}
+
+.term-modal-loading {
+  margin: auto;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+/* ── 会话历史弹窗：飞书式左右气泡 ─────────────────────────────────────────── */
+.history-modal {
+  width: min(860px, 94vw);
+  height: min(82vh, 900px);
+  max-height: calc(100vh - 24px);
+  padding: 0;
+  overflow: hidden;
+}
+
+.history-modal[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.history-scope-tag {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.history-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 14px 16px;
+  background: var(--bg-soft);
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-msg {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  max-width: 82%;
+}
+
+.history-msg.mine {
+  margin-left: auto;
+  flex-direction: row-reverse;
+}
+
+.history-msg-main {
+  min-width: 0;
+}
+
+.history-msg-meta {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 3px;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.history-msg.mine .history-msg-meta {
+  justify-content: flex-end;
+}
+
+.history-bubble {
+  padding: 8px 11px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-raised);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.history-msg.mine .history-bubble {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.history-avatar-user {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 12px;
+}
+
+/* 真人头像（contact API 拿到的）——与首字圆同尺寸 */
+.history-avatar-img {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/* 左上角 brand 的 owner 头像：盖满 brand-mark 方块 */
+.brand-mark {
+  position: relative;
+  overflow: hidden;
+}
+
+.brand-owner-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.history-error {
+  margin: auto;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+/* 图标方按钮：会话卡片操作行一排，也被详情抽屉 .actions 复用（chat-scope 的
+   「打开群聊」走同一个 .card-act）。图标宽度与语言无关，en/zh 都稳定一行，修掉了
+   EN 文案更宽把「关闭」挤下行的崩布局。基础按钮外观放在通用 .card-act 选择器上，
+   这样抽屉里的裸 <a class="card-act"> 也有按钮态；.session-card-actions 只管布局。
+   SVG 走 stroke:currentColor。 */
+.card-act svg,
+.term-btn svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.card-act {
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease, background .15s ease, transform .07s ease;
+}
+.card-act:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface-raised));
+}
+.card-act.danger:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 9%, var(--surface-raised));
+}
+.card-act:active { transform: scale(0.9); }
+
+/* 终端访问药丸：左「终端」段(accent ghost·只读旁观) + 右「钥匙」段(accent 实心·
+   主操作，可写)。两段一个圆角壳，钥匙段实心更抢眼，读起来就是「这个才是操作」。 */
+.term-pill {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.term-pill .term-btn {
+  width: 30px;
+  min-height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  /* the pill shell owns the rounding; reset so the global `button{border-radius:999px}`
+     pill-ify rule doesn't turn the <button> key segment into a circle. */
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+  transition: background .15s ease, filter .15s ease, transform .07s ease;
+}
+/* selectors scoped to .term-pill so they out-specify `.term-pill .term-btn`
+   above (both 0,2,0) by source order — otherwise the segments stay transparent. */
+.term-pill .term-open {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.term-pill .term-open:hover { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+.term-pill .term-write {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-left: 1px solid color-mix(in srgb, var(--on-accent) 28%, var(--accent));
+}
+.term-pill .term-write:hover { filter: brightness(1.1); }
+.term-pill .term-btn:active { transform: scale(0.88); }
 
 dialog {
   width: min(680px, calc(100vw - 32px));
@@ -1208,7 +2046,9 @@ fieldset legend {
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  background: var(--warning-soft);
+  /* warning-soft 在暗色主题带透明度，sticky 浮条悬在列表上会透字——
+     垫一层页面底色保证不透明，同时保留各主题自己的警示色调 */
+  background: linear-gradient(var(--warning-soft), var(--warning-soft)), var(--bg);
   border: 1px solid color-mix(in srgb, var(--warning) 28%, transparent);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -1504,6 +2344,22 @@ input.row-select,
   }
   .sessions-board {
     grid-template-columns: 1fr;
+  }
+  /* 窄屏看板：列改纵向堆叠，高度交还内容 */
+  .sessions-kanban {
+    flex-direction: column;
+  }
+  .kanban-column {
+    flex: none;
+    min-height: 0;
+    max-height: none;
+  }
+  .kanban-col-list {
+    overflow-y: visible;
+  }
+  .term-modal {
+    width: calc(100vw - 16px);
+    height: calc(100vh - 24px);
   }
   .filter-check-group {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2217,6 +3073,21 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
   gap: 13px;
 }
+/* AI 团队折叠/展开开关：贴着卡片栅格下沿居中，弱化成次级控件 */
+.team-toggle {
+  justify-self: center;
+  margin-top: -6px;
+  min-height: 28px;
+  padding: 3px 18px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  box-shadow: none;
+}
+.team-toggle:hover { color: var(--fg); border-color: var(--accent); }
 .mate {
   display: flex;
   flex-direction: column;
@@ -2738,6 +3609,797 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .settings-card .toggle-tx small {
   -webkit-line-clamp: unset;
   color: var(--muted);
+}
+
+.skills-page-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  max-width: 1600px;
+}
+
+.skills-side-rail {
+  position: sticky;
+  top: 18px;
+  z-index: 10;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.skills-side-rail > .bd-card,
+.skills-main-panel > .bd-card,
+.skills-bot-card {
+  max-width: none;
+  margin-bottom: 0;
+}
+
+.skills-defaults-panel,
+.skills-install-panel {
+  padding: 16px;
+}
+
+.skills-install-panel {
+  position: relative;
+}
+
+.skills-install-title {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
+}
+
+.skills-install-title .bd-section-title {
+  margin: 0;
+}
+
+.skills-help-tip {
+  position: relative;
+  display: inline-flex;
+}
+
+.skills-help-button {
+  width: 20px;
+  height: 20px;
+  min-height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.skills-help-popover {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  z-index: 50;
+  width: min(520px, calc(100vw - 48px));
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  box-shadow: var(--modal-shadow);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-line;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(0, -4px);
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.skills-help-tip:hover .skills-help-popover,
+.skills-help-tip:focus-within .skills-help-popover {
+  opacity: 1;
+  transform: translate(0, 0);
+}
+
+.skills-install-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.skills-install-grid label:first-child,
+.skills-install-field-wide,
+.skills-install-note {
+  grid-column: 1 / -1;
+}
+
+.skills-install-note {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.skills-install-note span {
+  display: block;
+}
+
+.skills-install-note strong {
+  color: var(--fg);
+  font-weight: 700;
+}
+
+.skills-install-grid label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.skills-install-grid input,
+.skills-attach-row select {
+  width: 100%;
+  min-width: 0;
+}
+
+.skills-main-panel,
+.skills-bot-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.skills-main-panel {
+  gap: 18px;
+  min-width: 0;
+}
+
+.skills-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.72fr);
+  gap: 16px;
+  align-items: stretch;
+  padding: 16px 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 58%),
+    var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.skills-overview-copy {
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.skills-overview-copy h2 {
+  margin: 0;
+  color: var(--fg);
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.skills-overview-copy p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.skills-metric-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.skills-metric-strip span {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 72%, transparent);
+}
+
+.skills-metric-strip small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.skills-metric-strip strong {
+  color: var(--fg);
+  font-size: 22px;
+  line-height: 1;
+  font-family: var(--mono);
+}
+
+.skills-installed-panel {
+  padding: 18px;
+  min-width: 0;
+}
+
+.skills-section-head {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.skills-section-head-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+}
+
+.skills-section-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.skills-section-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.skills-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.skills-row {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0;
+  min-height: 162px;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-muted) 24%, transparent), transparent 46%),
+    var(--surface);
+}
+
+.skills-row:first-child { border-top: 1px solid var(--border-soft); }
+.skills-row-body {
+  min-width: 0;
+  padding: 14px 14px 12px;
+}
+.skills-row strong {
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.skills-row p {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin: 6px 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.skills-row small { color: var(--muted); font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+
+.skills-card-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: auto;
+  border-top: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface-muted) 55%, transparent);
+}
+
+.skills-card-actions button {
+  min-height: 38px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.skills-card-actions button + button {
+  border-left: 1px solid var(--border-soft);
+}
+
+.skills-card-actions button:hover {
+  background: var(--surface-muted);
+  color: var(--fg);
+}
+
+.skills-card-actions [data-action="remove-skill"]:hover {
+  color: var(--danger);
+}
+
+.skills-installed-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.skills-pager {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.skills-pager span {
+  min-width: 42px;
+  text-align: center;
+}
+
+.skills-pager-button {
+  width: 26px;
+  height: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.skills-pager-button:hover:not(:disabled) {
+  background: var(--surface);
+  color: var(--accent-strong);
+}
+
+.skills-bots-panel {
+  min-width: 0;
+  position: relative;
+}
+
+.skills-bots-panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.skills-bot-grid {
+  display: flex;
+  gap: 14px;
+  align-items: stretch;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  padding: 2px 2px 12px;
+  scroll-padding-inline: 2px;
+  scroll-snap-type: x mandatory;
+  scrollbar-color: color-mix(in srgb, var(--accent) 45%, var(--border)) transparent;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+
+.skills-bot-grid::-webkit-scrollbar {
+  height: 8px;
+}
+
+.skills-bot-grid::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.skills-bot-grid::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 34%, var(--border));
+}
+
+.skills-bot-card {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  flex: 0 0 calc((100% - 28px) / 3);
+  align-content: stretch;
+  gap: 10px;
+  padding: 14px;
+  min-width: 0;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
+.skills-bot-card .bd-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding-top: 4px;
+}
+
+.skills-bot-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.skills-bot-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.skills-bot-head code {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-bot-head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-count-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.skills-bot-rail-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.skills-rail-button {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.skills-chip-list {
+  display: grid;
+  gap: 2px;
+  margin-top: 4px;
+  max-height: 92px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 3px;
+  scrollbar-color: color-mix(in srgb, var(--accent) 42%, var(--border)) transparent;
+  scrollbar-width: thin;
+}
+
+.skills-chip-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.skills-chip-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.skills-chip-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 32%, var(--border));
+}
+
+.skills-priority-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 2px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 68%, transparent);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.skills-priority-row:last-child {
+  border-bottom: 0;
+}
+
+.skills-priority-name {
+  display: block;
+  min-width: 0;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-priority-name small {
+  margin-left: 6px;
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.skills-priority-remove {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.skills-priority-remove:hover {
+  background: var(--surface-muted);
+  color: var(--danger);
+}
+
+.skills-priority-dangling .skills-priority-name {
+  color: var(--danger);
+}
+
+.skills-policy-summary {
+  display: grid;
+  gap: 3px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.skills-policy-summary strong {
+  color: var(--fg);
+  font-size: 11px;
+}
+
+.skills-policy-summary span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-attach-row,
+.skills-policy-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.skills-bot-card .skills-attach-row {
+  margin-top: auto;
+}
+
+.skills-policy-controls {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+
+.skills-control-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.skills-defaults-panel .skills-control-block + .skills-control-block {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.skills-control-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.skills-choice-group {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.skills-choice-group-compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.skills-choice-group-compact .skills-choice {
+  gap: 7px;
+  min-height: 96px;
+  padding: 13px 14px;
+  align-content: start;
+}
+
+.skills-choice-group-compact .skills-choice strong {
+  font-size: 13px;
+}
+
+.skills-choice-group-compact .skills-choice small {
+  white-space: pre-line;
+  line-height: 1.42;
+}
+
+.skills-project-group .skills-choice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.skills-project-group .skills-choice strong,
+.skills-project-group .skills-choice small {
+  width: 100%;
+  text-align: left;
+}
+
+.skills-defaults-panel .skills-choice-group:not(.skills-choice-group-compact) {
+  grid-template-columns: 1fr;
+}
+
+.skills-choice {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  min-width: 0;
+  min-height: 62px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--fg);
+  justify-items: start;
+  align-content: center;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.skills-choice:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.skills-choice:active {
+  transform: translateY(1px);
+}
+
+.skills-choice strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.skills-choice small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.skills-choice.selected {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.skills-delivery-group .skills-choice {
+  grid-template-columns: minmax(96px, 0.32fr) minmax(0, 1fr);
+  column-gap: 14px;
+  min-height: 62px;
+  padding: 11px 14px;
+  align-content: start;
+}
+
+.skills-delivery-group .skills-choice strong,
+.skills-delivery-group .skills-choice small {
+  align-self: start;
+}
+
+.skills-policy-controls [data-bot-status] {
+  grid-column: 1 / -1;
+}
+
+@media (min-width: 1600px) {
+  .skills-list {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1220px) {
+  .skills-bot-card {
+    flex-basis: calc((100% - 14px) / 2);
+  }
+}
+
+@media (max-width: 980px) {
+  .skills-page-grid {
+    grid-template-columns: 1fr;
+  }
+  .skills-side-rail {
+    position: static;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .skills-overview {
+    grid-template-columns: 1fr;
+  }
+  .skills-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .skills-page-grid,
+  .skills-side-rail,
+  .skills-main-panel,
+  .skills-defaults-panel,
+  .skills-install-panel,
+  .skills-overview,
+  .skills-installed-panel {
+    width: 100%;
+    max-width: 100%;
+  }
+  .skills-side-rail,
+  .skills-install-grid,
+  .skills-section-head-row,
+  .skills-overview,
+  .skills-metric-strip,
+  .skills-row,
+  .skills-attach-row,
+  .skills-policy-controls,
+  .skills-choice-group,
+  .skills-choice-group-compact {
+    grid-template-columns: 1fr;
+  }
+  .skills-help-popover {
+    left: 16px;
+    right: 16px;
+    top: 54px;
+    width: auto;
+  }
+  .skills-install-title,
+  .skills-help-tip {
+    position: static;
+  }
+  .skills-list {
+    grid-template-columns: 1fr;
+  }
+  .skills-bot-card {
+    flex-basis: 100%;
+  }
+  .skills-bot-head {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .skills-bot-head .skills-count-pill {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+  .skills-bot-rail-actions {
+    justify-content: flex-start;
+  }
 }
 
 /* toggle 开关行：checkbox 隐藏，switch 是视觉开关 */

@@ -19,6 +19,14 @@ import {
   type FederatedBot,
 } from '../services/federation-store.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
+import { listTeamGroups } from '../services/team-groups-store.js';
+import {
+  listTeamReports,
+  readTeamBoard,
+  recordTeamSessions,
+  sanitizeReportedSessions,
+  setTeamBoardEntry,
+} from '../services/team-board-store.js';
 import { findMembershipByDelegationToken } from '../services/federation-membership-store.js';
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
@@ -200,7 +208,53 @@ export async function handleFederationApi(
       name: typeof body?.name === 'string' ? body.name : undefined,
     });
     if (!ok) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
-    jsonRes(res, 200, { ok: true });
+    // 顺带下发该团队的协作群清单——spoke 据此筛出要上报给团队看板的会话。
+    const synced = getDeploymentByToken(dataDir, syncToken);
+    jsonRes(res, 200, {
+      ok: true,
+      groupChatIds: synced ? listTeamGroups(dataDir, synced.teamId).map(b => b.chatId) : [],
+    });
+    return true;
+  }
+
+  // ── 团队看板（申晗架构：编排存 host，会话源数据各部署自持）────────────────
+  // 成员上报会话裁剪行：白名单清洗后按 deploymentId 覆盖式落盘。
+  if (path === '/api/federation/team-sessions' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const found = getDeploymentByToken(dataDir, bearerOnly(req));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const sessions = sanitizeReportedSessions(body?.sessions);
+    recordTeamSessions(dataDir, found.teamId, found.deployment.deploymentId, found.deployment.name, sessions);
+    jsonRes(res, 200, { ok: true, accepted: sessions.length });
+    return true;
+  }
+
+  // 成员拉取团队看板：共享编排 + 各部署最近一次上报（含调用方自己的，
+  // 前端按 deploymentId 去掉自己那份，本地数据走实时 store）。
+  if (path === '/api/federation/team-board' && method === 'GET') {
+    const found = getDeploymentByToken(dataDir, federationToken(req, url));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    jsonRes(res, 200, {
+      ok: true,
+      teamId: found.teamId,
+      deploymentId: found.deployment.deploymentId,
+      board: readTeamBoard(dataDir, found.teamId),
+      reports: listTeamReports(dataDir, found.teamId),
+      groupChatIds: listTeamGroups(dataDir, found.teamId).map(b => b.chatId),
+    });
+    return true;
+  }
+
+  // 成员拖拽团队看板卡片：编排是全团队共享的一份，谁拖都写 host 这里。
+  if (path === '/api/federation/team-board-move' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const found = getDeploymentByToken(dataDir, bearerOnly(req));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const entry = setTeamBoardEntry(dataDir, found.teamId, String(body?.sessionId ?? ''), body?.column, body?.position);
+    if (!entry) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
+    jsonRes(res, 200, { ok: true, entry });
     return true;
   }
 

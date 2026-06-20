@@ -36,6 +36,7 @@ export interface ScheduleCardTaskInput {
   prompt?: string;
   parsed: ParsedSchedule;
   enabled: boolean;
+  deliver?: ScheduleDelivery;
   larkAppId?: string;
   /** Human bot label (e.g. `zkd-claude-bot`). Optional — when present the
    *  global-scope card row prefixes the row with it so the user can tell
@@ -55,6 +56,7 @@ export interface ScheduleCardTaskInput {
 }
 
 export type ScheduleKind = ParsedSchedule['kind'];
+export type ScheduleDelivery = 'origin' | 'local' | 'new-topic';
 export type ScheduleKindChip = ScheduleKind | 'all';
 
 export interface ScheduleFilterQuery extends PaginationParams {
@@ -109,6 +111,7 @@ export interface ScheduleDetailDto {
   enabled: boolean;
   kind: ScheduleKind;
   displayExpr: string;
+  deliver: ScheduleDelivery;
   prompt?: string;
   /** True when prompt was longer than promptTruncateAt and got cut. */
   promptTruncated: boolean;
@@ -193,6 +196,29 @@ export function computeButtonAvailability(task: ScheduleCardTaskInput): Schedule
   };
 }
 
+export function normalizeScheduleDelivery(deliver: ScheduleCardTaskInput['deliver']): ScheduleDelivery {
+  return deliver === 'new-topic' || deliver === 'local' ? deliver : 'origin';
+}
+
+export function computeDeliveryButtonAvailability(
+  task: ScheduleCardTaskInput,
+  target: Exclude<ScheduleDelivery, 'local'>,
+): ButtonState {
+  const current = normalizeScheduleDelivery(task.deliver);
+  if (current === 'local') {
+    return { enabled: false, reasonKey: 'schedules.action.delivery.local' };
+  }
+  if (current === target) {
+    return {
+      enabled: false,
+      reasonKey: target === 'origin'
+        ? 'schedules.action.delivery.alreadyOrigin'
+        : 'schedules.action.delivery.alreadyNewTopic',
+    };
+  }
+  return { enabled: true };
+}
+
 /** Build a single ScheduleRowDto for list rendering. */
 export function toScheduleRowDto(task: ScheduleCardTaskInput, ctx: RowRenderContext): ScheduleRowDto {
   return {
@@ -225,6 +251,7 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
     enabled: task.enabled,
     kind: task.parsed.kind,
     displayExpr: task.parsed.display,
+    deliver: normalizeScheduleDelivery(task.deliver),
     prompt: promptRaw.length === 0 ? undefined : prompt,
     promptTruncated,
     chatId: task.chatId,

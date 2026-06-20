@@ -48,3 +48,32 @@ export function findAncestorSessionContext(dataDir: string, startPid: number = p
   }
   return null;
 }
+
+/**
+ * Resolve the owning session for an in-session subcommand (`botmux send`, etc.).
+ *
+ * Primary signal: the process-tree marker walk above — it carries the fresh
+ * per-turn turnId, so it's preferred whenever it resolves a session id.
+ *
+ * Fallback: `BOTMUX_SESSION_ID` from the environment. The marker walk depends on
+ * an unbroken ancestry between this process and the CLI's spawn pid. That link
+ * is severed whenever the subcommand runs in a detached/backgrounded process
+ * (`run_in_background`, `nohup`, `&`, `setsid` → reparented to init/pid 1),
+ * nested deeper than the 8-level walk, or under a separate pid-namespace — in all
+ * of which the marker walk returns null even though we ARE inside a botmux
+ * session. The worker injects `BOTMUX_SESSION_ID` into the CLI's env, and every
+ * descendant inherits it regardless of reparenting, so it stays correct. The
+ * session id never changes after spawn, so this fallback can't route to the wrong
+ * session; turnId is intentionally omitted (env can't be refreshed per-turn for a
+ * long-lived CLI — callers fall back to `BOTMUX_TURN_ID` when they need it).
+ */
+export function resolveSessionContext(
+  dataDir: string,
+  envSessionId: string | undefined,
+  startPid: number = process.ppid,
+): AncestorSessionContext | null {
+  const fromMarker = findAncestorSessionContext(dataDir, startPid);
+  if (fromMarker && fromMarker.sessionId) return fromMarker;
+  if (envSessionId) return { sessionId: envSessionId };
+  return fromMarker;
+}

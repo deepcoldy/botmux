@@ -37,7 +37,9 @@ import {
   buildEventSubDeepLink,
   buildRemainingSteps,
   BOTMUX_REQUIRED_SCOPES,
+  DOC_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
+import { DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 
 const scopeListMock = (sdk as any).__scopeListMock as ReturnType<typeof vi.fn>;
 const scopeApplyMock = (sdk as any).__scopeApplyMock as ReturnType<typeof vi.fn>;
@@ -288,5 +290,22 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
       missing,
       `BOTMUX_REQUIRED_SCOPES entries not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`,
     ).toEqual([]);
+  });
+
+  it('DOC_FEATURE_SCOPES are valid manifest scopes and match DOC_COMMENT_OAUTH_SCOPES (no drift)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const missing = DOC_FEATURE_SCOPES.filter(s => !declared.has(s.name));
+    expect(missing, `DOC_FEATURE_SCOPES not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`).toEqual([]);
+
+    // The startup-check list and the OAuth-request list must stay name-aligned.
+    expect(DOC_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([...DOC_COMMENT_OAUTH_SCOPES].sort());
+    // Doc-feature scopes are opt-in → must never be critical (would nag every bot).
+    expect(DOC_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
   });
 });

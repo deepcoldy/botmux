@@ -1,4 +1,5 @@
 import { config } from '../../config.js';
+import { t, type Locale } from '../../i18n/index.js';
 import type { WaitCreatedEvent } from '../../workflows/events/types.js';
 import type { Snapshot } from '../../workflows/events/replay.js';
 import { isPayloadRef } from '../../workflows/events/schema.js';
@@ -106,18 +107,19 @@ export function buildWorkflowApprovalCard(
   event: WaitCreatedEvent,
   snapshot: Snapshot,
   opts: WorkflowApprovalCardOptions = {},
+  locale?: Locale,
 ): string {
   const ctx = getWorkflowApprovalCardContext(event, snapshot, opts);
   const promptMaxChars = opts.promptMaxChars ?? DEFAULT_PROMPT_MAX_CHARS;
-  const prompt = truncatePrompt(ctx.prompt, promptMaxChars);
+  const prompt = truncatePrompt(ctx.prompt, promptMaxChars, locale);
   const revision = ctx.revisionId ? short(ctx.revisionId, 12) : 'unknown';
   const workflow = ctx.workflowId ? `${ctx.workflowId} @ ${revision}` : `unknown @ ${revision}`;
-  const deadline = ctx.deadlineAt ? new Date(ctx.deadlineAt).toLocaleString('zh-CN') : '无';
+  const deadline = ctx.deadlineAt ? new Date(ctx.deadlineAt).toLocaleString('zh-CN') : t('card.wf.none', undefined, locale);
 
   const resolution = opts.resolution;
   const title = resolution
-    ? `${resolutionTitlePrefix(resolution.kind)}：${titleText(ctx.nodeId)}`
-    : `需要审批：${titleText(ctx.nodeId)}`;
+    ? t('card.wf.title_resolved', { prefix: resolutionTitlePrefix(resolution.kind, locale), node: titleText(ctx.nodeId) }, locale)
+    : t('card.wf.title_pending', { node: titleText(ctx.nodeId) }, locale);
   const template = resolution ? resolutionTemplate(resolution.kind) : 'blue';
 
   const elements: Array<Record<string, unknown>> = [
@@ -136,8 +138,8 @@ export function buildWorkflowApprovalCard(
       text: {
         tag: 'lark_md',
         content: ctx.hasFullBehindRef
-          ? `**审批内容**（预览，完整内容见下方 Web 详情）\n${escapeMd(prompt)}`
-          : `**审批内容**\n${escapeMd(prompt)}`,
+          ? `**${t('card.wf.review_content', undefined, locale)}**${t('card.wf.review_preview_suffix', undefined, locale)}\n${escapeMd(prompt)}`
+          : `**${t('card.wf.review_content', undefined, locale)}**\n${escapeMd(prompt)}`,
       },
     },
   ];
@@ -146,7 +148,7 @@ export function buildWorkflowApprovalCard(
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: resolutionBanner(resolution) },
+      text: { tag: 'lark_md', content: resolutionBanner(resolution, locale) },
     });
   } else {
     elements.push({
@@ -156,7 +158,7 @@ export function buildWorkflowApprovalCard(
         {
           tag: 'input',
           name: WORKFLOW_COMMENT_FIELD,
-          placeholder: { tag: 'plain_text', content: '可选：填写审批意见' },
+          placeholder: { tag: 'plain_text', content: t('card.wf.comment_placeholder', undefined, locale) },
         },
         {
           tag: 'column_set',
@@ -171,7 +173,7 @@ export function buildWorkflowApprovalCard(
               elements: [
                 {
                   tag: 'button',
-                  text: { tag: 'plain_text', content: '✅ 通过' },
+                  text: { tag: 'plain_text', content: t('card.wf.btn_approve', undefined, locale) },
                   type: 'primary',
                   name: 'workflow_approve',
                   action_type: 'form_submit',
@@ -187,7 +189,7 @@ export function buildWorkflowApprovalCard(
               elements: [
                 {
                   tag: 'button',
-                  text: { tag: 'plain_text', content: '❌ 拒绝' },
+                  text: { tag: 'plain_text', content: t('card.wf.btn_reject', undefined, locale) },
                   type: 'danger',
                   name: 'workflow_reject',
                   action_type: 'form_submit',
@@ -199,7 +201,7 @@ export function buildWorkflowApprovalCard(
         },
         {
           tag: 'button',
-          text: { tag: 'plain_text', content: '取消 Run' },
+          text: { tag: 'plain_text', content: t('card.wf.btn_cancel_run', undefined, locale) },
           type: 'default',
           name: 'workflow_cancel',
           action_type: 'form_submit',
@@ -214,7 +216,7 @@ export function buildWorkflowApprovalCard(
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: t('card.wf.btn_web_detail', undefined, locale) },
         type: 'default',
         multi_url: {
           url: ctx.webDetailUrl,
@@ -236,11 +238,11 @@ export function buildWorkflowApprovalCard(
   });
 }
 
-function resolutionTitlePrefix(kind: WorkflowApprovalResolutionKind): string {
+function resolutionTitlePrefix(kind: WorkflowApprovalResolutionKind, locale?: Locale): string {
   switch (kind) {
-    case 'approved': return '已通过';
-    case 'rejected': return '已拒绝';
-    case 'cancelled': return '已取消';
+    case 'approved': return t('card.wf.resolved.approved', undefined, locale);
+    case 'rejected': return t('card.wf.resolved.rejected', undefined, locale);
+    case 'cancelled': return t('card.wf.resolved.cancelled', undefined, locale);
   }
 }
 
@@ -252,19 +254,19 @@ function resolutionTemplate(kind: WorkflowApprovalResolutionKind): string {
   }
 }
 
-function resolutionBanner(r: WorkflowApprovalCardResolution): string {
+function resolutionBanner(r: WorkflowApprovalCardResolution, locale?: Locale): string {
   const label =
     r.kind === 'approved'
-      ? '✅ 已通过'
+      ? t('card.wf.banner.approved', undefined, locale)
       : r.kind === 'rejected'
-        ? '❌ 已拒绝'
-        : '🛑 已取消';
+        ? t('card.wf.banner.rejected', undefined, locale)
+        : t('card.wf.banner.cancelled', undefined, locale);
   // Open_id contains underscores that are markdown-significant; wrapping in
   // backticks would force the escape backslashes to render literally in
   // some Lark clients (codex review nit). Plain text with escapeMd keeps
   // it portable — Lark renders escaped `_` as `_` outside code spans.
-  const lines = [`**${label}**`, `操作人：${escapeMd(short(r.by, 28))}`];
-  if (r.comment) lines.push(`备注：${escapeMd(r.comment)}`);
+  const lines = [`**${label}**`, t('common.operator', { by: escapeMd(short(r.by, 28)) }, locale)];
+  if (r.comment) lines.push(t('card.wf.comment_label', { comment: escapeMd(r.comment) }, locale));
   return lines.join('\n');
 }
 
@@ -281,9 +283,9 @@ function actionValue(ctx: WorkflowApprovalCardContext, action: string): Record<s
   };
 }
 
-function truncatePrompt(s: string, maxChars: number): string {
-  if (s.length <= maxChars) return s || '无';
-  return `${s.slice(0, maxChars)}\n\n…（已截断，完整内容请在 Web 查看）`;
+function truncatePrompt(s: string, maxChars: number, locale?: Locale): string {
+  if (s.length <= maxChars) return s || t('card.wf.none', undefined, locale);
+  return `${s.slice(0, maxChars)}\n\n${t('card.wf.truncated', undefined, locale)}`;
 }
 
 function escapeMd(s: string): string {

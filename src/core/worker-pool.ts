@@ -2,44 +2,54 @@
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
  */
-import { fork, execSync, type ChildProcess } from 'node:child_process';
+import { fork, execSync, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
+import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
-import { persistStreamCardState } from './session-manager.js';
-import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, MessageWithdrawnError } from '../im/lark/client.js';
+import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
+import { fallbackTurnId } from './reply-target.js';
+import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
-import { clearPendingResponsePatchMarker, markPendingResponsePatchMarkerPatched, writePendingResponsePatchMarker } from '../services/pending-response-transaction-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
+import { replyToDocComment, chunkCommentText, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession } from './persistent-backend.js';
 import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import { composeRowFromActive } from './dashboard-rows.js';
+import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
 import { publishAttentionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
+import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { BackendType } from '../adapters/backend/types.js';
+import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
+import { prepareSkillDelivery } from './skills/delivery.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
-import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
+import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
+import { prependBotmuxBin } from './botmux-wrapper.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+
+type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -194,11 +204,36 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
 
-function daemonCardFooterRecipientOpenId(ds: DaemonSession): string | undefined {
+/** CLIs whose model→Lark delivery is the daemon's stdout-runner fallback card
+ *  (NOT the model calling `botmux send`): mira (Web API runner) and mir (local
+ *  mircli runner). They can't @-trigger a peer bot themselves, so for bot-to-bot
+ *  handoffs the fallback card must carry the real <at> back to the dispatcher. */
+function isRunnerDeliveryCli(cliId?: string): boolean {
+  return cliId === 'mira' || cliId === 'mir';
+}
+
+function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
-  if (!owner) return undefined;
+  if (!owner) {
+    // Mira / Mir run through botmux's stdout-runner and cannot execute
+    // `botmux send` to @-trigger a peer bot. For bot-to-bot handoffs, address
+    // the daemon fallback card back to the original dispatcher so orchestration
+    // resumes (the card's real <at> is what re-wakes the dispatching bot).
+    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+      return ds.session.creatorOpenId;
+    }
+    return undefined;
+  }
   try {
-    return loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner) ? undefined : owner;
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner)) {
+      // `/repo`-primed dispatch records the dispatching bot as owner (unlike
+      // the @-mention auto-create path, which nulls ownerOpenId for bot
+      // senders). Same constraint for the stdout-runner CLIs (mira/mir): the
+      // daemon fallback card is their only @-trigger channel, so address the
+      // dispatcher bot here too.
+      return isRunnerDeliveryCli(effectiveCliId) ? owner : undefined;
+    }
+    return owner;
   } catch {
     return owner;
   }
@@ -552,12 +587,104 @@ export async function deliverWriteLinkCard(
   }
 }
 
+export interface WriteLinkOwnerDelivery {
+  ok: boolean;
+  error?: 'terminal_unavailable' | 'no_owner' | 'delivery_failed';
+  delivered: number;
+  total: number;
+  channels: Array<'ephemeral' | 'dm' | 'failed'>;
+}
+
+/**
+ * Build the write-enabled session card (writable terminal URL + manage buttons)
+ * for `ds`, or null when the terminal isn't up yet (no worker port/token).
+ * Shared by the owner-fanout ({@link deliverWriteLinkCardToOwners}, behind
+ * `botmux term-link`) and the single-operator delivery
+ * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
+ */
+function buildWritableTerminalCard(ds: DaemonSession): string | null {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port || !ds.workerToken) return null;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  return buildSessionCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds, { write: true }),
+    ds.session.title || getCliDisplayName(effectiveCliId),
+    effectiveCliId,
+    true,             // showManageButtons — write-link card includes restart & close
+    !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+    localeForBot(ds.larkAppId),
+  );
+}
+
+/**
+ * Build the write-enabled session card for `ds` and deliver it privately to the
+ * bot's owner(s) — the payload behind the `botmux term-link` CLI command.
+ *
+ * Mirrors the in-chat "🔑 获取操作链接" button flow ({@link deliverWriteLinkCard}),
+ * but fans out to the owner audience ({@link resolvePrivateCardAudience}) instead
+ * of a single click-operator: a CLI caller has no Lark identity, so "deliver to
+ * the owner(s)" is the closest equivalent of "deliver to the person who asked".
+ * Each owner gets an in-chat visible-to-you ephemeral card, auto-falling back to
+ * a private DM in topic / p2p chats. The write token therefore only ever rides
+ * these private channels — it is never returned to the CLI caller / stdout.
+ */
+export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<WriteLinkOwnerDelivery> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return { ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] };
+
+  const audience = resolvePrivateCardAudience(ds);
+  if (audience.length === 0) return { ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] };
+
+  const channels: Array<'ephemeral' | 'dm' | 'failed'> = [];
+  // Cap concurrency like postPrivateSnapshotCard (Feishu ephemeral ~50/s total).
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    channels.push(...await Promise.all(batch.map(openId => deliverWriteLinkCard(ds, openId, cardJson))));
+  }
+  const delivered = channels.filter(c => c !== 'failed').length;
+  return {
+    ok: delivered > 0,
+    error: delivered > 0 ? undefined : 'delivery_failed',
+    delivered,
+    total: audience.length,
+    channels,
+  };
+}
+
+/**
+ * Deliver the writable-terminal card privately to a single operator — the `/term`
+ * slash command's payload (the owner who typed it; owner-gated in command-handler).
+ * Same private ephemeral→DM channel as the "🔑 获取操作链接" card button. Returns
+ * 'not_ready' when the terminal isn't up yet, else the channel actually used.
+ */
+export async function deliverWritableTerminalCardTo(
+  ds: DaemonSession,
+  operatorOpenId: string,
+): Promise<'ephemeral' | 'dm' | 'failed' | 'not_ready'> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return 'not_ready';
+  return deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+}
+
 /**
  * Deliver a status confirmation (restart / session-closed / resume) as a
  * "visible-to-the-operator-only" ephemeral message in a plain group; on failure
  * (topic groups reject with 18053) or in p2p, fall back to the normal visible
  * reply (`reply`). `content` is the card JSON when msgType==='interactive',
  * otherwise the plain text. Topic-group / p2p behavior is unchanged.
+ *
+ * IMPORTANT: ephemeral is only attempted for flat **chat-scope** sessions. The
+ * ephemeral API (`ephemeral/v1/send`) takes a `chat_id` only — it has no
+ * thread/root anchoring — so for a **thread-scope** session (a 话题 inside a
+ * 普通群, or a 话题群 topic) an ephemeral card would escape the topic and land at
+ * the group top-level. 话题群 happened to reject ephemeral with 18053 and fall
+ * back to the in-thread reply, but a 话题 inside a 普通群 succeeds and leaks the
+ * card out of the thread. So thread-scope sessions always take the visible
+ * `reply()` path, which routes back into the thread (`reply_in_thread`).
  */
 export async function deliverEphemeralOrReply(
   ds: DaemonSession,
@@ -566,7 +693,7 @@ export async function deliverEphemeralOrReply(
   msgType: 'text' | 'interactive',
   reply: () => Promise<unknown>,
 ): Promise<void> {
-  if (operatorOpenId && ds.chatType !== 'p2p') {
+  if (operatorOpenId && ds.chatType !== 'p2p' && ds.scope === 'chat') {
     try {
       // The ephemeral API is card-only (msg_type=text → 10003), so wrap a plain
       // confirmation line into a minimal markdown card.
@@ -681,6 +808,12 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
     catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
+  // 命令式 hook 安装（CoCo 走 `coco plugin install`，纯写文件搞不定）。内部自带
+  // try/catch，失败只 warn；与 hookInstall 互斥。
+  if (adapter.ensureAskHook) {
+    try { adapter.ensureAskHook(); }
+    catch (err) { logger.warn(`[hook] ensureAskHook failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
   // botmux-ask 落在与其它 skill 同一目录：plugin 模式下是 {pluginDir}/skills。
   const askSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
   ensureAskSkill(cliId, askSkillsDir, !adapter.asksViaHook);
@@ -714,7 +847,9 @@ function removeJsonKey(configPath: string, pathSegments: string[], keyToRemove: 
     }
     if (!node || typeof node !== 'object' || !(keyToRemove in node)) return false;
     delete node[keyToRemove];
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：这里改的是外部 CLI 自己的热配置文件（如 ~/.claude.json），
+    // 裸写半截会弄坏 CLI 的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     return true;
   } catch {
     return false;
@@ -843,7 +978,9 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
     if (entry.hasTrustDialogAccepted === true) return; // already trusted — skip write
 
     entry.hasTrustDialogAccepted = true;
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：~/.claude.json 是 Claude Code 的热状态文件，所有并发 claude
+    // 实例都在读写，裸写半截会弄坏它们的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     logger.info(`[claude-trust] Pre-accepted folder trust for ${canonical}`);
   } catch (err) {
     logger.debug(`[claude-trust] seed failed (ignored): ${err}`);
@@ -854,7 +991,16 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
-  if (!ds.worker || ds.worker.killed) return;
+  if (!ds.worker || ds.worker.killed) {
+    // No live worker to receive {type:'close'}, so its destroySession() — which
+    // tears down the persistent backing session (tmux/herdr/zellij) — never
+    // fires. Those sessions survive a worker exit BY DESIGN (idle-suspend /
+    // lazy-restore keep the CLI alive for later resume), so /close on such a
+    // session would leave an orphaned CLI running in tmux that still replies.
+    // Destroy the backing session directly here so /close always terminates it.
+    destroyOrphanedBackingSession(ds);
+    return;
+  }
   try {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
@@ -865,8 +1011,26 @@ export function killWorker(ds: DaemonSession): void {
   ds.workerToken = null;
 }
 
-export function isSuspendableBackendType(backendType: BackendType | undefined): boolean {
-  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij';
+/**
+ * Tear down a persistent backing session (tmux/herdr/zellij) directly from the
+ * daemon when there is no live worker to do it via the 'close' IPC. The session
+ * name is deterministic from the session UUID, and each killSession() is a no-op
+ * if the session is already gone.
+ *
+ * Adopt sessions are skipped: botmux never owned the user's pane (ownsSession is
+ * false worker-side too), so killing it would violate the bridge invariant of
+ * leaving the user's own CLI untouched.
+ */
+function destroyOrphanedBackingSession(ds: DaemonSession): void {
+  if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
+  const backendType = getSessionPersistentBackendType(ds);
+  if (!backendType) return;
+  try {
+    killPersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId));
+    logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
+  }
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
@@ -885,6 +1049,16 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.workerPort = null;
   ds.workerToken = null;
   ds.session.webPort = undefined;
+  // The worker's suspend handler destroys the backing session + CLI (frees
+  // memory), so there is no live CLI to reattach to: the next turn MUST
+  // cold-resume from the on-disk transcript. forkWorker(resume=true) builds the
+  // CLI's `--resume <cliSessionId>` args, so mark this session as having history
+  // (the normal `claude_exit` path that sets this never fires on suspend —
+  // process.exit(0) races it). Also persist `suspendedColdResume` so a daemon
+  // restart treats a 'missing' backing session as a deliberate lazy-resume
+  // rather than a zombie to close. See sweepIdleWorkers + restoreActiveSessions.
+  ds.hasHistory = true;
+  ds.session.suspendedColdResume = true;
   sessionStore.updateSessionPid(ds.session.sessionId, null);
   sessionStore.updateSession(ds.session);
 
@@ -895,7 +1069,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
       body: { sessionId: ds.session.sessionId, reason },
     });
   }
-  logger.info(`[${tag(ds)}] Worker suspended (${reason}); session remains active`);
+  logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
   return true;
 }
 
@@ -934,8 +1108,27 @@ export async function closeSession(
 ): Promise<{ ok: true; alreadyClosed: boolean }> {
   const ds = findActiveBySessionId(sessionId);
   let killedLive = false;
+  // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
+  // 生命周期内永久占位（restartCounts 此前无任何 delete）。
+  restartCounts.delete(sessionId);
   if (ds) {
+    // Usage ledger: flush the final delta before the worker goes away (a
+    // crash/limited turn may never have reached an idle edge).
+    recordUsageForDaemonSession(ds);
     killWorker(ds);
+    // 文档订阅清理：会话关闭即退订其绑定的所有文档（飞书侧退订 + 删注册表），
+    // 否则该文档之后的评论会变成「命中订阅但无活跃会话」而被丢弃。
+    try {
+      const anchor = sessionAnchorId(ds);
+      const subs = listDocSubscriptionsForSession(config.session.dataDir, ds.larkAppId, anchor);
+      for (const sub of subs) {
+        await unsubscribeDocFile(ds.larkAppId, { fileToken: sub.fileToken, fileType: sub.fileType });
+        removeDocSubscription(config.session.dataDir, ds.larkAppId, sub.fileToken);
+      }
+      if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → unsubscribed ${subs.length} doc(s)`);
+    } catch (err: any) {
+      logger.warn(`[doc-comment] cleanup on close failed for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
+    }
     activeSessionsRegistry?.delete(sessionKey(sessionAnchorId(ds), ds.larkAppId));
     killedLive = true;
     if (!ds.exitEventEmitted) {
@@ -961,6 +1154,7 @@ export async function closeSession(
         patch: {
           status: 'closed',
           closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
+          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
         },
       },
     });
@@ -1046,15 +1240,30 @@ export async function transferSession(
   targetChatId: string,
   targetRootMessageId: string,
   /**
-   * Target chat type — narrowed to `'group'` at the type level. The picker-
-   * mode entry guard in command-handler.ts refuses p2p and topic chats
-   * upfront; `/relay --create` builds the target by createGroupWithBots so
-   * it's a regular group by construction; the cross-daemon migrate-to-chat
-   * IPC inherits the same target. Every call site can vouch — TS prevents
-   * any non-'group' literal from reaching here, and the runtime check just
-   * below catches mock data / future bypasses.
+   * Target chat type.
+   *   'group' → topic groups are supported via `targetScope: 'thread'`;
+   *             `/relay --create` builds the target by createGroupWithBots so
+   *             it's a regular group by construction; the cross-daemon
+   *             migrate-to-chat IPC inherits the same target.
+   *   'p2p'   → the bot's DM. Flat DMs (p2pMode 'chat') land chat-scope on the
+   *             chatId anchor; thread-mode DMs land thread-scope on a DM 话题
+   *             root. The session's chatType flips with the move so post-relay
+   *             inbound routing / picker labels / reply targeting treat it as
+   *             a DM. Carried from the picker card's `target_chat_type`.
+   * The runtime check just below catches raw-string casting at module
+   * boundaries (mocks, HTTP body parses, future bypasses).
    */
-  targetChatType: 'group',
+  targetChatType: 'group' | 'p2p',
+  /**
+   * Target routing scope for the relayed session.
+   *   'chat'   → anchor = chatId (flat top-level; `/relay --create`, migrate
+   *              IPC, and普通群 flat-mode picker all use this — current behavior).
+   *   'thread' → anchor = `targetRootMessageId` (a Lark 话题/thread); replies
+   *              go reply_in_thread. Picker computes this via
+   *              resolveRelayTargetRouting for 话题群 / new-topic / shared /
+   *              线程内回复.
+   */
+  targetScope: 'thread' | 'chat',
   opts?: {
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
@@ -1066,12 +1275,19 @@ export async function transferSession(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   // Depth defense — unreachable per TS narrowing above, but guards against
   // raw-string casting at module boundaries (mocks, HTTP body parses, etc.).
-  if ((targetChatType as string) !== 'group') {
+  if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
-  if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
+  // Anchor-based identity. A thread-scope session in the SAME chat (different
+  // root) is a legitimate cross-topic move, so we refuse only when the target
+  // anchor equals the source anchor (relaying a session onto itself). Replaces
+  // the old `targetChatId === ds.chatId → same_chat` check, which would have
+  // blocked同群话题间搬运.
+  const sourceAnchor = sessionAnchorId(ds);
+  const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
+  if (targetAnchor === sourceAnchor) return { ok: false, error: 'same_anchor' };
 
   // pendingRepo: the user created a session via M0 but hasn't picked a repo
   // yet, so worker is null and the CLI has never run. Relaying produces an
@@ -1105,8 +1321,8 @@ export async function transferSession(
     return { ok: false, error: 'worker_busy' };
   }
 
-  // Existing-session guard: a chat-scope session at the target chatId would
-  // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
+  // Existing-session guard: a session sharing the *target anchor* would
+  // collide on sessionKey(targetAnchor, larkAppId) after the rewrite, and
   // Map.set would silently orphan the prior entry's worker. We split the
   // collision predicate two ways:
   //   - real session (worker !== null): refuse the transfer
@@ -1117,15 +1333,15 @@ export async function transferSession(
   //     transfer Map.set doesn't silently overwrite it (which leaves the
   //     scratch as a ghost-active on next daemon restart — exact bug we're
   //     fixing).
-  // We only check chat-scope entries — thread-scope sessions in the same
-  // chat are keyed by rootMessageId, so they don't collide.
+  // Anchor-based: chat-scope anchors on chatId, thread-scope on rootMessageId.
+  // Only a session at the target anchor collides — same-chat other-topic
+  // sessions have a different anchor and are fine (enables同群话题间搬运).
   const scratchesToClose: string[] = [];
   if (activeSessionsRegistry) {
     for (const existing of activeSessionsRegistry.values()) {
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
-      if (existing.chatId !== targetChatId) continue;
-      if (existing.scope !== 'chat') continue;
+      if (sessionAnchorId(existing) !== targetAnchor) continue;
       if (!existing.worker) {
         scratchesToClose.push(existing.session.sessionId);
         continue;
@@ -1174,12 +1390,16 @@ export async function transferSession(
   kw(ds);
   activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
 
-  // Rewrite routing fields. Target chat is always chat-scope: leader posts a
-  // notification message (M1) used as `targetRootMessageId` for trace, but
-  // chat-scope routes by chatId anyway, so M1 is purely audit/UX.
+  // Rewrite routing fields per the requested target scope.
+  //   chat-scope:   routes by chatId; `targetRootMessageId` (e.g. an M1 id) is
+  //                 stored on rootMessageId but is purely audit/UX.
+  //   thread-scope: routes by rootMessageId; `targetRootMessageId` IS the
+  //                 routing anchor (the Lark 话题 root) — replies reply_in_thread
+  //                 to it, and future inbound messages in that 话题 resolve to
+  //                 the same anchor.
   ds.session.chatId = targetChatId;
   ds.session.rootMessageId = targetRootMessageId;
-  ds.session.scope = 'chat';
+  ds.session.scope = targetScope;
   ds.session.chatType = targetChatType;
   ds.session.lastMessageAt = new Date().toISOString();
   // Card state was pinned to the source chat — clear so the new worker posts
@@ -1192,7 +1412,7 @@ export async function transferSession(
   // Mirror onto runtime DaemonSession.
   ds.chatId = targetChatId;
   ds.chatType = targetChatType;
-  ds.scope = 'chat';
+  ds.scope = targetScope;
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.currentImageKey = undefined;
@@ -1211,7 +1431,7 @@ export async function transferSession(
       patch: {
         chatId: targetChatId,
         rootMessageId: targetRootMessageId,
-        scope: 'chat',
+        scope: targetScope,
         chatType: targetChatType,
       },
     },
@@ -1244,6 +1464,33 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
   if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
 
+  // Materialise the resolved launch dir on the live session. getSessionWorkingDir()
+  // falls back to the bot-default workingDir, but the usage ledger and dashboard read
+  // `ds.workingDir ?? s.workingDir` RAW (without that fallback). A session that inherits
+  // the bot-default workingDir — i.e. one never pinned via /repo or /cd — therefore leaves
+  // ds.workingDir undefined, so getSessionTokenUsage() is handed cwd=undefined, cannot
+  // locate the CLI transcript, and the session's token usage silently never records.
+  // Pinning the resolved cwd here (it equals what the worker actually forked into) closes
+  // that gap without touching the persisted session.workingDir "unset = follow default"
+  // semantics: this is re-derived on every fork/restore.
+  ds.workingDir = cwd;
+
+  // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
+  // restore — so toggling the live bot flag never retroactively (un)sandboxes a
+  // historical session. A brand-new session (resume=false) with no recorded
+  // decision adopts the live bot flag; a restore (resume=true) with no recorded
+  // decision predates the sandbox feature → stays NOT sandboxed.
+  if (ds.session.sandbox === undefined) {
+    if (!resume) {
+      ds.session.sandbox = botCfg.sandbox === true;
+      ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
+    } else {
+      ds.session.sandbox = false;
+      ds.session.sandboxHidePaths = [];
+    }
+    sessionStore.updateSession(ds.session);
+  }
+
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
     logger.warn(`[${t}] Worker already running (pid: ${ds.worker.pid}), killing before re-fork`);
@@ -1252,6 +1499,14 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     ds.worker = null;
     ds.workerPort = null;
     ds.workerToken = null;
+  }
+
+  // Re-establishing a worker ends the cold-resume-suspended state: clear the
+  // persisted marker so a future restart no longer treats this session's
+  // backing as a deliberate-missing (a genuine later zombie must still close).
+  if (ds.session.suspendedColdResume) {
+    ds.session.suspendedColdResume = undefined;
+    sessionStore.updateSession(ds.session);
   }
 
   ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);
@@ -1263,12 +1518,40 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const familyAdapter = createCliAdapterSync(botCfg.cliId, botCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
+  let skillPluginDir: string | undefined;
+  let skillReadonlyRoots: string[] | undefined;
+  if (!resume && prompt.trim().length > 0) {
+    const preparedSkills = prepareSessionSkillPrompt({
+      sessionId: ds.session.sessionId,
+      cliId: botCfg.cliId,
+      workingDir: cwd,
+      prompt,
+      botPolicy: botCfg.skills,
+    });
+    prompt = preparedSkills.prompt;
+    const delivery = prepareSkillDelivery(familyAdapter, preparedSkills.manifest, preparedSkills.manifest?.delivery ?? 'auto');
+    skillPluginDir = delivery.pluginDir;
+    skillReadonlyRoots = delivery.readonlyRoots.length ? delivery.readonlyRoots : undefined;
+    for (const diagnostic of delivery.diagnostics) logger.warn(`[${t}] skill delivery: ${diagnostic}`);
+    if (delivery.fatal) {
+      const reason = delivery.diagnostics.join(', ') || 'unknown';
+      const message = tr('worker.skill_delivery_failed', { reason }, botLocale(botCfg));
+      logger.warn(`[${t}] Skill delivery blocked session start: ${reason}`);
+      void cb.sessionReply(sessionAnchorId(ds), message, undefined, ds.larkAppId, fallbackTurnId(ds, undefined))
+        .catch((err) => logger.warn(`[${t}] Failed to notify skill delivery error: ${err?.message ?? err}`));
+      void closeSession(ds.session.sessionId)
+        .catch((err) => logger.warn(`[${t}] Failed to close skill delivery error session: ${err?.message ?? err}`));
+      return;
+    }
+  }
+
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.
   const botmuxBinDir = join(homedir(), '.botmux', 'bin');
-  const pathWithBotmux = `${botmuxBinDir}:${process.env.PATH ?? ''}`;
+  const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
   const worker = fork(workerPath, [], {
+    windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
     env: {
@@ -1277,10 +1560,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       CLAUDECODE: undefined,
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
       SESSION_DATA_DIR: config.session.dataDir,
+      BOTMUX_SESSION_ID: ds.session.sessionId,
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
-  });
+  } as WindowsForkOptions);
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
   // the unhandled event crashes the daemon. Log and move on.
@@ -1315,8 +1599,17 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     workingDir: cwd,
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
+    wrapperCli: botCfg.wrapperCli,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    // Startup commands run on every fresh spawn (incl. resume) so session-only
+    // settings like `/effort ultracode` are re-established. Adopt sessions are
+    // observed, not driven — forkAdoptWorker intentionally omits this.
+    startupCommands: botCfg.startupCommands,
+    // Use the decision recorded on the session (above), NOT the live bot flag, so
+    // historical sessions never get retroactively sandboxed on restart.
+    sandbox: ds.session.sandbox === true,
+    sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
@@ -1330,6 +1623,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: ds.currentReplyTarget?.turnId,
+    skillPluginDir,
+    skillReadonlyRoots,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -1364,6 +1659,13 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     reason: resume ? 'resume' : 'worker_spawn',
     pid: worker.pid ?? null,
   });
+  // Usage ledger: fresh spawns anchor the baseline so pre-existing transcript
+  // history is never billed. Restores reconcile instead — an in-flight turn
+  // may have completed inside tmux while the daemon was down, and that work
+  // was submitted by botmux (anchoring would swallow it).
+  if (resume) reconcileUsageForDaemonSession(ds);
+  else anchorUsageForDaemonSession(ds);
+  recordOwnershipForDaemonSession(ds);
 }
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
@@ -1371,8 +1673,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  // Worker messages without a turn of their own (first streaming card, crash
+  // notices) anchor to the session's current reply-target turn so a shared
+  // fold-back topic keeps them in-thread instead of leaking top-level.
   const scopedReply = (content: string, msgType?: string, turnId?: string) =>
-    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, turnId);
+    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
@@ -1574,12 +1879,34 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
+          const rawInput = ds.pendingRawInput;
+          ds.pendingRawInput = undefined;
+          // Input buffered while the repo card was pending rides on the SAME
+          // IPC: worker message handlers run concurrently (async handlers
+          // don't serialize), so a separate `message` IPC could write into
+          // the PTY during raw_input's 200ms text→Enter beat. The worker
+          // enqueues followUpContent only after the Enter landed.
+          const followUp = ds.pendingFollowUpInput;
+          ds.pendingFollowUpInput = undefined;
+          ds.worker.send({
+            type: 'raw_input',
+            content: rawInput,
+            followUpContent: followUp?.cliInput,
+          } as DaemonToWorker);
+          logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
+          if (followUp) rememberLastCliInput(ds, followUp.userPrompt, followUp.cliInput);
+        }
         break;
       }
 
       case 'cli_session_id': {
         ds.session.cliSessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);
+        // Usage ledger: publish ownership the moment the CLI-native session id
+        // is known, so consumers exclude this session from native parsers
+        // before its first positive-delta record exists.
+        recordOwnershipForDaemonSession(ds);
         break;
       }
 
@@ -1603,6 +1930,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               patch: {
                 status: ds.lastScreenStatus,
                 lastMessageAt: ds.lastMessageAt,
+                tokenUsage: composeRowFromActive(ds).tokenUsage,
               },
             },
           });
@@ -1610,6 +1938,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             source: 'screen_update',
             content: msg.content,
           });
+          // Usage ledger + turn reactions: idle/limited edges are turn
+          // boundaries. Append the token delta, and flip this turn's pending ✋
+          // reactions to ✅ (best-effort, never blocks the status pipeline).
+          if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
+            recordUsageForDaemonSession(ds);
+            void finishTurnReactions(ds);
+          }
         }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
@@ -1939,14 +2274,15 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           break;
         }
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
-        const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
-          title: '📜 /adopt 前最后一轮',
+          title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
           assistantText: msg.assistantText,
           assistantLabel: getCliDisplayName(effectiveCliId),
           recipientOpenId,
           brand: resolveBrandLabel(ds.larkAppId),
+          locale: localeForBot(ds.larkAppId),
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -1988,6 +2324,38 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 
+/**
+ * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
+ * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
+ * acceptance point (`noteTurnReceived`); when the worker next returns to idle we
+ * flip every pending ✋ on this session to ✅ DONE and clear the list. Binding the
+ * start to the message (not a status edge) means type-ahead / busy-batched
+ * messages each get their own reaction and all settle together here.
+ *
+ * Every Feishu call is best-effort — a failure only means a missing emoji, so it
+ * must never throw into the status pipeline (callers invoke as `void`).
+ */
+async function finishTurnReactions(ds: DaemonSession): Promise<void> {
+  const list = ds.pendingAckReactions;
+  if (!list || list.length === 0) return;
+  // Detach the batch first so a second idle edge can't double-flip it.
+  ds.pendingAckReactions = [];
+  for (const ack of list) {
+    if (ack.reactionId) {
+      try {
+        await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
+      } catch (err: any) {
+        logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
+      }
+    }
+    try {
+      await addReaction(ds.larkAppId, ack.messageId, DONE_REACTION_EMOJI_TYPE);
+    } catch (err: any) {
+      logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
+    }
+  }
+}
+
 /** Deliver a bridge `final_output` to Lark. The worker emits each turn
  *  exactly once (it pops the turn off its queue at emit time), so the
  *  daemon owns retries on transient failures. After 3 attempts we log
@@ -1998,16 +2366,12 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
-  lockedPendingCardId?: string,
-  lockedQuoteTargetId?: string,
 ): void {
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const scopedReply = (content: string, msgType?: string, turnId?: string) =>
-    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, turnId);
+    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
   setTimeout(async () => {
-    let pendingCardId: string | undefined;
-    let pendingQuoteTargetId: string | undefined;
     // Guard: if the user closed the session (or it was torn down for any
     // other reason) between attempts, don't post a stale final answer to
     // a closed thread.
@@ -2016,6 +2380,22 @@ function deliverFinalOutput(
       return;
     }
     try {
+      // 文档评论入口分流：本轮若来自飞书文档评论（/subscribe-lark-doc），把正文
+      // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
+      const docTurn = ds.docCommentTurns?.get(msg.turnId);
+      if (docTurn) {
+        // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
+        // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
+        const chunks = chunkCommentText(msg.content);
+        for (let i = 0; i < chunks.length; i++) {
+          await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
+        }
+        ds.docCommentTurns?.delete(msg.turnId);
+        ds.lastBridgeEmittedUuid = msg.lastUuid;
+        logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        return;
+      }
+
       // Wrap the model's reply in the same card chrome `botmux send` uses
       // (schema 2.0 + footer with botmux link + 发送给 owner) so a turn
       // delivered via this fallback path looks identical in the Lark thread
@@ -2027,51 +2407,25 @@ function deliverFinalOutput(
       // they use the contextual card so the user prompt sits in a
       // blockquote and only the assistant body goes through full markdown
       // rendering.
-      const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+      const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
-              ? '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）'
-              : '🖥️ 终端本地对话（在 adopted pane 中直接输入，已同步至飞书）',
+              ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
+              : tr('card.local_turn', undefined, localeForBot(ds.larkAppId)),
             userText: msg.kind === 'local-turn' ? msg.userText ?? '' : undefined,
             assistantText: msg.content,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
             brand: resolveBrandLabel(ds.larkAppId),
+            locale: localeForBot(ds.larkAppId),
           })
-        : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId));
+        : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId), localeForBot(ds.larkAppId));
 
-      pendingCardId = lockedPendingCardId ?? claimPendingResponseCard(ds.session);
-      pendingQuoteTargetId = lockedQuoteTargetId ?? ds.session.quoteTargetId;
-      if (pendingCardId) {
-        try {
-          if (ds.session.pendingResponseCardId !== pendingCardId) {
-            await scopedReply(cardJson, 'interactive', msg.turnId);
-          } else {
-            writePendingResponsePatchMarker(ds.session.sessionId, pendingCardId);
-            await updateMessage(ds.larkAppId, pendingCardId, cardJson);
-            markPendingResponsePatchMarkerPatched(ds.session.sessionId);
-            markPendingResponseCardPatchedIfCurrent(ds.session, pendingCardId);
-            syncPendingResponseState(ds, ds.session);
-            sessionStore.updateSession(ds.session);
-            clearPendingResponsePatchMarker(ds.session.sessionId);
-            if (pendingQuoteTargetId && ds.session.lastPatchedResponseCardId === pendingCardId) {
-              addReaction(ds.larkAppId, pendingQuoteTargetId, COMPLETED_REACTION_EMOJI_TYPE)
-                .catch((err: any) => logger.warn(`[${t}] failed to add completion reaction to ${pendingQuoteTargetId}: ${err?.message ?? err}`));
-            }
-          }
-        } catch (err: any) {
-          clearPendingResponsePatchMarker(ds.session.sessionId);
-          if (!(err instanceof MessageWithdrawnError)) throw err;
-          logger.warn(`[${t}] Pending response card withdrawn while forwarding final_output; sending a new reply`);
-          await scopedReply(cardJson, 'interactive', msg.turnId);
-          markPendingResponseCardPatchedIfCurrent(ds.session, pendingCardId);
-          syncPendingResponseState(ds, ds.session);
-          sessionStore.updateSession(ds.session);
-        }
-      } else {
-        await scopedReply(cardJson, 'interactive', msg.turnId);
-      }
+      // Always deliver the answer as a fresh message — never PATCH a card in
+      // place. message.patch is silent (no Feishu notification / unread), which
+      // used to swallow the answer; a brand-new message always pings.
+      await scopedReply(cardJson, 'interactive', msg.turnId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
@@ -2083,7 +2437,6 @@ function deliverFinalOutput(
         cb.closeSession(ds);
         return;
       }
-      if (pendingCardId) clearPendingResponsePatchMarker(ds.session.sessionId);
       const next = attempt + 1;
       if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
         logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
@@ -2092,7 +2445,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, pendingCardId, pendingQuoteTargetId);
+      deliverFinalOutput(ds, msg, t, next);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -2102,6 +2455,7 @@ function deliverFinalOutput(
  *  fork. Intentionally underscored to discourage non-test callers. */
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
+export const __testOnly_finishTurnReactions = finishTurnReactions;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
@@ -2133,6 +2487,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
   const worker = fork(workerPath, [], {
+    windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd: adoptCwd,
     env: {
@@ -2142,7 +2497,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
-  });
+  } as WindowsForkOptions);
 
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.
   worker.on('error', (err) => {
@@ -2169,6 +2524,8 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //   - codex: worker resolves the rollout path either from cliSessionId
   //     (passed below when known) or by reading the Codex pid's open fds
   //     in /proc — so we always pass the pid for codex adopt.
+  //   - traex: same rollout strategy as codex (byte-identical JSONL format),
+  //     only the directory layout (~/.trae/cli/sessions) and finders differ.
   //   - coco: events.jsonl path is `~/.cache/coco/sessions/<sid>/events.jsonl`,
   //     deterministic from cliSessionId. PID is the fallback when discovery
   //     missed (events.jsonl isn't held open continuously, so worker may need
@@ -2200,7 +2557,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   // open store.db fd (chatId), or from cliSessionId (= chatId) when discovery
   // captured it — so adopt must forward the pid + cwd like the other
   // transcript-backed CLIs.
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
+  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'traex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   const initMsg: DaemonToWorker = {
@@ -2293,6 +2650,109 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     pid: worker.pid ?? null,
     adoptedFrom: adopted.tmuxTarget,
   });
+  // Adopted CLIs come with pre-botmux history — anchor it out of the ledger.
+  anchorUsageForDaemonSession(ds);
+  recordOwnershipForDaemonSession(ds);
+}
+
+// ─── Reap orphan workers ────────────────────────────────────────────────────
+
+/** A live process, reduced to what orphan detection needs. */
+export interface ProcSnapshot {
+  pid: number;
+  ppid: number;
+  /** Full command line (argv joined by spaces). */
+  cmd: string;
+}
+
+/**
+ * Enumerate live processes as {pid, ppid, cmd}. Linux reads `/proc` directly
+ * (the rest of the worker code already relies on /proc); other POSIX shells out
+ * to `ps`. Returns `[]` on Windows or on any failure — callers then reap
+ * nothing, so "can't tell" can never escalate into a wrong kill.
+ */
+export function listProcesses(): ProcSnapshot[] {
+  if (process.platform === 'win32') return [];
+  try {
+    if (process.platform === 'linux') {
+      const procs: ProcSnapshot[] = [];
+      for (const entry of readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) continue;
+        const pid = Number(entry);
+        try {
+          // /proc/<pid>/stat = "<pid> (comm) <state> <ppid> ...". `comm` can
+          // contain spaces and ')', so read ppid from after the LAST ')'.
+          const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+          const after = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+          const ppid = Number(after[1]); // after = [state, ppid, ...]
+          const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ').trim();
+          if (Number.isFinite(ppid)) procs.push({ pid, ppid, cmd });
+        } catch { /* exited mid-scan / unreadable — skip */ }
+      }
+      return procs;
+    }
+    // macOS / other POSIX. `-ww` defeats command-column truncation.
+    const raw = execSync('ps -axww -o pid=,ppid=,command=', { encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024 });
+    const procs: ProcSnapshot[] = [];
+    for (const line of raw.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] });
+    }
+    return procs;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Reap worker processes orphaned by a previous daemon that died WITHOUT running
+ * its graceful shutdown — SIGKILL, OOM, or an uncaught crash. The shutdown()
+ * path in daemon.ts already SIGKILLs stragglers on SIGTERM, but a hard kill
+ * skips it entirely: the workers get re-parented to init (ppid==1), and because
+ * a fresh worker's pid overwrites `session.pid`, killStalePids can never reach
+ * them again. Each leaks ~0.5 GB and they pile up across restarts (observed:
+ * 22 orphans / 3.3 GB on a dev box; daemon.ts records a prior 841-orphan /
+ * ~65 GB incident).
+ *
+ * Identification is deliberately conservative — a process is reaped only if it
+ * BOTH:
+ *   1. has ppid==1 — its forking daemon is gone. A live daemon's workers are
+ *      parented to that daemon, so this never touches a running worker, even
+ *      under the one-daemon-per-bot layout or when several daemons start at
+ *      once; and
+ *   2. references THIS install's worker script in its command line — so we
+ *      never touch another botmux install or an unrelated `worker.js`.
+ *
+ * Process listing and the kill syscall are injectable for tests. Returns the
+ * number of orphans actually reaped.
+ */
+export function reapOrphanWorkers(opts: {
+  procs?: ProcSnapshot[];
+  kill?: (pid: number, signal: NodeJS.Signals) => void;
+  workerPath?: string;
+} = {}): number {
+  if (process.platform === 'win32') return 0;
+  const procs = opts.procs ?? listProcesses();
+  const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
+  const workerPath = opts.workerPath ?? join(__dirname, '..', 'worker.js');
+
+  let reaped = 0;
+  for (const p of procs) {
+    if (p.ppid !== 1) continue;                 // parent still alive → not an orphan
+    if (!p.cmd.includes(workerPath)) continue;  // not OUR worker script
+    try {
+      // SIGKILL, not SIGTERM: an orphan can be wedged in a sync code path (the
+      // very failure mode that produced it) where SIGTERM is lost. It holds no
+      // active session and no IPC channel, so there is nothing to flush.
+      kill(p.pid, 'SIGKILL');
+      reaped++;
+      logger.info(`Reaped orphan worker pid=${p.pid} (forking daemon gone)`);
+    } catch { /* already exited, or another daemon won the race — fine */ }
+  }
+  if (reaped > 0) {
+    logger.warn(`Reaped ${reaped} orphan worker(s) leaked by a previous daemon that didn't shut down cleanly.`);
+  }
+  return reaped;
 }
 
 // ─── Kill stale PIDs ────────────────────────────────────────────────────────
@@ -2364,7 +2824,7 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
 
   try {
     mkdirSync(config.session.dataDir, { recursive: true });
-    writeFileSync(cliIdFile, currentCliId);
+    atomicWriteFileSync(cliIdFile, currentCliId);
   } catch (err) {
     logger.warn(`Failed to write ${cliIdFile}: ${err}`);
   }

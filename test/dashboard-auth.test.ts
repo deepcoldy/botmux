@@ -202,6 +202,28 @@ describe('decideDashboardAuth — public surface', () => {
     });
     expect(d.kind).toBe('allow');
   });
+
+  it('GET /game/index.html — HD2D office shell allow without any token', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname: '/game/index.html',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('POST /api/game/download without token → deny401 (gated: triggers a ~74MB fetch)', () => {
+    const d = decideDashboardAuth({
+      method: 'POST',
+      pathname: '/api/game/download',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('deny401');
+  });
 });
 
 describe('decideDashboardAuth — protected surface', () => {
@@ -425,7 +447,11 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       // (role/persona content, per-bot oncall config, CLI option metadata).
       '/api/roles/cli_app/oc_chat',
       '/api/bots',
+      '/api/skills',
       '/api/cli-options',
+      // Mints a token-bearing writable terminal URL — never public, even in
+      // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).
+      '/api/sessions/sess-1/write-link',
       // A path that doesn't exist yet must also default to private.
       '/api/some-future-read',
     ]) {

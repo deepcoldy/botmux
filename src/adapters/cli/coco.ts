@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
+import { delay, scaleMs } from '../../utils/timing.js';
+import { installCocoAskPlugin } from '../coco-ask-plugin.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 /** Global submit log — CoCo appends one JSON line here on every successful
@@ -12,10 +14,6 @@ import type { CliAdapter, PtyHandle } from './types.js';
  *  marker → retry Enter if missing → return {submitted:false, recheck}
  *  on final failure so worker can surface a Lark warning. */
 const HISTORY_PATH = join(cocoCacheRoot(), 'history.jsonl');
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
@@ -96,7 +94,7 @@ function historyDeltaContains(path: string, fromByte: number, prefix: string): b
 async function waitForHistoryAppend(
   path: string, fromByte: number, prefix: string, timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     if (historyDeltaContains(path, fromByte, prefix)) return true;
     await delay(100);
@@ -121,6 +119,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
+    authPaths: ['~/.trae/cli/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass }) {
@@ -276,6 +275,13 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // dequeue-deferral — see codex.ts and CodexBridgeQueue's HOL-block-drop.
     supportsTypeAhead: true,
     altScreen: false,
+    // AskUserQuestion 接管：装一个 CoCo 插件（hooks.json: PreToolUse/AskUserQuestion）
+    // 把事件转发到 `botmux hook coco`，弹成飞书选择卡。CoCo 的 hook 不能用 directive
+    // 代答，答案由 daemon 在结算后按键驱动原生 picker 回灌（见 coco-picker-keys.ts +
+    // daemon /api/asks coco 分支 + worker driveCocoPicker）。asksViaHook 置 true 以
+    // 关掉 botmux-ask skill 兜底，避免 skill 与 hook 双重弹卡。
+    asksViaHook: true,
+    ensureAskHook() { installCocoAskPlugin(this.resolvedBin); },
     // CoCo/Trae CLI reads the same skill root as the Trae-flavoured adapter.
     skillsDir: '~/.trae/skills',
     modelChoices: [

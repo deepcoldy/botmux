@@ -41,4 +41,25 @@ describe('resolveAllowedUsersWithMap — on_ union_id entries (PR#72 lockout fix
 
     expect(resolved).toEqual(['ou_plain', 'ou_from_union']);
   });
+
+  // Regression for PR #240: resolution must keep `allowedUsers` config order so
+  // `owner = first ou_` follows the configured ranking. The pre-fix logic bucketed
+  // literal `ou_` ahead of resolved on_/email entries, so an `on_` owner listed
+  // FIRST got displaced by any later literal `ou_` group member. The previous test
+  // happens to put `ou_` first, so it never exercises the reorder — this one does.
+  it('keeps config order when on_ owner precedes literal ou_ members (no displacement)', async () => {
+    stubClient(async ({ path }: any) =>
+      ({ code: 0, data: { user: { open_id: 'ou_owner', union_id: path.user_id, name: 'Owner' } } }));
+
+    // Real-world shape: creator written as on_ (first), then group members appended
+    // as literal ou_, with the creator also re-appearing as a literal ou_ duplicate.
+    const { resolved } = await resolveAllowedUsersWithMap(
+      APP, ['on_owner', 'ou_memberA', 'ou_memberB', 'ou_owner'],
+    );
+
+    // Owner stays first (was displaced to position 3 under the old bucketing),
+    // and the duplicate ou_owner is deduped to its first occurrence.
+    expect(resolved).toEqual(['ou_owner', 'ou_memberA', 'ou_memberB']);
+    expect(resolved[0]).toBe('ou_owner');
+  });
 });

@@ -158,8 +158,28 @@ The `CliAdapter` interface requires:
 
 ## Tests
 
+Tests are split into two Vitest projects with different execution profiles
+(see `vitest.config.ts`):
+
+- **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
+  Runs with **file parallelism on** (one process per file). This is what
+  `pnpm test` runs, so the default is fast (~10s) and needs no real CLI binary
+  or browser.
+- **`e2e`** (`*.e2e.ts`) — spawns real CLIs / drives the Feishu web UI through a
+  shared daemon, so files run **sequentially**. Opt-in only.
+
 ```bash
-pnpm test                # Run all tests (unit + E2E)
+pnpm test                # Unit tests only — parallel, ~10s (default)
+pnpm test:all            # Unit + E2E (needs real CLIs / browser session)
+pnpm test:e2e            # All *.e2e.ts (sequential)
 pnpm test:codex          # Codex input E2E
 pnpm test:gemini         # Gemini CLI input E2E
+pnpm test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
+pnpm test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
+
+> **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a
+> submit (poll the CLI history/transcript). `BOTMUX_TIME_SCALE` (read by
+> `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every
+> such delay. Filesystem-mocked unit tests set it small to collapse those waits.
+> See [`docs/test-benchmark.md`](docs/test-benchmark.md).

@@ -1,8 +1,13 @@
-import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, ASK_SKILL, ASK_SKILL_NAME } from './definitions.js';
+
+// This module only manages botmux-owned bridge/ask skills. User-defined skills
+// live in src/core/skills/* and services/skill-registry-store.ts so their
+// lifecycle stays independent of any specific CLI's global skill directory.
 
 function expandHome(p: string): string {
   return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
@@ -34,7 +39,7 @@ export function ensurePluginSkills(cliId: string, pluginDir: string | undefined)
   try {
     mkdirSync(manifestDir, { recursive: true });
     if (!(existsSync(manifestFile) && readFileSync(manifestFile, 'utf-8') === PLUGIN_MANIFEST)) {
-      writeFileSync(manifestFile, PLUGIN_MANIFEST, 'utf-8');
+      atomicWriteFileSync(manifestFile, PLUGIN_MANIFEST);
       logger.info(`[skills] Wrote plugin manifest for ${cliId} → ${manifestFile}`);
     }
   } catch (err: any) {
@@ -95,7 +100,7 @@ export function ensureAskSkill(cliId: string, skillsDir: string | undefined, ins
     if (install) {
       if (existsSync(skillFile) && readFileSync(skillFile, 'utf-8') === ASK_SKILL) return;
       mkdirSync(skillDir, { recursive: true });
-      writeFileSync(skillFile, ASK_SKILL, 'utf-8');
+      atomicWriteFileSync(skillFile, ASK_SKILL);
       logger.info(`[skills] Installed ${ASK_SKILL_NAME} (无 hook 接管，兜底) for ${cliId} → ${skillFile}`);
     } else {
       if (!existsSync(skillDir)) return;
@@ -130,7 +135,8 @@ export function ensureSkills(cliId: string, skillsDir: string | undefined): void
         if (current === skill.content) continue;
       }
       mkdirSync(skillDir, { recursive: true });
-      writeFileSync(skillFile, skill.content, 'utf-8');
+      // 原子写：多个 daemon 启动时并发刷同一份共享 skill 文件，CLI spawn 同时在读。
+      atomicWriteFileSync(skillFile, skill.content);
       logger.info(`[skills] Installed ${skill.name} for ${cliId} → ${skillFile}`);
     } catch (err: any) {
       logger.warn(`[skills] Failed to install ${skill.name} for ${cliId}: ${err.message}`);

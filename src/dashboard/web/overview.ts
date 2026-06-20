@@ -3,8 +3,10 @@
 import { store } from './store.js';
 import {
   attentionReason,
+  attentionWaitSince,
   botAvatarHtml,
   botDisplayName,
+  botNameForAppId,
   chatDisplayTitle,
   escapeHtml,
   loadNameMaps,
@@ -79,12 +81,44 @@ function buildBotCards(sessions: any[]): BotCard[] {
       if (attentionReason(s)) card.attention.push(s);
     }
   }
+  for (const card of byKey.values()) {
+    // 首屏 /api/groups 还没回来时 botName 只能是 larkAppId（cli_xxx）——
+    // 用 localStorage 回灌的名字缓存先把人话名字顶上，避免每次刷新闪 id。
+    if (card.botName === card.larkAppId) {
+      const cached = botNameForAppId(card.larkAppId);
+      if (cached) card.botName = cached;
+    }
+  }
   return [...byKey.values()].sort((a, b) => {
     // 等你的排最前，其次干活中，再按最近活跃
     const rank = (c: BotCard) => (c.attention.length ? 0 : c.busy.length ? 1 : c.online || c.active.length ? 2 : 3);
     if (rank(a) !== rank(b)) return rank(a) - rank(b);
     return b.lastActiveAt - a.lastActiveAt;
   });
+}
+
+// AI 团队折叠态：bot 一多整屏都是卡片，默认只露两整行重点（attention/busy 在前），
+// 展开偏好记进 localStorage 跨刷新保留。
+const TEAM_EXPAND_KEY = 'botmux.overview.teamExpanded';
+// 与 .team-grid 的 repeat(auto-fill, minmax(230px, 1fr)) / gap:13px 保持同步——
+// 按容器实际宽度算出每行列数，折叠时正好露满整行，不留半行尾巴。
+const TEAM_CARD_MIN_W = 230;
+const TEAM_GRID_GAP = 13;
+const TEAM_COLLAPSED_ROWS = 2;
+
+function collapsedCardCount(gridEl: HTMLElement): number {
+  const width = gridEl.clientWidth;
+  if (!width) return TEAM_COLLAPSED_ROWS * 3; // 首帧尚未布局时的兜底
+  const cols = Math.max(1, Math.floor((width + TEAM_GRID_GAP) / (TEAM_CARD_MIN_W + TEAM_GRID_GAP)));
+  return cols * TEAM_COLLAPSED_ROWS;
+}
+
+function readTeamExpanded(): boolean {
+  try { return window.localStorage.getItem(TEAM_EXPAND_KEY) === '1'; } catch { return false; }
+}
+
+function persistTeamExpanded(v: boolean): void {
+  try { window.localStorage.setItem(TEAM_EXPAND_KEY, v ? '1' : '0'); } catch { /* 静默 */ }
 }
 
 function mateCardHtml(card: BotCard): string {
@@ -94,7 +128,7 @@ function mateCardHtml(card: BotCard): string {
   const dotClass = needsYou ? 'warn' : busy ? 'busy' : offline ? 'off' : 'ok';
   let taskHtml: string;
   if (needsYou) {
-    const a = card.attention[0];
+    const a = [...card.attention].sort((x, y) => attentionWaitSince(x) - attentionWaitSince(y))[0];
     taskHtml = `<b>${escapeHtml((stripMentionPrefix(a.title) || a.sessionId).slice(0, 60))}</b> · ${escapeHtml(attentionReason(a) ?? '')}`;
   } else if (busy) {
     const w = [...card.busy].sort((x, y) => Number(y.lastMessageAt ?? 0) - Number(x.lastMessageAt ?? 0))[0];
@@ -133,7 +167,7 @@ function attentionCardHtml(s: any): string {
     ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
     <div class="qcard-tx">
       <b>${escapeHtml(botName)} · ${escapeHtml((stripMentionPrefix(s.title) || s.sessionId).slice(0, 56))}</b>
-      <span>${escapeHtml(attentionReason(s) ?? '')} · ${relTime(s.lastMessageAt)}</span>
+      <span>${escapeHtml(attentionReason(s) ?? '')} · ${relTime(attentionWaitSince(s))}</span>
     </div>
     <a class="qcard-go" href="#/sessions">${escapeHtml(t('strip.handle'))}</a>
   </article>`;
@@ -193,6 +227,7 @@ export async function renderOverviewPage(root: HTMLElement) {
       <a href="#/bot-defaults">${t('overview.viewAll')}</a>
     </div>
     <div class="team-grid" id="team-grid"></div>
+    <button type="button" class="team-toggle" id="team-toggle" hidden></button>
 
     <div class="sect-head" id="attention-head">
       <h2>${t('overview.attention')}</h2><span>${t('overview.attentionHint')}</span>
@@ -236,6 +271,13 @@ export async function renderOverviewPage(root: HTMLElement) {
 
   const pillsEl = root.querySelector<HTMLElement>('#overview-pills')!;
   const teamEl = root.querySelector<HTMLElement>('#team-grid')!;
+  const teamToggleEl = root.querySelector<HTMLButtonElement>('#team-toggle')!;
+  let teamExpanded = readTeamExpanded();
+  teamToggleEl.onclick = () => {
+    teamExpanded = !teamExpanded;
+    persistTeamExpanded(teamExpanded);
+    rerender();
+  };
   const attentionEl = root.querySelector<HTMLElement>('#attention-list')!;
   const sessionsEl = root.querySelector<HTMLElement>('#recent-sessions')!;
   const donutEl = root.querySelector<HTMLElement>('#today-donut')!;
@@ -246,7 +288,7 @@ export async function renderOverviewPage(root: HTMLElement) {
     const active = sessions.filter(s => s.status !== 'closed');
     const attention = active
       .filter(s => attentionReason(s))
-      .sort((a, b) => Number(a.lastMessageAt ?? 0) - Number(b.lastMessageAt ?? 0));
+      .sort((a, b) => attentionWaitSince(a) - attentionWaitSince(b));
     const busy = active.filter(s => BUSY_STATUSES.has(s.status) && !attentionReason(s));
     const idle = active.length - attention.length - busy.length;
 
@@ -258,9 +300,19 @@ export async function renderOverviewPage(root: HTMLElement) {
       <span class="pill${attention.length ? ' pill-hot' : ''}">${escapeHtml(t('overview.attention'))} <b>${attention.length}</b></span>
       <span class="pill">${escapeHtml(t('overview.onlineBots'))} <b>${onlineBots}</b></span>`;
 
-    teamEl.innerHTML = cards.length
-      ? cards.map(mateCardHtml).join('')
+    const collapsedN = collapsedCardCount(teamEl);
+    const visibleCards = teamExpanded ? cards : cards.slice(0, collapsedN);
+    teamEl.innerHTML = visibleCards.length
+      ? visibleCards.map(mateCardHtml).join('')
       : `<div class="empty">${t('overview.noSessions')}</div>`;
+    if (cards.length > collapsedN) {
+      teamToggleEl.hidden = false;
+      teamToggleEl.textContent = teamExpanded
+        ? t('overview.teamCollapse')
+        : t('overview.teamExpand', { count: cards.length });
+    } else {
+      teamToggleEl.hidden = true;
+    }
 
     attentionEl.innerHTML = attention.length
       ? attention.map(attentionCardHtml).join('')
@@ -289,6 +341,13 @@ export async function renderOverviewPage(root: HTMLElement) {
       ? upcoming.map(renderScheduleMini).join('')
       : `<li class="empty">${t('overview.noSchedules')}</li>`;
   }
+
+  // 窗口宽度变了每行列数会变，折叠态要跟着补/裁到整行；页面切走后自动解绑。
+  const onResize = () => {
+    if (!document.body.contains(teamEl)) { window.removeEventListener('resize', onResize); return; }
+    if (!teamExpanded) rerender();
+  };
+  window.addEventListener('resize', onResize);
 
   store.on(rerender);
   rerender();

@@ -2,21 +2,19 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
 
 /** Adapter for Pi coding-agent's native TUI (`pi`). */
 export function createPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
     id: 'pi',
+    authPaths: ['~/.pi/agent/auth.json'],
     resolvedBin: bin,
 
     buildArgs({ sessionId, initialPrompt }) {
       const args = [
         '--session-id', sessionId,
-        '--tools', 'read,bash,edit,write,grep,find,ls',
       ];
       // Pi's interactive mode processes positional initial messages after TUI
       // startup, avoiding stdin races while keeping the native TUI visible.
@@ -43,6 +41,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    busyPattern: /Working\.\.\./,
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,

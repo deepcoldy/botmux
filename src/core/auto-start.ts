@@ -82,3 +82,38 @@ export function chatHasAllowedUser(
 export function resolveGroupJoinPrompt(configured: string | undefined): string {
   return (configured ?? '').trim();
 }
+
+/**
+ * 场景①: D7 gate with retry — wait for an allowedUser to appear in the chat.
+ *
+ * Alarm/oncall platforms that auto-create incident chats (e.g. ByteDance
+ * Nexus) add the bot FIRST and the human members moments later. A one-shot
+ * membership snapshot taken at bot.added time races against that and loses:
+ * the chat looks like it has no allowedUser and auto-start is silently
+ * skipped even though the owner lands in the chat a second later. Re-check
+ * membership a few times with backoff before giving up.
+ *
+ * Attempts = retryDelaysMs.length + 1 (default 4 attempts over ~25s). Errors
+ * from `listMembers` propagate to the caller on ANY attempt — same handling
+ * as the previous one-shot check (warn + scope hint). Empty allowedUsers
+ * short-circuits to false without calling `listMembers` (FR-2).
+ */
+export async function waitForAllowedUserInChat(opts: {
+  listMembers: () => Promise<string[]>;
+  allowedUsers: Iterable<string>;
+  /** Waits BETWEEN attempts (ms). Default [3000, 7000, 15000]. */
+  retryDelaysMs?: number[];
+  sleep?: (ms: number) => Promise<void>;
+  onRetry?: (attempt: number, delayMs: number) => void;
+}): Promise<boolean> {
+  const allowed = [...opts.allowedUsers];
+  if (allowed.length === 0) return false;
+  const delays = opts.retryDelaysMs ?? [3000, 7000, 15000];
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  for (let attempt = 0; ; attempt++) {
+    if (chatHasAllowedUser(await opts.listMembers(), allowed)) return true;
+    if (attempt >= delays.length) return false;
+    opts.onRetry?.(attempt + 1, delays[attempt]);
+    await sleep(delays[attempt]);
+  }
+}

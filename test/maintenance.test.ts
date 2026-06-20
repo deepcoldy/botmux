@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,8 @@ import {
   runMaintenanceTick,
   readMaintenanceStateTo,
   writeMaintenanceStateTo,
+  buildRestartLauncher,
+  maintenanceRestartLogPath,
   type MaintenanceDeps,
   type MaintenanceState,
 } from '../src/core/maintenance.js';
@@ -142,6 +144,29 @@ describe('runMaintenanceTick', () => {
     expect(calls.restart).toBe(0);
     expect(calls.intents).toEqual([]);
     expect(state.autoUpdate?.lastDate).toBe(TODAY);
+  });
+});
+
+describe('buildRestartLauncher', () => {
+  const NODE = '/usr/bin/node';
+  const CLI = '/opt/botmux/dist/cli.js';
+
+  it('uses setsid to start the restart in a new session when available', () => {
+    // The auto-restart driver must NOT be a descendant of the daemon it kills,
+    // or PM2 tearing down botmux-0 interrupts the restart. setsid → new session.
+    expect(buildRestartLauncher(NODE, CLI, true)).toEqual({ cmd: 'setsid', args: [NODE, CLI, 'restart'] });
+  });
+
+  it('falls back to a plain detached node spawn when setsid is unavailable', () => {
+    expect(buildRestartLauncher(NODE, CLI, false)).toEqual({ cmd: NODE, args: [CLI, 'restart'] });
+  });
+});
+
+describe('maintenanceRestartLogPath', () => {
+  afterEach(() => vi.unstubAllEnvs());
+  it('points at ~/.botmux/logs/maintenance-restart.log', () => {
+    vi.stubEnv('HOME', '/home/bot');
+    expect(maintenanceRestartLogPath()).toBe('/home/bot/.botmux/logs/maintenance-restart.log');
   });
 });
 

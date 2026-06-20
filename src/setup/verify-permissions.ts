@@ -18,6 +18,7 @@
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
+import { DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
 
 // Brand 的单一事实源在 im/lark/lark-hosts.ts；这里 re-export 保持既有导入路径可用。
 export type { Brand };
@@ -73,6 +74,28 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   { name: 'im:message.group_at_msg.include_bot:readonly', desc: '跨 bot @ 事件', critical: true },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
+
+/** 文档评论入口（/subscribe-lark-doc）专用的 app 权限。**不在** BOTMUX_REQUIRED_SCOPES
+ *  里——它是 opt-in 特性，只对「已订阅过文档」的 bot 启动自检（见
+ *  event-dispatcher.checkRequiredScopes 的文档就绪分支），不给没用该特性的 bot 添噪。
+ *  名字单一事实源 = utils/user-token.DOC_COMMENT_OAUTH_SCOPES（同名 OAuth user scope），
+ *  这里补中文说明；test 兜底两者一致 + 都在 lark-scopes.json manifest 内。 */
+const DOC_SCOPE_DESC: Record<string, string> = {
+  'docs:document.subscription': '订阅云文档事件（评论新增）',
+  'docs:event:subscribe': '云文档事件订阅',
+  'docs:document.comment:read': '读取文档评论',
+  'docs:document.comment:create': '回复 / 新建文档评论',
+  'wiki:wiki:readonly': '解析 wiki 节点（订阅 wiki 文档时）',
+};
+export const DOC_FEATURE_SCOPES: RequiredScope[] = DOC_COMMENT_OAUTH_SCOPES.map((name) => ({
+  name,
+  desc: DOC_SCOPE_DESC[name] ?? name,
+  critical: false,
+}));
+
+/** 文档评论入口需要订阅的事件——飞书无「列出已订阅事件」的 API，无法自检，仅在
+ *  启动就绪检查里据此提醒管理员去开发者后台订阅。 */
+export const DOC_COMMENT_EVENT = 'drive.notice.comment_add_v1';
 
 export interface RemainingStep {
   title: string;

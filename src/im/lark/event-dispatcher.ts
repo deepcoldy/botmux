@@ -4,18 +4,22 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
+import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
-import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
+import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
+import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
@@ -66,7 +70,10 @@ export function writeBotInfoFile(dataDir: string): void {
     });
   }
 
-  writeFileSync(filePath, JSON.stringify([...map.values()], null, 2) + '\n');
+  // 原子写：一 bot 一 daemon，多个 daemon 进程并发 upsert 同一个 bots-info.json，
+  // 裸写会让并发读者看到半截 JSON。（read-merge-write 的 lost-update 仍存在，
+  // 但每个 daemon 周期性重写自己的条目，可自愈。）
+  atomicWriteFileSync(filePath, JSON.stringify([...map.values()], null, 2) + '\n');
 }
 
 /**
@@ -234,6 +241,34 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
     );
 
+    // 文档评论入口就绪自检：仅对「已订阅过文档」的 bot 生效（opt-in，不打扰其他 bot）。
+    // ① 校验文档 app 权限是否开通（可查 → 缺则 DM 深链）② 提醒去后台订阅评论事件
+    // drive.notice.comment_add_v1（飞书无 API 可查是否已订阅，只能提醒）——让「订阅
+    // 成功却收不到评论」这类配置漏项在重启自检时暴露。
+    try {
+      const docSubs = listAllDocSubscriptions(config.session.dataDir, larkAppId);
+      if (docSubs.length > 0) {
+        const missingDoc = DOC_FEATURE_SCOPES.filter(s => !grantedScopes.has(s.name));
+        if (missingDoc.length > 0) {
+          const summary = missingDoc.map(s => `${s.name}(${s.desc})`).join('、');
+          logger.error(`[${larkAppId}] 文档评论入口已在用（${docSubs.length} 个订阅）但缺 ${missingDoc.length} 项文档权限：${summary}。评论将收不到/回不了，请到权限管理开通后 botmux restart。`);
+          const adminDoc = getAdminOpenId(bot);
+          if (adminDoc) {
+            const lines = missingDoc.map((s, i) => `${i + 1}. **${s.desc}** (\`${s.name}\`)\n   ${buildScopeDeepLink(bot.config.larkAppId, s.name, brand)}`).join('\n\n');
+            await dmAdmin(larkAppId, adminDoc,
+              `⚠️ 机器人 "${bot.botName ?? larkAppId}" 已订阅 ${docSubs.length} 个飞书文档（/subscribe-lark-doc），但缺少文档评论所需权限：\n\n${lines}\n\n` +
+              `另外请确认开发者后台「事件订阅」里已添加 **\`${DOC_COMMENT_EVENT}\`**（云文档新增评论）事件——该事件无法被自动检测，缺它则评论永远收不到。\n\n开通 + 订阅事件后执行 \`botmux restart\`。`,
+              `missing doc-feature scopes: ${missingDoc.map(s => s.name).join(',')}`);
+          }
+        } else {
+          // 权限齐了——事件订阅查不了，仅 info 记一条提醒（不 DM 免重启刷屏）。
+          logger.info(`[${larkAppId}] doc-comment 权限齐全（${docSubs.length} 订阅）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
+        }
+      }
+    } catch (err: any) {
+      logger.debug(`[${larkAppId}] doc-feature readiness check errored: ${err?.message ?? err}`);
+    }
+
     // Diff against the canonical list. Critical-missing is the main signal;
     // non-critical is mentioned only when something critical is also missing,
     // so deployments don't get nagged about purely optional scopes like
@@ -281,7 +316,9 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
 // groups (oncall chats often have 3rd-party oncall/form/AI-search bots).
 
 export const CHAT_CACHE_TTL = 5 * 60_000; // 5 minutes
-const chatStatsCache = new Map<string, { userCount: number; botCount: number; fetchedAt: number }>();
+// Bounded: keyed per chat; TTL gates freshness on read, the cap stops the
+// entry count growing with every distinct chat the bot ever serves.
+const chatStatsCache = new BoundedMap<string, { userCount: number; botCount: number; fetchedAt: number }>(1000);
 
 // ─── Event callback ACK safety ──────────────────────────────────────────────
 //
@@ -468,12 +505,12 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   // on/off) legitimately repeat and must not be pinned for the whole TTL.
   if (eventId && !claimEventOnce(key)) {
     logger.info(`[event-dedupe] duplicate card action ignored (claimed): ${key}`);
-    return { toast: { type: 'info', content: '操作已收到，请勿重复点击' } };
+    return { toast: { type: 'info', content: t('toast.action_received_no_repeat', undefined, localeForBot(larkAppId)) } };
   }
 
   if (cardActionInFlight.has(key)) {
     logger.info(`[event-dedupe] duplicate card action ignored while in-flight: ${key}`);
-    return { toast: { type: 'info', content: '操作正在处理中，请稍候' } };
+    return { toast: { type: 'info', content: t('toast.action_in_progress', undefined, localeForBot(larkAppId)) } };
   }
 
   cardActionInFlight.add(key);
@@ -505,7 +542,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   if (result === CARD_ACTION_TIMEOUT) {
     timedOut = true;
     logger.warn(`[card-action] handler exceeded ${CARD_ACTION_ACK_TIMEOUT_MS}ms; ACKing first and continuing in background: ${key}`);
-    return { toast: { type: 'info', content: '操作已收到，后台处理中' } };
+    return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)) } };
   }
   return result;
 }
@@ -616,7 +653,7 @@ export function updateBotOpenIdCrossRef(
   if (changed) {
     try {
       if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-      writeFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
+      atomicWriteFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
       logger.debug(`Updated bot open_id cross-ref for ${larkAppId}: ${JSON.stringify(existing)}`);
     } catch (err) {
       logger.debug(`Failed to write bot open_id cross-ref: ${err}`);
@@ -972,6 +1009,24 @@ export interface EventHandlers {
    *  — which in a 话题群 wraps each top-level message in a fresh topic.
    *  Best-effort fire-and-forget; the dispatcher proceeds either way. */
   onChatModeConverted?: (chatId: string, larkAppId: string) => void;
+  /** 文档评论入口（/subscribe-lark-doc）：一条命中订阅的文档评论被喂进其绑定
+   *  会话。daemon 负责定位会话、投递给 worker、记录该轮回评论的落点。 */
+  handleDocComment?: (ctx: DocCommentContext) => Promise<void>;
+}
+
+/** 一条已通过订阅 + 触发范围 + 自触发过滤的文档评论，交给 daemon 投递。 */
+export interface DocCommentContext {
+  larkAppId: string;
+  /** 命中的文档订阅（含 sessionAnchor / scope / chatId）。 */
+  sub: DocSubscription;
+  /** 触发评论的 comment_id。 */
+  commentId: string;
+  /** 触发的具体回复 id（作 turnId，回评论落点也按它走）；缺省退回 commentId。 */
+  replyId?: string;
+  /** 评论纯文本（喂给模型的用户消息）。 */
+  text: string;
+  /** 评论发表者 open_id。 */
+  authorOpenId?: string;
 }
 
 /**
@@ -1083,6 +1138,46 @@ async function maybeApplySharedTopicSeed(input: {
   return messageId;
 }
 
+async function maybeFoldMentionedRegularGroupThreadToChat(input: {
+  larkAppId: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  message: any;
+  routing: { scope: 'thread' | 'chat'; anchor: string };
+  forceTopicApplied?: boolean;
+  mentionedThisBot: boolean;
+  ownsThreadSession?: boolean;
+}): Promise<string | undefined> {
+  const { larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot, ownsThreadSession } = input;
+  if (forceTopicApplied || ownsThreadSession) return undefined;
+  if (!mentionedThisBot) return undefined;
+  if (chatType !== 'group') return undefined;
+  const rootId: string | undefined = message?.root_id;
+  const threadId: string | undefined = message?.thread_id;
+  if (!rootId || !threadId) return undefined;
+  const rawText = extractMessageTextForRouting(message);
+  if (rawText) {
+    const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
+    if (parseForceTopicInvocation(stripped)) return undefined;
+  }
+
+  // In a regular group, `chat` and `shared` both mean "use the group's one
+  // chat-scope session/context". Lark still reports replies inside an existing
+  // topic as root_id+thread_id, so decideRouting's generic real-thread rule
+  // would otherwise fork a brand-new thread-scope session every time another
+  // human/bot @mentions us inside that topic. Keep the visible reply in the
+  // same topic (replyRootId=rootId), but route the turn through the group
+  // chat-scope session. `new-topic` is the only mode that intentionally keeps
+  // per-topic independent sessions.
+  if (resolveRegularGroupMode(larkAppId, chatId) === 'new-topic') return undefined;
+  const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+  if (freshMode !== 'group') return undefined;
+  routing.scope = 'chat';
+  routing.anchor = chatId;
+  logger.info(`[reply-mode] mentioned thread root=${rootId.substring(0, 12)} folds into chat=${chatId.substring(0, 12)}`);
+  return rootId;
+}
+
 /** Compute the scope + anchor for an inbound message:
  *   - root_id + thread_id     → thread-scope, anchor = root_id (real Lark 话题)
  *   - 话题群 + no real thread → thread-scope, anchor = message_id (thread seed)
@@ -1165,6 +1260,107 @@ export async function decideRouting(
   return { scope, anchor };
 }
 
+/** 从评论事件 payload 里挖出 { fileToken, fileType, commentId, replyId,
+ *  noticeType, isMentioned, operatorOpenId }。
+ *
+ *  真机实测 drive.notice.comment_add_v1 的 event 体形如
+ *  `{ comment_id, is_mentioned, notice_meta, reply_id }` —— **file_token 不在顶层，
+ *  藏在 notice_meta 里**（notice_meta 可能是对象或 JSON 字符串）。故这里展开
+ *  notice_meta 并多路径兜底；file_type 拿不到无妨（后续用订阅表里的）。 */
+function parseCommentEvent(data: any): {
+  fileToken?: string; fileType?: string; commentId?: string; replyId?: string;
+  noticeType?: string; isMentioned?: boolean; operatorOpenId?: string; meta?: any;
+} {
+  const d = data?.event ?? data ?? {};
+  let meta = d.notice_meta ?? d.noticeMeta;
+  if (typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { /* 保留原字符串 */ } }
+  const m = (meta && typeof meta === 'object') ? meta : {};
+  const pick = (k: string) => d[k] ?? m[k] ?? m[k.replace(/_([a-z])/g, (_: string, c: string) => c.toUpperCase())];
+  return {
+    fileToken: pick('file_token') ?? pick('token') ?? pick('obj_token'),
+    fileType: pick('file_type') ?? pick('obj_type'),
+    commentId: pick('comment_id'),
+    replyId: pick('reply_id'),
+    noticeType: pick('notice_type'),
+    isMentioned: d.is_mentioned === true || m.is_mentioned === true,
+    operatorOpenId: d.operator_id?.open_id ?? d.user_id?.open_id ?? m.operator_id?.open_id,
+    meta,
+  };
+}
+
+/** 评论事件入口：去重 ACK-safe 包装 + 订阅匹配 + 自触发/触发范围过滤后转 daemon。 */
+function handleCommentEventAckSafe(data: any, larkAppId: string, handlers: EventHandlers): void {
+  const parsed = parseCommentEvent(data);
+  const eventKey = `drive.comment_add:${larkAppId}:${eventIdForKey(data) ?? `${parsed.fileToken ?? '?'}:${parsed.replyId ?? parsed.commentId ?? '?'}`}`;
+  scheduleAckSafeEvent(eventKey, async () => {
+    try {
+      await processCommentEvent(parsed, larkAppId, handlers);
+    } catch (err) {
+      logger.error(`Error handling doc-comment event: ${err}`);
+    }
+  }, 'doc-comment event');
+}
+
+async function processCommentEvent(
+  parsed: ReturnType<typeof parseCommentEvent>,
+  larkAppId: string,
+  handlers: EventHandlers,
+): Promise<void> {
+  if (!handlers.handleDocComment) return;
+  const { fileToken, commentId } = parsed;
+  if (!fileToken || !commentId) {
+    logger.info(`[doc-comment] event dropped: missing fileToken/commentId (fileToken=${fileToken ?? '?'} commentId=${commentId ?? '?'}) — payload 字段路径可能与解析不符`);
+    return;
+  }
+
+  // 1) 必须是已订阅的文档（per-文档订阅 → 主键命中才处理）
+  const sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
+  if (!sub) {
+    logger.info(`[doc-comment] event dropped: file_token=${fileToken.slice(0, 12)} 不在订阅表（已订阅的可 /subscribe-lark-doc list 查；注意 wiki 链接会解析成底层 obj_token）`);
+    return;
+  }
+
+  // 2) 拉评论 thread 取权威正文 / 作者 / @ 列表（事件 payload 不保证带全），
+  //    同时用最新一条回复作为"触发回复"。
+  const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
+  if (!comment || comment.replies.length === 0) {
+    logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
+    return;
+  }
+  const trigger = parsed.replyId
+    ? comment.replies.find(r => r.replyId === parsed.replyId) ?? comment.replies[comment.replies.length - 1]
+    : comment.replies[comment.replies.length - 1];
+
+  // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
+  //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
+  //    ②reply_id 在 bot 创建集合 ③文本含隐形哨兵。任一命中即跳过。
+  const selfBotOpenId = getBot(larkAppId).botOpenId;
+  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
+
+  // 4) 触发范围：mention-only 要求评论 @ 到本 bot。优先用事件自带的 is_mentioned
+  //    （飞书已判好），拿不到再回退按评论正文里的 @person 列表比对 bot open_id。
+  if (sub.commentTriggerMode === 'mention-only') {
+    const mentioned = parsed.isMentioned === true || (!!selfBotOpenId && trigger.mentions.includes(selfBotOpenId));
+    if (!mentioned) {
+      logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)})`);
+      return;
+    }
+  }
+
+  const text = trigger.text.trim();
+  if (!text) return;
+
+  logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
+  await handlers.handleDocComment({
+    larkAppId,
+    sub,
+    commentId,
+    replyId: trigger.replyId || commentId,
+    text,
+    authorOpenId: trigger.userId,
+  });
+}
+
 /**
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
@@ -1190,7 +1386,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
       }, 'bot-added event');
     },
+    // 文档评论入口（/subscribe-lark-doc）。飞书评论事件命名在 v1/v2 间有差异，
+    // 两个候选名都注册（同一处理器）——真机一锤定音后可删冗余。需在开发者后台
+    // 订阅对应事件。注意：评论事件是 per-文档 推送（订阅时按 file_token 注册）。
+    'drive.file.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
+    'drive.notice.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
+    // 表情回复事件——一旦在开发者后台订阅了 reaction，SDK 每收到一次都会因
+    // 没有 handler 打 "no im.message.reaction.created_v1 handle" 警告刷屏。
+    // botmux 不消费表情事件，注册显式 no-op 把这条噪声静默掉。
+    'im.message.reaction.created_v1': () => {},
+    'im.message.reaction.deleted_v1': () => {},
     'im.message.receive_v1': (data: any) => {
       const messageIdForKey = data?.message?.message_id;
       const eventKey = `im.message.receive_v1:${larkAppId}:${eventIdForKey(data) ?? messageIdForKey ?? unkeyableEventKey()}`;
@@ -1265,9 +1471,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           if (forcedTopic) {
             logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
           }
-          const replyRootId = await maybeApplySharedTopicSeed({
-            larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
+          const ownsThreadSession = ctx.scope === 'thread'
+            ? (handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false)
+            : false;
+          const canFoldForeignBotThread = findOncallChat(larkAppId, chatId)
+            || isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+            || hasChatGrant(larkAppId, chatId, senderOpenId)
+            || hasGlobalGrant(larkAppId, senderOpenId);
+          let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
+            larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: !!canFoldForeignBotThread, ownsThreadSession,
           });
+          if (!replyRootId) {
+            replyRootId = await maybeApplySharedTopicSeed({
+              larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
+            });
+          }
           // Regular-group foreign-bot @mention: gate to vetted botmux peers
           // (registered in our bot-openids cross-ref). Fires for legacy chat-scope
           // routing, the new-topic send-shape
@@ -1441,12 +1659,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
         let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
 
-        const seedReplyRootId = await maybeApplySharedTopicSeed({
-          larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
+        const ownsThreadSessionBeforeFold = routing.scope === 'thread'
+          ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
+          : false;
+        const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
+          larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
         });
-        if (seedReplyRootId) {
-          replyRootId = seedReplyRootId;
+        if (foldedReplyRootId) {
+          replyRootId = foldedReplyRootId;
           ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+        } else {
+          const seedReplyRootId = await maybeApplySharedTopicSeed({
+            larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
+          });
+          if (seedReplyRootId) {
+            replyRootId = seedReplyRootId;
+            ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+          }
         }
 
         // 普通群 → 话题群 conversion detection. Lark group admins can flip
@@ -1561,6 +1790,31 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }, 'message event');
     },
   });
+
+  // 诊断：包一层 invoke，记录长连接收到的**每一个**事件类型（含未注册的）。
+  // 排查云文档评论事件是否真送达 / 实际事件名用——comment 类一律连 payload 关键字段
+  // 一起打。日常其它事件只在 DEBUG 下打，避免刷屏。
+  // 仅当 dispatcher 真有 invoke 方法时才包（单测里 Lark.EventDispatcher 是 mock，
+  // register() 返回的对象没有 invoke → 不包，避免 undefined.bind 抛错）。
+  const __origInvoke = typeof (eventDispatcher as any).invoke === 'function'
+    ? (eventDispatcher as any).invoke.bind(eventDispatcher)
+    : undefined;
+  if (__origInvoke) {
+    (eventDispatcher as any).invoke = (data: any) => {
+      try {
+        const et: string = data?.header?.event_type ?? data?.event_type ?? data?.type ?? 'unknown';
+        const isCommentish = typeof et === 'string' && et.includes('comment');
+        if (isCommentish) {
+          const ev = data?.event ?? data;
+          const p = parseCommentEvent(data);
+          logger.info(`[ws-event] ${larkAppId} event_type=${et} → parsed fileToken=${p.fileToken ?? '?'} commentId=${p.commentId ?? '?'} replyId=${p.replyId ?? '?'} isMentioned=${p.isMentioned} | notice_meta=${JSON.stringify(ev?.notice_meta ?? ev?.noticeMeta ?? null)}`);
+        } else if (process.env.DEBUG) {
+          logger.info(`[ws-event] ${larkAppId} event_type=${et}`);
+        }
+      } catch { /* 诊断不阻断分发 */ }
+      return __origInvoke(data);
+    };
+  }
 
   // Start WSClient
   const wsClient = new Lark.WSClient({

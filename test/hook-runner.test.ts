@@ -310,6 +310,51 @@ describe('runHookCommandForTest', () => {
     expect(Date.now() - started).toBeLessThan(900);
   });
 
+  it('emitHookEventLocal spawns locally even when session env leaked into the process', async () => {
+    // Regression guard for the daemon self-forward storm: the daemon's
+    // /api/hooks/emit handler runs hooks via emitHookEventLocal, which must
+    // execute locally and never re-enter the CLI forward gate — even when
+    // session-scoped env leaked into the process (e.g. pm2 startOrRestart
+    // injecting the caller's environment after an in-session `botmux restart`).
+    const marker = join(tmpDir, 'daemon-local-spawn-touched');
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        '--input-type=module',
+        '-e',
+        [
+          "const { emitHookEventLocal } = await import('./src/services/hook-runner.ts');",
+          "emitHookEventLocal('outbound.send', { content: 'hi' });",
+        ].join('\n'),
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          BOTMUX_SESSION_ID: 'sid-leaked-into-daemon',
+          BOTMUX_LARK_APP_ID: 'cli_leaked_into_daemon',
+          BOTMUX_HOOKS_JSON: JSON.stringify([
+            { event: 'outbound.send', command: `/usr/bin/touch ${marker}`, timeoutMs: 5000 },
+          ]),
+        },
+        timeout: 5000,
+      },
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    // fireAndForget lets the emitting process exit before the hook child
+    // finishes — poll briefly for the marker instead of asserting instantly.
+    const deadline = Date.now() + 3000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    expect(existsSync(marker)).toBe(true);
+  });
+
   it('CLI context forwards to daemon instead of spawning locally', () => {
     // Behavioural proof of the daemon-supervised path: when BOTMUX_SESSION_ID
     // and BOTMUX_LARK_APP_ID are set (CLI session), emitHookEvent forwards to

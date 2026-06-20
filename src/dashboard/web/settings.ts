@@ -6,6 +6,7 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 interface DashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  repoPickerMode: 'all' | 'repos';
   maintenance: MaintenanceCfg;
   localDevInstall: boolean;
 }
@@ -20,6 +21,7 @@ function parseSettings(s: any): DashboardSettings {
   return {
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
+    repoPickerMode: s?.repoPickerMode === 'repos' ? 'repos' : 'all',
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
     localDevInstall: s?.localDevInstall === true,
   };
@@ -103,6 +105,17 @@ function renderSettingsBody(): string {
         </label>
       </section>
       <section class="bd-section">
+        <h3 class="bd-section-title">${t('settings.sectionRepoPicker')}</h3>
+        <label class="form-row">
+          <span>${t('settings.repoPickerMode')}</span>
+          <select data-select-setting="repoPickerMode" ${dis}>
+            <option value="all" ${settings.repoPickerMode === 'all' ? 'selected' : ''}>${t('settings.repoPickerModeAll')}</option>
+            <option value="repos" ${settings.repoPickerMode === 'repos' ? 'selected' : ''}>${t('settings.repoPickerModeRepos')}</option>
+          </select>
+          <small>${t('settings.repoPickerModeHelp')}</small>
+        </label>
+      </section>
+      <section class="bd-section">
         <h3 class="bd-section-title">${t('settings.sectionMaintenance')}</h3>
         ${autoUpdateRow(updDisabled)}
         ${settings.localDevInstall ? `<p class="hint-warn">${t('settings.autoUpdateLocalDev')}</p>` : ''}
@@ -146,7 +159,7 @@ export async function renderSettingsPage(root: HTMLElement): Promise<void> {
     return bodyEl.querySelector<HTMLElement>('[data-settings-status]');
   }
 
-  async function putSettings(payload: unknown, revert: () => void, input: HTMLInputElement): Promise<void> {
+  async function putSettings(payload: unknown, revert: () => void, input: HTMLInputElement | HTMLSelectElement): Promise<void> {
     if (!settings) return;
     input.disabled = true;
     const st = statusEl();
@@ -176,6 +189,13 @@ export async function renderSettingsPage(root: HTMLElement): Promise<void> {
         const key = input.dataset.setting as 'publicReadOnly' | 'openTerminalInFeishu';
         const before = !input.checked;
         void putSettings({ [key]: input.checked }, () => { input.checked = before; }, input);
+      });
+    });
+    bodyEl.querySelectorAll<HTMLSelectElement>('select[data-select-setting]').forEach(input => {
+      input.addEventListener('change', () => {
+        const key = input.dataset.selectSetting as 'repoPickerMode';
+        const before = settings?.[key] ?? 'all';
+        void putSettings({ [key]: input.value }, () => { input.value = before; }, input);
       });
     });
     // Maintenance: auto-update sends {enabled,time}; auto-restart is a toggle ({enabled}).

@@ -14,10 +14,31 @@ import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 
-/** 从 mention 列表取所有非本 bot 的对象（可以是真人，也可以是另一个 bot——
+/** 从 mention 列表取所有非本 bot 的【授权目标】（可以是真人，也可以是另一个 bot——
  *  授权 bot 走同一条路，命中后写本群 chatGrants，放行其在本群拉起 chat-scope 会话）。
- *  按 open_id 去重、保持 @ 顺序，支持一次 /grant @a @b、/revoke @a @b 批量处置。 */
+ *  按 open_id 去重、保持 @ 顺序，支持一次 /grant @a @b、/revoke @a @b 批量处置。
+ *
+ *  **只取「命令词 /grant|/revoke 之后」出现的 @**：命令词之前的 @ 是「点名让哪个 bot 执行」
+ *  （`@OperatorBot /grant @Grantee`），不是 grantee。否则 owner 一条 `@Claude @Codex /grant`
+ *  把两个操作 bot 都前导 @ 了，每个 daemon 会把「另一个 bot」当成目标 → 两 bot 互相授权
+ *  （申晗实测 bug）。位置过滤仅在能拿到位置信息（text 形态的 key / post 的节点序）时生效；
+ *  纯 mentions 的合成消息（无 content.text）退回历史「全部非本 bot」行为。 */
 export function parseGrantTargets(message: any, botOpenId: string | undefined): Array<{ openId: string; name: string }> {
+  let content: any;
+  try { content = JSON.parse(message?.content ?? '{}'); } catch { content = undefined; }
+
+  // text 形态：@ 落在 content.text 里，每个 mention 带 key 占位符可定位其位置 → 按命令词位置过滤。
+  if (content && typeof content.text === 'string') {
+    return parseTextTargetsAfterCommand(content.text, message?.mentions ?? [], botOpenId);
+  }
+  // post（富文本）形态：@ 落在 inline `at` 节点（message.mentions 常为空、偶有填充，统一走节点序）→
+  // 按命令词节点位置过滤，不被「message.mentions 是否填充」左右。
+  const inner = content?.zh_cn ?? content?.en_us ?? content;
+  if (Array.isArray(inner?.content)) {
+    return parsePostAtMentions(message, botOpenId);
+  }
+
+  // 合成消息（仅 mentions、无 content 结构，多见于单测/旧调用）：无位置信息，退回全部非本 bot。
   const seen = new Set<string>();
   const out: Array<{ openId: string; name: string }> = [];
   for (const x of (message?.mentions ?? [])) {
@@ -26,13 +47,34 @@ export function parseGrantTargets(message: any, botOpenId: string | undefined): 
     seen.add(oid);
     out.push({ openId: oid, name: x.name ?? oid });
   }
-  // post（富文本）消息的 message.mentions 常为空，@ 落在 inline `at` 节点里。不回退的话
-  // `@Operator /grant @Target` 的富文本会解析出 0 目标 → 落进裸 /grant 分支误开整群授权。
-  if (out.length === 0) return parsePostAtMentions(message, botOpenId);
   return out;
 }
 
-/** 从 post inline `at` 节点取非本 bot 的目标（user_name 兜 name），按 user_id 去重、保持顺序。 */
+/** text 形态：只取「命令词之后」的非本 bot mention。用 mention 的 key 占位符定位其在 text 里的
+ *  位置；`key(?!\d)` 边界规避 @_user_1 / @_user_10 前缀歧义（与 isGrantTargetOnly 同款）。
+ *  定位不到 key（异常形态）时保守退回「视为目标」，与历史行为一致，不漏真实 grantee。 */
+function parseTextTargetsAfterCommand(
+  text: string, mentions: any[], botOpenId: string | undefined,
+): Array<{ openId: string; name: string }> {
+  const cmdIdx = text.search(/\/(?:grant|revoke)\b/i);
+  const seen = new Set<string>();
+  const out: Array<{ openId: string; name: string }> = [];
+  for (const m of mentions) {
+    const oid = m?.id?.open_id;
+    if (!oid || oid === botOpenId || seen.has(oid)) continue;
+    const key = m?.key;
+    if (cmdIdx >= 0 && typeof key === 'string' && key.length > 0) {
+      const km = new RegExp(`${escapeRe(key)}(?!\\d)`).exec(text);
+      if (km && km.index <= cmdIdx) continue;   // 命令词之前 = 操作 bot 点名，剔除
+    }
+    seen.add(oid);
+    out.push({ openId: oid, name: m.name ?? oid });
+  }
+  return out;
+}
+
+/** 从 post inline `at` 节点取非本 bot 的目标（user_name 兜 name），按 user_id 去重、保持顺序。
+ *  同 text 形态：只收「命令词文本节点之后」的 `at` 节点（前导 @ 是操作 bot 点名，剔除）。 */
 function parsePostAtMentions(message: any, botOpenId: string | undefined): Array<{ openId: string; name: string }> {
   const seen = new Set<string>();
   const out: Array<{ openId: string; name: string }> = [];
@@ -40,15 +82,22 @@ function parsePostAtMentions(message: any, botOpenId: string | undefined): Array
   try { content = JSON.parse(message?.content ?? '{}'); } catch { return out; }
   const inner = content?.zh_cn ?? content?.en_us ?? content;
   if (!Array.isArray(inner?.content)) return out;
+  // 先定位命令词文本节点的序号，再只收其后的 at 节点。
+  let seq = 0, cmdSeq = -1;
+  const ats: Array<{ oid: string; name: string; seq: number }> = [];
   for (const para of inner.content) {
     if (!Array.isArray(para)) continue;
     for (const node of para) {
-      if (node?.tag !== 'at') continue;
-      const oid = node.user_id;
-      if (!oid || oid === botOpenId || seen.has(oid)) continue;
-      seen.add(oid);
-      out.push({ openId: oid, name: node.user_name ?? oid });
+      if (cmdSeq < 0 && node?.tag === 'text' && /\/(?:grant|revoke)\b/i.test(node.text ?? '')) cmdSeq = seq;
+      if (node?.tag === 'at' && node.user_id) ats.push({ oid: node.user_id, name: node.user_name ?? node.user_id, seq });
+      seq++;
     }
+  }
+  for (const a of ats) {
+    if (a.oid === botOpenId || seen.has(a.oid)) continue;
+    if (cmdSeq >= 0 && a.seq <= cmdSeq) continue;   // 命令词之前 = 操作 bot 点名，剔除
+    seen.add(a.oid);
+    out.push({ openId: a.oid, name: a.name });
   }
   return out;
 }

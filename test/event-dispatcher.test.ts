@@ -27,6 +27,11 @@ vi.mock('node:fs', async (importOriginal) => {
     mkdirSync: vi.fn(),
   };
 });
+// bots-info.json 走原子写 helper；这里直接代理到 mockWriteFileSync，
+// 断言面（最终路径 + 完整内容）与裸 writeFileSync 时代保持一致。
+vi.mock('../src/utils/atomic-write.js', () => ({
+  atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
+}));
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
@@ -1106,12 +1111,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('honors a real Lark 话题 (root_id + thread_id) in 普通群 even when chat-scope session exists', async () => {
-    // User explicitly opened a 话题 on a message in 普通群 → message carries
-    // both root_id AND thread_id. The bot owns a chat-scope session at this
-    // chat, but the user's intent is a fresh thread, so we must NOT bounce
-    // them back into chat-scope. Routes thread-scope; since no thread session
-    // owns this root, handleNewTopic is invoked (fresh thread session).
+  it('folds an @ inside a regular-group topic into the chat-scope session when no thread session owns it', async () => {
+    // In chat/shared modes, a mentioned reply inside a regular-group topic should
+    // reuse the group chat-scope context and reply in that same topic, rather
+    // than spawning a new thread-scope session per topic.
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@BotA new topic please' }),
@@ -1128,12 +1131,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
 
-    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
-      scope: 'thread',
-      anchor: 'real-topic-root',
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-fallback-3',
+      replyRootId: 'real-topic-root',
       larkAppId: MY_APP_ID,
     }));
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
   it('keeps thread-scope when root_id+thread_id are set and a thread session DOES exist', async () => {
@@ -1205,7 +1209,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('shared thread-contained @ starts a fresh alias on the current message id', async () => {
+  it('shared thread-contained @ reuses the chat session and replies in the existing topic', async () => {
     setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     const event = makeUserMessageEvent({
@@ -1226,13 +1230,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-reply-mode',
-      replyRootId: 'msg-topic-alias-delegate',
+      replyRootId: 'old-discussion-root',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('shared explicit @ inside an existing alias thread starts a new alias on current message', async () => {
+  it('shared explicit @ inside an existing alias thread replies in that alias topic', async () => {
     setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
@@ -1253,13 +1257,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-reply-mode',
-      replyRootId: 'msg-new-delegate-in-alias',
+      replyRootId: 'old-alias-root',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('shared bot-sent post inside a thread starts a fresh alias on current message', async () => {
+  it('shared bot-sent post inside a thread reuses the chat session and replies in the existing topic', async () => {
     setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' } });
     mockGetChatMode.mockResolvedValue('group');
     mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
@@ -1287,7 +1291,60 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-reply-mode',
-      replyRootId: 'msg-bot-delegate',
+      replyRootId: 'old-thread-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('default chat-mode @ inside a regular-group topic reuses the group chat session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-default');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue with group context' }),
+      rootId: 'existing-topic-root',
+      threadId: 'existing-topic-root',
+      messageId: 'msg-mentioned-in-topic',
+      chatId: 'chat-default',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-default',
+      replyRootId: 'existing-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('new-topic mode keeps @ inside a regular-group topic as an independent thread session', async () => {
+    setupBotState({ regularGroupReplyMode: 'new-topic', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'existing-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA use independent topic context' }),
+      rootId: 'existing-topic-root',
+      threadId: 'existing-topic-root',
+      messageId: 'msg-mentioned-in-new-topic-mode',
+      chatId: 'chat-new-topic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'existing-topic-root',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
@@ -1561,6 +1618,35 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('bot-sent @ inside a freshly seeded shared topic folds into the receiver chat session', async () => {
+    setupBotState({ regularGroupReplyMode: 'shared' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@BotA inherited group-context handoff' }),
+      rootId: 'sender-shared-topic-root',
+      threadId: 'sender-shared-topic-root',
+      messageId: 'msg-bot-shared-handoff',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      replyRootId: 'sender-shared-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
   it('per-chat shared overrides a per-bot new-topic default — single mode, no competition', async () => {

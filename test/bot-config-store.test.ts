@@ -78,6 +78,8 @@ describe('bot-config store', () => {
     expect(new Set(keys).size).toBe(keys.length);
     expect(keys).toContain('allowedUsers');
     expect(keys).toContain('model');
+    expect(keys).not.toContain('repoPickerMode');
+    expect(keys).toContain('skills');
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -110,6 +112,57 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.model).toBeUndefined();
   });
 
+  it('parses bot skill policy while leaving omitted policy undefined', async () => {
+    const { registry } = await freshModules();
+    const [plain, skilled, advancedOnly] = registry.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' },
+      {
+        larkAppId: 'skilled',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        skills: {
+          profiles: ['frontend'],
+          include: ['skill:deploy-runbook'],
+          exclude: ['skill:old-release'],
+          projectSkills: 'trusted',
+          mode: 'priority',
+          delivery: 'auto',
+        },
+      },
+      {
+        larkAppId: 'advanced-only',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        skills: {
+          delivery: 'prompt',
+          projectSkills: 'all',
+        },
+      },
+    ]));
+
+    expect(plain.skills).toBeUndefined();
+    expect(skilled.skills).toEqual({ include: ['skill:deploy-runbook'] });
+    expect(advancedOnly.skills).toBeUndefined();
+  });
+
+  it('sets and unsets JSON skills policy through /config store', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('skills')!;
+    const coerced = store.coerceConfigValue(spec, '{"include":["skill:deploy-runbook"],"delivery":"prompt"}');
+    expect(coerced).toEqual({ ok: true, value: { include: ['skill:deploy-runbook'] } });
+    if (!coerced.ok) throw new Error('coerce failed');
+
+    const r1 = await store.applyConfigField('app_default', spec, coerced.value);
+    expect(r1.ok).toBe(true);
+    expect(readConfig().skills).toEqual({ include: ['skill:deploy-runbook'] });
+    expect(registry.getBot('app_default').config.skills).toEqual({ include: ['skill:deploy-runbook'] });
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().skills).toBeUndefined();
+    expect(registry.getBot('app_default').config.skills).toBeUndefined();
+  });
+
   it('boolean field writes true / deletes key on false (keeps bots.json tidy)', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('disableStreamingCard')!;
@@ -123,6 +176,35 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('number field (maxLiveWorkers) round-trips and clears on null', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('maxLiveWorkers')!;
+    expect(spec.kind).toBe('number');
+    expect(spec.effect).toBe('immediate');
+
+    const r1 = await store.applyConfigField('app_default', spec, 6);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('∅'); expect(r1.newText).toBe('6'); }
+    expect(readConfig().maxLiveWorkers).toBe(6);
+    expect(registry.getBot('app_default').config.maxLiveWorkers).toBe(6);
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().maxLiveWorkers).toBeUndefined();
+    expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('coerceConfigValue(number) accepts positive integers and rejects junk/≤0/fractions', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('maxLiveWorkers')!;
+    expect(store.coerceConfigValue(spec, 4)).toEqual({ ok: true, value: 4 });
+    expect(store.coerceConfigValue(spec, '12')).toEqual({ ok: true, value: 12 });
+    expect(store.coerceConfigValue(spec, 0)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, -3)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1.5)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 'abc')).toEqual({ ok: false, reason: 'invalid_number' });
+  });
+
   it('cli field persists the chosen adapter id', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('cli')!;
@@ -130,6 +212,75 @@ describe('bot-config store', () => {
     expect(r.ok).toBe(true);
     expect(readConfig().cliId).toBe('codex');
     expect(registry.getBot('app_default').config.cliId).toBe('codex');
+  });
+
+  it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
+    const { store } = await freshModules();
+    const spec = store.findConfigField('customPassthroughCommands')!;
+    expect(spec.kind).toBe('stringList');
+    // 逗号/空格混排、缺前导 / 自动补、大写归一、去重；/status 遮蔽 daemon 命令被丢、`/b@d` 非法字符被丢。
+    expect(store.coerceConfigValue(spec, 'goal, /export /GOAL /status /b@d'))
+      .toEqual({ ok: true, value: ['/goal', '/export'] });
+    // 全部非法/被过滤 → empty。
+    expect(store.coerceConfigValue(spec, '/status /!nope')).toEqual({ ok: false, reason: 'empty' });
+  });
+
+  it('stringList field round-trips array to disk + memory; empty/unset clears the key', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('customPassthroughCommands')!;
+
+    const r1 = await store.applyConfigField('app_default', spec, ['/goal', '/export']);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('∅'); expect(r1.newText).toBe('/goal, /export'); expect(r1.effect).toBe('immediate'); }
+    expect(readConfig().customPassthroughCommands).toEqual(['/goal', '/export']);
+    expect(registry.getBot('app_default').config.customPassthroughCommands).toEqual(['/goal', '/export']);
+
+    // 空数组等价清除（bots.json 保持干净）。
+    const r2 = await store.applyConfigField('app_default', spec, []);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().customPassthroughCommands).toBeUndefined();
+    expect(registry.getBot('app_default').config.customPassthroughCommands).toBeUndefined();
+  });
+
+  it('getConfigCardData surfaces customPassthroughCommands as a space-joined string', async () => {
+    const { store } = await loaded({ customPassthroughCommands: ['/goal', '/export'] });
+    expect(store.getConfigCardData('app_default')?.customPassthroughCommands).toBe('/goal /export');
+    const { store: store2 } = await loaded();
+    expect(store2.getConfigCardData('app_default')?.customPassthroughCommands).toBeNull();
+  });
+
+  it('startupCommands is a next-session stringList that keeps argument spaces (own parser)', async () => {
+    const { store } = await freshModules();
+    const spec = store.findConfigField('startupCommands')!;
+    expect(spec.kind).toBe('stringList');
+    expect(spec.effect).toBe('next-session');
+    // Comma/newline split (NOT space) — args survive; leading / auto-added; deduped.
+    expect(store.coerceConfigValue(spec, 'effort ultracode, /model opus\n/effort ultracode'))
+      .toEqual({ ok: true, value: ['/effort ultracode', '/model opus'] });
+    expect(store.coerceConfigValue(spec, '   ')).toEqual({ ok: false, reason: 'empty' });
+  });
+
+  it('startupCommands round-trips array to disk + memory; empty clears the key', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('startupCommands')!;
+
+    const r1 = await store.applyConfigField('app_default', spec, ['/effort ultracode', '/model opus']);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.newText).toBe('/effort ultracode, /model opus'); expect(r1.effect).toBe('next-session'); }
+    expect(readConfig().startupCommands).toEqual(['/effort ultracode', '/model opus']);
+    expect(registry.getBot('app_default').config.startupCommands).toEqual(['/effort ultracode', '/model opus']);
+
+    const r2 = await store.applyConfigField('app_default', spec, []);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().startupCommands).toBeUndefined();
+    expect(registry.getBot('app_default').config.startupCommands).toBeUndefined();
+  });
+
+  it('getConfigCardData joins startupCommands with ", " (commands carry space args)', async () => {
+    const { store } = await loaded({ startupCommands: ['/effort ultracode', '/model opus'] });
+    expect(store.getConfigCardData('app_default')?.startupCommands).toBe('/effort ultracode, /model opus');
+    const { store: store2 } = await loaded();
+    expect(store2.getConfigCardData('app_default')?.startupCommands).toBeNull();
   });
 
   it('getConfigSnapshot reports current values + info', async () => {

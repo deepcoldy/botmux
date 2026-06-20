@@ -17,10 +17,13 @@ import type {
 } from '../global-config.js';
 import {
   mergeDashboardConfig,
+  mergeGlobalConfig,
   mergeMaintenanceConfig,
   parseMaintenancePatch,
   readGlobalConfig,
+  setGlobalLocale,
 } from '../global-config.js';
+import { isLocale } from '../i18n/types.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 
 /**
@@ -46,27 +49,40 @@ export interface SettingsWriteApplierDeps {
   readGlobalConfig: () => GlobalConfig;
   /** Atomic write of dashboard-level fields (publicReadOnly / openTerminalInFeishu). */
   mergeDashboardConfig: (patch: DashboardGlobalConfig) => DashboardGlobalConfig;
+  /** Atomic write of global-level fields (repoPickerMode). */
+  mergeGlobalConfig: (patch: Partial<GlobalConfig>) => void;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
+  /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
+  setGlobalLocale: (locale: 'zh' | 'en' | null) => void;
   /** Type-strict body validator for the maintenance segment. */
   parseMaintenancePatch: (body: unknown) => ParseMaintenanceResult;
   /** True iff the current install is a source-checkout (auto-update unavailable). */
   isLocalDevInstall: () => boolean;
   /** Returns the post-merge view the response body echoes back to the caller. */
   resolveDashboardSettings: () => ResolvedDashboardSettingsView;
+  /** Validate locale string. */
+  isLocale: (v: unknown) => v is 'zh' | 'en';
+  /** Fan out locale reload to all online daemons. */
+  reloadLocaleOnAllDaemons?: () => Promise<void>;
 }
 
 /** Production deps wiring — call once per dashboard process. */
 export function defaultSettingsWriteApplierDeps(
   resolveDashboardSettings: () => ResolvedDashboardSettingsView,
+  reloadLocaleOnAllDaemons?: () => Promise<void>,
 ): SettingsWriteApplierDeps {
   return {
     readGlobalConfig,
     mergeDashboardConfig,
+    mergeGlobalConfig,
     mergeMaintenanceConfig,
+    setGlobalLocale,
     parseMaintenancePatch,
     isLocalDevInstall,
     resolveDashboardSettings,
+    isLocale,
+    reloadLocaleOnAllDaemons,
   };
 }
 
@@ -82,6 +98,8 @@ export type ApplySettingsWriteResult =
 export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
+  | 'invalid_repoPickerMode'
+  | 'invalid_lang'
   | 'invalid_maintenance' // ← never returned literally; surfaces parseMaintenancePatch's reason instead
   | 'local_dev_no_autoupdate'
   | 'autoupdate_required'
@@ -94,15 +112,17 @@ export type ApplySettingsWriteError =
  *
  * Behaviour mirrors `dashboard.ts:460-498` exactly:
  *   - Validates `publicReadOnly` / `openTerminalInFeishu` are booleans.
+ *   - Validates `repoPickerMode` is 'all' | 'repos'.
+ *   - Validates `lang` is a valid locale or null.
  *   - Defers maintenance validation to `parseMaintenancePatch` (returns its error verbatim).
  *   - Forbids enabling `autoUpdate` on a local-dev install.
  *   - Forbids enabling `autoRestart` unless `autoUpdate` is (or is being) enabled.
- *   - Returns `empty_patch` when neither dashboard fields nor maintenance changed.
+ *   - Returns `empty_patch` when no fields changed.
  */
-export function applySettingsWrite(
+export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
-): ApplySettingsWriteResult {
+): Promise<ApplySettingsWriteResult> {
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
@@ -127,6 +147,15 @@ export function applySettingsWrite(
     touched = true;
   }
 
+  if ('repoPickerMode' in obj) {
+    const v = obj.repoPickerMode;
+    if (v !== 'all' && v !== 'repos') {
+      return { ok: false, error: 'invalid_repoPickerMode' };
+    }
+    deps.mergeGlobalConfig({ repoPickerMode: v });
+    touched = true;
+  }
+
   if ('maintenance' in obj) {
     const r = deps.parseMaintenancePatch(obj.maintenance);
     if (!r.ok) return { ok: false, error: r.error };
@@ -143,6 +172,18 @@ export function applySettingsWrite(
       if (!autoUpdateOn) return { ok: false, error: 'autoupdate_required' };
     }
     deps.mergeMaintenanceConfig(r.patch);
+    touched = true;
+  }
+
+  if ('lang' in obj) {
+    const v = obj.lang;
+    if (v !== null && !deps.isLocale(v)) {
+      return { ok: false, error: 'invalid_lang' };
+    }
+    deps.setGlobalLocale(v === null ? null : v);
+    if (deps.reloadLocaleOnAllDaemons) {
+      await deps.reloadLocaleOnAllDaemons();
+    }
     touched = true;
   }
 

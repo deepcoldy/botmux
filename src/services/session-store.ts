@@ -3,13 +3,21 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import { mergePendingResponseState } from '../core/pending-response.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+
+// Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
+// no longer exist on Session and nothing reads them, but sessions persisted
+// before the removal still carry them on disk. Strip on write so the file
+// converges to clean on the first save (daemon + CLI both call this).
+const LEGACY_PENDING_CARD_FIELDS = ['pendingResponseCardId', 'pendingResponseCardState', 'lastPatchedResponseCardId'] as const;
+export function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
+  for (const f of LEGACY_PENDING_CARD_FIELDS) delete session[f];
+}
 
 /**
  * Initialise session store for a specific bot (multi-daemon mode).
@@ -73,27 +81,35 @@ function load(): void {
   loaded = true;
 }
 
-function readExistingSessionsFromDisk(fp: string): Record<string, Session> {
-  if (!existsSync(fp)) return {};
+function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record<string, Session> } {
+  if (!existsSync(fp)) return { raw: '', parsed: {} };
   try {
-    return JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
+    const raw = readFileSync(fp, 'utf-8');
+    return { raw, parsed: JSON.parse(raw) as Record<string, Session> };
   } catch {
-    return {};
+    return { raw: '', parsed: {} };
   }
 }
 
 function save(): void {
   ensureDir();
   const fp = getFilePath();
-  const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  const existing = readExistingSessionsFromDisk(fp);
+  const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
   const obj: Record<string, Session> = {};
   for (const [k, v] of sessions) {
-    const merged = mergePendingResponseState(v, existing[k]);
-    sessions.set(k, merged);
-    obj[k] = merged;
+    stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
+    obj[k] = v;
   }
-  writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
+  const json = JSON.stringify(obj, null, 2);
+  // The daemon fires several updateSession()/save() calls per inbound message
+  // (activity bump, pid, stream-card state, …) and many leave the serialized
+  // file byte-identical. Skipping the temp-file write + rename in that case
+  // elides the bulk of the redundant disk I/O — and writing identical bytes is
+  // a guaranteed no-op, so this can't drop state or race a concurrent writer
+  // (we compare against what's actually on disk right now).
+  if (json === existingRaw) return;
+  const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmpFp, json, 'utf-8');
   renameSync(tmpFp, fp);
 }
 
@@ -221,6 +237,41 @@ export function countActiveSessionsOnDisk(dataDir: string = config.session.dataD
     }
   } catch { /* missing dir → 0 */ }
   return n;
+}
+
+/**
+ * Collect every CLI session identity botmux has ever recorded — across ALL bot
+ * store files, ANY status (active or closed). Returns both each session's
+ * botmux `sessionId` (which, for claude-family, IS the on-disk jsonl filename
+ * since botmux spawns with `--session-id <id>`) and its `cliSessionId` (the
+ * CLI-native id after any resume/rotation, e.g. a codex/traex rollout id).
+ *
+ * Used by `/adopt`'s resume-import discovery to hide sessions botmux already
+ * manages — live OR closed — so the picker surfaces only genuinely external
+ * sessions (a CLI the user ran standalone). Closed botmux sessions remain
+ * resumable via their own session-closed cards.
+ */
+export function collectBotmuxSessionIdentities(dataDir: string = config.session.dataDir): Set<string> {
+  const ids = new Set<string>();
+  const add = (s: Session | undefined) => {
+    if (!s) return;
+    if (s.sessionId) ids.add(s.sessionId);
+    if (s.cliSessionId) ids.add(s.cliSessionId);
+  };
+  // In-memory first (freshest — covers ids not yet flushed to disk).
+  load();
+  for (const s of sessions.values()) add(s);
+  // Then every bot's persisted store file (other daemons own their own files).
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (!file.startsWith('sessions') || !file.endsWith('.json')) continue;
+      try {
+        const data: Record<string, Session> = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+        for (const s of Object.values(data)) add(s);
+      } catch { continue; }
+    }
+  } catch { /* missing dir → in-memory only */ }
+  return ids;
 }
 
 function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session[] {

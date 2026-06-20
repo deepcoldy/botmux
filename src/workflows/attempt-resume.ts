@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,12 +24,13 @@ import {
   isValidPathSegment,
   isValidRunId,
 } from './ops-projection.js';
+import { prependBotmuxBin } from '../core/botmux-wrapper.js';
 
 export const ATTEMPT_RESUME_SCHEMA_VERSION = 1;
 export const ATTEMPT_RESUME_IDLE_MS = 30 * 60 * 1000;
 export const ATTEMPT_RESUME_GRACE_MS = 5000;
 export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'codex-app', 'cursor', 'mira']);
-export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'seed', 'codex', 'mtr', 'hermes', 'pi']);
+export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'seed', 'relay', 'codex', 'mtr', 'hermes', 'pi', 'mir']);
 
 export type AttemptResumeStatus = 'starting' | 'live' | 'closed';
 
@@ -236,7 +238,7 @@ export class AttemptResumeManager {
       cwd: workingDir,
       env: {
         ...process.env,
-        PATH: `${join(homedir(), '.botmux', 'bin')}:${process.env.PATH ?? ''}`,
+        PATH: prependBotmuxBin(join(homedir(), '.botmux', 'bin'), process.env.PATH),
         BOTMUX_WORKFLOW: '1',
         BOTMUX_WORKFLOW_RESUME: '1',
         BOTMUX_WORKFLOW_RUN_ID: input.runId,
@@ -457,7 +459,7 @@ export class AttemptResumeManager {
       ...(status === 'closed' ? { closedAt: now, closeReason: entry.closeReason } : {}),
     };
     mkdirSync(dirname(entry.sidecarPath), { recursive: true });
-    writeFileSync(entry.sidecarPath, JSON.stringify(sidecar, null, 2), 'utf-8');
+    atomicWriteFileSync(entry.sidecarPath, JSON.stringify(sidecar, null, 2));
   }
 
   private resumeUrl(webPort: number, writeToken: string): string {

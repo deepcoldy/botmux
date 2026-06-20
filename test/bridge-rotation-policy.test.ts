@@ -3,6 +3,7 @@ import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
   decideFingerprintSwitch,
+  shouldHealAbsentBaseline,
   sessionIdFromJsonlPath,
 } from '../src/services/bridge-rotation-policy.js';
 
@@ -244,5 +245,52 @@ describe('decideFingerprintSwitch', () => {
     });
     const r = decideFingerprintSwitch(input);
     expect(r).toEqual({ action: 'no-match' });
+  });
+});
+
+describe('shouldHealAbsentBaseline', () => {
+  it('heals when baseline not done, a path is pinned, and the file is absent', () => {
+    // The user-reported stuck case: resume/restore guessed <botmux-sid>.jsonl,
+    // Claude wrote under a different sessionId, so the guessed file never
+    // appears. An absent file has no history to absorb → safe to arm
+    // fresh-empty readiness so the turn gets marked and fingerprint recovery
+    // can find the real transcript.
+    expect(shouldHealAbsentBaseline({
+      baselineDone: false,
+      hasJsonlPath: true,
+      jsonlFileExists: false,
+    })).toBe(true);
+  });
+
+  it('does NOT heal when the pinned file exists (slow-resume-with-history)', () => {
+    // The genuine resume case: the file exists with prior turns. Healing here
+    // (offset 0) would re-emit history as live turns. Defer to normal
+    // lazy-baseline instead.
+    expect(shouldHealAbsentBaseline({
+      baselineDone: false,
+      hasJsonlPath: true,
+      jsonlFileExists: true,
+    })).toBe(false);
+  });
+
+  it('does NOT heal once baseline is already done', () => {
+    expect(shouldHealAbsentBaseline({
+      baselineDone: true,
+      hasJsonlPath: true,
+      jsonlFileExists: false,
+    })).toBe(false);
+    expect(shouldHealAbsentBaseline({
+      baselineDone: true,
+      hasJsonlPath: true,
+      jsonlFileExists: true,
+    })).toBe(false);
+  });
+
+  it('does NOT heal when no path is pinned (nothing to recover onto)', () => {
+    expect(shouldHealAbsentBaseline({
+      baselineDone: false,
+      hasJsonlPath: false,
+      jsonlFileExists: false,
+    })).toBe(false);
   });
 });

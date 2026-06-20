@@ -237,6 +237,39 @@ describe('card-handler grant actions', () => {
     expect(entries).toEqual([{ openId: 'ou_a', name: '张三' }, { openId: 'ou_bot2', name: 'Codex' }]);
   });
 
+  // 申晗实测 bug：手动 /grant 一个 bot 后，通知卡若 <at> 对方 bot 会唤醒其 daemon 误拉空会话。
+  // 修复后通知卡对 bot grantee 只用纯文本名字（无 <at>），对真人仍 @。
+  it('通知卡：bot grantee 用纯文本名字（无 <at>），不唤醒对方 bot', async () => {
+    const { pending, handler } = await fresh();
+    // 默认 isHumanMock=false → ou_bot2 判为 bot。
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_bot2']);
+    const data: any = {
+      operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
+      action: { value: { action: 'grant_chat', target_open_ids: ['ou_bot2'], target_names: ['Codex'], chat_id: 'oc_1', nonce } },
+    };
+    await handler.handleCardAction(data, deps, 'h1');
+    await flushBackground();
+    const notify = replyMock.mock.calls.at(-1)![2] as string;
+    expect(notify).not.toContain('<at id=ou_bot2');   // bot 绝不被 <at>
+    expect(notify).toContain('Codex');                 // 纯文本名字保留可读信息
+  });
+
+  it('通知卡：真人 grantee 仍 @ 点名（真人被 @ 不会自动开会话）', async () => {
+    const { pending, handler } = await fresh();
+    isHumanMock.mockImplementation(async (_app: string, openId: string) => openId === 'ou_human');
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_human', 'ou_bot2']);
+    const data: any = {
+      operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
+      action: { value: { action: 'grant_chat', target_open_ids: ['ou_human', 'ou_bot2'], target_names: ['真人', 'Codex'], chat_id: 'oc_1', nonce } },
+    };
+    await handler.handleCardAction(data, deps, 'h1');
+    await flushBackground();
+    const notify = replyMock.mock.calls.at(-1)![2] as string;
+    expect(notify).toContain('<at id=ou_human></at>');  // 真人 → @
+    expect(notify).not.toContain('<at id=ou_bot2');      // bot → 纯文本
+    expect(notify).toContain('Codex');
+  });
+
   it('grant 成功 → 查通讯录确认是真人的目标不登记花名册（避免污染 bot 列表）', async () => {
     const { registry, pending, handler } = await fresh();
     isHumanMock.mockImplementation(async (_app: string, openId: string) => openId === 'ou_human');

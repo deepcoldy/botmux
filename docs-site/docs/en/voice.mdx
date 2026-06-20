@@ -1,0 +1,103 @@
+# Voice Summary
+
+Turn the AI's text reply into a **voice message** in your Lark group with one click. Every reply card gets a "🔊 Voice Summary" button at the bottom — tap it, and the bot condenses that reply into spoken language, synthesizes a voice bubble, and sends it to the current topic.
+
+<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421547656_voice-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+- **On-demand trigger**: Nothing is generated automatically by default — it only happens when you tap, so you don't get a long voice clip attached to every reply.
+- **Condense first, then synthesize**: After you tap, the model compresses the original reply into a few spoken sentences (stripping out code, paths, links, and other content that doesn't read aloud well), so what you hear is a "plain-speech" summary rather than the original text read verbatim.
+- **Permission gate**: Only members with "chat / operate" permission on that bot can tap it; others who tap get a "needs authorization" prompt.
+- **Generated only once per reply**: The voice for a given reply is generated only once, so multiple taps won't flood the chat.
+
+> Voice is an **optional advanced feature**: you must first configure a text-to-speech (TTS) engine; until you do, the button won't appear on reply cards.
+
+## Configure the voice engine
+
+Configure interactively with the dedicated command `botmux voice` (deliberately kept separate from `botmux setup`). The configuration is written to the `voice` block of the global `~/.botmux/config.json`, and takes effect after `botmux restart`.
+
+Two kinds of engines are supported — **pick one based on your identity**:
+
+### ByteDance tenant: SAMI (large-model speech synthesis)
+
+Internal ByteDance users can use the company's large-model speech synthesis (SAMI) directly — natural voices, no need to run your own service.
+
+**① Apply for credentials (one-time)**
+
+- On the company **Speech Capability Platform**, apply for the "**Speech Synthesis (large model)**" capability (botmux only does synthesis; speech recognition is not needed).
+- You'll get three things: **appkey**, **AccessKey**, **SecretKey**.
+- If you hit a "Namespace not enabled / no route" message, go through internal **Oncall** to have the Speech team enable it in the Ops Center.
+
+> To find the application entry, search "Speech Synthesis Large Model / SAMI" on the internal platform, or just ask the Speech team directly.
+
+**② Configure**
+
+```bash
+botmux voice          # Interactive: select SAMI → paste accessKey / secretKey / appkey in turn
+botmux restart        # Take effect
+```
+
+The voice defaults to "灿灿" (Cancan), which you can change to another voice id during configuration. The service endpoint is built in, no need to fill it. The SecretKey is only used locally to sign and exchange for a temporary token; it's never sent out.
+
+### External users: OpenAI-compatible engine
+
+External / open-source users can connect any TTS service that's **compatible with the OpenAI speech API** — it can be OpenAI's official service, or self-hosted (e.g. Kokoro-FastAPI, openedai-speech, etc.).
+
+**① Prepare a TTS service, and get three things:**
+
+- **baseUrl**: the service address. OpenAI's official is `https://api.openai.com/v1`; for self-hosted, fill in your own (e.g. `http://127.0.0.1:8880/v1`).
+- **apiKey**: the service key (can be left empty if your self-hosted service has no auth).
+- **model**: the model name. For OpenAI it's `tts-1`; for self-hosted, follow your service's docs (e.g. `kokoro`).
+
+**② Configure**
+
+```bash
+botmux voice          # Interactive: select OpenAI-compatible → fill in baseUrl / apiKey / model
+botmux restart        # Take effect
+```
+
+The voice is optional: OpenAI defaults to `alloy`; for self-hosted, fill in a voice your service supports.
+
+## System dependencies
+
+The synthesized output needs to be encoded into the opus format used by Lark voice bubbles, which depends on the system's **opus-tools** (providing `opusenc`). **When you run `botmux voice` to configure, it auto-detects this; if it's missing, it asks and installs it for you** (using the same package manager + sudo logic as tmux). You can also install it manually:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y opus-tools
+# macOS
+brew install opus-tools
+```
+
+## Management commands
+
+```bash
+botmux voice          # Configure (interactive)
+botmux voice status   # View the current configuration (credentials auto-masked)
+botmux voice disable  # Turn off voice (removes the configuration, the button disappears with it)
+```
+
+## Config file reference
+
+You can also edit the `voice` block of `~/.botmux/config.json` directly:
+
+```jsonc
+// ByteDance tenant (SAMI)
+{
+  "voice": {
+    "engine": "sami",
+    "speaker": "zh_female_cancan_mars_bigtts",   // Optional, defaults to Cancan
+    "sami": { "accessKey": "...", "secretKey": "...", "appkey": "..." }
+  }
+}
+
+// External users (OpenAI-compatible)
+{
+  "voice": {
+    "engine": "openai",
+    "speaker": "alloy",                            // Optional
+    "openai": { "baseUrl": "https://api.openai.com/v1", "apiKey": "...", "model": "tts-1" }
+  }
+}
+```
+
+**Per-bot override** is supported: put the same `voice` block inside a bot object in `bots.json`, and it overlays the global config field by field (multiple bots can share one config, or each can have its own).

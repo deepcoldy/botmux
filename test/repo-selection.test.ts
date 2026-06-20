@@ -55,6 +55,29 @@ describe('resolveRepoSelection', () => {
     expect(r!.displayName).toBe('proj (dev)');
   });
 
+  it('resolves an explicit linked worktree path', () => {
+    const repo = join(scanDir, 'proj');
+    mkdirSync(repo);
+    gitInit(repo, 'main');
+
+    const worktreeRoot = realpathSync(mkdtempSync(join(tmpdir(), 'bmx-repo-worktree-')));
+    const worktree = join(worktreeRoot, 'proj-feature');
+    execSync(`git worktree add -q -b feature/test "${worktree}"`, {
+      cwd: repo,
+      stdio: 'pipe',
+    });
+
+    try {
+      const r = resolveRepoSelection(worktree, [scanDir]);
+      expect(r).not.toBeNull();
+      expect(realpathSync(r!.path)).toBe(worktree);
+      expect(r!.displayName).toBe('proj (feature/test)');
+    } finally {
+      execSync(`git worktree remove -f "${worktree}"`, { cwd: repo, stdio: 'pipe' });
+      rmSync(worktreeRoot, { recursive: true, force: true });
+    }
+  });
+
   it('resolves a relative path against the scan dir', () => {
     const repo = join(scanDir, 'nested', 'app');
     mkdirSync(repo, { recursive: true });

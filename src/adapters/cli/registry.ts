@@ -5,6 +5,7 @@ import { isAbsolute, join } from 'node:path';
 import type { CliAdapter, CliId } from './types.js';
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createSeedAdapter } from './seed.js';
+import { createRelayAdapter } from './relay.js';
 import { createAidenAdapter } from './aiden.js';
 import { createCocoAdapter } from './coco.js';
 import { createCodexAdapter } from './codex.js';
@@ -16,9 +17,11 @@ import { createAntigravityAdapter } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
 import { createMiraAdapter } from './mira.js';
+import { createMirAdapter } from './mir.js';
 import { createTraexAdapter } from './traex.js';
 import { createPiAdapter } from './pi.js';
 import { createCopilotAdapter } from './copilot.js';
+import { createOhMyPiAdapter } from './oh-my-pi.js';
 
 /** Resolve a command name to its absolute path via shell `which`.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
@@ -101,13 +104,14 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
   switch (id.toLowerCase() as CliId) {
     case 'claude-code': return createClaudeCodeAdapter(pathOverride);
     case 'seed': return createSeedAdapter(pathOverride);
+    case 'relay': return createRelayAdapter(pathOverride);
     case 'aiden': return createAidenAdapter(pathOverride);
     case 'coco': return createCocoAdapter(pathOverride);
     case 'codex': return createCodexAdapter(pathOverride);
@@ -119,9 +123,11 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'mtr': return createMtrAdapter(pathOverride);
     case 'hermes': return createHermesAdapter(pathOverride);
     case 'mira': return createMiraAdapter(pathOverride);
+    case 'mir': return createMirAdapter(pathOverride);
     case 'traex': return createTraexAdapter(pathOverride);
     case 'pi': return createPiAdapter(pathOverride);
     case 'copilot': return createCopilotAdapter(pathOverride);
+    case 'oh-my-pi': return createOhMyPiAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

@@ -1,14 +1,17 @@
 /**
- * Schedules list card (PR3 `/dashboard schedules` slice 1 + slice 2a).
+ * Schedules list card (PR3 `/dashboard schedules` slice 1 + slice 2a/2b).
  *
  * Slice 1 — read-only list + pagination + refresh.
  * Slice 2a — per-row "📂 详情" button opens a detail card; detail card has
  *           "⏸ 暂停" / "▶ 恢复" (mutually exclusive) + "🔙 返回" actions.
+ * Slice 2b — detail card adds delivery-mode switching between "原话题" and
+ *           "每次新话题" (mutually exclusive). `local` is read-only here.
  *
  * Detail-card pattern (codex 2026-06-10 scope-cut):
  *  - List card stays read-only beyond the "📂 详情" inline button.
  *  - All action buttons live on the detail card.
- *  - Pause/Resume are the ONLY actions this slice. Run-now lands in slice 2b.
+ *  - Pause/Resume landed first; delivery-mode switching is the next reversible
+ *    state toggle. Run-now stays out because it is a one-shot side effect.
  *
  * Sync pause/resume (NOT optimistic state):
  *  - The pause/resume callback awaits the Route B POST inline.
@@ -30,7 +33,7 @@
  *  - `value.schedule_id` is read but NEVER trusted for identity — only used
  *    as the routing key. The owner gate is the only authority. The Route B
  *    upstream further enforces `ownerOf(schedule_id)` scope (and as of
- *    2026-06-10 also gates cross-bot pause/resume by `callerAppId`).
+ *    2026-06-10 also gates cross-bot schedule writes by `callerAppId`).
  *  - Before any POST we re-run the PR1 `computeButtonAvailability` matrix
  *    against the fresh snapshot and fail-closed if the chosen action is
  *    disabled — client-side `disabled` is UX only and a replayed event or an
@@ -45,10 +48,13 @@ import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
 import type {
   ScheduleCardTaskInput,
   ScheduleDetailDto,
+  ScheduleDelivery,
   ScheduleRowDto,
 } from '../../dashboard/schedule-card-model.js';
 import {
+  computeDeliveryButtonAvailability,
   computeButtonAvailability,
+  normalizeScheduleDelivery,
   paginateSchedules,
   toScheduleDetailDto,
   toScheduleRowDto,
@@ -63,6 +69,7 @@ export const SCHEDULES_ACTION_PAGE = 'dash_schedules_page' as const;
 export const SCHEDULES_ACTION_DETAIL = 'dash_schedules_detail' as const;
 export const SCHEDULES_ACTION_PAUSE = 'dash_schedules_pause' as const;
 export const SCHEDULES_ACTION_RESUME = 'dash_schedules_resume' as const;
+export const SCHEDULES_ACTION_DELIVERY = 'dash_schedules_delivery' as const;
 export const SCHEDULES_ACTION_BACK_TO_LIST = 'dash_schedules_back_to_list' as const;
 /** Action emitted by "🔙 返回总览" on overview-origin sub-cards. Same string
  *  as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't import
@@ -360,25 +367,41 @@ function botLabelFromRow(row: ScheduleRowDto): string {
   return '—';
 }
 
+function deliveryLabel(deliver: ScheduleDelivery, locale: Locale): string {
+  switch (deliver) {
+    case 'new-topic':
+      return t('card.dashboard.schedules.delivery.new_topic', undefined, locale);
+    case 'local':
+      return t('card.dashboard.schedules.delivery.local', undefined, locale);
+    case 'origin':
+    default:
+      return t('card.dashboard.schedules.delivery.origin', undefined, locale);
+  }
+}
+
+function nextDeliveryTarget(deliver: ScheduleDelivery): Exclude<ScheduleDelivery, 'local'> {
+  return deliver === 'new-topic' ? 'origin' : 'new-topic';
+}
+
 /** Slice-2a options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
 export interface BuildSchedulesDetailCardOpts {
   invokerOpenId: string;
   locale: Locale;
-  /** Overview drilldown nav state — threaded into the "🔙 返回" button so
+  /** Overview drilldown nav state — threaded into action buttons so
    *  the list rebuilt by BACK_TO_LIST is still drilldown-shaped (5/page +
    *  return-to-overview). Detail itself does NOT render return-to-overview. */
   origin?: 'overview';
   pageSize?: number;
-  /** Global-scope flag (2026-06-11) — threaded into pause/resume/back so
+  /** Global-scope flag (2026-06-11) — threaded into action buttons so
    *  the rebuilt list and follow-on writes keep `?scope=global` semantics. */
   scope?: 'global';
 }
 
 /**
  * Build the detail card (slice 2a). Status icon + bold title + id monospace;
- * key/value block for name/enabled/kind/displayExpr/nextRunAt/lastRunAt/
- * lastStatus/repeat/prompt; next-N runs list; action row with pause/resume +
- * back.
+ * key/value block for name/enabled/kind/displayExpr/delivery/nextRunAt/
+ * lastRunAt/lastStatus/repeat/prompt; next-N runs list; action row with
+ * pause/resume + delivery + back.
  *
  * Pause and resume are MUTUALLY EXCLUSIVE per the PR1 matrix:
  *   enabled === true → pause clickable, resume disabled (alreadyEnabled)
@@ -427,6 +450,13 @@ export function buildSchedulesDetailCard(
     t(
       'card.dashboard.schedules.detail.display_label',
       { expr: escapeLarkMd(detail.displayExpr) },
+      opts.locale,
+    ),
+  );
+  infoLines.push(
+    t(
+      'card.dashboard.schedules.detail.delivery_label',
+      { delivery: escapeLarkMd(deliveryLabel(detail.deliver, opts.locale)) },
       opts.locale,
     ),
   );
@@ -512,9 +542,13 @@ export function buildSchedulesDetailCard(
   }
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
-  // ─── Action row — pause / resume (mutually exclusive) + back ───────────
+  // ─── Action row — pause / resume + delivery (mutually exclusive) + back ─
   const pauseEnabled = detail.actions.pause.enabled === true;
   const resumeEnabled = detail.actions.resume.enabled === true;
+  const currentDelivery = normalizeScheduleDelivery(detail.raw.deliver);
+  const deliveryTarget = nextDeliveryTarget(currentDelivery);
+  const deliveryButtonState = computeDeliveryButtonAvailability(detail.raw, deliveryTarget);
+  const deliveryEnabled = deliveryButtonState.enabled === true;
   const pauseButton: Record<string, unknown> = {
     tag: 'button',
     text: { tag: 'plain_text', content: t('card.dashboard.schedules.btn.pause', undefined, opts.locale) },
@@ -539,11 +573,34 @@ export function buildSchedulesDetailCard(
     },
   };
   if (!resumeEnabled) resumeButton.disabled = true;
+  const deliveryButton: Record<string, unknown> = {
+    tag: 'button',
+    text: {
+      tag: 'plain_text',
+      content: t(
+        deliveryTarget === 'new-topic'
+          ? 'card.dashboard.schedules.btn.use_new_topic'
+          : 'card.dashboard.schedules.btn.use_origin',
+        undefined,
+        opts.locale,
+      ),
+    },
+    type: deliveryEnabled ? 'primary' : 'default',
+    value: {
+      action: SCHEDULES_ACTION_DELIVERY,
+      invoker_open_id: opts.invokerOpenId,
+      schedule_id: detail.id,
+      target_delivery: deliveryTarget,
+      ...navFields,
+    },
+  };
+  if (!deliveryEnabled) deliveryButton.disabled = true;
   elements.push({
     tag: 'action',
     actions: [
       pauseButton,
       resumeButton,
+      deliveryButton,
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.dashboard.schedules.btn.back', undefined, opts.locale) },
@@ -573,6 +630,17 @@ export function buildSchedulesDetailCard(
   }
   if (!resumeEnabled) {
     const reasonKey = mapResumeDisabledReason(detail.actions.resume.reasonKey);
+    if (reasonKey) {
+      elements.push({
+        tag: 'note',
+        elements: [
+          { tag: 'lark_md', content: t(reasonKey, undefined, opts.locale) },
+        ],
+      });
+    }
+  }
+  if (!deliveryEnabled) {
+    const reasonKey = mapDeliveryDisabledReason(deliveryButtonState.reasonKey);
     if (reasonKey) {
       elements.push({
         tag: 'note',
@@ -616,6 +684,19 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
   switch (reasonKey) {
     case 'schedules.action.resume.alreadyEnabled':
       return 'card.dashboard.schedules.resume.disabled.alreadyEnabled';
+    default:
+      return undefined;
+  }
+}
+
+function mapDeliveryDisabledReason(reasonKey: string | undefined): string | undefined {
+  switch (reasonKey) {
+    case 'schedules.action.delivery.local':
+      return 'card.dashboard.schedules.delivery.disabled.local';
+    case 'schedules.action.delivery.alreadyOrigin':
+      return 'card.dashboard.schedules.delivery.disabled.alreadyOrigin';
+    case 'schedules.action.delivery.alreadyNewTopic':
+      return 'card.dashboard.schedules.delivery.disabled.alreadyNewTopic';
     default:
       return undefined;
   }
@@ -697,6 +778,7 @@ export async function handleSchedulesCardAction(
     SCHEDULES_ACTION_DETAIL,
     SCHEDULES_ACTION_PAUSE,
     SCHEDULES_ACTION_RESUME,
+    SCHEDULES_ACTION_DELIVERY,
     SCHEDULES_ACTION_BACK_TO_LIST,
   ]);
   if (!validActions.has(action)) {
@@ -850,7 +932,80 @@ export async function handleSchedulesCardAction(
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3c) BACK TO LIST — rebuild list card at page 1 ─────────────────
+  // ─── 3c) DELIVERY — switch origin ↔ new-topic synchronously ──────────
+  if (action === SCHEDULES_ACTION_DELIVERY) {
+    const scheduleId = value.schedule_id;
+    if (typeof scheduleId !== 'string' || !scheduleId) {
+      return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
+    }
+    const targetDelivery =
+      value.target_delivery === 'origin' || value.target_delivery === 'new-topic'
+        ? value.target_delivery
+        : undefined;
+    if (!targetDelivery) {
+      return ackToast('card.dashboard.settings.invalid_action', locale);
+    }
+    const failedKey = 'card.dashboard.schedules.delivery_failed';
+
+    const pre = await safeGetSchedulesList(client, locale, listPathSuffix);
+    if ('errorResult' in pre) return pre.errorResult;
+    const before = pre.tasks.find(t => t.id === scheduleId);
+    if (!before) {
+      return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
+    }
+
+    // Server-side action matrix for delivery mirrors pause/resume: the card
+    // paint is UX only. Re-read the latest row and verify this exact target
+    // is still a legal transition before calling the owner daemon.
+    const deliveryState = computeDeliveryButtonAvailability(before, targetDelivery);
+    if (deliveryState.enabled !== true) {
+      const mappedKey = mapDeliveryDisabledReason(deliveryState.reasonKey) ?? failedKey;
+      return errorToast(mappedKey, undefined, locale);
+    }
+
+    let resp: Awaited<ReturnType<DaemonClient['request']>>;
+    try {
+      resp = await client.request({
+        method: 'POST',
+        path: `/__daemon/schedules/${encodeURIComponent(scheduleId)}/delivery${writePathSuffix}`,
+      });
+    } catch (e) {
+      return errorToast(failedKey, { reason: (e as Error).message }, locale);
+    }
+    if (resp.status !== 200) {
+      const body = (resp.body ?? {}) as Record<string, unknown>;
+      const reason = String(body.error ?? `http_${resp.status}`);
+      return errorToast(failedKey, { reason }, locale);
+    }
+
+    const responseDeliver =
+      (resp.body as { deliver?: unknown } | undefined)?.deliver === 'origin' ||
+      (resp.body as { deliver?: unknown } | undefined)?.deliver === 'new-topic'
+        ? (resp.body as { deliver: 'origin' | 'new-topic' }).deliver
+        : targetDelivery;
+    const postRefetch = await safeGetSchedulesList(client, locale, listPathSuffix);
+    let after: ScheduleCardTaskInput | undefined;
+    if (!('errorResult' in postRefetch)) {
+      after = postRefetch.tasks.find(t => t.id === scheduleId);
+    }
+    if (!after) {
+      // Delivery toggle succeeded upstream but the refetch was stale/missing.
+      // Keep the card interactive by rendering a synth row with the known
+      // target mode; the next refresh converges to the owner daemon snapshot.
+      after = { ...before, deliver: responseDeliver };
+    }
+    const detail = toScheduleDetailDto(after, { nowMs: now() });
+    const cardJson = buildSchedulesDetailCard(detail, {
+      invokerOpenId: expectedOwner,
+      locale,
+      origin: navOrigin,
+      pageSize: navPageSize,
+      scope: navScope,
+    });
+    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+  }
+
+  // ─── 3d) BACK TO LIST — rebuild list card at page 1 ─────────────────
   if (action === SCHEDULES_ACTION_BACK_TO_LIST) {
     const r = await safeGetSchedulesList(client, locale, listPathSuffix);
     if ('errorResult' in r) return r.errorResult;
@@ -869,7 +1024,7 @@ export async function handleSchedulesCardAction(
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3d) Slice-1 actions — REFRESH + PAGE ───────────────────────────
+  // ─── 3e) Slice-1 actions — REFRESH + PAGE ───────────────────────────
   // `action` is already constrained to validActions above; the only ones
   // left here are REFRESH + PAGE (the other 4 returned early).
   let page = 1;

@@ -1,7 +1,8 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import {
-  readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync,
+  readFileSync, existsSync, mkdirSync, chmodSync,
 } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
 
 const NONCE_TTL_MS = 60_000;
@@ -12,16 +13,46 @@ const seenNonces = new Map<string, number>();   // nonce → expiresAt
 export interface HmacAttempt { ts: string; nonce: string; sig: string; }
 
 /**
+ * Canonical "binding" string mixed into the signed payload so a captured HMAC
+ * header can't be replayed against a different route or port. Without it, a
+ * single set of `X-Botmux-Cli-*` headers signed only over `ts:nonce` is valid
+ * for ANY `/__cli/*` route on ANY dashboard — which lets a malicious local
+ * server, handed a discovery probe, forward the headers to the real dashboard
+ * (e.g. a `/__cli/current` probe relayed to `/__cli/rotate` to mint a token).
+ * Binding `method + path + bound-port` makes the credential single-purpose:
+ *  - the verifier uses the port IT actually bound (not the attacker-controlled
+ *    Host header), so a forward from port X to the dashboard on port Y mismatches;
+ *  - a `/__cli/current` capture can't be replayed to `/__cli/rotate` (path differs).
+ */
+export function cliAuthBind(method: string, path: string, port: number | string): string {
+  return `${String(method).toUpperCase()} ${path} ${port}`;
+}
+
+/** Mint the three `X-Botmux-Cli-*` header values for a loopback request.
+ *  Pass the same `bind` (see {@link cliAuthBind}) the verifier will reconstruct;
+ *  omit it only for the legacy daemon-IPC scheme that signs bare `ts:nonce`. */
+export function signCliAuth(secretB64Url: string, bind?: string): HmacAttempt {
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const nonce = randomBytes(8).toString('hex');
+  const msg = bind ? `${ts}:${nonce}:${bind}` : `${ts}:${nonce}`;
+  const sig = createHmac('sha256', secretB64Url).update(msg).digest('base64url');
+  return { ts, nonce, sig };
+}
+
+/**
  * Verify a CLI rotation HMAC attempt.
  * - Source IP must be loopback (127.0.0.1 / ::1 / IPv4-mapped form).
  * - Timestamp must be within ±TS_WINDOW_S seconds of now.
  * - Nonce must not have been seen in the last NONCE_TTL_MS.
- * - HMAC-SHA256(secret, `${ts}:${nonce}`) must match `sig` (timing-safe).
+ * - HMAC-SHA256(secret, `${ts}:${nonce}` [+ `:${bind}`]) must match `sig`
+ *   (timing-safe). Pass `bind` (method+path+port) to scope the credential to a
+ *   single route/port; omit it for the legacy bare daemon-IPC scheme.
  */
 export function verifyHmac(
   secretB64Url: string,
   attempt: HmacAttempt,
   remoteAddr: string,
+  bind?: string,
 ): { ok: boolean; reason?: string } {
   if (
     remoteAddr !== '127.0.0.1' &&
@@ -40,9 +71,8 @@ export function verifyHmac(
   for (const [n, exp] of seenNonces) if (exp < now) seenNonces.delete(n);
   if (seenNonces.has(attempt.nonce)) return { ok: false, reason: 'replay' };
 
-  const expected = createHmac('sha256', secretB64Url)
-    .update(`${attempt.ts}:${attempt.nonce}`)
-    .digest();
+  const msg = bind ? `${attempt.ts}:${attempt.nonce}:${bind}` : `${attempt.ts}:${attempt.nonce}`;
+  const expected = createHmac('sha256', secretB64Url).update(msg).digest();
   let provided: Buffer;
   try { provided = Buffer.from(attempt.sig, 'base64url'); }
   catch { return { ok: false, reason: 'bad_sig' }; }
@@ -78,7 +108,7 @@ export function loadPersistedToken(tokenPath: string): string | null {
 /** Persist the active dashboard token to `tokenPath` with 0600 perms. */
 export function persistToken(tokenPath: string, token: string): void {
   mkdirSync(dirname(tokenPath), { recursive: true });
-  writeFileSync(tokenPath, token, { mode: 0o600 });
+  atomicWriteFileSync(tokenPath, token, { mode: 0o600 });
   chmodSync(tokenPath, 0o600);
 }
 
@@ -175,7 +205,8 @@ export function decideDashboardAuth(opts: {
     pathname.startsWith('/api/workflows/') &&
     !isRawTerminalLog;
   const isStaticShell =
-    method === 'GET' && (pathname === '/' || pathname.startsWith('/assets/'));
+    method === 'GET' &&
+    (pathname === '/' || pathname.startsWith('/assets/') || pathname.startsWith('/game/'));
 
   // Public read-only mode opens ONLY the allow-listed "watch work" reads
   // (PUBLIC_READ_PATHS) — fail-closed: a path not on the list stays token-gated

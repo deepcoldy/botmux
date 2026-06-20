@@ -421,6 +421,44 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
       vi.useRealTimers();
     }
   });
+
+  it('fires exit when adopted CLI pid disappears while the pane stays alive', () => {
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | 0) => {
+      if (pid === 4242 && signal === 0) {
+        const err: NodeJS.ErrnoException = new Error('gone');
+        err.code = 'ESRCH';
+        throw err;
+      }
+      return true;
+    }) as typeof process.kill);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecSync.mockImplementation((cmd: any) => {
+        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) return '%1\n' as any;
+        return '' as any;
+      });
+      const be = new TmuxPipeBackend('0:2.0', { cliPid: 4242 });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecSync.mockClear();
+
+      vi.advanceTimersByTime(1_000);
+
+      expect(exits).toEqual([[1, null]]);
+      const cancelCall = mockedExecSync.mock.calls
+        .map(c => String(c[0]))
+        .find(c => c.includes('pipe-pane'));
+      expect(cancelCall).toBeDefined();
+      expect(cancelCall).toContain("'0:2.0'");
+      expect(cancelCall).not.toContain('cat >');
+    } finally {
+      errSpy.mockRestore();
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('TmuxPipeBackend send failure handling', () => {

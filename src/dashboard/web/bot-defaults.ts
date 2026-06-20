@@ -4,7 +4,7 @@
 // after the save; existing chats are left alone, and chats already auto-bound
 // once stay user-controlled.
 import { store } from './store.js';
-import { botAvatarHtml, escapeHtml, loadNameMaps, t } from './ui.js';
+import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
 
 let cache: { bots: any[] } = { bots: [] };
 let loadError: string | null = null;
@@ -98,6 +98,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     }
   });
 
+  // /api/bots 要逐 daemon 探活，慢——先亮 loading 占住右侧详情区。
+  listEl.innerHTML = loadingHtml();
   await loadBots();
 
   function rerender() {
@@ -202,9 +204,10 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             </div>
             ${renderAutoStartControls(b)}
           </section>
+          ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -310,10 +313,13 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       ? b.regularGroupReplyMode : 'chat';
     const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never')
       ? b.regularGroupMentionMode : 'always';
+    const docMode: string = b.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
     const opt = (v: string, label: string) =>
       `<option value="${v}" ${regular === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     const mopt = (v: string, label: string) =>
       `<option value="${v}" ${mention === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    const dopt = (v: string, label: string) =>
+      `<option value="${v}" ${docMode === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionSessionMode')}</h3>
       <div class="bd-row">
@@ -356,6 +362,86 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <div class="actions">
           <span class="oncall-status" data-mention-mode-status></span>
         </div>
+      </div>
+      <div class="bd-row">
+        <label>
+          <span>${t('botDefaults.docSubscribeMode')}</span>
+          <select data-input="docSubscribeDefaultMode">
+            ${dopt('mention-only', t('botDefaults.docSubscribeModeMention'))}
+            ${dopt('all', t('botDefaults.docSubscribeModeAll'))}
+          </select>
+        </label>
+        <small class="bd-help">${t('botDefaults.docSubscribeModeHelp')}</small>
+        <div class="actions">
+          <span class="oncall-status" data-doc-subscribe-mode-status></span>
+        </div>
+      </div>
+    </section>`;
+  }
+
+  function sessionCapStateLabel(cap: number | null): string {
+    return cap == null
+      ? t('botDefaults.maxLiveWorkersStateDefault')
+      : t('botDefaults.maxLiveWorkersStateOn', { count: cap });
+  }
+
+  // 最大同时活跃会话数（maxLiveWorkers）：数字输入 + 保存/恢复默认按钮（空＝用默认 30）。
+  // 超过上限时最久未用的会话自动休眠（worker+CLI 一起杀回收内存），下条消息冷恢复。
+  // PUT /api/bots/:appId/max-live-workers 落 bots.json，daemon 每分钟读实时值即时生效。
+  function renderSessionCapSection(b: any): string {
+    const cap: number | null = typeof b.maxLiveWorkers === 'number' ? b.maxLiveWorkers : null;
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionSessionCap')}</h4>
+      <div class="bd-row bd-quota">
+        <label>
+          <span>${t('botDefaults.maxLiveWorkers')}</span>
+          <input type="number" min="1" step="1" data-input="maxLiveWorkers"
+            placeholder="${escapeHtml(t('botDefaults.maxLiveWorkersPlaceholder'))}"
+            value="${cap == null ? '' : cap}">
+        </label>
+        <small data-session-cap-state>${escapeHtml(sessionCapStateLabel(cap))}</small>
+        <small class="bd-help">${t('botDefaults.maxLiveWorkersHelp')}</small>
+        <div class="actions">
+          <button type="button" class="primary" data-action="save-session-cap">${t('botDefaults.maxLiveWorkersSave')}</button>
+          <button type="button" data-action="off-session-cap">${t('botDefaults.maxLiveWorkersOff')}</button>
+          <span class="oncall-status" data-session-cap-status></span>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  // 启动命令 startupCommands：开会话后、首条消息前自动按序发给 CLI 的 slash 命令（可带
+  // 参数，如 /effort ultracode）。文本域，逗号/换行分隔，每行一条；空＝不发。next-session
+  // 生效（含 resume，每次新会话重放）。PUT /api/bots/:appId/startup-commands 落 bots.json。
+  function renderStartupCommandsSection(b: any): string {
+    const val: string = typeof b.startupCommands === 'string' ? b.startupCommands : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionStartupCommands')}</h4>
+      <p class="bd-section-note">${t('botDefaults.startupCommandsHelp')}</p>
+      <textarea data-input="startupCommands" rows="3"
+        placeholder="${escapeHtml(t('botDefaults.startupCommandsPlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(val)}</textarea>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-startup-commands">${t('botDefaults.startupCommandsSave')}</button>
+        <span class="oncall-status" data-startup-commands-status></span>
+      </div>
+    </div>`;
+  }
+
+  // File sandbox (oncall): a per-bot toggle. ON → this bot's sessions run inside
+  // a per-session bwrap file sandbox (Linux). Auto-saves on change.
+  function renderSandboxSection(b: any): string {
+    const on = b.sandbox === true;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionSandbox')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-sandbox" ${on ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.sandboxToggle')}</strong>
+        <small>${t('botDefaults.sandboxHelp')}</small></span>
+      </label>
+      <div class="actions">
+        <span class="oncall-status" data-sandbox-status></span>
       </div>
     </section>`;
   }
@@ -586,6 +672,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
               cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
               cached.regularGroupReplyMode = body.regularGroupReplyMode;
               cached.regularGroupMentionMode = body.regularGroupMentionMode;
+              cached.docSubscribeDefaultMode = body.docSubscribeDefaultMode;
             }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
@@ -618,6 +705,38 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (privateCardCb) {
         privateCardCb.addEventListener('change', () => {
           putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
+
+      // ── File sandbox toggle (auto-save on change) ─────────────────────────
+      const sandboxCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-sandbox]');
+      const sandboxStatusEl = card.querySelector<HTMLSpanElement>('[data-sandbox-status]');
+      if (sandboxCb) {
+        sandboxCb.addEventListener('change', async () => {
+          const enabled = sandboxCb.checked;
+          if (sandboxStatusEl) { sandboxStatusEl.textContent = ''; sandboxStatusEl.className = 'oncall-status'; }
+          sandboxCb.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/sandbox`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ enabled }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              if (sandboxStatusEl) { sandboxStatusEl.textContent = `✓ ${t('botDefaults.sandboxSaved')}`; sandboxStatusEl.classList.add('hint-ok'); }
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.sandbox = body.sandbox === true;
+            } else {
+              if (sandboxStatusEl) { sandboxStatusEl.textContent = `✗ ${body.error ?? r.status}`; sandboxStatusEl.classList.add('hint-warn-inline'); }
+              sandboxCb.checked = !enabled;  // revert on failure
+            }
+          } catch (e: any) {
+            if (sandboxStatusEl) { sandboxStatusEl.textContent = `✗ ${e?.message ?? e}`; sandboxStatusEl.classList.add('hint-warn-inline'); }
+            sandboxCb.checked = !enabled;
+          } finally {
+            sandboxCb.disabled = false;
+          }
         });
       }
 
@@ -702,6 +821,20 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             { regularGroupMentionMode: mentionModeSel.value },
             mentionModeSel,
             mentionModeStatusEl,
+          );
+        });
+      }
+
+      // ── 文档订阅默认触发范围（bot-global）─────────────────────────────────
+      // mention-only = 仅评论 @ 我才触发（默认）；all = 所有新评论都触发。
+      const docModeSel = card.querySelector<HTMLSelectElement>('select[data-input=docSubscribeDefaultMode]');
+      const docModeStatusEl = card.querySelector<HTMLSpanElement>('[data-doc-subscribe-mode-status]');
+      if (docModeSel) {
+        docModeSel.addEventListener('change', () => {
+          putCardPref(
+            { docSubscribeDefaultMode: docModeSel.value },
+            docModeSel,
+            docModeStatusEl,
           );
         });
       }
@@ -879,6 +1012,108 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         quotaOffBtn.addEventListener('click', () => {
           quotaInput.value = '';
           putGrantPref({ messageQuotaDefaultLimit: null }, quotaOffBtn);
+        });
+      }
+
+      // ── 最大同时活跃会话数 maxLiveWorkers（空＝回落默认 30） ──────────────────
+      const capInput = card.querySelector<HTMLInputElement>('input[data-input=maxLiveWorkers]');
+      const capSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-session-cap]');
+      const capOffBtn = card.querySelector<HTMLButtonElement>('button[data-action=off-session-cap]');
+      const capStatusEl = card.querySelector<HTMLSpanElement>('[data-session-cap-status]');
+      const capStateEl = card.querySelector<HTMLElement>('[data-session-cap-state]');
+
+      // PUT { maxLiveWorkers: number | null } to the bot's daemon (via the
+      // dashboard proxy). null = unlimited. Mirrors putGrantPref.
+      async function putMaxLiveWorkers(value: number | null, selfEl: HTMLInputElement | HTMLButtonElement) {
+        if (!capStatusEl) return;
+        capStatusEl.textContent = '';
+        capStatusEl.className = 'oncall-status';
+        selfEl.disabled = true;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/max-live-workers`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ maxLiveWorkers: value }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok && body.ok) {
+            capStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+            capStatusEl.classList.add('hint-ok');
+            const next: number | null = typeof body.maxLiveWorkers === 'number' ? body.maxLiveWorkers : null;
+            const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+            if (cached) cached.maxLiveWorkers = next;
+            if (capStateEl) capStateEl.textContent = sessionCapStateLabel(next);
+            if (capInput) capInput.value = next == null ? '' : String(next);
+          } else {
+            capStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+            capStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          capStatusEl.textContent = `✗ ${e?.message ?? e}`;
+          capStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          selfEl.disabled = false;
+        }
+      }
+
+      if (capInput && capSaveBtn) {
+        capSaveBtn.addEventListener('click', () => {
+          const raw = capInput.value.trim();
+          if (raw === '') { putMaxLiveWorkers(null, capSaveBtn); return; } // 空＝清回默认 30
+          // 只认纯正整数 token（拒 1e2 / 1.0 / 01），与额度输入同口径。
+          if (!/^[1-9]\d*$/.test(raw)) {
+            if (capStatusEl) {
+              capStatusEl.textContent = `✗ ${t('botDefaults.maxLiveWorkersInvalid')}`;
+              capStatusEl.className = 'oncall-status hint-warn-inline';
+            }
+            return;
+          }
+          putMaxLiveWorkers(Number(raw), capSaveBtn);
+        });
+      }
+      if (capInput && capOffBtn) {
+        capOffBtn.addEventListener('click', () => {
+          capInput.value = '';
+          putMaxLiveWorkers(null, capOffBtn);
+        });
+      }
+
+      // ── 启动命令 startupCommands（逗号/换行分隔；空＝清除，不发任何命令） ──────────
+      const startupEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=startupCommands]');
+      const startupSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-startup-commands]');
+      const startupStatusEl = card.querySelector<HTMLSpanElement>('[data-startup-commands-status]');
+      if (startupEl && startupSaveBtn) {
+        startupSaveBtn.addEventListener('click', async () => {
+          if (!startupStatusEl) return;
+          startupStatusEl.textContent = '';
+          startupStatusEl.className = 'oncall-status';
+          startupSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/startup-commands`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ startupCommands: startupEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              startupStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              startupStatusEl.classList.add('hint-ok');
+              // Server returns the normalized, newline-joined list — reflect it
+              // back so the textarea shows exactly what was persisted.
+              const next: string = typeof body.startupCommands === 'string' ? body.startupCommands : '';
+              startupEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.startupCommands = next;
+            } else {
+              startupStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              startupStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            startupStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            startupStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            startupSaveBtn.disabled = false;
+          }
         });
       }
     });

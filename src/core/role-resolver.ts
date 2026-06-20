@@ -13,7 +13,8 @@
  * bot to adopt different personas in different Lark groups.
  */
 
-import { existsSync, readFileSync, statSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, mkdirSync, unlinkSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -126,7 +127,7 @@ export function writeRoleFile(larkAppId: string, chatId: string, content: string
   mkdirSync(dirname(filePath), { recursive: true });
   // Truncate by UTF-8 byte length, not JS string length
   const trimmed = truncateToByteLimit(content.trim());
-  writeFileSync(filePath, trimmed, 'utf-8');
+  atomicWriteFileSync(filePath, trimmed);
   cache.delete(cacheKey(larkAppId, chatId)); // invalidate so next read picks up the new content
   logger.info(`[role] wrote chat=${chatId} file=${filePath} (${Buffer.byteLength(trimmed, 'utf-8')} bytes)`);
 }
@@ -159,7 +160,7 @@ export function writeTeamRoleFile(larkAppId: string, content: string): void {
   const filePath = teamRoleFilePath(larkAppId);
   mkdirSync(dirname(filePath), { recursive: true });
   const trimmed = truncateToByteLimit(content.trim());
-  writeFileSync(filePath, trimmed, 'utf-8');
+  atomicWriteFileSync(filePath, trimmed);
   cache.delete(teamCacheKey(larkAppId));
   logger.info(`[role] wrote team app=${larkAppId} file=${filePath} (${Buffer.byteLength(trimmed, 'utf-8')} bytes)`);
 }

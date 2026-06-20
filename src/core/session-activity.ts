@@ -34,9 +34,21 @@ export function publishAttentionPatch(ds: DaemonSession): void {
       patch: {
         pendingRepo: !!ds.pendingRepo,
         tuiPromptActive: !!ds.tuiPromptCardId,
+        // Object when raised, null to clear — SSE consumers merge the patch, so
+        // null overwrites the prior value and drops the row out of needs-you.
+        agentAttention: ds.agentAttention
+          ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+          : null,
       },
     },
   });
+}
+
+export function clearAgentAttention(ds: DaemonSession): boolean {
+  if (!ds.agentAttention) return false;
+  ds.agentAttention = undefined;
+  publishAttentionPatch(ds);
+  return true;
 }
 
 /** Announce a repo-selection-pending session to dashboard SSE subscribers.

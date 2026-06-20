@@ -32,6 +32,9 @@ let tempDir: string;
 
 // Mutable probe verdict the mocked TmuxBackend returns this test run.
 const probe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'unknown' }));
+// Mutable tmux-SERVER liveness the mocked TmuxBackend returns this test run.
+// Default 'running' so a bare 'missing' is read as a solo zombie (server up).
+const server = vi.hoisted(() => ({ state: 'running' as 'running' | 'down' | 'unknown' }));
 
 vi.mock('../src/config.js', () => ({
   config: {
@@ -125,6 +128,7 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
     sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
     probeSession: vi.fn(() => probe.result),
     hasSession: vi.fn(() => probe.result === 'exists'),
+    serverState: vi.fn(() => server.state),
     killSession: vi.fn(),
   },
 }));
@@ -150,6 +154,7 @@ beforeEach(() => {
   sessionStore.init();
   wp.registry = null;
   probe.result = 'exists';
+  server.state = 'running';
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
 });
@@ -179,6 +184,84 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect([...map.values()].some(v => v.session.sessionId === s.sessionId)).toBe(false);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('"missing" + server DOWN (host reboot) → keeps the active record, does NOT close', async () => {
+    // The reboot bug: tmux server is gone, so every bmx-* pane probes 'missing'.
+    // Closing them all wiped a full dashboard. With the server-state gate, a
+    // down server means "keep for lazy resume" (CLI transcript on disk is still
+    // resumable), exactly like a pty session.
+    probe.result = 'missing';
+    server.state = 'down';
+    const s = makeActivePersistentSession('om_reboot');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    const ds = map.get(sessionKey('om_reboot', 'app_test'));
+    expect(ds).toBeDefined();              // active record retained…
+    expect(ds!.worker).toBeNull();         // …worker-less, resumes on next message
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('"missing" + server DOWN → keeps ALL sessions (no mass-close after reboot)', async () => {
+    probe.result = 'missing';
+    server.state = 'down';
+    const a = makeActivePersistentSession('om_reboot_a');
+    const b = makeActivePersistentSession('om_reboot_b');
+    const c = makeActivePersistentSession('om_reboot_c');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    for (const s of [a, b, c]) {
+      expect(map.get(sessionKey(s.rootMessageId, 'app_test'))).toBeDefined();
+      expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+    }
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('"missing" + server UP but session was cap-suspended → keeps active for cold-resume (NOT a zombie)', async () => {
+    // The idle-worker sweeper deliberately kills a session's backing pane + CLI
+    // over the per-bot cap. The server stays up (only one pane was killed), so
+    // without the suspend-intent marker this looks exactly like a solo zombie
+    // and would be wrongly closed — losing a session that should lazily
+    // cold-resume on the next message.
+    probe.result = 'missing';
+    server.state = 'running';
+    const s = makeActivePersistentSession('om_cap_suspended');
+    s.suspendedColdResume = true;
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    const ds = map.get(sessionKey('om_cap_suspended', 'app_test'));
+    expect(ds).toBeDefined();              // active record retained…
+    expect(ds!.worker).toBeNull();         // …worker-less, cold-resumes on next message
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('"missing" + server state UNKNOWN → closes (conservative, server may be up)', async () => {
+    probe.result = 'missing';
+    server.state = 'unknown';
+    const s = makeActivePersistentSession('om_missing_unknown_server');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
   });

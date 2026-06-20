@@ -8,7 +8,8 @@
  * OAuth login via /login command writes to botmux's own token file.
  * Auto-refreshes expired access_token using refresh_token.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { atomicWriteFileSync } from './atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -86,7 +87,9 @@ function saveTokenForApp(token: TokenStore, appId: string): void {
   const path = tokenPathForApp(appId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(path, JSON.stringify(token, null, 2));
+  // 0600：OAuth token 是密钥，且原子写每次重建文件，不传 mode 会把用户
+  // 手动收紧过的权限在自动刷新时悄悄改回 0644。
+  atomicWriteFileSync(path, JSON.stringify(token, null, 2), { mode: 0o600 });
 }
 
 function isValid(isoDate: string): boolean {
@@ -203,19 +206,38 @@ const DEFAULT_SCOPES = [
 ].join(' ');
 
 /**
+ * 飞书文档订阅入口（/subscribe-lark-doc）专用的额外 OAuth scope。**不进**全局
+ * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login（图片下载用）都会请求这些 scope，
+ * 没在开发者后台启用它们的 app 会一起 20043 失败。改由 /subscribe-lark-doc 在
+ * 需要时通过 generateAuthUrl 的 extraScopes 单独带上。
+ *
+ * 每个 scope 都对着 src/setup/lark-scopes.json 校验过（错名会触发 authorize 报
+ * 错 20043）。使用前仍需在开发者后台为该 app 启用这些 scope 并订阅评论事件。
+ */
+export const DOC_COMMENT_OAUTH_SCOPES = [
+  'docs:document.subscription',  // 订阅文档事件（评论新增等）
+  'docs:event:subscribe',        // 事件订阅
+  'docs:document.comment:read',  // 读评论
+  'docs:document.comment:create',// 回复 / 新建评论
+  'wiki:wiki:readonly',          // 解析 wiki 节点 → obj_token
+];
+
+/**
  * Generate an OAuth authorization URL. Returns the URL and stores pending state.
  * Called by /login command handler.
  */
-export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu'): { authUrl: string; state: string } {
+export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu', extraScopes: string[] = []): { authUrl: string; state: string } {
   const state = randomBytes(32).toString('hex');
   const redirectUri = `http://127.0.0.1:${DEFAULT_PORT}/callback`;
 
+  // 基础 scope + 调用方按需追加（去重）。文档订阅入口会带 DOC_COMMENT_OAUTH_SCOPES。
+  const scope = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])].join(' ');
   const params = new URLSearchParams({
     client_id: appId,
     redirect_uri: redirectUri,
     response_type: 'code',
     state,
-    scope: DEFAULT_SCOPES,
+    scope,
   });
 
   // authorize 走 accounts host（feishu: accounts.feishu.cn / lark: accounts.larksuite.com）

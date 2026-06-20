@@ -51,11 +51,31 @@ describe('buildGrantCard', () => {
     expect(byAction.grant_global).toMatchObject({ target_open_ids: ['ou_a', 'ou_b', 'ou_bot'], chat_id: 'oc_3', nonce: 'n3' });
   });
 
-  it('buildGrantNotifyCard @-mentions every granted target', () => {
+  it('buildGrantNotifyCard @-mentions every granted target (legacy string[] = humans)', () => {
     const card = JSON.parse(buildGrantNotifyCard('chat', ['ou_a', 'ou_b'], 'zh'));
     const flat = JSON.stringify(card);
     expect(flat).toContain('<at id=ou_a></at>');
     expect(flat).toContain('<at id=ou_b></at>');
+  });
+
+  // 申晗实测 bug 修复：bot grantee 绝不能用 <at>（会唤醒对方 bot 的 daemon 误拉空会话），
+  // 改用纯文本名字；真人 grantee 仍 @ 点名（真人被 @ 不会自动开会话）。
+  it('buildGrantNotifyCard renders bot grantees as PLAIN name (no <at>), humans as @', () => {
+    const card = JSON.parse(buildGrantNotifyCard('chat', [
+      { openId: 'ou_human', name: '张三', isBot: false },
+      { openId: 'ou_codex', name: 'Codex', isBot: true },
+    ], 'zh'));
+    const flat = JSON.stringify(card);
+    expect(flat).toContain('<at id=ou_human></at>');   // 真人 → @
+    expect(flat).not.toContain('<at id=ou_codex');     // bot → 绝无 <at>
+    expect(flat).toContain('Codex');                   // bot → 纯文本名字
+  });
+
+  it('buildGrantNotifyCard bot grantee without name falls back to open_id (still no <at>)', () => {
+    const card = JSON.parse(buildGrantNotifyCard('chat', [{ openId: 'ou_codex', isBot: true }], 'zh'));
+    const flat = JSON.stringify(card);
+    expect(flat).not.toContain('<at id=ou_codex');
+    expect(flat).toContain('ou_codex');
   });
 
   it('buildGrantResultCard has no buttons', () => {

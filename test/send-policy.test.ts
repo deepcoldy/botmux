@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveQuoteTarget, validateMentionDecision } from '../src/services/send-policy.js';
+import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attentionUsageError } from '../src/services/send-policy.js';
 
 describe('resolveQuoteTarget', () => {
   const base = { isChatScope: true, sendTopLevel: false, noQuote: false };
@@ -78,5 +78,45 @@ describe('validateMentionDecision', () => {
 
   it('--top-level exempt from gate', () => {
     expect(validateMentionDecision({ ...base, sendTopLevel: true }).ok).toBe(true);
+  });
+});
+
+describe('parseAttentionFlag', () => {
+  it('absent → not requested, default kind', () => {
+    expect(parseAttentionFlag(['hello'])).toEqual({ requested: false, kind: 'blocked' });
+  });
+  it('bare --attention does NOT eat the next arg as kind/value', () => {
+    // the message ("我卡住了") must remain a positional, not become the flag value
+    const r = parseAttentionFlag(['--attention', '我卡住了']);
+    expect(r).toEqual({ requested: true, kind: 'blocked' });
+  });
+  it('--attention=kind parses the kind', () => {
+    expect(parseAttentionFlag(['--attention=authz'])).toEqual({ requested: true, kind: 'authz' });
+    expect(parseAttentionFlag(['--attention=decision'])).toEqual({ requested: true, kind: 'decision' });
+  });
+  it('unknown kind falls back to blocked (never fail over a typo)', () => {
+    expect(parseAttentionFlag(['--attention=bogus'])).toEqual({ requested: true, kind: 'blocked' });
+    expect(parseAttentionFlag(['--attention='])).toEqual({ requested: true, kind: 'blocked' });
+  });
+});
+
+describe('attentionUsageError', () => {
+  const ok = { requested: true, sendTopLevel: false, hasText: true };
+  it('not requested → null', () => {
+    expect(attentionUsageError({ requested: false, sendTopLevel: true, hasText: false })).toBeNull();
+  });
+  it('valid current-session reply with text → null', () => {
+    expect(attentionUsageError(ok)).toBeNull();
+  });
+  it('rejects --top-level / --chat-id / --into (clear-on-reply would bind wrong anchor)', () => {
+    expect(attentionUsageError({ ...ok, sendTopLevel: true })).toMatch(/--top-level/);
+    expect(attentionUsageError({ ...ok, overrideChatId: 'oc_x' })).toMatch(/--chat-id/);
+    expect(attentionUsageError({ ...ok, sendInto: 'om_x' })).toMatch(/--into/);
+  });
+  it('rejects --voice (voice path returns before attention state can be raised)', () => {
+    expect(attentionUsageError({ ...ok, asVoice: true })).toMatch(/--voice/);
+  });
+  it('rejects no-text (dashboard needs a reason)', () => {
+    expect(attentionUsageError({ ...ok, hasText: false })).toMatch(/reason/);
   });
 });

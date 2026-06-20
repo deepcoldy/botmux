@@ -1,9 +1,23 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { startIpcServer, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { createHmac, randomBytes } from 'node:crypto';
+import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
+import * as workerPool from '../src/core/worker-pool.js';
+import { registerBot } from '../src/bot-registry.js';
+
+// Loopback-HMAC the write-link routes require. Inject a known secret per test
+// (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
+// ~/.botmux/.dashboard-secret existing on the box.
+const TEST_IPC_SECRET = 'test-ipc-secret-deadbeef';
+function tokenAuthHeaders(secret = TEST_IPC_SECRET): Record<string, string> {
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const nonce = randomBytes(8).toString('hex');
+  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
+  return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
+}
 
 let handle: IpcServerHandle | null = null;
 
@@ -13,6 +27,7 @@ afterEach(async () => {
   // Reset module-level larkAppId between tests so groups endpoints don't
   // leak state across describes.
   setLarkAppId('');
+  setIpcAuthSecret(null);
 });
 
 describe('dashboard IPC server', () => {
@@ -55,6 +70,126 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
+  });
+});
+
+describe('GET /api/sessions/:sessionId/write-link', () => {
+  it('returns 401 without a valid loopback-HMAC signature', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s2/write-link`);
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe('unauthorized');
+  });
+
+  it('returns 404 session_not_active for an unknown/closed session', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/ghost/write-link`, { headers: tokenAuthHeaders() });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('session_not_active');
+  });
+
+  it('returns 409 terminal_unavailable when the live session has no web terminal yet', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's1', webPort: null },
+      workerPort: null,
+      workerToken: null,
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s1/write-link`, { headers: tokenAuthHeaders() });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('terminal_unavailable');
+    spy.mockRestore();
+  });
+
+  it('returns 200 with a token-bearing url for a live session', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's2', webPort: 4321 },
+      workerPort: 4321,
+      workerToken: 'secret-tok',
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s2/write-link`, { headers: tokenAuthHeaders() });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(typeof body.url).toBe('string');
+    expect(body.url).toContain('token=secret-tok');
+    spy.mockRestore();
+  });
+});
+
+describe('POST /api/sessions/:sessionId/write-link-card', () => {
+  it('returns 401 without a valid loopback-HMAC signature', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s2/write-link-card`, { method: 'POST' });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe('unauthorized');
+  });
+
+  it('returns 404 session_not_active for an unknown/closed session', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/ghost/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toBe('session_not_active');
+  });
+
+  it('on success returns delivery counts only — never the token or URL', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's9' }, workerPort: 4321, workerToken: 'secret-tok',
+    } as any);
+    const deliverSpy = vi.spyOn(workerPool, 'deliverWriteLinkCardToOwners').mockResolvedValue({
+      ok: true, delivered: 2, total: 2, channels: ['ephemeral', 'dm'],
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s9/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    // The token rides only the private Lark channels — the HTTP response that
+    // crosses back to the CLI must carry counts, not the credential.
+    expect(raw).not.toContain('secret-tok');
+    expect(raw).not.toContain('token=');
+    const body = JSON.parse(raw);
+    expect(body).toMatchObject({ ok: true, delivered: 2, total: 2, channels: ['ephemeral', 'dm'] });
+    expect(body.url).toBeUndefined();
+    findSpy.mockRestore();
+    deliverSpy.mockRestore();
+  });
+
+  it('maps no_owner → 422 and terminal_unavailable → 409', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({ session: { sessionId: 's9' } } as any);
+    const deliverSpy = vi.spyOn(workerPool, 'deliverWriteLinkCardToOwners');
+
+    deliverSpy.mockResolvedValueOnce({ ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const noOwner = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s9/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(noOwner.status).toBe(422);
+    expect((await noOwner.json()).error).toBe('no_owner');
+
+    deliverSpy.mockResolvedValueOnce({ ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] });
+    const notReady = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s9/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(notReady.status).toBe(409);
+    expect((await notReady.json()).error).toBe('terminal_unavailable');
+
+    findSpy.mockRestore();
+    deliverSpy.mockRestore();
   });
 });
 
@@ -106,6 +241,17 @@ describe('POST /api/schedules/:id/(run|pause|resume)', () => {
     expect(body.ok).toBe(false);
     expect(body.error).toBe('not_found');
   });
+
+  // The delivery-toggle route must be registered on the IPC server (the outer
+  // dashboard proxy in dashboard.ts forwards /(run|pause|resume|delivery)$ here).
+  it('returns ok=false for unknown id (delivery)', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules/nonexistent/delivery`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('not_found');
+  });
 });
 
 describe('SSE /api/events', () => {
@@ -132,6 +278,48 @@ describe('SSE /api/events', () => {
     reader.releaseLock();
     await res.body!.cancel();
   }, 5_000);
+});
+
+describe('POST /api/locale/reload', () => {
+  it('hot-reloads the process default locale from disk and reports it', async () => {
+    setLarkAppId('');  // no registered bot → per-bot override path stays null
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/locale/reload`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(['zh', 'en']).toContain(body.defaultLocale);
+    expect(body.botLang).toBeNull();
+    // The route applied it in-process: getDefaultLocale reflects the same value
+    // (same i18n module singleton the daemon's card rendering reads).
+    const { getDefaultLocale } = await import('../src/i18n/index.js');
+    expect(getDefaultLocale()).toBe(body.defaultLocale);
+  });
+});
+
+describe('PUT /api/bot-skills', () => {
+  it('rejects invalid non-null policy instead of clearing skills', async () => {
+    const appId = 'test-skill-policy-app';
+    setLarkAppId(appId);
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      skills: { include: ['skill:deploy'] },
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-skills`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'set', policy: { include: [123] } }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'invalid_policy' });
+  });
 });
 
 describe('GET /api/groups (Phase B)', () => {
@@ -161,7 +349,7 @@ describe('GET /api/groups (Phase B)', () => {
     // dashboard can sort newly-added chats to the top. In this test the
     // store hasn't been init()'d (no daemon), so the value degrades to
     // null instead of failing the request — see chat-first-seen-store.
-    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team', oncallChat: null, firstSeenAt: null, hasRole: false }]);
+    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team', oncallChat: null, firstSeenAt: null, hasRole: false, observedBotNames: [] }]);
     spy.mockRestore();
   });
 });
