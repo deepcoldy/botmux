@@ -18,7 +18,7 @@ import type { LarkMessage } from '../src/types.js';
 const LARK_APP_ID = 'cli_test';
 const OWNER_UNION = 'on_alice';
 const INVOKER = 'ou_alice';
-const BOT_OWNER = INVOKER;  // PR3 revision: invoker_open_id = bot owner open_id
+const BOT_ADMIN = INVOKER;  // invoker_open_id = invoking allowedUsers admin open_id
 
 function makeDTO(over: Partial<SettingsCardDTO['sections'][0]['toggles'][0]> = {}): SettingsCardDTO {
   const baseToggle = {
@@ -245,7 +245,7 @@ describe('handleSettingsCardAction', () => {
     const createClientSpy = vi.fn(() => ({ request: requestSpy } as any));
     return {
       createClient: createClientSpy,
-      getOwnerOpenId: () => BOT_OWNER,
+      getOwnerOpenId: () => BOT_ADMIN,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       locale: 'zh',
       createClientSpy,
@@ -300,7 +300,7 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('per-bot owner gate denies non-owner → owner_only, no client call (PR3 revision)', async () => {
+  it('per-bot admin gate denies non-admin → owner_only, no client call', async () => {
     const deps = makeDeps({ getOwnerOpenId: () => 'ou_other_owner' });
     const data: CardActionData = {
       operator: { open_id: INVOKER },
@@ -311,7 +311,7 @@ describe('handleSettingsCardAction', () => {
     expect(deps.createClientSpy).not.toHaveBeenCalled();
   });
 
-  it('getOwnerOpenId returns undefined → owner_only, no client call', async () => {
+  it('no resolved dashboard admin → owner_only, no client call', async () => {
     const deps = makeDeps({ getOwnerOpenId: () => undefined });
     const data = makeAction({ action: SETTINGS_ACTION_TOGGLE, invoker_open_id: INVOKER, field: 'publicReadOnly', next_value: 'true' });
     const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
@@ -335,6 +335,32 @@ describe('handleSettingsCardAction', () => {
     expect((r as any).card).toBeDefined();
   });
 
+  it('second allowedUsers admin can operate; rebuilt settings card keeps that admin as invoker', async () => {
+    const secondAdmin = 'ou_second_admin';
+    const resolveUserUnionId = vi.fn(async (_appId, openId) => ({ unionId: openId === secondAdmin ? 'on_second' : OWNER_UNION }));
+    const deps = makeDeps({
+      getDashboardAdminOpenIds: () => [INVOKER, secondAdmin],
+      resolveUserUnionId,
+    });
+    const data: CardActionData = {
+      operator: { open_id: secondAdmin, union_id: 'on_second' },
+      action: {
+        value: {
+          action: SETTINGS_ACTION_TOGGLE,
+          invoker_open_id: secondAdmin,
+          field: 'publicReadOnly',
+          next_value: 'true',
+        },
+      },
+    };
+    const r = await handleSettingsCardAction(data, LARK_APP_ID, deps);
+    expect(resolveUserUnionId).not.toHaveBeenCalled();
+    expect(deps.createClientSpy).toHaveBeenCalledOnce();
+    const reqSpy: any = (deps.createClient as any).mock.results[0]!.value.request;
+    expect(reqSpy.mock.calls[0][0].body.ownerUnionId).toBe('on_second');
+    expect(JSON.stringify((r as any).card.data)).toContain(`"invoker_open_id":"${secondAdmin}"`);
+  });
+
   /** ─── Overview drilldown — handler honors origin on rebuild ─── */
   it('toggle with origin=overview → rebuilt card still carries ↩ 总览 button', async () => {
     // Mock the PUT response with a real settings shape so composeSections
@@ -348,7 +374,7 @@ describe('handleSettingsCardAction', () => {
     }));
     const deps = {
       createClient: vi.fn(() => ({ request: reqSpy } as any)),
-      getOwnerOpenId: () => BOT_OWNER,
+      getOwnerOpenId: () => BOT_ADMIN,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       locale: 'zh' as const,
     } as any;
@@ -374,7 +400,7 @@ describe('handleSettingsCardAction', () => {
     }));
     const deps = {
       createClient: vi.fn(() => ({ request: reqSpy } as any)),
-      getOwnerOpenId: () => BOT_OWNER,
+      getOwnerOpenId: () => BOT_ADMIN,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       locale: 'zh' as const,
     } as any;
@@ -398,7 +424,7 @@ describe('handleSettingsCardAction', () => {
     }));
     const deps = {
       createClient: vi.fn(() => ({ request: reqSpy } as any)),
-      getOwnerOpenId: () => BOT_OWNER,
+      getOwnerOpenId: () => BOT_ADMIN,
       resolveUserUnionId: async () => ({ unionId: OWNER_UNION }),
       locale: 'zh' as const,
     } as any;
@@ -531,7 +557,7 @@ describe('handleSettingsCardAction', () => {
 /** ─── dashboard-command/index.ts dispatches settings to real handler ── */
 
 describe('handleDashboardCommand dispatches settings to real handler', () => {
-  it('owner /dashboard settings → DM card to owner (PR3 revision)', async () => {
+  it('admin /dashboard settings → DM card to admin', async () => {
     const requestSpy = vi.fn(async () => ({
       status: 200,
       body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
@@ -580,7 +606,7 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
     expect((deps.sessionReply as any).mock.calls[0][1]).toContain('📬');
   });
 
-  it('non-owner /dashboard settings → owner_only in topic, never calls client', async () => {
+  it('non-admin /dashboard settings → owner_only in topic, never calls client', async () => {
     const createClient = vi.fn(() => ({ request: vi.fn() } as any));
     const sendUserMessage = vi.fn(async () => 'om_dm');
     const deps: CommandHandlerDeps = {

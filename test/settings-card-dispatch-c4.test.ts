@@ -34,12 +34,13 @@ vi.mock('../src/daemon-internal-client-wrapper.js', () => ({
   createDaemonClientFor: vi.fn(),
 }));
 
-// Mock per-bot owner lookup so dispatch reaches the write path.
+// Mock per-bot admin lookup so dispatch reaches the write path.
 vi.mock('../src/bot-registry.js', async () => {
   const actual = await vi.importActual<typeof import('../src/bot-registry.js')>('../src/bot-registry.js');
   return {
     ...actual,
     getOwnerOpenId: vi.fn(() => 'ou_alice'),
+    getDashboardAdminOpenIds: vi.fn(() => ['ou_alice']),
   };
 });
 

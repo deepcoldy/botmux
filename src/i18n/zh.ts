@@ -626,7 +626,7 @@ export const messages: Record<string, string> = {
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
-  'card.dashboard.owner_only': '🔒 `/dashboard` 命令组仅 Bot Owner 可用。',
+  'card.dashboard.owner_only': '🔒 `/dashboard` 命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.overview.not_implemented_yet': '🚧 `/dashboard overview` 总览卡片尚未实现，将在后续 PR 中上线。',
   'card.dashboard.sessions.not_implemented_yet': '🚧 `/dashboard sessions` 会话卡片尚未实现，将在后续 PR 中上线。',
   'card.dashboard.workflows.not_implemented_yet': '🚧 `/dashboard workflows` 工作流卡片尚未实现，将在后续 PR 中上线。',
@@ -641,12 +641,12 @@ export const messages: Record<string, string> = {
     '• `workflows`  — 工作流运行（beta）\n' +
     '• `groups`     — 群组矩阵\n' +
     '• `schedules`  — 定时任务\n' +
-    '• `settings`   — 全局设置（仅 owner）\n' +
+    '• `settings`   — 全局设置（仅管理员）\n' +
     '• `help`       — 本帮助\n\n' +
-    '不带子命令时默认 `overview`。整个命令组仅 Bot Owner 可用。',
+    '不带子命令时默认 `overview`。整个命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',
-  'card.dashboard.dm_sent': '📬 Dashboard 响应已私信给 Bot Owner。',
-  'card.dashboard.dm_failed': '⚠️ 给 Bot Owner 发私聊失败：{reason}',
+  'card.dashboard.dm_sent': '📬 Dashboard 响应已私信给你。',
+  'card.dashboard.dm_failed': '⚠️ 给你发送 Dashboard 私聊失败：{reason}',
   // sessions card (PR3 slice 1)
   'card.dashboard.sessions.title': '🖥️ Dashboard 会话',
   'card.dashboard.sessions.count_summary': '活跃 {active} · 已关闭 {closed} · 第 {page}/{totalPages} 页',
@@ -655,8 +655,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.prev': '← 上',
   'card.dashboard.sessions.next': '下 →',
   'card.dashboard.sessions.jump_page': '{n}/{total}',
-  'card.dashboard.sessions.dm_sent': '📬 Dashboard 会话列表已私信给 Bot Owner。',
-  'card.dashboard.sessions.dm_failed': '⚠️ 给 Bot Owner 发送会话列表失败：{reason}',
+  'card.dashboard.sessions.dm_sent': '📬 Dashboard 会话列表已私信给你。',
+  'card.dashboard.sessions.dm_failed': '⚠️ 给你发送会话列表失败：{reason}',
   'card.dashboard.sessions.list_failed': '⚠️ 拉取会话列表失败：{reason}',
   // sessions card (PR3 slice 2a) — detail card + close action
   'card.dashboard.sessions.row_detail': '📂 详情',
@@ -698,8 +698,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.next_label': '下次 {rel}',
   'card.dashboard.schedules.last_label': '上次 {rel}',
   'card.dashboard.schedules.repeat_label': '已跑 {repeat}',
-  'card.dashboard.schedules.dm_sent': '📬 Dashboard 定时任务列表已私信给 Bot Owner。',
-  'card.dashboard.schedules.dm_failed': '⚠️ 给 Bot Owner 发送定时任务列表失败：{reason}',
+  'card.dashboard.schedules.dm_sent': '📬 Dashboard 定时任务列表已私信给你。',
+  'card.dashboard.schedules.dm_failed': '⚠️ 给你发送定时任务列表失败：{reason}',
   'card.dashboard.schedules.list_failed': '⚠️ 拉取定时任务列表失败：{reason}',
   // schedules card (PR3 slice 2a) — detail card + pause/resume actions
   'card.dashboard.schedules.row_detail': '📂 详情',
@@ -751,8 +751,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.groups.status.out': '未加入',
   'card.dashboard.groups.status.unknown': '未知',
   'card.dashboard.groups.status.error': '错误',
-  'card.dashboard.groups.dm_sent': '📬 Dashboard 群组已私信给 Bot Owner。',
-  'card.dashboard.groups.dm_failed': '⚠️ 给 Bot Owner 发送群组失败：{reason}',
+  'card.dashboard.groups.dm_sent': '📬 Dashboard 群组已私信给你。',
+  'card.dashboard.groups.dm_failed': '⚠️ 给你发送群组失败：{reason}',
   'card.dashboard.groups.list_failed': '⚠️ 拉取群组失败：{reason}',
   'card.dashboard.groups.row_manage': '🛠 管理',
   'card.dashboard.groups.detail.title': '🌐 群组管理',
@@ -795,8 +795,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.workflows.progress_label': '步 {done}/{total}',
   'card.dashboard.workflows.started_label': '启动 {rel}',
   'card.dashboard.workflows.updated_label': '上次 {rel}',
-  'card.dashboard.workflows.dm_sent': '📬 Dashboard 工作流列表已私信给 Bot Owner。',
-  'card.dashboard.workflows.dm_failed': '⚠️ 给 Bot Owner 发送工作流列表失败：{reason}',
+  'card.dashboard.workflows.dm_sent': '📬 Dashboard 工作流列表已私信给你。',
+  'card.dashboard.workflows.dm_failed': '⚠️ 给你发送工作流列表失败：{reason}',
   'card.dashboard.workflows.list_failed': '⚠️ 拉取工作流列表失败：{reason}',
   // workflows card (PR3 slice 2a) — detail card + cancel action
   'card.dashboard.workflows.row_detail': '📂 详情',
@@ -820,8 +820,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.workflows.cancel_failed': '⚠️ 取消失败：{reason}',
   'card.dashboard.workflows.workflow_not_found': '⚠️ 运行不存在或已被清理。',
 
-  'card.dashboard.settings.dm_sent': '📬 Dashboard 设置卡片已私信给 Bot Owner。',
-  'card.dashboard.settings.dm_failed': '⚠️ 给 Bot Owner 发送设置卡片失败：{reason}',
+  'card.dashboard.settings.dm_sent': '📬 Dashboard 设置卡片已私信给你。',
+  'card.dashboard.settings.dm_failed': '⚠️ 给你发送设置卡片失败：{reason}',
 
   // overview card (PR3 slice 1)
   'card.dashboard.overview.title': '⚙️ Dashboard 总览',
@@ -843,8 +843,8 @@ export const messages: Record<string, string> = {
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.
   'card.dashboard.overview.back_button': '↩ 总览',
-  'card.dashboard.overview.dm_sent': '📬 Dashboard 总览已私信给 Bot Owner。',
-  'card.dashboard.overview.dm_failed': '⚠️ 给 Bot Owner 发送总览失败：{reason}',
+  'card.dashboard.overview.dm_sent': '📬 Dashboard 总览已私信给你。',
+  'card.dashboard.overview.dm_failed': '⚠️ 给你发送总览失败：{reason}',
   'card.dashboard.overview.overview_failed': '⚠️ 拉取总览快照失败：{reason}',
   // settings_summary 子串
   'card.dashboard.overview.settings.publicReadOnly.on': '公开只读已开启',
@@ -869,7 +869,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.refreshed': '✅ 已刷新',
   'card.dashboard.settings.save_failed': '⚠️ 保存失败：{reason}',
   'card.dashboard.settings.not_invoker': '🔒 此卡片只能由发起者操作。',
-  'card.dashboard.settings.owner_only': '🔒 设置仅 Bot Owner 可改。',
+  'card.dashboard.settings.owner_only': '🔒 设置仅 Bot 管理员（allowedUsers）可改。',
   'card.dashboard.settings.invalid_field': '⚠️ 字段不支持修改。',
   'card.dashboard.settings.invalid_value': '⚠️ 取值非法。',
   'card.dashboard.settings.invalid_time': '⚠️ 时间格式必须是 HH:MM。',
@@ -881,7 +881,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.segment.on_current': '✓ 已开启',
   'card.dashboard.settings.segment.off_current': '✓ 已关闭',
   'card.dashboard.settings.maintenance.time_display': '更新时间：{time}',
-  'card.dashboard.settings.footer.security': '🔒 仅 Bot Owner 可见 · 私聊回复 · ACK 自动刷新',
+  'card.dashboard.settings.footer.security': '🔒 仅 Bot 管理员可见 · 私聊回复 · ACK 自动刷新',
   'settings.readOnlyVisitor': '只读访客模式，无法修改设置。',
   'settings.autoUpdateLocalDev': '本地源码安装不支持自动更新。',
   // 每个 toggle 自己的 disable 原因（更具体，PR3 UI 修订）

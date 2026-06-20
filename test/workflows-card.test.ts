@@ -252,6 +252,18 @@ describe('handleWorkflowsCardAction', () => {
     expect(JSON.stringify(r.card?.data)).toContain('"dashboard_scope":"global"');
   });
 
+  it('second allowedUsers admin can refresh; rebuilt card keeps that admin as invoker', async () => {
+    const secondAdmin = 'ou_second_admin';
+    const deps = makeDeps({ getDashboardAdminOpenIds: () => [INVOKER, secondAdmin] });
+    const r = await handleWorkflowsCardAction(
+      makeAction({ action: WORKFLOWS_ACTION_REFRESH, invoker_open_id: secondAdmin }, secondAdmin),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy).toHaveBeenCalledOnce();
+    expect(JSON.stringify(r.card?.data)).toContain(`"invoker_open_id":"${secondAdmin}"`);
+  });
+
   it('page=2 with 25 rows → 第 2/5 页', async () => {
     // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
     const rows = Array.from({ length: 25 }, (_, i) =>
@@ -271,7 +283,7 @@ describe('handleWorkflowsCardAction', () => {
     expect(cardJson).toContain('第 2/5 页');
   });
 
-  it('non-owner → toast `owner_only`, NO client call', async () => {
+  it('non-admin → toast `owner_only`, NO client call', async () => {
     const deps = makeDeps({ getOwnerOpenId: () => 'ou_other' });
     const r = await handleWorkflowsCardAction(
       makeAction({ action: WORKFLOWS_ACTION_REFRESH, invoker_open_id: INVOKER }),
@@ -784,7 +796,7 @@ describe('handleWorkflowsCardAction — dash_workflows_detail', () => {
     expect(r.card).toBeUndefined();
   });
 
-  it('non-owner → owner_only toast, no GET', async () => {
+  it('non-admin → owner_only toast, no GET', async () => {
     const deps = { ...makeDetailDeps('r_a'), getOwnerOpenId: () => 'ou_other' };
     const r = await handleWorkflowsCardAction(
       makeAction({ action: WORKFLOWS_ACTION_DETAIL, invoker_open_id: INVOKER, run_id: 'r_a' }),
@@ -1044,7 +1056,7 @@ describe('handleWorkflowsCardAction — dash_workflows_cancel', () => {
     expect(r.card).toBeUndefined();
   });
 
-  it('non-owner → owner_only toast, no POST', async () => {
+  it('non-admin → owner_only toast, no POST', async () => {
     const before = run({
       runId: 'r_nonowner',
       workflowId: 'wf',

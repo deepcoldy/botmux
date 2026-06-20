@@ -27,11 +27,11 @@
  *    card so the user keeps their current state for retry.
  *
  * Identity / security:
- *  - `invokerOpenId` is the owner's `ou_*` and is the invoker-lock anchor.
+ *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
  *  - sender union_id NEVER lands on `action.value` (red line).
- *  - Owner gate runs at the command entry AND on every callback.
+ *  - Admin gate runs at the command entry AND on every callback.
  *  - `value.schedule_id` is read but NEVER trusted for identity — only used
- *    as the routing key. The owner gate is the only authority. The Route B
+ *    as the routing key. The admin gate is the IM authority. The Route B
  *    upstream further enforces `ownerOf(schedule_id)` scope (and as of
  *    2026-06-10 also gates cross-bot schedule writes by `callerAppId`).
  *  - Before any POST we re-run the PR1 `computeButtonAvailability` matrix
@@ -44,7 +44,7 @@
  * (toast + card would trigger a two-pass render and flash the stale list).
  */
 
-import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
+import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import type {
   ScheduleCardTaskInput,
   ScheduleDetailDto,
@@ -126,7 +126,7 @@ export interface BuildSchedulesCardOpts {
    *  button.value carries `origin=overview`. Undefined → standalone card. */
   origin?: 'overview';
   /** Dashboard scope. `'global'` (2026-06-11): the `/dashboard` command
-   *  family is a tool panel for the Bot Owner; schedules from any bot show
+   *  family is a tool panel for Bot admins; schedules from any bot show
    *  up regardless of which bot dispatched the callback. Threaded onto
    *  every button.value so refresh/page/detail/back keep the scope; the
    *  handler appends `?scope=global` to every Route B GET/POST. Undefined
@@ -719,6 +719,7 @@ function escapeLarkMd(text: string): string {
 
 export interface SchedulesCardHandlerDeps {
   getOwnerOpenId?: (larkAppId: string) => string | undefined;
+  getDashboardAdminOpenIds?: (larkAppId: string) => ReadonlyArray<string> | undefined;
   createClient: (larkAppId: string) => DaemonClient;
   locale?: Locale;
   /** Override `Date.now()` so tests are deterministic. */
@@ -761,10 +762,8 @@ export async function handleSchedulesCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // ─── 2) Per-bot owner gate ──────────────────────────────────────────
-  const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
-  const expectedOwner = getOwnerOpenId(larkAppId);
-  if (!expectedOwner || operatorOpenId !== expectedOwner) {
+  // ─── 2) Per-bot admin gate ──────────────────────────────────────────
+  if (!isDashboardAdmin(larkAppId, operatorOpenId, deps)) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -814,7 +813,7 @@ export async function handleSchedulesCardAction(
     }
     const detail = toScheduleDetailDto(row, { nowMs: now() });
     const cardJson = buildSchedulesDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
@@ -866,8 +865,8 @@ export async function handleSchedulesCardAction(
       return errorToast(mappedKey, undefined, locale);
     }
 
-    // Route B owner gate is the authority on whether THIS bot's owner can
-    // toggle THIS schedule; we only sanitize the routing key above. As of
+    // Route B owner routing is the authority on whether this schedule can be
+    // toggled; we only sanitize the routing key above. As of
     // 2026-06-10 the Route B handler also gates cross-bot writes.
     let resp: Awaited<ReturnType<DaemonClient['request']>>;
     try {
@@ -891,7 +890,7 @@ export async function handleSchedulesCardAction(
       const synth: ScheduleCardTaskInput = { ...before, enabled: false };
       const detail = toScheduleDetailDto(synth, { nowMs: now() });
       const cardJson = buildSchedulesDetailCard(detail, {
-        invokerOpenId: expectedOwner,
+        invokerOpenId: operatorOpenId,
         locale,
         origin: navOrigin,
         pageSize: navPageSize,
@@ -923,7 +922,7 @@ export async function handleSchedulesCardAction(
     }
     const detail = toScheduleDetailDto(after, { nowMs: now() });
     const cardJson = buildSchedulesDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
@@ -996,7 +995,7 @@ export async function handleSchedulesCardAction(
     }
     const detail = toScheduleDetailDto(after, { nowMs: now() });
     const cardJson = buildSchedulesDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
@@ -1012,7 +1011,7 @@ export async function handleSchedulesCardAction(
     const cardJson = buildSchedulesCard(
       r.tasks,
       {
-        invokerOpenId: expectedOwner,
+        invokerOpenId: operatorOpenId,
         locale,
         page: 1,
         pageSize: navPageSize,
@@ -1042,7 +1041,7 @@ export async function handleSchedulesCardAction(
   const cardJson = buildSchedulesCard(
     r.tasks,
     {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       page,
       pageSize: navPageSize,

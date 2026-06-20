@@ -2,17 +2,17 @@
  * `/dashboard settings` real sub-handler (PR3 C4 + revision).
  *
  * Pipeline:
- *   1. owner gate has ALREADY run in `handleDashboardCommand` — this function
- *      is called only when the caller IS the per-bot owner (ownerOpenId is
+ *   1. admin gate has ALREADY run in `handleDashboardCommand` — this function
+ *      is called only when the caller IS the per-bot admin (adminOpenId is
  *      passed in by the dispatch).
  *   2. fetch the live settings snapshot via PR2 Route B
  *      (`GET /__daemon/settings-snapshot`).
  *   3. project through PR1 `composeSections` and emit a Feishu card.
- *   4. PR3 revision: send the card to the OWNER'S DM (sendUserMessage), NOT
+ *   4. PR3 revision: send the card to the ADMIN'S DM (sendUserMessage), NOT
  *      the topic. Topic only receives a confirmation line (card_dmd idiom).
  *
  * The card builder NEVER receives `senderUnionId` — identity stays inside
- * this closure (plan v3 B5). `invokerOpenId` is the owner open_id itself,
+ * this closure (plan v3 B5). `invokerOpenId` is the admin open_id itself,
  * which both binds the card to the operator and ensures invoker-lock holds.
  */
 
@@ -39,7 +39,7 @@ export async function handleDashboardSettings(
   _chatId: string,
   deps: CommandHandlerDeps,
   larkAppId: string | undefined,
-  ownerOpenId: string,
+  adminOpenId: string,
   testDeps: DashboardSettingsCommandDeps = {},
 ): Promise<void> {
   if (!larkAppId) return;
@@ -78,20 +78,20 @@ export async function handleDashboardSettings(
   }
 
   const dto = composeSections(settings as any, { canWrite: true });
-  // PR3 revision: invokerOpenId = ownerOpenId (NOT message.senderId). This
+  // PR3 revision: invokerOpenId = adminOpenId (NOT message.senderId). This
   // doubles as the invoker-lock anchor, so any future click MUST come from
-  // the same owner open_id.
+  // the same admin open_id.
   const cardJson = buildSettingsCard(dto, {
-    invokerOpenId: ownerOpenId,
+    invokerOpenId: adminOpenId,
     locale,
     canWrite: true,
   });
 
-  // PR3 revision: DM the card to the bot owner; the topic gets only a
+  // PR3 revision: DM the card to the bot admin; the topic gets only a
   // short confirmation. Matches `/card` (cmd.config.card_dmd) idiom.
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
-    await sendUserMessage(larkAppId, ownerOpenId, cardJson, 'interactive');
+    await sendUserMessage(larkAppId, adminOpenId, cardJson, 'interactive');
     await deps.sessionReply(
       rootId,
       t('card.dashboard.settings.dm_sent', undefined, locale),

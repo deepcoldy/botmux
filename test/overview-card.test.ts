@@ -328,6 +328,18 @@ describe('handleOverviewCardAction', () => {
     expect(cardJson).toContain('Dashboard 会话');
   });
 
+  it('second allowedUsers admin can drill down; child card keeps that admin as invoker', async () => {
+    const secondAdmin = 'ou_second_admin';
+    const deps = makeDeps({ getDashboardAdminOpenIds: () => [INVOKER, secondAdmin] });
+    const r = await handleOverviewCardAction(
+      makeAction({ action: OVERVIEW_ACTION_GOTO_SESSIONS, invoker_open_id: secondAdmin }, secondAdmin),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list?scope=global' });
+    expect(JSON.stringify(r.card?.data)).toContain(`"invoker_open_id":"${secondAdmin}"`);
+  });
+
   it('goto_schedules → GET /__daemon/schedules-list, returns schedules card as { card }', async () => {
     const deps = makeDeps();
     const r = await handleOverviewCardAction(
@@ -356,7 +368,7 @@ describe('handleOverviewCardAction', () => {
     expect(cardJson).toContain('Dashboard 全局设置');
   });
 
-  it('non-owner → owner_only toast (lock), no client call', async () => {
+  it('non-admin → owner_only toast (lock), no client call', async () => {
     const deps = makeDeps({ getOwnerOpenId: () => 'ou_other_owner' });
     const r = await handleOverviewCardAction(
       makeAction({ action: OVERVIEW_ACTION_REFRESH, invoker_open_id: INVOKER }),
@@ -442,7 +454,7 @@ describe('handleOverviewCardAction', () => {
     );
     // Same fallthrough as settings: invalid_action carries the ⚠️ glyph.
     expect(r.toast?.content).toContain('⚠️');
-    // The handler still gets to create a client (owner gate passed), but it
+    // The handler still gets to create a client (admin gate passed), but it
     // should NOT make any HTTP request for an unknown action.
     expect(deps.requestSpy).not.toHaveBeenCalled();
   });

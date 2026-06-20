@@ -1,10 +1,10 @@
 /**
  * `/dashboard schedules` real sub-handler (PR3 slice 1).
  *
- * Mirrors `/dashboard sessions` slice 1: owner gate has ALREADY run in
+ * Mirrors `/dashboard sessions` slice 1: admin gate has ALREADY run in
  * `handleDashboardCommand`; this function only fetches the list from PR2
  * Route B (`GET /__daemon/schedules-list`), builds the card, and DMs the
- * owner with the topic getting a short `dm_sent` confirmation.
+ * admin with the topic getting a short `dm_sent` confirmation.
  *
  * No CRUD / no run-now / no pause / no resume in slice 1.
  */
@@ -32,7 +32,7 @@ export async function handleDashboardSchedules(
   _chatId: string,
   deps: CommandHandlerDeps,
   larkAppId: string | undefined,
-  ownerOpenId: string,
+  adminOpenId: string,
   testDeps: DashboardSchedulesCommandDeps = {},
 ): Promise<void> {
   if (!larkAppId) return;
@@ -73,13 +73,13 @@ export async function handleDashboardSchedules(
   // global view and route writes to the row's true owner.
   const cardJson = buildSchedulesCard(
     tasks,
-    { invokerOpenId: ownerOpenId, locale, page: 1, scope: 'global' },
+    { invokerOpenId: adminOpenId, locale, page: 1, scope: 'global' },
     nowMs,
   );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
-    await sendUserMessage(larkAppId, ownerOpenId, cardJson, 'interactive');
+    await sendUserMessage(larkAppId, adminOpenId, cardJson, 'interactive');
     await deps.sessionReply(
       rootId,
       t('card.dashboard.schedules.dm_sent', undefined, locale),

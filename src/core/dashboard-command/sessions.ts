@@ -2,14 +2,14 @@
  * `/dashboard sessions` real sub-handler (PR3 slice 1).
  *
  * Pipeline (mirrors `/dashboard settings`):
- *   1. owner gate ran in `handleDashboardCommand` — this function is only
- *      called when the caller IS the per-bot owner (ownerOpenId passed in).
+ *   1. admin gate ran in `handleDashboardCommand` — this function is only
+ *      called when the caller IS the per-bot admin (adminOpenId passed in).
  *   2. fetch the live sessions list via PR2 Route B
  *      (`GET /__daemon/sessions-list?scope=global`) — `/dashboard` is the
- *      Bot Owner's global tool panel, not a per-bot view.
+ *      Bot admin's global tool panel, not a per-bot view.
  *   3. project through PR1 `composeEntries + sortByStatus + paginate` inside
  *      the card builder; emit a Feishu interactive card.
- *   4. send the card to the OWNER's DM (sendUserMessage), NOT the topic.
+ *   4. send the card to the ADMIN's DM (sendUserMessage), NOT the topic.
  *      Topic only receives a short confirmation line.
  *
  * Slice 1 is read-only: no close/restart/locate buttons. Those need
@@ -41,7 +41,7 @@ export async function handleDashboardSessions(
   _chatId: string,
   deps: CommandHandlerDeps,
   larkAppId: string | undefined,
-  ownerOpenId: string,
+  adminOpenId: string,
   testDeps: DashboardSessionsCommandDeps = {},
 ): Promise<void> {
   if (!larkAppId) return;
@@ -71,16 +71,16 @@ export async function handleDashboardSessions(
 
   const rows = ((snap.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
   const nowMs = testDeps.nowMs ? testDeps.nowMs() : Date.now();
-  // invokerOpenId = ownerOpenId so subsequent clicks still pass the invoker lock.
+  // invokerOpenId = adminOpenId so subsequent clicks still pass the invoker lock.
   const cardJson = buildSessionsCard(
     rows,
-    { invokerOpenId: ownerOpenId, locale, page: 1, scope: 'global' },
+    { invokerOpenId: adminOpenId, locale, page: 1, scope: 'global' },
     nowMs,
   );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
-    await sendUserMessage(larkAppId, ownerOpenId, cardJson, 'interactive');
+    await sendUserMessage(larkAppId, adminOpenId, cardJson, 'interactive');
     await deps.sessionReply(
       rootId,
       t('card.dashboard.sessions.dm_sent', undefined, locale),

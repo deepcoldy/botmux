@@ -9,8 +9,8 @@
  * of pretending the matrix has a single caller-bot column.
  *
  * Identity / security mirrors sessions-card.ts (slice 1):
- *  - `invokerOpenId` is the owner's `ou_*` (invoker-lock anchor).
- *  - Owner gate runs at the command entry AND on every callback.
+ *  - `invokerOpenId` is the invoking admin's `ou_*` (invoker-lock anchor).
+ *  - Admin gate runs at the command entry AND on every callback.
  *  - sender union_id NEVER lands on action.value.
  *
  * Response: success returns `{ card }` only (no toast) — single-pass render,
@@ -20,7 +20,7 @@
  * owns the canonical ordering; resorting in the card would silently diverge.
  */
 
-import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
+import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import type {
   GroupCoverageStatus,
   GroupDetailMemberDto,
@@ -674,6 +674,7 @@ function escapeLarkMd(text: string): string {
 
 export interface GroupsCardHandlerDeps {
   getOwnerOpenId?: (larkAppId: string) => string | undefined;
+  getDashboardAdminOpenIds?: (larkAppId: string) => ReadonlyArray<string> | undefined;
   createClient: (larkAppId: string) => DaemonClient;
   locale?: Locale;
 }
@@ -815,10 +816,8 @@ export async function handleGroupsCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // Per-bot owner gate.
-  const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
-  const expectedOwner = getOwnerOpenId(larkAppId);
-  if (!expectedOwner || operatorOpenId !== expectedOwner) {
+  // Per-bot admin gate.
+  if (!isDashboardAdmin(larkAppId, operatorOpenId, deps)) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -833,7 +832,7 @@ export async function handleGroupsCardAction(
   const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
   const pathSuffix = navScope === 'global' ? '?scope=global' : '';
   const navOptsBase: GroupsNavOpts = {
-    invokerOpenId: expectedOwner,
+    invokerOpenId: operatorOpenId,
     locale,
     pageSize: navPageSize,
     origin: navOrigin,
@@ -879,7 +878,7 @@ export async function handleGroupsCardAction(
   const matrix = load.matrix;
 
   const renderList = (p: number): GroupsCardHandlerResult => cardResult(buildGroupsCard(matrix, {
-    invokerOpenId: expectedOwner,
+    invokerOpenId: operatorOpenId,
     locale,
     page: p,
     pageSize: navPageSize,

@@ -28,11 +28,11 @@
  *    crafted callbacks are server-side rejected before the POST.
  *
  * Identity / security:
- *  - `invokerOpenId` is the owner's `ou_*` and is the invoker-lock anchor.
+ *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
  *  - sender union_id NEVER lands on `action.value` (red line).
- *  - Owner gate runs at the command entry AND on every callback.
+ *  - Admin gate runs at the command entry AND on every callback.
  *  - `value.session_id` is read but NEVER trusted for identity — only used
- *    as the routing key. The owner gate is the only authority. The Route B
+ *    as the routing key. The admin gate is the IM authority. The Route B
  *    upstream further enforces `ownerOf(sessionId)` scope.
  *  - close + resume re-run the PR1 composeDetail matrix against the
  *    pre-POST snapshot and fail-closed if the action is not enabled there
@@ -43,7 +43,7 @@
  * single pass. Locate returns a toast-only result (no card change).
  */
 
-import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
+import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import type { SessionRowDto, SessionDetailDto } from '../../dashboard/session-card-model.js';
 import { composeEntries, sortByStatus, paginate, composeDetail } from '../../dashboard/session-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
@@ -682,8 +682,9 @@ function escapeLarkMd(text: string): string {
 /** ─── Handler ─────────────────────────────────────────────────────────── */
 
 export interface SessionsCardHandlerDeps {
-  /** Override the per-bot owner lookup. Production omits and uses `bot-registry.getOwnerOpenId`. */
+  /** Legacy owner test seam; prefer `getDashboardAdminOpenIds` for new tests. */
   getOwnerOpenId?: (larkAppId: string) => string | undefined;
+  getDashboardAdminOpenIds?: (larkAppId: string) => ReadonlyArray<string> | undefined;
   /** Factory returning a Route B client for the given larkAppId. */
   createClient: (larkAppId: string) => DaemonClient;
   /** Override locale resolution; production uses the caller-supplied locale. */
@@ -733,10 +734,8 @@ export async function handleSessionsCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // ─── 2) Per-bot owner gate ──────────────────────────────────────────
-  const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
-  const expectedOwner = getOwnerOpenId(larkAppId);
-  if (!expectedOwner || operatorOpenId !== expectedOwner) {
+  // ─── 2) Per-bot admin gate ──────────────────────────────────────────
+  if (!isDashboardAdmin(larkAppId, operatorOpenId, deps)) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -784,7 +783,7 @@ export async function handleSessionsCardAction(
     }
     const detail = composeDetail(row, now());
     const cardJson = buildSessionsDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       nowMs: now(),
       origin: navOrigin,
@@ -832,8 +831,8 @@ export async function handleSessionsCardAction(
       return errorToast(mappedKey, undefined, locale);
     }
 
-    // Route B owner gate is the authority on whether THIS bot's owner can
-    // close THIS session; we only sanitize the routing key above.
+    // Route B owner routing is the authority on whether this session can be
+    // closed; we only sanitize the routing key above.
     let resp: Awaited<ReturnType<DaemonClient['request']>>;
     try {
       resp = await client.request({
@@ -876,7 +875,7 @@ export async function handleSessionsCardAction(
     };
     const detail = composeDetail(synth, now());
     const cardJson = buildSessionsDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       nowMs: now(),
       origin: navOrigin,
@@ -1000,7 +999,7 @@ export async function handleSessionsCardAction(
     }
     const detail = composeDetail(after, now());
     const cardJson = buildSessionsDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       nowMs: now(),
       origin: navOrigin,
@@ -1019,7 +1018,7 @@ export async function handleSessionsCardAction(
     const cardJson = buildSessionsCard(
       r.rows,
       {
-        invokerOpenId: expectedOwner,
+        invokerOpenId: operatorOpenId,
         locale,
         page: 1,
         pageSize: navPageSize,
@@ -1049,7 +1048,7 @@ export async function handleSessionsCardAction(
   const cardJson = buildSessionsCard(
     r.rows,
     {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       page,
       pageSize: navPageSize,

@@ -327,7 +327,6 @@ describe('PR3 zh dashboard copy sanity', () => {
     const allowedEnglish = [
       // Product / permission terms kept as-is in the Chinese UI.
       'Dashboard',
-      'Bot Owner',
       'CLI',
       'Web',
       'ACK',

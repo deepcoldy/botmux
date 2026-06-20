@@ -249,8 +249,8 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
   it('callback path: non-owner gate locally denies before any HTTP call', async () => {
     const data: CardActionData = {
       // Stranger is the actor (operator) AND matches the invoker_open_id
-      // so the invoker-lock passes. The per-bot owner gate is what must
-      // reject — bot's owner is INVOKER, not the stranger.
+      // so the invoker-lock passes. The per-bot admin gate is what must
+      // reject — allowedUsers contains INVOKER, not the stranger.
       operator: { open_id: 'ou_stranger' },
       action: {
         value: {
@@ -272,7 +272,7 @@ describe('PR3 smoke — end-to-end /dashboard settings', () => {
       locale: 'en',
     });
 
-    expect(r.toast?.content).toContain('Owner only');
+    expect(r.toast?.content).toContain('bot-admin only');
     // Server NEVER reached for this caller — local gate caught them first.
     expect(fx.hits.GET).toBe(0);
     expect(fx.hits.PUT).toBe(0);

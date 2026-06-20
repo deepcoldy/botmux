@@ -1,11 +1,11 @@
 /**
  * `/dashboard groups` real sub-handler.
  *
- * Mirrors `/dashboard sessions` slice 1: owner gate has ALREADY run in
+ * Mirrors `/dashboard sessions` slice 1: admin gate has ALREADY run in
  * `handleDashboardCommand`; this function only fetches the matrix from PR2
  * Route B (`GET /__daemon/groups-matrix?scope=global`), builds the card,
- * and DMs the owner with the topic getting a short `dm_sent` confirmation.
- * `/dashboard` is the Bot Owner's global tool panel, not a per-bot view.
+ * and DMs the admin with the topic getting a short `dm_sent` confirmation.
+ * `/dashboard` is the Bot admin's global tool panel, not a per-bot view.
  *
  * The command entry sends the list card; per-row detail cards carry add-bot,
  * remove-bot, oncall and role actions through card callbacks.
@@ -37,7 +37,7 @@ export async function handleDashboardGroups(
   _chatId: string,
   deps: CommandHandlerDeps,
   larkAppId: string | undefined,
-  ownerOpenId: string,
+  adminOpenId: string,
   testDeps: DashboardGroupsCommandDeps = {},
 ): Promise<void> {
   if (!larkAppId) return;
@@ -74,9 +74,9 @@ export async function handleDashboardGroups(
     chats: body.chats ?? [],
     bots: body.bots ?? [],
   };
-  // invokerOpenId = ownerOpenId so subsequent clicks still pass the invoker lock.
+  // invokerOpenId = adminOpenId so subsequent clicks still pass the invoker lock.
   const cardJson = buildGroupsCard(matrix, {
-    invokerOpenId: ownerOpenId,
+    invokerOpenId: adminOpenId,
     locale,
     page: 1,
     scope: 'global',
@@ -84,7 +84,7 @@ export async function handleDashboardGroups(
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
-    await sendUserMessage(larkAppId, ownerOpenId, cardJson, 'interactive');
+    await sendUserMessage(larkAppId, adminOpenId, cardJson, 'interactive');
     await deps.sessionReply(
       rootId,
       t('card.dashboard.groups.dm_sent', undefined, locale),

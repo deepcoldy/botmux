@@ -10,6 +10,7 @@ import { handleDashboardCommand } from '../src/core/dashboard-command/index.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, type CommandHandlerDeps } from '../src/core/command-handler.js';
 
 const OWNER = 'ou_bot_owner';
+const SECOND_ADMIN = 'ou_second_admin';
 
 function makeMessage(over: Partial<LarkMessage> = {}): LarkMessage {
   return {
@@ -35,6 +36,10 @@ function ownerLookup(owner: string | undefined = OWNER) {
   return { getOwnerOpenId: () => owner };
 }
 
+function adminLookup(admins: ReadonlyArray<string> | undefined = [OWNER]) {
+  return { getDashboardAdminOpenIds: () => admins };
+}
+
 function captureDM(): {
   sendUserMessage: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
   calls: Array<{ openId: string; content: string; msgType?: string }>;
@@ -49,21 +54,21 @@ function captureDM(): {
   };
 }
 
-/** ─── ensureDashboardOwner — per-bot owner ─────────────────────────── */
+/** ─── ensureDashboardOwner — per-bot allowedUsers admin ────────────── */
 
-describe('ensureDashboardOwner (per-bot owner)', () => {
-  it('returns no_bot_owner when larkAppId is undefined', async () => {
+describe('ensureDashboardOwner (per-bot allowedUsers admin)', () => {
+  it('returns no_dashboard_admin when larkAppId is undefined', async () => {
     const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), undefined, ownerLookup());
     expect(r.ok).toBe(false);
-    expect((r as Extract<DashboardOwnerCheck, { ok: false }>).reason).toBe('no_bot_owner');
+    expect((r as Extract<DashboardOwnerCheck, { ok: false }>).reason).toBe('no_dashboard_admin');
   });
 
-  it('returns no_bot_owner when getOwnerOpenId returns undefined', async () => {
+  it('returns no_dashboard_admin when no allowedUsers admin exists', async () => {
     const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), 'cli_x', {
-      getOwnerOpenId: () => undefined,  // explicit undefined, NOT the helper default
+      getDashboardAdminOpenIds: () => [],
     });
     expect(r.ok).toBe(false);
-    expect((r as any).reason).toBe('no_bot_owner');
+    expect((r as any).reason).toBe('no_dashboard_admin');
   });
 
   it('returns missing_sender when message.senderId is absent', async () => {
@@ -72,24 +77,23 @@ describe('ensureDashboardOwner (per-bot owner)', () => {
     expect((r as any).reason).toBe('missing_sender');
   });
 
-  it('returns not_bot_owner when senderId != ownerOpenId', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderId: 'ou_stranger' }), 'cli_x', ownerLookup());
+  it('returns not_dashboard_admin when senderId is not in allowedUsers admins', async () => {
+    const r = await ensureDashboardOwner(makeMessage({ senderId: 'ou_stranger' }), 'cli_x', adminLookup([OWNER]));
     expect(r.ok).toBe(false);
-    expect((r as any).reason).toBe('not_bot_owner');
+    expect((r as any).reason).toBe('not_dashboard_admin');
   });
 
-  it('returns ok:true with ownerOpenId when match', async () => {
-    const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), 'cli_x', ownerLookup());
+  it('returns ok:true with adminOpenId when sender is any allowedUsers admin', async () => {
+    const r = await ensureDashboardOwner(makeMessage({ senderId: SECOND_ADMIN }), 'cli_x', adminLookup([OWNER, SECOND_ADMIN]));
     expect(r.ok).toBe(true);
-    expect((r as Extract<DashboardOwnerCheck, { ok: true }>).ownerOpenId).toBe(OWNER);
+    expect((r as Extract<DashboardOwnerCheck, { ok: true }>).adminOpenId).toBe(SECOND_ADMIN);
   });
 
-  it('owner of bot A is rejected when @-ed at bot B (cross-bot owner is not enough)', async () => {
-    // Bot B's owner is OUR_BOT_B_OWNER, not the caller.
-    const lookup = { getOwnerOpenId: (appId: string) => appId === 'cli_a' ? OWNER : 'ou_other' };
+  it('admin of bot A is rejected when @-ed at bot B (cross-bot admin is not enough)', async () => {
+    const lookup = { getDashboardAdminOpenIds: (appId: string) => appId === 'cli_a' ? [OWNER] : ['ou_other'] };
     const r = await ensureDashboardOwner(makeMessage({ senderId: OWNER }), 'cli_b', lookup);
     expect(r.ok).toBe(false);
-    expect((r as any).reason).toBe('not_bot_owner');
+    expect((r as any).reason).toBe('not_dashboard_admin');
   });
 });
 
@@ -117,17 +121,17 @@ describe('stub module list', () => {
   });
 });
 
-/** ─── Owner gate guards EVERY subcommand ─────────────────────────────── */
+/** ─── Admin gate guards EVERY subcommand ────────────────────────────── */
 
-describe('handleDashboardCommand — owner gate covers all subcommands', () => {
+describe('handleDashboardCommand — admin gate covers all subcommands', () => {
   it.each(['help', 'sessions', 'settings', 'totally_made_up', ''] as const)(
-    'non-owner /dashboard %s → owner_only in topic, NEVER DMs',
+    'non-admin /dashboard %s → owner_only in topic, NEVER DMs',
     async (sub) => {
       const deps = makeDeps();
       const dm = captureDM();
       await handleDashboardCommand(
         makeMessage({ senderId: 'ou_stranger' }), sub, 'om_root', 'oc_test', deps, 'cli_x',
-        { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
+        { ...adminLookup([OWNER]), sendUserMessage: dm.sendUserMessage },
       );
       const text = (deps.sessionReply as any).mock.calls[0][1] as string;
       expect(text).toContain('🔒');
@@ -136,9 +140,9 @@ describe('handleDashboardCommand — owner gate covers all subcommands', () => {
   );
 });
 
-/** ─── Owner-gated replies all go to DM, NOT topic interactive ───────── */
+/** ─── Admin-gated replies all go to DM, NOT topic interactive ──────── */
 
-describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
+describe('handleDashboardCommand — admin dispatch DMs the invoking admin', () => {
   // All 5 modules (overview / sessions / workflows / groups / schedules)
   // plus settings now have real handlers; the parametric stub loop has
   // dropped to zero entries. Verify the stub fallback path is no longer
@@ -151,16 +155,28 @@ describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
     ]);
   });
 
-  it('owner /dashboard help → help DMed to owner', async () => {
+  it('admin /dashboard help → help DMed to admin', async () => {
     const deps = makeDeps();
     const dm = captureDM();
     await handleDashboardCommand(
       makeMessage(), 'help', 'om_root', 'oc_test', deps, 'cli_x',
-      { ...ownerLookup(), sendUserMessage: dm.sendUserMessage },
+      { ...adminLookup([OWNER]), sendUserMessage: dm.sendUserMessage },
     );
     expect(dm.calls.length).toBe(1);
     expect(dm.calls[0].content).toContain('/dashboard');
     expect(dm.calls[0].content).toContain('overview');
+  });
+
+  it('second allowedUsers admin /dashboard help → help DMed to that admin', async () => {
+    const deps = makeDeps();
+    const dm = captureDM();
+    await handleDashboardCommand(
+      makeMessage({ senderId: SECOND_ADMIN }), 'help', 'om_root', 'oc_test', deps, 'cli_x',
+      { ...adminLookup([OWNER, SECOND_ADMIN]), sendUserMessage: dm.sendUserMessage },
+    );
+    expect(dm.calls.length).toBe(1);
+    expect(dm.calls[0].openId).toBe(SECOND_ADMIN);
+    expect(dm.calls[0].content).toContain('/dashboard');
   });
 
   // NOTE: empty-args default routing (`/dashboard` → overview) is exercised
@@ -172,7 +188,7 @@ describe('handleDashboardCommand — owner dispatch DMs the owner', () => {
     const sendUserMessage = vi.fn(async () => { throw new Error('lark_403'); });
     await handleDashboardCommand(
       makeMessage(), 'help', 'om_root', 'oc_test', deps, 'cli_x',
-      { ...ownerLookup(), sendUserMessage },
+      { ...adminLookup([OWNER]), sendUserMessage },
     );
     const topicCalls = (deps.sessionReply as any).mock.calls;
     expect(topicCalls.length).toBe(1);

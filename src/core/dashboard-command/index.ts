@@ -2,9 +2,10 @@
  * `/dashboard <module>` command-group entry (PR3 C1).
  *
  * Pipeline:
- *  1. Owner gate: the entire `/dashboard *` group is owner-only. Any sub
- *     (help / unknown / overview / sessions / workflows / groups / schedules
- *     / settings) that bypasses the gate is a security regression — see the
+ *  1. Admin gate: the entire `/dashboard *` group is restricted to the
+ *     bot's resolved `allowedUsers`, matching `/botconfig`. Any sub (help /
+ *     unknown / overview / sessions / workflows / groups / schedules /
+ *     settings) that bypasses the gate is a security regression — see the
  *     dispatch tests for the explicit guarantee.
  *  2. Subcommand dispatch by the first whitespace-delimited token; empty
  *     args default to `overview` to match v1.3 §0 routing rules.
@@ -35,7 +36,7 @@ import { handleDashboardGroups, type DashboardGroupsCommandDeps } from './groups
 
 /** Optional test seam — production omits and uses the real PR2 helper. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
-  /** Override for `sendUserMessage` (DM to owner). Production omits. */
+  /** Override for `sendUserMessage` (DM to invoking admin). Production omits. */
   sendUserMessage?: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
   settings?: DashboardSettingsCommandDeps;
   sessions?: DashboardSessionsCommandDeps;
@@ -55,18 +56,17 @@ export async function handleDashboardCommand(
   testDeps: DashboardCommandDeps = {},
 ): Promise<void> {
   const loc = localeForBot(larkAppId);
-  // ─── B1 (v2): integral owner gate — applies to ALL subcommands ───
-  // PR3 revision: per-bot owner — only the owner of the @-ed bot can use
-  // `/dashboard *`, regardless of whether they're an owner of some other
-  // bot in this deployment.
+  // Integral admin gate — applies to ALL subcommands. It intentionally
+  // matches `/botconfig`: any resolved allowedUsers entry can use dashboard,
+  // but open-mode bots with no allowedUsers still fail closed.
   const gate = await ensureDashboardOwner(message, larkAppId, testDeps);
   if (!gate.ok) {
-    // Owner gate failure: reply in the topic (we don't have an owner DM target).
+    // Admin gate failure: reply in the topic (we don't have an admin DM target).
     await deps.sessionReply(rootId, t('card.dashboard.owner_only', undefined, loc), undefined, larkAppId);
     return;
   }
 
-  // PR3 revision: every owner-gated response goes to the owner's DM. The
+  // Every admin-gated response goes to the invoking admin's DM. The
   // topic receives only a short confirmation, sharing the `/card` idiom
   // (cmd.config.card_dmd: "configuration card sent to your DM").
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
@@ -76,7 +76,7 @@ export async function handleDashboardCommand(
       return;
     }
     try {
-      await sendUserMessage(larkAppId, gate.ownerOpenId, text, msgType);
+      await sendUserMessage(larkAppId, gate.adminOpenId, text, msgType);
       await deps.sessionReply(rootId, t('card.dashboard.dm_sent', undefined, loc), undefined, larkAppId);
     } catch (e: any) {
       await deps.sessionReply(
@@ -87,7 +87,7 @@ export async function handleDashboardCommand(
     }
   };
 
-  // ─── Dispatch (owner-only zone) ───
+  // ─── Dispatch (admin-only zone) ───
   const sub = args.trim().split(/\s+/)[0] || 'overview';
 
   if (sub === 'help') {
@@ -98,37 +98,37 @@ export async function handleDashboardCommand(
   // PR3 C4: settings dispatched to the real handler.
   if (sub === 'settings') {
     const settingsArgs = args.replace(/^settings\s*/, '');
-    return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.settings);
+    return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.settings);
   }
 
   // PR3 sessions slice 1: read-only list + pagination + refresh.
   if (sub === 'sessions') {
     const sessionsArgs = args.replace(/^sessions\s*/, '');
-    return handleDashboardSessions(message, sessionsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.sessions);
+    return handleDashboardSessions(message, sessionsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.sessions);
   }
 
   // PR3 schedules slice 1: read-only list + pagination + refresh.
   if (sub === 'schedules') {
     const schedulesArgs = args.replace(/^schedules\s*/, '');
-    return handleDashboardSchedules(message, schedulesArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.schedules);
+    return handleDashboardSchedules(message, schedulesArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.schedules);
   }
 
   // PR3 workflows slice 1: read-only list + pagination + refresh.
   if (sub === 'workflows') {
     const workflowsArgs = args.replace(/^workflows\s*/, '');
-    return handleDashboardWorkflows(message, workflowsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.workflows);
+    return handleDashboardWorkflows(message, workflowsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.workflows);
   }
 
   // PR3 groups: list + pagination + refresh + per-row management detail.
   if (sub === 'groups') {
     const groupsArgs = args.replace(/^groups\s*/, '');
-    return handleDashboardGroups(message, groupsArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.groups);
+    return handleDashboardGroups(message, groupsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.groups);
   }
 
   // PR3 overview slice 1: read-only summary card + goto buttons.
   if (sub === 'overview') {
     const overviewArgs = args.replace(/^overview\s*/, '');
-    return handleDashboardOverview(message, overviewArgs, rootId, _chatId, deps, larkAppId, gate.ownerOpenId, testDeps.overview);
+    return handleDashboardOverview(message, overviewArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.overview);
   }
 
   if (DASHBOARD_MODULES.includes(sub as DashboardModule)) {

@@ -6,15 +6,15 @@
  *
  *   1. invoker lock: `action.value.invoker_open_id === operator.open_id`
  *      (plan §7 idiom — only the user who saw the card is allowed to mutate).
- *   2. per-bot owner gate (PR3 revision): `operator.open_id` MUST equal
- *      `bot-registry.getOwnerOpenId(larkAppId)`. The global union_id owner set
- *      is NOT consulted anymore — each callback is scoped to the bot that
- *      received it; A's owner cannot use B's `/dashboard *`.
+ *   2. per-bot admin gate: `operator.open_id` MUST be one of this bot's
+ *      resolved `allowedUsers`, matching `/botconfig`. Each callback is
+ *      scoped to the bot that received it; an admin of bot A cannot use
+ *      bot B's `/dashboard *`.
  *   3. noop short-circuit: `dash_settings_noop` (current-value button in the
  *      segmented control) returns a toast WITHOUT calling the Route B client.
  *      Fail-safe for clients that don't suppress `disabled` callbacks.
  *   4. Sync handler (PR3 UI revision pass 2):
- *        - await the Route B PUT/GET (resolves the owner's union_id via
+ *        - await the Route B PUT/GET (resolves the admin's union_id via
  *          `resolveUserUnionId` first, since the server-side write API
  *          still requires `ownerUnionId` in the body),
  *        - return ONLY `{ card }` (no toast) on the success path so the
@@ -31,10 +31,10 @@
  *
  * Sender identity (`unionId`) NEVER lands on `action.value`. The only field
  * the callback echoes from the original render is `invoker_open_id`, which
- * is the OWNER's open_id (not the sender's union_id).
+ * is the invoking admin's open_id (not the sender's union_id).
  */
 
-import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
+import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import { composeSections, type SettingsCardDTO } from '../../dashboard/settings-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
@@ -150,7 +150,7 @@ export function buildSettingsCard(dto: SettingsCardDTO, opts: BuildSettingsCardO
   elements.push({ tag: 'action', actions: footerActions });
 
   // Footer security note (PR3 UI revision) — communicates that the card is
-  // owner-private and ACK-refreshing, so users know clicks self-heal.
+  // admin-private and ACK-refreshing, so users know clicks self-heal.
   elements.push({
     tag: 'note',
     elements: [
@@ -320,14 +320,34 @@ function buildSegmentedRow(
 /** ─── Handler ─────────────────────────────────────────────────────────── */
 
 export interface SettingsCardHandlerDeps {
-  /** Override the per-bot owner lookup. Production omits and uses `bot-registry.getOwnerOpenId`. */
+  /** Legacy owner test seam; prefer `getDashboardAdminOpenIds` for new tests. */
   getOwnerOpenId?: (larkAppId: string) => string | undefined;
+  getDashboardAdminOpenIds?: (larkAppId: string) => ReadonlyArray<string> | undefined;
   /** Override the union_id resolver. Production omits; tests skip Lark contact API. */
   resolveUserUnionId?: (larkAppId: string, openId: string) => Promise<{ unionId?: string }>;
   /** Factory returning a Route B client for the given larkAppId. */
   createClient: (larkAppId: string) => DaemonClient;
   /** Override locale resolution; production uses the caller-supplied locale. */
   locale?: Locale;
+}
+
+async function resolveVerifiedOperatorUnionId(
+  data: CardActionData,
+  larkAppId: string,
+  operatorOpenId: string,
+  deps: Pick<SettingsCardHandlerDeps, 'resolveUserUnionId'>,
+): Promise<string | undefined> {
+  const verified = data.operator?.union_id;
+  if (typeof verified === 'string') {
+    return verified.startsWith('on_') ? verified : undefined;
+  }
+  const resolveUnion = deps.resolveUserUnionId ?? defaultResolveUserUnionId;
+  try {
+    const r = await resolveUnion(larkAppId, operatorOpenId);
+    return typeof r.unionId === 'string' && r.unionId.startsWith('on_') ? r.unionId : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -480,13 +500,11 @@ export async function handleSettingsCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // ─── 2) Per-bot owner gate (PR3 revision) ────────────────────────────
-  // We no longer consult the global union_id owner set. Each callback is
-  // scoped to the bot that received it: only THAT bot's owner can act.
-  // `action.value.*` identity fields are still ignored (red line).
-  const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
-  const expectedOwner = getOwnerOpenId(larkAppId);
-  if (!expectedOwner || operatorOpenId !== expectedOwner) {
+  // ─── 2) Per-bot admin gate ───────────────────────────────────────────
+  // Match `/botconfig`: any resolved allowedUsers entry can act. The
+  // invoker lock above still pins this specific card to the admin who
+  // received it, and `action.value.*` identity fields are ignored.
+  if (!isDashboardAdmin(larkAppId, operatorOpenId, deps)) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -513,7 +531,7 @@ export async function handleSettingsCardAction(
     try {
       const client = deps.createClient(larkAppId);
       const snap = await client.request({ method: 'GET', path: '/__daemon/settings-snapshot' });
-      return successResult(snap, expectedOwner, locale, 'card.dashboard.settings.refreshed', navOrigin);
+      return successResult(snap, operatorOpenId, locale, 'card.dashboard.settings.refreshed', navOrigin);
     } catch (e) {
       return errorToast('card.dashboard.settings.snapshot_failed', { reason: (e as Error).message }, locale);
     }
@@ -525,17 +543,11 @@ export async function handleSettingsCardAction(
     return ackToast(`card.dashboard.settings.${patch.error}`, locale);
   }
 
-  // PR2 Route B's `PUT /__daemon/settings-write` still expects `ownerUnionId`
-  // in the body for global-owner verification on the server side. The local
-  // per-bot owner gate above already accepted this caller; we just need to
-  // surface their union_id.
-  const resolveUnion = deps.resolveUserUnionId ?? defaultResolveUserUnionId;
-  let ownerUnionId: string | undefined;
-  try {
-    const r = await resolveUnion(larkAppId, expectedOwner);
-    ownerUnionId = r.unionId;
-  } catch { /* fail-closed: leave undefined → owner_only */ }
-  if (!ownerUnionId || !ownerUnionId.startsWith('on_')) {
+  // Route B still expects `ownerUnionId` for global settings authorization.
+  // Prefer Lark's verified callback field; only fall back to contact lookup
+  // when Lark omitted it. Never read identity from action.value.
+  const ownerUnionId = await resolveVerifiedOperatorUnionId(data, larkAppId, operatorOpenId, deps);
+  if (!ownerUnionId) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -553,7 +565,7 @@ export async function handleSettingsCardAction(
         locale,
       );
     }
-    return successResult(r, expectedOwner, locale, 'card.dashboard.settings.saved', navOrigin);
+    return successResult(r, operatorOpenId, locale, 'card.dashboard.settings.saved', navOrigin);
   } catch (e) {
     return errorToast('card.dashboard.settings.save_failed', { reason: (e as Error).message }, locale);
   }

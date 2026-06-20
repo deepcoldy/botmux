@@ -24,6 +24,7 @@ vi.mock('../src/bot-registry.js', async () => {
   return {
     ...actual,
     getOwnerOpenId: vi.fn(() => 'ou_alice'),
+    getDashboardAdminOpenIds: vi.fn(() => ['ou_alice']),
   };
 });
 

@@ -623,7 +623,7 @@ export const messages: Record<string, string> = {
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
-  'card.dashboard.owner_only': '🔒 The `/dashboard` command group is restricted to the Bot Owner.',
+  'card.dashboard.owner_only': '🔒 The `/dashboard` command group is restricted to bot admins (allowedUsers).',
   'card.dashboard.overview.not_implemented_yet': '🚧 `/dashboard overview` is not implemented yet; coming in a follow-up PR.',
   'card.dashboard.sessions.not_implemented_yet': '🚧 `/dashboard sessions` is not implemented yet; coming in a follow-up PR.',
   'card.dashboard.workflows.not_implemented_yet': '🚧 `/dashboard workflows` is not implemented yet; coming in a follow-up PR.',
@@ -638,12 +638,12 @@ export const messages: Record<string, string> = {
     '• `workflows`  — workflow runs (beta)\n' +
     '• `groups`     — group matrix\n' +
     '• `schedules`  — scheduled tasks\n' +
-    '• `settings`   — global settings (owner only)\n' +
+    '• `settings`   — global settings (admins only)\n' +
     '• `help`       — this help\n\n' +
-    'Without a subcommand, defaults to `overview`. The entire group is owner-only.',
+    'Without a subcommand, defaults to `overview`. The entire group is restricted to bot admins (allowedUsers).',
   'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',
-  'card.dashboard.dm_sent': '📬 The dashboard reply was DMed to the Bot Owner.',
-  'card.dashboard.dm_failed': '⚠️ Failed to DM Bot Owner: {reason}',
+  'card.dashboard.dm_sent': '📬 The dashboard reply was DMed to you.',
+  'card.dashboard.dm_failed': '⚠️ Failed to DM you the dashboard reply: {reason}',
   // sessions card (PR3 slice 1)
   'card.dashboard.sessions.title': '🖥️ Dashboard Sessions',
   'card.dashboard.sessions.count_summary': 'Active {active} · Closed {closed} · Page {page}/{totalPages}',
@@ -652,8 +652,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.prev': '← Prev',
   'card.dashboard.sessions.next': 'Next →',
   'card.dashboard.sessions.jump_page': '{n}/{total}',
-  'card.dashboard.sessions.dm_sent': '📬 The dashboard sessions list was DMed to the Bot Owner.',
-  'card.dashboard.sessions.dm_failed': '⚠️ Failed to DM the sessions list to Bot Owner: {reason}',
+  'card.dashboard.sessions.dm_sent': '📬 The dashboard sessions list was DMed to you.',
+  'card.dashboard.sessions.dm_failed': '⚠️ Failed to DM you the sessions list: {reason}',
   'card.dashboard.sessions.list_failed': '⚠️ Failed to fetch sessions list: {reason}',
   // sessions card (PR3 slice 2a) — detail card + close action
   'card.dashboard.sessions.row_detail': '📂 Detail',
@@ -695,8 +695,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.next_label': 'next {rel}',
   'card.dashboard.schedules.last_label': 'last {rel}',
   'card.dashboard.schedules.repeat_label': 'ran {repeat}',
-  'card.dashboard.schedules.dm_sent': '📬 The dashboard schedules list was DMed to the Bot Owner.',
-  'card.dashboard.schedules.dm_failed': '⚠️ Failed to DM the schedules list to Bot Owner: {reason}',
+  'card.dashboard.schedules.dm_sent': '📬 The dashboard schedules list was DMed to you.',
+  'card.dashboard.schedules.dm_failed': '⚠️ Failed to DM you the schedules list: {reason}',
   'card.dashboard.schedules.list_failed': '⚠️ Failed to fetch schedules list: {reason}',
   // schedules card (PR3 slice 2a) — detail card + pause/resume actions
   'card.dashboard.schedules.row_detail': '📂 Detail',
@@ -748,8 +748,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.groups.status.out': 'out',
   'card.dashboard.groups.status.unknown': 'unknown',
   'card.dashboard.groups.status.error': 'error',
-  'card.dashboard.groups.dm_sent': '📬 The dashboard groups card was DMed to the Bot Owner.',
-  'card.dashboard.groups.dm_failed': '⚠️ Failed to DM the groups card to Bot Owner: {reason}',
+  'card.dashboard.groups.dm_sent': '📬 The dashboard groups card was DMed to you.',
+  'card.dashboard.groups.dm_failed': '⚠️ Failed to DM you the groups card: {reason}',
   'card.dashboard.groups.list_failed': '⚠️ Failed to fetch groups: {reason}',
   'card.dashboard.groups.row_manage': '🛠 Manage',
   'card.dashboard.groups.detail.title': '🌐 Group Management',
@@ -792,8 +792,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.workflows.progress_label': 'step {done}/{total}',
   'card.dashboard.workflows.started_label': 'started {rel}',
   'card.dashboard.workflows.updated_label': 'updated {rel}',
-  'card.dashboard.workflows.dm_sent': '📬 The dashboard workflows list was DMed to the Bot Owner.',
-  'card.dashboard.workflows.dm_failed': '⚠️ Failed to DM the workflows list to Bot Owner: {reason}',
+  'card.dashboard.workflows.dm_sent': '📬 The dashboard workflows list was DMed to you.',
+  'card.dashboard.workflows.dm_failed': '⚠️ Failed to DM you the workflows list: {reason}',
   'card.dashboard.workflows.list_failed': '⚠️ Failed to fetch workflows list: {reason}',
   // workflows card (PR3 slice 2a) — detail card + cancel action
   'card.dashboard.workflows.row_detail': '📂 Detail',
@@ -817,8 +817,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.workflows.cancel_failed': '⚠️ Cancel failed: {reason}',
   'card.dashboard.workflows.workflow_not_found': '⚠️ Run not found or already cleaned up.',
 
-  'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to the Bot Owner.',
-  'card.dashboard.settings.dm_failed': '⚠️ Failed to DM the settings card to Bot Owner: {reason}',
+  'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to you.',
+  'card.dashboard.settings.dm_failed': '⚠️ Failed to DM you the settings card: {reason}',
 
   // overview card (PR3 slice 1)
   'card.dashboard.overview.title': '⚙️ Dashboard Overview',
@@ -840,8 +840,8 @@ export const messages: Record<string, string> = {
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.
   'card.dashboard.overview.back_button': '↩ Overview',
-  'card.dashboard.overview.dm_sent': '📬 The dashboard overview was DMed to the Bot Owner.',
-  'card.dashboard.overview.dm_failed': '⚠️ Failed to DM the overview to Bot Owner: {reason}',
+  'card.dashboard.overview.dm_sent': '📬 The dashboard overview was DMed to you.',
+  'card.dashboard.overview.dm_failed': '⚠️ Failed to DM you the overview: {reason}',
   'card.dashboard.overview.overview_failed': '⚠️ Failed to fetch overview snapshot: {reason}',
   // settings_summary substrings
   'card.dashboard.overview.settings.publicReadOnly.on': 'Public read-only ON',
@@ -866,7 +866,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.refreshed': '✅ Refreshed',
   'card.dashboard.settings.save_failed': '⚠️ Save failed: {reason}',
   'card.dashboard.settings.not_invoker': '🔒 Only the card invoker can use this control.',
-  'card.dashboard.settings.owner_only': '🔒 Settings are Bot Owner only.',
+  'card.dashboard.settings.owner_only': '🔒 Settings are bot-admin only (allowedUsers).',
   'card.dashboard.settings.invalid_field': '⚠️ Field not supported.',
   'card.dashboard.settings.invalid_value': '⚠️ Invalid value.',
   'card.dashboard.settings.invalid_time': '⚠️ Time must be HH:MM.',
@@ -878,7 +878,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.segment.on_current': '✓ On',
   'card.dashboard.settings.segment.off_current': '✓ Off',
   'card.dashboard.settings.maintenance.time_display': 'Update time: {time}',
-  'card.dashboard.settings.footer.security': '🔒 Bot Owner only · DM reply · ACK auto-refresh',
+  'card.dashboard.settings.footer.security': '🔒 Bot admins only · DM reply · ACK auto-refresh',
   'settings.readOnlyVisitor': 'Read-only visitor mode — settings are not editable.',
   'settings.autoUpdateLocalDev': 'Local-dev install does not support auto-update.',
   // Per-toggle disable reasons (more specific than the section hint, PR3 UI revision)

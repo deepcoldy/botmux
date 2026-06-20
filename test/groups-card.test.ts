@@ -466,6 +466,18 @@ describe('handleGroupsCardAction', () => {
     expect(JSON.stringify(r.card?.data)).toContain('"dashboard_scope":"global"');
   });
 
+  it('second allowedUsers admin can refresh; rebuilt card keeps that admin as invoker', async () => {
+    const secondAdmin = 'ou_second_admin';
+    const deps = makeDeps({ getDashboardAdminOpenIds: () => [INVOKER, secondAdmin] });
+    const r = await handleGroupsCardAction(
+      makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: secondAdmin }, secondAdmin),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy).toHaveBeenCalledOnce();
+    expect(JSON.stringify(r.card?.data)).toContain(`"invoker_open_id":"${secondAdmin}"`);
+  });
+
   it('page → renders requested page', async () => {
     const chats = Array.from({ length: 25 }, (_, i) =>
       chat({ chatId: `oc_${String(i).padStart(4, '0')}`, name: `chat-${i}` }),
@@ -485,7 +497,7 @@ describe('handleGroupsCardAction', () => {
     expect(cardJson).toContain('第 2/5 页');
   });
 
-  it('non-owner → toast `owner_only`, NO client call', async () => {
+  it('non-admin → toast `owner_only`, NO client call', async () => {
     const deps = makeDeps({ getOwnerOpenId: () => 'ou_other' });
     const r = await handleGroupsCardAction(
       makeAction({ action: GROUPS_ACTION_REFRESH, invoker_open_id: INVOKER }),

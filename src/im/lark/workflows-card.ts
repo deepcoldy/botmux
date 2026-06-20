@@ -26,11 +26,11 @@
  *    card so the user keeps their current state for retry.
  *
  * Identity / security:
- *  - `invokerOpenId` is the owner's `ou_*` and is the invoker-lock anchor.
+ *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
  *  - sender union_id NEVER lands on `action.value` (red line).
- *  - Owner gate runs at the command entry AND on every callback.
+ *  - Admin gate runs at the command entry AND on every callback.
  *  - `value.run_id` is read but NEVER trusted for identity — only used as
- *    the routing key. The owner gate is the only authority. The Route B
+ *    the routing key. The admin gate is the IM authority. The Route B
  *    upstream further enforces `chatBinding.larkAppId` scope (and as of
  *    2026-06-10 also gates cross-bot cancel/approve/reject by
  *    `callerAppId`).
@@ -45,7 +45,7 @@
  * renders the card in a single pass.
  */
 
-import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
+import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import type {
   WorkflowRunDetailDto,
   WorkflowRunDetailInput,
@@ -692,6 +692,7 @@ function escapeLarkMd(text: string): string {
 
 export interface WorkflowsCardHandlerDeps {
   getOwnerOpenId?: (larkAppId: string) => string | undefined;
+  getDashboardAdminOpenIds?: (larkAppId: string) => ReadonlyArray<string> | undefined;
   createClient: (larkAppId: string) => DaemonClient;
   locale?: Locale;
   /** Override `Date.now()` so tests are deterministic. */
@@ -738,10 +739,8 @@ export async function handleWorkflowsCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // ─── 2) Per-bot owner gate ──────────────────────────────────────────
-  const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
-  const expectedOwner = getOwnerOpenId(larkAppId);
-  if (!expectedOwner || operatorOpenId !== expectedOwner) {
+  // ─── 2) Per-bot admin gate ──────────────────────────────────────────
+  if (!isDashboardAdmin(larkAppId, operatorOpenId, deps)) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -788,7 +787,7 @@ export async function handleWorkflowsCardAction(
     }
     const detail = projectRunDetailDto(row as WorkflowRunDetailInput, { nowMs: now() });
     const cardJson = buildWorkflowsDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       nowMs: now(),
       origin: navOrigin,
@@ -832,8 +831,8 @@ export async function handleWorkflowsCardAction(
       return errorToast('card.dashboard.workflows.cancel.disabled.noOwner', undefined, locale);
     }
 
-    // POST cancel. Route B owner gate is the authority on whether THIS
-    // bot's owner can cancel THIS run; the IM layer only sanitizes the
+    // POST cancel. Route B owner routing is the authority on whether this
+    // run can be cancelled; the IM layer only sanitizes the
     // routing key + does the matrix check above.
     let resp: Awaited<ReturnType<DaemonClient['request']>>;
     try {
@@ -869,7 +868,7 @@ export async function handleWorkflowsCardAction(
     }
     const detail = projectRunDetailDto(after as WorkflowRunDetailInput, { nowMs: now() });
     const cardJson = buildWorkflowsDetailCard(detail, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       nowMs: now(),
       origin: navOrigin,
@@ -886,7 +885,7 @@ export async function handleWorkflowsCardAction(
     const cardJson = buildWorkflowsCard(
       r.runs,
       {
-        invokerOpenId: expectedOwner,
+        invokerOpenId: operatorOpenId,
         locale,
         page: 1,
         pageSize: navPageSize,
@@ -916,7 +915,7 @@ export async function handleWorkflowsCardAction(
   const cardJson = buildWorkflowsCard(
     r.runs,
     {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       page,
       pageSize: navPageSize,

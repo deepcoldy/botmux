@@ -442,6 +442,11 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
+/** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
+export function getDashboardAdminOpenIds(larkAppId: string): string[] {
+  return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
+}
+
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
 export function getBotOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.botOpenId;

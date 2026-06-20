@@ -698,6 +698,18 @@ describe('handleSessionsCardAction', () => {
     expect(JSON.stringify(r.card?.data)).toContain('"dashboard_scope":"global"');
   });
 
+  it('second allowedUsers admin can refresh; rebuilt card keeps that admin as invoker', async () => {
+    const secondAdmin = 'ou_second_admin';
+    const deps = makeDeps({ getDashboardAdminOpenIds: () => [INVOKER, secondAdmin] });
+    const r = await handleSessionsCardAction(
+      makeAction({ action: SESSIONS_ACTION_REFRESH, invoker_open_id: secondAdmin }, secondAdmin),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.requestSpy).toHaveBeenCalledOnce();
+    expect(JSON.stringify(r.card?.data)).toContain(`"invoker_open_id":"${secondAdmin}"`);
+  });
+
   it('page → uses the requested page index (clamped)', async () => {
     // 25 rows / PAGE_SIZE=5 = 5 pages.
     const rows = Array.from({ length: 25 }, (_, i) => row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }));
@@ -843,7 +855,7 @@ describe('handleSessionsCardAction', () => {
     expect(cardJson).toContain('"page_size":"3"');
   });
 
-  it('non-owner → toast `owner_only`, NO client call', async () => {
+  it('non-admin → toast `owner_only`, NO client call', async () => {
     const deps = makeDeps({ getOwnerOpenId: () => 'ou_other' });
     const r = await handleSessionsCardAction(
       makeAction({ action: SESSIONS_ACTION_REFRESH, invoker_open_id: INVOKER }),
@@ -982,7 +994,7 @@ describe('handleSessionsCardAction', () => {
       expect(r.card).toBeUndefined();
     });
 
-    it('non-owner → toast, no GET', async () => {
+    it('non-admin → toast, no GET', async () => {
       const deps = { ...makeDetailDeps('sess_a'), getOwnerOpenId: () => 'ou_other' };
       const r = await handleSessionsCardAction(
         makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
@@ -1180,7 +1192,7 @@ describe('handleSessionsCardAction', () => {
       expect(r.card).toBeUndefined();
     });
 
-    it('non-owner → toast, no POST issued', async () => {
+    it('non-admin → toast, no POST issued', async () => {
       const deps = { ...makeCloseDeps('sess_a'), getOwnerOpenId: () => 'ou_other' };
       const r = await handleSessionsCardAction(
         makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
@@ -1305,7 +1317,7 @@ describe('handleSessionsCardAction', () => {
       expect(cardJson).toContain('第 1/5 页');
     });
 
-    it('non-owner → toast, no GET', async () => {
+    it('non-admin → toast, no GET', async () => {
       const requestSpy = vi.fn();
       const deps = {
         createClient: vi.fn(() => ({ request: requestSpy } as any)),

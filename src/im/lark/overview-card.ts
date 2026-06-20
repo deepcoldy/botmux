@@ -3,8 +3,8 @@
  *
  * Slice 1 scope:
  *  - Sources from the shared `GET /__daemon/overview-snapshot` endpoint
- *    (sessions + schedules now scoped by callerAppId, matching the
- *    per-bot owner gate the dedicated list endpoints already apply).
+ *    (dashboard list reads use `?scope=global` where implemented; write
+ *    actions still route to each row's true owner daemon).
  *  - Summary sections follow the Web Dashboard navigation order: sessions /
  *    workflows / groups / schedules / settings.
  *  - Each section with an implemented sub-card has a
@@ -15,8 +15,8 @@
  *  - Footer: refresh + reused `card.dashboard.settings.footer.security`.
  *
  * Identity / security mirrors `sessions-card.ts` slice 1:
- *  - `invokerOpenId` is the owner's `ou_*` and is the invoker-lock anchor.
- *  - Owner gate runs at the command entry AND on every callback.
+ *  - `invokerOpenId` is the invoking admin's `ou_*` and is the invoker-lock anchor.
+ *  - Admin gate runs at the command entry AND on every callback.
  *  - sender union_id NEVER lands on `action.value` (red line).
  *  - non-200 from Route B becomes an error toast — NOT an empty card.
  *
@@ -24,7 +24,7 @@
  * `{ card }` (no toast) so Lark renders in a single pass.
  */
 
-import { getOwnerOpenId as defaultGetOwnerOpenId } from '../../bot-registry.js';
+import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { DashboardSettingsInput } from '../../dashboard/settings-card-model.js';
 import type { ScheduleCardTaskInput } from '../../dashboard/schedule-card-model.js';
@@ -391,6 +391,7 @@ export function buildOverviewCard(
 
 export interface OverviewCardHandlerDeps {
   getOwnerOpenId?: (larkAppId: string) => string | undefined;
+  getDashboardAdminOpenIds?: (larkAppId: string) => ReadonlyArray<string> | undefined;
   createClient: (larkAppId: string) => DaemonClient;
   locale?: Locale;
   /** Override `Date.now()` so tests are deterministic. */
@@ -456,10 +457,8 @@ export async function handleOverviewCardAction(
     return ackToast('card.dashboard.settings.not_invoker', locale);
   }
 
-  // ─── 2) Per-bot owner gate ──────────────────────────────────────────
-  const getOwnerOpenId = deps.getOwnerOpenId ?? defaultGetOwnerOpenId;
-  const expectedOwner = getOwnerOpenId(larkAppId);
-  if (!expectedOwner || operatorOpenId !== expectedOwner) {
+  // ─── 2) Per-bot admin gate ──────────────────────────────────────────
+  if (!isDashboardAdmin(larkAppId, operatorOpenId, deps)) {
     return ackToast('card.dashboard.settings.owner_only', locale);
   }
 
@@ -468,7 +467,7 @@ export async function handleOverviewCardAction(
   const nowMs = deps.nowMs ? deps.nowMs() : Date.now();
 
   if (action === OVERVIEW_ACTION_REFRESH) {
-    return rebuildOverview(client, expectedOwner, locale);
+    return rebuildOverview(client, operatorOpenId, locale);
   }
 
   if (action === OVERVIEW_ACTION_GOTO_SESSIONS) {
@@ -490,7 +489,7 @@ export async function handleOverviewCardAction(
     // refresh/page/detail/action round-trips.
     const cardJson = buildSessionsCard(
       rows,
-      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview', scope: 'global' },
+      { invokerOpenId: operatorOpenId, locale, page: 1, origin: 'overview', scope: 'global' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -516,7 +515,7 @@ export async function handleOverviewCardAction(
     // pause/resume keep the global view + cross-bot owner-routing.
     const cardJson = buildSchedulesCard(
       tasks,
-      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview', scope: 'global' },
+      { invokerOpenId: operatorOpenId, locale, page: 1, origin: 'overview', scope: 'global' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -543,7 +542,7 @@ export async function handleOverviewCardAction(
     // (cli-handler) calls buildSettingsCard without `origin`.
     const cardJson = buildSettingsCard(
       dto,
-      { invokerOpenId: expectedOwner, locale, canWrite: true, origin: 'overview' },
+      { invokerOpenId: operatorOpenId, locale, canWrite: true, origin: 'overview' },
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
@@ -564,7 +563,7 @@ export async function handleOverviewCardAction(
     // Drilldown subcard — `origin` preserves return-to-overview;
     // `scope: 'global'` keeps full matrix semantics.
     const cardJson = buildGroupsCard(matrix, {
-      invokerOpenId: expectedOwner,
+      invokerOpenId: operatorOpenId,
       locale,
       page: 1,
       origin: 'overview',
@@ -592,7 +591,7 @@ export async function handleOverviewCardAction(
     const runs = ((r.body as { runs?: ReadonlyArray<WorkflowRunInput> })?.runs) ?? [];
     const cardJson = buildWorkflowsCard(
       runs,
-      { invokerOpenId: expectedOwner, locale, page: 1, origin: 'overview', scope: 'global' },
+      { invokerOpenId: operatorOpenId, locale, page: 1, origin: 'overview', scope: 'global' },
       nowMs,
     );
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };

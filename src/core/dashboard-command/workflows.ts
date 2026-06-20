@@ -1,11 +1,11 @@
 /**
  * `/dashboard workflows` real sub-handler (PR3 slice 1).
  *
- * Mirrors `/dashboard sessions` slice 1: owner gate has ALREADY run in
+ * Mirrors `/dashboard sessions` slice 1: admin gate has ALREADY run in
  * `handleDashboardCommand`; this function only fetches the run list from
  * PR2 Route B (`GET /__daemon/workflows-runs-snapshot?all=1&scope=global`),
- * builds the card, and DMs the owner with the topic getting a short
- * `dm_sent` confirmation. `/dashboard` is the Bot Owner's global tool panel,
+ * builds the card, and DMs the admin with the topic getting a short
+ * `dm_sent` confirmation. `/dashboard` is the Bot admin's global tool panel,
  * not a per-bot view.
  *
  * No cancel / approve / reject / search / status filter in slice 1 —
@@ -36,7 +36,7 @@ export async function handleDashboardWorkflows(
   _chatId: string,
   deps: CommandHandlerDeps,
   larkAppId: string | undefined,
-  ownerOpenId: string,
+  adminOpenId: string,
   testDeps: DashboardWorkflowsCommandDeps = {},
 ): Promise<void> {
   if (!larkAppId) return;
@@ -73,16 +73,16 @@ export async function handleDashboardWorkflows(
 
   const rows = ((snap.body as { runs?: ReadonlyArray<WorkflowRunInput> })?.runs) ?? [];
   const nowMs = testDeps.nowMs ? testDeps.nowMs() : Date.now();
-  // invokerOpenId = ownerOpenId so subsequent clicks still pass the invoker lock.
+  // invokerOpenId = adminOpenId so subsequent clicks still pass the invoker lock.
   const cardJson = buildWorkflowsCard(
     rows,
-    { invokerOpenId: ownerOpenId, locale, page: 1, scope: 'global' },
+    { invokerOpenId: adminOpenId, locale, page: 1, scope: 'global' },
     nowMs,
   );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
-    await sendUserMessage(larkAppId, ownerOpenId, cardJson, 'interactive');
+    await sendUserMessage(larkAppId, adminOpenId, cardJson, 'interactive');
     await deps.sessionReply(
       rootId,
       t('card.dashboard.workflows.dm_sent', undefined, locale),

@@ -2,16 +2,16 @@
  * `/dashboard overview` real sub-handler.
  *
  * Pipeline (mirrors `/dashboard sessions` / `/dashboard schedules`):
- *   1. Owner gate has ALREADY run in `handleDashboardCommand`; this function
- *      is called with `ownerOpenId` already resolved.
+ *   1. Admin gate has ALREADY run in `handleDashboardCommand`; this function
+ *      is called with `adminOpenId` already resolved.
  *   2. Fetch the live overview snapshot via PR2 Route B
  *      (`GET /__daemon/overview-snapshot?scope=global`). `/dashboard` is
- *      a Bot Owner tool panel — list modules surface cross-bot under
+ *      a Bot admin tool panel — list modules surface cross-bot under
  *      `?scope=global` so the first-open view matches refresh/drilldown.
  *   3. Project through `buildOverviewCard` (counts + settings summary line)
  *      with section buttons routed to the goto handlers (which also send
  *      `?scope=global`).
- *   4. DM the card to the OWNER; topic only gets a short `dm_sent` line.
+ *   4. DM the card to the admin; topic only gets a short `dm_sent` line.
  *
  * Read-only — no buttons mutate state from the overview surface itself.
  */
@@ -47,7 +47,7 @@ export async function handleDashboardOverview(
   _chatId: string,
   deps: CommandHandlerDeps,
   larkAppId: string | undefined,
-  ownerOpenId: string,
+  adminOpenId: string,
   testDeps: DashboardOverviewCommandDeps = {},
 ): Promise<void> {
   if (!larkAppId) return;
@@ -94,12 +94,12 @@ export async function handleDashboardOverview(
       schedules: body.schedules ?? [],
       settings: body.settings,
     },
-    { invokerOpenId: ownerOpenId, locale },
+    { invokerOpenId: adminOpenId, locale },
   );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
   try {
-    await sendUserMessage(larkAppId, ownerOpenId, cardJson, 'interactive');
+    await sendUserMessage(larkAppId, adminOpenId, cardJson, 'interactive');
     await deps.sessionReply(
       rootId,
       t('card.dashboard.overview.dm_sent', undefined, locale),

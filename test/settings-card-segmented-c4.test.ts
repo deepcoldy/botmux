@@ -280,14 +280,14 @@ describe('PR3 UI revision — no header summary + footer security note + mainten
     expect(autoUpdateOffCard).toContain('需先开启「每日自动更新」');
   });
 
-  it('footer security note is still present and mentions Bot Owner + DM + ACK', () => {
+  it('footer security note is still present and mentions bot admins + DM + ACK', () => {
     const card = renderCard(buildSettings());
     const parsed = JSON.parse(card);
     const elements = parsed.elements as any[];
     const footerNote = elements[elements.length - 1];
     expect(footerNote.tag).toBe('note');
     const text = String(footerNote.elements[0].content);
-    expect(text).toContain('Bot Owner');
+    expect(text).toContain('Bot 管理员');
     expect(text).toContain('私聊');
     expect(text).toContain('ACK');
   });
