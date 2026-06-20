@@ -11,6 +11,7 @@ pnpm daemon:logs          # 查看日志
 ```
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
+- 如果改动会影响 daemon / 飞书卡片运行效果，不能只跑 `tsc` 或测试后直接重启；PM2 入口是 `dist/cli.js`，必须先构建并用 `rg dist` 或实际卡片 JSON 验证 `dist/` 已包含目标文案 / action，再声称“本机可测”。
 
 ## 模块结构
 
