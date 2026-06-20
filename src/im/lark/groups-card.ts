@@ -434,12 +434,14 @@ function renderDetailMember(
             },
           },
           {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.oncall_bind', undefined, opts.locale) },
-            type: 'primary',
-            name: 'groups_oncall_bind',
-            action_type: 'form_submit',
-            value: { action: GROUPS_ACTION_ONCALL_BIND, ...valueBase },
+            tag: 'action',
+            actions: [{
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.oncall_bind', undefined, opts.locale) },
+              type: 'primary',
+              form_action_type: 'submit',
+              value: { action: GROUPS_ACTION_ONCALL_BIND, ...valueBase },
+            }],
           },
         ],
       });

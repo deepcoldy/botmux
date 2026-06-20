@@ -657,13 +657,16 @@ describe('handleGroupsCardAction', () => {
     expect(form.elements).toEqual(expect.arrayContaining([
       expect.objectContaining({ tag: 'input', name: 'working_dir' }),
       expect.objectContaining({
-        tag: 'button',
-        name: 'groups_oncall_bind',
-        action_type: 'form_submit',
-        value: expect.objectContaining({ action: GROUPS_ACTION_ONCALL_BIND }),
+        tag: 'action',
+        actions: expect.arrayContaining([
+          expect.objectContaining({
+            tag: 'button',
+            form_action_type: 'submit',
+            value: expect.objectContaining({ action: GROUPS_ACTION_ONCALL_BIND }),
+          }),
+        ]),
       }),
     ]));
-    expect(form.elements.some((e: any) => e?.tag === 'action')).toBe(false);
   });
 
   it('add_bot action → GET matrix, POST add-bots, GET fresh matrix, returns detail card', async () => {
