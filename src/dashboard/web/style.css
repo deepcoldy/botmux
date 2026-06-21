@@ -4179,6 +4179,19 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   min-width: 0;
 }
 
+.skills-source-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.skills-source-control button {
+  min-height: 36px;
+  padding: 0 13px;
+  white-space: nowrap;
+}
+
 .skills-main-panel,
 .skills-bot-grid {
   display: grid;
@@ -4323,7 +4336,27 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
-.skills-row small { color: var(--muted); font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+.skills-row small {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.skills-source-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 22px;
+  margin-top: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .skills-card-actions {
   display: grid;
@@ -4758,6 +4791,152 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   align-self: start;
 }
 
+.skills-discovery-dialog {
+  width: min(780px, calc(100vw - 44px));
+  max-height: min(760px, calc(100vh - 64px));
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--modal-shadow);
+  color: var(--fg);
+}
+
+.skills-discovery-dialog::backdrop {
+  background: color-mix(in srgb, #0b1524 42%, transparent);
+  backdrop-filter: blur(4px);
+}
+
+.skills-discovery-dialog article {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  max-height: inherit;
+}
+
+.skills-discovery-dialog header {
+  display: grid;
+  gap: 5px;
+  padding: 18px 20px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.skills-discovery-dialog h3,
+.skills-discovery-dialog p {
+  margin: 0;
+}
+
+.skills-discovery-dialog h3 {
+  font-size: 17px;
+}
+
+.skills-discovery-dialog p {
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.skills-discovery-body {
+  display: grid;
+  gap: 12px;
+  min-height: 0;
+  max-height: 520px;
+  overflow: auto;
+  padding: 16px 20px;
+}
+
+.skills-discovery-group {
+  display: grid;
+  gap: 8px;
+}
+
+.skills-discovery-group header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 0;
+  border: 0;
+}
+
+.skills-discovery-group strong {
+  text-transform: uppercase;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.skills-discovery-group code {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-discovery-list {
+  display: grid;
+  gap: 7px;
+}
+
+.skills-discovery-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  min-height: 54px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  cursor: pointer;
+}
+
+.skills-discovery-row input {
+  margin-top: 3px;
+}
+
+.skills-discovery-row span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.skills-discovery-row strong {
+  overflow: hidden;
+  color: var(--fg);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-discovery-row small {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.skills-discovery-row em {
+  align-self: center;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.skills-discovery-row.installed {
+  opacity: 0.68;
+  cursor: default;
+}
+
+.skills-discovery-dialog footer {
+  justify-content: end;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border-soft);
+}
+
 .skills-policy-controls [data-bot-status] {
   grid-column: 1 / -1;
 }
@@ -4803,6 +4982,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   }
   .skills-side-rail,
   .skills-install-grid,
+  .skills-source-control,
   .skills-section-head-row,
   .skills-overview,
   .skills-metric-strip,

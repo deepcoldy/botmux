@@ -1,8 +1,9 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { codexHistoryPath, codexSessionsRoot } from '../../services/codex-paths.js';
+import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 
@@ -276,7 +277,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // install into the global ~/.codex/skills. This is visible to a standalone
     // `codex` too, but every botmux-* skill's description is tightly bound to
     // "当前飞书话题", so implicit mis-fire risk is negligible.
-    skillsDir: '~/.codex/skills',
+    get skillsDir(): string { return join(codexHome(), 'skills'); },
     modelChoices: ['gpt-5', 'gpt-5-codex', 'o3', 'o3-mini'],
   };
 }

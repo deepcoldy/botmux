@@ -53,6 +53,7 @@ import {
 import { redactGitUrlCredentials } from './core/skills/sources.js';
 import { loadBotConfigs } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
@@ -551,12 +552,31 @@ function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
   };
 }
 
+function dashboardSkillCliIds(): CliId[] {
+  const ids = new Set<CliId>();
+  try {
+    for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
+  } catch {
+    // Fall back to daemon descriptors below when persistent config is unavailable.
+  }
+  for (const bot of registry.list()) {
+    if (bot.cliId) ids.add(bot.cliId as CliId);
+  }
+  return [...ids];
+}
+
 function dashboardSkillsPayload(): Record<string, unknown> {
   const globalSkills = readGlobalConfig().skills ?? {};
+  const nativeSkillGroups = discoverNativeCliSkillGroups(dashboardSkillCliIds())
+    .map(group => ({
+      ...group,
+      skills: group.skills.map(sanitizeSkillForDashboard),
+    }));
   return {
     skills: Object.values(readSkillRegistry().skills)
       .sort((a, b) => a.name.localeCompare(b.name))
       .map(sanitizeSkillForDashboard),
+    nativeSkillGroups,
     trustProjectSkills: globalSkills.trustProjectSkills ?? 'off',
     delivery: globalSkills.delivery ?? 'auto',
   };
