@@ -5,6 +5,8 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing adapters
@@ -290,7 +292,9 @@ describe('codex buildArgs', () => {
   it('keeps Codex home untouched', () => {
     expect(adapter.buildSpawnEnv).toBeUndefined();
     expect(adapter.authPaths).toEqual(['~/.codex/auth.json']);
-    expect(adapter.skillsDir).toBe('~/.codex/skills');
+    // skillsDir resolves under CODEX_HOME (default ~/.codex) so it tracks where
+    // Codex actually scans skills when CODEX_HOME is overridden.
+    expect(adapter.skillsDir).toBe(join(codexHome(), 'skills'));
   });
 
   it('passes fixed Codex args regardless of session/resume when no resume target is known', () => {
@@ -337,11 +341,12 @@ describe('codex buildArgs', () => {
     expect(args[idx + 1]).toBe('gpt-5-codex');
   });
 
-  it('installs built-in skills into the global ~/.codex/skills dir', () => {
+  it('installs built-in skills into Codex\'s CODEX_HOME/skills dir', () => {
     // Codex has no per-session skill injection (no --plugin-dir equivalent), so
-    // botmux installs into Codex's hard-coded global scan root. Pin it here so a
-    // future refactor can't silently drop the field and leave Codex skill-less.
-    expect(adapter.skillsDir).toBe('~/.codex/skills');
+    // botmux installs into Codex's global scan root, which lives under CODEX_HOME
+    // (default ~/.codex). Pin it here so a future refactor can't silently drop the
+    // field and leave Codex skill-less, while still respecting a custom CODEX_HOME.
+    expect(adapter.skillsDir).toBe(join(codexHome(), 'skills'));
     expect(adapter.pluginDir).toBeUndefined();
   });
 });
