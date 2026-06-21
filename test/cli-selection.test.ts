@@ -7,6 +7,7 @@ import {
   lookupCliSelection,
   selectionKeyForBot,
   stripSettingsArgs,
+  stripWrapperUnsafeArgs,
   buildWrappedLaunch,
   parseWrapperCli,
   decorateResumeForWrapper,
@@ -16,6 +17,7 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from '../src/setup/cli-selection.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
   it('includes the two aiden gateway options right after native aiden', () => {
@@ -208,6 +210,46 @@ describe('stripSettingsArgs', () => {
   });
 });
 
+describe('stripWrapperUnsafeArgs', () => {
+  it('strips --settings (both forms) like stripSettingsArgs', () => {
+    expect(stripWrapperUnsafeArgs(['--settings', '{}', '--plugin-dir', '/p'])).toEqual(['--plugin-dir', '/p']);
+    expect(stripWrapperUnsafeArgs(['--settings={}', '--model', 'm'])).toEqual(['--model', 'm']);
+  });
+
+  it('strips the botmux-injected codex -c override (flag + value)', () => {
+    expect(stripWrapperUnsafeArgs([
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="s"',
+      '-C',
+      '/repo',
+    ])).toEqual(['--no-alt-screen', '-C', '/repo']);
+  });
+
+  it('strips a botmux override for any BOTMUX_* key, not just SESSION_ID', () => {
+    expect(stripWrapperUnsafeArgs(['-c', 'shell_environment_policy.set.BOTMUX_TURN_ID="t"', '--model', 'm']))
+      .toEqual(['--model', 'm']);
+  });
+
+  it('leaves a user-supplied -c (non-botmux config override) untouched', () => {
+    expect(stripWrapperUnsafeArgs(['-c', 'model_reasoning_effort="high"', '--model', 'm']))
+      .toEqual(['-c', 'model_reasoning_effort="high"', '--model', 'm']);
+  });
+
+  it('handles both --settings and the codex -c override in one pass', () => {
+    expect(stripWrapperUnsafeArgs([
+      '--session-id', 'x',
+      '--settings', '{}',
+      '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"',
+      '--model', 'm',
+    ])).toEqual(['--session-id', 'x', '--model', 'm']);
+  });
+
+  it('leaves args untouched when nothing is unsafe', () => {
+    expect(stripWrapperUnsafeArgs(['resume', 'cid', '--model', 'm'])).toEqual(['resume', 'cid', '--model', 'm']);
+  });
+});
+
 describe('parseWrapperCli', () => {
   it('splits on whitespace and drops blanks', () => {
     expect(parseWrapperCli('  aiden   x claude ')).toEqual(['aiden', 'x', 'claude']);
@@ -222,10 +264,59 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['x', 'claude', '--session-id', 'sid', '--plugin-dir', '/p']);
   });
 
-  it('prepends the prefix but keeps args verbatim for aiden x codex', () => {
+  it('keeps non-config args verbatim for aiden x codex', () => {
     const out = buildWrappedLaunch('aiden x codex', ['resume', 'cid', '--model', 'm']);
     expect(out.bin).toBe('aiden');
     expect(out.args).toEqual(['x', 'codex', 'resume', 'cid', '--model', 'm']);
+  });
+
+  // Regression: aiden 1.8.38+ rejects `aiden x codex … -c …`. The Codex adapter
+  // injects `-c shell_environment_policy.set.BOTMUX_SESSION_ID=…` (commit 10d3e61),
+  // which previously reached the launcher verbatim and broke spawn. It must now be
+  // stripped for aiden wrappers; everything else (bypass/-C/--model) is preserved.
+  it('strips the botmux-injected codex -c override for aiden x codex', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual([
+      'x',
+      'codex',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.args).not.toContain('-c');
+  });
+
+  it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
+    const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
+    expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
+  });
+
+  it('keeps the codex -c override for the bare-passthrough cjadk codex gateway', () => {
+    const out = buildWrappedLaunch('cjadk codex', [
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+    ]);
+    // cjadk forwards CLI args verbatim to the real codex, which accepts -c — keep it.
+    expect(out.args).toEqual(['codex', '--no-alt-screen', '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"']);
+  });
+
+  it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {
+    const out = buildWrappedLaunch('ttadk codex', [
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+    ]);
+    expect(out.args).toContain('-c');
+    expect(out.args).toContain('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
   });
 
   it('keeps --settings for cjadk claude (forwarded verbatim to real claude)', () => {
@@ -287,6 +378,61 @@ describe('buildWrappedLaunch', () => {
       const out = buildWrappedLaunch('ttadk claude', [], (b) => `/abs/${b}`, { ttadkModel: 'glm-5' });
       expect(out.bin).toBe('/abs/ttadk');
     });
+  });
+});
+
+// End-to-end regression: wire the REAL Codex adapter's buildArgs into the
+// launcher exactly as the worker does. This is the actual failure the user hit
+// (aiden 1.8.38 rejecting `aiden x codex … -c …`). Guards against the adapter
+// and the wrapper layer drifting apart in the future.
+describe('codex adapter × aiden wrapper (regression for commit 10d3e61)', () => {
+  const codex = createCodexAdapter('/usr/bin/codex');
+
+  const BOTMUX_OVERRIDE_RE = /^shell_environment_policy\.set\.BOTMUX_/;
+  const forwardsBotmuxC = (args: ReadonlyArray<string>): boolean =>
+    args.some((a, i) => a === '-c' && BOTMUX_OVERRIDE_RE.test(args[i + 1] ?? ''));
+
+  it('native codex still injects the botmux session-env -c (feature preserved)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(forwardsBotmuxC(args)).toBe(true);
+  });
+
+  it('aiden x codex never forwards the botmux -c (fresh launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    const out = buildWrappedLaunch('aiden x codex', args);
+    expect(forwardsBotmuxC(out.args)).toBe(false);
+    expect(out.args).not.toContain('-c');
+  });
+
+  it('aiden x codex never forwards the botmux -c (resume launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-uuid' });
+    expect(args).toContain('resume');               // sanity: we exercised the resume branch
+    const out = buildWrappedLaunch('aiden x codex', args);
+    expect(forwardsBotmuxC(out.args)).toBe(false);
+    // resume target + benign flags survive the strip.
+    expect(out.args).toContain('codex-uuid');
+    expect(out.args).toContain('--no-alt-screen');
+  });
+
+  // Cross-CLI guard: any aiden `aiden x <cli>` wrapper must drop a botmux-injected
+  // `-c shell_environment_policy.set.BOTMUX_*` override, so a future adapter that
+  // mirrors Codex's injection cannot re-break aiden launches. Bare-passthrough
+  // gateways (ttadk/cjadk) intentionally keep it.
+  it('no aiden built-in wrapper forwards a botmux -c override', () => {
+    const codexArgs = [
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="s"',
+    ];
+    const aidenWrappers = CLI_SELECT_OPTIONS
+      .map((o) => o.wrapperCli)
+      .filter((w): w is string => !!w && parseWrapperCli(w)[0] === 'aiden');
+    expect(aidenWrappers).toContain('aiden x codex');
+    for (const w of aidenWrappers) {
+      const out = buildWrappedLaunch(w, codexArgs);
+      expect(forwardsBotmuxC(out.args), `${w} must not forward botmux -c`).toBe(false);
+    }
   });
 });
 

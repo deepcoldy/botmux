@@ -233,9 +233,18 @@ export function parseWrapperCli(wrapperCli: string): string[] {
   return wrapperCli.trim().split(/\s+/).filter(Boolean);
 }
 
-/** 该前缀是否为 `aiden x claude`（仅它需要剥 --settings）。 */
-function isAidenXClaude(tokens: ReadonlyArray<string>): boolean {
-  return tokens[0] === 'aiden' && tokens[1] === 'x' && tokens[2] === 'claude';
+/** wrapper 前缀首 token 是否为 aiden 网关（`aiden x <cli>`）。aiden 会拦截底层 CLI
+ *  的 config 透传参数——`aiden x claude` 拒收 `--settings`、`aiden x codex` 自 1.8.38
+ *  起直接报错拒收 `-c`——故转发前要剥掉 botmux 注入的那部分（见 {@link stripWrapperUnsafeArgs}）。 */
+function isAidenWrapper(tokens: ReadonlyArray<string>): boolean {
+  return tokens[0] === 'aiden';
+}
+
+/** 是否为 botmux 经 codex `-c` 注入的「把 BOTMUX_* 塞进 shell 工具环境」配置覆盖值。
+ *  只认 botmux 自己注入的 `shell_environment_policy.set.BOTMUX_` 前缀，绝不误伤用户
+ *  自带的 `-c key=val`。 */
+function isBotmuxShellEnvConfigValue(value: string | undefined): boolean {
+  return !!value && value.startsWith('shell_environment_policy.set.BOTMUX_');
 }
 
 /**
@@ -248,6 +257,35 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
     const a = args[i];
     if (a === '--settings') { i++; continue; }     // 跳过 flag + 紧随其后的值
     if (a.startsWith('--settings=')) continue;       // 跳过 --settings=<v>
+    out.push(a);
+  }
+  return out;
+}
+
+/**
+ * 剥掉 aiden `aiden x <cli>` 网关拒收的、**botmux 注入的**底层 CLI config 覆盖参数：
+ *   - `--settings <v>` / `--settings=<v>`（claude 携带 hook/bypass，aiden x claude 历来就剥）
+ *   - `-c shell_environment_policy.set.BOTMUX_*=…`（codex 用来把 BOTMUX_SESSION_ID 注入
+ *     shell 工具环境；aiden 1.8.38+ 直接报错拒收 `aiden x codex` 透传的 `-c`，正是本次回归）
+ * 这些参数承载的 session 环境已在进程级 env（BOTMUX_SESSION_ID 等）注入、并被 wrapper
+ * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders
+ * 通道，不丢功能。`-c` 按 botmux 注入特征精确识别——只剥值以 `shell_environment_policy.set.BOTMUX_`
+ * 开头者，用户自带的 `-c key=val` 一律不动；`--settings` 则沿用 aiden x claude 历来的兼容策略
+ * 整体剥离（复用 {@link stripSettingsArgs}，不区分来源）。原生启动及 ttadk/cjadk 等「裸透传」
+ * 网关不走本函数，仍保留 `-c`（它们的 launcher 接受并转发给真 CLI，照常生效）。
+ *
+ * 关键：识别按 botmux 注入特征（`--settings` 的语义 + `-c …BOTMUX_` 前缀）而非按某个具体 CLI——
+ * 任何适配器将来注入**同形态**的 config 覆盖，经 aiden 网关时都会被一并剥掉，不会重蹈 codex 覆辙。
+ * 注意范围仅限上述两种 botmux 注入形态：coco 的 `--config model.name=…`（承载 model、非 session
+ * 管线，且无内置 `aiden x coco` 选项）等不同形态的 config 覆盖**有意不在此剥离**。
+ */
+export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
+  // 先剥 claude 的 --settings（单一事实源 stripSettingsArgs），再剥 codex 注入的 -c override。
+  const afterSettings = stripSettingsArgs(args);
+  const out: string[] = [];
+  for (let i = 0; i < afterSettings.length; i++) {
+    const a = afterSettings[i]!;
+    if (a === '-c' && isBotmuxShellEnvConfigValue(afterSettings[i + 1])) { i++; continue; }
     out.push(a);
   }
   return out;
@@ -320,7 +358,8 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
 /**
  * 由 wrapperCli 前缀 + 底层 CLI 的 args 构造实际 spawn 的 `{ bin, args }`。
  *   - bin = 前缀首 token（经 binResolver 走 PATH 解析）
- *   - args = 前缀其余 token + CLI 参数（aiden x claude 形态会先剥掉 --settings）
+ *   - args = 前缀其余 token + CLI 参数（aiden `aiden x <cli>` 形态会先经
+ *     {@link stripWrapperUnsafeArgs} 剥掉 botmux 注入、aiden 拒收的 `--settings`/`-c`）
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
  * 前缀为空时返回 `{ bin: '', args }`，调用方据此跳过（不改写 spawn）。
  */
@@ -333,7 +372,7 @@ export function buildWrappedLaunch(
   const tokens = parseWrapperCli(wrapperCli);
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
   if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
-  const forwarded = isAidenXClaude(tokens) ? stripSettingsArgs(cliArgs) : [...cliArgs];
+  const forwarded = isAidenWrapper(tokens) ? stripWrapperUnsafeArgs(cliArgs) : [...cliArgs];
   return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwarded] };
 }
 
