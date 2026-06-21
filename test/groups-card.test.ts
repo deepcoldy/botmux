@@ -669,14 +669,9 @@ describe('handleGroupsCardAction', () => {
     expect(form.elements).toEqual(expect.arrayContaining([
       expect.objectContaining({ tag: 'input', name: 'working_dir' }),
       expect.objectContaining({
-        tag: 'action',
-        actions: expect.arrayContaining([
-          expect.objectContaining({
-            tag: 'button',
-            form_action_type: 'submit',
-            value: expect.objectContaining({ action: GROUPS_ACTION_ONCALL_BIND }),
-          }),
-        ]),
+        tag: 'button',
+        action_type: 'form_submit',
+        value: expect.objectContaining({ action: GROUPS_ACTION_ONCALL_BIND }),
       }),
     ]));
   });

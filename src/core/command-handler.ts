@@ -14,7 +14,7 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';

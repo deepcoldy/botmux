@@ -9,7 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard } from './card-builder.js';
 import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
