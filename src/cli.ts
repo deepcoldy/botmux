@@ -570,10 +570,16 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
 }
 
 /**
- * 用指定应用凭证把 open_id (ou_) 解析成 union_id (on_，跨应用稳定)。
- * 查询失败（无 contact 权限 / API 错误）则 fallback 返回原 open_id。
+ * 用新应用自身凭证验证扫码链路拿到的 open_id。
+ * 能解析 union_id 时写 on_；没有 union_id 但 open_id 对当前 app 有效时写 ou_。
+ * 查询失败或用户不在当前 app 视角时返回 undefined，调用方不得 fallback 写入该 ou_。
  */
-async function resolveOpenIdToUnionId(appId: string, appSecret: string, openId: string, brand: Brand = 'feishu'): Promise<string> {
+async function resolveScannerAllowedUser(
+  appId: string,
+  appSecret: string,
+  openId: string,
+  brand: Brand = 'feishu',
+): Promise<string | undefined> {
   try {
     const { Client } = await import('@larksuiteoapi/node-sdk');
     // brand → 域名。Lark 扫码人 ou_→on_ 必须打 larksuite.com，否则失败丢掉 cross-app 稳定性。
@@ -582,9 +588,11 @@ async function resolveOpenIdToUnionId(appId: string, appSecret: string, openId: 
       path: { user_id: openId },
       params: { user_id_type: 'open_id' },
     });
-    if (res.code === 0 && res.data?.user?.union_id) return res.data.user.union_id as string;
-  } catch { /* fallback */ }
-  return openId;
+    if (res.code === 0 && res.data?.user) {
+      return res.data.user.union_id ?? openId;
+    }
+  } catch { /* do not trust scanner open_id when verification fails */ }
+  return undefined;
 }
 
 /**
@@ -607,11 +615,11 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
     }
     const invalid = findInvalidAllowedUserEntries(entries);
     if (invalid.length > 0) {
-      console.log(`   ❌ 以下不是完整邮箱或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
+      console.log(`   ❌ 以下不是完整邮箱、union_id 或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
       continue;
     }
     if (!hasOwnerEntry(entries)) {
-      console.log('   ❌ 至少需要一个 open_id 或完整邮箱作为 owner。');
+      console.log('   ❌ 至少需要一个完整邮箱、union_id 或 open_id 作为 owner。');
       continue;
     }
     return entries;
@@ -673,13 +681,19 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   // setup 不再询问 model（用户常选到无权限的 model，setup 完一发消息就 spawn
   // 报错，排查成本高）。需要指定 model 走 /config 卡片或手动编辑 bots.json。
-  // 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id), 天然就是 owner.
-  // 优先解析成 union_id (on_，跨应用稳定)；失败则 fallback 到 open_id (ou_)。
+  // 扫码场景默认填扫码人自己，但 registerApp 返回的 open_id 不能直接信任：
+  // 只有新 app 自身能验证时才写入 allowedUsers；验证失败则要求手动填写 owner。
   // 手动 fallback 场景没 open_id —— 必须显式指定 owner, 否则配置无 owner:
   // allowedUsers 为空时虽然"全开放", 但一旦后续加了 allowedChatGroups 就会变成
   // "群成员能对话却没人能做敏感操作 / 用 /grant". setup 阶段强制收口, 不允许没 owner.
   if (creds.userOpenId) {
-    bot.allowedUsers = [await resolveOpenIdToUnionId(creds.appId, creds.appSecret, creds.userOpenId, creds.brand)];
+    const owner = await resolveScannerAllowedUser(creds.appId, creds.appSecret, creds.userOpenId, creds.brand);
+    if (owner) {
+      bot.allowedUsers = [owner];
+    } else {
+      console.log('⚠️  无法确认扫码人的 open_id 属于当前新应用，请手动填写 owner。');
+      bot.allowedUsers = await promptRequiredOwner(rl);
+    }
   } else {
     bot.allowedUsers = await promptRequiredOwner(rl);
   }
@@ -792,7 +806,7 @@ async function promptEditBotConfig(
   input.workingDir = await ask(rl, `默认工作目录 [${formatOptionalValue(bot.workingDir)}]: `);
 
   printInputHelp('允许的用户', [
-    '可选。限制哪些飞书用户可以操作机器人，支持完整邮箱（如 alice@example.com）或 open_id（ou_xxx），多个值用逗号分隔。',
+    '可选。限制哪些飞书用户可以操作机器人，支持完整邮箱（如 alice@example.com）、union_id（on_xxx）或 open_id（ou_xxx），多个值用逗号分隔。',
     '注意：必须是完整邮箱，邮箱前缀（如 alice）无法解析、会被丢弃。',
     '留空保留当前值；输入 - 清空限制。',
   ]);

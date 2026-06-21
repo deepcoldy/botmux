@@ -644,6 +644,8 @@ const DAEMON_REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemon
 interface DaemonDescriptor {
   larkAppId: string;
   botName: string;
+  /** CLI adapter id from bots.json, used by dashboard roster before any sessions exist. */
+  cliId: string;
   /** Lark app avatar URL (from /bot/v3/info); absent until the open_id probe lands. */
   botAvatarUrl?: string;
   botIndex: number;
@@ -3523,6 +3525,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.larkAppId,
+    cliId: cfg.cliId,
     botIndex: idx,
     ipcPort,
     pid: process.pid,
@@ -3636,7 +3639,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (bot.resolvedAllowedUsers.length > 0) {
       // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
       // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
-      const needsResolve = bot.resolvedAllowedUsers.some(u => u.includes('@') || u.startsWith('on_'));
+      // literal ou_ 也走 best-effort 校验，用于诊断把其他 app 视角 open_id
+      // 误填到本 bot 的配置。
+      const needsResolve = bot.resolvedAllowedUsers.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
       if (needsResolve) {
         try {
           // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。

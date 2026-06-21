@@ -17,6 +17,10 @@ import {
 
 let groupsSnapshot: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
 
+export function __setGroupsSnapshotForTest(snapshot: { chats: any[]; bots: any[] }): void {
+  groupsSnapshot = snapshot;
+}
+
 async function loadGroupsSnapshot(): Promise<void> {
   try {
     const r = await fetch('/api/groups');
@@ -46,7 +50,7 @@ const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
  *  以 larkAppId 为身份键（部分会话缺 botName，按名字聚会裂成两张卡）；
  *  显示名优先 daemon 注册表，其次会话上的 botName。只剩历史 closed 会话、
  *  又不在注册表里的 bot 不出卡（避免一排灰色离线噪音）。 */
-function buildBotCards(sessions: any[]): BotCard[] {
+export function buildBotCards(sessions: any[]): BotCard[] {
   const byKey = new Map<string, BotCard>();
   const ensure = (key: string): BotCard => {
     let card = byKey.get(key);
@@ -64,6 +68,7 @@ function buildBotCards(sessions: any[]): BotCard[] {
     card.online = true;
     if (b.botName) card.botName = b.botName;
     if (b.botAvatarUrl) card.botAvatarUrl = b.botAvatarUrl;
+    if (b.cliId) card.cliId = b.cliId;
   }
   // 两遍：先 active 建卡，再让 closed 会话只补充已有卡（不为其单独出卡）
   const ordered = [...sessions].sort((a, b) => Number(a.status === 'closed') - Number(b.status === 'closed'));

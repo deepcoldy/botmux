@@ -517,7 +517,7 @@ describe('Card integration: full event flow', () => {
       // privateCard on + an owner in allowedUsers. Sticky (close path calls
       // getBot several times); restored in finally so it can't leak.
       vi.mocked(botRegMod.getBot).mockReturnValue({
-        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true },
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
         botOpenId: 'ou_bot',
       } as any);
@@ -558,7 +558,7 @@ describe('Card integration: full event flow', () => {
       // still go ephemeral — its visibility is pinned to the card, not to the
       // current (mutable) config.
       vi.mocked(botRegMod.getBot).mockReturnValue({
-        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false },
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
         botOpenId: 'ou_bot',
       } as any);
@@ -711,7 +711,8 @@ describe('Card integration: full event flow', () => {
       // operator, then verify resumeSession was never called and no reply went out.
       const botRegMod = await import('../src/bot-registry.js');
       vi.mocked(botRegMod.getBot).mockReturnValueOnce({
-        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' } as any,
+        // config.allowedUsers 是原始配置（hasAllowlist 据此判定）；resolvedAllowedUsers 是解析结果。
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_other_user'] } as any,
         resolvedAllowedUsers: ['ou_other_user'],
         botOpenId: 'ou_bot',
       } as any);

@@ -11,7 +11,11 @@ let loadError: string | null = null;
 // master-detail：左侧员工名册选中谁，右侧就渲染谁的档案
 let selectedAppId: string | null = null;
 
-/** /api/bots 不带 cliId — 从 store 里该 bot 最近的会话上推。 */
+export function displayCliId(bot: any, sessionFallback: string): string {
+  return typeof bot?.cliId === 'string' && bot.cliId ? bot.cliId : sessionFallback;
+}
+
+/** Fallback for old /api/bots payloads: infer from the bot's recent sessions. */
 function cliIdOf(appId: string): string {
   let best: any = null;
   for (const s of store.sessions.values()) {
@@ -138,7 +142,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
   function renderRosterItem(b: any): string {
     const name = b.botName ?? b.larkAppId;
-    const cli = cliIdOf(b.larkAppId);
+    const cli = displayCliId(b, cliIdOf(b.larkAppId));
     const flag = b.defaultOncall?.enabled
       ? `<span class="bd-roster-flag">oncall</span>`
       : '';
@@ -166,7 +170,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     const def = b.defaultOncall ?? { enabled: false, workingDir: '', since: 0 };
     const enabled = !!def.enabled;
     const name = b.botName ?? b.larkAppId;
-    const cli = cliIdOf(b.larkAppId);
+    const cli = displayCliId(b, cliIdOf(b.larkAppId));
     return `<article class="bd-card bd-profile" data-appid="${escapeHtml(b.larkAppId)}">
       <header class="bd-profile-head">
         ${botAvatarHtml({ name, larkAppId: b.larkAppId, dot: 'ok' })}

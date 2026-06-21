@@ -789,11 +789,13 @@ export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
 ): Promise<{ resolved: string[]; map: Map<string, string> }> {
   const map = new Map<string, string>();
+  const openIds: string[] = [];
   const emails: string[] = [];
   const unionIds: string[] = [];
   for (const v of raw) {
     if (v.startsWith('ou_')) {
       map.set(v, v);
+      openIds.push(v);
     } else if (v.startsWith('on_')) {
       // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
       // 启动时用本 app 凭证把 on_ 翻成本 app 的 ou_，下游一律照旧用 open_id。
@@ -803,8 +805,27 @@ export async function resolveAllowedUsersWithMap(
     }
   }
 
-  if (emails.length > 0 || unionIds.length > 0) {
+  if (emails.length > 0 || unionIds.length > 0 || openIds.length > 0) {
     const c = getBotClient(larkAppId);
+
+    // Literal open_id is app-scoped. Keep it as-is for compatibility, but
+    // diagnose the common misconfiguration where a different app's ou_ is copied
+    // into this bot's allowedUsers and owner checks silently lock everyone out.
+    for (const oid of openIds) {
+      try {
+        const res = await (c as any).contact.v3.user.get({
+          path: { user_id: oid },
+          params: { user_id_type: 'open_id' },
+        });
+        if (res?.code === 99992361) {
+          logger.warn(`allowedUsers open_id ${oid} belongs to another app for ${larkAppId}; use email or union_id (on_) instead.`);
+        } else if (res?.code && res.code !== 0) {
+          logger.debug(`verify allowedUsers open_id ${oid} non-zero code: ${res.code} ${res.msg ?? ''}`);
+        }
+      } catch (err: any) {
+        logger.debug(`verify allowedUsers open_id ${oid} failed: ${err?.message ?? err}`);
+      }
+    }
 
     // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
     for (const uid of unionIds) {

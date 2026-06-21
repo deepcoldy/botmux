@@ -117,6 +117,8 @@ function setupBotState(opts?: {
   chatGrants?: Record<string, string[]>;
   globalGrants?: string[];
   allowedUsers?: string[];
+  /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
+  configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared';
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
@@ -129,6 +131,9 @@ function setupBotState(opts?: {
       larkAppId: MY_APP_ID,
       larkAppSecret: 'secret',
       cliId: 'claude-code',
+      // 生产里 config.allowedUsers 是原始配置（启动后 resolvedAllowedUsers 才是解析结果）。
+      // 默认镜像, 单测可用 configAllowedUsers 单独构造「配了但解析为空」的 fail-closed 场景。
+      allowedUsers: opts?.configAllowedUsers ?? opts?.allowedUsers,
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
       restrictGrantCommands: opts?.restrictGrantCommands,
@@ -889,7 +894,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockFindOncallChat.mockReturnValue(undefined);
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_sibling'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_sibling'],
     });
@@ -937,7 +942,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
   it('does not grant sensitive operations from an allowedChatGroups chat', () => {
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'], allowedUsers: ['ou_admin'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_admin'],
     });
@@ -955,7 +960,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockReadFileSync.mockReturnValue(JSON.stringify({ 'BotB': OTHER_BOT_OPEN_ID }));
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_human_only'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_human_only'],
     });
@@ -1735,6 +1740,34 @@ describe('globalGrants — global talk-only authorization (canTalk / canOperate)
   });
 });
 
+describe('configured-but-unresolved allowlist stays fail-closed (not fail-open)', () => {
+  beforeEach(() => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('{}');  // empty peer cross-ref
+  });
+
+  // 回归：config.allowedUsers 配了 owner，但启动时 email/union 解析失败 → resolvedAllowedUsers
+  // 为空。hasAllowlist 必须用「原始配置」判定，否则会 fall through 成「无白名单=全开放」，
+  // 让任何人 canTalk/canOperate（正是 onboarding 路径可能写出的隐患）。
+  it('canOperate: configured owner that resolves to empty denies everyone (not open)', () => {
+    setupBotState({ configAllowedUsers: ['owner@corp.com'], allowedUsers: [] });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(false);
+    expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('canTalk: configured owner that resolves to empty blocks ordinary talk (not open)', () => {
+    setupBotState({ configAllowedUsers: ['owner@corp.com'], allowedUsers: [] });
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(false);
+  });
+
+  it('truly empty config (no allowlist at all) remains open mode', () => {
+    // 对照：完全没配白名单仍是「个人自用全开放」，不被本次收紧误伤。
+    setupBotState({ allowedUsers: [] });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(true);
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(true);
+  });
+});
+
 describe('im.message.receive_v1 — stale chat-scope detection (group → topic conversion)', () => {
   // Lark lets group admins flip chat_mode 'group' ↔ 'topic' on the fly. A
   // botmux chat-scope session built while a chat was 普通群 keeps `scope='chat'`
@@ -2205,7 +2238,7 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
   it('still ignores when sender is not allowed (permission gate runs first)', async () => {
     // Even with /t, an un-allow-listed user gets the same not_allowed treatment.
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_only_this_user'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_only_this_user'],
     });
@@ -2237,6 +2270,7 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
         larkAppId: MY_APP_ID,
         larkAppSecret: 'secret',
         cliId: 'claude-code',
+        allowedUsers: ['ou_someone_else'],
         autoStartOnNewTopic: enabled,
         regularGroupReplyMode: regularGroupNewTopic ? 'new-topic' : undefined,
       },
@@ -2563,7 +2597,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
   it('allows /introduce from any user (no auth gate): records + acks, never reaches CLI', async () => {
     // sender NOT in allowedUsers — /introduce should STILL work（只记花名册、不授权）。
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_some_other_human'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_some_other_human'],  // USER_OPEN_ID not in list
     });
