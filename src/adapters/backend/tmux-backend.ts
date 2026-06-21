@@ -153,6 +153,41 @@ export class TmuxBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Create a parked diagnostic session after a CLI has exited. The worker uses
+   * this only after it has already captured the failed pane's output, so the
+   * browser can still attach to `bmx-*` and see the startup error while daemon
+   * auto-restart is paused.
+   */
+  static parkDiagnosticSession(name: string, opts: { cwd: string; cols: number; rows: number; contentPath: string }): boolean {
+    try {
+      TmuxBackend.killSession(name);
+      const shellSpec = resolveUserShell();
+      execFileSync('tmux', [
+        'new-session',
+        '-d',
+        '-s', name,
+        '-x', String(opts.cols),
+        '-y', String(opts.rows),
+        '--',
+        shellSpec.shell, ...shellSpec.flags, '-c', DIAGNOSTIC_SHELL_SCRIPT, '_',
+        opts.cwd,
+        opts.contentPath,
+        shellSpec.shell,
+      ], {
+        stdio: 'ignore',
+        cwd: opts.cwd,
+        env: tmuxEnv(),
+        timeout: 5000,
+      });
+      configureTmuxSessionOptions(name);
+      return true;
+    } catch (err) {
+      logger.warn(`[tmux:${name}] failed to park diagnostic session: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
   // ─── SessionBackend implementation ────────────────────────────────────────
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
@@ -256,21 +291,7 @@ export class TmuxBackend implements SessionBackend {
     // backfill options added after the session was originally created.
     // Setting an already-applied option is idempotent.
     setTimeout(() => {
-      try {
-        const t = shellescape(this.sessionName);
-        const env = tmuxEnv();
-        execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
-        execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
-        // set-clipboard is a server option — enable OSC 52 passthrough for web copy
-        execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
-        execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
-        // Prevent web terminal clients (smaller viewport) from shrinking the
-        // tmux window.  If a web client at 80×24 causes tmux to resize the
-        // window down, reflowed content shifts buffer positions and the
-        // terminal renderer's baseline tracking breaks — historical output
-        // leaks into the streaming card.
-        execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
-      } catch { /* session may not be ready yet — benign */ }
+      configureTmuxSessionOptions(this.sessionName);
     }, 500);
   }
 
@@ -591,6 +612,16 @@ export function buildBotmuxEnvAssignments(
  */
 export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && exec /usr/bin/env "$@"`;
 
+export const DIAGNOSTIC_SHELL_SCRIPT = [
+  'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
+  REDACTED_ENV_UNSET_CLAUSE,
+  'clear',
+  `printf '\\033[1;31m[botmux] Agent CLI exited. Auto-restart is paused and the last terminal output is preserved below.\\033[0m\\n\\n'`,
+  'cat -- "$2" 2>/dev/null || true',
+  `printf '\\n\\033[1;33m[botmux] Fix the startup error, then send a new message to retry. Type exit to close this diagnostic shell.\\033[0m\\n'`,
+  'exec "$3" -i',
+].join('; ');
+
 /**
  * Debug variant of the wrapper script — same prelude, but the CLI runs as
  * a *child* (no `exec`) and the wrapper hands off to an interactive shell
@@ -641,6 +672,23 @@ function specForKind(shell: string, kind: ShellKind): ShellSpec {
   else if (kind === 'zsh') flags.push('-l', '-i');
   // 'sh' adds nothing — POSIX sh has no portable interactive rcfile.
   return { shell, flags };
+}
+
+function configureTmuxSessionOptions(sessionName: string): void {
+  try {
+    const t = shellescape(sessionName);
+    const env = tmuxEnv();
+    execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+    execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
+    // set-clipboard is a server option — enable OSC 52 passthrough for web copy
+    execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
+    execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
+    // Prevent web terminal clients (smaller viewport) from shrinking the
+    // tmux window. If a web client at 80x24 causes tmux to resize the window
+    // down, reflowed content shifts buffer positions and historical output
+    // leaks into the streaming card.
+    execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+  } catch { /* session may not be ready yet — benign */ }
 }
 
 /** Classify a shell binary path by basename. Returns null for shells whose

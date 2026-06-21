@@ -2196,6 +2196,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
         if (rc.count > 3) {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
+          const keepDiagnosticWorker = msg.diagnosticTerminal === 'tmux';
           // Freeze the last streaming card so it doesn't stay at "working" forever
           if (ds.streamCardId && ds.workerPort) {
             const readUrl = buildTerminalUrl(ds);
@@ -2208,11 +2209,30 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             );
             scheduleCardPatch(ds, frozenCard);
           }
-          // Kill the worker process to free resources
-          killWorker(ds);
+          if (keepDiagnosticWorker) {
+            // The worker parked a lightweight tmux diagnostic pane under the
+            // usual bmx-* name. Keep its web server alive so the existing
+            // terminal URL can show the startup failure; the next user message
+            // tells that same worker to destroy the diagnostic pane and retry.
+            restartCounts.delete(key);
+            ds.lastScreenStatus = 'idle';
+          } else {
+            // Non-tmux or failed diagnostic parking: keep the historical
+            // cleanup path so we do not leave an unusable worker around.
+            killWorker(ds);
+          }
           const cliName = getCliDisplayName(effectiveCliId);
+          const parts = [tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
+          if (keepDiagnosticWorker) {
+            parts.push(loc === 'zh'
+              ? 'Web 终端已保留最后一次启动输出，可直接打开查看；修复问题后发新消息会重新启动。'
+              : 'The web terminal now preserves the last startup output. Fix the issue, then send a new message to retry.');
+          }
+          if (msg.logTail?.trim()) {
+            parts.push((loc === 'zh' ? '最近终端输出：' : 'Recent terminal output:') + `\n${msg.logTail.trim()}`);
+          }
           try {
-            await scopedReply(tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc), 'text', undefined);
+            await scopedReply(parts.join('\n\n'), 'text', undefined);
           } catch (replyErr) {
             if (replyErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);

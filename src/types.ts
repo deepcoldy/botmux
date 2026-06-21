@@ -294,7 +294,7 @@ export type DaemonToWorker =
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string; turnId?: string }
   | { type: 'cli_session_id'; cliSessionId: string }
-  | { type: 'claude_exit'; code: number | null; signal: string | null }
+  | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; diagnosticTerminal?: 'tmux' }
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string }
   | { type: 'error'; message: string }

@@ -129,6 +129,7 @@ let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
+let crashDiagnosticTmuxParked = false;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
  *  web-terminal updates flow through the shared scrollback fan-out instead
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
@@ -2196,6 +2197,8 @@ const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
 const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
 const WORKFLOW_OUTPUT_END_MARKER = '</WORKFLOW_OUTPUT>';
+const CRASH_DIAGNOSTIC_RAW_MAX = 200_000; // enough scrollback for the web terminal without huge temp files
+const CRASH_LOG_TAIL_MAX = 2_500; // bounded Feishu text payload
 let workflowTranscript = '';
 let workflowFinalOutputSent = false;
 /** Tracks whether the CLI is currently in the alt screen buffer. Updated by
@@ -2207,6 +2210,78 @@ let workflowFinalOutputSent = false;
 let altBufferActive = false;
 const ALT_ENTER_RE = /\x1b\[\?(1049|1047|47)h/g;
 const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
+
+function tailChars(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(text.length - max);
+}
+
+function stripAnsiForLog(text: string): string {
+  return text
+    // OSC sequences.
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    // CSI/SGR and most cursor/control sequences.
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    // Remaining one-byte ESC commands.
+    .replace(/\x1b[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function recentTerminalLogTail(): string | undefined {
+  const plain = stripAnsiForLog(tailChars(scrollback, CRASH_DIAGNOSTIC_RAW_MAX));
+  if (!plain) return undefined;
+  return tailChars(plain, CRASH_LOG_TAIL_MAX);
+}
+
+function crashDiagnosticPath(): string | undefined {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir || !sessionId) return undefined;
+  return join(dataDir, 'crash-diagnostics', `${sessionId}.ansi`);
+}
+
+function destroyCrashDiagnosticTerminal(reason: string): void {
+  if (!crashDiagnosticTmuxParked || !sessionId) return;
+  try {
+    TmuxBackend.killSession(TmuxBackend.sessionName(sessionId));
+    log(`Crash diagnostic tmux session destroyed (${reason})`);
+  } catch (err: any) {
+    log(`Crash diagnostic tmux cleanup failed (${reason}): ${err?.message ?? err}`);
+  }
+  crashDiagnosticTmuxParked = false;
+}
+
+function parkCrashDiagnosticTerminal(code: number | null, signal: string | null): boolean {
+  if (lastInitConfig?.adoptMode || effectiveBackendType !== 'tmux' || !sessionId) return false;
+  const path = crashDiagnosticPath();
+  if (!path) return false;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const rawTail = tailChars(scrollback, CRASH_DIAGNOSTIC_RAW_MAX);
+    const header =
+      `[botmux] ${cliName()} exited (code: ${code ?? 'null'}, signal: ${signal ?? 'null'}).\n` +
+      `[botmux] Captured at ${new Date().toISOString()}.\n\n`;
+    writeFileSync(path, header + rawTail);
+  } catch (err: any) {
+    log(`Crash diagnostic log write failed: ${err?.message ?? err}`);
+    return false;
+  }
+
+  const ok = TmuxBackend.parkDiagnosticSession(TmuxBackend.sessionName(sessionId), {
+    cwd: lastInitConfig?.workingDir ?? process.cwd(),
+    cols: renderCols || PTY_COLS,
+    rows: renderRows || PTY_ROWS,
+    contentPath: path,
+  });
+  if (!ok) return false;
+  crashDiagnosticTmuxParked = true;
+  isTmuxMode = true;
+  isPipeMode = false;
+  isZellijMode = false;
+  log(`Crash diagnostic tmux session parked at ${TmuxBackend.sessionName(sessionId)}`);
+  return true;
+}
 
 // ─── Screen Analyzer (AI-based TUI prompt detection) ────────────────────────
 
@@ -4344,6 +4419,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   backend.onData(onPtyData);
   backend.onExit((code, signal) => {
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
+    const logTail = recentTerminalLogTail();
+    const diagnosticTerminal = parkCrashDiagnosticTerminal(code, signal) ? 'tmux' as const : undefined;
     // Inputs written but not yet consumed (no idle since the write) die with
     // the CLI — codex crashing mid-submit never records them, and the fresh
     // respawn comes up empty. Stash them so the next spawnCli re-queues and
@@ -4354,7 +4431,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
     backend = null;
     isPromptReady = false;
-    send({ type: 'claude_exit', code, signal });
+    send({ type: 'claude_exit', code, signal, logTail, diagnosticTerminal });
   });
 
   if (isPipeMode && backend && 'isReattach' in backend && backend.isReattach) {
@@ -4388,6 +4465,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 }
 
 function killCli(): void {
+  destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
   stopReattachIdleProbe();
@@ -5014,6 +5092,16 @@ process.on('message', async (raw: unknown) => {
       const content = msg.content;
       currentBotmuxTurnId = msg.turnId;
       writeCliPidMarker();
+      if (!backend && crashDiagnosticTmuxParked && lastInitConfig && !lastInitConfig.adoptMode) {
+        log('Message received while crash diagnostic terminal is parked; retrying CLI start');
+        destroyCrashDiagnosticTerminal('retry after message');
+        stopScreenAnalyzer();
+        stopScreenUpdates();
+        awaitingFirstPrompt = true;
+        startScreenUpdates();
+        startScreenAnalyzer();
+        spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+      }
       if (lastInitConfig?.adoptMode) {
         // Bridge mode: capture transcript baseline BEFORE writing to the pane,
         // so any assistant uuids appended after this point are attributed to

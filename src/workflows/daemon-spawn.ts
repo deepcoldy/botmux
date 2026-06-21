@@ -63,7 +63,7 @@ type WorkerEvent =
       status: 'working' | 'idle' | 'analyzing';
     }
   | { type: 'prompt_ready' }
-  | { type: 'claude_exit'; code: number | null; signal: string | null }
+  | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; diagnosticTerminal?: 'tmux' }
   | { type: 'error'; message: string };
 
 // ─── Worker process abstraction (factory + handle) ────────────────────────
