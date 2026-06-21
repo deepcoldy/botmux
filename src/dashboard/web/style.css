@@ -4847,7 +4847,10 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .skills-discovery-tabs {
   display: flex;
   gap: 8px;
+  align-items: center;
+  min-height: 40px;
   overflow-x: auto;
+  overflow-y: hidden;
   padding-bottom: 2px;
   scrollbar-width: thin;
 }
