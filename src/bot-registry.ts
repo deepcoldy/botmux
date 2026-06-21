@@ -10,6 +10,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
+import { sanitizePerBotEnv } from './core/per-bot-env.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 
@@ -196,6 +197,16 @@ export interface BotConfig {
    * is trimmed and gets a leading `/` if missing; arguments (spaces) preserved.
    */
   startupCommands?: string[];
+  /**
+   * Optional per-bot environment variables, injected into THIS bot's CLI
+   * process (e.g. `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` to run the bot
+   * on GLM / a third-party Anthropic-compatible provider, an `HTTPS_PROXY`, or
+   * a CLI feature flag). Sanitized at load via {@link sanitizePerBotEnv}
+   * (valid env-var names + string/number/boolean values; botmux-reserved keys
+   * dropped). Delivered per-session as SpawnOpts.injectEnv so it never pollutes
+   * the shared tmux/zellij server env. Missing/empty → undefined.
+   */
+  env?: Record<string, string>;
   /**
    * Optional per-bot priority skill policy. Missing means botmux does not alter
    * the underlying CLI's native skill discovery or spawn arguments.
@@ -747,6 +758,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const startupCommandsList = normalizeStartupCommandList(entry.startupCommands);
     const startupCommands = startupCommandsList.length > 0 ? startupCommandsList : undefined;
 
+    // env：per-bot 环境变量（如代理 / 第三方服务商端点 ANTHROPIC_BASE_URL+AUTH_TOKEN）。
+    // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
+    const sanitizedEnv = sanitizePerBotEnv(entry.env);
+    const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
+
     const skills = readBotSkillPolicy(entry.skills);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
@@ -813,6 +829,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       customPassthroughCommands,
       startupCommands,
+      env,
       skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined

@@ -3,6 +3,7 @@ import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
   assertOwnerWhenChatGroups,
+  botProcessEnv,
   botProcessName,
   findInvalidAllowedUserEntries,
   hasOwnerEntry,
@@ -13,6 +14,43 @@ import {
   removeBotConfig,
   resolveCliId,
 } from '../src/setup/bot-config-editor.js';
+
+describe('botProcessEnv', () => {
+  it('keeps valid process env keys and stringifies primitive values', () => {
+    expect(botProcessEnv({
+      env: {
+        HTTPS_PROXY: 'http://127.0.0.1:7890',
+        OPENAI_TIMEOUT_MS: 30000,
+        FEATURE_FLAG: true,
+        EMPTY_VALUE: '',
+      },
+    })).toEqual({
+      HTTPS_PROXY: 'http://127.0.0.1:7890',
+      OPENAI_TIMEOUT_MS: '30000',
+      FEATURE_FLAG: 'true',
+      EMPTY_VALUE: '',
+    });
+  });
+
+  it('drops invalid keys and non-primitive values', () => {
+    expect(botProcessEnv({
+      env: {
+        '1BAD': 'x',
+        'BAD-NAME': 'x',
+        OK_NAME: ['x'],
+        ALSO_OK: { nested: true },
+        NULLISH: null,
+        VALID_NAME: false,
+      },
+    })).toEqual({ VALID_NAME: 'false' });
+  });
+
+  it('returns an empty object when env is missing or not an object', () => {
+    expect(botProcessEnv({})).toEqual({});
+    expect(botProcessEnv({ env: [] })).toEqual({});
+    expect(botProcessEnv({ env: 'HTTPS_PROXY=x' })).toEqual({});
+  });
+});
 
 describe('parseBotSelection', () => {
   const bots = [
