@@ -43,6 +43,7 @@ function pageHtml(): string {
       </div>
     </div>
     <div id="settings-body"></div>
+    <div id="update-body"></div>
   </section>`;
 }
 
@@ -126,6 +127,219 @@ function renderSettingsBody(): string {
       </div>
     </article>
   </div>`;
+}
+
+// ─── Version & update card ──────────────────────────────────────────────────
+// A separate card (next to Auto Maintenance) for the manual update flow:
+// version check, changelog, update-to-latest (with node + multi-install
+// preflight), and a standalone restart. Backed by the authed-only
+// /api/update/* endpoints, so read-only visitors only see a login prompt.
+
+interface InstallEntry { binPath: string; root: string; kind: 'npm-global' | 'source-checkout' | 'unknown' }
+interface NodeCheck { version: string; major: number; required: number; ok: boolean }
+interface UpdateStatus {
+  current: string;
+  latest: string | null;
+  behind: boolean;
+  localDevInstall: boolean;
+  node: NodeCheck;
+  installs: { entries: InstallEntry[]; multiple: boolean };
+}
+interface ReleaseNote { version: string; name: string; body: string; url: string; publishedAt: string | null }
+
+let upStatus: UpdateStatus | null = null;
+let upStatusError: string | null = null;
+let upChangelog: ReleaseNote[] | null = null;
+let upChangelogOpen = false;
+let upChangelogError: string | null = null;
+let upBusy = false;
+let upMsg: { text: string; cls: string } | null = null;
+
+function installKindLabel(kind: string): string {
+  if (kind === 'npm-global') return t('update.kindNpm');
+  if (kind === 'source-checkout') return t('update.kindSource');
+  return t('update.kindUnknown');
+}
+
+function renderChangelogPanel(): string {
+  if (upChangelogError) return `<p class="hint-warn-inline">${t('update.changelogFailed')}</p>`;
+  if (upChangelog === null) return `<p class="empty">${t('update.changelogLoading')}</p>`;
+  if (upChangelog.length === 0) return `<p class="empty">${t('update.changelogEmpty')}</p>`;
+  return `<div class="update-changelog">${upChangelog.map(r => {
+    const title = r.name && r.name !== `v${r.version}` ? r.name : '';
+    const date = r.publishedAt ? new Date(r.publishedAt).toLocaleDateString() : '';
+    return `<details class="update-release" open>
+      <summary><strong>v${escapeHtml(r.version)}</strong> ${escapeHtml(title)} <small>${escapeHtml(date)}</small>
+        <a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">↗</a></summary>
+      <pre class="update-release-body">${escapeHtml(r.body || '')}</pre>
+    </details>`;
+  }).join('')}</div>`;
+}
+
+function renderUpdateCard(canWrite: boolean): string {
+  let inner: string;
+  if (!canWrite) {
+    inner = `<p class="hint-warn">${t('update.loginRequired')}</p>`;
+  } else if (upStatusError) {
+    inner = `<p class="hint-warn">${t('update.checkFailed')}: ${escapeHtml(upStatusError)}</p>
+      <div class="update-actions"><button type="button" data-up="check">${t('update.btnCheck')}</button></div>`;
+  } else if (!upStatus) {
+    inner = `<p class="empty">${t('update.loading')}</p>`;
+  } else {
+    const s = upStatus;
+    const badge = s.latest
+      ? (s.behind
+          ? `<span class="update-badge update-badge-new">${t('update.newAvailable', { version: `v${s.latest}` })}</span>`
+          : `<span class="update-badge update-badge-ok">${t('update.upToDate')}</span>`)
+      : `<span class="hint-warn-inline">${t('update.checkUnavailable')}</span>`;
+    const versionLine = `<p class="update-version"><span>${t('update.current')}: <strong>v${escapeHtml(s.current)}</strong></span> ${badge}</p>`;
+    const warnings: string[] = [];
+    if (!s.node.ok) warnings.push(`<p class="hint-warn">${t('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p>`);
+    if (s.localDevInstall) warnings.push(`<p class="hint-warn">${t('update.localDev')}</p>`);
+    if (s.installs.multiple) {
+      const list = s.installs.entries
+        .map(e => `<li><code>${escapeHtml(e.binPath)}</code> → ${installKindLabel(e.kind)} <small>${escapeHtml(e.root)}</small></li>`)
+        .join('');
+      warnings.push(`<div class="hint-warn"><p>${t('update.multiInstallWarn')}</p><ul class="update-install-list">${list}</ul></div>`);
+    }
+    const updateDisabled = s.localDevInstall || upBusy;
+    const buttons = `<div class="update-actions">
+      <button type="button" data-up="check" ${upBusy ? 'disabled' : ''}>${t('update.btnCheck')}</button>
+      <button type="button" data-up="changelog" ${upBusy ? 'disabled' : ''}>${upChangelogOpen ? t('update.btnChangelogHide') : t('update.btnChangelog')}</button>
+      <button type="button" class="primary" data-up="update" ${updateDisabled ? 'disabled' : ''}>${t('update.btnUpdate')}</button>
+      <button type="button" data-up="restart" ${upBusy ? 'disabled' : ''}>${t('update.btnRestart')}</button>
+    </div>`;
+    const changelog = upChangelogOpen ? renderChangelogPanel() : '';
+    const msg = upMsg ? `<p class="oncall-status ${escapeHtml(upMsg.cls)}">${escapeHtml(upMsg.text)}</p>` : '';
+    inner = versionLine + warnings.join('') + buttons + changelog + msg;
+  }
+  return `<div class="settings-grid">
+    <article class="bd-card settings-card">
+      <section class="bd-section">
+        <h3 class="bd-section-title">${t('update.section')}</h3>
+        ${inner}
+      </section>
+    </article>
+  </div>`;
+}
+
+function mountUpdateCard(container: HTMLElement, canWrite: boolean): void {
+  function rerender(): void {
+    container.innerHTML = renderUpdateCard(canWrite);
+    wire();
+  }
+  function setMsg(text: string, cls = ''): void { upMsg = { text, cls }; }
+
+  async function fetchStatus(): Promise<void> {
+    try {
+      const r = await fetch('/api/update/status');
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) { upStatus = null; upStatusError = body?.error ?? `HTTP ${r.status}`; return; }
+      upStatus = body as UpdateStatus;
+      upStatusError = null;
+    } catch (e: any) {
+      upStatus = null; upStatusError = e?.message ?? String(e);
+    }
+  }
+
+  async function loadChangelog(): Promise<void> {
+    upChangelog = null; upChangelogError = null; rerender();
+    try {
+      const r = await fetch('/api/update/changelog');
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) upChangelogError = body?.error ?? `HTTP ${r.status}`;
+      else upChangelog = Array.isArray(body.releases) ? body.releases : [];
+    } catch (e: any) {
+      upChangelogError = e?.message ?? String(e);
+    }
+    rerender();
+  }
+
+  function pollReconnect(): void {
+    const start = Date.now();
+    const tick = async (): Promise<void> => {
+      if (Date.now() - start > 90_000) { upBusy = false; setMsg(t('update.restartSlow'), 'hint-warn-inline'); rerender(); return; }
+      try {
+        const r = await fetch('/__health', { cache: 'no-store' });
+        if (r.ok) { location.reload(); return; }
+      } catch { /* still down → keep polling */ }
+      setTimeout(() => void tick(), 2000);
+    };
+    // Give the old dashboard a moment to actually go down before polling.
+    setTimeout(() => void tick(), 3000);
+  }
+
+  async function doRestart(updatePayload: { oldVersion: string; newVersion: string } | null): Promise<void> {
+    upBusy = true; setMsg(t('update.restarting')); rerender();
+    try {
+      await fetch('/api/update/restart', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(updatePayload ? { update: updatePayload } : {}),
+      });
+    } catch (e: any) {
+      upBusy = false; setMsg(t('update.restartFailed', { detail: e?.message ?? e }), 'hint-warn-inline'); rerender(); return;
+    }
+    pollReconnect();
+  }
+
+  async function doUpdate(): Promise<void> {
+    const s = upStatus;
+    if (!s) return;
+    if (!s.node.ok) { window.alert(t('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required })); return; }
+    if (s.installs.multiple) {
+      const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind)})`).join('\n');
+      if (!window.confirm(t('update.confirmMultiInstall', { paths }))) return;
+    }
+    const confirmMsg = s.latest ? t('update.confirmUpdate', { version: `v${s.latest}` }) : t('update.confirmUpdateNoVer');
+    if (!window.confirm(confirmMsg)) return;
+    upBusy = true; setMsg(t('update.updating')); rerender();
+    try {
+      const r = await fetch('/api/update/run', { method: 'POST' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        const detail = body?.detail ?? body?.error ?? `HTTP ${r.status}`;
+        upBusy = false; setMsg(t('update.updateFailed', { detail }), 'hint-warn-inline'); rerender(); return;
+      }
+      if (body.changed) {
+        upBusy = false;
+        setMsg(t('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` }), 'hint-ok'); rerender();
+        if (window.confirm(t('update.confirmRestart'))) {
+          await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
+        } else {
+          setMsg(t('update.noRestartHint'), 'hint-ok'); rerender();
+        }
+      } else {
+        upBusy = false; setMsg(t('update.alreadyLatestRun', { version: `v${body.newVersion}` }), 'hint-ok');
+        await fetchStatus(); rerender();
+      }
+    } catch (e: any) {
+      upBusy = false; setMsg(t('update.updateFailed', { detail: e?.message ?? e }), 'hint-warn-inline'); rerender();
+    }
+  }
+
+  function wire(): void {
+    container.querySelectorAll<HTMLButtonElement>('button[data-up]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const act = btn.dataset.up;
+        if (act === 'check') {
+          upStatus = null; upChangelog = null; upChangelogOpen = false; upMsg = null; upStatusError = null;
+          rerender(); void fetchStatus().then(rerender);
+        } else if (act === 'changelog') {
+          upChangelogOpen = !upChangelogOpen;
+          if (upChangelogOpen && upChangelog === null) void loadChangelog();
+          else rerender();
+        } else if (act === 'update') {
+          void doUpdate();
+        } else if (act === 'restart') {
+          if (window.confirm(t('update.confirmPlainRestart'))) void doRestart(null);
+        }
+      });
+    });
+  }
+
+  rerender();
+  if (canWrite) void fetchStatus().then(rerender);
 }
 
 async function fetchSettings(): Promise<void> {
@@ -230,4 +444,10 @@ export async function renderSettingsPage(root: HTMLElement): Promise<void> {
   rerender();
   await fetchSettings();
   rerender();
+
+  // Mount the version & update card (separate lifecycle from the settings PUT
+  // form, so a maintenance toggle re-render doesn't wipe its loaded state).
+  upBusy = false; upMsg = null; upChangelogOpen = false;
+  const updateEl = root.querySelector<HTMLElement>('#update-body')!;
+  mountUpdateCard(updateEl, canWrite);
 }

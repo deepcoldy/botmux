@@ -2228,6 +2228,21 @@ input.row-select,
 }
 .bd-section-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 
+/* ── Version & update card ── */
+.update-version { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.update-badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; }
+.update-badge-new { color: var(--accent-strong); background: var(--accent-soft); }
+.update-badge-ok { color: var(--success); background: var(--success-soft); }
+.update-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.update-install-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.6; }
+.update-install-list code { font-size: 11px; }
+.update-install-list small { color: var(--muted); }
+.update-changelog { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.update-release { border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px 12px; background: var(--surface-muted); }
+.update-release > summary { cursor: pointer; font-size: 13px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.update-release > summary small { color: var(--muted); font-size: 11px; }
+.update-release-body { margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.5; max-height: 320px; overflow: auto; color: var(--fg); }
+
 /* A lighter sub-group inside a bd-section (e.g. 主动开工 lives under 新群 Oncall).
    Separated by a soft top rule + indent so it reads as "part of this block". */
 .bd-subsection {

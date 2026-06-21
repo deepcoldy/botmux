@@ -172,6 +172,40 @@ function setsidAvailable(): boolean {
   }
 }
 
+/**
+ * Spawn a detached `botmux restart`, immune to this process's own teardown
+ * (setsid → a new session reparented to init, so PM2 killing the current
+ * process doesn't interrupt the restart driver). Output is appended to the
+ * maintenance-restart log so a failed restart stays diagnosable. Shared by the
+ * maintenance timer (auto-update) and the dashboard's manual update/restart.
+ *
+ * @param reason short tag written to the log (e.g. 'auto-update', 'dashboard').
+ */
+export function spawnDetachedRestart(reason: string): void {
+  const logFile = maintenanceRestartLogPath();
+  let fd: number | undefined;
+  try {
+    mkdirSync(dirname(logFile), { recursive: true });
+    fd = openSync(logFile, 'a');
+    writeSync(fd, `\n[${new Date().toISOString()}] ${reason}: launching restart\n`);
+  } catch {
+    fd = undefined; // fall back to discarding output rather than failing the restart
+  }
+  const { cmd, args } = buildRestartLauncher(process.execPath, botmuxCliEntry(), setsidAvailable());
+  const child = spawn(cmd, args, {
+    detached: true,
+    stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
+    env: process.env,
+  });
+  // A detached child's 'error' (e.g. spawn ENOENT) would otherwise throw
+  // unhandled and crash this process — log it instead.
+  child.on('error', (e) => logger.error(`[maintenance] restart launch failed: ${e instanceof Error ? e.message : e}`));
+  child.unref();
+  if (fd !== undefined) {
+    try { closeSync(fd); } catch { /* the detached child holds its own dup */ }
+  }
+}
+
 function productionDeps(): MaintenanceDeps {
   return {
     now: () => Date.now(),
@@ -185,31 +219,7 @@ function productionDeps(): MaintenanceDeps {
       execSync('npm install -g botmux@latest', { stdio: 'inherit' });
     },
     writeIntent: (intent) => writeRestartIntent(intent),
-    triggerRestart: () => {
-      // Capture the restart's output to a log so a failure is visible.
-      const logFile = maintenanceRestartLogPath();
-      let fd: number | undefined;
-      try {
-        mkdirSync(dirname(logFile), { recursive: true });
-        fd = openSync(logFile, 'a');
-        writeSync(fd, `\n[${new Date().toISOString()}] auto-update: launching restart to apply\n`);
-      } catch {
-        fd = undefined; // fall back to discarding output rather than failing the restart
-      }
-      const { cmd, args } = buildRestartLauncher(process.execPath, botmuxCliEntry(), setsidAvailable());
-      const child = spawn(cmd, args, {
-        detached: true,
-        stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
-        env: process.env,
-      });
-      // A detached child's 'error' (e.g. spawn ENOENT) would otherwise throw
-      // unhandled and crash the daemon — log it instead.
-      child.on('error', (e) => logger.error(`[maintenance] restart launch failed: ${e instanceof Error ? e.message : e}`));
-      child.unref();
-      if (fd !== undefined) {
-        try { closeSync(fd); } catch { /* the detached child holds its own dup */ }
-      }
-    },
+    triggerRestart: () => spawnDetachedRestart('auto-update'),
     log: (msg) => logger.info(`[maintenance] ${msg}`),
   };
 }
