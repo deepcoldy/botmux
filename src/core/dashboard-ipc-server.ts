@@ -344,7 +344,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight/turn/:turnIndex', (req, res, p
 // 跨会话 insight 总览：仍然只读、按需、owner-only（外层 dashboard route
 // 不在 public-read 白名单）。只聚合本 daemon registry 里的 botmux 会话；
 // 不扫整机 transcript，不返回 raw span/input/output。
-ipcRoute('GET', '/api/insights/summary', (req, res) => {
+ipcRoute('GET', '/api/insights/summary', async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
   const active = listActiveSessions().map(composeRowFromActive);
@@ -353,7 +353,7 @@ ipcRoute('GET', '/api/insights/summary', (req, res) => {
     .filter(s => s.status === 'closed' && !activeIds.has(s.sessionId))
     .map(composeRowFromClosed);
   const rows = [...active, ...closed];
-  const overview = buildSafeInsightOverview(rows.map(row => {
+  const overview = await buildSafeInsightOverview(rows.map(row => {
     const session = findSessionRecord(row.sessionId);
     return {
       cliId: row.cliId,

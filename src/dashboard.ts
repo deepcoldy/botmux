@@ -62,6 +62,9 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+/** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
+ *  aggregate latency when one daemon's insight parse is slow or hung. */
+const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
@@ -765,11 +768,21 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
       const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
+      // Per-daemon timeout + isolate failures: an upstream insight parse can be
+      // heavy, so a slow/hung daemon must not stall the aggregated summary. A
+      // timed-out / errored chunk drops to null and is filtered out below.
       const chunks = await Promise.all(registry.list().map(async d => {
-        const upstream = await proxyToDaemon(d.larkAppId, `/api/insights/summary?limit=${limit}`, { method: 'GET' });
-        if (!upstream.ok) return null;
-        const body = await upstream.json().catch(() => null) as { overview?: SafeInsightOverview } | null;
-        return body?.overview ?? null;
+        try {
+          const upstream = await proxyToDaemon(d.larkAppId, `/api/insights/summary?limit=${limit}`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(INSIGHT_FANOUT_TIMEOUT_MS),
+          });
+          if (!upstream.ok) return null;
+          const body = await upstream.json().catch(() => null) as { overview?: SafeInsightOverview } | null;
+          return body?.overview ?? null;
+        } catch {
+          return null;
+        }
       }));
       const overview = mergeSafeInsightOverviews(chunks.filter((x): x is SafeInsightOverview => !!x), { limit });
       return jsonRes(res, 200, { ok: true, overview });
