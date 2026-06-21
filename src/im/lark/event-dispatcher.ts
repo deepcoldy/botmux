@@ -806,6 +806,18 @@ function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean 
   return !!openId && !!getBot(larkAppId).config.globalGrants?.includes(openId);
 }
 
+/**
+ * 是否配置了任何白名单（限制态）。判定用 **原始** config.allowedUsers, 不用
+ * resolvedAllowedUsers——否则「配了 owner 但启动时邮箱/union 解析失败 → resolved 为空」
+ * 会 fall through 成「无白名单 = 全开放」，把误配/解析失败 fail-open 成谁都能 operate。
+ * 配了就算限制态：解析为空时成员判定一律落空 → fail-closed（由 owner 修配置）。
+ */
+function hasConfiguredAllowlist(bot: ReturnType<typeof getBot>): boolean {
+  return (bot.config.allowedUsers?.length ?? 0) > 0
+    || (bot.config.allowedChatGroups?.length ?? 0) > 0
+    || (bot.config.globalGrants?.length ?? 0) > 0;
+}
+
 export function canTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined): boolean {
   return evaluateTalk(larkAppId, chatId, senderOpenId).allowed;
 }
@@ -830,11 +842,9 @@ export function evaluateTalk(larkAppId: string, chatId: string | undefined, send
   if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return { allowed: true, reason: 'allowedChatGroup' };
 
   // globalGrants 与 allowedChatGroups 同样确立"有白名单"语义：只配 globalGrants 也算限制态，
-  // 不能 fall through 到"全开放"。
-  const hasAllowlist = allowedUsers.length > 0
-    || (bot.config.allowedChatGroups?.length ?? 0) > 0
-    || (bot.config.globalGrants?.length ?? 0) > 0;
-  if (!hasAllowlist) return { allowed: true, reason: 'open' };
+  // 不能 fall through 到"全开放"。用原始配置判定（见 hasConfiguredAllowlist）：配了 owner
+  // 但解析失败时也保持限制态, 不 fail-open。
+  if (!hasConfiguredAllowlist(bot)) return { allowed: true, reason: 'open' };
 
   if (hasChatGrant(larkAppId, chatId, senderOpenId)) {
     return { allowed: true, reason: 'chatGrant', quotaKey: chatQuotaKey(chatId!, senderOpenId!) };
@@ -858,10 +868,8 @@ export function canOperate(larkAppId: string, _chatId: string | undefined, sende
   // globalGrants（与 allowedChatGroups 同理）确立"有白名单"语义：只配 globalGrants 也算限制态，
   // 否则 canOperate 会 fall through 到"全开放"，把 talk-only 授权变成 operate 全开——正是 PR #46
   // 要堵的洞。注意 globalGrants 只进 hasAllowlist 判定，operate 命中仍只认 allowedUsers。
-  const hasAllowlist = allowedUsers.length > 0
-    || (bot.config.allowedChatGroups?.length ?? 0) > 0
-    || (bot.config.globalGrants?.length ?? 0) > 0;
-  if (!hasAllowlist) return true;
+  // 用原始配置判定（hasConfiguredAllowlist）：配了 owner 但解析为空时 fail-closed, 不 fail-open。
+  if (!hasConfiguredAllowlist(bot)) return true;
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
 }
 

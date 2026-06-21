@@ -15,10 +15,47 @@
 - **本群 Role** 优先级最高：同一个 bot 在不同群可以有不同性格 / 职责（如在 A 群当「严格的 reviewer」、在 B 群当「亲和的答疑助手」）。
 - **默认角色** 是该 bot 的跨群默认人设，没设本群 Role 时生效。
 - Role 内容是 Markdown，注入到 CLI 的 system prompt，最大约 4096 字节。
+- Role 解析顺序始终是：**本群 Role > 默认角色 > 无**。
 
 > 💡 **默认角色**最直观的设置方式是在 `botmux dashboard` 的 **Bot 配置** 页——每个 bot 卡片都有「**默认角色**」编辑器（和 `/role team set` 写的是同一份配置；它是 bot 级的全局默认人设，放在 Bot 配置更合适）。**团队**面板里只做**只读查看**入口，编辑统一去 Bot 配置页。
 
 ![Dashboard Bot 配置 — 默认角色编辑器](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780051089378_default-role-shot.png)
+
+## Role Profile
+
+Role profile 是一套可复用的、按 bot 区分的**本群 Role**。它不是第三层运行时 role，也不支持 `{{teamRole}}` 这类模板继承。
+
+常用命令：
+
+```bash
+/role profile list
+/role profile show collab-main
+/role profile set collab-main <Markdown>
+/role profile save collab-main
+/role profile apply collab-main --quiet
+```
+
+工作方式：
+
+- 每个 bot 只拥有自己的 profile entry，按 `larkAppId` 存储。
+- `save` 会把当前 bot 的生效 Role 保存到 profile：先取本群 Role，再取默认角色；都没有则失败。
+- `apply` 会把当前 bot 的 profile entry 写成本群 Role。若本群已存在 Role，默认拒绝覆盖，除非传 `--force`。
+- 缺 entry 是安全的：不写任何内容；如果该 bot 有默认角色，会继续 fallback 到默认角色。
+
+在 Dashboard 里，**角色配置集** 是独立入口：
+
+- 左侧列表打开或新建 profile。
+- 中间查看每个 bot 是否已有 entry，并编辑该 bot 的 Markdown Role。
+- 在 Apply 区选择目标群，先 **预览 Apply**，确认不会误覆盖后再 **Apply Profile**。
+- 从 **群组** 页面点击某个群的「应用配置集」会直接跳到该群作为 Apply 目标。
+
+创建协作群时可以一次 bootstrap：
+
+```bash
+@botA @botB @botC /g --role-profile collab-main War Room
+```
+
+创建者会先直接应用自己的 entry，再在新群里发送 `@botB @botC /role profile apply collab-main --quiet` 给其它 bot。每个 bot 只应用自己的本地 entry，不会跨 daemon 写其它机器人的 role 存储。
 
 ## 能力标签（花名册）
 

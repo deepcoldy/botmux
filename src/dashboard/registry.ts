@@ -4,6 +4,8 @@ import { join } from 'node:path';
 export interface DaemonInfo {
   larkAppId: string;
   botName: string;
+  /** CLI adapter id from bots.json, e.g. codex / claude-code / traex. */
+  cliId?: string;
   /** Lark app avatar URL (from /bot/v3/info); absent until the open_id probe lands. */
   botAvatarUrl?: string;
   botIndex: number;

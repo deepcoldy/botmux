@@ -56,6 +56,8 @@ import { loadBotConfigs } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
+import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
+import { isValidRoleProfileId } from './services/role-profile-store.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -305,13 +307,29 @@ async function proxyToDaemon(
  *  Surfaces invalidBotIds/invalidUserIds so the UI never implies a non-added
  *  bot/user joined. */
 /** Live daemon-registry bots — authoritative source for THIS deployment's
- *  bots (cliId added from bots-info.json downstream). Fixes an empty/stale
- *  bots-info.json hiding running bots from the team roster / federation. */
-function liveBots(): { larkAppId: string; botName: string }[] {
-  return registry.list().map(d => ({ larkAppId: d.larkAppId, botName: d.botName }));
+ *  bots. cliId comes from the daemon descriptor, with bots.json as a
+ *  compatibility fallback for descriptors written by older daemons. */
+function configuredCliIds(): Map<string, string> {
+  try {
+    return new Map(loadBotConfigs().map(b => [b.larkAppId, b.cliId]));
+  } catch {
+    return new Map();
+  }
 }
 
-async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[] }): Promise<{
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string }>(bot: T, ids: Map<string, string>): T & { cliId?: string } {
+  return bot.cliId ? bot : { ...bot, cliId: ids.get(bot.larkAppId) };
+}
+
+function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+  const ids = configuredCliIds();
+  return registry.list().map(d => {
+    const b = withConfiguredCliId(d, ids);
+    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+  });
+}
+
+async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[]; roleProfileId?: string }): Promise<{
   ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidUserIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string; autoInviteUnavailable?: boolean;
 }> {
   const selectedIds = Array.from(new Set(args.larkAppIds.filter(Boolean)));
@@ -337,7 +355,13 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: args.name, larkAppIds: selectedIds, userOpenIds, ownerUnionIds: args.ownerUnionIds ?? [] }),
+      body: JSON.stringify({
+        name: args.name,
+        larkAppIds: selectedIds,
+        userOpenIds,
+        ownerUnionIds: args.ownerUnionIds ?? [],
+        ...(args.roleProfileId ? { roleProfileId: args.roleProfileId } : {}),
+      }),
     });
     const text = await upstream.text();
     let parsed: any = null;
@@ -993,6 +1017,33 @@ const server = createServer(async (req, res) => {
       const job = botOnboarding.start({ cliId, wrapperCli, workingDir, model });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
+    let mOwner: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mOwner = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/owner$/))) {
+      // needs_owner 状态下用户手动提交 owner：扫码人身份验证不了时的兜底入口。
+      // submitOwner 内部做格式 + 可用性校验, 通过才落盘并转 completed。
+      const onboardingId = decodeURIComponent(mOwner[1]);
+      let parsedOwner: { owner?: unknown; allowedUsers?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsedOwner = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      // 接受 owner 字符串 (逗号/空白分隔) 或 allowedUsers 数组。
+      const entries = Array.isArray(parsedOwner.allowedUsers)
+        ? parsedOwner.allowedUsers.filter((v): v is string => typeof v === 'string')
+        : typeof parsedOwner.owner === 'string'
+          ? parsedOwner.owner.split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
+          : [];
+      const r = await botOnboarding.submitOwner(onboardingId, entries);
+      if (!r.ok) {
+        const status = r.error === 'unknown_onboarding_job' ? 404 : 400;
+        return jsonRes(res, status, r);
+      }
+      return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
+    }
     let mOnboard: RegExpMatchArray | null;
     if (req.method === 'GET' && (mOnboard = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)$/))) {
       const job = botOnboarding.get(decodeURIComponent(mOnboard[1]));
@@ -1135,7 +1186,8 @@ const server = createServer(async (req, res) => {
       const out = new Map<string, any>();
       // Sort by botIndex so the matrix columns + the create-group bot picker
       // both match the order in bots.json (fs.readdir order is unstable).
-      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+      const cliIds = configuredCliIds();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
       await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
@@ -1154,6 +1206,7 @@ const server = createServer(async (req, res) => {
             cur.memberBots.push({
               larkAppId: d.larkAppId,
               botName: d.botName,
+              cliId: d.cliId,
               inChat: true,
               oncallChat: oncallChat ?? null,
               hasRole: hasRole ?? false,
@@ -1172,7 +1225,7 @@ const server = createServer(async (req, res) => {
         const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
         for (const b of onlineBots) {
           if (!present.has(b.larkAppId)) {
-            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, inChat: false, oncallChat: null, hasRole: false });
+            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
           }
         }
       }
@@ -1195,7 +1248,7 @@ const server = createServer(async (req, res) => {
       // prompt strip + keeps /api/bots oncall removal honest).
       return jsonRes(res, 200, {
         chats: authed ? sorted : redactGroupsForPublic(sorted),
-        bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName, botAvatarUrl: b.botAvatarUrl })),
+        bots: onlineBots.map(botSummaryPayload),
       });
     }
 
@@ -1233,6 +1286,137 @@ const server = createServer(async (req, res) => {
         res.end(await upstream.text());
         return;
       }
+    }
+
+    // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
+    if (req.method === 'GET' && url.pathname === '/api/role-profiles') {
+      type RoleProfileAggregate = {
+        profileId: string;
+        entryCount: number;
+        updatedAt: number | null;
+        botEntries: Array<{ larkAppId: string; hasEntry: boolean }>;
+      };
+      const merged = new Map<string, RoleProfileAggregate>();
+      await Promise.all(registry.list().map(async d => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles`);
+          if (!r.ok) return;
+          const j = await r.json() as { profiles?: any[]; larkAppId?: string };
+          for (const p of j.profiles ?? []) {
+            if (typeof p.profileId !== 'string') continue;
+            const cur: RoleProfileAggregate = merged.get(p.profileId) ?? { profileId: p.profileId, entryCount: 0, updatedAt: null, botEntries: [] };
+            cur.entryCount = Math.max(cur.entryCount, typeof p.entryCount === 'number' ? p.entryCount : 0);
+            if (typeof p.updatedAt === 'number') cur.updatedAt = cur.updatedAt === null ? p.updatedAt : Math.max(cur.updatedAt, p.updatedAt);
+            const larkAppId = j.larkAppId ?? d.larkAppId;
+            if (!cur.botEntries.some(entry => entry.larkAppId === larkAppId)) {
+              cur.botEntries.push({ larkAppId, hasEntry: p.hasCurrentBotEntry === true });
+            }
+            merged.set(p.profileId, cur);
+          }
+        } catch { /* skip offline/bad daemon */ }
+      }));
+      return jsonRes(res, 200, {
+        profiles: [...merged.values()]
+          .map(p => ({
+            ...p,
+            entryCount: Math.max(p.entryCount, p.botEntries.filter(entry => entry.hasEntry).length),
+          }))
+          .sort((a, b) => a.profileId.localeCompare(b.profileId)),
+      });
+    }
+
+    let mRoleProfileApply: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mRoleProfileApply = url.pathname.match(/^\/api\/role-profiles\/([^/]+)\/apply$/))) {
+      const profileId = decodeURIComponent(mRoleProfileApply[1]);
+      if (!isValidRoleProfileId(profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      let raw = '{}';
+      let parsed: { larkAppId?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        parsed = JSON.parse(raw);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const larkAppId = typeof parsed.larkAppId === 'string' ? parsed.larkAppId : '';
+      if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
+      const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    let mRoleProfileEntry: RegExpMatchArray | null;
+    if ((mRoleProfileEntry = url.pathname.match(/^\/api\/role-profiles\/([^/]+)\/([^/]+)$/))) {
+      const profileId = decodeURIComponent(mRoleProfileEntry[1]);
+      const larkAppId = decodeURIComponent(mRoleProfileEntry[2]);
+      if (!isValidRoleProfileId(profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'DELETE') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, { method: 'DELETE' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
+    let mRoleProfile: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mRoleProfile = url.pathname.match(/^\/api\/role-profiles\/([^/]+)$/))) {
+      const profileId = decodeURIComponent(mRoleProfile[1]);
+      if (!isValidRoleProfileId(profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      type RoleProfileEntryAggregate = {
+        profileId: string;
+        larkAppId: string;
+        content: string;
+        byteLength: number;
+        updatedAt: number | null;
+      };
+      const byBot = new Map<string, RoleProfileEntryAggregate>();
+      await Promise.all(registry.list().map(async d => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles/${encodeURIComponent(profileId)}`);
+          if (!r.ok) return;
+          const j = await r.json() as { entries?: any[] };
+          for (const entry of j.entries ?? []) {
+            if (typeof entry.larkAppId !== 'string' || typeof entry.content !== 'string') continue;
+            const updatedAt = typeof entry.updatedAt === 'number' ? entry.updatedAt : null;
+            const current = byBot.get(entry.larkAppId);
+            if (current && (current.updatedAt ?? 0) > (updatedAt ?? 0)) continue;
+            byBot.set(entry.larkAppId, {
+              profileId,
+              larkAppId: entry.larkAppId,
+              content: entry.content,
+              byteLength: typeof entry.byteLength === 'number' ? entry.byteLength : Buffer.byteLength(entry.content, 'utf-8'),
+              updatedAt,
+            });
+          }
+        } catch { /* skip */ }
+      }));
+      const entries = [...byBot.values()].sort((a, b) => a.larkAppId.localeCompare(b.larkAppId));
+      return jsonRes(res, 200, { profileId, entries });
     }
 
     let m2: RegExpMatchArray | null;
@@ -1399,43 +1583,18 @@ const server = createServer(async (req, res) => {
     // PUT  /api/bots/:appId/default-oncall   — proxy to that bot's daemon
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
-      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+      const cliIds = configuredCliIds();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
           if (!r.ok) {
-            return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: `http_${r.status}` };
+            return botDefaultsPayload(d, undefined, `http_${r.status}`);
           }
           const j = await r.json() as any;
-          return {
-            larkAppId: d.larkAppId,
-            botName: d.botName ?? j.botName,
-            online: true,
-            defaultOncall: j.defaultOncall,
-            autoboundChatCount: j.autoboundChatCount ?? 0,
-            brandLabel: j.brandLabel ?? null,
-            sandbox: j.sandbox === true,
-            disableStreamingCard: j.disableStreamingCard === true,
-            writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
-            privateCard: j.privateCard === true,
-            autoStartOnGroupJoin: j.autoStartOnGroupJoin === true,
-            autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
-            autoStartOnNewTopic: j.autoStartOnNewTopic === true,
-            regularGroupReplyMode: (j.regularGroupReplyMode === 'new-topic' || j.regularGroupReplyMode === 'shared')
-              ? j.regularGroupReplyMode
-              : 'chat',
-            regularGroupMentionMode: (j.regularGroupMentionMode === 'topic' || j.regularGroupMentionMode === 'never')
-              ? j.regularGroupMentionMode
-              : 'always',
-            restrictGrantCommands: j.restrictGrantCommands === true,
-            messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
-            p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',
-            maxLiveWorkers: typeof j.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
-            startupCommands: typeof j.startupCommands === 'string' ? j.startupCommands : '',
-            skills: j.skills && typeof j.skills === 'object' ? j.skills : null,
-          };
+          return botDefaultsPayload({ ...d, botName: d.botName ?? j.botName }, j);
         } catch (e: any) {
-          return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
+          return botDefaultsPayload(d, undefined, e?.message ?? String(e));
         }
       }));
       return jsonRes(res, 200, { bots: out });
@@ -1609,7 +1768,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; bindWorkingDir?: unknown };
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -1623,6 +1782,12 @@ const server = createServer(async (req, res) => {
         : [];
       if (selectedIds.length === 0) {
         return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
+      }
+      const roleProfileId = typeof parsed.roleProfileId === 'string' && parsed.roleProfileId.trim()
+        ? parsed.roleProfileId.trim()
+        : null;
+      if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
       }
 
       const explicit = Array.isArray(parsed.userOpenIds)
@@ -1657,6 +1822,7 @@ const server = createServer(async (req, res) => {
         bindWorkingDir: typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
           ? parsed.bindWorkingDir.trim()
           : undefined,
+        roleProfileId: roleProfileId ?? undefined,
       };
       const upstream = await fetch(
         `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,
@@ -1666,6 +1832,7 @@ const server = createServer(async (req, res) => {
       let upstreamJson: any = null;
       try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
       if (upstreamJson && typeof upstreamJson === 'object') {
+        if (roleProfileId) upstreamJson.roleProfileId = roleProfileId;
         // If Lark rejected the invite (open_id wrong scope, banned user, etc.)
         // null out autoInvitedOpenId so the frontend doesn't falsely claim
         // success — the user actually isn't a member of the new chat.

@@ -26,6 +26,40 @@ describe('worker pipe initial screen ordering', () => {
     expect(probeIdx).toBeGreaterThan(writeIdx);
   });
 
+  it('rechecks busy-pattern adapters when a Lark message is queued while busy', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const queueLogIdx = source.indexOf('Queued message (${pendingMessages.length} pending)');
+    const queuedProbeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);');
+    const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
+
+    expect(helperIdx).toBeGreaterThan(-1);
+    expect(queueLogIdx).toBeGreaterThan(-1);
+    expect(queuedProbeIdx).toBeGreaterThan(queueLogIdx);
+  });
+
+  it('rechecks busy-pattern adapters after first prompt timeout', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const timeoutIdx = source.indexOf("log('First prompt timeout — enabling screen updates and flushing queued messages');");
+    const probeIdx = source.indexOf('probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)', timeoutIdx);
+
+    expect(timeoutIdx).toBeGreaterThan(-1);
+    expect(probeIdx).toBeGreaterThan(timeoutIdx);
+  });
+
+  it('limits busy-pattern idle probes to the active status region', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function busyProbeRegion(content: string): string');
+    const probeStart = source.indexOf('function probeBusyPatternIdle');
+    const probeEnd = source.indexOf('function scheduleReattachIdleProbe');
+    const helper = source.slice(helperStart, probeEnd);
+    const probe = source.slice(probeStart, probeEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
+    expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
+    expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
+  });
+
   it('limits the reattach idle probe to adapters with a busy marker', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const helperStart = source.indexOf('function scheduleReattachIdleProbe');

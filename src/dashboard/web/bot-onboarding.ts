@@ -6,6 +6,7 @@ type OnboardingStatus =
   | 'verifying'
   | 'configuring_permissions'
   | 'waiting_for_platform_scan'
+  | 'needs_owner'
   | 'completed'
   | 'failed';
 
@@ -77,14 +78,15 @@ function statusText(job: OnboardingJob): string {
       : t('botOnboarding.configuringPermissions');
   }
   if (job.status === 'waiting_for_platform_scan') return t('botOnboarding.platformScanHint');
+  if (job.status === 'needs_owner') return t('botOnboarding.needsOwner');
   if (job.status === 'completed') return t('botOnboarding.completed');
   if (job.status === 'failed') return `${t('botOnboarding.failed')}: ${escapeHtml(job.message ?? job.error ?? 'unknown')}`;
   return t('botOnboarding.starting');
 }
 
-/** 完成页的权限摘要 / 手动兜底步骤. */
+/** 完成页 / 待填 owner 页的权限摘要 / 手动兜底步骤. */
 function permissionBlock(job: OnboardingJob): string {
-  if (job.status !== 'completed' || !job.permission) return '';
+  if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return '';
   const p = job.permission;
   if (p.ok) {
     const parts = [t('botOnboarding.permissionOk', { count: p.scopeCount ?? 0 })];
@@ -104,7 +106,24 @@ function permissionBlock(job: OnboardingJob): string {
     + (steps ? `<ol class="onboarding-steps">${steps}</ol>` : '');
 }
 
-function renderJob(job: OnboardingJob): void {
+/** needs_owner：扫码人身份验证不了, 让用户手动填 owner (带内联报错). */
+function ownerBlock(job: OnboardingJob, ownerError?: string): string {
+  if (job.status !== 'needs_owner') return '';
+  const errorHtml = ownerError ? `<p class="form-error">${escapeHtml(ownerError)}</p>` : '';
+  return `<form id="ob-owner-form" class="onboarding-form">
+      <label class="onboarding-field">
+        <span>${t('botOnboarding.ownerLabel')}</span>
+        <input id="ob-owner" type="text" placeholder="${t('botOnboarding.ownerPlaceholder')}" autocomplete="off" spellcheck="false">
+      </label>
+      <p class="hint-warn">${t('botOnboarding.ownerHint')}</p>
+      ${errorHtml}
+      <menu class="onboarding-actions">
+        <button type="submit" class="primary">${t('botOnboarding.ownerSubmit')}</button>
+      </menu>
+    </form>`;
+}
+
+function renderJob(job: OnboardingJob, ownerError?: string): void {
   const d = ensureDialog();
   // 第 1 个二维码: 扫码建应用
   const appQr = job.status === 'waiting_for_scan' && job.qrDataUrl
@@ -138,9 +157,43 @@ function renderJob(job: OnboardingJob): void {
     ${platformQr}
     ${metaLine}
     ${permissionBlock(job)}
+    ${ownerBlock(job, ownerError)}
     ${restartHint}
     <form method="dialog"><button>${t('botOnboarding.close')}</button></form>
   </article>`;
+
+  // needs_owner：把提交挂上去 (走 /owner 端点, 通过校验后转 completed)。
+  if (job.status === 'needs_owner') {
+    const ownerForm = d.querySelector<HTMLFormElement>('#ob-owner-form');
+    ownerForm?.addEventListener('submit', ev => {
+      ev.preventDefault();
+      const owner = d.querySelector<HTMLInputElement>('#ob-owner')?.value ?? '';
+      void submitOwner(job, owner);
+    });
+  }
+}
+
+async function submitOwner(job: OnboardingJob, ownerRaw: string): Promise<void> {
+  if (!ownerRaw.trim()) {
+    renderJob(job, t('botOnboarding.ownerEmpty'));
+    return;
+  }
+  try {
+    const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(job.id)}/owner`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ owner: ownerRaw.trim() }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      // 校验失败 (格式 / 不可用): 留在 needs_owner 内联报错, 不丢已填值的语义。
+      renderJob(job, body?.message ?? body?.error ?? t('botOnboarding.ownerInvalid'));
+      return;
+    }
+    if (body?.job) renderJob(body.job);
+  } catch (err) {
+    renderJob(job, err instanceof Error ? err.message : String(err));
+  }
 }
 
 async function fetchCliOptions(): Promise<CliOption[]> {
@@ -288,7 +341,11 @@ async function pollJob(id: string): Promise<void> {
   const body = await res.json();
   if (!res.ok || !body?.job) throw new Error(body?.error ?? `http_${res.status}`);
   renderJob(body.job);
-  if (body.job.status === 'completed' || body.job.status === 'failed') stopPolling();
+  // needs_owner 也停轮询：它是等用户操作的状态, 继续轮询会周期性重渲染、清掉用户
+  // 正在输入的 owner。后续由 owner 提交流程驱动渲染。
+  if (body.job.status === 'completed' || body.job.status === 'failed' || body.job.status === 'needs_owner') {
+    stopPolling();
+  }
 }
 
 async function openBotOnboarding(): Promise<void> {

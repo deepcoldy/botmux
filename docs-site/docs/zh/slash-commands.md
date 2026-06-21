@@ -59,6 +59,11 @@
 | `/role delete` | 删除本群 Role |
 | `/role team set <Markdown>` | 设置**默认角色**（跨群默认人设；命令名沿用 `team`，= dashboard「Bot 配置 → 默认角色」） |
 | `/role cap set <一句话>` / `/role cap clear` | 设置/清除花名册里的能力标签 |
+| `/role profile list` | 列出本地 role profiles |
+| `/role profile show <profile> [--all]` | 查看当前 bot 的 profile entry，或本 daemon 已知的全部本地 entries |
+| `/role profile set <profile> <Markdown>` | 设置当前 bot 在 profile 里的 entry |
+| `/role profile save <profile>` | 把当前 bot 的生效 Role 保存到 profile |
+| `/role profile apply <profile> [--preview] [--force] [--quiet]` | 把当前 bot 的 profile entry 写成本群 Role |
 
 详见 [角色与团队](/roles)。
 
@@ -84,7 +89,15 @@
 
 ## 🆕 一键新建会话群
 
-`/group <群名>`（别名 `/g`）：自动新建飞书群、邀请你进群、转让群主，整个群作为一个独立 CLI 会话。`@botA @botB /g <群名>` 可把多个机器人一并拉进新群。详见 [一键建会话群](/group)。
+`/group <群名>`（别名 `/g`）：自动新建飞书群、邀请你进群、转让群主，整个群作为一个独立 CLI 会话。`@botA @botB /g <群名>` 可把多个机器人一并拉进新群。
+
+加上 `--role-profile <profile>` 可以在新群里自动 bootstrap 一套按 bot 区分的角色：
+
+```bash
+@botA @botB /g --role-profile collab-main War Room
+```
+
+详见 [一键建会话群](/group)。
 
 ## 📄 飞书文档评论入口
 

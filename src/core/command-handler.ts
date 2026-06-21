@@ -48,8 +48,18 @@ import { publishAttentionPatch, announcePendingRepoSession } from './session-act
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
-import { writeRoleFile, deleteRoleFile, resolveRole, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
+import { writeRoleFile, deleteRoleFile, resolveRole, resolveRoleFile, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
 import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
+import {
+  deleteRoleProfileEntry,
+  deleteRoleProfileIfEmpty,
+  isValidRoleProfileId,
+  listRoleProfileEntries,
+  listRoleProfiles,
+  MAX_ROLE_PROFILE_ENTRY_BYTES,
+  readRoleProfileEntry,
+  writeRoleProfileEntry,
+} from '../services/role-profile-store.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -332,6 +342,151 @@ async function handleRoleCommand(
   const trimmed = args.trim();
   const loc = localeForBot(larkAppId);
   const dataDir = config.session.dataDir;
+
+  // /role profile [...] — reusable suites of per-bot chat roles. Profiles are
+  // not a runtime role layer; applying one materializes this bot's entry into
+  // the current chat role.
+  const profileMatch = trimmed.match(/^profile\b([\s\S]*)$/);
+  if (profileMatch) {
+    const profileArgs = profileMatch[1].trim();
+    const subMatch = profileArgs.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+    const sub = (subMatch?.[1] ?? '').toLowerCase();
+    const subBody = subMatch?.[2]?.trim() ?? '';
+
+    if (!sub || sub === 'help') {
+      await sessionReply(rootId, t('role.profile.help', undefined, loc));
+      return;
+    }
+
+    if (sub === 'list' || sub === 'ls') {
+      const profiles = listRoleProfiles(dataDir);
+      if (profiles.length === 0) {
+        await sessionReply(rootId, t('role.profile.list_empty', undefined, loc));
+        return;
+      }
+      const lines = profiles.map(p => {
+        const hasEntry = readRoleProfileEntry(dataDir, p.profileId, larkAppId) !== null;
+        const status = hasEntry
+          ? t('role.profile.current_configured', undefined, loc)
+          : t('role.profile.current_missing', undefined, loc);
+        return `• ${p.profileId} — ${p.entryCount} ${t('role.profile.entries', undefined, loc)}; ${status}`;
+      });
+      await sessionReply(rootId, `${t('role.profile.list_header', undefined, loc)}\n${lines.join('\n')}`);
+      return;
+    }
+
+    const [profileId = '', ...afterProfile] = subBody.split(/\s+/);
+    if (!profileId || !isValidRoleProfileId(profileId)) {
+      await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+      return;
+    }
+
+    if (sub === 'show') {
+      const showAll = afterProfile.includes('--all');
+      if (showAll) {
+        const entries = listRoleProfileEntries(dataDir, profileId);
+        if (entries.length === 0) {
+          await sessionReply(rootId, t('role.profile.no_entries', { profile: profileId }, loc));
+          return;
+        }
+        const body = entries.map(entry =>
+          `### ${entry.larkAppId}\n${t('role.byte_count', { bytes: entry.byteLength, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc)}\n\`\`\`markdown\n${entry.content}\n\`\`\``,
+        ).join('\n\n');
+        await sessionReply(rootId, `${t('role.profile.show_all_header', { profile: profileId }, loc)}\n${body}`);
+        return;
+      }
+      const content = readRoleProfileEntry(dataDir, profileId, larkAppId);
+      if (content === null) {
+        await sessionReply(rootId, t('role.profile.entry_empty', { profile: profileId }, loc));
+        return;
+      }
+      await sessionReply(rootId, `${t('role.profile.entry_current', { profile: profileId }, loc)}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: Buffer.byteLength(content, 'utf-8'), max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc)}`);
+      return;
+    }
+
+    if (sub === 'set') {
+      const content = subBody.slice(profileId.length).trim();
+      if (!content) {
+        await sessionReply(rootId, t('role.profile.set_empty', undefined, loc));
+        return;
+      }
+      writeRoleProfileEntry(dataDir, profileId, larkAppId, content);
+      await sessionReply(rootId, t('role.profile.entry_saved', {
+        profile: profileId,
+        bytes: Math.min(Buffer.byteLength(content.trim(), 'utf-8'), MAX_ROLE_PROFILE_ENTRY_BYTES),
+        max: MAX_ROLE_PROFILE_ENTRY_BYTES,
+      }, loc));
+      return;
+    }
+
+    if (sub === 'save') {
+      const { content, source } = resolveRole(larkAppId, chatId);
+      if (!content) {
+        await sessionReply(rootId, t('role.profile.save_no_effective', { profile: profileId }, loc));
+        return;
+      }
+      writeRoleProfileEntry(dataDir, profileId, larkAppId, content);
+      await sessionReply(rootId, t('role.profile.saved_effective', {
+        profile: profileId,
+        source,
+        bytes: Buffer.byteLength(content, 'utf-8'),
+        max: MAX_ROLE_PROFILE_ENTRY_BYTES,
+      }, loc));
+      return;
+    }
+
+    if (sub === 'delete' || sub === 'del' || sub === 'rm' || sub === '删除') {
+      const existed = deleteRoleProfileEntry(dataDir, profileId, larkAppId);
+      deleteRoleProfileIfEmpty(dataDir, profileId);
+      await sessionReply(rootId, existed
+        ? t('role.profile.entry_deleted', { profile: profileId }, loc)
+        : t('role.profile.entry_nothing', { profile: profileId }, loc));
+      return;
+    }
+
+    if (sub === 'apply') {
+      const flags = new Set(afterProfile);
+      const preview = flags.has('--preview');
+      const force = flags.has('--force');
+      const quiet = flags.has('--quiet');
+      const content = readRoleProfileEntry(dataDir, profileId, larkAppId);
+      if (content === null) {
+        await sessionReply(rootId, t('role.profile.apply_missing', { profile: profileId }, loc));
+        return;
+      }
+      const existing = resolveRoleFile(larkAppId, chatId);
+      const bytes = Buffer.byteLength(content, 'utf-8');
+      if (preview) {
+        const overwriteLine = existing && !force
+          ? `\n${t('role.profile.apply_would_refuse', undefined, loc)}`
+          : '';
+        await sessionReply(rootId, `${t('role.profile.apply_preview', { profile: profileId, bytes, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc)}${overwriteLine}\n\`\`\`markdown\n${content}\n\`\`\``);
+        return;
+      }
+      if (existing && !force) {
+        // An empty entry would *clear* the chat role, not overwrite it — phrase
+        // the --force refusal accordingly so the intent is not misread.
+        const refusedKey = content ? 'role.profile.apply_refused' : 'role.profile.apply_refused_clear';
+        await sessionReply(rootId, t(refusedKey, { profile: profileId }, loc));
+        return;
+      }
+      if (!content) {
+        deleteRoleFile(larkAppId, chatId);
+        if (!quiet) {
+          await sessionReply(rootId, t('role.profile.applied', { profile: profileId, bytes, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc));
+        }
+        return;
+      }
+      writeRoleFile(larkAppId, chatId, content);
+      if (!quiet) {
+        await sessionReply(rootId, t('role.profile.applied', { profile: profileId, bytes, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc));
+      }
+      return;
+    }
+
+    await sessionReply(rootId, t('role.profile.help', undefined, loc));
+    return;
+  }
 
   // /role team [...] — manage the team-level (per-bot, cross-chat) role
   const teamMatch = trimmed.match(/^team\b([\s\S]*)$/);
@@ -1850,6 +2005,16 @@ export async function handleCommand(
         for (const m of mentions) {
           if (m.name) rawArgs = rawArgs.split(`@${m.name}`).join(' ');
         }
+        let roleProfileId: string | undefined;
+        const roleProfileArg = rawArgs.match(/(?:^|\s)--role-profile(?:=|\s+)(\S+)/);
+        if (roleProfileArg) {
+          if (!isValidRoleProfileId(roleProfileArg[1])) {
+            await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+            break;
+          }
+          roleProfileId = roleProfileArg[1];
+          rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
+        }
         const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
         const MAX_NAME = 50; // Lark group names cap around 60; leave headroom for '…'
         let groupName: string;
@@ -1874,6 +2039,7 @@ export async function handleCommand(
             userOpenIds: [senderOpenId],
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
+            roleProfileId,
           });
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
@@ -1904,6 +2070,13 @@ export async function handleCommand(
           }
           if (result.invalidBotIds.length > 0) {
             hints.push(t('cmd.group.warn_bots_rejected', { bots: result.invalidBotIds.map(nameOf).join('、') }, loc));
+          }
+          if (roleProfileId) {
+            if (result.roleProfileBootstrapError) {
+              hints.push(t('cmd.group.role_profile_bootstrap_failed', { profile: roleProfileId, reason: result.roleProfileBootstrapError ?? 'unknown' }, loc));
+            } else {
+              hints.push(t('cmd.group.role_profile_bootstrap_sent', { profile: roleProfileId }, loc));
+            }
           }
           const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
           await sessionReply(rootId, t('cmd.group.created', { name: groupName, link, hints: hintsText }, loc));

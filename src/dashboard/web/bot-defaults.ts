@@ -11,7 +11,26 @@ let loadError: string | null = null;
 // master-detail：左侧员工名册选中谁，右侧就渲染谁的档案
 let selectedAppId: string | null = null;
 
-/** /api/bots 不带 cliId — 从 store 里该 bot 最近的会话上推。 */
+export function displayCliId(bot: any, sessionFallback: string): string {
+  return typeof bot?.cliId === 'string' && bot.cliId ? bot.cliId : sessionFallback;
+}
+
+type BotProfileRoleItem = {
+  profileId: string;
+  loaded?: boolean;
+  loading?: boolean;
+  content?: string | null;
+  error?: string;
+};
+type BotProfileRoleState = {
+  loaded: boolean;
+  loading: boolean;
+  error?: string;
+  items: BotProfileRoleItem[];
+};
+const botProfileRoleCache = new Map<string, BotProfileRoleState>();
+
+/** Fallback for old /api/bots payloads: infer from the bot's recent sessions. */
 function cliIdOf(appId: string): string {
   let best: any = null;
   for (const s of store.sessions.values()) {
@@ -85,7 +104,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
   refreshBtn.onclick = async () => {
     refreshBtn.disabled = true;
-    try { await loadBots(); rerender(); } finally { refreshBtn.disabled = false; }
+    try {
+      botProfileRoleCache.clear();
+      await loadBots();
+      rerender();
+    } finally { refreshBtn.disabled = false; }
   };
 
   // 帮助文字默认折叠成一行；点说明文字本身展开/收起（preventDefault 拦掉
@@ -138,7 +161,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
   function renderRosterItem(b: any): string {
     const name = b.botName ?? b.larkAppId;
-    const cli = cliIdOf(b.larkAppId);
+    const cli = displayCliId(b, cliIdOf(b.larkAppId));
     const flag = b.defaultOncall?.enabled
       ? `<span class="bd-roster-flag">oncall</span>`
       : '';
@@ -166,7 +189,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     const def = b.defaultOncall ?? { enabled: false, workingDir: '', since: 0 };
     const enabled = !!def.enabled;
     const name = b.botName ?? b.larkAppId;
-    const cli = cliIdOf(b.larkAppId);
+    const cli = displayCliId(b, cliIdOf(b.larkAppId));
     return `<article class="bd-card bd-profile" data-appid="${escapeHtml(b.larkAppId)}">
       <header class="bd-profile-head">
         ${botAvatarHtml({ name, larkAppId: b.larkAppId, dot: 'ok' })}
@@ -234,7 +257,34 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <button type="button" data-action="delete-role"${loaded ? '' : ' disabled'}>${t('botDefaults.roleDelete')}</button>
         <span class="oncall-status" data-role-status></span>
       </div>
+      <div class="bd-profile-roles" data-profile-roles>
+        <h4 class="bd-subsection-title">${t('botDefaults.profileRoles')}</h4>
+        <p class="bd-section-note">${t('botDefaults.profileRolesHelp')}</p>
+        <div class="bd-profile-role-list" data-profile-role-list>${renderProfileRoleList(b.larkAppId)}</div>
+      </div>
     </section>`;
+  }
+
+  function renderProfileRoleList(appId: string): string {
+    const state = botProfileRoleCache.get(appId);
+    if (!state || state.loading) return loadingHtml();
+    if (state.error) return `<p class="hint-warn-inline">${escapeHtml(t('botDefaults.profileRolesLoadFailed', { error: state.error }))}</p>`;
+    if (state.items.length === 0) return `<p class="empty">${t('botDefaults.profileRolesEmpty')}</p>`;
+    return state.items.map(item => `
+      <details class="bd-profile-role-entry" data-profile-id="${escapeHtml(item.profileId)}">
+        <summary><code>${escapeHtml(item.profileId)}</code></summary>
+        <div class="bd-profile-role-content" data-profile-role-body="${escapeHtml(item.profileId)}">
+          ${renderProfileRoleContent(item)}
+        </div>
+      </details>
+    `).join('');
+  }
+
+  function renderProfileRoleContent(item: BotProfileRoleItem): string {
+    if (item.loading) return loadingHtml();
+    if (item.error) return `<p class="hint-warn-inline">${escapeHtml(t('botDefaults.profileRoleDetailLoadFailed', { error: item.error }))}</p>`;
+    if (!item.loaded) return `<p class="empty">${t('botDefaults.profileRoleClickToLoad')}</p>`;
+    return `<pre>${escapeHtml(item.content ?? '')}</pre>`;
   }
 
   // brandLabel is null when unset (→ default botmux), '' when off, else custom.
@@ -521,9 +571,91 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </div>`;
   }
 
+  function liveCard(appId: string): HTMLElement | null {
+    return listEl.querySelector<HTMLElement>(`.bd-card[data-appid="${CSS.escape(appId)}"]`);
+  }
+
+  function renderProfileRolesInto(card: HTMLElement | null, appId: string): void {
+    const target = card?.querySelector<HTMLElement>('[data-profile-role-list]');
+    if (!target) return;
+    target.innerHTML = renderProfileRoleList(appId);
+    wireProfileRoleDetails(card!, appId);
+  }
+
+  async function ensureProfileRolesLoaded(appId: string, card: HTMLElement): Promise<void> {
+    let state = botProfileRoleCache.get(appId);
+    if (state?.loaded || state?.loading) {
+      renderProfileRolesInto(card, appId);
+      return;
+    }
+
+    state = { loaded: false, loading: true, items: [] };
+    botProfileRoleCache.set(appId, state);
+    renderProfileRolesInto(card, appId);
+    try {
+      const r = await fetch('/api/role-profiles');
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body?.error ?? String(r.status));
+      const profiles = Array.isArray(body.profiles) ? body.profiles : [];
+      state.items = profiles
+        .filter((profile: any) => (profile.botEntries ?? []).some((entry: any) =>
+          entry?.larkAppId === appId && entry?.hasEntry,
+        ))
+        .map((profile: any) => ({ profileId: String(profile.profileId) }));
+      state.loaded = true;
+    } catch (e: any) {
+      state.error = e?.message ?? String(e);
+      state.loaded = true;
+    } finally {
+      state.loading = false;
+      renderProfileRolesInto(liveCard(appId), appId);
+    }
+  }
+
+  function wireProfileRoleDetails(card: HTMLElement, appId: string): void {
+    card.querySelectorAll<HTMLDetailsElement>('details.bd-profile-role-entry[data-profile-id]').forEach(detail => {
+      detail.addEventListener('toggle', () => {
+        if (!detail.open) return;
+        const profileId = detail.dataset.profileId;
+        if (profileId) void ensureProfileRoleDetailLoaded(appId, profileId);
+      });
+    });
+  }
+
+  async function ensureProfileRoleDetailLoaded(appId: string, profileId: string): Promise<void> {
+    const state = botProfileRoleCache.get(appId);
+    const item = state?.items.find(i => i.profileId === profileId);
+    if (!item || item.loaded || item.loading) return;
+    item.loading = true;
+    renderProfileRoleBody(appId, profileId);
+    try {
+      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(appId)}`);
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body?.error ?? String(r.status));
+      item.content = body?.hasEntry ? String(body.content ?? '') : '';
+      item.loaded = true;
+    } catch (e: any) {
+      item.error = e?.message ?? String(e);
+    } finally {
+      item.loading = false;
+      renderProfileRoleBody(appId, profileId);
+    }
+  }
+
+  function renderProfileRoleBody(appId: string, profileId: string): void {
+    const state = botProfileRoleCache.get(appId);
+    const item = state?.items.find(i => i.profileId === profileId);
+    if (!item) return;
+    const body = liveCard(appId)?.querySelector<HTMLElement>(
+      `[data-profile-role-body="${CSS.escape(profileId)}"]`,
+    );
+    if (body) body.innerHTML = renderProfileRoleContent(item);
+  }
+
   function wireCardHandlers() {
     listEl.querySelectorAll<HTMLElement>('.bd-card').forEach(card => {
       const appId = card.dataset.appid!;
+      void ensureProfileRolesLoaded(appId, card);
       const toggle = card.querySelector<HTMLInputElement>('input[data-action=toggle]');
       const input = card.querySelector<HTMLInputElement>('input[data-input=workingDir]');
       const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save]');

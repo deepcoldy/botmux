@@ -34,6 +34,13 @@ describe('role-resolver storage', () => {
     expect(resolveRoleFile('app1', 'oc_x')).toContain('代码审查员');
   });
 
+  it('rejects invalid chat ids for role file writes', async () => {
+    const { writeRoleFile, resolveRoleFile, deleteRoleFile } = await fresh();
+    expect(resolveRoleFile('app1', '../escape')).toBeNull();
+    expect(() => writeRoleFile('app1', '../escape', 'bad')).toThrow(/invalid chat id/);
+    expect(deleteRoleFile('app1', '../escape')).toBe(false);
+  });
+
   it('keys on larkAppId — two bots sharing a chatId do not collide', async () => {
     const { writeRoleFile, resolveRoleFile } = await fresh();
     writeRoleFile('app1', 'oc_shared', 'role-A');

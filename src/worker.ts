@@ -3236,6 +3236,7 @@ function sendToPty(content: string, turnId?: string): void {
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
     if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
+    scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);
   }
 }
 
@@ -3475,6 +3476,12 @@ function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 
   return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? '';
 }
 
+function busyProbeRegion(content: string): string {
+  const lines = content.split(/\r?\n/);
+  const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
+  return lines.slice(-tailLineCount).join('\n');
+}
+
 function probeBusyPatternIdle(
   source: string,
   be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>,
@@ -3483,7 +3490,7 @@ function probeBusyPatternIdle(
     const content = captureBackendScreen(be);
     if (!content) return false;
     if (cliAdapter?.busyPattern) {
-      if (cliAdapter.busyPattern.test(content)) return false;
+      if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
       log(`${source} idle probe: busy marker absent, marking prompt ready`);
       markPromptReady();
       return true;
@@ -4354,6 +4361,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       awaitingFirstPrompt = false;
       renderer?.markNewTurn();
       log('First prompt timeout — enabling screen updates and flushing queued messages');
+      if (backend && cliAdapter?.busyPattern && probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) {
+        return;
+      }
       // For type-ahead adapters (Codex/CoCo/TRAE/Claude) the TUI is booted
       // enough to park input even if the idle detector hasn't fired yet.
       // Directly invoking markPromptReady() would claim the CLI is idle
