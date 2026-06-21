@@ -4,7 +4,7 @@
  * Pipeline (mirrors `/dashboard sessions` / `/dashboard schedules`):
  *   1. Admin gate has ALREADY run in `handleDashboardCommand`; this function
  *      is called with `adminOpenId` already resolved.
- *   2. Fetch the live overview snapshot via PR2 Route B
+ *   2. Fetch the live overview snapshot via Route B
  *      (`GET /__daemon/overview-snapshot?scope=global`). `/dashboard` is
  *      a Bot admin tool panel — list modules surface cross-bot under
  *      `?scope=global` so the first-open view matches refresh/drilldown.

@@ -101,7 +101,7 @@ export interface ResolveCardOperatorUnionIdDeps {
 /**
  * Resolve the verified `union_id` of the operator who clicked a card button.
  *
- * Three-state semantics (plan v3 B2):
+ * Three-state semantics:
  *  1. `operator.union_id` starts with `on_` → trust it directly.
  *  2. `operator.union_id` is present but does NOT start with `on_` (e.g.
  *     `ou_xxx`, malformed) → reject; do NOT fallback. Trusting `open_id`

@@ -1,10 +1,10 @@
 /**
- * Settings write applier (PR2 C2) — single source of truth for what
+ * Settings write applier — single source of truth for what
  * `PUT /api/settings` (`dashboard.ts:460-498`) used to do inline.
  *
  * Lives in `src/dashboard/` so both:
  *   - the existing browser-facing `PUT /api/settings` route
- *   - the new HMAC-gated `PUT /__daemon/settings-write` route (PR2 C6)
+ *   - the new HMAC-gated `PUT /__daemon/settings-write` route
  * share the same validation + persistence path. Behaviour is byte-equivalent
  * to the original inline implementation; the only change is that all IO is
  * funnelled through `deps`, so tests don't touch `~/.botmux`.

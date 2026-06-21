@@ -1,10 +1,10 @@
 /**
- * Groups action helpers (PR2 C3) — single source of truth for the
+ * Groups action helpers — single source of truth for the
  * `/api/groups/:chatId/*` action routes that used to live inline in
- * `dashboard.ts:678-832`.
+ * `dashboard.ts`.
  *
  * Each helper returns a `HandlerResult { status, body }` so the dashboard route
- * and the (PR2 C6) HMAC-gated `/__daemon/groups/...` route render the same
+ * and the HMAC-gated `/__daemon/groups/...` route render the same
  * response. Behaviour is byte-equivalent to the original inline implementation;
  * all IO flows through `deps`.
  */
@@ -140,7 +140,7 @@ export async function leaveGroup(
   const result = await Promise.all(ids.map(async appId => {
     const d = deps.registryGetByAppId(appId);
     // Pre-proxy failure shapes do NOT carry `closedSessions` — matches the
-    // historical inline route (`dashboard.ts:789-800`) which only attaches
+    // historical inline route (`dashboard.ts`) which only attaches
     // `closedSessions` to the upstream-proxy branch.
     if (!d) return { larkAppId: appId, ok: false, error: 'daemon_offline' };
     try {

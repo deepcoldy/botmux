@@ -55,7 +55,7 @@ export interface ScheduleCounts {
   paused: number;
   /** Schedules whose last run errored — counted regardless of enabled state,
    *  to match the schedules list-card's ⚠️ semantics (see countSchedules
-   *  docblock + `schedule-card-model.ts:201`). */
+   *  docblock + `schedule-card-model.ts`). */
   errors: number;
 }
 
@@ -77,9 +77,9 @@ export function countSessions(rows: ReadonlyArray<SessionRow>): SessionCounts {
  * Count schedule rows into (enabled / paused / errors-in-last-run) buckets.
  *
  * `errors` counts every task whose last run failed, regardless of `enabled`.
- * This matches the schedules list-card semantics: `schedule-card-model.ts:201`
+ * This matches the schedules list-card semantics: `schedule-card-model.ts`
  * sets `errorIndicator = task.lastStatus === 'error'` independent of the
- * paused/enabled state, and `schedules-card.ts:180+208` paints the ⚠️ glyph
+ * paused/enabled state, and `schedules-card.ts` paints the ⚠️ glyph
  * on any such row. Keeping the same definition prevents an undercount where
  * overview reads "上次错误 0" while drilling into schedules surfaces a
  * paused task with ⚠️.
@@ -251,7 +251,6 @@ export function buildOverviewCard(
   // ─── Groups section ──────────────────────────────────────────────────
   // overview-snapshot doesn't carry groups counts yet (would require a
   // server-side aggregator); the entry button is enough for navigation.
-  // Counts may be backfilled in a later slice without breaking this card.
   elements.push({
     tag: 'div',
     text: {

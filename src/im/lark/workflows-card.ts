@@ -381,7 +381,7 @@ function renderRow(row: WorkflowRunRowDto, locale: Locale, nowMs: number): unkno
   };
 }
 
-/** Slice-2a options for the detail card. */
+/** Options for the detail card. */
 export interface BuildWorkflowsDetailCardOpts {
   invokerOpenId: string;
   locale: Locale;
@@ -850,7 +850,7 @@ export async function handleWorkflowsCardAction(
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3d) Slice-1 actions — REFRESH + PAGE ───────────────────────────
+  // ─── 3d) REFRESH + PAGE actions ───────────────────────────
   // `action` is already constrained to validActions above; the only ones
   // left here are REFRESH + PAGE (the other 3 returned early).
   let page = 1;

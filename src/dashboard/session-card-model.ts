@@ -28,7 +28,7 @@ export type SessionStatus =
 /** Status-chip filter value — all StreamStatus + 'closed' + 'all'. */
 export type StatusChip = SessionStatus | 'all';
 
-/** A single row projected for the sessions list card. Keeps `raw` for downstream renderers (PR2+). */
+/** A single row projected for the sessions list card. Keeps `raw` for downstream renderers. */
 export interface SessionRowDto {
   sessionId: string;
   /** Display dot — color tone + pulse + i18n-free label key. */
@@ -43,8 +43,7 @@ export interface SessionRowDto {
   webPort: number | null;
   scope?: 'thread' | 'chat';
   /**
-   * Raw row preserved for downstream card-builder use; PR2 may trim if JSON
-   * size becomes a problem. v1.5 design point Q7.
+   * Raw row preserved for downstream card-builder use.
    */
   raw: SessionRow;
 }
@@ -61,7 +60,7 @@ export interface SessionActionMatrix {
   locateMode: LocateMode;
 }
 
-/** Detail-card DTO. Action matrix encodes every visibility rule from v1.5 M5. */
+/** Detail-card DTO. Action matrix encodes every visibility rule. */
 export interface SessionDetailDto {
   sessionId: string;
   status: string;
@@ -154,7 +153,7 @@ export function composeEntries(rows: ReadonlyArray<SessionRow>, nowMs?: number):
 /**
  * Filter entries by status chip. `all` short-circuits with a shallow copy
  * (same content + order, but a fresh array so downstream pipelines can rely
- * on a non-aliased reference — v1.5 M1).
+ * on a non-aliased reference).
  */
 export function filterByStatus(entries: ReadonlyArray<SessionRowDto>, chip: StatusChip): SessionRowDto[] {
   if (chip === 'all') return entries.slice();
@@ -229,12 +228,12 @@ export function paginate<T>(
   };
 }
 
-/** Build the detail-card DTO with the full action matrix (v1.5 M5). */
+/** Build the detail-card DTO with the full action matrix. */
 export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDto {
   const isClosed = row.status === 'closed';
   const isStarting = row.status === 'starting';
   const canCloseNow = !isClosed && !isStarting;
-  // Codex 2026-06-11 blocker #1: closed sessions can still carry a stale
+  // Closed sessions can still carry a stale
   // webPort (closeSession / dashboard close don't null the field), so a
   // simple `webPort != null` check would surface a dead terminal link on
   // the closed detail card. Gate openTerminal on status too — terminals

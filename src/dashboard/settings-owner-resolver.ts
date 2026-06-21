@@ -1,5 +1,5 @@
 /**
- * Settings owner resolver (PR2 C5) — global owner check for `PUT /__daemon/settings-write`.
+ * Settings owner resolver — global owner check for `PUT /__daemon/settings-write`.
  *
  * v1.3 §6.1 pins the owner model: dashboard `settings` is the dashboard
  * process's global config, NOT per-bot, so per-bot `getOwnerOpenId` cannot

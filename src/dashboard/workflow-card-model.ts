@@ -3,8 +3,7 @@
  * snapshots into list / detail DTOs. Self-contained: no imports from
  * `src/workflows/`, only `card-model-types.ts` shared types.
  *
- * v1 scope: cancel / approve / reject. Attempt-level resume is NOT exposed
- * (see coverage matrix §3, last column of plan A.3.3 — v1.3 design freeze).
+ * v1 scope: cancel / approve / reject. Attempt-level resume is NOT exposed.
  */
 
 import type { ButtonState, PaginationMeta, StatusDot } from './card-model-types.js';
@@ -27,7 +26,7 @@ export interface ChatBinding {
   rootMessageId?: string;
 }
 
-/** Minimum row shape — adapter (PR2) converts ops-projection RunRow into this. */
+/** Minimum row shape — adapter converts ops-projection RunRow into this. */
 export interface WorkflowRunInput {
   runId: string;
   workflowId?: string;
@@ -261,7 +260,7 @@ function clampPageSize(pageSize: number | undefined): number {
  *
  * `chipCounts` is computed AFTER the search filter but BEFORE the status
  * chip filter, so users get accurate counts per status under their current
- * search context (A.3.3 plan rule).
+ * search context.
  */
 export function filterAndPaginateRuns(
   runs: ReadonlyArray<WorkflowRunInput>,

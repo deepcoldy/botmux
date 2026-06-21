@@ -1,16 +1,16 @@
 /**
- * Workflows action helpers (PR2 C4) — single source of truth for the
+ * Workflows action helpers — single source of truth for the
  * dashboard workflow-runs routes that used to live inline in
- * `workflow-api.ts:184-465`.
+ * `workflow-api.ts`.
  *
  * Each helper returns a `HandlerResult { status, body }` so both
  *   - the existing `workflow-api.ts handleWorkflowApi` dispatcher, and
- *   - the (PR2 C6) HMAC-gated `/__daemon/workflows-runs/*` route
+ *   - the HMAC-gated `/__daemon/workflows-runs/*` route
  * render identical responses. Response shapes, error codes, terminal-state
  * branches, and unauth-scrub semantics are byte-equivalent to the original
  * inline implementation.
  *
- * Attempt resume is intentionally out of scope (plan v1.3 §3 cuts it from v1).
+ * Attempt resume is intentionally out of scope (cuts it from v1).
  */
 
 import type { HandlerResult } from './groups-action-helpers.js';
@@ -136,7 +136,7 @@ export async function getRunSnapshot(
 /**
  * POST /api/workflows/runs/:id/(approve|reject) — proxy to the owning daemon.
  *
- * Behaviour mirrors `workflow-api.ts:293-352`:
+ * Behaviour mirrors `workflow-api.ts`:
  *   - bad_run_id (400) if `isValidRunId` rejects
  *   - bad_json (400) on parse failure
  *   - unknown_run (404) if snapshot missing
@@ -211,7 +211,7 @@ export async function runApproveReject(
 /**
  * POST /api/workflows/runs/:id/cancel — proxy to the owning daemon.
  *
- * Behaviour mirrors `workflow-api.ts:413-465`:
+ * Behaviour mirrors `workflow-api.ts`:
  *   - bad_run_id (400) if `isValidRunId` rejects
  *   - bad_json (400) on parse failure
  *   - unknown_run (404) if snapshot missing

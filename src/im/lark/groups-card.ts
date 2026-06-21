@@ -121,8 +121,7 @@ function buildNavFields(opts: { pageSize?: number; origin?: 'overview'; scope?: 
   return navFields;
 }
 
-/** Build the groups list card JSON. Pure (composes + paginates + renders).
- *  PR1 model owns the sort. */
+/** Build the groups list card JSON. Pure (composes + paginates + renders). */
 export function buildGroupsCard(
   matrix: GroupsMatrix,
   opts: BuildGroupsCardOpts,

@@ -374,7 +374,7 @@ function clampPageSize(pageSize: number | undefined): number {
   return Math.floor(pageSize);
 }
 
-/** Slice an already-filtered list into a single page. Clamp rules per v1.5 M4. */
+/** Slice an already-filtered list into a single page. Clamp rules apply. */
 export function paginateSchedules<T>(
   items: ReadonlyArray<T>,
   page: number | undefined,
@@ -396,7 +396,7 @@ export function paginateSchedules<T>(
   };
 }
 
-/** End-to-end pipeline: filter → toRow → paginate → counts. Used by the dashboard endpoint (PR2+). */
+/** End-to-end pipeline: filter → toRow → paginate → counts. Used by the dashboard endpoint. */
 export function filterAndPaginateSchedules(
   tasks: ReadonlyArray<ScheduleCardTaskInput>,
   query: ScheduleFilterQuery,

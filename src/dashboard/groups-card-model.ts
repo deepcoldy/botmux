@@ -127,7 +127,7 @@ function coverageStatusOf(member: GroupsMemberBotInput | undefined): GroupCovera
 }
 
 /**
- * Filter groups by query / missingOnly. v1.5 M3: missingOnly keeps a chat when
+ * Filter groups by query / missingOnly. missingOnly keeps a chat when
  * at least one configured bot is NOT effectively covered — covers all four
  * gap types: inChat=false / member row absent / status='unknown' / status='error'.
  *
@@ -168,7 +168,7 @@ function clampPageSize(pageSize: number | undefined): number {
   return Math.floor(pageSize);
 }
 
-/** Slice a filtered group list into one page. Clamp matches the v1.5 contract. */
+/** Slice a filtered group list into one page. Clamp rules apply. */
 export function paginateGroups(
   chats: ReadonlyArray<GroupsChatInput>,
   page?: number,

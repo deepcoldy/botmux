@@ -350,7 +350,7 @@ function nextDeliveryTarget(deliver: ScheduleDelivery): Exclude<ScheduleDelivery
   return deliver === 'new-topic' ? 'origin' : 'new-topic';
 }
 
-/** Slice-2a options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
+/** Options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
 export interface BuildSchedulesDetailCardOpts {
   invokerOpenId: string;
   locale: Locale;
@@ -977,7 +977,7 @@ export async function handleSchedulesCardAction(
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3e) Slice-1 actions — REFRESH + PAGE ───────────────────────────
+  // ─── 3e) REFRESH + PAGE actions ─────────────────────────────────────
   // `action` is already constrained to validActions above; the only ones
   // left here are REFRESH + PAGE (the other 4 returned early).
   let page = 1;

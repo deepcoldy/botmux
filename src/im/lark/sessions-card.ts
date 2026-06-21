@@ -279,7 +279,7 @@ function renderRow(entry: SessionRowDto, _locale: Locale): unknown {
   };
 }
 
-/** Slice-2a/2b options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
+/** Options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
 export interface BuildSessionsDetailCardOpts {
   invokerOpenId: string;
   locale: Locale;
@@ -288,7 +288,7 @@ export interface BuildSessionsDetailCardOpts {
   /** Overview drilldown nav state — threaded into the "🔙 返回" button so the
    *  list rebuilt by `BACK_TO_LIST` is still drilldown-shaped (5/page +
    *  return-to-overview). Detail itself does NOT render a return-to-overview
-   *  button (single back affordance per slice). */
+   *  button (single back affordance). */
   origin?: 'overview';
   pageSize?: number;
   /** Dashboard scope. Threaded into locate/close/resume/back buttons. */
@@ -377,7 +377,7 @@ export function buildSessionsDetailCard(
   elements.push({ tag: 'hr' });
 
   // ─── Action row — locate / terminal / (close OR resume) / back ────────
-  // Slice 2b: detail card matches the Web dashboard's four primary actions.
+  // Detail card matches the Web dashboard's four primary actions.
   // active state shows close (danger); closed state replaces close with
   // resume so the user can revive the session.
   const backNav: Record<string, string> = {};
@@ -394,7 +394,7 @@ export function buildSessionsDetailCard(
   // Track reason notes to render below the action row in row order.
   const reasonNotes: { key: string; titleKey?: string }[] = [];
 
-  // 1) Locate button. PR1 matrix says it's always enabled; we still gate
+  // 1) Locate button. The matrix says it's always enabled; we still gate
   //    on matrix to stay matrix-driven.
   const locateEnabled = detail.actions.locate.enabled === true;
   const locateButton: Record<string, unknown> = {
@@ -961,7 +961,7 @@ export async function handleSessionsCardAction(
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3d) Slice-1 actions — REFRESH + PAGE ───────────────────────────
+  // ─── 3d) REFRESH + PAGE actions ─────────────────────────────────────
   // `action` is already constrained to validActions above; the only ones
   // left here are REFRESH + PAGE (the other 3 returned early).
   let page = 1;

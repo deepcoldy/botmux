@@ -260,8 +260,7 @@ function buildSegmentedRow(
   }
 
   // autoUpdate always shows the schedule time (read-only when toggle blocked,
-  // editable form when writable). Codex C4: even disabled, the JSON MUST
-  // contain `04:00`.
+  // editable form when writable).
   if (toggle.time) {
     row.push({
       tag: 'div',
@@ -374,12 +373,12 @@ export type PatchBuildResult =
  * Build the dashboard settings patch from an action callback. Pure — caller
  * decides whether to PUT.
  *
- * Whitelisting (plan v3 B3): `next_value` MUST be the literal string
+ * Whitelisting: `next_value` MUST be the literal string
  * `'true'` or `'false'`. Anything else (`'yes'`, `'TRUE'`, undefined, an
  * object) returns `invalid_value` so an upstream callback drift cannot
  * silently flip a toggle.
  *
- * Time validation (plan v2 B5): HH:MM regex, no silent fallback to 04:00.
+ * Time validation: HH:MM regex, no silent fallback to 04:00.
  */
 export function buildPatchFromAction(
   action: string,
@@ -472,7 +471,7 @@ export async function handleSettingsCardAction(
   const operatorOpenId = data.operator?.open_id;
   const action = value.action;
 
-  // ─── 1) Invoker lock — fail-closed (B3) ─────────────────────────────
+  // ─── 1) Invoker lock — fail-closed ──────────────────────────────────
   // Settings card is new — there is no legacy callback shape to keep
   // compatible. Reject any callback whose envelope is missing either side
   // of the invoker assertion, then reject when they disagree.

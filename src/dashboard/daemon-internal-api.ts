@@ -1,5 +1,5 @@
 /**
- * Daemon-internal API (PR2 C6) — typed Route B server for `/__daemon/*`.
+ * Daemon-internal API — typed Route B server for `/__daemon/*`.
  *
  * Dispatch pipeline:
  *   1) `verifyDaemonRequest` checks HMAC + loopback + ts ±60s + nonce replay.
@@ -10,7 +10,7 @@
  *      endpoints — there is intentionally NO generic forward, so a daemon
  *      can never use Route B as a path-shifting proxy.
  *
- * Settings-write also enforces the §6.1 union_id owner gate: the body must
+ * Settings-write also enforces the union_id owner gate: the body must
  * carry an `ownerUnionId` (`on_`-prefixed) that resolves to a candidate in
  * the global owner set, or the request returns 403 `owner_only`.
  *
@@ -67,7 +67,7 @@ export interface DaemonInternalApiDeps {
   getSessions: () => unknown[];
   getSchedules: () => unknown[];
   resolveDashboardSettings: () => ResolvedDashboardSettingsView;
-  /** Returns `{ chats, bots }`; PR1 groups model requires both for missingOnly accuracy. */
+  /** Returns `{ chats, bots }`; groups model requires both for missingOnly accuracy. */
   buildGroupsMatrix: () => Promise<{ chats: unknown[]; bots: unknown[] }>;
 
   // ─── WRITE ACTIONS (via helpers) ───────────────────────────────────
