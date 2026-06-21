@@ -204,7 +204,18 @@ export class HerdrBackend implements SessionBackend {
     //     into the CLI process via plain process.env inheritance
     // Skip on externalTarget: that's the user's own pre-existing herdr
     // session; we can't (and shouldn't) re-env an already-running CLI.
-    this.childEnv = this.opts.externalTarget ? undefined : { ...opts.env };
+    //
+    // Per-bot env (opts.injectEnv, e.g. ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM
+    // bot): herdr runs a per-session server (one `herdr --session <name> server`
+    // per botmux session, see ensureServer), so unlike tmux/zellij there is no
+    // shared cross-bot server whose global env we'd pollute — merging it into
+    // childEnv is safe (same reasoning as the pty backend). childEnv flows to
+    // both the daemon spawn and the agent-start call, and the daemon forks the
+    // CLI as its child, so the per-bot env reaches the CLI. Already sanitized by
+    // the worker. Appended last so it wins over a same-named key in opts.env.
+    this.childEnv = this.opts.externalTarget
+      ? undefined
+      : { ...opts.env, ...(opts.injectEnv ?? {}) };
     this.ensureServer();
 
     const external = this.opts.externalTarget;
