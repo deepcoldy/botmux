@@ -319,7 +319,10 @@ async function loadData(): Promise<void> {
     ]);
     const skillsBody = await skillsRes.json().catch(() => ({}));
     const botsBody = await botsRes.json().catch(() => ({}));
-    if (!skillsRes.ok) throw new Error(skillsBody?.error ?? `skills HTTP ${skillsRes.status}`);
+    if (!skillsRes.ok) {
+      const error = skillsBody?.error ?? `skills HTTP ${skillsRes.status}`;
+      throw new Error(error === 'not_found_yet' || error === 'not_found' ? t('skills.apiUnavailable') : error);
+    }
     if (!botsRes.ok) throw new Error(botsBody?.error ?? `bots HTTP ${botsRes.status}`);
     state = {
       skills: Array.isArray(skillsBody.skills) ? skillsBody.skills : [],
