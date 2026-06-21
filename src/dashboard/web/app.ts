@@ -6,7 +6,7 @@ import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
 import { renderSkillsPage } from './skills.js';
-import { renderRolesPage } from './roles.js';
+import { renderRoleProfilesPage, renderRolesPage } from './roles.js';
 import { renderTeamFederationPage, renderTeamManagePage } from './team-federation.js';
 import { renderConnectorsPage } from './connectors.js';
 import { renderSettingsPage } from './settings.js';
@@ -32,7 +32,7 @@ let publicReadOnly = false;
 
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
-const MANAGE_ROUTES = ['roles', 'bot-defaults', 'skills', 'team', 'connectors'];
+const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'team', 'connectors'];
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 // Shown only when the dashboard token was rotated WHILE public read-only is off
@@ -205,7 +205,7 @@ function renderAuthRequiredPage(host: HTMLElement): void {
     'padding:40px 36px;box-shadow:0 8px 28px rgba(0,0,0,.12)">' +
     '<h2 style="margin:0 0 12px;font-size:20px;color:var(--fg)">此页需要授权链接</h2>' +
     '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted);font-size:14px">' +
-    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / Webhook）需要授权链接。' +
+    '你当前是只读访问，管理页（群角色 / Profiles / Bot 配置 / 团队 / Webhook）需要授权链接。' +
     '运行 <code>botmux dashboard</code> 获取最新链接后即可管理。</p>' +
     '<a href="#/" style="display:inline-block;padding:8px 22px;background:var(--accent);' +
     'color:var(--on-accent);border-radius:8px;text-decoration:none;font-size:14px">返回总览</a>' +
@@ -219,7 +219,11 @@ let pageDispose: (() => void) | null = null;
 function highlightNav(hash: string): void {
   for (const a of document.querySelectorAll<HTMLAnchorElement>('.sidebar-nav a')) {
     const href = a.getAttribute('href') ?? '#/';
-    a.classList.toggle('active', href === (hash || '#/'));
+    const current = hash || '#/';
+    const isActive = href === current || (
+      href !== '#/' && (current.startsWith(`${href}?`) || current.startsWith(`${href}/`))
+    );
+    a.classList.toggle('active', isActive);
   }
 }
 
@@ -252,6 +256,11 @@ function route() {
   else if (hash.startsWith('#/connectors')) renderConnectorsPage(root);
   else if (hash.startsWith('#/team/manage')) renderTeamManagePage(root);
   else if (hash.startsWith('#/team')) renderTeamFederationPage(root);
+  else if (hash.startsWith('#/role-profiles')) {
+    window.location.replace(`#/roles/profile${hash.slice('#/role-profiles'.length)}`);
+    return;
+  }
+  else if (hash.startsWith('#/roles/profile')) renderRoleProfilesPage(root);
   else if (hash.startsWith('#/roles')) renderRolesPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
   else if (hash.startsWith('#/sessions')) renderSessionsPage(root);

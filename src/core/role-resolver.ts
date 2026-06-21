@@ -20,6 +20,7 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
 const MAX_ROLE_BYTES = 4 * 1024; // 4 KB
+const ROLE_CHAT_ID_RE = /^(?:oc|om)_[A-Za-z0-9_-]{1,128}$/;
 
 interface CacheEntry {
   mtimeMs: number;
@@ -34,6 +35,7 @@ function cacheKey(larkAppId: string, chatId: string): string {
 
 /** Absolute path to the role file for a given bot + chat. */
 function roleFilePath(larkAppId: string, chatId: string): string {
+  assertRoleChatId(chatId);
   return join(config.session.dataDir, 'roles', larkAppId, `${chatId}.md`);
 }
 
@@ -44,6 +46,16 @@ function teamRoleFilePath(larkAppId: string): string {
 
 function teamCacheKey(larkAppId: string): string {
   return `team::${larkAppId}`;
+}
+
+export function isValidRoleChatId(chatId: string): boolean {
+  return ROLE_CHAT_ID_RE.test(chatId);
+}
+
+function assertRoleChatId(chatId: string): void {
+  if (!isValidRoleChatId(chatId)) {
+    throw new Error(`invalid chat id: ${chatId}`);
+  }
 }
 
 /** Truncate `content` to at most MAX_ROLE_BYTES UTF-8 bytes. */
@@ -108,6 +120,7 @@ function readRoleFile(filePath: string, key: string, logLabel: string): string |
  */
 export function resolveRoleFile(larkAppId: string, chatId: string): string | null {
   if (!larkAppId || !chatId) return null;
+  if (!isValidRoleChatId(chatId)) return null;
   return readRoleFile(roleFilePath(larkAppId, chatId), cacheKey(larkAppId, chatId), `chat=${chatId}`);
 }
 
@@ -134,6 +147,7 @@ export function writeRoleFile(larkAppId: string, chatId: string, content: string
 
 /** Delete a role file for a chat. */
 export function deleteRoleFile(larkAppId: string, chatId: string): boolean {
+  if (!isValidRoleChatId(chatId)) return false;
   const filePath = roleFilePath(larkAppId, chatId);
   try {
     unlinkSync(filePath);

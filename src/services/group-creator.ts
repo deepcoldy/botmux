@@ -18,8 +18,11 @@
  * this is the decision layer's job — the service trusts its inputs.
  */
 import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId } from './groups-store.js';
-import { sendMessage } from '../im/lark/client.js';
+import { listChatBotMembers, sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
+import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
+import { writeRoleFile } from '../core/role-resolver.js';
+import { config } from '../config.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -38,6 +41,10 @@ export interface CreateGroupOpts {
    *  every invited bot. The path is validated by callers; this service only
    *  persists the binding after chat.create succeeds. */
   bindWorkingDir?: string;
+  /** Optional reusable role suite to bootstrap. The creator bot applies its
+   *  local entry directly; peer bots are prompted by a multi-mention
+   *  `/role profile apply` command in the newly created chat. */
+  roleProfileId?: string;
 }
 
 export interface CreateGroupResult {
@@ -57,6 +64,8 @@ export interface CreateGroupResult {
   shareLink: string | null;
   shareLinkError: string | null;
   oncallBindings: { larkAppId: string; ok: boolean; created?: boolean; error?: string }[];
+  roleProfileBootstrapMessageId: string | null;
+  roleProfileBootstrapError: string | null;
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
@@ -139,14 +148,14 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   }
 
   const oncallBindings: CreateGroupResult['oncallBindings'] = [];
+  const invalidBots = new Set(r.invalidBotIds);
+  const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
+    .filter(id => !invalidBots.has(id));
   const bindWorkingDir = opts.bindWorkingDir?.trim();
   if (bindWorkingDir) {
     // Bind the new chat for every bot that actually joined it. The creator is
     // an implicit member; Lark reports rejected invitees in invalidBotIds.
-    const invalidBots = new Set(r.invalidBotIds);
-    const targetBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
-      .filter(id => !invalidBots.has(id));
-    for (const larkAppId of targetBotIds) {
+    for (const larkAppId of joinedBotIds) {
       try {
         const br = await bindOncall(larkAppId, r.chatId, bindWorkingDir);
         if (br.ok) {
@@ -156,6 +165,52 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
         }
       } catch (e: any) {
         oncallBindings.push({ larkAppId, ok: false, error: e?.message ?? String(e) });
+      }
+    }
+  }
+
+  let roleProfileBootstrapMessageId: string | null = null;
+  let roleProfileBootstrapError: string | null = null;
+  const roleProfileId = opts.roleProfileId?.trim();
+  if (roleProfileId) {
+    if (!isValidRoleProfileId(roleProfileId)) {
+      roleProfileBootstrapError = 'invalid_role_profile_id';
+    } else {
+      try {
+        const creatorContent = readRoleProfileEntry(config.session.dataDir, roleProfileId, opts.creatorLarkAppId);
+        // null = no entry; '' = explicit (clear) entry — both skip the write on
+        // a fresh chat, but only a truly missing entry counts as "not applicable".
+        const creatorHasEntry = creatorContent !== null;
+        if (creatorContent) {
+          writeRoleFile(opts.creatorLarkAppId, r.chatId, creatorContent);
+        }
+        const peerBotIds = joinedBotIds.filter(id => id !== opts.creatorLarkAppId);
+        if (peerBotIds.length > 0) {
+          const members = await listChatBotMembers(opts.creatorLarkAppId, r.chatId);
+          const byAppId = new Map(members.map(m => [m.larkAppId, m]));
+          const mentions = peerBotIds
+            .map(id => byAppId.get(id))
+            .filter((m): m is NonNullable<typeof m> => !!m && !!m.openId && m.mentionable)
+            .map(m => `<at user_id="${m.openId}"></at>`);
+          if (mentions.length === 0) {
+            roleProfileBootstrapError = 'no_mentionable_bots';
+          } else {
+            roleProfileBootstrapMessageId = await sendMessage(
+              opts.creatorLarkAppId,
+              r.chatId,
+              `${mentions.join(' ')} /role profile apply ${roleProfileId} --quiet`,
+              'text',
+            );
+          }
+        } else if (!creatorHasEntry) {
+          // Solo group whose creator has no entry in this profile: nothing was
+          // written and no peer bootstrap was sent. Surface it rather than
+          // reporting a misleading "bootstrap started". An explicit empty entry
+          // ('') is still a valid entry (clears on apply), so it is NOT flagged.
+          roleProfileBootstrapError = 'no_applicable_entries';
+        }
+      } catch (e: any) {
+        roleProfileBootstrapError = e?.message ?? String(e);
       }
     }
   }
@@ -174,5 +229,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     shareLink,
     shareLinkError,
     oncallBindings,
+    roleProfileBootstrapMessageId,
+    roleProfileBootstrapError,
   };
 }

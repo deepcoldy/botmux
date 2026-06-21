@@ -55,6 +55,7 @@ vi.mock('../src/global-config.js', () => ({
 vi.mock('../src/core/role-resolver.js', () => ({
   writeRoleFile: vi.fn(),
   deleteRoleFile: vi.fn(() => true),
+  resolveRoleFile: vi.fn(() => null),
   resolveRole: vi.fn(() => ({ content: null, source: 'none' })),
   resolveTeamRoleFile: vi.fn(() => null),
   writeTeamRoleFile: vi.fn(),
@@ -64,6 +65,16 @@ vi.mock('../src/services/bot-profile-store.js', () => ({
   getBotCapability: vi.fn(() => null),
   setBotCapability: vi.fn(),
   clearBotCapability: vi.fn(() => true),
+}));
+vi.mock('../src/services/role-profile-store.js', () => ({
+  deleteRoleProfileEntry: vi.fn(() => true),
+  deleteRoleProfileIfEmpty: vi.fn(() => true),
+  isValidRoleProfileId: vi.fn((id: string) => /^[A-Za-z0-9._-]{1,64}$/.test(id)),
+  listRoleProfileEntries: vi.fn(() => []),
+  listRoleProfiles: vi.fn(() => []),
+  MAX_ROLE_PROFILE_ENTRY_BYTES: 4096,
+  readRoleProfileEntry: vi.fn(() => null),
+  writeRoleProfileEntry: vi.fn(),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -209,6 +220,8 @@ vi.mock('../src/services/group-creator.js', () => ({
     notifyMessageId: 'om_notify',
     notifyError: null,
     oncallBindings: [],
+    roleProfileBootstrapMessageId: null,
+    roleProfileBootstrapError: null,
   })),
 }));
 
@@ -358,8 +371,13 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
-import { writeTeamRoleFile, deleteTeamRoleFile, resolveRole } from '../src/core/role-resolver.js';
+import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
+import {
+  listRoleProfiles,
+  readRoleProfileEntry,
+  writeRoleProfileEntry,
+} from '../src/services/role-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
@@ -2018,6 +2036,18 @@ describe('handleCommand', () => {
       expect(reply).toContain('oc_new_group');
     });
 
+    it('passes /group --role-profile through and strips it from the group name', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --role-profile collab-main My Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.name).toBe('My Project');
+      expect(opts.roleProfileId).toBe('collab-main');
+    });
+
     it('does NOT auto-post a repo-select card after creating the group', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -2974,6 +3004,75 @@ describe('/role subcommand routing', () => {
     expect(resolveRole).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('TEAMROLE_MARKER');
+  });
+
+  it('routes "/role profile list" through role-profile-store and marks this bot status', async () => {
+    vi.mocked(listRoleProfiles).mockReturnValue([{ profileId: 'collab-main', entryCount: 2, updatedAt: null }]);
+    vi.mocked(readRoleProfileEntry).mockReturnValue('profile role');
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile list'), deps, LARK_APP_ID);
+    expect(listRoleProfiles).toHaveBeenCalledWith('/fake/data');
+    expect(readRoleProfileEntry).toHaveBeenCalledWith('/fake/data', 'collab-main', LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('collab-main');
+    expect(reply).toContain('已配置');
+  });
+
+  it('routes "/role profile save <profile>" from the effective role', async () => {
+    vi.mocked(resolveRole).mockReturnValue({ content: 'EFFECTIVE_ROLE', source: 'chat' });
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile save collab-main'), deps, LARK_APP_ID);
+    expect(resolveRole).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+    expect(writeRoleProfileEntry).toHaveBeenCalledWith('/fake/data', 'collab-main', LARK_APP_ID, 'EFFECTIVE_ROLE');
+  });
+
+  it('routes "/role profile apply <profile>" to write this chat role when empty', async () => {
+    vi.mocked(readRoleProfileEntry).mockReturnValue('PROFILE_ROLE');
+    vi.mocked(resolveRoleFile).mockReturnValue(null);
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile apply collab-main'), deps, LARK_APP_ID);
+    expect(readRoleProfileEntry).toHaveBeenCalledWith('/fake/data', 'collab-main', LARK_APP_ID);
+    expect(resolveRoleFile).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+    expect(writeRoleFile).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, 'PROFILE_ROLE');
+  });
+
+  it('refuses "/role profile apply <profile>" when chat role exists without --force', async () => {
+    vi.mocked(readRoleProfileEntry).mockReturnValue('PROFILE_ROLE');
+    vi.mocked(resolveRoleFile).mockReturnValue('EXISTING_CHAT_ROLE');
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile apply collab-main'), deps, LARK_APP_ID);
+    expect(writeRoleFile).not.toHaveBeenCalled();
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('--force');
+  });
+
+  it('allows "/role profile apply <profile> --force" to overwrite chat role', async () => {
+    vi.mocked(readRoleProfileEntry).mockReturnValue('PROFILE_ROLE');
+    vi.mocked(resolveRoleFile).mockReturnValue('EXISTING_CHAT_ROLE');
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile apply collab-main --force'), deps, LARK_APP_ID);
+    expect(writeRoleFile).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, 'PROFILE_ROLE');
+  });
+
+  it('treats an empty role profile entry as clearing this chat role when forced', async () => {
+    vi.mocked(readRoleProfileEntry).mockReturnValue('');
+    vi.mocked(resolveRoleFile).mockReturnValue('EXISTING_CHAT_ROLE');
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile apply collab-main --force'), deps, LARK_APP_ID);
+    expect(deleteRoleFile).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+    expect(writeRoleFile).not.toHaveBeenCalled();
+  });
+
+  it('refuses an empty entry with a clear-specific message (not overwrite) when no --force', async () => {
+    vi.mocked(readRoleProfileEntry).mockReturnValue('');
+    vi.mocked(resolveRoleFile).mockReturnValue('EXISTING_CHAT_ROLE');
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/role', ROOT_ID, makeLarkMessage('/role profile apply collab-main'), deps, LARK_APP_ID);
+    expect(deleteRoleFile).not.toHaveBeenCalled();
+    expect(writeRoleFile).not.toHaveBeenCalled();
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('--force');
+    expect(reply).toContain('清除'); // clear-intent wording, not the overwrite ('覆盖') message
   });
 });
 
