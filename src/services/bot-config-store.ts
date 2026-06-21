@@ -19,6 +19,7 @@ import { statSync } from 'node:fs';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
+import { sanitizePerBotEnv } from '../core/per-bot-env.js';
 
 /**
  * 生效时机：
@@ -74,6 +75,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大同时活跃会话数；超过后最久未用的会话自动休眠（杀 worker+CLI 回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
+  { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -101,6 +103,14 @@ function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
+  }
+  // env may hold secrets (e.g. ANTHROPIC_AUTH_TOKEN). NEVER render the values
+  // anywhere chat-visible (/config get): show key names with masked values only.
+  if (spec.configKey === 'env') {
+    const obj = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>) : null;
+    const keys = obj ? Object.keys(obj) : [];
+    return keys.length ? keys.map(k => `${k}=••••`).join(', ') : '∅';
   }
   if (spec.kind === 'json') {
     return value === undefined || value === null ? '∅' : JSON.stringify(value);
@@ -279,6 +289,14 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
+        }
+        if (spec.configKey === 'env') {
+          // Must be a JSON object; sanitize to valid env keys + primitive values
+          // (botmux-reserved keys dropped). Nothing valid left → reject (empty
+          // text is handled as "clear" by the caller before reaching coerce).
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
+          const sanitized = sanitizePerBotEnv(parsed);
+          return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
         }
         return { ok: true, value: parsed };
       } catch {

@@ -230,7 +230,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -474,6 +474,25 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="actions">
         <button type="button" class="primary" data-action="save-startup-commands">${t('botDefaults.startupCommandsSave')}</button>
         <span class="oncall-status" data-startup-commands-status></span>
+      </div>
+    </div>`;
+  }
+
+  // 环境变量 env：注入到本 bot CLI 进程的环境变量（JSON 对象），如让某个 bot 走 GLM/
+  // 第三方服务商（ANTHROPIC_BASE_URL+ANTHROPIC_AUTH_TOKEN）或设 HTTPS_PROXY。next-session
+  // 生效（下个新会话起注入）。PUT /api/bots/:appId/env 落 bots.json，跨后端按会话注入
+  // （不进共享 tmux server 全局 env，不会串到别的 bot）。
+  function renderEnvSection(b: any): string {
+    const val: string = typeof b.env === 'string' ? b.env : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionEnv')}</h4>
+      <p class="bd-section-note">${t('botDefaults.envHelp')}</p>
+      <textarea data-input="env" rows="5"
+        placeholder="${escapeHtml(t('botDefaults.envPlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(val)}</textarea>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-env">${t('botDefaults.envSave')}</button>
+        <span class="oncall-status" data-env-status></span>
       </div>
     </div>`;
   }
@@ -1245,6 +1264,45 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             startupStatusEl.classList.add('hint-warn-inline');
           } finally {
             startupSaveBtn.disabled = false;
+          }
+        });
+      }
+
+      // ── 环境变量 env（JSON 对象；空＝清除） ──────────────────────────────
+      const envEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=env]');
+      const envSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-env]');
+      const envStatusEl = card.querySelector<HTMLSpanElement>('[data-env-status]');
+      if (envEl && envSaveBtn) {
+        envSaveBtn.addEventListener('click', async () => {
+          if (!envStatusEl) return;
+          envStatusEl.textContent = '';
+          envStatusEl.className = 'oncall-status';
+          envSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/env`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ env: envEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              envStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              envStatusEl.classList.add('hint-ok');
+              // Server returns the sanitized, pretty-printed JSON — reflect it
+              // back so the textarea shows exactly what was persisted.
+              const next: string = typeof body.env === 'string' ? body.env : '';
+              envEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.env = next;
+            } else {
+              envStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              envStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            envStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            envStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            envSaveBtn.disabled = false;
           }
         });
       }

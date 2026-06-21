@@ -45,6 +45,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     p2pMode: j?.p2pMode === 'chat' ? 'chat' : 'thread',
     maxLiveWorkers: typeof j?.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
+    env: typeof j?.env === 'string' ? j.env : '',
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

@@ -493,7 +493,7 @@ export class TmuxPipeBackend implements SessionBackend {
 
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
     const shellSpec = resolveUserShell();
-    const envAssignments = buildBotmuxEnvAssignments(opts.env);
+    const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
     execFileSync('tmux', [
       'new-session',
       '-d',

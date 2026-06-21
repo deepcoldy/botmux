@@ -5,6 +5,7 @@ import { basename } from 'node:path';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
 import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -212,7 +213,7 @@ export class TmuxBackend implements SessionBackend {
       //     could `unset` or `export` over it before the CLI sees it. env(1)
       //     injection happens after rcfile load and is authoritative.
       const shellSpec = resolveUserShell();
-      const envAssignments = buildBotmuxEnvAssignments(opts.env);
+      const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
       // Debug knob — when on, the wrapper does NOT `exec` the CLI; it runs the
       // CLI as a child and then drops into an interactive `$shell -i` so the
       // user can poke at PATH / NVM / pnpm in the web terminal after exiting
@@ -548,13 +549,29 @@ const BOTMUX_INJECTED_ENV_KEYS = [
  * `IS_SANDBOX` for instance is only set when the daemon is running as root.
  * Pure function for unit-testing without spawning tmux.
  */
-export function buildBotmuxEnvAssignments(env: NodeJS.ProcessEnv | undefined): string[] {
-  if (!env) return [];
+export function buildBotmuxEnvAssignments(
+  env: NodeJS.ProcessEnv | undefined,
+  injectEnv?: Record<string, string>,
+): string[] {
   const out: string[] = [];
-  for (const key of BOTMUX_INJECTED_ENV_KEYS) {
-    const val = env[key];
-    if (val === undefined) continue;
-    out.push(`${key}=${val}`);
+  if (env) {
+    for (const key of BOTMUX_INJECTED_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+  }
+  // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
+  // bot's provider creds win over any same-named leftover, and emitted ONLY
+  // here (the per-pane `/usr/bin/env` prefix) — never via the tmux client env —
+  // so they don't pollute the shared server global and leak across bots. These
+  // are argv items consumed as `"$@"` by the shell wrapper, so values with
+  // spaces / quotes / `$` need no escaping. Re-sanitized defensively (the value
+  // crossed an IPC boundary from the daemon).
+  if (injectEnv) {
+    for (const [key, val] of Object.entries(sanitizePerBotEnv(injectEnv))) {
+      out.push(`${key}=${val}`);
+    }
   }
   return out;
 }

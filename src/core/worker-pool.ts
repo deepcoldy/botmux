@@ -1606,6 +1606,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
     startupCommands: botCfg.startupCommands,
+    // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
+    // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
+    // observed, not driven, so forkAdoptWorker intentionally omits it.
+    env: botCfg.env,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,

@@ -1078,6 +1078,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const sc = getBot(cachedLarkAppId).config.startupCommands;
     if (Array.isArray(sc) && sc.length) startupCommands = sc.join('\n');
   } catch { /* none */ }
+  // Per-bot env → pretty JSON for the dashboard textarea. The dashboard is
+  // owner-authenticated, so showing the real values here is acceptable (same
+  // as editing bots.json directly); the chat-facing /config get masks them.
+  let env = '';
+  try {
+    const e = getBot(cachedLarkAppId).config.env;
+    if (e && typeof e === 'object' && Object.keys(e).length) env = JSON.stringify(e, null, 2);
+  } catch { /* none */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
@@ -1099,6 +1107,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     p2pMode,
     maxLiveWorkers,
     startupCommands,
+    env,
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
 });
@@ -1228,6 +1237,33 @@ ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如
+// `{"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"}` 让本 bot 走 GLM/第三方
+// 服务商）：空白 → 清除；否则按 json kind 解析 + sanitizePerBotEnv 过滤后落盘。
+// 走 applyConfigField（与 /botconfig 同一写盘 + 内存热更新路径），next-session 生效
+// （下个会话起注入到 CLI 进程）。回包返回脱敏后的 pretty JSON 供 textarea 回填。
+ipcRoute('PUT', '/api/bot-env', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { env?: unknown };
+  try { body = await readJsonBody<{ env?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('env');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.env === 'string' ? body.env : '';
+  let value: Record<string, string> | null;
+  if (!raw.trim()) {
+    value = null;  // 清除
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as Record<string, string>;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, env: value ? JSON.stringify(value, null, 2) : '' });
 });
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:

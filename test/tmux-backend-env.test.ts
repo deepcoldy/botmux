@@ -155,6 +155,46 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).toContain('BOTMUX_SESSION_ID=sess_xxx');
     expect(out).toContain('SESSION_DATA_DIR=/d');
   });
+
+  // ── Per-bot env (bots.json `env`) injected via the 2nd arg ──────────────────
+  it('appends per-bot injectEnv AFTER the botmux-managed keys (so it wins last)', () => {
+    const out = buildBotmuxEnvAssignments(
+      { BOTMUX: '1', SESSION_DATA_DIR: '/d' },
+      { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_AUTH_TOKEN: 'glm-key' },
+    );
+    expect(out).toEqual([
+      'BOTMUX=1',
+      'SESSION_DATA_DIR=/d',
+      'ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic',
+      'ANTHROPIC_AUTH_TOKEN=glm-key',
+    ]);
+  });
+
+  it('forwards per-bot injectEnv even when there is no botmux-managed env at all', () => {
+    expect(buildBotmuxEnvAssignments(undefined, { OPENAI_BASE_URL: 'https://x/v1' }))
+      .toEqual(['OPENAI_BASE_URL=https://x/v1']);
+    expect(buildBotmuxEnvAssignments({}, { HTTPS_PROXY: 'http://127.0.0.1:7890' }))
+      .toEqual(['HTTPS_PROXY=http://127.0.0.1:7890']);
+  });
+
+  it('re-sanitizes injectEnv: drops botmux-reserved keys even if they sneak in', () => {
+    const out = buildBotmuxEnvAssignments(
+      { BOTMUX: '1' },
+      {
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        BOTMUX_SESSION_ID: 'hijack',     // reserved → dropped
+        LARK_APP_SECRET: 's',            // reserved → dropped
+        CLAUDE_CONFIG_DIR: '/tmp/evil',  // reserved → dropped
+        'BAD-NAME': 'x',                 // invalid name → dropped
+      },
+    );
+    expect(out).toEqual(['BOTMUX=1', 'ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic']);
+  });
+
+  it('no injectEnv arg leaves output identical to the legacy whitelist-only behavior', () => {
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1', SESSION_DATA_DIR: '/d' }))
+      .toEqual(['BOTMUX=1', 'SESSION_DATA_DIR=/d']);
+  });
 });
 
 describe('resolveUserShell()', () => {

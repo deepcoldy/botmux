@@ -23,6 +23,7 @@ import { shouldWriteNow } from './utils/input-gate.js';
 import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
+import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -3945,6 +3946,16 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // them past the server's global env.
   if (cliAdapter.spawnEnv) Object.assign(childEnv, cliAdapter.spawnEnv);
 
+  // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
+  // ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN to run a bot on GLM/a 3rd-party
+  // provider, an HTTPS_PROXY, or a CLI feature flag. Passed as injectEnv (NOT
+  // merged into childEnv) so the tmux/zellij backends inject it via the per-pane
+  // `/usr/bin/env` prefix and never into the shared backing-server global env,
+  // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
+  const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  const perBotInjectKeys = Object.keys(perBotInjectEnv);
+  if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
+
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
   // per-session project copy + de-identified config. The agent's `botmux send`
   // routes through a daemon-side outbox watcher (creds never enter the sandbox).
@@ -4090,6 +4101,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     cols: PTY_COLS,
     rows: PTY_ROWS,
     env: childEnv as Record<string, string>,
+    injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
   });
 
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)

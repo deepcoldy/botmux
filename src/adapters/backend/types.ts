@@ -20,6 +20,15 @@ export interface SpawnOpts {
   cols: number;
   rows: number;
   env: Record<string, string>;
+  /**
+   * Per-bot env (bots.json `env`) to inject into the CLI process ONLY. Kept
+   * separate from `env` on purpose: the persistent backends (tmux/zellij) must
+   * NOT put these into the shared backing-server global env — they inject them
+   * via the per-pane `/usr/bin/env KEY=VAL` prefix so one bot's provider creds
+   * can't leak into another bot's panes. The pty backend (no shared server)
+   * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
+   */
+  injectEnv?: Record<string, string>;
 }
 
 export interface SessionBackend {

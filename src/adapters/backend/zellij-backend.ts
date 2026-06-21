@@ -314,7 +314,7 @@ export function kdlString(s: string): string {
  */
 export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts): string {
   const shellSpec = resolveUserShell();
-  const envAssignments = buildBotmuxEnvAssignments(opts.env);
+  const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
   const paneArgs = [
     ...shellSpec.flags, '-c', SHELL_WRAPPER_SCRIPT, '_',
     opts.cwd,
