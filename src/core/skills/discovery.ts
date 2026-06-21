@@ -55,9 +55,13 @@ export function discoverNativeCliSkillGroups(cliIds: readonly CliId[]): NativeCl
     if (adapter.claudeDataDir) roots.push(join(expandHome(adapter.claudeDataDir), 'skills'));
     if (adapter.skillsDir) roots.push(expandHome(adapter.skillsDir));
     for (const root of roots) {
-      const key = `${cliId}:${root}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      // Dedup by ROOT globally (not per cliId): several adapters share a skills
+      // directory — coco/traex both use ~/.trae/skills, mtr/opencode both use
+      // ~/.config/opencode/skills — so a shared root would otherwise show up as
+      // two tabs listing byte-identical skills (and let the same dir be picked
+      // twice across tabs). First CLI to claim a root owns its tab.
+      if (seen.has(root)) continue;
+      seen.add(root);
       out.push({ cliId, rootDir: root, skills: discoverSkillRoot(root) });
     }
   }

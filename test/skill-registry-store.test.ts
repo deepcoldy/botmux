@@ -61,6 +61,31 @@ describe('skill registry store', () => {
     expect(registry.skills.docs.rootDir).toBe(realpathSync(join(src, 'docs')));
   });
 
+  it('collapses same-named local links to one entry (last wins) without duplicating the result', () => {
+    // The discovery dialog can surface the same skill name under multiple CLI
+    // roots (e.g. botmux's own builtin skills live in every CLI's skillsDir).
+    // Selecting both must not write twice nor return a duplicate package.
+    write(join(src, 'codex', 'send', 'SKILL.md'), '---\nname: send\ndescription: from codex\n---\n# Send');
+    write(join(src, 'claude', 'send', 'SKILL.md'), '---\nname: send\ndescription: from claude\n---\n# Send');
+
+    const packages = installLocalSkillLinks([join(src, 'codex', 'send'), join(src, 'claude', 'send')]);
+    const registry = readSkillRegistry();
+
+    expect(packages.map(pkg => pkg.name)).toEqual(['send']); // deduped — not ['send','send']
+    // Last selection wins for the surviving registry entry's path.
+    expect(registry.skills.send.source).toMatchObject({ type: 'local-link', path: join(src, 'claude', 'send') });
+    expect(registry.skills.send.rootDir).toBe(realpathSync(join(src, 'claude', 'send')));
+  });
+
+  it('aborts the whole batch and names the offending dir when a source is invalid', () => {
+    write(join(src, 'good', 'SKILL.md'), '---\nname: good\n---\n# Good');
+    const missing = join(src, 'gone'); // no SKILL.md
+
+    expect(() => installLocalSkillLinks([join(src, 'good'), missing])).toThrow(new RegExp(`local_link_failed:.*gone`));
+    // All-or-nothing: nothing registered when any source fails.
+    expect(readSkillRegistry().skills.good).toBeUndefined();
+  });
+
   it('removes the registry entry and store copy for local-copy installs', () => {
     write(join(src, 'cleanup', 'SKILL.md'), '---\nname: cleanup\n---\n# Cleanup');
     const pkg = installLocalSkill(join(src, 'cleanup'), { link: false });

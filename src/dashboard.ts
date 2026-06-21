@@ -56,7 +56,7 @@ import { loadBotConfigs } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
-import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
+import { installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 
@@ -904,20 +904,17 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-      const sources = Array.isArray(body.sources)
-        ? body.sources.filter((source): source is string => typeof source === 'string' && source.trim().length > 0).map(source => source.trim())
-        : [];
+      const sources = parseInstallLocalLinksSources(parsed);
       if (sources.length === 0) return jsonRes(res, 400, { ok: false, error: 'sources_required' });
+      if (sources.length > MAX_LOCAL_LINK_SOURCES) return jsonRes(res, 400, { ok: false, error: 'too_many_sources' });
       try {
         const skills = installLocalSkillLinks(sources);
-        return jsonRes(res, 200, {
-          ok: true,
-          installed: skills.map(sanitizeSkillForDashboard),
-          ...dashboardSkillsPayload(),
-        });
+        // Frontend re-fetches /api/skills (refresh()) after success, so we keep
+        // the response lean — no need to spread a full dashboardSkillsPayload()
+        // (which would re-run the native-skill discovery scan a second time).
+        return jsonRes(res, 200, { ok: true, installed: skills.map(sanitizeSkillForDashboard) });
       } catch (err: any) {
-        return jsonRes(res, 400, { ok: false, error: err?.message ?? String(err) });
+        return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
       }
     }
 
