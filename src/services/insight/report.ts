@@ -66,7 +66,9 @@ const DEFAULT_SLOW_THRESHOLD_MS = 60_000;
 const DIAGNOSTIC_TARGET_CAP = 100;
 const SEVERITY_ORDER: Record<InsightSeverity, number> = { bad: 0, warn: 1, info: 2 };
 const SUPPORTED_CLI_IDS = new Set(['claude-code', 'seed', 'relay', 'aiden', 'codex', 'traex', 'antigravity']);
-const PARSE_CACHE_MAX = 256;
+// Sized above MAX_OVERVIEW_LIMIT so a single overview pass doesn't evict its own
+// earlier sessions (FIFO thrash), defeating the parse-cache amortization.
+const PARSE_CACHE_MAX = 600;
 const parseCache = new Map<string, InsightParseResult>();
 
 export function __resetInsightReportCacheForTest(): void {
@@ -1093,16 +1095,20 @@ export function buildSafeInsightReport(q: InsightReportQuery, opts: BuildInsight
 }
 
 function mergeAgg(into: SafeInsightAggregate, agg: SafeInsightAggregate): void {
-  into.totalSpans += agg.totalSpans;
-  into.failedSpans += agg.failedSpans;
-  into.slowSpans += agg.slowSpans;
-  into.compactions += agg.compactions;
-  for (const [tool, count] of Object.entries(agg.failByTool)) {
-    into.failByTool[tool] = (into.failByTool[tool] ?? 0) + count;
+  // Defensive: in the cross-daemon merge, `agg` comes from a peer daemon's HTTP
+  // response, so don't assume its shape — a malformed chunk must not throw and
+  // 500 the whole aggregated overview (it should just contribute nothing).
+  if (!agg || typeof agg !== 'object') return;
+  into.totalSpans += agg.totalSpans ?? 0;
+  into.failedSpans += agg.failedSpans ?? 0;
+  into.slowSpans += agg.slowSpans ?? 0;
+  into.compactions += agg.compactions ?? 0;
+  for (const [tool, count] of Object.entries(agg.failByTool ?? {})) {
+    into.failByTool[tool] = (into.failByTool[tool] ?? 0) + (count ?? 0);
   }
   for (const phase of INSIGHT_PHASES) {
-    into.phase[phase].count += agg.phase[phase]?.count ?? 0;
-    into.phase[phase].ms += agg.phase[phase]?.ms ?? 0;
+    into.phase[phase].count += agg.phase?.[phase]?.count ?? 0;
+    into.phase[phase].ms += agg.phase?.[phase]?.ms ?? 0;
   }
 }
 
@@ -1135,10 +1141,18 @@ function overviewSuggestions(reports: SafeInsightReport[]): SafeInsightOverviewS
     .slice(0, 12);
 }
 
-export function buildSafeInsightOverview(
+/** Yield to the event loop so a large overview (up to MAX_OVERVIEW_LIMIT sessions,
+ *  each a synchronous transcript read+parse) can't monopolize the single-threaded
+ *  daemon — Lark dispatch / PTY IO get a slot between batches. */
+const OVERVIEW_YIELD_EVERY = 16;
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve));
+}
+
+export async function buildSafeInsightOverview(
   sessions: InsightOverviewSessionInput[],
   opts: BuildInsightOverviewOptions = {},
-): SafeInsightOverview {
+): Promise<SafeInsightOverview> {
   const parsedAt = (opts.now?.() ?? new Date()).toISOString();
   const requestedLimit = opts.limit ?? DEFAULT_OVERVIEW_LIMIT;
   const limit = Math.min(Math.max(Math.floor(requestedLimit) || DEFAULT_OVERVIEW_LIMIT, 1), MAX_OVERVIEW_LIMIT);
@@ -1146,18 +1160,23 @@ export function buildSafeInsightOverview(
     .slice()
     .sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0));
   const selected = input.slice(0, limit);
-  const rows = selected.map(s => ({
-    sessionId: s.sessionId,
-    cliId: s.cliId ?? 'unknown',
-    cliSessionId: s.cliSessionId,
-    title: s.title,
-    botName: s.botName,
-    larkAppId: s.larkAppId,
-    workingDir: s.workingDir ?? s.cwd,
-    status: s.status,
-    lastMessageAt: s.lastMessageAt,
-    report: buildSafeInsightReport(s, { ...opts, detail: 'summary', now: () => new Date(parsedAt) }),
-  }));
+  const rows: SafeInsightOverview['sessions'] = [];
+  for (let i = 0; i < selected.length; i++) {
+    const s = selected[i]!;
+    rows.push({
+      sessionId: s.sessionId,
+      cliId: s.cliId ?? 'unknown',
+      cliSessionId: s.cliSessionId,
+      title: s.title,
+      botName: s.botName,
+      larkAppId: s.larkAppId,
+      workingDir: s.workingDir ?? s.cwd,
+      status: s.status,
+      lastMessageAt: s.lastMessageAt,
+      report: buildSafeInsightReport(s, { ...opts, detail: 'summary', now: () => new Date(parsedAt) }),
+    });
+    if ((i + 1) % OVERVIEW_YIELD_EVERY === 0 && i + 1 < selected.length) await yieldToEventLoop();
+  }
   const reports = rows.map(r => r.report);
   const okReports = reports.filter(r => r.status === 'ok');
   const agg = emptyAgg();

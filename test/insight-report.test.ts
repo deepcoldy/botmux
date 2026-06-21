@@ -647,9 +647,9 @@ describe('SafeInsightReport', () => {
     expect(JSON.stringify(report)).not.toContain('/private/path');
   });
 
-  it('builds a cross-session safe overview with aggregate suggestions', () => {
+  it('builds a cross-session safe overview with aggregate suggestions', async () => {
     resolvedPath = writeClaudeFailureFixture(3);
-    const overview = buildSafeInsightOverview([
+    const overview = await buildSafeInsightOverview([
       {
         cliId: 'claude-code',
         sessionId: 's1',
