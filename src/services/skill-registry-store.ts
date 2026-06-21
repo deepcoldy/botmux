@@ -61,6 +61,21 @@ export function installLocalSkill(dir: string, opts: { link: boolean }): SkillPa
   return registry.skills[pkg.name];
 }
 
+export function installLocalSkillLinks(dirs: readonly string[]): SkillPackage[] {
+  const uniqueDirs = [...new Set(dirs.map((dir) => resolve(dir)))];
+  const packages = uniqueDirs.map((sourceDir) => {
+    const provisional = loadSkillPackage(sourceDir, { source: { type: 'local-link', path: sourceDir } });
+    return loadSkillPackage(sourceDir, { source: { type: 'local-link', path: sourceDir }, id: provisional.id });
+  });
+  const now = new Date().toISOString();
+  const registry = readSkillRegistry();
+  for (const pkg of packages) {
+    registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+  }
+  writeSkillRegistry(registry);
+  return packages.map(pkg => registry.skills[pkg.name]);
+}
+
 function sourceId(url: string): string {
   return createHash('sha256').update(url).digest('hex').slice(0, 16);
 }

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { skillRegistryPath } from '../src/core/skills/registry-paths.js';
-import { installLocalSkill, readSkillRegistry, removeInstalledSkill } from '../src/services/skill-registry-store.js';
+import { installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -45,6 +45,20 @@ describe('skill registry store', () => {
 
     expect(pkg.rootDir).toBe(realpathSync(join(src, 'review')));
     expect(readSkillRegistry().skills.review.source.type).toBe('local-link');
+  });
+
+  it('installs multiple local links with one registry write path', () => {
+    write(join(src, 'api', 'SKILL.md'), '---\nname: api\n---\n# API');
+    write(join(src, 'docs', 'SKILL.md'), '---\nname: docs\n---\n# Docs');
+
+    const packages = installLocalSkillLinks([join(src, 'api'), join(src, 'docs')]);
+    const registry = readSkillRegistry();
+
+    expect(packages.map(pkg => pkg.name).sort()).toEqual(['api', 'docs']);
+    expect(registry.skills.api.source).toMatchObject({ type: 'local-link', path: join(src, 'api') });
+    expect(registry.skills.docs.source).toMatchObject({ type: 'local-link', path: join(src, 'docs') });
+    expect(registry.skills.api.rootDir).toBe(realpathSync(join(src, 'api')));
+    expect(registry.skills.docs.rootDir).toBe(realpathSync(join(src, 'docs')));
   });
 
   it('removes the registry entry and store copy for local-copy installs', () => {

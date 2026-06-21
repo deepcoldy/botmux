@@ -4792,7 +4792,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 }
 
 .skills-discovery-dialog {
-  width: min(780px, calc(100vw - 44px));
+  width: min(860px, calc(100vw - 44px));
   max-height: min(760px, calc(100vh - 64px));
   padding: 0;
   border: 1px solid var(--border-soft);
@@ -4844,9 +4844,67 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   padding: 16px 20px;
 }
 
+.skills-discovery-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.skills-discovery-tabs button {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 8px;
+  align-items: center;
+  flex: 0 0 auto;
+  min-height: 38px;
+  padding: 0 12px;
+  border-radius: 999px;
+  text-transform: uppercase;
+}
+
+.skills-discovery-tabs button.selected {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--fg);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.skills-discovery-tabs strong {
+  font-size: 12px;
+}
+
+.skills-discovery-tabs small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: none;
+}
+
+.skills-discovery-path {
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 70%, transparent);
+}
+
+.skills-discovery-path code {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .skills-discovery-group {
   display: grid;
   gap: 8px;
+}
+
+.skills-discovery-group[hidden] {
+  display: none;
 }
 
 .skills-discovery-group header {

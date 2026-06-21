@@ -46,6 +46,7 @@ import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
+  installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
   updateInstalledSkillAsync,
@@ -893,6 +894,30 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skills/install-local-links') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      const sources = Array.isArray(body.sources)
+        ? body.sources.filter((source): source is string => typeof source === 'string' && source.trim().length > 0).map(source => source.trim())
+        : [];
+      if (sources.length === 0) return jsonRes(res, 400, { ok: false, error: 'sources_required' });
+      try {
+        const skills = installLocalSkillLinks(sources);
+        return jsonRes(res, 200, {
+          ok: true,
+          installed: skills.map(sanitizeSkillForDashboard),
+          ...dashboardSkillsPayload(),
+        });
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: err?.message ?? String(err) });
       }
     }
 
