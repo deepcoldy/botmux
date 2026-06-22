@@ -7041,6 +7041,10 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .hot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: start; }
 .insights-page .ihist-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .insights-page .ihist-head h3 { margin: 0; }
+.insights-page .trend-block { grid-column: 1 / -1; }
+.insights-page .trend { display: flex; align-items: flex-end; gap: 2px; height: 60px; padding-top: 8px; }
+.insights-page .trendbar { flex: 1 1 0; min-width: 2px; min-height: 2px; background: var(--acc); opacity: .8; border-radius: 2px 2px 0 0; transition: height .4s ease; }
+.insights-page .trendbar:hover { opacity: 1; }
 .insights-page .hot-sessions, .insights-page .hot-note { grid-column: 1 / -1; }
 .insights-page .hot-note { margin-top: 2px; }
 .insights-page .insight-disclosure { margin-top: 16px; color: var(--ins-faint); font-size: 11px; line-height: 1.55; border-top: 1px solid var(--line); padding-top: 10px; }

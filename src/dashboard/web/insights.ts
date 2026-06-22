@@ -390,9 +390,33 @@ function renderHistogram(title: string, values: number[], bins: Array<{ label: s
   </section>`;
 }
 
+// Sessions-per-day over the last 4 weeks (from each record's lastMessageAt) — a quick
+// "how busy lately" trend. Pure client-side, no new engine data.
+function renderTrend(records: InsightRecord[]): string {
+  const DAYS = 28;
+  const dayMs = 86400000;
+  const now = Date.now();
+  const counts = new Array(DAYS).fill(0);
+  for (const rec of records) {
+    const ts = Number(rec.session.lastMessageAt ?? 0);
+    if (!ts) continue;
+    const age = Math.floor((now - ts) / dayMs);
+    if (age >= 0 && age < DAYS) counts[DAYS - 1 - age]++;
+  }
+  const total = counts.reduce((a, b) => a + b, 0);
+  if (!total) return '';
+  const max = Math.max(1, ...counts);
+  const bars = counts.map(c => `<i class="trendbar" style="height:${c ? Math.max(8, Math.round((c / max) * 100)) : 2}%" data-tip="${c}"></i>`).join('');
+  return `<section class="block trend-block">
+    <div class="ihist-head"><h3>${escapeHtml(t('insights.distTrend'))}</h3><span class="mut">${escapeHtml(t('insights.distTrendSub'))} · ${total}</span></div>
+    <div class="trend">${bars}</div>
+  </section>`;
+}
+
 function renderDistribution(records: InsightRecord[]): string {
   const reports = okReports(records);
   if (!reports.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
+  const churn = reports.map(r => (r.hot?.files ?? []).reduce((s, f) => s + (f.added ?? 0) + (f.removed ?? 0), 0));
   const spans = reports.map(r => r.agg.totalSpans);
   const failed = reports.map(r => r.agg.failedSpans);
   const slow = reports.map(r => r.agg.slowSpans);
@@ -400,6 +424,7 @@ function renderDistribution(records: InsightRecord[]): string {
   const rw = reports.map(r => r.agg.readWriteRatio).filter((v): v is number => v !== null && Number.isFinite(v));
   return `<p class="mut ins-hint">${escapeHtml(t('insights.distHint'))}</p>
   <div class="ihist-grid">
+    ${renderTrend(records)}
     ${renderHistogram(t('insights.distSpans'), spans, [
       { label: '0–10', test: v => v <= 10 },
       { label: '11–50', test: v => v > 10 && v <= 50 },
@@ -433,6 +458,13 @@ function renderDistribution(records: InsightRecord[]): string {
       { label: '1–3', test: v => v >= 1 && v < 3 },
       { label: '3+', test: v => v >= 3 },
     ], n => n.toFixed(1)) : ''}
+    ${renderHistogram(t('insights.distChurn'), churn, [
+      { label: '0', test: v => v === 0 },
+      { label: '1–100', test: v => v > 0 && v <= 100 },
+      { label: '100–1k', test: v => v > 100 && v <= 1000 },
+      { label: '1k–10k', test: v => v > 1000 && v <= 10000 },
+      { label: '10k+', test: v => v > 10000 },
+    ])}
   </div>
   ${disclosureNote()}`;
 }
