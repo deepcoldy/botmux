@@ -8,9 +8,11 @@ import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } 
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
+import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { sessionKey } from '../src/core/types.js';
 import { writeTeamRoleFile } from '../src/core/role-resolver.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
@@ -163,6 +165,50 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     expect(res.status).toBe(502);
     expect(await res.json()).toMatchObject({ ok: false });
     findSpy.mockRestore();
+  });
+});
+
+describe('POST /api/sessions/:sessionId/resume', () => {
+  it('wakes a resumed session immediately when wake=1 is set', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
+      session.larkAppId = '';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      session.workingDir = process.cwd();
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume?wake=1`, { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: true, sessionId: session.sessionId, wake: true });
+      expect(registry.get(sessionKey('om_resume', ''))?.session.sessionId).toBe(session.sessionId);
+      expect(forkSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ session: expect.objectContaining({ sessionId: session.sessionId }) }),
+        '',
+        true,
+      );
+    } finally {
+      forkSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 

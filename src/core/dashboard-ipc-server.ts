@@ -535,7 +535,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/sandbox-land/:action', (_req, res, pa
  * CLI command (via this HTTP route). The CLI route also drops a notice into
  * the original Lark thread so users see why the session is alive again.
  */
-ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
   const sessionId = params.sessionId;
   const reg = getActiveSessionsRegistry();
   if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
@@ -546,6 +546,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) =>
   }
 
   const ds = result.ds;
+  const wake = new URL(req.url ?? '/', 'http://localhost').searchParams.get('wake') === '1';
   // Tell the dashboard the row flipped back to active (mirror of session.update
   // emitted by closeSession). Use `null` for closedAt — `undefined` would be
   // dropped by JSON.stringify on the SSE wire and the aggregator's spread
@@ -578,9 +579,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) =>
     }
   }
 
+  if (wake && (!ds.worker || ds.worker.killed)) {
+    forkWorker(ds, '', true);
+  }
+
   jsonRes(res, 200, {
     ok: true,
     sessionId,
+    wake,
     title: ds.session.title,
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
