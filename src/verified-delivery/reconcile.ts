@@ -4,18 +4,26 @@
  * The gap this closes: a worker often *claims* done in the goal chat but never
  * runs `botmux report`, so the ledger stays at TaskDispatched and the board never
  * advances — even though the artifacts are sitting right there on disk. The fix
- * agreed with 老滕: the supervisor treats a worker's chat ping as a *trigger to go
- * check the ledger*, NOT as proof. If the ledger is stale, the supervisor VERIFIES
- * the work itself by mechanically running the structured acceptance criteria (#7),
- * then writes report+accept (it really passes) or reject (it doesn't). The chat
- * claim is never trusted; the criteria checks are the proof.
+ * agreed with 老滕: a worker's chat ping is a *trigger to go check the ledger*,
+ * NOT proof. The mechanical layer VERIFIES the work itself by running the
+ * structured acceptance criteria (#7); the chat claim is never trusted, the
+ * criteria checks are the proof.
  *
- * This keeps the verified-delivery thesis intact — chat ≠ truth, evidence is — and
- * only removes the dependence on worker discipline (and on an L2 LLM eyeballing).
- * The deterministic path REQUIRES structured `acceptanceCriteria`; legacy free-text
- * tasks return `no-criteria` so the caller (goal-watchdog) falls back to the LLM
- * injection it already does. The watchdog owns the *trigger* (on worker message /
- * on tick) and any chat notification; this module owns the verify + ledger writes.
+ * BUT the mechanical layer is a *verifier*, not an autonomous decision-maker —
+ * the supervisor (L2) is the one who 统揽 (owns the goal). So the only accept this
+ * module makes on its own is confirming a delivery the worker ACTUALLY FILED
+ * (`pass + pending report → accept`). When the artifacts merely satisfy the
+ * criteria on disk but the worker never reported, it must NOT fabricate a
+ * completion (the bug 老滕 caught: a stray/leftover file getting auto-stamped);
+ * it returns `unreported-pass` with an inspection fact and lets the supervisor
+ * decide (代办 report+accept with explicit trace / 催交 / 重派).
+ *
+ * This keeps the verified-delivery thesis intact — chat ≠ truth, evidence is —
+ * while keeping ownerless completion calls out of a dumb rule. The deterministic
+ * path REQUIRES structured `acceptanceCriteria`; legacy free-text tasks return
+ * `no-criteria` so the caller (goal-watchdog) falls back to the LLM injection it
+ * already does. The watchdog owns the *trigger* (on worker message / on tick) and
+ * routing the inspection facts to L2; this module owns verify + the safe writes.
  *
  * Trust boundary: `command` checks run arbitrary shell the *dispatcher* authored
  * (same author who could already make the L2 avatar run them). P0/P1 is same-host /
@@ -24,7 +32,6 @@
  */
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { buildReport } from './report.js';
 import type { LedgerHandle } from './ledger.js';
 import { REJECT_REASON } from './types.js';
 import type { AcceptanceCriteria } from './types.js';
@@ -130,8 +137,17 @@ export function verifyAcceptanceCriteria(criteria: AcceptanceCriteria, opts: Ver
 // ─── reconcile (verify → write the right ledger events) ───────────────────────
 
 export type ReconcileAction =
-  /** Verify passed → ledger is now accepted (existing or synthesized report). */
+  /** Verify passed on a worker's *pending report* → ledger is now accepted.
+   *  This is the ONLY autonomous accept the mechanical layer is allowed to make:
+   *  it merely confirms a delivery the worker actually filed. */
   | 'accepted'
+  /** Verify passed but the worker NEVER filed a report — the artifacts merely
+   *  happen to satisfy the criteria on disk. The mechanical layer must NOT
+   *  fabricate a report+accept here (that's an ownerless completion call). It
+   *  surfaces an inspection fact (see ReconcileResult.inspectionFact) and defers
+   *  to the supervisor (L2): 代办 report+accept after independent verification /
+   *  催交 / 重派. The supervisor — not a dumb rule — owns the decision. */
+  | 'unreported-pass'
   /** Verify failed on a worker's pending report → ledger is now rejected. */
   | 'rejected'
   /** Verify failed and nothing is on the ledger yet → caller should nudge worker;
@@ -159,6 +175,9 @@ export interface ReconcileResult {
   reportId?: string;
   /** Whether the verdict append deduped (idempotent re-run). */
   deduped?: boolean;
+  /** For 'unreported-pass' only: a human-readable fact the caller injects to the
+   *  supervisor (L2) so it can decide 代办/催交/重派. Never a ledger write. */
+  inspectionFact?: string;
 }
 
 export interface ReconcileOpts {
@@ -192,13 +211,14 @@ function verifyTrailText(v: AcceptanceVerifyResult): string {
  * report writes nothing (`nudge`) so it's safe to call every tick.
  *
  * Decision table:
- *   no task ............................. unknown-task   (no write)
+ *   no task ............................. unknown-task    (no write)
  *   status=accepted ..................... already-accepted (no write)
- *   no acceptanceCriteria ............... no-criteria    (no write; caller → LLM)
- *   pass + pending report .............. accept that report
- *   pass + no pending report ........... synthesize report-on-behalf + accept
+ *   status=blocked/escalated ........... blocked/escalated (no write; → supervisor)
+ *   no acceptanceCriteria ............... no-criteria     (no write; caller → LLM)
+ *   pass + pending report .............. accept that report (auto-verify a real delivery)
+ *   pass + no report ................... unreported-pass (no write; → supervisor decides)
  *   fail + pending report .............. reject that report
- *   fail + no pending report ........... nudge           (no write)
+ *   fail + no pending report ........... nudge            (no write)
  */
 export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, opts: ReconcileOpts): ReconcileResult {
   const task = ledger.task(taskId);
@@ -221,34 +241,35 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
   const pendingReport = latest && !latest.verdict ? latest : undefined;
 
   if (verify.passed) {
-    let reportId = pendingReport?.reportId;
-    if (!reportId) {
-      // Worker never (re)reported — synthesize a report-on-behalf carrying the
-      // criteria artifacts as path-evidence + the verify trail as inline evidence,
-      // so the ledger has a real, inspectable delivery record (not a chat claim).
-      const built = buildReport({
-        taskId,
-        summary: `监管者对账自动补登（worker 未自报）：${verifySummary(verify)}`,
-        artifacts: (criteria.artifacts ?? []).map((a) => a.path),
-        inline: [{ name: 'reconcile-verify.txt', content: verifyTrailText(verify) }],
-        workerOpenId: task.workerOpenIds?.[0],
-        chatId: task.chatId,
-        ts: opts.now,
-      }, ledger);
-      ledger.append(built.draft);
-      reportId = built.reportId;
+    // Only autonomously accept when the worker actually FILED a report — this is a
+    // deterministic confirmation of a real delivery, not an ownerless completion call.
+    if (pendingReport) {
+      const reportId = pendingReport.reportId;
+      const res = ledger.append({
+        type: 'TaskAccepted', actor: 'orchestrator', taskId, chatId: task.chatId,
+        idempotencyKey: `accepted:${taskId}:${reportId}`, ts: opts.now,
+        payload: {
+          taskId, reportId, checkedBy: opts.checkedBy, via: 'reconcile',
+          note: '对账自动验收：worker 已交付，结构化 acceptanceCriteria 全部通过',
+          evidenceChecked: verify.evidenceChecked.length ? verify.evidenceChecked : undefined,
+          ranCommands: verify.ranCommands.length ? verify.ranCommands : undefined,
+        },
+      });
+      return { taskId, action: 'accepted', verify, reportId, deduped: res.deduped };
     }
-    const res = ledger.append({
-      type: 'TaskAccepted', actor: 'orchestrator', taskId, chatId: task.chatId,
-      idempotencyKey: `accepted:${taskId}:${reportId}`, ts: opts.now,
-      payload: {
-        taskId, reportId, checkedBy: opts.checkedBy, via: 'reconcile',
-        note: '对账自动验收：结构化 acceptanceCriteria 全部通过',
-        evidenceChecked: verify.evidenceChecked.length ? verify.evidenceChecked : undefined,
-        ranCommands: verify.ranCommands.length ? verify.ranCommands : undefined,
-      },
-    });
-    return { taskId, action: 'accepted', verify, reportId, deduped: res.deduped };
+    // Artifacts satisfy the criteria but the worker NEVER filed a report. The
+    // mechanical layer must not fabricate a completion (the bug 老滕 caught: a
+    // stray/leftover file getting auto-stamped). Surface it as a fact for the
+    // supervisor to own the call: 代办 report+accept (with explicit trace) / 催交 / 重派.
+    const inspectionFact = [
+      `任务 ${taskId} 的产物已满足全部验收标准（${verifySummary(verify)}），但 worker 未走 botmux report 正式交付。`,
+      '核验明细：',
+      verifyTrailText(verify),
+      '请你（监管者）判断下一步，不要直接当作已完成：',
+      '① 独立核验属实 → 代 worker 落 report+accept，note 写明「supervisor 代办：worker 未自报，已独立核验」；',
+      '② 让 worker 正式用 botmux report 交付；③ 产物可疑/不对 → 重派或驳回。',
+    ].join('\n');
+    return { taskId, action: 'unreported-pass', verify, inspectionFact };
   }
 
   if (pendingReport) {

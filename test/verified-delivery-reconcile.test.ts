@@ -95,22 +95,19 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(led.read()).toHaveLength(1); // nothing appended
   });
 
-  it('dispatched + verify pass → synthesizes report-on-behalf + accepts', () => {
+  it('dispatched + verify pass but NO worker report → unreported-pass, writes NOTHING (defers to supervisor)', () => {
+    // The bug 老滕 caught: a stray/leftover file satisfying the criteria must NOT be
+    // auto-stamped as a completion. The mechanical layer surfaces a fact and leaves
+    // the accept call to the supervisor (L2).
     const led = dispatched('t1', { workerOpenIds: ['ou_worker'] });
+    const before = led.read().length;
     const r = reconcileTaskByCriteria(led, 't1', { checkedBy: 'ou_sup', now: TS, verify: pass });
-    expect(r.action).toBe('accepted');
-    const task = led.task('t1')!;
-    expect(task.status).toBe('accepted');
-    expect(task.reports).toHaveLength(1);
-    const rep = task.reports[0];
-    expect(rep.workerOpenId).toBe('ou_worker');
-    // synthetic report carries the criteria artifact as path-evidence + a verify-trail blob
-    expect(rep.evidence.some((e) => e.kind === 'path' && e.path === '/tmp/vd-demo/x.txt')).toBe(true);
-    expect(rep.evidence.some((e) => e.kind === 'inline')).toBe(true);
-    expect(rep.verdict).toBe('accepted');
-    expect(rep.checkedBy).toBe('ou_sup');
-    expect(rep.evidenceChecked).toEqual(['/x']);
-    expect(rep.verdictVia).toBe('reconcile'); // self-identifies as machine-reconciled
+    expect(r.action).toBe('unreported-pass');
+    expect(r.verify?.passed).toBe(true);
+    expect(r.inspectionFact).toContain('未走 botmux report'); // the fact handed to L2
+    expect(r.inspectionFact).toContain('代办'); // and the options it must choose among
+    expect(led.read()).toHaveLength(before); // mechanical layer fabricates no report/accept
+    expect(led.task('t1')!.status).toBe('dispatched'); // still pending — supervisor owns the call
   });
 
   it('dispatched + verify fail → nudge, nothing written to the ledger', () => {
@@ -148,6 +145,7 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
 
   it('idempotent: re-running an accepted task does nothing', () => {
     const led = dispatched('t5');
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't5', chatId: 'oc_g', idempotencyKey: 'reported:t5-r1', payload: { taskId: 't5', reportId: 't5-r1', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/vd-demo/x.txt' }] } }));
     expect(reconcileTaskByCriteria(led, 't5', { checkedBy: 'sup', now: TS, verify: pass }).action).toBe('accepted');
     const after = led.read().length;
     const again = reconcileTaskByCriteria(led, 't5', { checkedBy: 'sup', now: TS + 1, verify: pass });
@@ -155,16 +153,32 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(led.read()).toHaveLength(after); // no new events
   });
 
-  it('end-to-end with real files: dispatched → reconcile auto-accepts on real artifacts', () => {
+  it('end-to-end with real files: worker reported + reconcile auto-accepts on real artifacts', () => {
     const led = openLedger({ baseDir });
     const dirReal = mkdtempSync(join(tmpdir(), 'vd-real-'));
     const file = join(dirReal, 'codex.txt'); writeFileSync(file, 'DEMO-CODEX-OK');
     const crit: AcceptanceCriteria = { version: 1, artifacts: [{ path: file, checks: [{ type: 'exists' }, { type: 'contains', text: 'DEMO-CODEX-OK' }] }] };
     led.append(draft({ type: 'TaskDispatched', taskId: 't-e2e', chatId: 'oc_g', idempotencyKey: 'dispatched:t-e2e', payload: { taskId: 't-e2e', acceptanceCriteria: crit, workerOpenIds: ['ou_codex'] } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-e2e', chatId: 'oc_g', idempotencyKey: 'reported:t-e2e-r1', payload: { taskId: 't-e2e', reportId: 't-e2e-r1', summary: 'done', evidence: [{ kind: 'path', path: file }] } }));
     const r = reconcileTaskByCriteria(led, 't-e2e', { checkedBy: 'ou_sup', now: TS });
     expect(r.action).toBe('accepted');
     expect(r.verify?.passed).toBe(true);
     expect(led.task('t-e2e')!.status).toBe('accepted');
+    rmSync(dirReal, { recursive: true, force: true });
+  });
+
+  it('end-to-end with real files: artifacts pass but worker never reported → unreported-pass, no write', () => {
+    const led = openLedger({ baseDir });
+    const dirReal = mkdtempSync(join(tmpdir(), 'vd-real2-'));
+    const file = join(dirReal, 'codex.txt'); writeFileSync(file, 'DEMO-CODEX-OK');
+    const crit: AcceptanceCriteria = { version: 1, artifacts: [{ path: file, checks: [{ type: 'exists' }, { type: 'contains', text: 'DEMO-CODEX-OK' }] }] };
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-e2e2', chatId: 'oc_g', idempotencyKey: 'dispatched:t-e2e2', payload: { taskId: 't-e2e2', acceptanceCriteria: crit, workerOpenIds: ['ou_codex'] } }));
+    const before = led.read().length;
+    const r = reconcileTaskByCriteria(led, 't-e2e2', { checkedBy: 'ou_sup', now: TS });
+    expect(r.action).toBe('unreported-pass'); // real artifacts, but no worker delivery → defer to L2
+    expect(r.verify?.passed).toBe(true);
+    expect(led.read()).toHaveLength(before); // nothing fabricated
+    expect(led.task('t-e2e2')!.status).toBe('dispatched');
     rmSync(dirReal, { recursive: true, force: true });
   });
 });
