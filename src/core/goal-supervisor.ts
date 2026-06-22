@@ -30,12 +30,16 @@ export interface GoalNotifyParentRequest {
   supervisorSessionId?: string;
   goalChatId?: string;
   summary: string;
+  attentionKind?: string;
+  attentionReason?: string;
 }
 
 export interface GoalNotifyParentResponse {
   ok: true;
   parentSessionId: string;
   goalChatId: string;
+  attentionKind?: string;
+  attentionReason?: string;
 }
 
 export interface GoalNotifyParentError {
@@ -173,6 +177,8 @@ export async function notifyGoalParent(
     ok: true,
     parentSessionId: parent.session.sessionId,
     goalChatId: supervisor.session.goalSupervisor.goalChatId,
+    attentionKind: req.attentionKind,
+    attentionReason: req.attentionReason,
   };
 }
 
