@@ -156,7 +156,7 @@ function filterRecords(records: InsightRecord[], filter: InsightFilter, q: strin
     const r = rec.report;
     if (scope.analyzableOnly && r?.status !== 'ok') return false;
     if (scope.project && projectOf(rec) !== scope.project) return false;
-    if (scope.sinceMs && Number(s.lastMessageAt ?? 0) < scope.sinceMs) return false;
+    if (scope.sinceMs && Number(s.lastMessageAt ?? s.spawnedAt ?? 0) < scope.sinceMs) return false;
     if (cliSel.size && !cliSel.has(cliIdOf(rec))) return false;
     if (filter === 'review' && !reportNeedsReview(r)) return false;
     if (filter === 'failed' && !(r?.status === 'ok' && r.agg.failedSpans > 0)) return false;
@@ -193,16 +193,6 @@ function renderCliChips(records: InsightRecord[], active: Set<string>): string {
     `<button type="button" class="spanchip${on ? ' on' : ''}" data-clifilter="${escapeHtml(key)}">${escapeHtml(label)} <b>${n}</b></button>`;
   return [chip('all', t('common.all'), records.length, active.size === 0),
     ...counts.map(c => chip(c.id, c.id, c.count, active.has(c.id)))].join('');
-}
-
-function sortRecords(records: InsightRecord[]): InsightRecord[] {
-  return [...records].sort((a, b) => {
-    const ar = a.report;
-    const br = b.report;
-    const aScore = (ar?.status === 'ok' ? ar.agg.failedSpans * 6 + ar.agg.slowSpans * 3 + ar.suggestions.filter(s => s.severity === 'bad').length * 5 : 0);
-    const bScore = (br?.status === 'ok' ? br.agg.failedSpans * 6 + br.agg.slowSpans * 3 + br.suggestions.filter(s => s.severity === 'bad').length * 5 : 0);
-    return bScore - aScore || Number(b.session.lastMessageAt ?? 0) - Number(a.session.lastMessageAt ?? 0);
-  });
 }
 
 function renderMetric(label: string, value: string, sub = ''): string {
@@ -400,7 +390,8 @@ function renderDistribution(records: InsightRecord[]): string {
   const slow = reports.map(r => r.agg.slowSpans);
   const agentMin = reports.map(r => agentMsOf(r) / 60000);
   const rw = reports.map(r => r.agg.readWriteRatio).filter((v): v is number => v !== null && Number.isFinite(v));
-  return `<div class="ihist-grid">
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.distHint'))}</p>
+  <div class="ihist-grid">
     ${renderHistogram(t('insights.distSpans'), spans, [
       { label: '0–10', test: v => v <= 10 },
       { label: '11–50', test: v => v > 10 && v <= 50 },
@@ -463,7 +454,8 @@ function renderHotspots(records: InsightRecord[]): string {
   }
   const projects = [...projMap.entries()].map(([id, v]) => ({ id, ...v })).sort((a, b) => b.fails - a.fails || b.sessions - a.sessions).slice(0, 10);
   const projMax = Math.max(1, ...projects.map(x => x.sessions));
-  return `<div class="hot-grid">
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.hotHint'))}</p>
+  <div class="hot-grid">
     <section class="block">
       <h3>${escapeHtml(t('insights.hotToolFailures'))}</h3>
       <div class="hbars">${tools.length ? tools.map(x => {
@@ -1078,7 +1070,9 @@ function renderConvoOps(unit: { turnIndex: number; msgs: InsightConversationMess
   const sayMsgs = unit.msgs.filter(m => m.text && !m.event);
   const opMsgs = unit.msgs.filter(m => m.event);
   const worst = unit.msgs.some(m => m.severity === 'bad') ? ' sev-bad' : unit.msgs.some(m => m.severity === 'warn') ? ' sev-warn' : '';
-  const say = sayMsgs.map(m => `<div class="cbub-say"><div class="md-body">${renderPromptMarkdown(m.text! + (m.truncated ? ' …' : ''))}</div></div>`).join('');
+  // m.text already carries a trailing '…' when truncated (safeScrubAndTruncate),
+  // so don't append another — that double-ellipsis'd the bubble.
+  const say = sayMsgs.map(m => `<div class="cbub-say"><div class="md-body">${renderPromptMarkdown(m.text!)}</div></div>`).join('');
   const rows = opMsgs.map(m => renderConvoOpRow(m, openOps.has(m.id))).join('');
   return `<div class="cbub cbub-left role-agent cbub-ops${worst}">
     <div class="cbub-head"><span class="tp-label tp-src tp-src-system">🤖 ${escapeHtml(t('insights.replayAgent'))}</span><span class="cbub-turn">#${escapeHtml(String(unit.turnIndex))}</span>${opMsgs.length ? `<span class="cbub-opcount">${escapeHtml(t('insights.replayOps', { count: opMsgs.length }))}</span>` : ''}${convoRecBadges(unit.turnIndex, recByTurn)}</div>
@@ -1372,8 +1366,8 @@ export function renderInsightsPage(root: HTMLElement): () => void {
       </form>
       <div id="insight-tabbar">${renderTabBar(tab)}</div>
       <div id="insight-status" class="insight-page-status"></div>
-      <div class="insight-panel" data-tabpanel="overview"><div id="insight-overview"></div></div>
-      <div class="insight-panel" data-tabpanel="sessions" hidden>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="overview"><div id="insight-overview"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="sessions" hidden>
         <div id="insight-list-view">
           <div class="insight-list-head">
             <span id="insight-list-subtitle"></span>
@@ -1386,8 +1380,8 @@ export function renderInsightsPage(root: HTMLElement): () => void {
           <div id="insight-detail">${renderDetailShell(undefined)}</div>
         </div>
       </div>
-      <div class="insight-panel" data-tabpanel="dist" hidden><div id="insight-dist"></div></div>
-      <div class="insight-panel" data-tabpanel="hot" hidden><div id="insight-hot"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="dist" hidden><div id="insight-dist"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="hot" hidden><div id="insight-hot"></div></div>
       <div id="insight-modal" class="insight-modal" hidden></div>
       <div id="insight-tip" class="ins-tip" role="tooltip" hidden></div>
     </section>`;
@@ -1478,7 +1472,11 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     overviewEl.innerHTML = overviewData ? renderOverview(aggregateRecords(rows)) : '';
     listSubtitle.textContent = t('insights.listCount', { shown: rows.length, total: records.length });
     sortBar.innerHTML = renderSortBar(sessSort);
-    list.innerHTML = renderSessionRows(rows, selectedId, true);
+    // When the analyzable-only default empties the list, point at the toggle so
+    // the user isn't stranded on a blank page wondering where their sessions went.
+    list.innerHTML = (!rows.length && !showNoise)
+      ? `<div class="insight-empty">${escapeHtml(t('insights.empty'))}<br><span class="mut">${escapeHtml(t('insights.emptyAnalyzableHint'))}</span></div>`
+      : renderSessionRows(rows, selectedId, true);
     const selected = rows.find(r => r.session.sessionId === selectedId) ?? records.find(r => r.session.sessionId === selectedId);
     if (!selectedId || !selected) detail.innerHTML = renderDetailShell(undefined);
     wireSessionButtons(list);

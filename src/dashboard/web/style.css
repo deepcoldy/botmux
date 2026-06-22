@@ -6877,6 +6877,7 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .ins-clear:hover { color: var(--fg); border-color: var(--acc); }
 
 /* distribution histograms + hotspots grids */
+.insights-page .ins-hint { margin: 0 0 12px; font-size: 12px; }
 .insights-page .ihist-grid,
 .insights-page .hot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: start; }
 .insights-page .ihist-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
@@ -6907,11 +6908,8 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
   .insights-page .slist.wide .srstats { justify-content: flex-start; flex-wrap: wrap; }
 }
 
-/* workbench: session list | detail (master-detail) */
-.insight-workbench { display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr); gap: 14px; align-items: start; }
-@media (max-width: 900px) { .insight-workbench { grid-template-columns: 1fr; } }
-.insight-workbench > *, .insight-list-panel, .insight-detail { min-width: 0; }
-.insight-list-panel, .insight-detail { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+/* session detail panel (full-width detail view) */
+.insight-detail { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
 .insight-list-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .insight-list-head h3 { font-size: 13px; margin: 0; }
 .insight-list-head span { font-size: 11px; color: var(--mut); }
@@ -7420,11 +7418,11 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 @keyframes insight-bar-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 .insights-page .insights-metrics { animation: insight-fade-up .35s ease both; }
 .insights-page .insights-overview-grid { animation: insight-fade-up .35s ease both; animation-delay: .05s; }
-.insights-page .insight-workbench { animation: insight-fade-up .35s ease both; animation-delay: .1s; }
+.insights-page .insight-panel { animation: insight-fade-up .35s ease both; animation-delay: .1s; }
 @media (prefers-reduced-motion: reduce) {
   .insights-page .insights-metrics,
   .insights-page .insights-overview-grid,
-  .insights-page .insight-workbench,
+  .insights-page .insight-panel,
   .insights-page .hbfill { animation: none; }
   .insights-page .srow { transition: none; }
   .insights-page .srow:hover { transform: none; }

@@ -831,9 +831,20 @@ function buildTurnTimeline(
     row.push({ span, index });
     grouped.set(span.turnIndex, row);
   });
-  return [...grouped.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([turnIndex, rows]) => {
+  // A fully tool-less turn (pure Q&A / clarification / text-only reply) produces
+  // no span, so keying turns off `grouped` alone would drop it from the timeline
+  // and the conversation replay entirely. Union in every turn index that carries
+  // a prompt / context / narration so a span-less turn still renders (empty
+  // events, just its prompt + say). Detail==='summary' passes these undefined, so
+  // summary reports are unaffected — only span-bearing turns appear there.
+  const turnIndexes = new Set<number>(grouped.keys());
+  turnPrompts?.forEach((p, i) => { if (p) turnIndexes.add(i); });
+  turnContext?.forEach((c, i) => { if (c) turnIndexes.add(i); });
+  turnAgentSay?.forEach((s, i) => { if (s?.text) turnIndexes.add(i); });
+  return [...turnIndexes]
+    .sort((a, b) => a - b)
+    .map(turnIndex => {
+      const rows = grouped.get(turnIndex) ?? [];
       const rowSpans = rows.map(r => r.span);
       const diag = diagByTurn.get(turnIndex);
       const tags = [...new Set(rowSpans.flatMap(s => s.tags ?? ['normal']))] as SafeSpanTag[];
