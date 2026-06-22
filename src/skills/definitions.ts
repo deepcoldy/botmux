@@ -1216,9 +1216,9 @@ botmux dispatch --chat-id "<goalId>" --title "<子项目标题>" --bot "<coder_o
 
 ### 7. 收结果 + 验收（查账本，不信聊天）
 子 bot 用 \`botmux report --task <taskId> --summary ... --artifact <证据>\` 交付 → 你被唤起。**验收只认账本，不认聊天里说的"完成"**：
-- 先查账本拿结构化状态：\`botmux delivery list --goal <goalId>\`（本项目所有任务的 dispatched/reported/accepted/rejected）；单个看 \`botmux delivery show <taskId>\`。
+- 先查账本拿结构化状态：\`botmux delivery list --goal <goalId>\`（本项目所有任务的 dispatched/reported/accepted/rejected）；单个看 \`botmux delivery show --task <taskId>\`。
 - 对 reported 的任务**优先用硬证据验收**：能跑测试就跑、能读产物就读；只有不可测的活（调研/设计）才纯靠判断。
-- 合格 → \`botmux delivery accept <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject <taskId> --reason ... --retry-brief ...\`（会自动回推到子 bot 话题，让它用同一 taskId 重做）。
+- 合格 → \`botmux delivery accept --task <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject --task <taskId> --reason ... --retry-brief ...\`（会自动回推到子 bot 话题，让它用同一 taskId 重做）。
 - 推进：有依赖的下一波，依赖满足了再 dispatch；**卡住/超时靠查账本**——\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的任务，去对应话题 \`botmux dispatch --into <root>\` @ 它问进展或改派（不靠后台轮询）。
 - 全程把关键节点用 \`botmux send\` 同步用户（人看飞书任务板也能一眼掌握）。
 
