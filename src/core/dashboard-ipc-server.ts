@@ -71,7 +71,7 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
-import type { ScheduledTask, ParsedSchedule, Session } from '../types.js';
+import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 
@@ -192,6 +192,27 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
+    return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
+  }
+  if (!ds.worker || ds.worker.killed) {
+    return jsonRes(res, 409, { ok: false, error: 'worker_not_running' });
+  }
+  try {
+    ds.worker.send({ type: 'restart' } as DaemonToWorker);
+  } catch (err) {
+    return jsonRes(res, 502, { ok: false, error: String(err) });
+  }
+  jsonRes(res, 200, {
+    ok: true,
+    sessionId: params.sessionId,
+    cliId: ds.session.cliId ?? 'unknown',
+  });
 });
 
 /** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与

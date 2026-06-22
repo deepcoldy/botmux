@@ -141,6 +141,7 @@ const ICON = {
   close: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.2 4.2 11.8 11.8"/><path d="M11.8 4.2 4.2 11.8"/></svg>',
   edit: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.7 3.3 12.7 5.3 6.3 11.7 3.7 12.3 4.3 9.7 10.7 3.3z"/></svg>',
   history: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.2 4.8a2 2 0 0 1 2-2h7.6a2 2 0 0 1 2 2v4.6a2 2 0 0 1-2 2H6.6l-2.9 2.4v-2.4h-.5a2 2 0 0 1-2-2z"/><path d="M5.2 6.2h5.6M5.2 8.4h3.6"/></svg>',
+  restart: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.4 6.2a4.8 4.8 0 1 0 1.1 3.1"/><path d="M12.4 2.9v3.3H9.1"/></svg>',
   // 飞书：两片交叠的羽毛向右上展翅（还原 Lark 彩色 logo 的飞鸟造型），单色
   // stroke:currentColor 适配本组线性图标，圆角端点呼应原 logo 的圆润羽尖。
   feishu: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.6 4.4C6.4 4 10.4 5.4 13.4 8.2 9.8 7 6.4 6.6 3.4 7.4"/><path d="M13.4 8.2C9.6 8.7 6 10 2.9 12 5.6 9 8.8 7.6 13.4 8.2"/></svg>',
@@ -212,6 +213,24 @@ export function renderCliFilterGroup(): string {
       `).join('')}
     </div>
   </details>`;
+}
+
+export function restartConfirmMessage(s: any): string {
+  const status = String(s.status ?? 'unknown');
+  const cli = String(s.cliId ?? 'unknown');
+  const sep = ui.locale === 'zh' ? '：' : ': ';
+  return [
+    t('sessions.restartConfirmIntro'),
+    '',
+    `${t('sessions.restartConfirmStatus')}${sep}${status}`,
+    `${t('sessions.restartConfirmCli')}${sep}${cli}`,
+    '',
+    t('sessions.restartConfirmQuestion'),
+  ].join('\n');
+}
+
+export function canRestartSession(s: any): boolean {
+  return s.status !== 'closed' && !s.adopt && !s.pendingRepo;
 }
 
 function pageHtml(): string {
@@ -615,6 +634,7 @@ export function renderSessionsPage(root: HTMLElement) {
       <div class="session-card-actions">
         ${chatScopeLink(s) ?? cardActBtn('locate', ICON.pin, t('sessions.locate'))}
         ${cardActBtn('details', ICON.details, t('sessions.details'))}
+        ${canRestartSession(s) ? cardActBtn('restart', ICON.restart, t('sessions.restart')) : ''}
         ${terminalControlsHtml(terminal)}
         ${cardActBtn('close', ICON.close, t('sessions.close'), 'danger')}
       </div>
@@ -692,7 +712,8 @@ export function renderSessionsPage(root: HTMLElement) {
           <span class="kanban-card-dot" data-status="${escapeHtml(status)}" title="${escapeHtml(status)}"></span>
           ${remote ? '' : `<button type="button" class="card-act kanban-card-act" data-action="history" title="${escapeHtml(t('sessions.history.title'))}" aria-label="${escapeHtml(t('sessions.history.title'))}">${ICON.history}</button>
           ${s.feishuChatLink ? `<a class="card-act kanban-card-act" href="${escapeHtml(s.feishuChatLink)}" target="_blank" rel="noopener" title="${escapeHtml(t('sessions.kanban.openFeishu'))}" aria-label="${escapeHtml(t('sessions.kanban.openFeishu'))}">${ICON.feishu}</a>` : ''}
-          <button type="button" class="card-act kanban-card-act" data-action="details" title="${escapeHtml(t('sessions.details'))}" aria-label="${escapeHtml(t('sessions.details'))}">${ICON.details}</button>`}
+          <button type="button" class="card-act kanban-card-act" data-action="details" title="${escapeHtml(t('sessions.details'))}" aria-label="${escapeHtml(t('sessions.details'))}">${ICON.details}</button>
+          ${canRestartSession(s) ? `<button type="button" class="card-act kanban-card-act" data-action="restart" title="${escapeHtml(t('sessions.restart'))}" aria-label="${escapeHtml(t('sessions.restart'))}">${ICON.restart}</button>` : ''}`}
         </span>
       </div>
       <p class="kanban-card-title" title="${escapeHtml(String(s.title ?? title))}">${escapeHtml(String(title).slice(0, 140))}</p>
@@ -1354,6 +1375,25 @@ export function renderSessionsPage(root: HTMLElement) {
     }
   }
 
+  async function restartSession(s: any, restartBtn?: HTMLButtonElement): Promise<boolean> {
+    if (!confirm(restartConfirmMessage(s))) return false;
+    if (restartBtn) restartBtn.disabled = true;
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/restart`, { method: 'POST' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false) {
+        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.error ?? r.status}`);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      alert(`${t('sessions.restartFailed')}: ${e}`);
+      return false;
+    } finally {
+      if (restartBtn) restartBtn.disabled = false;
+    }
+  }
+
   // ── Insight (owner-only): render a SafeInsightReport into the drawer. All
   //    free text (suggestions, span input/output summaries) is escapeHtml'd —
   //    the report is already fail-closed redacted upstream, this is defense in
@@ -1426,6 +1466,7 @@ export function renderSessionsPage(root: HTMLElement) {
         ${chatScopeLink(s) ?? `<button id="locate-btn" type="button">${t('sessions.locate')}</button>`}
         <button id="history-drawer-btn" type="button">${t('sessions.history.title')}</button>
         ${terminalControlsHtml(terminal)}
+        ${canRestartSession(s) ? `<button id="restart-btn" type="button" class="primary">${t('sessions.restart')}</button>` : ''}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
         <button id="land-btn" type="button">${t('sessions.land')}</button>
@@ -1479,6 +1520,11 @@ export function renderSessionsPage(root: HTMLElement) {
           resumeBtn.disabled = false;
         }
       };
+    }
+
+    const restartBtn = drawer.querySelector<HTMLButtonElement>('#restart-btn');
+    if (restartBtn) {
+      restartBtn.onclick = () => void restartSession(s, restartBtn);
     }
 
     const closeBtn = drawer.querySelector<HTMLButtonElement>('#close-btn');
@@ -1594,6 +1640,7 @@ export function renderSessionsPage(root: HTMLElement) {
       if (action === 'details') openDrawer(s);
       else if (action === 'write-link') void openWriteLink(s, actionButton);
       else if (action === 'locate') void locateSession(s, actionButton);
+      else if (action === 'restart') void restartSession(s, actionButton);
       else if (action === 'close') void closeSession(s, actionButton).then(ok => {
         if (ok) {
           selected.delete(s.sessionId);
@@ -1695,6 +1742,7 @@ export function renderSessionsPage(root: HTMLElement) {
       if (actionButton.dataset.action === 'details') openDrawer(s);
       else if (actionButton.dataset.action === 'rename') startKanbanRename(card, s);
       else if (actionButton.dataset.action === 'history') void openHistoryModal(s);
+      else if (actionButton.dataset.action === 'restart') void restartSession(s, actionButton);
       return;
     }
     if (target.closest('a, button, input, label')) return;

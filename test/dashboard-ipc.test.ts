@@ -78,6 +78,36 @@ describe('POST /api/sessions/:sessionId/close', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/restart', () => {
+  it('sends a restart IPC message to the live worker', async () => {
+    const send = vi.fn();
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-restart', cliId: 'codex' },
+      worker: { send, killed: false },
+      adoptedFrom: undefined,
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-restart/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-restart', cliId: 'codex' });
+    expect(send).toHaveBeenCalledWith({ type: 'restart' });
+    findSpy.mockRestore();
+  });
+
+  it('rejects unknown sessions without creating a restart side effect', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'session_not_active' });
+    findSpy.mockRestore();
+  });
+});
+
 describe('GET /api/sessions/:sessionId/write-link', () => {
   it('returns 401 without a valid loopback-HMAC signature', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
