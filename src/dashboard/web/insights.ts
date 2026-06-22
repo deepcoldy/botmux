@@ -234,8 +234,6 @@ function aggregateRecords(records: InsightRecord[]): DerivedOverview {
     subagentCostShare: null,
   };
   let analyzed = 0;
-  let rwSum = 0;
-  let rwN = 0;
   const suggMap = new Map<string, SafeInsightOverviewSuggestion>();
   for (const rec of records) {
     const r = rec.report;
@@ -256,17 +254,18 @@ function aggregateRecords(records: InsightRecord[]): DerivedOverview {
         agg.phase[ph].ms += pv.ms;
       }
     }
-    if (a.readWriteRatio !== null && Number.isFinite(a.readWriteRatio)) {
-      rwSum += a.readWriteRatio;
-      rwN += 1;
-    }
     for (const s of r.suggestions ?? []) {
       const e = suggMap.get(s.id);
       if (e) e.count += 1;
       else suggMap.set(s.id, { id: s.id, title: s.title, severity: s.severity, count: 1, evidence: s.evidence ?? [], action: s.action });
     }
   }
-  agg.readWriteRatio = rwN ? Number((rwSum / rwN).toFixed(2)) : null;
+  // Pooled read:write (Σreads / Σwrites), consistent with the pooled totals on the
+  // same metric row (spans/failed/slow). A mean of per-session ratios would let a
+  // tiny 2-read/1-write session skew the headline as much as a 300/100 one.
+  agg.readWriteRatio = agg.phase.edit.count > 0
+    ? Number((agg.phase.research.count / agg.phase.edit.count).toFixed(2))
+    : null;
   const topFailedTools = Object.entries(agg.failByTool)
     .map(([tool, count]) => ({ tool, count }))
     .sort((x, y) => y.count - x.count)
