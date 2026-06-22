@@ -68,12 +68,22 @@ export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[]): 
   ].join('\n');
 }
 
+export function isGoalSupervisorTitle(title: string | undefined): boolean {
+  return title?.startsWith('[Goal]') === true;
+}
+
+export function shouldTriggerGoalWatchdogOnSessionBoundary(ds: DaemonSession): boolean {
+  return ds.scope === 'chat'
+    && Boolean(ds.chatId)
+    && !isGoalSupervisorTitle(ds.session.title);
+}
+
 function isGoalSupervisorSession(ds: DaemonSession, larkAppId: string, goalChatId: string): boolean {
   return ds.larkAppId === larkAppId
     && ds.chatId === goalChatId
     && ds.scope === 'chat'
     && ds.session.status === 'active'
-    && ds.session.title.startsWith('[Goal]');
+    && isGoalSupervisorTitle(ds.session.title);
 }
 
 function isBusy(ds: DaemonSession): boolean {
