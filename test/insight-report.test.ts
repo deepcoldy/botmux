@@ -5,9 +5,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 let resolvedPath = '';
 let resolvedKind: string = 'claude';
+// Per-sessionId override map for multi-session overview tests; falls back to the
+// single resolvedPath when a sessionId has no entry (back-compat for old tests).
+let resolvedPaths: Record<string, string> = {};
 
 vi.mock('../src/services/transcript-resolver.js', () => ({
-  resolveSessionTranscriptPath: vi.fn(() => resolvedPath ? { path: resolvedPath, kind: resolvedKind } : null),
+  resolveSessionTranscriptPath: vi.fn((q?: { sessionId?: string }) => {
+    const p = (q?.sessionId && resolvedPaths[q.sessionId]) || resolvedPath;
+    return p ? { path: p, kind: resolvedKind } : null;
+  }),
 }));
 
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../src/services/insight/report.js';
@@ -18,6 +24,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-insight-report-'));
   resolvedPath = '';
   resolvedKind = 'claude';
+  resolvedPaths = {};
 });
 
 afterEach(() => {
@@ -229,6 +236,55 @@ function writeClaudeNarrationFixture(): string {
       { type: 'text', text: 'It does X.' },
     ] } }),
   ];
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
+// A session mixing real reads/edits with planning tools (TodoWrite/TodoRead).
+// Planning tools must NOT count as edit/research, or they corrupt the r/w ratio.
+function writeClaudePlanningFixture(): string {
+  const path = join(dir, 'claude-planning.jsonl');
+  const spans = [
+    { name: 'Read', input: { file_path: '/x/a.ts' } },
+    { name: 'Read', input: { file_path: '/x/b.ts' } },
+    { name: 'Edit', input: { file_path: '/x/a.ts' } },
+    { name: 'TodoWrite', input: { todos: [{ content: 'plan', status: 'pending' }] } },
+    { name: 'TodoRead', input: {} },
+  ];
+  const lines: string[] = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'work' } }),
+  ];
+  spans.forEach((s, i) => {
+    lines.push(JSON.stringify({
+      type: 'assistant',
+      timestamp: `2026-06-17T01:00:0${i + 1}.000Z`,
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: `p${i}`, name: s.name, input: s.input }] },
+    }));
+    lines.push(JSON.stringify({
+      type: 'user',
+      timestamp: `2026-06-17T01:00:0${i + 1}.500Z`,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `p${i}`, content: 'ok' }] },
+    }));
+  });
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
+// N Read spans + M Edit spans, for testing the pooled overview read/write ratio.
+function writeClaudeRwFixture(name: string, reads: number, edits: number): string {
+  const path = join(dir, `claude-rw-${name}.jsonl`);
+  const lines: string[] = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'work' } }),
+  ];
+  let n = 0;
+  const add = (tool: string, input: unknown) => {
+    n++;
+    const id = `${name}-${n}`;
+    lines.push(JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: tool, input }] } }));
+    lines.push(JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } }));
+  };
+  for (let i = 0; i < reads; i++) add('Read', { file_path: `/x/r${i}.ts` });
+  for (let i = 0; i < edits; i++) add('Edit', { file_path: `/x/e${i}.ts` });
   writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
   return path;
 }
@@ -830,4 +886,39 @@ describe('SafeInsightReport', () => {
       expect(report.turnTimeline?.[0]?.metrics.durationMs).toBe(0);
     });
   }
+
+  it('does not bucket planning tools (TodoWrite/TodoRead) as edit/research', () => {
+    resolvedPath = writeClaudePlanningFixture();
+    const report = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'summary', now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    expect(report.status).toBe('ok');
+    // 2 Read → research; 1 Edit → edit; TodoWrite + TodoRead → discuss (NOT
+    // edit/research). Without the fix TodoWrite would land in edit and TodoRead
+    // in research, deflating the ratio from 2.0 to 1.5.
+    expect(report.agg.phase.research.count).toBe(2);
+    expect(report.agg.phase.edit.count).toBe(1);
+    expect(report.agg.phase.discuss.count).toBe(2);
+    expect(report.agg.readWriteRatio).toBe(2);
+  });
+
+  it('pools the cross-session read/write ratio instead of averaging per-session ratios', async () => {
+    // Session A: 4 reads / 1 edit (ratio 4.0); Session B: 1 read / 4 edits (ratio 0.25).
+    // Mean of per-session ratios = 2.13; pooled Σread/Σedit = 5/5 = 1.0. We want pooled.
+    resolvedPaths = {
+      sa: writeClaudeRwFixture('a', 4, 1),
+      sb: writeClaudeRwFixture('b', 1, 4),
+    };
+    const overview = await buildSafeInsightOverview([
+      { cliId: 'claude-code', sessionId: 'sa', cwd: dir, title: 'a', lastMessageAt: 20 },
+      { cliId: 'claude-code', sessionId: 'sb', cwd: dir, title: 'b', lastMessageAt: 10 },
+    ], { limit: 10, now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    expect(overview.agg.phase.research.count).toBe(5);
+    expect(overview.agg.phase.edit.count).toBe(5);
+    expect(overview.agg.readWriteRatio).toBe(1);
+  });
 });

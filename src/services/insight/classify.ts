@@ -13,6 +13,11 @@ export function normalizeToolName(value: unknown): string {
 
 export function phaseForTool(tool: string): InsightPhase {
   const id = toolId(tool);
+  // Planning / bookkeeping tools (the todo list) are neither file reads nor
+  // file writes. Without this guard `TodoWrite` matches `write` → edit and
+  // `TodoRead` matches `read` → research, which silently pollutes the
+  // read/write ratio and can fire a bogus "修改多于阅读" suggestion.
+  if (id.includes('todo')) return 'discuss';
   if (
     id.includes('read') ||
     id.includes('grep') ||

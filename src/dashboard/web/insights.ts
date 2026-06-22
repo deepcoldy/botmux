@@ -21,7 +21,7 @@ import type {
   TurnPromptPreview,
   InsightConversationMessage,
 } from '../../services/insight/types.js';
-import { botDisplayName, escapeHtml, loadNameMaps, relTime, stripMentionPrefix, t } from './ui.js';
+import { botDisplayName, escapeHtml, loadNameMaps, relTime, t } from './ui.js';
 import MarkdownIt from 'markdown-it';
 
 type InsightFilter = 'all' | 'review' | 'failed' | 'slow';
@@ -61,9 +61,12 @@ function safeStatus(report: SafeInsightReport | null, error?: string): string {
 }
 
 function sessionTitle(s: Record<string, any>): string {
-  // Match the rest of the dashboard: strip the leading @mention, then fall back
-  // to the id only when nothing readable remains (e.g. a title of just "@Gpt").
-  return stripMentionPrefix(s.title ?? '') || String(s.sessionId ?? '');
+  // Strip the leading @mention(s), then fall back to the id when nothing
+  // readable remains — e.g. a title of just "@Gpt" or a blank/whitespace one.
+  // (stripMentionPrefix returns the raw string when stripping empties it, so we
+  // inline the strip here to detect the truly-empty case and fall back.)
+  const stripped = String(s.title ?? '').replace(/^(?:@\S+\s*)+/, '').trim();
+  return stripped || String(s.sessionId ?? '');
 }
 
 function severityLabel(sev: InsightSeverity): string {
@@ -437,7 +440,13 @@ function renderTrend(records: InsightRecord[]): string {
   const total = counts.reduce((a, b) => a + b, 0);
   if (!total) return '';
   const max = Math.max(1, ...counts);
-  const bars = counts.map(c => `<i class="trendbar" style="height:${c ? Math.max(8, Math.round((c / max) * 100)) : 2}%" data-tip="${c}"></i>`).join('');
+  // Native title tooltip (date · count). The old data-tip was never wired to a
+  // tooltip host outside the detail body, so it surfaced nothing on hover.
+  const bars = counts.map((c, j) => {
+    const d = new Date(now - (DAYS - 1 - j) * dayMs);
+    const label = `${d.getMonth() + 1}-${d.getDate()} · ${c}`;
+    return `<i class="trendbar" style="height:${c ? Math.max(8, Math.round((c / max) * 100)) : 2}%" title="${escapeHtml(label)}"></i>`;
+  }).join('');
   return `<section class="block trend-block">
     <div class="ihist-head"><h3>${escapeHtml(t('insights.distTrend'))}</h3><span class="mut">${escapeHtml(t('insights.distTrendSub'))} · ${total}</span></div>
     <div class="trend">${bars}</div>
@@ -638,7 +647,7 @@ function renderHotspots(records: InsightRecord[], openHot: Set<string>): string 
       <h3>${escapeHtml(t('insights.hotSlowSessions'))}</h3>
       <div class="slist">${slowSessions.length ? slowSessions.map(rec => {
         const a = rec.report!.agg;
-        return `<button type="button" class="srow" data-session-id="${escapeHtml(rec.session.sessionId)}">
+        return `<button type="button" class="srow" data-session-id="${escapeHtml(String(rec.session.sessionId))}">
           <div class="srmain"><strong>${escapeHtml(sessionTitle(rec.session))}</strong>
           <small>${escapeHtml(botDisplayName(rec.session))} · ${escapeHtml(String(rec.session.cliId ?? '-'))}</small></div>
           <div class="srstats"><b>${escapeHtml(t('insights.hotSlowCol'))}<em>${fmtInt(a.slowSpans)}</em></b><b>span<em>${fmtInt(a.totalSpans)}</em></b></div>
@@ -697,7 +706,7 @@ function renderSessionRows(records: InsightRecord[], selectedId: string | null, 
     const review = reportNeedsReview(r) ? ' review' : '';
     const reads = agg?.phase?.research?.count ?? 0;
     const edits = agg?.phase?.edit?.count ?? 0;
-    return `<button type="button" class="srow${on}${review}" data-session-id="${escapeHtml(s.sessionId)}">
+    return `<button type="button" class="srow${on}${review}" data-session-id="${escapeHtml(String(s.sessionId))}">
       <div class="srmain">
         <strong>${escapeHtml(sessionTitle(s))}</strong>
         <small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))}${s.workingDir ? ` · ${escapeHtml(projectOf(rec))}` : ''} · ${escapeHtml(relTime(s.lastMessageAt ?? s.spawnedAt ?? 0))}</small>
@@ -742,7 +751,7 @@ function renderSessionTable(records: InsightRecord[], selectedId: string | null)
          <span class="stc-num">${agg!.readWriteRatio !== null ? agg!.readWriteRatio.toFixed(1) : '-'}</span>
          <span class="stc-num">${escapeHtml(fmtMs(agentMsOf(r!)))}</span>`
       : `<span class="stc-msg">${escapeHtml(safeStatus(r, rec.error))}</span>`;
-    return `<button type="button" class="strow${on}${review}${ok ? '' : ' nostat'}" data-session-id="${escapeHtml(s.sessionId)}">
+    return `<button type="button" class="strow${on}${review}${ok ? '' : ' nostat'}" data-session-id="${escapeHtml(String(s.sessionId))}">
       <span class="stc-title"><strong>${escapeHtml(sessionTitle(s))}</strong><small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))}</small></span>
       <span class="stc-proj">${escapeHtml(s.workingDir ? projectOf(rec) : '-')}</span>
       ${mid}
@@ -1699,25 +1708,37 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (type === 'tab') { tab = key as InsightTab; selectedId = null; paint(); }
     else { tab = 'sessions'; showTab(); void selectSession(key); }
   }
-  function paintPalette(): void {
-    if (!paletteOpen) { paletteEl.hidden = true; paletteEl.innerHTML = ''; document.body.classList.remove('insight-modal-open'); return; }
+  // Re-render ONLY the results list (not the <input>), so typing never rebuilds
+  // or re-focuses the input — that would reset the caret and break IME (CJK)
+  // composition on every keystroke.
+  function paintPaletteList(): void {
+    const list = paletteEl.querySelector<HTMLElement>('.palette-list');
+    if (!list) return;
     const items = paletteItems();
     if (paletteIdx >= items.length) paletteIdx = Math.max(0, items.length - 1);
+    list.innerHTML = items.length ? items.map((it, i) =>
+      `<button type="button" class="palette-item${i === paletteIdx ? ' on' : ''}" data-pal-type="${it.type}" data-pal-key="${escapeHtml(it.key)}" data-pal-i="${i}">
+        <span class="pal-label">${escapeHtml(it.label)}</span><span class="pal-sub">${escapeHtml(it.sub)}</span>
+      </button>`).join('') : `<p class="mut palette-empty">${escapeHtml(t('insights.paletteEmpty'))}</p>`;
+    list.querySelectorAll<HTMLButtonElement>('.palette-item').forEach(btn =>
+      btn.addEventListener('click', () => choosePalette(btn.dataset.palType ?? 'tab', btn.dataset.palKey ?? '')));
+    list.querySelector<HTMLElement>('.palette-item.on')?.scrollIntoView({ block: 'nearest' });
+  }
+  function paintPalette(): void {
+    if (!paletteOpen) { paletteEl.hidden = true; paletteEl.innerHTML = ''; document.body.classList.remove('insight-modal-open'); return; }
     paletteEl.hidden = false;
     document.body.classList.add('insight-modal-open');
+    // Build the shell once per open. The <input> stays stable across keystrokes;
+    // only paintPaletteList() touches the DOM on input/arrow navigation.
     paletteEl.innerHTML = `<div class="modal-backdrop" data-pal-close></div>
       <div class="palette-panel" role="dialog" aria-modal="true">
         <input type="search" class="palette-input" placeholder="${escapeHtml(t('insights.palettePlaceholder'))}" value="${escapeHtml(paletteQ)}">
-        <div class="palette-list">${items.length ? items.map((it, i) =>
-          `<button type="button" class="palette-item${i === paletteIdx ? ' on' : ''}" data-pal-type="${it.type}" data-pal-key="${escapeHtml(it.key)}" data-pal-i="${i}">
-            <span class="pal-label">${escapeHtml(it.label)}</span><span class="pal-sub">${escapeHtml(it.sub)}</span>
-          </button>`).join('') : `<p class="mut palette-empty">${escapeHtml(t('insights.paletteEmpty'))}</p>`}</div>
+        <div class="palette-list"></div>
       </div>`;
     const input = paletteEl.querySelector<HTMLInputElement>('.palette-input');
-    if (input) { input.focus(); input.oninput = () => { paletteQ = input.value; paletteIdx = 0; paintPalette(); }; }
+    if (input) { input.focus(); input.oninput = () => { paletteQ = input.value; paletteIdx = 0; paintPaletteList(); }; }
     paletteEl.querySelectorAll<HTMLElement>('[data-pal-close]').forEach(el => el.addEventListener('click', closePalette));
-    paletteEl.querySelectorAll<HTMLButtonElement>('.palette-item').forEach(btn =>
-      btn.addEventListener('click', () => choosePalette(btn.dataset.palType ?? 'tab', btn.dataset.palKey ?? '')));
+    paintPaletteList();
   }
   function openPalette(): void { paletteOpen = true; paletteQ = ''; paletteIdx = 0; paintPalette(); }
   function closePalette(): void { paletteOpen = false; paintPalette(); }
@@ -2143,8 +2164,8 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (paletteOpen) {
       const items = paletteItems();
       if (e.key === 'Escape') { e.preventDefault(); closePalette(); }
-      else if (e.key === 'ArrowDown') { e.preventDefault(); paletteIdx = Math.min(items.length - 1, paletteIdx + 1); paintPalette(); }
-      else if (e.key === 'ArrowUp') { e.preventDefault(); paletteIdx = Math.max(0, paletteIdx - 1); paintPalette(); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); paletteIdx = Math.min(items.length - 1, paletteIdx + 1); paintPaletteList(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); paletteIdx = Math.max(0, paletteIdx - 1); paintPaletteList(); }
       else if (e.key === 'Enter') { e.preventDefault(); const it = items[paletteIdx]; if (it) choosePalette(it.type, it.key); }
       return;
     }

@@ -1296,16 +1296,16 @@ export async function buildSafeInsightOverview(
   const reports = rows.map(r => r.report);
   const okReports = reports.filter(r => r.status === 'ok');
   const agg = emptyAgg();
-  let rwSum = 0;
-  let rwN = 0;
   for (const report of okReports) {
     mergeAgg(agg, report.agg);
-    if (report.agg.readWriteRatio !== null) {
-      rwSum += report.agg.readWriteRatio;
-      rwN++;
-    }
   }
-  agg.readWriteRatio = rwN > 0 ? Math.round((rwSum / rwN) * 100) / 100 : null;
+  // Pooled read/write ratio (Σresearch ÷ Σedit), matching the dashboard's
+  // client-side aggregate. Averaging per-session ratios would let a tiny
+  // 2-read/1-write session weigh the same as a 300-read/100-write one and
+  // skew the headline, so pool the totals instead.
+  agg.readWriteRatio = agg.phase.edit.count > 0
+    ? Math.round((agg.phase.research.count / agg.phase.edit.count) * 100) / 100
+    : null;
   return {
     generatedAt: parsedAt,
     meta: {
@@ -1353,16 +1353,16 @@ export function mergeSafeInsightOverviews(
   const reports = rows.map(r => r.report);
   const okReports = reports.filter(r => r.status === 'ok');
   const agg = emptyAgg();
-  let rwSum = 0;
-  let rwN = 0;
   for (const report of okReports) {
     mergeAgg(agg, report.agg);
-    if (report.agg.readWriteRatio !== null) {
-      rwSum += report.agg.readWriteRatio;
-      rwN++;
-    }
   }
-  agg.readWriteRatio = rwN > 0 ? Math.round((rwSum / rwN) * 100) / 100 : null;
+  // Pooled read/write ratio (Σresearch ÷ Σedit), matching the dashboard's
+  // client-side aggregate. Averaging per-session ratios would let a tiny
+  // 2-read/1-write session weigh the same as a 300-read/100-write one and
+  // skew the headline, so pool the totals instead.
+  agg.readWriteRatio = agg.phase.edit.count > 0
+    ? Math.round((agg.phase.research.count / agg.phase.edit.count) * 100) / 100
+    : null;
   return {
     generatedAt,
     meta: {
