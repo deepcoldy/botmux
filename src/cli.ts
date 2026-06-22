@@ -26,7 +26,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
@@ -4770,10 +4770,19 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
       [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
       [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
+  botmux goal charter current --goal <goal群chatId> [--create] [--title <标题>]
+  botmux goal charter read --goal <goal群chatId> [--json]
+  botmux goal charter update --goal <goal群chatId> --expected-updated-at <ts> <完整内容>
+  botmux goal charter path --goal <goal群chatId>
 
 说明:
   daemon-native 地在 goal 群起一个 L2 supervisor 会话，绕开 Lark 自消息不会路由的限制。
-  默认从当前 L1 会话推断 parent-chat-id / parent-root / working-dir / bot daemon。`);
+  默认从当前 L1 会话推断 parent-chat-id / parent-root / working-dir / bot daemon。
+  goal charter 复用 whiteboard 存储/CAS，但不受全局 whiteboard enable 开关控制，也不会自动注入任何会话。`);
+    return;
+  }
+  if (sub === 'charter') {
+    await cmdGoalCharter(rest[0] ?? 'current', rest.slice(1));
     return;
   }
   if (sub !== 'supervise') {
@@ -4853,6 +4862,118 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
   console.log(JSON.stringify({ success: true, ...body }, null, 2));
+}
+
+function goalCharterId(goal: string): string {
+  const hash = createHash('sha256').update(goal).digest('hex').slice(0, 16);
+  return `goal_${hash}`;
+}
+
+function goalCharterTitle(goal: string, title?: string): string {
+  return title?.trim() || `Goal charter: ${goal.slice(0, 12)}`;
+}
+
+function ensureGoalCharter(goal: string, title?: string) {
+  const id = goalCharterId(goal);
+  const existing = getWhiteboard(id);
+  if (existing && !existing.archived) return existing;
+  return createWhiteboard({
+    id,
+    title: goalCharterTitle(goal, title),
+    scope: 'custom',
+    chatId: goal,
+  }, { allowDisabled: true });
+}
+
+async function cmdGoalCharter(action: string, rest: string[]): Promise<void> {
+  if (!action || action === '--help' || action === '-h' || rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux goal charter <command>
+
+Commands:
+  current --goal <chatId> [--create] [--title <t>]
+      Show the deterministic charter board for a goal group; --create ensures it.
+  read --goal <chatId> [--json]
+      Read the goal charter board. --json emits { id, updatedAt, content } for CAS.
+  update --goal <chatId> --expected-updated-at <ts> <content>
+      Replace the goal charter current-state snapshot using CAS.
+  path --goal <chatId>
+      Print the underlying board/meta/log paths.
+
+This command intentionally bypasses the global whiteboard feature flag and never
+attaches the board to a session, so it cannot trigger <whiteboard> prompt injection.`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const goal = argValue(rest, '--goal', '--chat-id');
+  if (!goal) {
+    console.error('goal charter 需要 --goal <goal群chatId>');
+    process.exit(1);
+  }
+  const id = goalCharterId(goal);
+
+  if (action === 'current') {
+    let meta = getWhiteboard(id);
+    if (!meta && argFlag(rest, '--create')) {
+      meta = ensureGoalCharter(goal, argValue(rest, '--title'));
+    }
+    console.log(JSON.stringify({
+      enabled: whiteboardEnabled(),
+      goal,
+      current: meta ?? null,
+      path: meta ? whiteboardPath(id) : undefined,
+      hint: meta ? undefined : 'Run `botmux goal charter current --goal <chatId> --create` to ensure the goal charter.',
+    }, null, 2));
+    return;
+  }
+
+  if (action === 'read') {
+    const meta = getWhiteboard(id);
+    if (!meta) { console.error(`Goal charter not found for ${goal}. Run \`botmux goal charter current --goal ${goal} --create\`.`); process.exit(1); }
+    if (argFlag(rest, '--json')) {
+      console.log(JSON.stringify({ id: meta.id, updatedAt: meta.updatedAt, content: readWhiteboard(id, { allowDisabled: true }) }));
+    } else {
+      process.stdout.write(readWhiteboard(id, { allowDisabled: true }));
+    }
+    return;
+  }
+
+  if (action === 'path') {
+    const meta = getWhiteboard(id);
+    if (!meta) { console.error(`Goal charter not found for ${goal}. Run \`botmux goal charter current --goal ${goal} --create\`.`); process.exit(1); }
+    console.log(JSON.stringify({ goal, board: meta, path: whiteboardPath(id) }, null, 2));
+    return;
+  }
+
+  if (action === 'update' || action === 'write') {
+    const meta = getWhiteboard(id) ?? ensureGoalCharter(goal, argValue(rest, '--title'));
+    if (action === 'write' && !argFlag(rest, '--yes')) {
+      console.error('Refusing to overwrite goal charter without --yes. Prefer `botmux goal charter update` with --expected-updated-at.');
+      process.exit(2);
+    }
+    const content = whiteboardContentFromArgs(rest, [...WHITEBOARD_BOOLEAN_FLAGS, '--yes']);
+    if (!content.trim()) {
+      console.error('Refusing to write empty goal charter content. Pass text as args, pipe stdin, or use --content-file <path>.');
+      process.exit(2);
+    }
+    const expectedUpdatedAt = argValue(rest, '--expected-updated-at');
+    const { writeWhiteboard } = await import('./services/whiteboard-store.js');
+    try {
+      const updated = writeWhiteboard(meta.id, content, {
+        actor: 'goal-charter',
+        kind: action === 'update' ? 'goal-charter-update' : 'goal-charter-write',
+        expectedUpdatedAt,
+        allowDisabled: true,
+      });
+      console.log(JSON.stringify({ ok: true, goal, board: updated }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, meta.id);
+    }
+    return;
+  }
+
+  console.error(`Unknown goal charter command: ${action}`);
+  process.exit(1);
 }
 
 // ─── Create-group subcommand ─────────────────────────────────────────────────

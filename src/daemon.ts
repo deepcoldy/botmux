@@ -1855,7 +1855,8 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // Lark self-messages are deliberately ignored before routing, so the main bot
 // cannot @ itself in the goal group to spawn the L2 supervisor. This thin
 // daemon-native entry creates that session directly while reusing the normal
-// session store, whiteboard injection and forkWorker path.
+// session store and forkWorker path. Goal charter is task-scoped (`goal charter`)
+// and intentionally not auto-injected as a session whiteboard.
 ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
   let raw: {
     chatId?: unknown;
