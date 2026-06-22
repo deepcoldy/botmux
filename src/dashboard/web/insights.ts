@@ -274,6 +274,12 @@ function aggregateRecords(records: InsightRecord[]): DerivedOverview {
 
 // Overview metrics + recommendations for the CURRENTLY VISIBLE (filtered) records,
 // so the summary tracks the active filter rather than staying global.
+// Cross-tool measurement caveat (Codex reads via shell aren't counted as 'read', etc.) —
+// shown under the overview & distribution so ratios/distributions aren't misread.
+function disclosureNote(): string {
+  return `<p class="insight-disclosure">⚖︎ ${escapeHtml(t('insights.disclosure'))}</p>`;
+}
+
 function renderOverview(d: DerivedOverview): string {
   const a = d.agg;
   const rw = a.readWriteRatio === null ? '-' : a.readWriteRatio.toFixed(1);
@@ -309,7 +315,8 @@ function renderOverview(d: DerivedOverview): string {
           }).join('') : `<p class="mut">${escapeHtml(t('insights.noFailures'))}</p>`}
         </div>
       </section>
-    </div>`;
+    </div>
+    ${disclosureNote()}`;
 }
 
 function renderPhaseMix(report: SafeInsightReport): string {
@@ -425,7 +432,8 @@ function renderDistribution(records: InsightRecord[]): string {
       { label: '1–3', test: v => v >= 1 && v < 3 },
       { label: '3+', test: v => v >= 3 },
     ], n => n.toFixed(1)) : ''}
-  </div>`;
+  </div>
+  ${disclosureNote()}`;
 }
 
 function renderHotspots(records: InsightRecord[]): string {
