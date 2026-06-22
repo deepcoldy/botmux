@@ -115,6 +115,7 @@ vi.mock('../src/core/session-discovery.js', () => ({
 }));
 
 vi.mock('../src/core/session-activity.js', () => ({
+  announceSessionRow: vi.fn(),
   markSessionActivity: vi.fn(),
 }));
 

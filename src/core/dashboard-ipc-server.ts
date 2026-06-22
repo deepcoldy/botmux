@@ -546,6 +546,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   }
 
   const ds = result.ds;
+  // `?wake=1` is an opt-in operational hook (no UI/CLI caller wires it today —
+  // it's meant for direct `curl` recovery): instead of the default lazy
+  // cold-resume on the next inbound message, fork the worker immediately so the
+  // session is usable right away. Off by default keeps every existing caller's
+  // behaviour unchanged.
   const wake = new URL(req.url ?? '/', 'http://localhost').searchParams.get('wake') === '1';
   // Tell the dashboard the row flipped back to active (mirror of session.update
   // emitted by closeSession). Use `null` for closedAt — `undefined` would be
@@ -579,14 +584,19 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     }
   }
 
-  if (wake && (!ds.worker || ds.worker.killed)) {
+  // Report the EFFECTIVE action, not the raw request flag: only fork when wake
+  // was asked AND there's no live worker to clobber. (resumeSession always hands
+  // back a worker:null ds today, so this matches `wake` in practice — but
+  // reporting the action keeps the response honest if the guard ever broadens.)
+  const woke = wake && (!ds.worker || ds.worker.killed);
+  if (woke) {
     forkWorker(ds, '', true);
   }
 
   jsonRes(res, 200, {
     ok: true,
     sessionId,
-    wake,
+    wake: woke,
     title: ds.session.title,
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,

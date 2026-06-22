@@ -210,6 +210,47 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('default resume (no wake) reactivates without forking a worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
+      session.larkAppId = '';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      session.workingDir = process.cwd();
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume`, { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // Reactivated, but NO eager fork — the session cold-resumes lazily on the
+      // next inbound message. This guards the `wake &&` short-circuit against a
+      // refactor that reverts to forking on every resume.
+      expect(body).toMatchObject({ ok: true, sessionId: session.sessionId, wake: false });
+      expect(registry.get(sessionKey('om_resume', ''))?.session.sessionId).toBe(session.sessionId);
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      forkSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/sessions/:sessionId/write-link', () => {
