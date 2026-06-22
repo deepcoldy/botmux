@@ -132,7 +132,7 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         const p = e.payload as import('./types.js').TaskAcceptedPayload;
         const t = ensure(e.taskId, e.chatId);
         const r = findReport(t, p.reportId);
-        if (r) { r.verdict = 'accepted'; r.checkedBy = p.checkedBy; r.evidenceChecked = p.evidenceChecked; r.ranCommands = p.ranCommands; }
+        if (r) { r.verdict = 'accepted'; r.checkedBy = p.checkedBy; r.evidenceChecked = p.evidenceChecked; r.ranCommands = p.ranCommands; r.verdictVia = p.via ?? r.verdictVia; }
         // Only the verdict on the CURRENT attempt moves the task. A late verdict
         // for a superseded report still records on that report, but must not drag
         // a fresh attempt back to a terminal state.
@@ -141,7 +141,7 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         const p = e.payload as import('./types.js').TaskRejectedPayload;
         const t = ensure(e.taskId, e.chatId);
         const r = findReport(t, p.reportId);
-        if (r) { r.verdict = 'rejected'; r.reason = p.reason; r.checkedBy = p.checkedBy; }
+        if (r) { r.verdict = 'rejected'; r.reason = p.reason; r.checkedBy = p.checkedBy; r.verdictVia = p.via ?? r.verdictVia; }
         if (p.reportId === t.latestReportId) t.status = 'rejected';
       }
     }
