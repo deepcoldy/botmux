@@ -24,7 +24,6 @@ export interface GoalSuperviseResponse {
   goalChatId: string;
   supervisorSessionId: string;
   supervisorRootId: string;
-  whiteboardId?: string;
   parent: { chatId: string; rootMessageId?: string };
 }
 
@@ -48,7 +47,7 @@ export function buildGoalSupervisorPrompt(req: GoalSuperviseRequest): string {
     `你是 goal 群里的 L2 监管 agent。goal: ${req.title.trim() || req.chatId}`,
     '',
     '职责：',
-    '1. 先按需创建/读取本 goal 群的 charter 白板：`botmux whiteboard current --create`，再 `botmux whiteboard read --json`。必要时用 `botmux whiteboard update --expected-updated-at ...` 维护目标、组织方式、当前状态、下一步。',
+    `1. 先按需创建/读取本 goal 群的 charter：\`botmux goal charter current --goal ${req.chatId} --create\`，再 \`botmux goal charter read --goal ${req.chatId} --json\`。必要时用 \`botmux goal charter update --goal ${req.chatId} --expected-updated-at ...\` 维护目标、组织方式、当前状态、下一步。`,
     `2. 派发和验收子任务前，先运行 \`botmux delivery list --goal ${req.chatId}\` 查可信交付账本，账本是真相源，聊天只是提醒和上下文。`,
     '3. 子任务在本 goal 群内用 `botmux dispatch --chat-id <本 goal 群 chatId>` 派发；worker 必须用 `botmux report --task ...` 交证据。',
     '4. 验收时只认账本里的 evidence：能读文件就读，能跑命令就跑；accept/reject 必须写 evidenceChecked / ranCommands / reason。',
