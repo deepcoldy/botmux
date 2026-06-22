@@ -402,11 +402,51 @@ export function renderSessionsPage(root: HTMLElement) {
     return hours === 168 ? '7d' : `${hours}H`;
   }
 
+  /** Chat IDs that belong to `team` in the kanban "team" view — the same
+   *  whitelist renderKanban uses to narrow the board (team-bound group chats +
+   *  groups where a same-team bot was /introduce'd). Extracted so idle cleanup
+   *  can scope to exactly what the team board shows. */
+  function teamChatIdsFor(team: any): Set<string> {
+    const teamChats = new Set<string>();
+    if (!team) return teamChats;
+    for (const chatId of team.groupChats) teamChats.add(chatId);
+    if (kanbanChatBots) {
+      for (const [chatId, c] of kanbanChatBots) {
+        if (teamChats.has(chatId)) continue;
+        let hasTeamBot = false;
+        for (const id of team.botIds) {
+          if (c.botIds.has(id)) { hasTeamBot = true; break; }
+        }
+        if (!hasTeamBot) continue;
+        for (const n of c.observedNames) {
+          if (team.botNames.has(n)) { teamChats.add(chatId); break; }
+        }
+      }
+    }
+    return teamChats;
+  }
+
+  /** Local rows actually visible in the current view — the basis for idle
+   *  cleanup so "所见即所关" holds everywhere. Table/board and kanban
+   *  (by-status / by-bot) render the full `filtered()` set; only the team
+   *  kanban narrows further to the selected team's chats AND overlays remote
+   *  rows from other deployments (which this dashboard can't close). Mirror the
+   *  team narrowing and never include remote rows. */
+  function currentCleanupVisibleRows(): any[] {
+    const rows = filtered();
+    if (viewMode === 'kanban' && kanbanGroupBy === 'team') {
+      const team = kanbanTeams.find(tm => tm.key === kanbanTeamKey) ?? kanbanTeams[0];
+      const teamChats = teamChatIdsFor(team);
+      return rows.filter(r => teamChats.has(String(r.chatId)));
+    }
+    return rows;
+  }
+
   function currentIdleCleanupCandidates(): any[] {
-    // Scope to the rows currently visible under the page filters (WYSIWYG):
-    // the count, the confirm dialog, and the sessionIds we POST all describe
-    // exactly what the operator sees, never other bots' sessions off-screen.
-    return selectIdleCleanupCandidates(filtered(), selectedIdleCleanupHours());
+    // Scope to the rows actually visible in the current view (WYSIWYG): the
+    // count, the confirm dialog, and the sessionIds we POST all describe exactly
+    // what the operator sees — never other bots'/teams' sessions off-screen.
+    return selectIdleCleanupCandidates(currentCleanupVisibleRows(), selectedIdleCleanupHours());
   }
 
   function paintIdleCleanupThresholds(): void {
@@ -895,26 +935,8 @@ export function renderSessionsPage(root: HTMLElement) {
         //   B. 群里 /introduce 过该团队成员机器人的群——介绍记录按名字与团队
         //      roster 匹配；介绍过的若不是本团队成员，不算（防误筛）
         // 命中群里所有 bot 的会话都展示（本质 = 同团队 bot 所在群/话题的会话）。
-        let teamRows: any[] = [];
-        const teamChats = new Set<string>();
-        if (team) {
-          for (const chatId of team.groupChats) teamChats.add(chatId);
-          if (kanbanChatBots) {
-            for (const [chatId, c] of kanbanChatBots) {
-              if (teamChats.has(chatId)) continue;
-              // 自家团队 bot 在场，且群里介绍过同团队的外部机器人
-              let hasTeamBot = false;
-              for (const id of team.botIds) {
-                if (c.botIds.has(id)) { hasTeamBot = true; break; }
-              }
-              if (!hasTeamBot) continue;
-              for (const n of c.observedNames) {
-                if (team.botNames.has(n)) { teamChats.add(chatId); break; }
-              }
-            }
-          }
-          teamRows = rows.filter(r => teamChats.has(String(r.chatId)));
-        }
+        const teamChats = teamChatIdsFor(team);
+        const teamRows = team ? rows.filter(r => teamChats.has(String(r.chatId))) : [];
         // ── hub 团队看板合并（申晗架构：编排存团队 host）──────────────────────
         // 本地行（实时）+ 对方部署上报的裁剪行（host 快照）；共享编排的列/排序
         // 覆盖个人看板字段——团队视图里大家看到同一份摆放。
