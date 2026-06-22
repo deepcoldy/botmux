@@ -56,7 +56,7 @@ export interface GoalWatchdogNotifyEvent {
 }
 
 function isPendingForWatchdog(task: TaskView): boolean {
-  return task.status === 'dispatched' || task.status === 'reported' || task.status === 'rejected';
+  return task.status === 'dispatched' || task.status === 'reported' || task.status === 'rejected' || task.status === 'blocked';
 }
 
 export function pendingGoalTasks(tasks: TaskView[]): Map<string, TaskView[]> {
@@ -78,10 +78,13 @@ export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[]): 
     const checks = task.acceptanceCriteria
       ? summarizeAcceptanceCriteria(task.acceptanceCriteria).map((line) => `\n    - ${line}`).join('')
       : '';
-    return `- ${task.taskId} status=${task.status}${hint}${checks}`;
+    const help = task.help
+      ? ` helpKind=${task.help.kind ?? 'other'} blocker=${task.help.blocker}`
+      : '';
+    return `- ${task.taskId} status=${task.status}${hint}${help}${checks}`;
   }).join('\n');
   return [
-    `${GOAL_WATCHDOG_PROMPT_PREFIX} 本 goal 有未完成任务（dispatched/rejected 未 accepted），请按 orchestrate 巡检协议扫账本、主动核验产物、accept/reject/催。`,
+    `${GOAL_WATCHDOG_PROMPT_PREFIX} 本 goal 有未完成任务（dispatched/rejected/blocked 未 accepted），请按 orchestrate 巡检协议扫账本、主动核验产物、accept/reject/催；blocked 任务先处理 worker 求助，定不了再升级给人。`,
     `goalChatId: ${goalChatId}`,
     '',
     'pending tasks:',
@@ -222,6 +225,10 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       if (reconcile.action === 'no-criteria') {
         if (task.status === 'reported') continue;
         legacyTasks.push(task);
+      } else if (reconcile.action === 'blocked') {
+        legacyTasks.push(task);
+      } else if (reconcile.action === 'escalated') {
+        continue;
       } else if ((reconcile.action === 'accepted' || reconcile.action === 'rejected') && !reconcile.deduped) {
         reconciled = true;
         try {

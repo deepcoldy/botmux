@@ -1994,6 +1994,8 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     supervisorSessionId?: unknown;
     goalChatId?: unknown;
     summary?: unknown;
+    attentionKind?: unknown;
+    attentionReason?: unknown;
   };
   try {
     raw = await readJsonBody(req);
@@ -2001,18 +2003,36 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
   }
   const summary = typeof raw.summary === 'string' ? raw.summary.trim() : '';
+  const attentionKindRaw = typeof raw.attentionKind === 'string' ? raw.attentionKind.trim().toLowerCase() : '';
+  const attentionKind = ['authz', 'decision', 'blocked', 'help'].includes(attentionKindRaw) ? attentionKindRaw : '';
+  const attentionReason = typeof raw.attentionReason === 'string' && raw.attentionReason.trim()
+    ? raw.attentionReason.replace(/\s+/g, ' ').trim().slice(0, 500)
+    : summary.replace(/\s+/g, ' ').trim().slice(0, 500);
   if (!summary) return jsonRes(res, 400, { ok: false, errorCode: 'missing_summary', error: 'summary is required' });
   try {
     const result = await notifyGoalParent({
       supervisorSessionId: typeof raw.supervisorSessionId === 'string' && raw.supervisorSessionId.trim() ? raw.supervisorSessionId.trim() : undefined,
       goalChatId: typeof raw.goalChatId === 'string' && raw.goalChatId.trim() ? raw.goalChatId.trim() : undefined,
       summary,
+      attentionKind: attentionKind || undefined,
+      attentionReason: attentionReason || undefined,
     }, { larkAppId: currentDaemonLarkAppId, activeSessions });
     if (!result.ok) {
       const status = result.errorCode === 'parent_not_active' || result.errorCode === 'supervisor_not_found' ? 404 : 400;
       return jsonRes(res, status, result);
     }
-    return jsonRes(res, 200, result);
+    let attentionRaised = false;
+    if (attentionKind && attentionReason) {
+      for (const ds of activeSessions.values()) {
+        if (ds.session.sessionId !== result.parentSessionId) continue;
+        ds.agentAttention = { kind: attentionKind, reason: attentionReason, at: Date.now() };
+        publishAttentionPatch(ds);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'goal_escalation', kind: attentionKind, message: attentionReason });
+        attentionRaised = true;
+        break;
+      }
+    }
+    return jsonRes(res, 200, { ...result, attentionRaised });
   } catch (err: any) {
     logger.warn(`[goal-notify-parent] IPC failed: ${err?.message ?? err}`);
     return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });

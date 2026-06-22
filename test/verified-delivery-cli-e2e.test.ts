@@ -27,9 +27,9 @@ beforeEach(() => {
 });
 afterEach(() => { rmSync(dataDir, { recursive: true, force: true }); });
 
-function delivery(args: string[]): { json: any; status: number; raw: string } {
+function cli(command: string, args: string[]): { json: any; status: number; raw: string } {
   try {
-    const raw = execFileSync('node', [CLI_PATH, 'delivery', ...args], {
+    const raw = execFileSync('node', [CLI_PATH, command, ...args], {
       env: { ...process.env, SESSION_DATA_DIR: dataDir },
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf-8',
@@ -41,6 +41,10 @@ function delivery(args: string[]): { json: any; status: number; raw: string } {
     try { json = JSON.parse(stdout); } catch { /* non-JSON error path */ }
     return { json, status: err.status ?? 1, raw: stdout + (err.stderr ?? '') };
   }
+}
+
+function delivery(args: string[]): { json: any; status: number; raw: string } {
+  return cli('delivery', args);
 }
 
 function seedDispatched(taskId: string, title: string, ts = TS, chatId = GOAL_CHAT): void {
@@ -98,6 +102,28 @@ describe('verified-delivery CLI e2e（delivery 回路，零飞书）', () => {
     expect(rej.json).toMatchObject({ taskId: 'task-d', rejected: true, pushed: false });
     const show = delivery(['show', '--task', 'task-d']);
     expect(show.json.task.status).toBe('rejected');
+  });
+
+  it('`help` 真跑（无 daemon 也成功）→ 账本 blocked，watchdog 作为 best-effort', () => {
+    seedDispatched('task-help', 'help');
+    const out = cli('help', ['--task', 'task-help', '--blocker', '缺测试账号权限', '--kind', 'access']);
+    expect(out.status).toBe(0);
+    expect(out.json).toMatchObject({ taskId: 'task-help', blocked: true, goalChatId: GOAL_CHAT });
+    expect(out.json.watchdog.contacted).toBe(0);
+    const show = delivery(['show', '--task', 'task-help']);
+    expect(show.json.task.status).toBe('blocked');
+    expect(show.json.task.help).toMatchObject({ blocker: '缺测试账号权限', kind: 'access' });
+  });
+
+  it('`delivery escalate --no-notify-parent` 真跑（零 daemon）→ 账本 escalated', () => {
+    seedDispatched('task-esc', 'esc');
+    cli('help', ['--task', 'task-esc', '--blocker', '需求范围冲突', '--kind', 'ambiguous']);
+    const out = delivery(['escalate', '--task', 'task-esc', '--reason', '需要人决定范围', '--retry-brief', '请确认是否包含移动端', '--by', 'l2-test', '--no-notify-parent']);
+    expect(out.status).toBe(0);
+    expect(out.json).toMatchObject({ taskId: 'task-esc', escalated: true });
+    const show = delivery(['show', '--task', 'task-esc']);
+    expect(show.json.task.status).toBe('escalated');
+    expect(show.json.task.escalation).toMatchObject({ reason: '需要人决定范围', by: 'l2-test', retryBrief: '请确认是否包含移动端' });
   });
 
   it('liveness：`list --status dispatched --older-than` 扫出卡住任务，新任务排除', () => {
