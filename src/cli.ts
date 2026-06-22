@@ -4456,6 +4456,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   whiteboard status|enable|disable
                        本地项目白板（默认关闭；enable 只打开能力，不创建白板）
        current --create / list / read / update / write --yes
+  goal supervise       在 goal 群启动 L2 监管会话（daemon-native，不依赖自 @ 路由）
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -7418,6 +7419,99 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   }));
 }
 
+async function cmdGoal(sub: string, rest: string[]): Promise<void> {
+  if (!sub || sub === '--help' || sub === '-h' || rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux goal — goal 群监管会话工具
+
+用法:
+  botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
+      [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
+      [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
+
+说明:
+  daemon-native 地在 goal 群起一个 L2 supervisor 会话，绕开 Lark 自消息不会路由的限制。
+  默认从当前 L1 会话推断 parent-chat-id / parent-root / working-dir / bot daemon。`);
+    return;
+  }
+  if (sub !== 'supervise') {
+    console.error('未知 goal 子命令。用法见 botmux goal --help');
+    process.exit(1);
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const chatId = argValue(rest, '--chat-id');
+  const title = argValue(rest, '--title') ?? '';
+  const sessionIdArg = argValue(rest, '--session-id');
+  const parentChatIdArg = argValue(rest, '--parent-chat-id');
+  const parentRootArg = argValue(rest, '--parent-root');
+  const workingDir = argValue(rest, '--working-dir');
+  const briefFile = argValue(rest, '--brief-file');
+  let brief = argValue(rest, '--brief') ?? '';
+  if (briefFile) {
+    if (!existsSync(briefFile)) { console.error(`文件不存在: ${briefFile}`); process.exit(1); }
+    brief = readFileSync(briefFile, 'utf-8');
+  }
+
+  if (!chatId) { console.error('goal supervise 需要 --chat-id <goal群chatId>'); process.exit(1); }
+  if (!title.trim()) { console.error('goal supervise 需要 --title <goal标题>'); process.exit(1); }
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  let parentChatId = parentChatIdArg;
+  let parentRoot = parentRootArg;
+  let larkAppId: string | undefined;
+  if (sid) {
+    const sessions = loadSessions();
+    const s = sessions.get(sid);
+    if (s) {
+      larkAppId = s.larkAppId;
+      parentChatId ??= s.chatId;
+      parentRoot ??= s.rootMessageId;
+    }
+  }
+  if (!larkAppId) {
+    console.error('无法推断 L1 会话所属 bot。请在 L1 CLI 会话里运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+  if (!parentChatId) {
+    console.error('无法推断 parent-chat-id，请传 --parent-chat-id <主群chatId>。');
+    process.exit(1);
+  }
+
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) {
+    console.error(`未找到在线 daemon (larkAppId=${larkAppId})。`);
+    process.exit(1);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/supervise`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        larkAppId,
+        chatId,
+        parentChatId,
+        parentRoot,
+        title: title.trim(),
+        brief,
+        workingDir,
+        parentSessionId: sid,
+      }),
+    });
+  } catch (err: any) {
+    console.error(`无法连接 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    process.exit(1);
+  }
+  let body: any = {};
+  try { body = await res.json(); } catch { /* */ }
+  if (!res.ok || !body?.ok) {
+    console.error(`goal supervise 失败: ${body?.error ?? res.statusText}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ success: true, ...body }, null, 2));
+}
+
 // ─── Create-group subcommand ─────────────────────────────────────────────────
 
 async function cmdCreateGroup(rest: string[]): Promise<void> {
@@ -9140,6 +9234,7 @@ switch (command) {
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'delivery': await cmdDelivery(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'goal': await cmdGoal(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;
