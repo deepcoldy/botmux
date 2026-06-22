@@ -5,7 +5,7 @@
 import { fork, execSync, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
@@ -1025,6 +1025,7 @@ export function killWorker(ds: DaemonSession): void {
  */
 function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
+  reclaimParkedCrashDiagnostic(ds);
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
@@ -1033,6 +1034,20 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
   }
+}
+
+/**
+ * Reclaim a session's parked crash-diagnostic shell (`bmx-diag-<sid>`) and its
+ * captured `.ansi` file. The worker normally tears these down itself (killCli /
+ * suspend / next-message retry), but it CAN'T when it is hard-killed
+ * (OOM/SIGKILL) while parked — then the daemon must do it, on the next refork
+ * (forkWorker) or on close (destroyOrphanedBackingSession). Both ops are no-ops
+ * when absent, so this is safe to call unconditionally for tmux sessions.
+ */
+function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
+  if (getSessionPersistentBackendType(ds) !== 'tmux') return;
+  try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId)); } catch { /* benign */ }
+  try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
@@ -1511,6 +1526,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     sessionStore.updateSession(ds.session);
   }
 
+  // Re-establishing a worker also reclaims any crash-diagnostic shell a prior
+  // worker left parked but couldn't clean (hard-killed while parked, daemon
+  // still alive → next message reforks here). The fresh CLI spawns under the
+  // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
+  if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
+
   ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
@@ -1885,6 +1906,17 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        // A live prompt means a (re)spawn reached a working CLI — clear the lazy
+        // cold-resume marker set when we parked a crash diagnostic shell. The
+        // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
+        // forkWorker, so without this the stale marker survives in the store and a
+        // LATER genuine zombie (bmx-<sid> actually gone) would be kept active by
+        // restore instead of being closed. If retry never reaches a prompt the
+        // marker persists, preserving the cross-daemon-restart lazy-retry intent.
+        if (ds.session.suspendedColdResume) {
+          ds.session.suspendedColdResume = undefined;
+          sessionStore.updateSession(ds.session);
+        }
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
           ds.pendingRawInput = undefined;
@@ -2199,6 +2231,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
         if (rc.count > 3) {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
+          const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working" forever
           if (ds.streamCardId && ds.workerPort) {
             const readUrl = buildTerminalUrl(ds);
@@ -2211,11 +2244,37 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             );
             scheduleCardPatch(ds, frozenCard);
           }
-          // Kill the worker process to free resources
-          killWorker(ds);
+          if (keepDiagnosticWorker) {
+            // Ask the worker to park a lightweight tmux diagnostic shell under
+            // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
+            // don't pay for it). Keep its web server alive so the existing
+            // terminal URL can show the startup failure; the next user message
+            // tells that same worker to destroy the diagnostic shell and retry.
+            ds.worker!.send({ type: 'park_diagnostic' } as DaemonToWorker);
+            restartCounts.delete(key);
+            ds.lastScreenStatus = 'idle';
+            // Survive a daemon restart: mark this as a lazy cold-resume so
+            // restore keeps the session active (re-spawns the CLI on the next
+            // message) instead of zombie-closing it when the real bmx-<sid> is
+            // found missing. ds.hasHistory is already true (set at the top of
+            // claude_exit); forkWorker clears suspendedColdResume on re-spawn.
+            ds.session.suspendedColdResume = true;
+            sessionStore.updateSession(ds.session);
+          } else {
+            // Non-tmux or failed diagnostic parking: keep the historical
+            // cleanup path so we do not leave an unusable worker around.
+            killWorker(ds);
+          }
           const cliName = getCliDisplayName(effectiveCliId);
+          const parts = [tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
+          if (keepDiagnosticWorker) {
+            parts.push(tr('worker.crash_diagnostic_terminal', undefined, loc));
+          }
+          if (msg.logTail?.trim()) {
+            parts.push(`${tr('worker.crash_recent_output', undefined, loc)}\n${msg.logTail.trim()}`);
+          }
           try {
-            await scopedReply(tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc), 'text', undefined);
+            await scopedReply(parts.join('\n\n'), 'text', undefined);
           } catch (replyErr) {
             if (replyErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);

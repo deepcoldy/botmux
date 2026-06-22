@@ -198,6 +198,27 @@ function writeClaudeLateFailureFixture(): string {
   return path;
 }
 
+// turn 0: prompt + narration + a tool_use span. turn 1: prompt + narration, NO
+// tool (a fully tool-less turn). Used to prove agent narration is gated to
+// detail=spans / conversation, and that a tool-less turn still renders.
+function writeClaudeNarrationFixture(): string {
+  const path = join(dir, 'claude-narration.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'fix' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { id: 'm1', role: 'assistant', content: [
+      { type: 'text', text: 'Looking into it. token=sk-abcdef1234567890' },
+      { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/a/b.ts' } },
+    ] } }),
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } }),
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:03.000Z', message: { role: 'user', content: 'and explain' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:04.000Z', message: { id: 'm2', role: 'assistant', content: [
+      { type: 'text', text: 'It does X.' },
+    ] } }),
+  ];
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
 describe('SafeInsightReport', () => {
   it('returns summary without spans and sorts suggestions by severity', () => {
     resolvedPath = writeClaudeFailureFixture(3);
@@ -681,5 +702,88 @@ describe('SafeInsightReport', () => {
     expect(overview.sessions.map(s => s.sessionId)).toEqual(['s2', 's1']);
     expect(JSON.stringify(overview)).not.toContain('sk-secret');
     expect(JSON.stringify(overview)).not.toContain('curl https://x.test');
+  });
+
+  it('gates scrubbed agent narration to detail=spans and omits it from detail=summary', () => {
+    resolvedPath = writeClaudeNarrationFixture();
+
+    const summary = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'summary', now: () => new Date('2026-06-17T02:00:00.000Z') });
+    // narration never reaches the summary report (the /insight card + overview path)
+    expect(JSON.stringify(summary)).not.toContain('Looking into it');
+    expect(JSON.stringify(summary)).not.toContain('It does X');
+
+    const spans = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'spans', now: () => new Date('2026-06-17T02:00:00.000Z') });
+    const t0 = spans.turnTimeline.find(t => t.turnIndex === 0);
+    expect(t0?.agentSay?.text).toContain('Looking into it');
+    // a secret echoed in narration is scrubbed before it reaches the structure
+    expect(JSON.stringify(spans.turnTimeline)).toContain('token=<redacted>');
+    expect(JSON.stringify(spans.turnTimeline)).not.toContain('sk-abcdef1234567890');
+  });
+
+  it('does not resurrect a cap-trimmed span turn as an empty narration turn, but keeps genuinely tool-less turns', () => {
+    // turn 0: a FAILING tool (high cap priority). turn 1: narration + a SUCCESS
+    // tool (low priority → trimmed when maxSpans is small). turn 2: narration
+    // only, no tool (genuinely tool-less).
+    const path = join(dir, 'claude-cap.jsonl');
+    writeFileSync(path, [
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 't0' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { id: 'a0', role: 'assistant', content: [
+        { type: 'tool_use', id: 'f0', name: 'Bash', input: { command: 'false' } },
+      ] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'f0', is_error: true, content: 'boom' }] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:03.000Z', message: { role: 'user', content: 't1' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:04.000Z', message: { id: 'a1', role: 'assistant', content: [
+        { type: 'text', text: 'CAPPED_TURN_NARRATION' },
+        { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: '/x/y.ts' } },
+      ] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:05.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'r1', content: 'ok' }] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:06.000Z', message: { role: 'user', content: 't2' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:07.000Z', message: { id: 'a2', role: 'assistant', content: [
+        { type: 'text', text: 'TOOLLESS_TURN_NARRATION' },
+      ] } }),
+    ].join('\n') + '\n', 'utf-8');
+    resolvedPath = path;
+
+    const report = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'spans', maxSpans: 1, now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    const turnIndexes = report.turnTimeline.map(t => t.turnIndex);
+    // turn 1 has a real span trimmed by the cap → must NOT become a phantom 0-op
+    // turn, and its narration must not leak past the cap.
+    expect(turnIndexes).not.toContain(1);
+    expect(JSON.stringify(report.turnTimeline)).not.toContain('CAPPED_TURN_NARRATION');
+    // turn 2 is genuinely tool-less → its narration still surfaces under the cap.
+    expect(turnIndexes).toContain(2);
+    const t2 = report.turnTimeline.find(t => t.turnIndex === 2);
+    expect(t2?.agentSay?.text).toContain('TOOLLESS_TURN_NARRATION');
+    expect(t2?.events).toEqual([]);
+  });
+
+  it('renders a tool-less narration turn in the conversation replay (turn with no span)', () => {
+    resolvedPath = writeClaudeNarrationFixture();
+    const convo = buildSafeInsightConversation({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { offset: 0, limit: 50 });
+
+    // turn 1 ran no tool — its narration must still surface as an agent 'say'
+    // message (text, no event). This is the regression the timeline union fixes.
+    const turn1Say = convo.messages.find(m => m.turnIndex === 1 && m.role === 'agent' && !!m.text && !m.event);
+    expect(turn1Say?.text).toContain('It does X');
+    // and the narration on the tool-bearing turn 0 is present too
+    const turn0Say = convo.messages.find(m => m.turnIndex === 0 && m.role === 'agent' && !!m.text && !m.event);
+    expect(turn0Say?.text).toContain('Looking into it');
   });
 });

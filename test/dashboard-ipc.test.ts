@@ -79,6 +79,94 @@ describe('POST /api/sessions/:sessionId/close', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/restart', () => {
+  it('sends a restart IPC message to the live worker', async () => {
+    const send = vi.fn();
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-restart', cliId: 'codex' },
+      worker: { send, killed: false },
+      adoptedFrom: undefined,
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-restart/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-restart', cliId: 'codex' });
+    expect(send).toHaveBeenCalledWith({ type: 'restart' });
+    findSpy.mockRestore();
+  });
+
+  it('rejects unknown sessions without creating a restart side effect', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'session_not_active' });
+    findSpy.mockRestore();
+  });
+
+  it('rejects adopt/observed sessions without restarting (would kill the user pane)', async () => {
+    const send = vi.fn();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-adopt', cliId: 'codex' },
+      worker: { send, killed: false },
+      adoptedFrom: { source: 'tmux', tmuxTarget: '0:1.0', cwd: '/x' },
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-adopt/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'adopt_restart_unsupported' });
+    expect(send).not.toHaveBeenCalled();
+    expect(forkSpy).not.toHaveBeenCalled();
+    findSpy.mockRestore();
+    forkSpy.mockRestore();
+  });
+
+  it('revives a worker-less but active session by re-forking (matches the Feishu card path)', async () => {
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-revive', cliId: 'codex' },
+      worker: null,
+      adoptedFrom: undefined,
+      hasHistory: true,
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-revive/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-revive', cliId: 'codex', revived: true });
+    expect(forkSpy).toHaveBeenCalledTimes(1);
+    // forkWorker(ds, prompt, resume) — resume must carry ds.hasHistory so the
+    // revived CLI resumes the conversation rather than starting blank.
+    expect(forkSpy.mock.calls[0][2]).toBe(true);
+    findSpy.mockRestore();
+    forkSpy.mockRestore();
+  });
+
+  it('returns 502 when sending the restart IPC throws (e.g. closed channel)', async () => {
+    const send = vi.fn(() => { throw new Error('ERR_IPC_CHANNEL_CLOSED'); });
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-throw', cliId: 'codex' },
+      worker: { send, killed: false },
+      adoptedFrom: undefined,
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-throw/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ ok: false });
+    findSpy.mockRestore();
+  });
+});
+
 describe('GET /api/sessions/:sessionId/write-link', () => {
   it('returns 401 without a valid loopback-HMAC signature', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);

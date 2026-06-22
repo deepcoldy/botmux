@@ -398,4 +398,50 @@ describe('insight span readers', () => {
     });
     expect(JSON.stringify(parsed)).not.toContain('sk-secret');
   });
+
+  it('captures Claude agent narration (text blocks), scrubs secrets, excludes thinking, keeps tool_use', () => {
+    const path = fp('claude-say.jsonl');
+    writeFileSync(path, [
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'fix the bug' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { id: 'm1', role: 'assistant', content: [
+        { type: 'text', text: 'Let me look. token=sk-abcdef1234567890 is set.' },
+        { type: 'thinking', thinking: 'hidden reasoning sk-shouldnotleak98765' },
+        { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/a/b.ts' } },
+      ] } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:02.000Z', message: { id: 'm2', role: 'assistant', content: [
+        { type: 'text', text: 'Done — fixed it.' },
+      ] } }),
+    ].join('\n') + '\n', 'utf-8');
+
+    const parsed = parseClaudeInsight(path);
+    // both narration segments in the same turn are concatenated
+    expect(parsed.turnAgentSay?.[0]?.text).toContain('Let me look.');
+    expect(parsed.turnAgentSay?.[0]?.text).toContain('Done — fixed it.');
+    // a secret echoed in narration is scrubbed
+    expect(parsed.turnAgentSay?.[0]?.text).toContain('token=<redacted>');
+    expect(JSON.stringify(parsed.turnAgentSay)).not.toContain('sk-abcdef1234567890');
+    // thinking / chain-of-thought is never captured
+    expect(JSON.stringify(parsed.turnAgentSay)).not.toContain('hidden reasoning');
+    expect(JSON.stringify(parsed.turnAgentSay)).not.toContain('sk-shouldnotleak98765');
+    // the tool_use sharing the assistant message is still captured as a span
+    expect(parsed.spans).toHaveLength(1);
+    expect(parsed.spans[0]).toMatchObject({ tool: 'Read', turnIndex: 0 });
+  });
+
+  it('captures Codex agent narration (agent_message), scrubs secrets, excludes agent_reasoning', () => {
+    const path = fp('codex-say.jsonl');
+    writeFileSync(path, [
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-06-17T01:00:00.000Z', payload: { type: 'user_message', message: 'deploy' } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-06-17T01:00:01.000Z', payload: { type: 'agent_message', message: 'Deploying with key=sk-deadbeef12345678 now.' } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-06-17T01:00:02.000Z', payload: { type: 'agent_reasoning', message: 'hidden codex reasoning sk-reasonleak0000' } }),
+    ].join('\n') + '\n', 'utf-8');
+
+    const parsed = parseCodexInsight(path);
+    expect(parsed.turnAgentSay?.[0]?.text).toContain('Deploying with');
+    expect(parsed.turnAgentSay?.[0]?.text).toContain('key=<redacted>');
+    expect(JSON.stringify(parsed.turnAgentSay)).not.toContain('sk-deadbeef12345678');
+    // agent_reasoning is never captured
+    expect(JSON.stringify(parsed.turnAgentSay)).not.toContain('hidden codex reasoning');
+    expect(JSON.stringify(parsed.turnAgentSay)).not.toContain('sk-reasonleak0000');
+  });
 });

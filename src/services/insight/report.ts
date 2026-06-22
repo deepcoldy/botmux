@@ -7,6 +7,7 @@ import { parseClaudeInsight } from './claude-span-reader.js';
 import { parseCodexInsight } from './codex-span-reader.js';
 import { safeErrorMessage, toSafeSpan } from './redact.js';
 import type {
+  AgentSay,
   InsightDetail,
   InsightDiagnosticKind,
   InsightConversationMessage,
@@ -820,6 +821,8 @@ function buildTurnTimeline(
   turnDiagnostics: TurnEfficiencyDiagnostic[],
   turnPrompts: TurnPromptPreview[] | undefined,
   turnContext: TurnContextPoint[] | undefined,
+  turnAgentSay?: AgentSay[],
+  allSpanTurnIndexes?: ReadonlySet<number>,
 ): TurnTimelineTurn[] {
   if (!spans) return [];
   const diagByTurn = new Map(turnDiagnostics.map(d => [d.turnIndex, d]));
@@ -829,9 +832,28 @@ function buildTurnTimeline(
     row.push({ span, index });
     grouped.set(span.turnIndex, row);
   });
-  return [...grouped.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([turnIndex, rows]) => {
+  // A fully tool-less turn (pure Q&A / clarification / text-only reply) has no
+  // span, so keying turns off `grouped` alone would drop it from the timeline and
+  // the conversation replay. Union in turn indices that carry a prompt / context /
+  // narration — but ONLY when the turn is genuinely span-less (absent from
+  // `allSpanTurnIndexes`, the full un-capped span set). A turn whose spans exist
+  // but were trimmed by the maxSpans cap must NOT be re-added as an events:[] turn:
+  // that would misrepresent a capped turn as a 0-op turn and leak its prompt/say
+  // preview past the cap. When `allSpanTurnIndexes` is omitted (uncapped paths)
+  // every real-span turn is already in `grouped`, so the guard is a no-op.
+  // Detail==='summary' passes the prompt/context/say arrays undefined, so summary
+  // reports stay span-only.
+  const turnIndexes = new Set<number>(grouped.keys());
+  const consider = (i: number): void => {
+    if (grouped.has(i) || !allSpanTurnIndexes?.has(i)) turnIndexes.add(i);
+  };
+  turnPrompts?.forEach((p, i) => { if (p) consider(i); });
+  turnContext?.forEach((c, i) => { if (c) consider(i); });
+  turnAgentSay?.forEach((s, i) => { if (s?.text) consider(i); });
+  return [...turnIndexes]
+    .sort((a, b) => a - b)
+    .map(turnIndex => {
+      const rows = grouped.get(turnIndex) ?? [];
       const rowSpans = rows.map(r => r.span);
       const diag = diagByTurn.get(turnIndex);
       const tags = [...new Set(rowSpans.flatMap(s => s.tags ?? ['normal']))] as SafeSpanTag[];
@@ -840,6 +862,7 @@ function buildTurnTimeline(
         turnIndex,
         severity: diag?.severity ?? 'info',
         ...(turnPrompts?.[turnIndex] ? { prompt: turnPrompts[turnIndex] } : {}),
+        ...(turnAgentSay?.[turnIndex]?.text ? { agentSay: turnAgentSay[turnIndex] } : {}),
         ...(turnContext?.[turnIndex] ? { context: turnContext[turnIndex] } : {}),
         headline: diag?.headline ?? { id: 'turn_normal', params: metrics },
         metrics,
@@ -890,6 +913,20 @@ function buildConversationProjection(turns: TurnTimelineTurn[]): InsightConversa
         text: turn.prompt.text,
         truncated: turn.prompt.truncated,
         ...(turn.prompt.source ? { source: turn.prompt.source } : {}),
+      });
+    }
+    if (turn.agentSay?.text) {
+      // Agent narration as a 'say' message (role 'agent', text but no event) — sits
+      // before the turn's operations so the replay reads 你说 → agent 说 → agent 做.
+      messages.push({
+        id: `turn-${turn.turnIndex}-say`,
+        turnIndex: turn.turnIndex,
+        role: 'agent',
+        severity: turn.severity,
+        tags: turn.tags,
+        author: 'agent',
+        text: turn.agentSay.text,
+        truncated: turn.agentSay.truncated,
       });
     }
     for (let i = 0; i < turn.events.length; i++) {
@@ -948,7 +985,7 @@ function buildDetailTimelineFromParsed(parsed: InsightParseResult, slowThreshold
   const tags = tagsForVisibleSpans(parsed.spans, slowThresholdMs);
   const safeSpans = attachSpanDetails(parsed.spans.map((span, index) => toSafeSpan(span, parsed.firstEventMs, tags[index]))) ?? [];
   const turnDiagnostics = buildTurnDiagnostics(parsed.spans, slowThresholdMs);
-  return buildTurnTimeline(safeSpans, turnDiagnostics, parsed.turnPrompts, parsed.turnContext);
+  return buildTurnTimeline(safeSpans, turnDiagnostics, parsed.turnPrompts, parsed.turnContext, parsed.turnAgentSay);
 }
 
 function resolveAndParseForPrompt(
@@ -1064,7 +1101,11 @@ export function buildSafeInsightReport(q: InsightReportQuery, opts: BuildInsight
   const visible = attachSpanDetails(visibleRaw?.map((s, index) => toSafeSpan(s, parsed.firstEventMs, visibleTags?.[index])));
   const diagnostics = diagnosticsFor(suggestions, agg, parsed.spans, visibleRaw, slowThresholdMs);
   const turnDiagnostics = buildTurnDiagnostics(visibleRaw, slowThresholdMs);
-  const turnTimeline = buildTurnTimeline(visible, turnDiagnostics, detail === 'spans' ? parsed.turnPrompts : undefined, detail === 'spans' ? parsed.turnContext : undefined);
+  // `visible` is capped to maxSpans; pass the FULL span turn set so a turn whose
+  // spans were trimmed by the cap isn't re-synthesized as an events:[] turn (only
+  // genuinely tool-less turns get unioned in). See buildTurnTimeline.
+  const allSpanTurnIndexes = detail === 'spans' ? new Set(parsed.spans.map(s => s.turnIndex)) : undefined;
+  const turnTimeline = buildTurnTimeline(visible, turnDiagnostics, detail === 'spans' ? parsed.turnPrompts : undefined, detail === 'spans' ? parsed.turnContext : undefined, detail === 'spans' ? parsed.turnAgentSay : undefined, allSpanTurnIndexes);
   const report: SafeInsightReport = {
     sessionId: q.sessionId,
     cliId: q.cliId ?? 'unknown',

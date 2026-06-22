@@ -123,11 +123,19 @@ describe('TmuxPipeBackend input addressing', () => {
     be.pasteText('multi\nline');
 
     const calls = getExecFileCalls();
-    expect(calls[0][1]).toContain('load-buffer');
+    const loadArgs = calls[0][1] as string[];
+    expect(loadArgs).toContain('load-buffer');
     expect((calls[0][2] as any).input).toBe('multi\nline');
+    const bIdx = loadArgs.indexOf('-b');
+    expect(bIdx).toBeGreaterThanOrEqual(0);
+    const bufferName = loadArgs[bIdx + 1];
+    expect(bufferName).toMatch(/^botmux-[a-f0-9]{16}$/);
 
     const pasteArgs = calls[1][1] as string[];
     expect(pasteArgs).toContain('paste-buffer');
+    const pasteBIdx = pasteArgs.indexOf('-b');
+    expect(pasteBIdx).toBeGreaterThanOrEqual(0);
+    expect(pasteArgs[pasteBIdx + 1]).toBe(bufferName);
     const tIdx = pasteArgs.indexOf('-t');
     expect(pasteArgs[tIdx + 1]).toBe('0:5.0');
     // -p forces bracketed-paste markers, REQUIRED for CoCo/Ink to treat the
@@ -136,6 +144,43 @@ describe('TmuxPipeBackend input addressing', () => {
     // the input box (replies-to-previous-message off-by-one). Regression guard
     // for PR #25, which added -p only to the unused TmuxBackend.
     expect(pasteArgs).toContain('-p');
+  });
+
+  it('uses a fresh named tmux buffer for each paste', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    be.pasteText('one');
+    be.pasteText('two');
+
+    const loadCalls = getExecFileCalls()
+      .map(call => call[1] as string[])
+      .filter(args => args.includes('load-buffer'));
+    const firstBuffer = loadCalls[0][loadCalls[0].indexOf('-b') + 1];
+    const secondBuffer = loadCalls[1][loadCalls[1].indexOf('-b') + 1];
+    expect(firstBuffer).not.toBe(secondBuffer);
+  });
+
+  it('deletes the named buffer when paste-buffer fails (cleanup, no leak)', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    // load-buffer succeeds, paste-buffer throws → the -d delete never runs, so
+    // the finally{} must delete the SAME named buffer. guardedSend swallows the
+    // failure (pane ALIVE via the default execSync mock) so pasteText must not throw.
+    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
+      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      return '' as any;
+    }) as any);
+
+    expect(() => be.pasteText('boom')).not.toThrow();
+
+    const calls = getExecFileCalls().map(call => call[1] as string[]);
+    const loadArgs = calls.find(args => args.includes('load-buffer'))!;
+    const bufferName = loadArgs[loadArgs.indexOf('-b') + 1];
+    const deleteArgs = calls.find(args => args.includes('delete-buffer'));
+    expect(deleteArgs).toBeDefined();
+    expect(deleteArgs![deleteArgs!.indexOf('-b') + 1]).toBe(bufferName);
   });
 
   it('write delegates to sendText (literal send-keys)', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { renderCliFilterGroup } from '../src/dashboard/web/sessions.js';
+import { canRestartSession, renderCliFilterGroup, restartConfirmMessage } from '../src/dashboard/web/sessions.js';
 
 describe('dashboard sessions filters', () => {
   it('renders CLI filters as same-name checkboxes checked by default for multi-select filtering', () => {
@@ -14,5 +14,20 @@ describe('dashboard sessions filters', () => {
     expect(html).toMatch(/value="codex" checked/);
     expect(html).toMatch(/value="pi" checked/);
     expect(html).not.toContain('<select');
+  });
+
+  it('builds restart confirmation text with current status and CLI', () => {
+    const message = restartConfirmMessage({ status: 'working', cliId: 'codex' });
+
+    expect(message).toContain('当前状态：working');
+    expect(message).toContain('CLI：codex');
+    expect(message).toContain('确认重启');
+  });
+
+  it('only shows restart for active botmux-owned sessions whose CLI has started', () => {
+    expect(canRestartSession({ status: 'idle', adopt: false })).toBe(true);
+    expect(canRestartSession({ status: 'closed', adopt: false })).toBe(false);
+    expect(canRestartSession({ status: 'idle', adopt: true })).toBe(false);
+    expect(canRestartSession({ status: 'starting', pendingRepo: true })).toBe(false);
   });
 });

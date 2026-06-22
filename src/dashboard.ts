@@ -72,6 +72,7 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient } from './platform/tunnel-client.js';
 import { buildGoalBoard } from './verified-delivery/goal-board.js';
+import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -863,6 +864,54 @@ const server = createServer(async (req, res) => {
       });
       return jsonRes(res, 200, { sessions });
     }
+    if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
+      let body: { olderThanHours?: unknown; sessionIds?: unknown };
+      try {
+        body = await readJsonBody(req) as { olderThanHours?: unknown; sessionIds?: unknown };
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
+      if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
+
+      // WYSIWYG: the UI scopes cleanup to the rows currently visible under the
+      // page filters and sends their sessionIds, so the closed set matches the
+      // confirmed count. We still hand the scoped rows to cleanupIdleSessions,
+      // which re-validates each is a genuine idle candidate — a stale/forged id
+      // can never close a non-idle session. Omitting sessionIds (e.g. an older
+      // client) falls back to a deployment-wide sweep. Cap the id set so a giant
+      // body can't blow up the Set build.
+      const idScope = Array.isArray(body?.sessionIds)
+        ? new Set((body.sessionIds as unknown[]).slice(0, 10000).map(String))
+        : null;
+      const rows = aggregator.getSessions();
+      const scoped = idScope ? rows.filter(s => idScope.has(s.sessionId)) : rows;
+
+      const result = await cleanupIdleSessions(scoped, olderThanHours, async s => {
+        try {
+          const upstream = await proxyToDaemon(
+            s.larkAppId as string,
+            `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
+            { method: 'POST' },
+          );
+          const text = await upstream.text();
+          let parsed: any = null;
+          try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+          // The daemon close route always replies 200 {ok:true}; treat anything
+          // else (incl. an unparseable/missing body) as a failure rather than a
+          // silent success.
+          const ok = upstream.ok && parsed?.ok === true;
+          return {
+            sessionId: s.sessionId,
+            ok,
+            error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
+          };
+        } catch (e: any) {
+          return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };
+        }
+      });
+      return jsonRes(res, 200, result);
+    }
     if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
       const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
       // Per-daemon timeout + isolate failures: an upstream insight parse can be
@@ -1294,7 +1343,7 @@ const server = createServer(async (req, res) => {
     }
 
     let m: RegExpMatchArray | null;
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
