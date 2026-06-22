@@ -52,6 +52,46 @@ describe('buildGoalBoard — ledger projection', () => {
     expect(tasks['t-legacy'].acceptanceHint).toBe('just text');
   });
 
+  it('surfaces lifecycle timestamps, attempts, evidence and verification trail', () => {
+    const led = openLedger({ baseDir });
+    const T1 = 1_700_000_000_000, T2 = 1_700_000_030_000, T3 = 1_700_000_090_000;
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-full', chatId: 'oc_g', idempotencyKey: 'd', ts: T1, payload: { taskId: 't-full', title: 'full' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-full', chatId: 'oc_g', idempotencyKey: 'r1', ts: T2, payload: { taskId: 't-full', reportId: 'rep1', workerOpenId: 'ou_w', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/out.txt' }, { kind: 'inline', ref: 'abc', name: 'log', bytes: 12, preview: 'PASS' }] } }));
+    led.append(draft({ type: 'TaskAccepted', taskId: 't-full', chatId: 'oc_g', idempotencyKey: 'a1', ts: T3, payload: { taskId: 't-full', reportId: 'rep1', checkedBy: 'ou_orch', evidenceChecked: ['/tmp/out.txt exists'], ranCommands: ['test -f /tmp/out.txt'] } }));
+
+    const t = buildGoalBoard({ baseDir, chatId: 'oc_g' }).goals[0].tasks[0];
+    expect(t.dispatchedAt).toBe(T1);
+    expect(t.latestReportedAt).toBe(T2);
+    expect(t.latestVerdictAt).toBe(T3);
+    expect(t.acceptedAt).toBe(T3);
+    expect(t.rejectedAt).toBeUndefined();
+    expect(t.checkedBy).toBe('ou_orch');
+    expect(t.evidenceChecked).toEqual(['/tmp/out.txt exists']);
+    expect(t.ranCommands).toEqual(['test -f /tmp/out.txt']);
+    expect(t.evidence).toEqual([
+      { kind: 'path', label: '/tmp/out.txt' },
+      { kind: 'inline', label: 'log', preview: 'PASS', bytes: 12 },
+    ]);
+    expect(t.attempts).toHaveLength(1);
+    expect(t.attempts[0]).toMatchObject({ reportId: 'rep1', ts: T2, verdict: 'accepted', workerOpenId: 'ou_w' });
+  });
+
+  it('records every attempt with its reject reason in the timeline', () => {
+    const led = openLedger({ baseDir });
+    const T = (n: number) => 1_700_000_000_000 + n * 1000;
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-multi', chatId: 'oc_g', idempotencyKey: 'd', ts: T(0), payload: { taskId: 't-multi' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-multi', chatId: 'oc_g', idempotencyKey: 'r1', ts: T(1), payload: { taskId: 't-multi', reportId: 'a1', summary: 'try1', evidence: [{ kind: 'path', path: '/tmp/a' }] } }));
+    led.append(draft({ type: 'TaskRejected', taskId: 't-multi', chatId: 'oc_g', idempotencyKey: 'x1', ts: T(2), payload: { taskId: 't-multi', reportId: 'a1', reason: 'check_failed' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-multi', chatId: 'oc_g', idempotencyKey: 'r2', ts: T(3), payload: { taskId: 't-multi', reportId: 'a2', summary: 'try2', evidence: [{ kind: 'path', path: '/tmp/b' }] } }));
+
+    const t = buildGoalBoard({ baseDir, chatId: 'oc_g' }).goals[0].tasks[0];
+    expect(t.status).toBe('reported');
+    expect(t.attempts).toHaveLength(2);
+    expect(t.attempts[0]).toMatchObject({ reportId: 'a1', ts: T(1), verdict: 'rejected', reason: 'check_failed' });
+    expect(t.attempts[1]).toMatchObject({ reportId: 'a2', ts: T(3) });
+    expect(t.attempts[1].verdict).toBeUndefined();
+  });
+
   it('carries reject reason onto the latest attempt', () => {
     const led = openLedger({ baseDir });
     led.append(draft({ type: 'TaskDispatched', taskId: 't-r', chatId: 'oc_g', idempotencyKey: 'd:r', payload: { taskId: 't-r' } }));
