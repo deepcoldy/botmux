@@ -84,6 +84,10 @@ export interface TaskView {
   title?: string;
   workerTopicRoot?: string;   // where to dispatch --into for reject/redo
   workerOpenIds?: string[];
+  /** Display names for the workers, index-aligned with workerOpenIds. Captured at
+   *  dispatch from the `--bot <id:name:role>` label — open_id is per-app scoped so
+   *  it can't be resolved to a name cross-app; the name is stored at the source. */
+  workerNames?: string[];
   acceptanceHint?: string;    // legacy free-text intent (kept for back-compat / display)
   acceptanceCriteria?: AcceptanceCriteria; // P1 #7: structured, validated verify plan (preferred)
   status: TaskStatus;
@@ -98,6 +102,8 @@ export interface TaskDispatchedPayload {
   title?: string;
   workerTopicRoot?: string;
   workerOpenIds?: string[];
+  /** Index-aligned display names for workerOpenIds (from `--bot <id:name:role>`). */
+  workerNames?: string[];
   brief?: string;
   acceptanceHint?: string;
   acceptanceCriteria?: AcceptanceCriteria;

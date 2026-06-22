@@ -116,6 +116,7 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         t.title = p.title ?? t.title;
         t.workerTopicRoot = p.workerTopicRoot ?? t.workerTopicRoot;
         t.workerOpenIds = p.workerOpenIds ?? t.workerOpenIds;
+        t.workerNames = p.workerNames ?? t.workerNames;
         t.acceptanceHint = p.acceptanceHint ?? t.acceptanceHint;
         t.acceptanceCriteria = p.acceptanceCriteria ?? t.acceptanceCriteria;
         if (t.reports.length === 0) t.status = 'dispatched';
