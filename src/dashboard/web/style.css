@@ -7103,6 +7103,17 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .flow-stitle { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .insights-page .flow-sess .mph { flex: 1; height: 11px; }
 .insights-page .flow-stime { font-size: 11px; color: var(--mut); text-align: right; font-variant-numeric: tabular-nums; }
+/* sub-agent swim-lanes (detail view) */
+.insights-page .subagent-block .ins-hint { margin: -2px 0 10px; }
+.insights-page .sublanes { display: grid; gap: 8px; }
+.insights-page .sublane { display: grid; gap: 5px; padding: 9px 12px; background: var(--ins-inner); border: 1px solid var(--line); border-radius: 8px; border-left: 3px solid var(--ph-delegate); }
+.insights-page .sublane.bad { border-left-color: var(--bad); }
+.insights-page .sublane-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.insights-page .sublane-type { flex: 0 0 auto; font-size: 11px; font-weight: 600; color: var(--acc); background: var(--accent-soft); padding: 1px 7px; border-radius: 999px; }
+.insights-page .sublane-task { font-size: 12px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.insights-page .sublane .mph { height: 8px; }
+.insights-page .sublane-stats { display: flex; gap: 14px; font-size: 11px; color: var(--mut); font-variant-numeric: tabular-nums; }
+.insights-page .sublane-stats .bad { color: var(--bad); }
 
 /* Sessions tab: full-width list ⇆ full-width detail (mirrors ASI 会话, replaces
    the cramped master-detail side panel) */

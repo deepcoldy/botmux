@@ -321,13 +321,42 @@ function renderOverview(d: DerivedOverview): string {
     ${disclosureNote()}`;
 }
 
-function renderPhaseMix(report: SafeInsightReport): string {
-  const entries = Object.entries(report.agg.phase ?? {}).filter(([, v]) => v.count > 0 || v.ms > 0);
+function phaseMixBar(phase: Record<string, { count: number; ms: number }> | undefined): string {
+  const entries = Object.entries(phase ?? {}).filter(([, v]) => v.count > 0 || v.ms > 0);
   if (!entries.length) return '';
-  return `<div class="mph">${entries.map(([phase, v]) => {
+  return `<div class="mph">${entries.map(([ph, v]) => {
     const weight = Math.max(1, v.ms || v.count);
-    return `<i class="${phaseClass(phase)}" style="flex:${weight}" title="${escapeHtml(`${phaseLabel(phase)} · ${v.count} · ${fmtMs(v.ms)}`)}"></i>`;
+    return `<i class="${phaseClass(ph)}" style="flex:${weight}" title="${escapeHtml(`${phaseLabel(ph)} · ${v.count} · ${fmtMs(v.ms)}`)}"></i>`;
   }).join('')}</div>`;
+}
+
+function renderPhaseMix(report: SafeInsightReport): string {
+  return phaseMixBar(report.agg.phase);
+}
+
+// Delegated sub-agents (Claude Task/Agent) as swim-lanes: each shows its type,
+// task, what it did (phase mix) and how long it ran. Renders nothing when none.
+function renderSubagents(report: SafeInsightReport): string {
+  const lanes = report.subagents ?? [];
+  if (!lanes.length) return '';
+  const totMs = lanes.reduce((s, l) => s + l.durationMs, 0);
+  const rows = lanes.map(l => `<div class="sublane${l.failures ? ' bad' : ''}">
+      <div class="sublane-head">
+        <span class="sublane-type">${escapeHtml(l.agentType)}</span>
+        <span class="sublane-task">${escapeHtml(l.task?.text ?? '')}${l.task?.truncated ? '…' : ''}</span>
+      </div>
+      ${phaseMixBar(l.phase)}
+      <div class="sublane-stats">
+        <span>${fmtInt(l.spans)} ${escapeHtml(t('insights.spansShort'))}</span>
+        <span>${escapeHtml(fmtMs(l.durationMs))}</span>
+        ${l.failures ? `<span class="bad">${fmtInt(l.failures)} ${escapeHtml(t('insights.failedShort'))}</span>` : ''}
+      </div>
+    </div>`).join('');
+  return `<section class="block subagent-block">
+    <h3>${escapeHtml(t('insights.subagents'))} <span class="mut">· ${lanes.length} · ${escapeHtml(fmtMs(totMs))}</span></h3>
+    <p class="mut ins-hint">${escapeHtml(t('insights.subagentsHint'))}</p>
+    <div class="sublanes">${rows}</div>
+  </section>`;
 }
 
 // ── Top-level tabs + global filter dimensions (project / time) ──────────────
@@ -1462,6 +1491,7 @@ function renderDetailBody(report: SafeInsightReport, view: DetailView): string {
     </section>
     ${renderTurnRail(report, focus, recByTurn)}
     ${renderWorkGantt(report)}
+    ${renderSubagents(report)}
     ${renderContextCurve(report)}
     <div class="detailtabs">
       <div class="detailtabbar" role="tablist" aria-label="${escapeHtml(t('insights.detailTabs'))}">

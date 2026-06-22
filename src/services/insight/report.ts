@@ -2,6 +2,7 @@ import { existsSync, statSync } from 'node:fs';
 import { basename, isAbsolute, relative } from 'node:path';
 import { resolveSessionTranscriptPath } from '../transcript-resolver.js';
 import { isReadPhase, isWritePhase, isInteractiveWaitTool } from './classify.js';
+import { buildSubagentLanes } from './subagent-reader.js';
 import { parseAntigravityInsight } from './antigravity-span-reader.js';
 import { parseClaudeInsight } from './claude-span-reader.js';
 import { parseCodexInsight } from './codex-span-reader.js';
@@ -1196,6 +1197,11 @@ export function buildSafeInsightReport(q: InsightReportQuery, opts: BuildInsight
     report.meta.spansReturned = visible.length;
     report.meta.capped = parsed.spans.length > visible.length;
     report.workSummary = buildWorkSummary(visibleRaw ?? [], visible, q.cwd);
+    // Delegated sub-agents (Claude only) — one extra file parse each, so detail-mode only.
+    if (resolved.kind === 'claude') {
+      const lanes = buildSubagentLanes(resolved.path);
+      if (lanes.length) report.subagents = lanes;
+    }
   }
 
   return report;

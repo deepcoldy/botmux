@@ -65,6 +65,8 @@ export interface SafeInsightReport {
   /** Compact per-session rollup (also present in summary mode) for cross-session
    *  recurrence hotspots — file / command / error signatures, all safe-projected. */
   hot?: SafeInsightHot;
+  /** Delegated sub-agent runs (detail mode only; Claude sub-agents). */
+  subagents?: SafeSubagentLane[];
   spans?: SafeSpan[];
   error?: { code: InsightStatus; message: string };
 }
@@ -73,6 +75,23 @@ export interface SafeInsightHot {
   files: Array<{ path: string; reads: number; edits: number; added?: number; removed?: number }>;
   cmds: Array<{ cmd: string; runs: number; fails: number }>;
   errs: Array<{ tool: string; result: string; count: number }>;
+}
+
+/** One delegated sub-agent run (Claude Task/Agent), rolled up from its own
+ *  transcript under <session>/subagents/. All text is safe-projected. */
+export interface SafeSubagentLane {
+  /** Sub-agent type, e.g. "Explore" / "general-purpose" (scrubbed, clamped). */
+  agentType: string;
+  /** What it was asked to do (scrubbed preview of the Task description). */
+  task?: SafeTextPreview;
+  spans: number;
+  reads: number;
+  edits: number;
+  runs: number;
+  failures: number;
+  /** Sum of tool-execution durations, excluding interactive-wait tools. */
+  durationMs: number;
+  phase: Record<InsightPhase, { count: number; ms: number }>;
 }
 
 export interface SafeInsightTurnDetail {
