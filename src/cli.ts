@@ -4200,26 +4200,27 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 }
 
-// ─── Dispatch subcommand (Phase 0: open a sub-project thread + assign bots) ───
+// ─── Dispatch subcommand (Phase 0: assign bots in a goal chat / optional topic) ───
 
 async function cmdDispatch(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux dispatch — 开子项目话题、把 bot 拉进去协作（含 repo 预设 / 待命 / 追加）
+    console.log(`botmux dispatch — 在 goal 群派活、把 bot 拉进去协作（含 repo 预设 / 待命 / 追加）
 
 用法:
-  新开话题派活:
+  群级派活（默认，不开话题）:
     botmux dispatch --title "子项目标题" --bot <open_id[:名字[:角色]]> [--bot ...] \\
         [--brief "简报" | --brief-file <path>] [--repo <工作目录>] [--standby] \\
-        [--task-id <id>] [--acceptance-hint <text>]
+        [--task-id <id>] [--acceptance-hint <text>] [--new-topic]
   往已有话题追加（激活待命 bot / 追加协调）:
     botmux dispatch --into <话题根消息id> --bot <spec> [--bot ...] (--brief ... | --brief-file ...)
 
 说明:
-  新开话题: 发一条顶层「子项目」种子消息，在它线程里把 bot @ 进来各起独立会话。
+  默认群级派活: 在目标群直接 @ worker，适合单 worker / 顺序 / 轻量子任务。
+  --new-topic: 显式开隔离话题，适合多 worker 并行、深度协作或防刷屏。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
-  --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
+  --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 或群级消息派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
-  返回 JSON（含 seedMessageId / threadRootId），供编排者登记 子项目↔话题。
+  返回 JSON（含 delivery=chat|thread），供编排者登记派活位置。
 
 选项:
   --title <t>           子项目标题（新开话题时必填）
@@ -4228,6 +4229,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief-file <path>   从文件读取简报
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
+  --new-topic           显式为本次派活开独立话题（默认不开）
   --task-id <id>        覆盖可信交付任务号（默认自动生成 task-<slug>-<hash8>）
   --acceptance-hint <t> 主 agent 打算如何验收，随任务简报和账本一起传给 worker
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
@@ -4246,6 +4248,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const explicitTaskId = argValue(rest, '--task-id');
   const acceptanceHint = argValue(rest, '--acceptance-hint');
   const standby = rest.includes('--standby');
+  const newTopic = rest.includes('--new-topic');
   const botSpecs = argValues(rest, '--bot');
 
   let brief = argValue(rest, '--brief') ?? '';
@@ -4284,6 +4287,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (standby && intoRoot) {
     console.error('--standby 与 --into 不能同用。');
+    process.exit(1);
+  }
+  if (newTopic && intoRoot) {
+    console.error('--new-topic 与 --into 不能同用。');
     process.exit(1);
   }
   if (!standby && !brief.trim()) {
@@ -4341,9 +4348,15 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       return;
     }
 
-    // New-thread mode.
-    // 1. Seed (thread root) — top-level header; gives the thread something to hang off.
-    const seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
+    // Default chat-scope mode: post directly into the goal group so L2 and
+    // workers share the project-room timeline. `--new-topic` keeps the old
+    // isolated-thread path as an explicit escape hatch for noisy/parallel work.
+    let seedId: string | undefined;
+    let primeId: string | undefined;
+    let kickoffId: string | undefined;
+    if (newTopic) {
+      seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
+    }
 
     if (taskId) {
       openLedger().append({
@@ -4364,53 +4377,56 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       });
     }
 
-    // Record the orchestrator's coords for this sub-topic, keyed by the seed
-    // (which becomes every dispatched sub-bot's session.rootMessageId). The
-    // sub-bot's `botmux report` looks this up to route its report back into the
-    // orchestrator's OWN session. Lives in the shared data dir so every bot's
-    // daemon (one-per-bot) can read it. Best-effort — report-back degrades to a
-    // clear error if absent.
-    try {
-      const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
-      let reg: Record<string, unknown> = {};
-      try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* corrupt → reset */ }
-      reg[seedId] = {
-        orchRoot: s.rootMessageId ?? '',
-        orchChatId: s.chatId,
-        orchScope: s.scope ?? 'thread',
-        orchAppId: s.larkAppId,
-        title: title.trim(),
-        taskId: taskId ?? undefined,
-        bots: built.mentionedOpenIds,
-      };
-      // 原子写：共享 data dir，其它 bot 的 daemon 会并发读这个注册表。
-      atomicWriteFileSync(regPath, JSON.stringify(reg, null, 2));
-    } catch { /* registry is best-effort */ }
+    if (seedId) {
+      // Record the orchestrator's coords for this sub-topic, keyed by the seed
+      // (which becomes every dispatched sub-bot's session.rootMessageId). The
+      // default chat-scope flow relies on same-goal-group report fallback and
+      // does not need this registry.
+      try {
+        const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+        let reg: Record<string, unknown> = {};
+        try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* corrupt → reset */ }
+        reg[seedId] = {
+          orchRoot: s.rootMessageId ?? '',
+          orchChatId: s.chatId,
+          orchScope: s.scope ?? 'thread',
+          orchAppId: s.larkAppId,
+          title: title.trim(),
+          taskId: taskId ?? undefined,
+          bots: built.mentionedOpenIds,
+        };
+        // 原子写：共享 data dir，其它 bot 的 daemon 会并发读这个注册表。
+        atomicWriteFileSync(regPath, JSON.stringify(reg, null, 2));
+      } catch { /* registry is best-effort */ }
+    }
 
     // 2. Optional repo prime — a plain TEXT message "@bot /repo <path>" (like a
     //    human types) so each sub-bot spawns idle in that dir (no repo-select
     //    card). Text goes through resolveMentions cleanly; a structured post
     //    drops the /repo arg in the live event. `/repo` is an existing command,
     //    so this needs no change on the receiving bot's daemon.
-    let primeId: string | undefined;
     if (repo) {
       const prime = buildRepoPrimeText({ path: repo, bots });
-      primeId = await replyMessage(appId, seedId, prime.text, 'text', true);
+      primeId = seedId
+        ? await replyMessage(appId, seedId, prime.text, 'text', true)
+        : await sendMessage(appId, targetChatId, prime.text, 'text');
     }
 
-    // 3. Brief kickoff — reply_in_thread @-ing the bots so each spawns its own
-    //    thread-scoped session. Skipped in --standby (bots wait for a later --into).
-    let kickoffId: string | undefined;
+    // 3. Brief kickoff — default posts into the goal group; `--new-topic`
+    //    replies inside the seed thread. Skipped in --standby.
     if (!standby) {
-      kickoffId = await replyMessage(appId, seedId, briefJson, 'post', true);
+      kickoffId = seedId
+        ? await replyMessage(appId, seedId, briefJson, 'post', true)
+        : await sendMessage(appId, targetChatId, briefJson, 'post');
     }
 
     console.log(JSON.stringify({
       success: true,
       mode: standby ? 'standby' : 'dispatch',
+      delivery: seedId ? 'thread' : 'chat',
       taskId: taskId ?? null,
-      seedMessageId: seedId,
-      threadRootId: seedId,
+      seedMessageId: seedId ?? null,
+      threadRootId: seedId ?? null,
       primeMessageId: primeId,
       kickoffMessageId: kickoffId,
       repo: repo ?? null,
@@ -4736,8 +4752,8 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
 
   let retryMessageId: string | undefined;
   if (!argFlag(rest, '--no-push')) {
-    if (!task.workerTopicRoot) {
-      console.error(`任务 ${taskId} 没有 workerTopicRoot，已写入 rejected 账本，但无法回推重做要求。`);
+    if (!task.workerTopicRoot && !task.chatId) {
+      console.error(`任务 ${taskId} 没有 workerTopicRoot/chatId，已写入 rejected 账本，但无法回推重做要求。`);
       console.log(JSON.stringify({ success: true, taskId, reportId, rejected: true, deduped: result.deduped, pushed: false }));
       return;
     }
@@ -4748,9 +4764,12 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     }
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-    const { replyMessage } = await import('./im/lark/client.js');
+    const { replyMessage, sendMessage } = await import('./im/lark/client.js');
     const content = buildRejectRetryContent({ task, reportId, reason, retryBrief, expectedEvidence });
-    retryMessageId = await replyMessage(s.larkAppId, task.workerTopicRoot, JSON.stringify({ zh_cn: { title: '', content } }), 'post', true);
+    const postJson = JSON.stringify({ zh_cn: { title: '', content } });
+    retryMessageId = task.workerTopicRoot
+      ? await replyMessage(s.larkAppId, task.workerTopicRoot, postJson, 'post', true)
+      : await sendMessage(s.larkAppId, task.chatId!, postJson, 'post');
   }
   console.log(JSON.stringify({
     success: true,
@@ -4777,7 +4796,7 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   botmux goal charter path --goal <goal群chatId>
 
 说明:
-  daemon-native 地在 goal 群起一个 L2 supervisor 会话，绕开 Lark 自消息不会路由的限制。
+  daemon-native 地在 goal 群起一个 chat-scope L2 supervisor 会话，绕开 Lark 自消息不会路由的限制。
   默认从当前 L1 会话推断 parent-chat-id / parent-root / working-dir / bot daemon。
   goal charter 复用 whiteboard 存储/CAS，但不受全局 whiteboard enable 开关控制，也不会自动注入任何会话。`);
     return;

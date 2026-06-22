@@ -2,7 +2,6 @@ import * as sessionStore from '../services/session-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { getBot } from '../bot-registry.js';
-import { sendMessage } from '../im/lark/client.js';
 import { localeForBot } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildNewTopicPrompt, getAvailableBots, rememberLastCliInput } from './session-manager.js';
@@ -23,7 +22,6 @@ export interface GoalSuperviseResponse {
   ok: true;
   goalChatId: string;
   supervisorSessionId: string;
-  supervisorRootId: string;
   parent: { chatId: string; rootMessageId?: string };
 }
 
@@ -49,7 +47,7 @@ export function buildGoalSupervisorPrompt(req: GoalSuperviseRequest): string {
     '职责：',
     `1. 先按需创建/读取本 goal 群的 charter：\`botmux goal charter current --goal ${req.chatId} --create\`，再 \`botmux goal charter read --goal ${req.chatId} --json\`。必要时用 \`botmux goal charter update --goal ${req.chatId} --expected-updated-at ...\` 维护目标、组织方式、当前状态、下一步。`,
     `2. 派发和验收子任务前，先运行 \`botmux delivery list --goal ${req.chatId}\` 查可信交付账本，账本是真相源，聊天只是提醒和上下文。`,
-    '3. 子任务在本 goal 群内用 `botmux dispatch --chat-id <本 goal 群 chatId>` 派发；worker 必须用 `botmux report --task ...` 交证据。',
+    '3. 子任务默认在本 goal 群的群级会话里用 `botmux dispatch --chat-id <本 goal 群 chatId>` 派发；worker 必须用 `botmux report --task ...` 交证据。只有超大并行/重协作/防刷屏时，才显式加 `--new-topic` 开隔离话题。',
     '4. 验收时只认账本里的 evidence：能读文件就读，能跑命令就跑；accept/reject 必须写 evidenceChecked / ranCommands / reason。',
     '5. 全部子任务 accepted 后，主动通知 L1 主群，说明 goal 完成、关键证据和账本状态。',
     '',
@@ -110,9 +108,8 @@ export async function startGoalSupervisor(
 
   const bot = getBot(larkAppId);
   const title = req.title.trim() || 'Goal supervisor';
-  const seed = `Goal supervisor: ${title}`;
-  const anchor = await sendMessage(larkAppId, chatId, seed, 'text');
-  const scope: 'thread' | 'chat' = 'thread';
+  const anchor = chatId;
+  const scope: 'thread' | 'chat' = 'chat';
 
   const session = sessionStore.createSession(chatId, anchor, `[Goal] ${title}`.slice(0, 50), 'group');
   const now = Date.now();
@@ -165,7 +162,6 @@ export async function startGoalSupervisor(
     ok: true,
     goalChatId: chatId,
     supervisorSessionId: session.sessionId,
-    supervisorRootId: anchor,
     parent: { chatId: parentChatId, rootMessageId: req.parentRoot },
   };
 }
