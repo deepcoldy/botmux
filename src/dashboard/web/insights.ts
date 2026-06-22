@@ -61,7 +61,9 @@ function safeStatus(report: SafeInsightReport | null, error?: string): string {
 }
 
 function sessionTitle(s: Record<string, any>): string {
-  return stripMentionPrefix(s.title ?? s.firstUserMessage ?? s.rootMessageId ?? s.sessionId);
+  // Match the rest of the dashboard: strip the leading @mention, then fall back
+  // to the id only when nothing readable remains (e.g. a title of just "@Gpt").
+  return stripMentionPrefix(s.title ?? '') || String(s.sessionId ?? '');
 }
 
 function severityLabel(sev: InsightSeverity): string {

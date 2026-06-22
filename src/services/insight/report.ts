@@ -1,7 +1,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { basename, isAbsolute, relative } from 'node:path';
 import { resolveSessionTranscriptPath } from '../transcript-resolver.js';
-import { isReadPhase, isWritePhase } from './classify.js';
+import { isReadPhase, isWritePhase, isInteractiveWaitTool } from './classify.js';
 import { parseAntigravityInsight } from './antigravity-span-reader.js';
 import { parseClaudeInsight } from './claude-span-reader.js';
 import { parseCodexInsight } from './codex-span-reader.js';
@@ -201,13 +201,17 @@ function aggregate(spans: RawInsightSpan[], compactions: number, slowThresholdMs
   let writes = 0;
   for (const s of spans) {
     const phase = INSIGHT_PHASES.includes(s.phase) ? s.phase : 'discuss';
+    // User-blocking tools (ask-question / plan approval) spend their wall-clock
+    // waiting on a human, not working — count the action but not its duration,
+    // and never flag it as a slow span.
+    const waits = isInteractiveWaitTool(s.tool);
     agg.phase[phase].count++;
-    if (s.durationMs !== undefined) agg.phase[phase].ms += Math.max(0, Math.round(s.durationMs));
+    if (s.durationMs !== undefined && !waits) agg.phase[phase].ms += Math.max(0, Math.round(s.durationMs));
     if (s.status === 'error') {
       agg.failedSpans++;
       agg.failByTool[s.tool] = (agg.failByTool[s.tool] ?? 0) + 1;
     }
-    if ((s.durationMs ?? 0) >= slowThresholdMs) agg.slowSpans++;
+    if (!waits && (s.durationMs ?? 0) >= slowThresholdMs) agg.slowSpans++;
     if (isReadPhase(phase)) reads++;
     if (isWritePhase(phase)) writes++;
   }

@@ -39,6 +39,15 @@ export function phaseForTool(tool: string): InsightPhase {
   return 'discuss';
 }
 
+// Tools that block on a human reply (question prompts, plan approval). Their
+// wall-clock duration is mostly user idle time, not agent work, so it must not
+// count toward work-time aggregation or slow-span detection — otherwise a user
+// who answers a question 78 minutes later shows up as 78 minutes of "discuss".
+const INTERACTIVE_WAIT_TOOLS = new Set(['askuserquestion', 'exitplanmode']);
+export function isInteractiveWaitTool(tool: string): boolean {
+  return INTERACTIVE_WAIT_TOOLS.has(toolId(tool));
+}
+
 export function isReadPhase(phase: InsightPhase): boolean {
   return phase === 'research';
 }
