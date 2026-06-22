@@ -4705,12 +4705,13 @@ function whiteboardContentFromArgs(args: string[], booleanFlags: string[] = []):
  *  whiteboard_empty_content / whiteboard_not_found); map each to a clear,
  *  actionable message so an agent or human reading stderr knows what to do
  *  next instead of seeing a bare code. Always exits. */
-function handleWhiteboardWriteError(e: unknown, id: string): never {
+function handleWhiteboardWriteError(e: unknown, id: string, opts?: { rereadCommand?: string }): never {
   const msg = (e as Error)?.message ?? String(e);
   if (msg === 'whiteboard_cas_mismatch') {
+    const reread = opts?.rereadCommand ?? `botmux whiteboard read --id ${id} --json`;
     console.error(
       `Whiteboard was modified since you last read it (CAS mismatch). Re-run ` +
-      `\`botmux whiteboard read --id ${id} --json\` to get the latest content ` +
+      `\`${reread}\` to get the latest content ` +
       `+ updatedAt, re-merge your changes against it, then update again with ` +
       `--expected-updated-at <new updatedAt>.`,
     );
@@ -7624,7 +7625,7 @@ attaches the board to a session, so it cannot trigger <whiteboard> prompt inject
       });
       console.log(JSON.stringify({ ok: true, goal, board: updated }, null, 2));
     } catch (e) {
-      handleWhiteboardWriteError(e, meta.id);
+      handleWhiteboardWriteError(e, meta.id, { rereadCommand: `botmux goal charter read --goal ${goal} --json` });
     }
     return;
   }
