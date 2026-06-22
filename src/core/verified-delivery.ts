@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { DispatchBot, PostParagraph } from './dispatch.js';
-import { REJECT_REASON, type RejectReason, type TaskView } from '../verified-delivery/types.js';
+import { REJECT_REASON, type LedgerEvent, type RejectReason, type TaskStatus, type TaskView } from '../verified-delivery/types.js';
 
 export function slugForTaskId(input: string): string {
   const slug = input
@@ -82,4 +82,79 @@ export function buildRejectRetryContent(input: {
     paras.push([{ tag: 'text', text: '当前证据主 agent 读不到；请改交可读取路径或 inline 自包含证据。' }]);
   }
   return paras;
+}
+
+export interface DeliveryListRow {
+  taskId: string;
+  chatId?: string;
+  status: TaskStatus;
+  title?: string;
+  latestReportId?: string;
+  reportCount: number;
+  workerTopicRoot?: string;
+  workerOpenIds?: string[];
+  acceptanceHint?: string;
+  createdAt?: number;
+  updatedAt?: number;
+  ageMs?: number;
+}
+
+export function parseDeliveryDuration(input: string): number {
+  const raw = input.trim();
+  const m = raw.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)?$/i);
+  if (!m) throw new Error(`invalid duration: ${input}`);
+  const value = Number(m[1]);
+  if (!Number.isFinite(value) || value < 0) throw new Error(`invalid duration: ${input}`);
+  const unit = (m[2] ?? 'ms').toLowerCase();
+  const scale =
+    unit === 'ms' ? 1 :
+    unit === 's' ? 1_000 :
+    unit === 'm' ? 60_000 :
+    unit === 'h' ? 3_600_000 :
+    unit === 'd' ? 86_400_000 :
+    undefined;
+  if (!scale) throw new Error(`invalid duration: ${input}`);
+  return Math.floor(value * scale);
+}
+
+export function buildDeliveryListRows(input: {
+  events: LedgerEvent[];
+  tasks: TaskView[];
+  status?: TaskStatus;
+  olderThanMs?: number;
+  now?: number;
+}): DeliveryListRow[] {
+  const now = input.now ?? Date.now();
+  const times = new Map<string, { createdAt: number; updatedAt: number }>();
+  for (const e of input.events) {
+    const existing = times.get(e.taskId);
+    if (!existing) {
+      times.set(e.taskId, { createdAt: e.ts, updatedAt: e.ts });
+    } else {
+      existing.createdAt = Math.min(existing.createdAt, e.ts);
+      existing.updatedAt = Math.max(existing.updatedAt, e.ts);
+    }
+  }
+
+  return input.tasks
+    .filter((task) => !input.status || task.status === input.status)
+    .map((task) => {
+      const t = times.get(task.taskId);
+      return {
+        taskId: task.taskId,
+        chatId: task.chatId,
+        status: task.status,
+        title: task.title,
+        latestReportId: task.latestReportId,
+        reportCount: task.reports.length,
+        workerTopicRoot: task.workerTopicRoot,
+        workerOpenIds: task.workerOpenIds,
+        acceptanceHint: task.acceptanceHint,
+        createdAt: t?.createdAt,
+        updatedAt: t?.updatedAt,
+        ageMs: t ? Math.max(0, now - t.updatedAt) : undefined,
+      } satisfies DeliveryListRow;
+    })
+    .filter((row) => input.olderThanMs === undefined || (row.ageMs !== undefined && row.ageMs >= input.olderThanMs))
+    .sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0) || a.taskId.localeCompare(b.taskId));
 }

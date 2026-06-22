@@ -34,8 +34,14 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
-import { appendVerifiedDeliveryInstructions, buildRejectRetryContent, generateTaskId } from './core/verified-delivery.js';
-import { REJECT_REASON, type RejectReason } from './verified-delivery/types.js';
+import {
+  appendVerifiedDeliveryInstructions,
+  buildDeliveryListRows,
+  buildRejectRetryContent,
+  generateTaskId,
+  parseDeliveryDuration,
+} from './core/verified-delivery.js';
+import { REJECT_REASON, type RejectReason, type TaskStatus } from './verified-delivery/types.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -7242,6 +7248,8 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
 用法:
   查看任务:
     botmux delivery show --task <taskId>
+  列出任务:
+    botmux delivery list [--goal <chatId>] [--status dispatched|reported|accepted|rejected] [--older-than 2h]
   验收通过:
     botmux delivery accept --task <taskId> [--report <reportId>] \\
         [--checked-by <id>] [--note <text>] [--evidence-checked <ref>]... [--ran-command <cmd>]...
@@ -7251,19 +7259,56 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
 
 说明:
   --report 省略时默认使用该任务 latestReportId。
+  --goal 按 goal 群 chatId 过滤；--older-than 按任务最后一条账本事件时间计算。
   常用 reason: ${Object.values(REJECT_REASON).join(' / ')}
   reject 默认会把 retryBrief/expectedEvidence 回推到派活 worker 话题；--no-push 仅写账本。`);
     return;
   }
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const ledger = openLedger();
+  if (sub === 'list') {
+    const goal = argValue(rest, '--goal', '--chat-id');
+    const status = argValue(rest, '--status');
+    const validStatuses = new Set<TaskStatus>(['dispatched', 'reported', 'accepted', 'rejected']);
+    if (status && !validStatuses.has(status as TaskStatus)) {
+      console.error('delivery list: --status 必须是 dispatched / reported / accepted / rejected');
+      process.exit(1);
+    }
+    const taskStatus = status as TaskStatus | undefined;
+    const olderThanRaw = argValue(rest, '--older-than');
+    let olderThanMs: number | undefined;
+    if (olderThanRaw) {
+      try {
+        olderThanMs = parseDeliveryDuration(olderThanRaw);
+      } catch (err: any) {
+        console.error(`delivery list: ${err.message}`);
+        process.exit(1);
+      }
+    }
+    const rows = buildDeliveryListRows({
+      events: ledger.read(),
+      tasks: ledger.tasks(goal),
+      status: taskStatus,
+      olderThanMs,
+    });
+    console.log(JSON.stringify({
+      success: true,
+      goal,
+      status,
+      olderThan: olderThanRaw,
+      count: rows.length,
+      tasks: rows,
+    }, null, 2));
+    return;
+  }
+
   const taskId = argValue(rest, '--task');
   if (!taskId) {
     console.error('缺少 --task <taskId>');
     process.exit(1);
   }
 
-  const ledger = openLedger();
   const task = ledger.task(taskId);
   if (!task) {
     console.error(`未找到任务: ${taskId}`);
