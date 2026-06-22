@@ -1,4 +1,4 @@
-import { phaseForTool, normalizeToolName } from './classify.js';
+import { phaseForTool, normalizeToolName, isUserRejectionText } from './classify.js';
 import { intentForToolInput, resultForToolOutput } from './intent.js';
 import { readCompleteJsonlObjects } from './jsonl.js';
 import { safePromptPreview } from './prompt.js';
@@ -209,8 +209,6 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
       } else if (isToolResultBlock(block)) {
         const span = pending.get(block.tool_use_id);
         if (!span) continue;
-        span.status = block.is_error === true ? 'error' : 'ok';
-        span.outputSummary = summarizeToolOutput(block);
         // tool_result content may be a string OR an array of {type:'text',text}
         // blocks — flatten the array form too, else a successful array result
         // looks empty and mislabels as 'no_output'.
@@ -222,7 +220,12 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
                 .join('\n')
                 .trim() || undefined
             : undefined;
-        span.result = resultForToolOutput(span, output, block.is_error === true);
+        // A user rejecting a proposed tool use lands as is_error but is user
+        // behaviour, not a tool/agent failure — don't let it count as a failure.
+        const errored = block.is_error === true && !isUserRejectionText(output);
+        span.status = errored ? 'error' : 'ok';
+        span.outputSummary = summarizeToolOutput({ is_error: errored, content: block.content });
+        span.result = resultForToolOutput(span, output, errored);
         if (span.phase === 'run') {
           const safeOutput = safeOutputPreview(block.content);
           if (safeOutput) span.evidence = { ...(span.evidence ?? {}), output: safeOutput };

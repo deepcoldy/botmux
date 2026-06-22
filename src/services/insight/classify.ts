@@ -53,6 +53,17 @@ export function isInteractiveWaitTool(tool: string): boolean {
   return INTERACTIVE_WAIT_TOOLS.has(toolId(tool));
 }
 
+// A user *declining* a proposed tool use (rejecting an edit, dismissing a
+// question) is delivered as an is_error tool_result, but it is NOT a tool or
+// agent failure — it is user behaviour. Counting it inflates failedSpans /
+// failByTool and the failure-friction suggestions. Detect Claude Code's
+// canonical rejection strings so these can be excluded from failure stats while
+// genuine errors (InputValidationError, file-not-read, exit codes…) still count.
+export function isUserRejectionText(text: string | undefined | null): boolean {
+  if (!text) return false;
+  return /the user doesn.?t want to proceed with this tool use|tool use was rejected/i.test(text);
+}
+
 export function isReadPhase(phase: InsightPhase): boolean {
   return phase === 'research';
 }

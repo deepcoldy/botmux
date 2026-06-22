@@ -270,6 +270,27 @@ function writeClaudePlanningFixture(): string {
   return path;
 }
 
+// One genuine tool error + two user-rejected tool uses (the canonical Claude
+// Code rejection string). Only the genuine error must count as a failure.
+function writeClaudeRejectionFixture(): string {
+  const path = join(dir, 'claude-rejection.jsonl');
+  const REJECT = 'The user doesn\'t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was not written to the file).';
+  const cases: Array<{ tool: string; err: string }> = [
+    { tool: 'Bash', err: '<tool_use_error>Exit code 1: command not found</tool_use_error>' }, // genuine
+    { tool: 'Edit', err: REJECT },     // user rejected an edit
+    { tool: 'AskUserQuestion', err: REJECT }, // user dismissed a question
+  ];
+  const lines: string[] = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'go' } }),
+  ];
+  cases.forEach((c, i) => {
+    lines.push(JSON.stringify({ type: 'assistant', timestamp: `2026-06-17T01:00:0${i + 1}.000Z`, message: { role: 'assistant', content: [{ type: 'tool_use', id: `j${i}`, name: c.tool, input: { command: 'x' } }] } }));
+    lines.push(JSON.stringify({ type: 'user', timestamp: `2026-06-17T01:00:0${i + 1}.500Z`, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `j${i}`, is_error: true, content: c.err }] } }));
+  });
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
 // N Read spans + M Edit spans, for testing the pooled overview read/write ratio.
 function writeClaudeRwFixture(name: string, reads: number, edits: number): string {
   const path = join(dir, `claude-rw-${name}.jsonl`);
@@ -903,6 +924,26 @@ describe('SafeInsightReport', () => {
     expect(report.agg.phase.edit.count).toBe(1);
     expect(report.agg.phase.discuss.count).toBe(2);
     expect(report.agg.readWriteRatio).toBe(2);
+  });
+
+  it('does not count user-rejected tool uses as failures', () => {
+    resolvedPath = writeClaudeRejectionFixture();
+    const report = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'spans', now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    expect(report.status).toBe('ok');
+    expect(report.agg.totalSpans).toBe(3);
+    // Only the genuine Bash error counts; the two user-rejections (Edit + AskUserQuestion) do not.
+    expect(report.agg.failedSpans).toBe(1);
+    expect(report.agg.failByTool).toEqual({ Bash: 1 });
+    // The rejected spans are recorded as non-error outcomes.
+    const byTool = Object.fromEntries((report.spans ?? []).map(s => [s.tool, s.status]));
+    expect(byTool.Bash).toBe('error');
+    expect(byTool.Edit).toBe('ok');
+    expect(byTool.AskUserQuestion).toBe('ok');
   });
 
   it('pools the cross-session read/write ratio instead of averaging per-session ratios', async () => {
