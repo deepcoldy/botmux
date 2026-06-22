@@ -2291,10 +2291,11 @@ async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: st
   });
   if (shouldRetryGoalWatchdog(results)) scheduleGoalWatchdogRetry(goalChatId, reason);
   const injected = countGoalWatchdogStatus(results, 'injected');
+  const reconciled = countGoalWatchdogStatus(results, 'reconciled');
   const busy = countGoalWatchdogStatus(results, 'busy');
   const rateLimited = countGoalWatchdogStatus(results, 'rate-limited');
-  if (injected > 0 || busy > 0 || rateLimited > 0) {
-    logger.info(`[goal-watchdog] event result goal=${goalChatId} reason=${reason} injected=${injected} busy=${busy} rateLimited=${rateLimited}`);
+  if (injected > 0 || reconciled > 0 || busy > 0 || rateLimited > 0) {
+    logger.info(`[goal-watchdog] event result goal=${goalChatId} reason=${reason} injected=${injected} reconciled=${reconciled} busy=${busy} rateLimited=${rateLimited}`);
   }
   return results;
 }
@@ -2303,10 +2304,11 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
   goalChatId: string;
   reason: string;
   sourceSessionId?: string;
-}): Promise<{ contacted: number; injected: number; busy: number; rateLimited: number }> {
+}): Promise<{ contacted: number; injected: number; reconciled: number; busy: number; rateLimited: number }> {
   const daemons = listOnlineDaemons();
   let contacted = 0;
   let injected = 0;
+  let reconciled = 0;
   let busy = 0;
   let rateLimited = 0;
   await Promise.all(daemons.map(async (daemon) => {
@@ -2324,6 +2326,7 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
       const body = await res.json().catch(() => null) as { results?: Array<{ status?: string }> } | null;
       const results = body?.results ?? [];
       injected += results.filter((r) => r.status === 'injected').length;
+      reconciled += results.filter((r) => r.status === 'reconciled').length;
       busy += results.filter((r) => r.status === 'busy').length;
       rateLimited += results.filter((r) => r.status === 'rate-limited').length;
     } catch {
@@ -2332,7 +2335,7 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
       clearTimeout(tt);
     }
   }));
-  return { contacted, injected, busy, rateLimited };
+  return { contacted, injected, reconciled, busy, rateLimited };
 }
 
 /**
@@ -15925,6 +15928,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }).then((results) => {
         if (results.injected > 0) {
           logger.info(`[goal-watchdog] event-triggered by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} injected=${results.injected}`);
+        } else if (results.reconciled > 0) {
+          logger.info(`[goal-watchdog] event-reconciled by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} reconciled=${results.reconciled}`);
         } else if (results.busy > 0 || results.rateLimited > 0) {
           logger.info(`[goal-watchdog] event observed by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} busy=${results.busy} rateLimited=${results.rateLimited}`);
         }

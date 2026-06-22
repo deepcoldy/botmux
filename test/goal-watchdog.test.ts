@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   GOAL_WATCHDOG_PROMPT_PREFIX,
@@ -8,7 +11,7 @@ import {
   shouldTriggerGoalWatchdogOnSessionBoundary,
 } from '../src/core/goal-watchdog.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
-import type { LedgerHandle } from '../src/verified-delivery/ledger.js';
+import { openLedger, type LedgerHandle } from '../src/verified-delivery/ledger.js';
 import type { AcceptanceCriteria, TaskView } from '../src/verified-delivery/types.js';
 
 function task(
@@ -107,7 +110,7 @@ describe('goal watchdog', () => {
     expect(injected[0].prompt).toContain('t1');
   });
 
-  it('renders structured acceptance criteria as a watchdog checklist', async () => {
+  it('falls back to L2 prompt for legacy free-text acceptance hints', async () => {
     const activeSessions = new Map<string, DaemonSession>();
     activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
     const injected: Array<{ prompt: string }> = [];
@@ -115,19 +118,16 @@ describe('goal watchdog', () => {
     await runGoalWatchdogOnce({
       larkAppId: 'cli_main',
       activeSessions,
-      ledger: ledger([task('t-criteria', 'oc_goal', 'dispatched', {
-        version: 1,
-        artifacts: [{ path: '/tmp/done.txt', kind: 'file', checks: [{ type: 'exists' }, { type: 'contains', text: 'PASS' }] }],
-        commands: [{ cmd: 'python3 check.py', cwd: '/repo', expectExitCode: 0 }],
-      }, '{"version":1,"artifacts":[{"path":"/tmp/done.txt"}]}')]),
+      ledger: ledger([task('t-legacy', 'oc_goal', 'dispatched', undefined, '人工验收: 读取结果文件并确认 PASS')]),
       now: 10_000,
       lastInjectedAt: new Map(),
       inject: (_target, prompt) => injected.push({ prompt }),
     });
 
-    expect(injected[0].prompt).toContain('产物 /tmp/done.txt(file): 存在 + 含"PASS"');
-    expect(injected[0].prompt).toContain('命令 `python3 check.py`, cwd=/repo, 期望退出码 0');
-    expect(injected[0].prompt).not.toContain('acceptanceHint=');
+    expect(injected).toHaveLength(1);
+    expect(injected[0].prompt).toContain(GOAL_WATCHDOG_PROMPT_PREFIX);
+    expect(injected[0].prompt).toContain('t-legacy');
+    expect(injected[0].prompt).toContain('acceptanceHint=人工验收: 读取结果文件并确认 PASS');
   });
 
   it('skips a busy L2 and rate-limits repeated injections', async () => {
@@ -222,5 +222,98 @@ describe('goal watchdog', () => {
       title: 'worker task',
       status: 'idle',
     }))).toBe(true);
+  });
+
+  it('reconciles structured passing tasks without waking L2', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-reconcile-'));
+    try {
+      const out = join(baseDir, 'done.txt');
+      writeFileSync(out, 'PASS');
+      const led = openLedger({ baseDir });
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-pass',
+        chatId: 'oc_goal',
+        ts: 1,
+        idempotencyKey: 'dispatched:task-pass',
+        payload: {
+          taskId: 'task-pass',
+          workerOpenIds: ['ou_worker'],
+          acceptanceCriteria: {
+            version: 1,
+            artifacts: [{ path: out, checks: [{ type: 'exists' }, { type: 'contains', text: 'PASS' }] }],
+          },
+        },
+      });
+      const notifications: any[] = [];
+      const results = await runGoalWatchdogOnce({
+        larkAppId: 'cli_main',
+        activeSessions: new Map(),
+        ledger: led,
+        now: 10_000,
+        lastInjectedAt: new Map(),
+        inject: () => { throw new Error('should not inject L2 for structured pass'); },
+        notify: (event) => notifications.push(event),
+      });
+
+      expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'reconciled', pendingTaskIds: ['task-pass'] }]);
+      expect(notifications.map((n) => n.kind)).toEqual(['accepted']);
+      expect(led.task('task-pass')?.status).toBe('accepted');
+      expect(led.task('task-pass')?.reports).toHaveLength(1);
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('nudges structured failing tasks and rate-limits repeated nudges', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-nudge-'));
+    try {
+      const missing = join(baseDir, 'missing.txt');
+      const led = openLedger({ baseDir });
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-fail',
+        chatId: 'oc_goal',
+        ts: 1,
+        idempotencyKey: 'dispatched:task-fail',
+        payload: {
+          taskId: 'task-fail',
+          workerOpenIds: ['ou_worker'],
+          acceptanceCriteria: {
+            version: 1,
+            artifacts: [{ path: missing, checks: [{ type: 'exists' }] }],
+          },
+        },
+      });
+      const lastInjectedAt = new Map<string, number>();
+      const notifications: any[] = [];
+      const first = await runGoalWatchdogOnce({
+        larkAppId: 'cli_main',
+        activeSessions: new Map(),
+        ledger: led,
+        now: 10_000,
+        intervalMs: 30_000,
+        lastInjectedAt,
+        notify: (event) => notifications.push(event),
+      });
+      const second = await runGoalWatchdogOnce({
+        larkAppId: 'cli_main',
+        activeSessions: new Map(),
+        ledger: led,
+        now: 20_000,
+        intervalMs: 30_000,
+        lastInjectedAt,
+        notify: (event) => notifications.push(event),
+      });
+
+      expect(first).toMatchObject([{ status: 'reconciled', pendingTaskIds: ['task-fail'] }]);
+      expect(second).toMatchObject([{ status: 'rate-limited', pendingTaskIds: ['task-fail'] }]);
+      expect(notifications.map((n) => n.kind)).toEqual(['nudge']);
+      expect(led.task('task-fail')?.status).toBe('dispatched');
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
   });
 });
