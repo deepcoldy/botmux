@@ -1200,12 +1200,12 @@ botmux create-group --name "<goal 名>" \\
 建群后**不要自己跨群派活**——改为在 goal 群起一个 L2 监管会话，把后续派活 / 验收都交给它：
 \`\`\`bash
 botmux goal supervise --chat-id "<goalChatId>" \\
-  --parent-chat-id "<主群 chatId>" [--parent-root "<你当前话题 root>"] \\
+  --parent-chat-id "<主群 chatId>" [--parent-root "<你当前话题 root>"] --session-id "<你当前会话 session_id>" \\
   --title "<goal 名>" [--brief "给 L2 的 goal 目标/验收口径"] [--working-dir "<仓库>"]
 # 输出 { supervisorSessionId, parent:{...} }（chat-scope L2，无话题 root）；charter 由 L2 自己 goal charter current --create 确保
 \`\`\`
 - daemon 在 goal 群**直接创建 L2 的 chat-scope 会话**（绕开 self-message guard，不是你 @ 自己）。
-- \`--parent-*\` 把主群坐标写进 L2 的 prompt，L2 完成时据此回通知你。
+- \`--parent-*\` + \`--session-id\` 把主群坐标 + 你这条 L1 会话写进 L2 的 prompt；L2 完成时用 \`goal notify-parent\` 据此精准唤起你（daemon-native，不发飞书）。**\`--session-id\` 填 prompt 顶部 \`<session_id>\` 的值**——这样不论你 L1 是话题还是群级会话都能被准确回定位（否则只能靠 chatId/parent-root 兜底，话题会话可能找不准）。
 - 起好 L2 **L1 基本就交棒了**：回主群等完成通知（L1-5）。要派的 subtask 写进 \`--brief\` 交给 L2，或由 L2 按 goal 自行拆派。
 
 > repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。
@@ -1213,7 +1213,7 @@ botmux goal supervise --chat-id "<goalChatId>" \\
 > 想「先把 bot 拉起待命、稍后再派具体任务」：用 \`--standby\`（只定目录不派简报），之后用 \`botmux dispatch --into <话题root> --bot ... --brief ...\` 激活。
 
 ### L1-5 收 L2 完成通知 → 汇总用户
-L2 把整个 goal 验收通过后会 \`botmux send --chat-id <主群>\` 回通知你。你被唤起后，可 \`botmux delivery list --goal <goalChatId>\` + \`botmux goal charter read --goal <goalChatId> --json\` 复核账本与状态，再给用户一份总汇总（做了什么、产出在哪、遗留项）。
+L2 把整个 goal 验收通过后会用 \`goal notify-parent\` 把你唤起（daemon-native，注入一条 \`[goal-parent-notify]\` 前缀消息，不走飞书）。**这条通知只是唤醒、不是真相源**：你被唤起后必须 \`botmux delivery list --goal <goalChatId>\` + \`botmux goal charter read --goal <goalChatId> --json\` 复核账本与状态，再给用户一份总汇总（做了什么、产出在哪、遗留项）。
 
 ## L2 流程（在 goal 群，你是 chat-scope 监管化身）
 
@@ -1277,11 +1277,13 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 每验收一波，\`botmux goal charter update --goal <goalChatId> --expected-updated-at <ts> ...\` 刷新状态（进展/下一步）。有依赖的下一波，依赖满足了再 dispatch。**卡住/超时靠查账本**：\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的，用 \`botmux send --chat-id <goalChatId> --mention <worker>\` 去问进展或改派（不靠后台轮询）。
 
 ### L2-5 全部 accepted → 通知 L1
-本 goal 所有 subtask 都 accepted 后，回主群通知 L1：
+本 goal 所有 subtask 都 accepted 后，用 \`goal notify-parent\` 回通知 L1（**不是** \`send --chat-id 主群\`）：
 \`\`\`bash
-botmux send --chat-id "<parent 主群 chatId>" [--mention <L1/用户 open_id>] "goal 完成：各 subtask 产出 + 位置"
+botmux goal notify-parent --summary "Goal 已完成：各 subtask 产出 + 位置 + 遗留项"
 \`\`\`
-这是 goal 群结果**回流主群**的唯一出口——L1 被唤起后据此汇总给用户（L1-5）。
+- **为什么不用 \`send --chat-id 主群\`**：L1/L2 是同一个 bot，L2 \`send\` 到主群对 L1 是 self-message → 被 self-guard 挡、唤不起 L1。\`goal notify-parent\` 是 daemon-native 唤起（按 supervise 时存的 parent 坐标定位 L1 会话、注入 \`[goal-parent-notify]\` turn），绕开 self-guard。
+- session 在 L2 上下文里自动推断（也可 \`--session-id <L2>\` / \`--goal <goalChatId>\` 显式指定）；长摘要用 \`--summary-file <path>\`。
+- 这是 goal 群结果**回流主群**的唯一出口——L1 被唤起后查账本 / charter 汇总给用户（L1-5）。
 
 ## 登记 & 恢复（账本是真相源，记忆只是缓存）
 **L2 尤其要靠查账本 + charter 恢复**：被唤起 / 断点续跑 / 怀疑漏了什么时，先 \`botmux delivery list --goal <goalChatId>\` 从账本重建任务真相、\`botmux goal charter read --goal <goalChatId> --json\` 读 goal 目标/状态，再动手——L2 自己的记忆、本地 scratch、飞书任务板都可能过期，账本 + charter 不会。L1 复核同理。
