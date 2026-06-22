@@ -55,7 +55,7 @@ export function pendingGoalTasks(tasks: TaskView[]): Map<string, TaskView[]> {
 
 export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[]): string {
   const rows = tasks.map((task) => {
-    const hint = task.acceptanceHint?.trim()
+    const hint = task.acceptanceHint?.trim() && !task.acceptanceCriteria
       ? ` acceptanceHint=${task.acceptanceHint.trim()}`
       : '';
     const checks = task.acceptanceCriteria
