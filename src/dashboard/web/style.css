@@ -22674,3 +22674,46 @@ button.ui-refresh-button.is-loading .ui-action-icon {
     min-height: 320px;
   }
 }
+
+/* ── Goal board (P1 #6) ───────────────────────────────────────────── */
+.goal-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+  margin-bottom: 16px;
+}
+.goal-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.goal-card-head h2 { margin: 0; font-size: 1.05rem; }
+.goal-card-meta { color: var(--muted); font-size: 0.85rem; }
+.goal-charter-tag { color: var(--accent-strong); }
+.goal-counts { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 12px; }
+.goal-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+  font-size: 0.8rem;
+}
+.goal-chip-total { background: var(--accent-soft); border-color: var(--accent-soft); color: var(--accent-strong); }
+.goal-task-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.goal-task-table th, .goal-task-table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+.goal-task-table th { color: var(--muted); font-weight: 600; }
+.goal-accept-cell { max-width: 360px; }
+.goal-accept { font-family: var(--mono); font-size: 0.78rem; color: var(--fg); word-break: break-all; }
+.goal-accept-legacy { color: var(--muted); font-style: italic; font-family: inherit; }
+.goal-reject { color: var(--danger); font-size: 0.78rem; }
