@@ -193,6 +193,13 @@ function cachedParseForKind(kind: string, path: string): InsightParseResult | nu
   return parsed;
 }
 
+// A span is "slow" only if it actually spent that time working — tools that block
+// on a human reply (ask-question / plan approval) are excluded everywhere slowness
+// is judged, since their duration is mostly user idle, not a slow operation.
+function isSlowSpan(span: { tool: string; durationMs?: number }, slowThresholdMs: number): boolean {
+  return (span.durationMs ?? 0) >= slowThresholdMs && !isInteractiveWaitTool(span.tool);
+}
+
 function aggregate(spans: RawInsightSpan[], compactions: number, slowThresholdMs: number): SafeInsightAggregate {
   const agg = emptyAgg();
   agg.totalSpans = spans.length;
@@ -211,7 +218,7 @@ function aggregate(spans: RawInsightSpan[], compactions: number, slowThresholdMs
       agg.failedSpans++;
       agg.failByTool[s.tool] = (agg.failByTool[s.tool] ?? 0) + 1;
     }
-    if (!waits && (s.durationMs ?? 0) >= slowThresholdMs) agg.slowSpans++;
+    if (isSlowSpan(s, slowThresholdMs)) agg.slowSpans++;
     if (isReadPhase(phase)) reads++;
     if (isWritePhase(phase)) writes++;
   }
@@ -248,7 +255,7 @@ function suggestionsFor(agg: SafeInsightAggregate, spans: RawInsightSpan[], slow
   }
 
   const slowest = spans
-    .filter(s => s.durationMs !== undefined)
+    .filter(s => s.durationMs !== undefined && !isInteractiveWaitTool(s.tool))
     .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0))[0];
   if (slowest && (slowest.durationMs ?? 0) >= slowThresholdMs) {
     out.push({
@@ -360,7 +367,7 @@ function diagnosticForSuggestion(
 
   if (s.id === 'slow_span') {
     const slowSpans = spans
-      .filter(span => (span.durationMs ?? 0) >= slowThresholdMs)
+      .filter(span => isSlowSpan(span, slowThresholdMs))
       .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0));
     const slowSet = new Set(slowSpans);
     const t = target(span => slowSet.has(span));
@@ -438,7 +445,7 @@ function selectVisibleSpans(spans: RawInsightSpan[], maxSpans: number, slowThres
     }
   };
   addWhere(span => span.status === 'error');
-  addWhere(span => (span.durationMs ?? 0) >= slowThresholdMs);
+  addWhere(span => isSlowSpan(span, slowThresholdMs));
   addWhere(() => true);
   return [...selected].sort((a, b) => a - b).map(i => spans[i]!);
 }
@@ -655,7 +662,7 @@ function tagsForVisibleSpans(spans: RawInsightSpan[], slowThresholdMs: number): 
   return spans.map(span => {
     const tags = new Set<SafeSpanTag>();
     if (span.status === 'error') tags.add('failure');
-    if ((span.durationMs ?? 0) >= slowThresholdMs) tags.add('slow');
+    if (isSlowSpan(span, slowThresholdMs)) tags.add('slow');
     const key = spanKey(span);
     if (!key.startsWith('unknown:') && (counts.get(key) ?? 0) > 1) tags.add('retry');
     const tc = turnCounts.get(span.turnIndex);
@@ -694,7 +701,7 @@ function buildTurnDiagnostics(visibleSpans: RawInsightSpan[] | undefined, slowTh
     if (isWritePhase(span.phase)) acc.edits++;
     if (span.phase === 'run') acc.runs++;
     if (span.status === 'error') acc.failures++;
-    if (span.durationMs !== undefined) acc.durationMs += Math.max(0, Math.round(span.durationMs));
+    if (span.durationMs !== undefined && !isInteractiveWaitTool(span.tool)) acc.durationMs += Math.max(0, Math.round(span.durationMs));
     acc.spanIndexes.push(i);
     for (const tag of spanTags[i] ?? []) {
       if (tag !== 'normal') acc.tags.add(tag);
