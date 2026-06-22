@@ -864,16 +864,29 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { sessions });
     }
     if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
-      let body: { olderThanHours?: unknown };
+      let body: { olderThanHours?: unknown; sessionIds?: unknown };
       try {
-        body = await readJsonBody(req) as { olderThanHours?: unknown };
+        body = await readJsonBody(req) as { olderThanHours?: unknown; sessionIds?: unknown };
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
       const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
       if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
 
-      const result = await cleanupIdleSessions(aggregator.getSessions(), olderThanHours, async s => {
+      // WYSIWYG: the UI scopes cleanup to the rows currently visible under the
+      // page filters and sends their sessionIds, so the closed set matches the
+      // confirmed count. We still hand the scoped rows to cleanupIdleSessions,
+      // which re-validates each is a genuine idle candidate — a stale/forged id
+      // can never close a non-idle session. Omitting sessionIds (e.g. an older
+      // client) falls back to a deployment-wide sweep. Cap the id set so a giant
+      // body can't blow up the Set build.
+      const idScope = Array.isArray(body?.sessionIds)
+        ? new Set((body.sessionIds as unknown[]).slice(0, 10000).map(String))
+        : null;
+      const rows = aggregator.getSessions();
+      const scoped = idScope ? rows.filter(s => idScope.has(s.sessionId)) : rows;
+
+      const result = await cleanupIdleSessions(scoped, olderThanHours, async s => {
         try {
           const upstream = await proxyToDaemon(
             s.larkAppId as string,
@@ -883,10 +896,14 @@ const server = createServer(async (req, res) => {
           const text = await upstream.text();
           let parsed: any = null;
           try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+          // The daemon close route always replies 200 {ok:true}; treat anything
+          // else (incl. an unparseable/missing body) as a failure rather than a
+          // silent success.
+          const ok = upstream.ok && parsed?.ok === true;
           return {
             sessionId: s.sessionId,
-            ok: upstream.ok && parsed?.ok !== false,
-            error: upstream.ok && parsed?.ok !== false ? undefined : (parsed?.error ?? `http_${upstream.status}`),
+            ok,
+            error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
           };
         } catch (e: any) {
           return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };

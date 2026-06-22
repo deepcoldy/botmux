@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
   cleanupIdleSessions,
+  idleCleanupCutoffMs,
   parseIdleCleanupHours,
   selectIdleCleanupCandidates,
 } from '../src/dashboard/session-cleanup.js';
@@ -81,6 +82,64 @@ describe('dashboard idle session cleanup selection', () => {
         { sessionId: 'old-idle', ok: true },
         { sessionId: 'fails', ok: false, error: 'close_failed' },
       ],
+    });
+  });
+
+  it('uses a strict cutoff — exactly-at-cutoff is excluded, one ms older is included', () => {
+    const cutoff = idleCleanupCutoffMs(24, NOW);
+    const candidates = selectIdleCleanupCandidates([
+      row('at-cutoff', { lastMessageAt: cutoff }),
+      row('one-ms-older', { lastMessageAt: cutoff - 1 }),
+      row('one-ms-newer', { lastMessageAt: cutoff + 1 }),
+    ], 24, NOW);
+
+    expect(candidates.map(s => s.sessionId)).toEqual(['one-ms-older']);
+  });
+
+  it('rejects non-positive / non-numeric lastMessageAt timestamps', () => {
+    const candidates = selectIdleCleanupCandidates([
+      row('epoch-zero', { lastMessageAt: 0 }),
+      row('negative', { lastMessageAt: -5 }),
+      row('nan', { lastMessageAt: Number.NaN }),
+      // The dashboard row shape carries a numeric epoch; a raw ISO string (the
+      // persisted Session shape) is intentionally dropped rather than parsed.
+      row('iso-string', { lastMessageAt: new Date(NOW - 48 * hour).toISOString() }),
+    ], 24, NOW);
+
+    expect(candidates).toEqual([]);
+  });
+
+  it('reports all-success and zero-candidate runs as ok', async () => {
+    const allOk = await cleanupIdleSessions([
+      row('a'),
+      row('b'),
+    ], 24, async (candidate) => ({ sessionId: candidate.sessionId, ok: true }), NOW);
+    expect(allOk).toEqual({
+      ok: true,
+      olderThanHours: 24,
+      cutoffMs: NOW - 24 * hour,
+      matched: 2,
+      closed: 2,
+      failed: 0,
+      results: [
+        { sessionId: 'a', ok: true },
+        { sessionId: 'b', ok: true },
+      ],
+    });
+
+    let called = false;
+    const none = await cleanupIdleSessions([
+      row('working-only', { status: 'working', lastMessageAt: NOW - 48 * hour }),
+    ], 24, async (candidate) => { called = true; return { sessionId: candidate.sessionId, ok: true }; }, NOW);
+    expect(called).toBe(false);
+    expect(none).toEqual({
+      ok: true,
+      olderThanHours: 24,
+      cutoffMs: NOW - 24 * hour,
+      matched: 0,
+      closed: 0,
+      failed: 0,
+      results: [],
     });
   });
 });

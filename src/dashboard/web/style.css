@@ -2101,6 +2101,10 @@ fieldset legend {
   background: var(--danger);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 12%, transparent);
 }
+.idle-cleanup-bar.is-empty .idle-cleanup-dot {
+  background: var(--muted);
+  box-shadow: none;
+}
 .idle-cleanup-count,
 .idle-cleanup-status,
 .idle-cleanup-label {

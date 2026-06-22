@@ -331,6 +331,7 @@ export function renderSessionsPage(root: HTMLElement) {
   const bulkCountSpan = root.querySelector<HTMLElement>('#bulk-count')!;
   const bulkCloseBtn = root.querySelector<HTMLButtonElement>('#bulk-close')!;
   const bulkClearBtn = root.querySelector<HTMLButtonElement>('#bulk-clear')!;
+  const idleCleanupBar = root.querySelector<HTMLElement>('#idle-cleanup-bar')!;
   const idleCleanupThreshold = root.querySelector<HTMLElement>('#idle-cleanup-threshold')!;
   const idleCleanupBtn = root.querySelector<HTMLButtonElement>('#idle-cleanup-run')!;
   const idleCleanupCount = root.querySelector<HTMLElement>('#idle-cleanup-count')!;
@@ -402,7 +403,10 @@ export function renderSessionsPage(root: HTMLElement) {
   }
 
   function currentIdleCleanupCandidates(): any[] {
-    return selectIdleCleanupCandidates([...store.sessions.values()], selectedIdleCleanupHours());
+    // Scope to the rows currently visible under the page filters (WYSIWYG):
+    // the count, the confirm dialog, and the sessionIds we POST all describe
+    // exactly what the operator sees, never other bots' sessions off-screen.
+    return selectIdleCleanupCandidates(filtered(), selectedIdleCleanupHours());
   }
 
   function paintIdleCleanupThresholds(): void {
@@ -1309,6 +1313,10 @@ export function renderSessionsPage(root: HTMLElement) {
     const count = currentIdleCleanupCandidates().length;
     idleCleanupCount.textContent = t('sessions.idleCleanupCount', { count });
     idleCleanupBtn.disabled = idleCleanupBusy || count === 0;
+    // Keep the bar (and its threshold switcher) visible so the operator can
+    // probe other thresholds, but drop the danger-red dot to neutral when
+    // there's nothing to clean — a red alarm at 0 candidates is misleading.
+    idleCleanupBar.classList.toggle('is-empty', count === 0);
     paintIdleCleanupThresholds();
   }
 
@@ -2034,6 +2042,9 @@ export function renderSessionsPage(root: HTMLElement) {
   });
 
   idleCleanupThreshold.addEventListener('click', e => {
+    // Don't let a threshold switch mid-cleanup repaint the count/pill against a
+    // different threshold than the request that's already running.
+    if (idleCleanupBusy) return;
     const btn = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-hours]');
     if (!btn) return;
     const next = parseIdleCleanupHours(btn.dataset.hours);
@@ -2056,7 +2067,9 @@ export function renderSessionsPage(root: HTMLElement) {
       const r = await fetch('/api/sessions/cleanup-idle', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ olderThanHours: hours }),
+        // Send the filtered candidate ids so the server closes exactly what the
+        // operator saw and confirmed (it re-validates each is still idle).
+        body: JSON.stringify({ olderThanHours: hours, sessionIds: candidates.map(c => c.sessionId) }),
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) {
