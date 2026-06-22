@@ -1148,7 +1148,11 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 
 # botmux-orchestrate — 多 bot 多话题编排
 
-你作为**编排者（主 bot）**，把一个大编程项目拆成若干**子项目**，每个子项目在群里**单开一条话题**、派给**一组 bot**（常见：一个写代码 coder + 一个 review）并行推进；用一张**飞书任务清单**当所有人共享的进度板，子 bot 干完回报后你聚合、推进、最终汇总给用户。
+你作为**编排者（主 bot）**，把一个大编程项目拆成若干**子项目**并行推进。
+
+**拓扑是两层（goal=群 / subtask=群内话题）**：每个大项目(goal)开**一个独立的工作群（goal 群）**，把要用的 bot 和发起用户都拉进去；该项目的每个子项目(subtask)在 **goal 群内单开一条话题**、派给**一组 bot**（常见 coder + reviewer）。你自己常驻**主群（总控台）**——被唤起、做决策、看全局都在主群。一个群 = 一个项目：可整体分享给人、群内搜索、进群即见全貌，而不是把所有项目的子话题堆在一个群里翻不动。
+
+进度有两套账，别混：**账本(verified-delivery)是机器可验的真相源**（你验收/恢复只认它，见「## 可信交付」），**飞书任务清单是给人一眼看的进度板**。子 bot 干完用**结构化回报**交付证据、你**验收**合格才算完，最终汇总给用户。
 
 ## 适用 & 不适用
 - 适用：一个长期项目同时满足三个结构化判据：① **多个 bot 分工**处理基本独立的子项目；② 需要持续存在的 **goal 群/多话题协调**和共享进度板；③ 主 bot 要持续收件并做最终**验收**。
@@ -1157,7 +1161,7 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 
 ## 物理事实（先记牢）
 - **你和子 bot 之间没有直连**，只能靠飞书消息触发；**没有请求-响应关联**——子 bot 干完用 \`botmux report\` 把回报发回**你这条主编排话题**（不是在它自己的子话题里 @ 你——那条子话题没有你的会话，@ 会另起一个无上下文的新会话）。对你就是「话题里来了条新消息」，你被唤起（带完整上下文）后去读任务板拿结构化状态。
-- 开新话题靠 \`botmux dispatch\`（发种子消息 + 在线程里 @ 子 bot，子 bot 即在该话题各起独立会话）。**子 bot 必须已在群里且 mentionable**（有 include_bot 权限）。
+- 开新话题靠 \`botmux dispatch\`（发种子消息 + 在线程里 @ 子 bot，子 bot 即在该话题各起独立会话）。**群模型下务必带 \`--chat-id <goal群id>\`**，话题才开在该项目的 goal 群里、而非你所在的主群（缺省会落到当前群）。**子 bot 必须已在 goal 群里且 mentionable**（有 include_bot 权限）——所以建 goal 群时就把这些 bot 一起拉进去。
 - 一条话题里可以有多个 bot（如 coder+reviewer），它们在该话题内互相 @ 协作。
 - **反方向同理（你 → 子 bot）**：子 bot 的会话只在它的子话题里。你要跟某个子 bot 说话（追问/补任务/确认），**一律 \`botmux dispatch --into <子话题root> --bot <子bot>\`** 发进它的子话题——**绝不要在主群 \`botmux send --mention <子bot>\`**，那条 @ 到不了它在子话题的会话，反而会在主群另起一个无上下文的新会话（与上面的回报问题完全对称）。子 bot 回报后你通常只需聚合，不必回它；要回也走 \`--into\`。（\`botmux send\` 已加护栏：误 @ 活跃子 bot 会被拦下并提示，确需强发才 \`--anyway\`。）
 
@@ -1172,7 +1176,21 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 ### 3. 一次性跟用户确认
 把「子项目清单 + 分配 + 开几条话题」用 \`botmux send\` 发给用户**一次审批**（可配合 botmux-ask 做按钮确认）。用户可改、可手动指派。**没通过别派活。**
 
-### 4. 建共享任务板（飞书任务清单）
+### 4. 建 goal 群（本项目的工作群）
+用户确认后、派活前，先为这个大项目建一个独立 goal 群——之后所有子项目话题都开在这里。复用现成命令，把要用的 worker bot 都拉进去、并绑好工作目录：
+\`\`\`bash
+botmux create-group --name "<项目名>" \\
+  --bot "<coder显示名或larkAppId>" --bot "<reviewer显示名或larkAppId>" [--bot ...] \\
+  --working-dir "<仓库路径>"
+# 成功后 stdout 输出新群 chatId（单行）——记住它，它就是本项目的 goalId
+\`\`\`
+- ⚠️ **\`create-group --bot\` 用 bot 显示名或 larkAppId**（同 \`botmux send @<name>\`）；这和 \`dispatch --bot\` 用 **open_id** 不一样，别混。
+- 拿到的 **群 chatId 就是 goalId**：后续 dispatch、查账本都用它。
+- \`--working-dir\` 给整群绑好仓库目录后，**该群里 dispatch 就不用再每次传 \`--repo\`**（子 bot 开话题自动继承）。
+- 建群命令默认把 creator 的 allowedUsers（发起用户）拉进群并转群主，他在群里就能盯整个项目进度。
+- **任务结束不自动删群**（留痕可回溯，归档以后再说）。
+
+### 5. 建共享任务板（飞书任务清单）
 用 **lark-task** 技能建一个**任务清单**（= 大项目），每个子项目建一条**任务**：
 - 负责人(member) 设为该子 bot（type=app，飞书任务支持 bot 当负责人）；
 - **把发起人（用户）加为任务清单成员/关注者**（tasklists.add_members，type=user，用他的 open_id）——否则任务板**不会出现在他的飞书任务里**，他看不到进度（这是常见漏点：建了板但没人能看到）；
@@ -1181,10 +1199,10 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 任务板给**人一眼看进度**，也是你的工作记忆。**主 bot 和子 bot 都可读写任务。**
 建完把任务清单链接用 \`botmux send\` 发给用户，让他确认能在飞书任务里看到。
 
-### 5. 逐个派活（开话题）
-对每个子项目，把简报写进 /tmp/brief-X.md，再：
+### 6. 逐个派活（在 goal 群里开话题）
+对每个子项目，把简报写进 /tmp/brief-X.md，再用 \`--chat-id <goalId>\` 把话题开进本项目的 goal 群：
 \`\`\`bash
-botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
+botmux dispatch --chat-id "<goalId>" --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --brief-file /tmp/brief-X.md
 \`\`\`
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
@@ -1196,17 +1214,27 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 > **OnCall 省 \`--repo\` 现按 bot 计**：OnCall 绑定是 per-bot 的——只有**目标子 bot 自己**在该群绑了 OnCall（\`@该bot /oncall bind <仓库路径>\`，多个 bot 一起绑用 \`@bot1 @bot2 /oncall bind <路径>\`）或配了 \`defaultWorkingDir\` 时，dispatch 才可省 \`--repo\`。否则子 bot **不会**跨 bot 继承群目录（除非同话题已有 sibling 在跑可继承），dispatch 仍应显式传 \`--repo\`，不然子 bot 会弹「选仓库」卡。
 > 想「先把 bot 拉起待命、稍后再派具体任务」：用 \`--standby\`（只定目录不派简报），之后用 \`botmux dispatch --into <话题root> --bot ... --brief ...\` 激活。
 
-### 6. 收结果 + 推进
-子 bot \`botmux report\` → 你（主编排会话，带完整上下文）被唤起 → 读任务板确认完成、看产出。然后：
-- 有依赖的下一波：依赖满足了再 dispatch 下一批；
-- 卡住/超时：去对应话题 \`botmux dispatch --into <root>\` @ 它问进展，或改派；
-- 全程把关键节点用 \`botmux send\` 同步用户（人看任务板也能一眼掌握）。
+### 7. 收结果 + 验收（查账本，不信聊天）
+子 bot 用 \`botmux report --task <taskId> --summary ... --artifact <证据>\` 交付 → 你被唤起。**验收只认账本，不认聊天里说的"完成"**：
+- 先查账本拿结构化状态：\`botmux delivery list --goal <goalId>\`（本项目所有任务的 dispatched/reported/accepted/rejected）；单个看 \`botmux delivery show <taskId>\`。
+- 对 reported 的任务**优先用硬证据验收**：能跑测试就跑、能读产物就读；只有不可测的活（调研/设计）才纯靠判断。
+- 合格 → \`botmux delivery accept <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject <taskId> --reason ... --retry-brief ...\`（会自动回推到子 bot 话题，让它用同一 taskId 重做）。
+- 推进：有依赖的下一波，依赖满足了再 dispatch；**卡住/超时靠查账本**——\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的任务，去对应话题 \`botmux dispatch --into <root>\` @ 它问进展或改派（不靠后台轮询）。
+- 全程把关键节点用 \`botmux send\` 同步用户（人看飞书任务板也能一眼掌握）。
 
-### 7. 汇总
-所有子项目完成 → 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
+### 8. 汇总
+所有子项目**验收通过**（账本里都 accepted）→ 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
 
-## 登记（别丢上下文）
-把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 /tmp/orchestrate-<项目>.json）；断点续跑/被唤起时据此恢复。
+## 登记 & 恢复（账本是真相源，记忆只是缓存）
+把「goalId(群) ↔ 子项目 ↔ taskId ↔ 话题root ↔ 指派bot」记一张小表（本地 scratch，如 /tmp/orchestrate-<项目>.json）方便手头快查。但**真相源是账本**：被唤起 / 断点续跑 / 怀疑漏了什么时，先 \`botmux delivery list --goal <goalId>\` 从账本重建状态再动手——本地小表和飞书任务板都可能过期，账本不会。
+
+## 可信交付（账本：聊天不算证据，验收要留痕）
+让"派出去的活到底做没做、验没验"有据可查，不靠群里互相说"好了"：
+- **每个 subtask 有一等 taskId**：\`dispatch\` 自动生成（或 \`--task-id\` 指定），子 bot 必须 \`botmux report --task <taskId>\` 带证据回报，不能只在群里说完成。
+- **证据两形态**：\`--artifact <路径>\`（你能读到的产物文件）或 inline（测试输出/关键内容/diff，自包含）；你读不到的路径不算数。
+- **账本是唯一真相源**：dispatched/reported/accepted/rejected 全落账，\`delivery list/show\` 查得到。**聊天里说的"完成"不是证据**；要把聊天内容当证据，须作为 inline 证据入账。
+- **验收留痕**：\`delivery accept/reject\` 都记下你查了哪些证据 / 跑了什么命令 / 结论原因，可回溯。
+- **goalId = goal 群 chatId**：\`delivery list --goal <goalId>\` 就是这个项目的全景账本视图。
 
 ## 注意
 - **没通过用户审批不要建板/派活。**
