@@ -257,6 +257,16 @@ export interface Session {
   lastCodexAppInput?: CodexAppTurnInput;
   /** Default local project whiteboard bound to this session when the optional whiteboard feature is enabled. */
   whiteboardId?: string;
+  /** Present on daemon-native L2 goal supervisor sessions. Used to notify the
+   * L1 parent without going through Lark self-message routing. */
+  goalSupervisor?: {
+    goalChatId: string;
+    title: string;
+    parentChatId: string;
+    parentRoot?: string;
+    parentSessionId?: string;
+    createdAt: string;
+  };
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
   /**
