@@ -437,41 +437,64 @@ function renderDistribution(records: InsightRecord[]): string {
   ${disclosureNote()}`;
 }
 
-function renderHotspots(records: InsightRecord[]): string {
-  const reports = okReports(records);
+type HotAgg = { key: string; label: string; sessions: Array<{ id: string; title: string }>; reads: number; edits: number; runs: number; fails: number; count: number };
+
+function renderHotspots(records: InsightRecord[], openHot: Set<string>): string {
+  const reports = records.filter(r => !!r.report && r.report.status === 'ok');
   if (!reports.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
-  // Tool failure hotspots: total fails + how many sessions hit each tool.
-  const toolFails = new Map<string, { fails: number; sessions: number }>();
-  for (const r of reports) {
-    for (const [tool, n] of Object.entries(r.agg.failByTool ?? {})) {
-      const e = toolFails.get(tool) ?? { fails: 0, sessions: 0 };
-      e.fails += n; e.sessions += 1; toolFails.set(tool, e);
-    }
+  // Cross-session recurrence from each session's compact report.hot, tracking which
+  // sessions contributed so each row can drill down to them.
+  const fileAgg = new Map<string, HotAgg>();
+  const cmdAgg = new Map<string, HotAgg>();
+  const errAgg = new Map<string, HotAgg>();
+  const bump = (m: Map<string, HotAgg>, key: string, label: string, sid: string, title: string): HotAgg => {
+    let h = m.get(key);
+    if (!h) { h = { key, label, sessions: [], reads: 0, edits: 0, runs: 0, fails: 0, count: 0 }; m.set(key, h); }
+    if (!h.sessions.some(s => s.id === sid)) h.sessions.push({ id: sid, title });
+    return h;
+  };
+  for (const rec of reports) {
+    const sid = String(rec.session.sessionId);
+    const title = sessionTitle(rec.session);
+    const hot = rec.report!.hot;
+    for (const f of hot?.files ?? []) { const h = bump(fileAgg, `file:${f.path}`, f.path, sid, title); h.reads += f.reads; h.edits += f.edits; }
+    for (const c of hot?.cmds ?? []) { const h = bump(cmdAgg, `cmd:${c.cmd}`, c.cmd, sid, title); h.runs += c.runs; h.fails += c.fails; }
+    for (const e of hot?.errs ?? []) { const h = bump(errAgg, `err:${e.tool} ${e.result}`, `${e.tool} · ${resultLabel(e.result)}`, sid, title); h.count += e.count; }
   }
-  const tools = [...toolFails.entries()].map(([tool, v]) => ({ tool, ...v })).sort((a, b) => b.fails - a.fails).slice(0, 10);
-  const toolMax = Math.max(1, ...tools.map(x => x.fails));
-  // Slowest sessions.
-  const slowSessions = [...records].filter(r => r.report?.status === 'ok' && r.report.agg.slowSpans > 0)
-    .sort((a, b) => (b.report!.agg.slowSpans) - (a.report!.agg.slowSpans)).slice(0, 8);
-  // Projects by session + fails.
+  const recur = (a: HotAgg, b: HotAgg) => b.sessions.length - a.sessions.length;
+  const files = [...fileAgg.values()].sort((a, b) => recur(a, b) || (b.edits + b.reads) - (a.edits + a.reads)).slice(0, 12);
+  const cmds = [...cmdAgg.values()].sort((a, b) => recur(a, b) || b.fails - a.fails || b.runs - a.runs).slice(0, 12);
+  const errs = [...errAgg.values()].sort((a, b) => recur(a, b) || b.count - a.count).slice(0, 10);
+
+  const block = (title: string, rows: HotAgg[], meta: (h: HotAgg) => string) => `
+    <section class="block">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="hotlist">${rows.length ? rows.map(h => {
+        const open = openHot.has(h.key);
+        const sess = open ? `<div class="hot-sess">${h.sessions.map(s =>
+          `<button type="button" class="hot-sesslink" data-session-id="${escapeHtml(s.id)}">${escapeHtml(s.title || s.id)}</button>`).join('')}</div>` : '';
+        return `<div class="hotitem${open ? ' open' : ''}">
+          <button type="button" class="hotrow" data-hotkey="${escapeHtml(h.key)}" aria-expanded="${open}">
+            <span class="hotlabel" title="${escapeHtml(h.label)}">${escapeHtml(h.label)}</span>
+            <span class="hotmeta">${meta(h)}</span>
+            <span class="hotses">${h.sessions.length} ${escapeHtml(t('insights.hotSessionsCol'))}</span>
+          </button>${sess}
+        </div>`;
+      }).join('') : `<p class="mut">-</p>`}</div>
+    </section>`;
+
+  // Projects (kept, with drill-down) + slowest sessions.
   const projMap = new Map<string, { sessions: number; fails: number }>();
-  for (const rec of records) {
-    if (rec.report?.status !== 'ok') continue;
-    const p = projectOf(rec); if (!p) continue;
-    const e = projMap.get(p) ?? { sessions: 0, fails: 0 };
-    e.sessions += 1; e.fails += rec.report.agg.failedSpans; projMap.set(p, e);
-  }
+  for (const rec of reports) { const p = projectOf(rec); if (!p) continue; const e = projMap.get(p) ?? { sessions: 0, fails: 0 }; e.sessions += 1; e.fails += rec.report!.agg.failedSpans; projMap.set(p, e); }
   const projects = [...projMap.entries()].map(([id, v]) => ({ id, ...v })).sort((a, b) => b.fails - a.fails || b.sessions - a.sessions).slice(0, 10);
   const projMax = Math.max(1, ...projects.map(x => x.sessions));
+  const slowSessions = [...reports].filter(r => r.report!.agg.slowSpans > 0).sort((a, b) => b.report!.agg.slowSpans - a.report!.agg.slowSpans).slice(0, 8);
+
   return `<p class="mut ins-hint">${escapeHtml(t('insights.hotHint'))}</p>
   <div class="hot-grid">
-    <section class="block">
-      <h3>${escapeHtml(t('insights.hotToolFailures'))}</h3>
-      <div class="hbars">${tools.length ? tools.map(x => {
-        const pct = Math.max(4, Math.round((x.fails / toolMax) * 100));
-        return `<div class="hbrow"><div class="hblabel">${escapeHtml(x.tool)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(x.fails)}<small>${x.sessions} ${escapeHtml(t('insights.hotSessionsCol'))}</small></div></div>`;
-      }).join('') : `<p class="mut">${escapeHtml(t('insights.noFailures'))}</p>`}</div>
-    </section>
+    ${block(t('insights.hotFiles'), files, h => `${escapeHtml(t('insights.readsShort'))}${h.reads} · ${escapeHtml(t('insights.editsShort'))}${h.edits}`)}
+    ${block(t('insights.hotCommands'), cmds, h => `${h.runs}×${h.fails ? ` · <span class="bad">${h.fails} ${escapeHtml(t('insights.hotFailsCol'))}</span>` : ''}`)}
+    ${block(t('insights.hotErrors'), errs, h => `${h.count}×`)}
     <section class="block">
       <h3>${escapeHtml(t('insights.hotProjects'))}</h3>
       <div class="hbars">${projects.length ? projects.map(x => {
@@ -490,7 +513,6 @@ function renderHotspots(records: InsightRecord[]): string {
         </button>`;
       }).join('') : `<p class="mut">-</p>`}</div>
     </section>
-    <p class="hot-note mut">${escapeHtml(t('insights.hotComingSoon'))}</p>
   </div>`;
 }
 
@@ -1369,6 +1391,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   let timeWin = hp.time ?? 'all';
   let showNoise = hp.noise === '1';
   let sessSort: SessSort = SESS_SORT_KEYS.includes(hp.sort as SessSort) ? hp.sort as SessSort : 'recent';
+  const openHot = new Set<string>();
 
   root.innerHTML = `
     <section class="page insights-page">
@@ -1531,7 +1554,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     wireSessionButtons(list);
     showSessionsView();
     distEl.innerHTML = overviewData ? renderDistribution(rows) : '';
-    hotEl.innerHTML = overviewData ? renderHotspots(rows) : '';
+    hotEl.innerHTML = overviewData ? renderHotspots(rows, openHot) : '';
     wireSessionButtons(hotEl, true);
     showTab();
     syncHash();
@@ -1835,7 +1858,17 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   });
   // 项目热点 → 设项目筛选并跳到会话 tab（最慢会话行的 data-session-id 由 wireSessionButtons 处理）。
   hotEl.addEventListener('click', e => {
-    const proj = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-hotproject]');
+    const target = e.target as HTMLElement;
+    // Expand/collapse a recurrence row → reveal its contributing sessions in place.
+    const hk = target.closest<HTMLButtonElement>('[data-hotkey]');
+    if (hk) {
+      const k = hk.dataset.hotkey || '';
+      if (openHot.has(k)) openHot.delete(k); else openHot.add(k);
+      hotEl.innerHTML = renderHotspots(currentRows(), openHot);
+      wireSessionButtons(hotEl, true);
+      return;
+    }
+    const proj = target.closest<HTMLButtonElement>('[data-hotproject]');
     if (!proj) return;
     project = proj.dataset.hotproject || '';
     tab = 'sessions';

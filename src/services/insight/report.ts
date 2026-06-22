@@ -8,6 +8,7 @@ import { parseCodexInsight } from './codex-span-reader.js';
 import { safeErrorMessage, toSafeSpan } from './redact.js';
 import type {
   AgentSay,
+  SafeInsightHot,
   InsightDetail,
   InsightDiagnosticKind,
   InsightConversationMessage,
@@ -578,6 +579,55 @@ function buildWorkSummary(spans: RawInsightSpan[], safeSpans: SafeSpan[] | undef
   return { fileChanges, commandsRun };
 }
 
+// Compact per-session rollup for cross-session recurrence hotspots. Computed from raw
+// spans alone (filePaths→safe label, evidence.command already a scrubbed preview, tool +
+// result enum), so it's cheap enough to include in summary mode. Top-N capped.
+function buildSessionHot(spans: RawInsightSpan[], cwd: string | undefined): SafeInsightHot {
+  const files = new Map<string, { path: string; reads: number; edits: number; added: number; removed: number }>();
+  const cmds = new Map<string, { cmd: string; runs: number; fails: number }>();
+  const errs = new Map<string, { tool: string; result: string; count: number }>();
+  for (const span of spans) {
+    for (const rawPath of span.filePaths ?? []) {
+      const label = safeFilePathLabel(rawPath, cwd);
+      const f = files.get(label) ?? { path: label, reads: 0, edits: 0, added: 0, removed: 0 };
+      if (isReadPhase(span.phase)) f.reads++;
+      if (isWritePhase(span.phase)) {
+        f.edits++;
+        const c = span.lineCounts ?? patchLineCounts(span.patchText);
+        if (c) { f.added += c.added; f.removed += c.removed; }
+      }
+      files.set(label, f);
+    }
+    // Command recurrence keyed by the SAFE intent (kind + safe subject) — never the
+    // raw command text, which must not cross into the summary/overview (redaction
+    // invariant: command previews live only in per-session detail).
+    if (span.phase === 'run' && span.intent && span.intent.kind !== 'unknown') {
+      const label = [span.intent.kind, span.intent.subject].filter(Boolean).join(' ');
+      if (label) {
+        const c = cmds.get(label) ?? { cmd: label, runs: 0, fails: 0 };
+        c.runs++;
+        if (span.status === 'error') c.fails++;
+        cmds.set(label, c);
+      }
+    }
+    if (span.status === 'error') {
+      const result = span.result?.category ?? 'tool_error';
+      const key = `${span.tool} ${result}`;
+      const e = errs.get(key) ?? { tool: span.tool, result, count: 0 };
+      e.count++;
+      errs.set(key, e);
+    }
+  }
+  return {
+    files: [...files.values()]
+      .map(f => ({ path: f.path, reads: f.reads, edits: f.edits, ...(f.added || f.removed ? { added: f.added, removed: f.removed } : {}) }))
+      .sort((a, b) => (b.edits + b.reads) - (a.edits + a.reads) || ((b.added ?? 0) + (b.removed ?? 0)) - ((a.added ?? 0) + (a.removed ?? 0)))
+      .slice(0, 12),
+    cmds: [...cmds.values()].sort((a, b) => b.fails - a.fails || b.runs - a.runs).slice(0, 12),
+    errs: [...errs.values()].sort((a, b) => b.count - a.count).slice(0, 8),
+  };
+}
+
 function spanKey(span: RawInsightSpan): string {
   const intent = span.intent;
   return `${intent?.kind ?? 'unknown'}:${intent?.subject ?? ''}:${intent?.detail ?? ''}`;
@@ -1124,6 +1174,10 @@ export function buildSafeInsightReport(q: InsightReportQuery, opts: BuildInsight
     turnDiagnostics,
     turnTimeline,
   };
+
+  // Compact recurrence rollup — included in BOTH modes so the overview (summary mode)
+  // can aggregate file/command/error hotspots cross-session without heavy detail.
+  report.hot = buildSessionHot(parsed.spans, q.cwd);
 
   if (detail === 'spans' && visible) {
     report.spans = visible;

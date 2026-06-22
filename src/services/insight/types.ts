@@ -62,8 +62,17 @@ export interface SafeInsightReport {
   turnDiagnostics: TurnEfficiencyDiagnostic[];
   turnTimeline: TurnTimelineTurn[];
   workSummary?: SafeInsightWorkSummary;
+  /** Compact per-session rollup (also present in summary mode) for cross-session
+   *  recurrence hotspots — file / command / error signatures, all safe-projected. */
+  hot?: SafeInsightHot;
   spans?: SafeSpan[];
   error?: { code: InsightStatus; message: string };
+}
+
+export interface SafeInsightHot {
+  files: Array<{ path: string; reads: number; edits: number; added?: number; removed?: number }>;
+  cmds: Array<{ cmd: string; runs: number; fails: number }>;
+  errs: Array<{ tool: string; result: string; count: number }>;
 }
 
 export interface SafeInsightTurnDetail {
