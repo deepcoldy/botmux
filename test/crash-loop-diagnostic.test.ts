@@ -1,11 +1,12 @@
 /**
  * Daemon-side crash-loop handling — worker-pool `case 'claude_exit'`, rc.count > 3.
  *
- *   - diagnosticTerminal:'tmux'  → KEEP the worker (no kill), reset the restart
- *     counter, status → idle, and mark the session suspendedColdResume so the
- *     parked diagnostic shell's "send a message to retry" affordance survives a
- *     daemon restart (restore lazy-resumes instead of zombie-closing).
- *   - no diagnosticTerminal      → historical path: kill the worker.
+ *   - canParkDiagnostic:true   → KEEP the worker (ask it to park via park_diagnostic),
+ *     reset the restart counter, status → idle, and mark the session
+ *     suspendedColdResume so the parked diagnostic shell's "send a message to
+ *     retry" affordance survives a daemon restart (restore lazy-resumes
+ *     instead of zombie-closing).
+ *   - canParkDiagnostic:false  → historical path: kill the worker.
  *
  * Run:  pnpm vitest run --project unit test/crash-loop-diagnostic.test.ts
  */
@@ -151,9 +152,9 @@ function makeDs(sessionId: string, worker: any): DaemonSession {
 
 const flush = () => new Promise<void>(r => setTimeout(r, 0));
 
-async function crashTimes(worker: any, n: number, diagnosticTerminal?: 'tmux') {
+async function crashTimes(worker: any, n: number, canParkDiagnostic?: boolean) {
   for (let i = 0; i < n; i++) {
-    worker.emit('message', { type: 'claude_exit', code: 1, signal: null, diagnosticTerminal });
+    worker.emit('message', { type: 'claude_exit', code: 1, signal: null, canParkDiagnostic });
   }
   await flush();
 }
@@ -175,10 +176,12 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     const ds = makeDs('sid-diag-keep', worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    await crashTimes(worker, 4, 'tmux');
+    await crashTimes(worker, 4, true);
 
-    // First 3 auto-restart in place; the 4th parks (no close, no further restart).
+    // First 3 auto-restart in place; the 4th asks the worker to park a
+    // diagnostic shell (deferred park) and keeps it alive (no close).
     expect(worker.send).toHaveBeenCalledWith({ type: 'restart' });
+    expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.
     expect(ds.session.suspendedColdResume).toBe(true);
@@ -192,7 +195,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     const ds = makeDs('sid-diag-cleared', worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    await crashTimes(worker, 4, 'tmux');
+    await crashTimes(worker, 4, true);
     expect(ds.session.suspendedColdResume).toBe(true); // parked → marked for restart survival
 
     // The in-place retry (worker.ts) respawns the CLI WITHOUT going through

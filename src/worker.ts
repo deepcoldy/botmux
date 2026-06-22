@@ -130,7 +130,17 @@ let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
+/** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
 let crashDiagnosticTmuxParked = false;
+/** True once the daemon told us to stop & park a crash diagnostic (crash loop):
+ *  the next user message retries the CLI. Distinct from the flag above because
+ *  retry must still fire even if the tmux park itself failed (no hang). */
+let crashDiagnosticStopped = false;
+/** Exit code/signal of the just-exited CLI, stashed so a deferred park
+ *  (park_diagnostic IPC) can stamp the captured log even though the park no
+ *  longer happens inline in onExit. */
+let lastCliExitCode: number | null = null;
+let lastCliExitSignal: string | null = null;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
  *  web-terminal updates flow through the shared scrollback fan-out instead
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
@@ -2225,6 +2235,10 @@ function crashDiagnosticPath(): string | undefined {
 }
 
 function destroyCrashDiagnosticTerminal(reason: string): void {
+  // Leaving the stopped-awaiting-retry state regardless of whether a tmux shell
+  // was actually parked (park may have failed); the next retry/close/suspend
+  // funnels through here.
+  crashDiagnosticStopped = false;
   if (!crashDiagnosticTmuxParked || !sessionId) return;
   try {
     TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(sessionId));
@@ -2270,7 +2284,11 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
     rows: renderRows || PTY_ROWS,
     contentPath: path,
   });
-  if (!ok) return false;
+  if (!ok) {
+    // tmux spawn failed after the .ansi was written — drop the orphan file.
+    try { unlinkSync(path); } catch { /* benign */ }
+    return false;
+  }
   crashDiagnosticTmuxParked = true;
   isTmuxMode = true;
   isPipeMode = false;
@@ -4423,7 +4441,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   backend.onExit((code, signal) => {
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
     const logTail = recentTerminalLogTail();
-    const diagnosticTerminal = parkCrashDiagnosticTerminal(code, signal) ? 'tmux' as const : undefined;
+    // Don't park a diagnostic shell here: most exits are immediately
+    // auto-restarted by the daemon, so an inline park would just be torn down
+    // again (a wasted tmux session + .ansi write on every restart). Instead
+    // report whether we COULD park; the daemon asks us to (park_diagnostic) only
+    // when it actually gives up restarting (crash loop). Stash the exit reason
+    // for that deferred park.
+    lastCliExitCode = code;
+    lastCliExitSignal = signal;
+    const canParkDiagnostic = !lastInitConfig?.adoptMode && effectiveBackendType === 'tmux' && !!sessionId;
     // Inputs written but not yet consumed (no idle since the write) die with
     // the CLI — codex crashing mid-submit never records them, and the fresh
     // respawn comes up empty. Stash them so the next spawnCli re-queues and
@@ -4434,7 +4460,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
     backend = null;
     isPromptReady = false;
-    send({ type: 'claude_exit', code, signal, logTail, diagnosticTerminal });
+    send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic });
   });
 
   if (isPipeMode && backend && 'isReattach' in backend && backend.isReattach) {
@@ -5101,8 +5127,8 @@ process.on('message', async (raw: unknown) => {
       const content = msg.content;
       currentBotmuxTurnId = msg.turnId;
       writeCliPidMarker();
-      if (!backend && crashDiagnosticTmuxParked && lastInitConfig && !lastInitConfig.adoptMode) {
-        log('Message received while crash diagnostic terminal is parked; retrying CLI start');
+      if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
+        log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
         stopScreenAnalyzer();
         stopScreenUpdates();
@@ -5224,6 +5250,17 @@ process.on('message', async (raw: unknown) => {
           log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
         }
       }
+      break;
+    }
+
+    case 'park_diagnostic': {
+      // The daemon gave up auto-restarting (crash loop) and wants the last
+      // terminal output preserved. Park the diagnostic shell now — deferred from
+      // onExit so transient (auto-restarted) exits never pay for it. Mark the
+      // stopped state even if the tmux park fails, so the next message still
+      // retries the CLI (no hang) rather than writing into a dead pane.
+      parkCrashDiagnosticTerminal(lastCliExitCode, lastCliExitSignal);
+      crashDiagnosticStopped = true;
       break;
     }
 

@@ -2228,7 +2228,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
         if (rc.count > 3) {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
-          const keepDiagnosticWorker = msg.diagnosticTerminal === 'tmux';
+          const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working" forever
           if (ds.streamCardId && ds.workerPort) {
             const readUrl = buildTerminalUrl(ds);
@@ -2242,10 +2242,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             scheduleCardPatch(ds, frozenCard);
           }
           if (keepDiagnosticWorker) {
-            // The worker parked a lightweight tmux diagnostic shell under
-            // bmx-diag-<sid>. Keep its web server alive so the existing terminal
-            // URL can show the startup failure; the next user message tells that
-            // same worker to destroy the diagnostic shell and retry.
+            // Ask the worker to park a lightweight tmux diagnostic shell under
+            // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
+            // don't pay for it). Keep its web server alive so the existing
+            // terminal URL can show the startup failure; the next user message
+            // tells that same worker to destroy the diagnostic shell and retry.
+            ds.worker!.send({ type: 'park_diagnostic' } as DaemonToWorker);
             restartCounts.delete(key);
             ds.lastScreenStatus = 'idle';
             // Survive a daemon restart: mark this as a lazy cold-resume so
