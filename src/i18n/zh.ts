@@ -608,6 +608,8 @@ export const messages: Record<string, string> = {
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ /adopt的 CLI 会话已断开',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
+  'worker.crash_diagnostic_terminal': 'Web 终端已保留最后一次启动输出，可直接打开查看；修复问题后发新消息会重新启动。',
+  'worker.crash_recent_output': '最近终端输出：',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',

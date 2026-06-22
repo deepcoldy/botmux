@@ -20,6 +20,7 @@ import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlCon
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
+import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
@@ -2211,24 +2212,6 @@ let altBufferActive = false;
 const ALT_ENTER_RE = /\x1b\[\?(1049|1047|47)h/g;
 const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
 
-function tailChars(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return text.slice(text.length - max);
-}
-
-function stripAnsiForLog(text: string): string {
-  return text
-    // OSC sequences.
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
-    // CSI/SGR and most cursor/control sequences.
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-    // Remaining one-byte ESC commands.
-    .replace(/\x1b[ -/]*[@-~]/g, '')
-    .replace(/\r/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
 function recentTerminalLogTail(): string | undefined {
   const plain = stripAnsiForLog(tailChars(scrollback, CRASH_DIAGNOSTIC_RAW_MAX));
   if (!plain) return undefined;
@@ -2244,11 +2227,15 @@ function crashDiagnosticPath(): string | undefined {
 function destroyCrashDiagnosticTerminal(reason: string): void {
   if (!crashDiagnosticTmuxParked || !sessionId) return;
   try {
-    TmuxBackend.killSession(TmuxBackend.sessionName(sessionId));
+    TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(sessionId));
     log(`Crash diagnostic tmux session destroyed (${reason})`);
   } catch (err: any) {
     log(`Crash diagnostic tmux cleanup failed (${reason}): ${err?.message ?? err}`);
   }
+  // Best-effort: drop the captured .ansi file too so a long-lived daemon does
+  // not accumulate one ~200 KB file per crashed session forever.
+  const path = crashDiagnosticPath();
+  if (path) { try { unlinkSync(path); } catch { /* already gone — benign */ } }
   crashDiagnosticTmuxParked = false;
 }
 
@@ -2268,7 +2255,16 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
     return false;
   }
 
-  const ok = TmuxBackend.parkDiagnosticSession(TmuxBackend.sessionName(sessionId), {
+  // Park under a DISTINCT name (`bmx-diag-<sid>`), never the live CLI's
+  // `bmx-<sid>` backing-session name. The whole persistent-backend machinery
+  // (restore probe, hasSession reattach, idle-sweep cold-resume, `botmux
+  // resume`) keys off `bmx-<sid>` to mean "the live CLI". Reusing that name for
+  // a bare diagnostic shell makes restore/cold-resume reattach the shell as if
+  // it were the CLI and type the user's next message into raw bash. With a
+  // distinct name, `bmx-<sid>` is correctly absent after the crash, so every
+  // one of those paths sees "no live CLI" and does the right thing; the web
+  // terminal is pointed at the diagnostic name explicitly (see the WS attach).
+  const ok = TmuxBackend.parkDiagnosticSession(TmuxBackend.diagnosticSessionName(sessionId), {
     cwd: lastInitConfig?.workingDir ?? process.cwd(),
     cols: renderCols || PTY_COLS,
     rows: renderRows || PTY_ROWS,
@@ -2279,7 +2275,14 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   isTmuxMode = true;
   isPipeMode = false;
   isZellijMode = false;
-  log(`Crash diagnostic tmux session parked at ${TmuxBackend.sessionName(sessionId)}`);
+  // The CLI is gone; stop the screen-update + analyzer loops so a stale
+  // `status='working'` tick can't un-freeze the daemon's frozen crash card.
+  // The web terminal is served by per-client tmux-attach PTYs, not these loops,
+  // so the diagnostic shell stays visible. flushPending's retry path restarts
+  // both when the next message respawns the CLI.
+  stopScreenUpdates();
+  stopScreenAnalyzer();
+  log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
   return true;
 }
 
@@ -4555,7 +4558,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // byte-for-byte (empty, separators, etc.) are not retransmitted, so
         // the earlier frame "bleeds through" — visible as a second
         // banner/prompt stacked above the new layout when scrolling up.
-        const tmuxTarget = lastInitConfig?.adoptTmuxTarget ?? TmuxBackend.sessionName(sessionId);
+        // While a crash diagnostic shell is parked it lives under bmx-diag-<sid>
+        // (not the live CLI's bmx-<sid>), so attach there to surface the startup
+        // error; otherwise attach the normal backing session.
+        const tmuxTarget = lastInitConfig?.adoptTmuxTarget
+          ?? (crashDiagnosticTmuxParked
+            ? TmuxBackend.diagnosticSessionName(sessionId)
+            : TmuxBackend.sessionName(sessionId));
         let cp: pty.IPty | null = null;
         const pendingInput: string[] = [];
 
@@ -5331,6 +5340,11 @@ process.on('message', async (raw: unknown) => {
       log('Suspend requested');
       stopScreenshotLoop();
       stopBridgeWatcher();
+      // A parked crash diagnostic shell has backend===null, so the
+      // destroySession/kill below is a no-op and would otherwise leak the
+      // bmx-diag-<sid> session. Tear it down explicitly. (The session then
+      // cold-resumes a FRESH CLI on the next message — bmx-<sid> is absent.)
+      destroyCrashDiagnosticTerminal('suspend');
       // Free the CLI's memory, not just the worker's: destroySession kills the
       // backing tmux/herdr/zellij session AND the CLI process inside it (kill()
       // would only detach the pty viewer and leave the CLI running in the

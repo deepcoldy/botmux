@@ -1023,6 +1023,10 @@ export function killWorker(ds: DaemonSession): void {
  */
 function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
+  // A crash diagnostic shell parks under bmx-diag-<sid>. If the worker was hard
+  // -killed (OOM/SIGKILL) while parked, its killCli() never ran and the shell
+  // leaks; tear it down here too. No-op when absent / for non-tmux backends.
+  try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId)); } catch { /* benign */ }
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
@@ -2210,10 +2214,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             scheduleCardPatch(ds, frozenCard);
           }
           if (keepDiagnosticWorker) {
-            // The worker parked a lightweight tmux diagnostic pane under the
-            // usual bmx-* name. Keep its web server alive so the existing
-            // terminal URL can show the startup failure; the next user message
-            // tells that same worker to destroy the diagnostic pane and retry.
+            // The worker parked a lightweight tmux diagnostic shell under
+            // bmx-diag-<sid>. Keep its web server alive so the existing terminal
+            // URL can show the startup failure; the next user message tells that
+            // same worker to destroy the diagnostic shell and retry.
             restartCounts.delete(key);
             ds.lastScreenStatus = 'idle';
           } else {
@@ -2224,12 +2228,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           const cliName = getCliDisplayName(effectiveCliId);
           const parts = [tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
           if (keepDiagnosticWorker) {
-            parts.push(loc === 'zh'
-              ? 'Web 终端已保留最后一次启动输出，可直接打开查看；修复问题后发新消息会重新启动。'
-              : 'The web terminal now preserves the last startup output. Fix the issue, then send a new message to retry.');
+            parts.push(tr('worker.crash_diagnostic_terminal', undefined, loc));
           }
           if (msg.logTail?.trim()) {
-            parts.push((loc === 'zh' ? '最近终端输出：' : 'Recent terminal output:') + `\n${msg.logTail.trim()}`);
+            parts.push(`${tr('worker.crash_recent_output', undefined, loc)}\n${msg.logTail.trim()}`);
           }
           try {
             await scopedReply(parts.join('\n\n'), 'text', undefined);

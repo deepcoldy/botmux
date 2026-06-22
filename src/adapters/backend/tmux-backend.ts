@@ -70,6 +70,17 @@ export class TmuxBackend implements SessionBackend {
     return `bmx-${sessionId.slice(0, 8)}`;
   }
 
+  /**
+   * Name of the parked crash-diagnostic shell session. DISTINCT from
+   * {@link sessionName} on purpose: the diagnostic shell must never collide with
+   * the live CLI's backing-session name, or restore/cold-resume/`botmux resume`
+   * would reattach the bare shell as if it were the CLI. Stays `bmx-`-prefixed
+   * so adopt-discovery still skips it.
+   */
+  static diagnosticSessionName(sessionId: string): string {
+    return `bmx-diag-${sessionId.slice(0, 8)}`;
+  }
+
   /** Check if a named tmux session exists. */
   static hasSession(name: string): boolean {
     return TmuxBackend.probeSession(name) === 'exists';
