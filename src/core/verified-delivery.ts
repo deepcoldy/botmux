@@ -34,6 +34,9 @@ export function buildVerifiedDeliveryInstructions(input: {
     '完成后必须用结构化回报交付，不能只在群里说“完成”：',
     `botmux report --task ${input.taskId} --summary "做了什么/结果如何" --artifact <主agent可读取的产物路径>`,
     '如果主 agent 读不到产物路径，请改用 inline 证据（测试输出/关键文件内容/diff），确保主 agent 能验证。',
+    '如果你无法完成（缺权限/需求有歧义/客观做不到/反复失败），不要硬撑、也不要只在群里说做不了，用求助：',
+    `botmux help --task ${input.taskId} --blocker "具体卡在哪、缺什么" --kind access|ambiguous|impossible|repeated_failure|other`,
+    '求助会落账并唤醒监管者来处理；监管者定不了的会升级给人。',
   ];
   if (input.acceptanceHint?.trim()) {
     lines.push(`验收提示: ${input.acceptanceHint.trim()}`);

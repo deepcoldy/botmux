@@ -22,6 +22,7 @@ describe('verified-delivery core helpers', () => {
     });
     expect(text).toContain('任务号: task-api-1234abcd');
     expect(text).toContain('botmux report --task task-api-1234abcd');
+    expect(text).toContain('botmux help --task task-api-1234abcd'); // 卡住时的求助指引
     expect(text).toContain('验收提示: run npm test');
   });
 
