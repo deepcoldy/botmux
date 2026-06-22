@@ -1317,13 +1317,36 @@ async function fetchDetail(sessionId: string): Promise<SafeInsightReport | null>
   return d.report as SafeInsightReport;
 }
 
+// URL state (deep-link + refresh-stable): the insights view state lives in the hash
+// query after #/insights (e.g. #/insights?tab=dist&project=botmux&sess=<id>). Written
+// via history.replaceState (no router re-run), read back on (re)mount.
+function parseInsightsHash(): Record<string, string> {
+  const h = typeof location !== 'undefined' ? (location.hash || '') : '';
+  const qi = h.indexOf('?');
+  if (qi < 0) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of new URLSearchParams(h.slice(qi + 1))) out[k] = v;
+  return out;
+}
+function buildInsightsHash(p: Record<string, string>): string {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(p)) if (v) sp.set(k, v);
+  const q = sp.toString();
+  return '#/insights' + (q ? `?${q}` : '');
+}
+const INSIGHT_FILTERS: InsightFilter[] = ['all', 'review', 'failed', 'slow'];
+const INSIGHT_TAB_KEYS: InsightTab[] = ['overview', 'sessions', 'dist', 'hot'];
+const SESS_SORT_KEYS: SessSort[] = ['recent', 'review', 'spans', 'fails', 'slow', 'agent'];
+
 export function renderInsightsPage(root: HTMLElement): () => void {
+  const hp = parseInsightsHash();
   let overviewData: SafeInsightOverview | null = null;
   let records: InsightRecord[] = [];
-  let filter: InsightFilter = 'all';
-  const cliFilter = new Set<string>();
-  let q = '';
+  let filter: InsightFilter = INSIGHT_FILTERS.includes(hp.filter as InsightFilter) ? hp.filter as InsightFilter : 'all';
+  const cliFilter = new Set<string>((hp.cli ?? '').split(',').filter(Boolean));
+  let q = hp.q ?? '';
   let selectedId: string | null = null;
+  let initialSess: string | null = hp.sess ?? null;
   let activeRec: string | null = null;
   let detailReport: SafeInsightReport | null = null;
   let detailTab: 'spans' | 'ledger' | 'convo' = 'spans';
@@ -1341,11 +1364,11 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   let modalPrompt: TurnPromptPreview | null = null;
   let modalReq = 0;
   let disposed = false;
-  let tab: InsightTab = 'overview';
-  let project = '';
-  let timeWin = 'all';
-  let showNoise = false;
-  let sessSort: SessSort = 'recent';
+  let tab: InsightTab = INSIGHT_TAB_KEYS.includes(hp.tab as InsightTab) ? hp.tab as InsightTab : 'overview';
+  let project = hp.project ?? '';
+  let timeWin = hp.time ?? 'all';
+  let showNoise = hp.noise === '1';
+  let sessSort: SessSort = SESS_SORT_KEYS.includes(hp.sort as SessSort) ? hp.sort as SessSort : 'recent';
 
   root.innerHTML = `
     <section class="page insights-page">
@@ -1401,6 +1424,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   const listSubtitle = root.querySelector<HTMLElement>('#insight-list-subtitle')!;
   const detail = root.querySelector<HTMLElement>('#insight-detail')!;
   const search = root.querySelector<HTMLInputElement>('input[name=q]')!;
+  search.value = q;
   const refreshBtn = root.querySelector<HTMLButtonElement>('#insight-refresh')!;
   const filterButtons = [...root.querySelectorAll<HTMLButtonElement>('[data-filter]')];
   const cliFilterEl = root.querySelector<HTMLElement>('#insight-cli-filter')!;
@@ -1429,6 +1453,22 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     const w = TIME_WINDOWS.find(x => x.key === timeWin);
     const sinceMs = w && w.days > 0 ? Date.now() - w.days * 86400000 : undefined;
     return { project: project || undefined, sinceMs, analyzableOnly: !showNoise };
+  }
+
+  // Mirror current view state into the URL hash (deep-link + refresh-stable) without
+  // triggering the router (replaceState fires no hashchange).
+  function syncHash(): void {
+    const p: Record<string, string> = {};
+    if (tab !== 'overview') p.tab = tab;
+    if (filter !== 'all') p.filter = filter;
+    if (q.trim()) p.q = q.trim();
+    if (project) p.project = project;
+    if (timeWin !== 'all') p.time = timeWin;
+    if (cliFilter.size) p.cli = [...cliFilter].join(',');
+    if (sessSort !== 'recent') p.sort = sessSort;
+    if (showNoise) p.noise = '1';
+    if (selectedId) p.sess = selectedId;
+    try { history.replaceState(null, '', buildInsightsHash(p)); } catch { /* ignore */ }
   }
 
   // Project <select> options reflect the severity+search+time scoped set (project
@@ -1494,6 +1534,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     hotEl.innerHTML = overviewData ? renderHotspots(rows) : '';
     wireSessionButtons(hotEl, true);
     showTab();
+    syncHash();
   }
 
   // Re-render the detail body in place (no refetch) after a focus/filter change.
@@ -1704,6 +1745,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   async function selectSession(sessionId: string): Promise<void> {
     selectedId = sessionId;
     showSessionsView();
+    syncHash();
     activeRec = null;
     detailTab = 'spans';
     spanFilter = 'all';
@@ -1761,6 +1803,10 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (selectedId && !records.some(r => r.session.sessionId === selectedId)) selectedId = null;
     paint();
     refreshBtn.disabled = false;
+    // Restore a deep-linked session (load its detail) once records are in.
+    const want = initialSess;
+    initialSess = null;
+    if (want && !selectedId && records.some(r => r.session.sessionId === want)) void selectSession(want);
   }
 
   search.oninput = () => { q = search.value; paint(); };
