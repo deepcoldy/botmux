@@ -4331,6 +4331,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error(`dispatch 构建失败: ${err.message}`);
     process.exit(1);
   }
+  const workerNameByOpenId = new Map(bots.map(b => [b.openId, b.name?.trim() || b.openId]));
+  const workerNames = built.mentionedOpenIds.map(openId => workerNameByOpenId.get(openId) ?? openId);
 
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
@@ -4385,6 +4387,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           title: title.trim(),
           workerTopicRoot: seedId,
           workerOpenIds: built.mentionedOpenIds,
+          workerNames,
           brief,
           acceptanceHint: acceptanceHint?.trim() || undefined,
           acceptanceCriteria: parsedAcceptance.criteria,
