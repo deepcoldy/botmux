@@ -29,7 +29,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
@@ -72,6 +72,7 @@ import {
 import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
+import type { DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 
@@ -194,25 +195,59 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => 
   jsonRes(res, 200, r);
 });
 
+/** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
+ *  mirroring the /resume route — so a Feishu-side observer sees why the CLI just
+ *  restarted under them (the IM `/restart` command and the card button notify
+ *  too; the dashboard was the lone silent path). `fresh` = the worker was gone
+ *  and we re-forked it (revive) rather than doing an in-place CLI restart.
+ *  Best-effort and fire-and-forget; never blocks the HTTP response. */
+function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
+  if (!ds.larkAppId) return;
+  const loc = localeForBot(ds.larkAppId);
+  const cliName = getCliDisplayName(ds.session.cliId ?? 'claude-code');
+  const text = fresh
+    ? t('card.action.restarted_fresh', { cliName }, loc)
+    : t('cmd.restart.in_progress', { cliName }, loc);
+  const notice = JSON.stringify({ text });
+  if (ds.scope === 'chat' && ds.chatId) {
+    getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
+      .then((mode) => mode === 'topic' && ds.session.rootMessageId
+        ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+        : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
+      .catch(err => logger.debug(`[restart] failed to post chat-scope restart notice: ${err}`));
+  } else if (ds.session.rootMessageId) {
+    replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+      .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
+  }
+}
+
 ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Adopt/observed sessions: botmux never owned the CLI — restarting would kill
+  // the user's real tmux/zellij pane. Hard-reject (the worker self-guards too).
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
   }
-  if (!ds.worker || ds.worker.killed) {
-    return jsonRes(res, 409, { ok: false, error: 'worker_not_running' });
+  const cliId = ds.session.cliId ?? 'unknown';
+  if (ds.worker && !ds.worker.killed) {
+    // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
+    try {
+      ds.worker.send({ type: 'restart' } as DaemonToWorker);
+    } catch (err) {
+      return jsonRes(res, 502, { ok: false, error: String(err) });
+    }
+    postRestartNotice(ds, false);
+    return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: false });
   }
-  try {
-    ds.worker.send({ type: 'restart' } as DaemonToWorker);
-  } catch (err) {
-    return jsonRes(res, 502, { ok: false, error: String(err) });
-  }
-  jsonRes(res, 200, {
-    ok: true,
-    sessionId: params.sessionId,
-    cliId: ds.session.cliId ?? 'unknown',
-  });
+  // Worker is gone but the session is still active — idle-suspended (over the
+  // per-bot cap), lazy-restored after a daemon restart, or crash-loop-stopped.
+  // Revive it the same way the Feishu card restart does (forkWorker), so the
+  // dashboard isn't a dead-end: a 409 here would leave NO working control to
+  // bring the CLI back (the resume button only shows for closed sessions).
+  forkWorker(ds, '', ds.hasHistory);
+  postRestartNotice(ds, true);
+  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
 });
 
 /** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与

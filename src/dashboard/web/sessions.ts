@@ -1375,7 +1375,17 @@ export function renderSessionsPage(root: HTMLElement) {
     }
   }
 
+  // Per-session restart cooldown. The route returns 200 the instant the IPC is
+  // sent — long before the worker's ~500ms+ respawn — so re-enabling the button
+  // immediately let a second restart land inside the respawn window, which trips
+  // the worker's tier-2 crash-loop guard (2 restarts before the CLI reaches its
+  // prompt) and silently drops --resume, losing conversation context. This Set
+  // debounces independently of the button DOM, which the table/board/kanban
+  // rebuild via innerHTML on every SSE update (a DOM-only `disabled` is wiped).
+  const restartCooldownIds = new Set<string>();
+
   async function restartSession(s: any, restartBtn?: HTMLButtonElement): Promise<boolean> {
+    if (restartCooldownIds.has(s.sessionId)) return false;
     if (!confirm(restartConfirmMessage(s))) return false;
     if (restartBtn) restartBtn.disabled = true;
     try {
@@ -1385,6 +1395,8 @@ export function renderSessionsPage(root: HTMLElement) {
         if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.error ?? r.status}`);
         return false;
       }
+      restartCooldownIds.add(s.sessionId);
+      setTimeout(() => restartCooldownIds.delete(s.sessionId), 5000);
       return true;
     } catch (e) {
       alert(`${t('sessions.restartFailed')}: ${e}`);
@@ -1466,7 +1478,7 @@ export function renderSessionsPage(root: HTMLElement) {
         ${chatScopeLink(s) ?? `<button id="locate-btn" type="button">${t('sessions.locate')}</button>`}
         <button id="history-drawer-btn" type="button">${t('sessions.history.title')}</button>
         ${terminalControlsHtml(terminal)}
-        ${canRestartSession(s) ? `<button id="restart-btn" type="button" class="primary">${t('sessions.restart')}</button>` : ''}
+        ${canRestartSession(s) ? `<button id="restart-btn" type="button">${t('sessions.restart')}</button>` : ''}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
         <button id="land-btn" type="button">${t('sessions.land')}</button>
@@ -1524,7 +1536,9 @@ export function renderSessionsPage(root: HTMLElement) {
 
     const restartBtn = drawer.querySelector<HTMLButtonElement>('#restart-btn');
     if (restartBtn) {
-      restartBtn.onclick = () => void restartSession(s, restartBtn);
+      restartBtn.onclick = async () => {
+        if (await restartSession(s, restartBtn)) drawer.close();
+      };
     }
 
     const closeBtn = drawer.querySelector<HTMLButtonElement>('#close-btn');
