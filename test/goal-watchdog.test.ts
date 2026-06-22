@@ -267,7 +267,7 @@ describe('goal watchdog', () => {
     }))).toBe(true);
   });
 
-  it('reconciles structured passing tasks without waking L2', async () => {
+  it('routes structured passing tasks without reports to L2 instead of auto-accepting', async () => {
     const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-reconcile-'));
     try {
       const out = join(baseDir, 'done.txt');
@@ -289,21 +289,27 @@ describe('goal watchdog', () => {
           },
         },
       });
+      const activeSessions = new Map<string, DaemonSession>();
+      activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
       const notifications: any[] = [];
+      const injected: Array<{ prompt: string }> = [];
       const results = await runGoalWatchdogOnce({
         larkAppId: 'cli_main',
-        activeSessions: new Map(),
+        activeSessions,
         ledger: led,
         now: 10_000,
         lastInjectedAt: new Map(),
-        inject: () => { throw new Error('should not inject L2 for structured pass'); },
+        inject: (_target, prompt) => injected.push({ prompt }),
         notify: (event) => notifications.push(event),
       });
 
-      expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'reconciled', pendingTaskIds: ['task-pass'] }]);
-      expect(notifications.map((n) => n.kind)).toEqual(['accepted']);
-      expect(led.task('task-pass')?.status).toBe('accepted');
-      expect(led.task('task-pass')?.reports).toHaveLength(1);
+      expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'injected', pendingTaskIds: ['task-pass'] }]);
+      expect(notifications).toHaveLength(0);
+      expect(injected).toHaveLength(1);
+      expect(injected[0].prompt).toContain('inspectionFact');
+      expect(injected[0].prompt).toContain('worker 未走 botmux report 正式交付');
+      expect(led.task('task-pass')?.status).toBe('dispatched');
+      expect(led.task('task-pass')?.reports).toHaveLength(0);
     } finally {
       rmSync(baseDir, { recursive: true, force: true });
     }
