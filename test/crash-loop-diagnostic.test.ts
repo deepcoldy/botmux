@@ -187,6 +187,22 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(updateSessionMock).toHaveBeenCalled();
   });
 
+  it('clears suspendedColdResume once the retried CLI reaches prompt_ready (in-place retry path)', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-diag-cleared', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, 4, 'tmux');
+    expect(ds.session.suspendedColdResume).toBe(true); // parked → marked for restart survival
+
+    // The in-place retry (worker.ts) respawns the CLI WITHOUT going through
+    // forkWorker; prompt_ready is the daemon's signal that retry succeeded.
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(ds.session.suspendedColdResume).toBeFalsy();
+  });
+
   it('after >3 crashes with NO diagnostic terminal: kills the worker (historical path)', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs('sid-diag-nokeep', worker);

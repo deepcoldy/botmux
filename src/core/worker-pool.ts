@@ -1904,6 +1904,17 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        // A live prompt means a (re)spawn reached a working CLI — clear the lazy
+        // cold-resume marker set when we parked a crash diagnostic shell. The
+        // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
+        // forkWorker, so without this the stale marker survives in the store and a
+        // LATER genuine zombie (bmx-<sid> actually gone) would be kept active by
+        // restore instead of being closed. If retry never reaches a prompt the
+        // marker persists, preserving the cross-daemon-restart lazy-retry intent.
+        if (ds.session.suspendedColdResume) {
+          ds.session.suspendedColdResume = undefined;
+          sessionStore.updateSession(ds.session);
+        }
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
           ds.pendingRawInput = undefined;
