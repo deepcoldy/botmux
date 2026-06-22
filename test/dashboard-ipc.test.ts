@@ -1454,6 +1454,15 @@ describe('GET /api/groups (Phase B)', () => {
 
   it('lists chats from groups-store when larkAppId set', async () => {
     setLarkAppId('test-app');
+    const bot = registerBot({
+      larkAppId: 'test-app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+    } as any);
+    bot.botOpenId = 'ou_test_bot';
+    bot.botName = 'Codex Test Bot';
     const spy = vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
       { chatId: 'oc_1', name: 'team' },
     ]);
@@ -1461,10 +1470,15 @@ describe('GET /api/groups (Phase B)', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body.bots).toEqual([{
+      larkAppId: 'test-app',
+      botOpenId: 'ou_test_bot',
+      botName: 'Codex Test Bot',
+      cliId: 'codex',
+    }]);
     // Each chat now carries an `oncallChat` enrichment (null when unbound)
     // so the dashboard matrix can render toggle state without a second
-    // round-trip. With no bot registered for 'test-app' the lookup falls
-    // back to undefined → null in the response.
+    // round-trip.
     // `firstSeenAt` is the per-bot creation-order proxy added so the
     // dashboard can sort newly-added chats to the top. In this test the
     // store hasn't been init()'d (no daemon), so the value degrades to
