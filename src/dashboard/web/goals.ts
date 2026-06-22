@@ -17,12 +17,12 @@ interface AcceptanceArtifact { path: string; kind?: string; checks: AcceptanceCh
 interface AcceptanceCommand { cmd: string; cwd?: string; expectExitCode?: number; timeoutMs?: number }
 interface AcceptanceCriteria { version: number; artifacts?: AcceptanceArtifact[]; commands?: AcceptanceCommand[] }
 interface BoardEvidence { kind: 'path' | 'inline'; label: string; preview?: string; bytes?: number }
-interface BoardAttempt { reportId: string; ts?: number; verdict?: 'accepted' | 'rejected'; reason?: string; summary: string; workerOpenId?: string }
+interface BoardAttempt { reportId: string; ts?: number; verdict?: 'accepted' | 'rejected'; reason?: string; summary: string; workerOpenId?: string; verdictVia?: 'reconcile' }
 interface BoardTask {
   taskId: string; title?: string; status: string;
   workerOpenIds?: string[]; workerNames?: string[]; latestReportId?: string; reportCount: number;
   acceptanceCriteria?: AcceptanceCriteria; acceptanceHint?: string;
-  latestVerdict?: 'accepted' | 'rejected'; rejectReason?: string;
+  latestVerdict?: 'accepted' | 'rejected'; rejectReason?: string; autoReconciled?: boolean;
   dispatchedAt?: number; latestReportedAt?: number; latestVerdictAt?: number; acceptedAt?: number; rejectedAt?: number;
   checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; evidence?: BoardEvidence[];
   attempts: BoardAttempt[];
@@ -133,6 +133,8 @@ function stageCell(t: BoardTask, key: string): string {
 function taskRow(t: BoardTask, selected: boolean): string {
   const verdictTag = t.status === 'rejected' && t.rejectReason
     ? `<span class="gb-reason">${escapeHtml(t.rejectReason)}</span>` : '';
+  const autoTag = t.autoReconciled
+    ? '<span class="gb-via gb-via-auto" title="监管者机器对账自动裁定（非人工）">🤖 自动对账</span>' : '';
   const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
     : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
   const primary = t.title
@@ -141,7 +143,7 @@ function taskRow(t: BoardTask, selected: boolean): string {
   return `<tr class="gb-trow${selected ? ' sel' : ''}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId)}">
     <td class="gb-task-id">${primary}${accTag}</td>
     ${STAGES.map(s => stageCell(t, s.key)).join('')}
-    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${verdictTag}</td>
+    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${autoTag}${verdictTag}</td>
   </tr>`;
 }
 function gridHtml(g: BoardGoal, selTask: string | null): string {
@@ -186,7 +188,7 @@ function trailHtml(t: BoardTask): string {
     return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">worker 尚未报告</p>';
   }
   const parts: string[] = [];
-  if (t.checkedBy) parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}</div>`);
+  if (t.checkedBy) parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}${t.autoReconciled ? ' <span class="gb-via gb-via-auto" title="机器对账，非人工">🤖 自动对账</span>' : ' <span class="gb-via gb-via-human" title="人工经 CLI 裁定">👤 人工</span>'}</div>`);
   if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
   if (t.ranCommands?.length) parts.push(`<div class="gb-kv"><span>跑了命令</span><ul>${t.ranCommands.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul></div>`);
   if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e =>
@@ -199,7 +201,8 @@ function attemptsHtml(t: BoardTask): string {
     const v = a.verdict === 'accepted' ? '<span class="gb-pill gb-pill-accepted">已验收</span>'
       : a.verdict === 'rejected' ? '<span class="gb-pill gb-pill-rejected">已驳回</span>'
         : '<span class="gb-pill gb-pill-reported">待核验</span>';
-    return `<li><div class="gb-att-head"><span class="gb-att-n">#${i + 1}</span>${v}<span class="gb-att-time">${fmtTs(a.ts)}</span></div>
+    const via = a.verdictVia === 'reconcile' ? '<span class="gb-via gb-via-auto" title="机器对账">🤖</span>' : '';
+    return `<li><div class="gb-att-head"><span class="gb-att-n">#${i + 1}</span>${v}${via}<span class="gb-att-time">${fmtTs(a.ts)}</span></div>
       <div class="gb-att-sum">${escapeHtml(a.summary)}</div>
       ${a.reason ? `<div class="gb-att-reason">原因：${escapeHtml(a.reason)}</div>` : ''}</li>`;
   }).join('')}</ol>`;
