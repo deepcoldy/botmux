@@ -273,6 +273,10 @@ export type DaemonToWorker =
   | { type: 'close' }
   | { type: 'suspend' }
   | { type: 'restart' }
+  // Crash loop: daemon gave up auto-restarting and asks the worker to park a
+  // diagnostic shell (bmx-diag-<sid>) preserving the last output. Deferred from
+  // onExit so transient auto-restarted exits don't park-then-tear-down.
+  | { type: 'park_diagnostic' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
   | { type: 'tui_text_input'; keys: string[]; text: string }
   // CoCo AskUserQuestion 作答：daemon 在 ask 结算后下发，worker 等原生 picker 渲染后
@@ -294,7 +298,7 @@ export type DaemonToWorker =
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string; turnId?: string }
   | { type: 'cli_session_id'; cliSessionId: string }
-  | { type: 'claude_exit'; code: number | null; signal: string | null }
+  | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean }
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string }
   | { type: 'error'; message: string }

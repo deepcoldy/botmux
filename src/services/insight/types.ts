@@ -312,6 +312,7 @@ export interface TurnTimelineTurn {
   turnIndex: number;
   severity: InsightSeverity;
   prompt?: TurnPromptPreview;
+  agentSay?: AgentSay;
   context?: TurnContextPoint;
   headline: {
     id: string;
@@ -425,6 +426,15 @@ export interface InsightParseResult {
   firstEventMs?: number;
   turnPrompts?: TurnPromptPreview[];
   turnContext?: TurnContextPoint[];
+  /** Per-turn agent narration (assistant text / codex agent_message), scrubbed +
+   *  truncated. Fail-closed: only reaches here after safe projection. */
+  turnAgentSay?: AgentSay[];
+}
+
+/** Scrubbed, length-capped agent narration for one turn (owner-only, secret-scrubbed). */
+export interface AgentSay {
+  text: string;
+  truncated: boolean;
 }
 
 export interface InsightReaderOptions {

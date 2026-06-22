@@ -2,8 +2,10 @@ import { phaseForTool, normalizeToolName } from './classify.js';
 import { intentForCodexArguments, resultForToolOutput } from './intent.js';
 import { readCompleteJsonlObjects } from './jsonl.js';
 import { safePromptPreview } from './prompt.js';
-import { safeCommandPreview, safeOutputPreview } from './safe-detail.js';
-import type { InsightParseResult, InsightReaderOptions, RawInsightSpan, TurnContextPoint } from './types.js';
+import { safeCommandPreview, safeOutputPreview, safeTextPreview } from './safe-detail.js';
+import type { AgentSay, InsightParseResult, InsightReaderOptions, RawInsightSpan, TurnContextPoint } from './types.js';
+
+const AGENT_SAY_MAX = 1500;
 
 function tsMs(value: unknown): number | undefined {
   if (typeof value !== 'string') return undefined;
@@ -173,6 +175,7 @@ export function parseCodexInsight(path: string, opts: InsightReaderOptions = {})
   let compactions = 0;
   const turnPrompts: InsightParseResult['turnPrompts'] = [];
   const turnContext: TurnContextPoint[] = [];
+  const sayBuf: string[][] = [];
   let currentModel = '';
 
   for (const entry of read.entries) {
@@ -191,6 +194,10 @@ export function parseCodexInsight(path: string, opts: InsightReaderOptions = {})
     if (entry?.type === 'event_msg' && payload.type === 'token_count') {
       const point = contextPointFromTokenCount(currentTurn, payload, currentModel);
       if (point) turnContext[point.turnIndex] = { ...(turnContext[point.turnIndex] ?? {}), ...point };
+    }
+    if (entry?.type === 'event_msg' && payload.type === 'agent_message') {
+      const msg = typeof payload.message === 'string' ? payload.message : outputText(payload.message);
+      if (msg && msg.trim()) (sayBuf[Math.max(currentTurn, 0)] ??= []).push(msg);
     }
 
     const tool = entry?.type === 'response_item' ? normalizeCodexTool(payload) : null;
@@ -249,6 +256,13 @@ export function parseCodexInsight(path: string, opts: InsightReaderOptions = {})
     }
   }
 
+  const turnAgentSay: AgentSay[] = [];
+  sayBuf.forEach((chunks, i) => {
+    if (!chunks?.length) return;
+    const p = safeTextPreview(chunks.join('\n\n'), AGENT_SAY_MAX);
+    if (p) turnAgentSay[i] = { text: p.text, truncated: p.truncated };
+  });
+
   return {
     spans,
     compactions,
@@ -257,5 +271,6 @@ export function parseCodexInsight(path: string, opts: InsightReaderOptions = {})
     firstEventMs,
     turnPrompts,
     turnContext,
+    turnAgentSay,
   };
 }

@@ -148,11 +148,15 @@ function toRecord(s: SafeInsightOverviewSession): InsightRecord {
   };
 }
 
-function filterRecords(records: InsightRecord[], filter: InsightFilter, q: string, cliSel: Set<string> = new Set()): InsightRecord[] {
+type ScopeOpts = { project?: string; sinceMs?: number; analyzableOnly?: boolean };
+function filterRecords(records: InsightRecord[], filter: InsightFilter, q: string, cliSel: Set<string> = new Set(), scope: ScopeOpts = {}): InsightRecord[] {
   const query = q.trim().toLowerCase();
   return records.filter(rec => {
     const s = rec.session;
     const r = rec.report;
+    if (scope.analyzableOnly && r?.status !== 'ok') return false;
+    if (scope.project && projectOf(rec) !== scope.project) return false;
+    if (scope.sinceMs && Number(s.lastMessageAt ?? s.spawnedAt ?? 0) < scope.sinceMs) return false;
     if (cliSel.size && !cliSel.has(cliIdOf(rec))) return false;
     if (filter === 'review' && !reportNeedsReview(r)) return false;
     if (filter === 'failed' && !(r?.status === 'ok' && r.agg.failedSpans > 0)) return false;
@@ -189,16 +193,6 @@ function renderCliChips(records: InsightRecord[], active: Set<string>): string {
     `<button type="button" class="spanchip${on ? ' on' : ''}" data-clifilter="${escapeHtml(key)}">${escapeHtml(label)} <b>${n}</b></button>`;
   return [chip('all', t('common.all'), records.length, active.size === 0),
     ...counts.map(c => chip(c.id, c.id, c.count, active.has(c.id)))].join('');
-}
-
-function sortRecords(records: InsightRecord[]): InsightRecord[] {
-  return [...records].sort((a, b) => {
-    const ar = a.report;
-    const br = b.report;
-    const aScore = (ar?.status === 'ok' ? ar.agg.failedSpans * 6 + ar.agg.slowSpans * 3 + ar.suggestions.filter(s => s.severity === 'bad').length * 5 : 0);
-    const bScore = (br?.status === 'ok' ? br.agg.failedSpans * 6 + br.agg.slowSpans * 3 + br.suggestions.filter(s => s.severity === 'bad').length * 5 : 0);
-    return bScore - aScore || Number(b.session.lastMessageAt ?? 0) - Number(a.session.lastMessageAt ?? 0);
-  });
 }
 
 function renderMetric(label: string, value: string, sub = ''): string {
@@ -327,27 +321,227 @@ function renderPhaseMix(report: SafeInsightReport): string {
   }).join('')}</div>`;
 }
 
-function renderSessionRows(records: InsightRecord[], selectedId: string | null): string {
+// ── Top-level tabs + global filter dimensions (project / time) ──────────────
+type InsightTab = 'overview' | 'sessions' | 'dist' | 'hot';
+const INSIGHT_TABS: Array<{ key: InsightTab; label: string }> = [
+  { key: 'overview', label: 'insights.tabOverview' },
+  { key: 'sessions', label: 'insights.tabSessions' },
+  { key: 'dist', label: 'insights.tabDist' },
+  { key: 'hot', label: 'insights.tabHot' },
+];
+function renderTabBar(active: InsightTab): string {
+  return `<div class="insight-tabs" role="tablist">${INSIGHT_TABS.map(tb =>
+    `<button type="button" class="itab${tb.key === active ? ' on' : ''}" data-itab="${tb.key}" role="tab" aria-selected="${tb.key === active}">${escapeHtml(t(tb.label))}</button>`,
+  ).join('')}</div>`;
+}
+
+function projectOf(rec: InsightRecord): string {
+  const wd = String(rec.session.workingDir ?? '').replace(/\/+$/, '');
+  if (!wd) return '';
+  return wd.split('/').pop() || wd;
+}
+function projectOptions(records: InsightRecord[]): Array<{ id: string; count: number }> {
+  const m = new Map<string, number>();
+  for (const rec of records) { const p = projectOf(rec); if (p) m.set(p, (m.get(p) ?? 0) + 1); }
+  return [...m.entries()].map(([id, count]) => ({ id, count })).sort((a, b) => b.count - a.count || a.id.localeCompare(b.id));
+}
+const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> = [
+  { key: 'all', label: 'insights.timeAll', days: 0 },
+  { key: '1d', label: 'insights.time1d', days: 1 },
+  { key: '7d', label: 'insights.time7d', days: 7 },
+  { key: '30d', label: 'insights.time30d', days: 30 },
+];
+
+function agentMsOf(r: SafeInsightReport): number {
+  return INSIGHT_PHASES.reduce((sum, ph) => sum + (r.agg.phase?.[ph]?.ms ?? 0), 0);
+}
+function okReports(records: InsightRecord[]): SafeInsightReport[] {
+  return records.map(r => r.report).filter((r): r is SafeInsightReport => !!r && r.status === 'ok');
+}
+function median(values: number[]): number {
+  if (!values.length) return 0;
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+}
+
+// One histogram card. bins is an ordered list of {label, test}; each session value
+// falls into the first matching bin. Reuses the .hbars bar styling.
+function renderHistogram(title: string, values: number[], bins: Array<{ label: string; test: (v: number) => boolean }>, fmtMedian: (n: number) => string = fmtInt): string {
+  const counts = bins.map(b => ({ label: b.label, count: values.filter(b.test).length }));
+  const max = Math.max(1, ...counts.map(c => c.count));
+  const total = Math.max(1, values.length);
+  const rows = counts.map(c => {
+    const pct = Math.max(c.count ? 4 : 0, Math.round((c.count / max) * 100));
+    const share = Math.round((c.count / total) * 100);
+    return `<div class="hbrow"><div class="hblabel">${escapeHtml(c.label)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(c.count)}<small>${share}%</small></div></div>`;
+  }).join('');
+  return `<section class="block ihist">
+    <div class="ihist-head"><h3>${escapeHtml(title)}</h3><span class="mut">${escapeHtml(t('insights.distMedian', { v: fmtMedian(median(values)) }))}</span></div>
+    <div class="hbars">${rows}</div>
+  </section>`;
+}
+
+function renderDistribution(records: InsightRecord[]): string {
+  const reports = okReports(records);
+  if (!reports.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
+  const spans = reports.map(r => r.agg.totalSpans);
+  const failed = reports.map(r => r.agg.failedSpans);
+  const slow = reports.map(r => r.agg.slowSpans);
+  const agentMin = reports.map(r => agentMsOf(r) / 60000);
+  const rw = reports.map(r => r.agg.readWriteRatio).filter((v): v is number => v !== null && Number.isFinite(v));
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.distHint'))}</p>
+  <div class="ihist-grid">
+    ${renderHistogram(t('insights.distSpans'), spans, [
+      { label: '0–10', test: v => v <= 10 },
+      { label: '11–50', test: v => v > 10 && v <= 50 },
+      { label: '51–200', test: v => v > 50 && v <= 200 },
+      { label: '201–500', test: v => v > 200 && v <= 500 },
+      { label: '500+', test: v => v > 500 },
+    ])}
+    ${renderHistogram(t('insights.distFailed'), failed, [
+      { label: '0', test: v => v === 0 },
+      { label: '1–2', test: v => v >= 1 && v <= 2 },
+      { label: '3–5', test: v => v >= 3 && v <= 5 },
+      { label: '6–10', test: v => v >= 6 && v <= 10 },
+      { label: '10+', test: v => v > 10 },
+    ])}
+    ${renderHistogram(t('insights.distSlow'), slow, [
+      { label: '0', test: v => v === 0 },
+      { label: '1–2', test: v => v >= 1 && v <= 2 },
+      { label: '3–5', test: v => v >= 3 && v <= 5 },
+      { label: '5+', test: v => v > 5 },
+    ])}
+    ${renderHistogram(t('insights.distAgentTime'), agentMin, [
+      { label: '<1m', test: v => v < 1 },
+      { label: '1–5m', test: v => v >= 1 && v < 5 },
+      { label: '5–30m', test: v => v >= 5 && v < 30 },
+      { label: '30m–2h', test: v => v >= 30 && v < 120 },
+      { label: '2h+', test: v => v >= 120 },
+    ], n => `${Math.round(n)}m`)}
+    ${rw.length ? renderHistogram(t('insights.distRw'), rw, [
+      { label: '0', test: v => v === 0 },
+      { label: '0–1', test: v => v > 0 && v < 1 },
+      { label: '1–3', test: v => v >= 1 && v < 3 },
+      { label: '3+', test: v => v >= 3 },
+    ], n => n.toFixed(1)) : ''}
+  </div>`;
+}
+
+function renderHotspots(records: InsightRecord[]): string {
+  const reports = okReports(records);
+  if (!reports.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
+  // Tool failure hotspots: total fails + how many sessions hit each tool.
+  const toolFails = new Map<string, { fails: number; sessions: number }>();
+  for (const r of reports) {
+    for (const [tool, n] of Object.entries(r.agg.failByTool ?? {})) {
+      const e = toolFails.get(tool) ?? { fails: 0, sessions: 0 };
+      e.fails += n; e.sessions += 1; toolFails.set(tool, e);
+    }
+  }
+  const tools = [...toolFails.entries()].map(([tool, v]) => ({ tool, ...v })).sort((a, b) => b.fails - a.fails).slice(0, 10);
+  const toolMax = Math.max(1, ...tools.map(x => x.fails));
+  // Slowest sessions.
+  const slowSessions = [...records].filter(r => r.report?.status === 'ok' && r.report.agg.slowSpans > 0)
+    .sort((a, b) => (b.report!.agg.slowSpans) - (a.report!.agg.slowSpans)).slice(0, 8);
+  // Projects by session + fails.
+  const projMap = new Map<string, { sessions: number; fails: number }>();
+  for (const rec of records) {
+    if (rec.report?.status !== 'ok') continue;
+    const p = projectOf(rec); if (!p) continue;
+    const e = projMap.get(p) ?? { sessions: 0, fails: 0 };
+    e.sessions += 1; e.fails += rec.report.agg.failedSpans; projMap.set(p, e);
+  }
+  const projects = [...projMap.entries()].map(([id, v]) => ({ id, ...v })).sort((a, b) => b.fails - a.fails || b.sessions - a.sessions).slice(0, 10);
+  const projMax = Math.max(1, ...projects.map(x => x.sessions));
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.hotHint'))}</p>
+  <div class="hot-grid">
+    <section class="block">
+      <h3>${escapeHtml(t('insights.hotToolFailures'))}</h3>
+      <div class="hbars">${tools.length ? tools.map(x => {
+        const pct = Math.max(4, Math.round((x.fails / toolMax) * 100));
+        return `<div class="hbrow"><div class="hblabel">${escapeHtml(x.tool)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(x.fails)}<small>${x.sessions} ${escapeHtml(t('insights.hotSessionsCol'))}</small></div></div>`;
+      }).join('') : `<p class="mut">${escapeHtml(t('insights.noFailures'))}</p>`}</div>
+    </section>
+    <section class="block">
+      <h3>${escapeHtml(t('insights.hotProjects'))}</h3>
+      <div class="hbars">${projects.length ? projects.map(x => {
+        const pct = Math.max(4, Math.round((x.sessions / projMax) * 100));
+        return `<div class="hbrow"><div class="hblabel">${escapeHtml(x.id)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(x.sessions)}<small>${x.fails} ${escapeHtml(t('insights.hotFailsCol'))}</small></div></div>`;
+      }).join('') : `<p class="mut">-</p>`}</div>
+    </section>
+    <section class="block hot-sessions">
+      <h3>${escapeHtml(t('insights.hotSlowSessions'))}</h3>
+      <div class="slist">${slowSessions.length ? slowSessions.map(rec => {
+        const a = rec.report!.agg;
+        return `<button type="button" class="srow" data-session-id="${escapeHtml(rec.session.sessionId)}">
+          <div class="srmain"><strong>${escapeHtml(sessionTitle(rec.session))}</strong>
+          <small>${escapeHtml(botDisplayName(rec.session))} · ${escapeHtml(String(rec.session.cliId ?? '-'))}</small></div>
+          <div class="srstats"><b>${escapeHtml(t('insights.hotSlowCol'))}<em>${fmtInt(a.slowSpans)}</em></b><b>span<em>${fmtInt(a.totalSpans)}</em></b></div>
+        </button>`;
+      }).join('') : `<p class="mut">-</p>`}</div>
+    </section>
+    <p class="hot-note mut">${escapeHtml(t('insights.hotComingSoon'))}</p>
+  </div>`;
+}
+
+// ── Sessions tab: sort controls + full-width rich rows (mirrors ASI 会话) ────
+type SessSort = 'recent' | 'review' | 'spans' | 'fails' | 'slow' | 'agent';
+const SESS_SORTS: Array<{ key: SessSort; label: string }> = [
+  { key: 'recent', label: 'insights.sortRecent' },
+  { key: 'review', label: 'insights.sortReview' },
+  { key: 'spans', label: 'insights.sortSpans' },
+  { key: 'fails', label: 'insights.sortFails' },
+  { key: 'slow', label: 'insights.sortSlow' },
+  { key: 'agent', label: 'insights.sortAgent' },
+];
+function renderSortBar(active: SessSort): string {
+  return `<span class="sesssort-label mut">${escapeHtml(t('insights.sortLabel'))}</span>` + SESS_SORTS.map(s =>
+    `<button type="button" class="spanchip${s.key === active ? ' on' : ''}" data-sesssort="${s.key}">${escapeHtml(t(s.label))}</button>`).join('');
+}
+function reviewScore(r: SafeInsightReport | null): number {
+  return r?.status === 'ok' ? r.agg.failedSpans * 6 + r.agg.slowSpans * 3 + r.suggestions.filter(s => s.severity === 'bad').length * 5 : 0;
+}
+function sortRecordsBy(records: InsightRecord[], key: SessSort): InsightRecord[] {
+  const recency = (rec: InsightRecord) => Number(rec.session.lastMessageAt ?? 0);
+  const val = (rec: InsightRecord): number => {
+    const r = rec.report; const a = r?.status === 'ok' ? r.agg : null;
+    switch (key) {
+      case 'spans': return a?.totalSpans ?? -1;
+      case 'fails': return a?.failedSpans ?? -1;
+      case 'slow': return a?.slowSpans ?? -1;
+      case 'agent': return r?.status === 'ok' ? agentMsOf(r) : -1;
+      case 'review': return reviewScore(r);
+      default: return 0;
+    }
+  };
+  return [...records].sort((a, b) => key === 'recent' ? recency(b) - recency(a) : (val(b) - val(a)) || recency(b) - recency(a));
+}
+
+function renderSessionRows(records: InsightRecord[], selectedId: string | null, wide = false): string {
   if (!records.length) return `<div class="insight-empty">${escapeHtml(t('insights.empty'))}</div>`;
   const stat = (label: string, val: string, bad = false) =>
     `<b${bad ? ' class="bad"' : ''}>${escapeHtml(label)}<em>${escapeHtml(val)}</em></b>`;
-  return `<div class="slist">${records.map(rec => {
+  return `<div class="slist${wide ? ' wide' : ''}">${records.map(rec => {
     const s = rec.session;
     const r = rec.report;
     const ok = r?.status === 'ok';
     const agg = r?.agg;
     const on = s.sessionId === selectedId ? ' on' : '';
     const review = reportNeedsReview(r) ? ' review' : '';
+    const reads = agg?.phase?.research?.count ?? 0;
+    const edits = agg?.phase?.edit?.count ?? 0;
     return `<button type="button" class="srow${on}${review}" data-session-id="${escapeHtml(s.sessionId)}">
       <div class="srmain">
         <strong>${escapeHtml(sessionTitle(s))}</strong>
-        <small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))} · ${escapeHtml(relTime(s.lastMessageAt ?? s.spawnedAt ?? 0))}</small>
+        <small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))}${s.workingDir ? ` · ${escapeHtml(projectOf(rec))}` : ''} · ${escapeHtml(relTime(s.lastMessageAt ?? s.spawnedAt ?? 0))}</small>
         ${ok ? renderPhaseMix(r!) : ''}
       </div>
       ${ok ? `<div class="srstats">
         ${stat(t('insights.spansShort'), fmtInt(agg!.totalSpans))}
         ${stat(t('insights.failedShort'), fmtInt(agg!.failedSpans), agg!.failedSpans > 0)}
         ${stat(t('insights.slowShort'), fmtInt(agg!.slowSpans))}
+        ${wide ? stat(t('insights.readsShort'), fmtInt(reads)) + stat(t('insights.editsShort'), fmtInt(edits)) + stat(t('insights.durShort'), fmtMs(agentMsOf(r!))) : ''}
         ${stat(t('insights.rwShort'), agg!.readWriteRatio !== null ? agg!.readWriteRatio.toFixed(1) : '-')}
       </div>` : `<div class="srmsg">${escapeHtml(safeStatus(r, rec.error))}</div>`}
     </button>`;
@@ -872,11 +1066,18 @@ function renderConvoOpRow(m: InsightConversationMessage, open: boolean): string 
 }
 
 function renderConvoOps(unit: { turnIndex: number; msgs: InsightConversationMessage[] }, openOps: Set<string>, recByTurn: Map<number, string[]>): string {
+  // An agent turn carries narration ('say': text, no event) + operations (event).
+  const sayMsgs = unit.msgs.filter(m => m.text && !m.event);
+  const opMsgs = unit.msgs.filter(m => m.event);
   const worst = unit.msgs.some(m => m.severity === 'bad') ? ' sev-bad' : unit.msgs.some(m => m.severity === 'warn') ? ' sev-warn' : '';
-  const rows = unit.msgs.map(m => renderConvoOpRow(m, openOps.has(m.id))).join('');
+  // m.text already carries a trailing '…' when truncated (safeScrubAndTruncate),
+  // so don't append another — that double-ellipsis'd the bubble.
+  const say = sayMsgs.map(m => `<div class="cbub-say"><div class="md-body">${renderPromptMarkdown(m.text!)}</div></div>`).join('');
+  const rows = opMsgs.map(m => renderConvoOpRow(m, openOps.has(m.id))).join('');
   return `<div class="cbub cbub-left role-agent cbub-ops${worst}">
-    <div class="cbub-head"><span class="tp-label tp-src tp-src-system">🤖 ${escapeHtml(t('insights.replayAgent'))}</span><span class="cbub-turn">#${escapeHtml(String(unit.turnIndex))}</span><span class="cbub-opcount">${escapeHtml(t('insights.replayOps', { count: unit.msgs.length }))}</span>${convoRecBadges(unit.turnIndex, recByTurn)}</div>
-    <div class="cbub-ops-list">${rows}</div>
+    <div class="cbub-head"><span class="tp-label tp-src tp-src-system">🤖 ${escapeHtml(t('insights.replayAgent'))}</span><span class="cbub-turn">#${escapeHtml(String(unit.turnIndex))}</span>${opMsgs.length ? `<span class="cbub-opcount">${escapeHtml(t('insights.replayOps', { count: opMsgs.length }))}</span>` : ''}${convoRecBadges(unit.turnIndex, recByTurn)}</div>
+    ${say ? `<div class="cbub-saywrap">${say}</div>` : ''}
+    ${rows ? `<div class="cbub-ops-list">${rows}</div>` : ''}
   </div>`;
 }
 
@@ -1131,6 +1332,11 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   let modalPrompt: TurnPromptPreview | null = null;
   let modalReq = 0;
   let disposed = false;
+  let tab: InsightTab = 'overview';
+  let project = '';
+  let timeWin = 'all';
+  let showNoise = false;
+  let sessSort: SessSort = 'recent';
 
   root.innerHTML = `
     <section class="page insights-page">
@@ -1144,6 +1350,10 @@ export function renderInsightsPage(root: HTMLElement): () => void {
       </div>
       <form id="insight-filters" class="filters insights-filters">
         <input type="search" name="q" placeholder="${escapeHtml(t('insights.search'))}">
+        <select id="insight-project" class="ins-select" aria-label="${escapeHtml(t('insights.projectAll'))}"></select>
+        <select id="insight-time" class="ins-select" aria-label="${escapeHtml(t('insights.timeAll'))}">
+          ${TIME_WINDOWS.map(w => `<option value="${w.key}">${escapeHtml(t(w.label))}</option>`).join('')}
+        </select>
         <div class="segmented" role="group" aria-label="${escapeHtml(t('insights.filter'))}">
           <button type="button" data-filter="all">${escapeHtml(t('insights.filterAll'))}</button>
           <button type="button" data-filter="review">${escapeHtml(t('insights.filterReview'))}</button>
@@ -1151,16 +1361,27 @@ export function renderInsightsPage(root: HTMLElement): () => void {
           <button type="button" data-filter="slow">${escapeHtml(t('insights.filterSlow'))}</button>
         </div>
         <div id="insight-cli-filter" class="spanfilter cli-filter" role="group" aria-label="${escapeHtml(t('insights.filter'))}"></div>
+        <label class="ins-toggle"><input type="checkbox" id="insight-noise"> ${escapeHtml(t('insights.showAll'))}</label>
+        <button type="button" id="insight-clear" class="ins-clear">${escapeHtml(t('insights.clear'))}</button>
       </form>
+      <div id="insight-tabbar">${renderTabBar(tab)}</div>
       <div id="insight-status" class="insight-page-status"></div>
-      <div id="insight-overview"></div>
-      <div class="insight-workbench">
-        <section class="insight-list-panel">
-          <div class="insight-list-head"><h3>${escapeHtml(t('insights.sessions'))}</h3><span id="insight-list-subtitle"></span></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="overview"><div id="insight-overview"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="sessions" hidden>
+        <div id="insight-list-view">
+          <div class="insight-list-head">
+            <span id="insight-list-subtitle"></span>
+            <div class="sesssort" id="insight-sort"></div>
+          </div>
           <div id="insight-list"></div>
-        </section>
-        <div id="insight-detail">${renderDetailShell(undefined)}</div>
+        </div>
+        <div id="insight-detail-view" hidden>
+          <button type="button" id="insight-back" class="ins-back">← ${escapeHtml(t('insights.backToList'))}</button>
+          <div id="insight-detail">${renderDetailShell(undefined)}</div>
+        </div>
       </div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="dist" hidden><div id="insight-dist"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="hot" hidden><div id="insight-hot"></div></div>
       <div id="insight-modal" class="insight-modal" hidden></div>
       <div id="insight-tip" class="ins-tip" role="tooltip" hidden></div>
     </section>`;
@@ -1174,29 +1395,96 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   const refreshBtn = root.querySelector<HTMLButtonElement>('#insight-refresh')!;
   const filterButtons = [...root.querySelectorAll<HTMLButtonElement>('[data-filter]')];
   const cliFilterEl = root.querySelector<HTMLElement>('#insight-cli-filter')!;
+  const distEl = root.querySelector<HTMLElement>('#insight-dist')!;
+  const hotEl = root.querySelector<HTMLElement>('#insight-hot')!;
+  const projectSel = root.querySelector<HTMLSelectElement>('#insight-project')!;
+  const timeSel = root.querySelector<HTMLSelectElement>('#insight-time')!;
+  const noiseToggle = root.querySelector<HTMLInputElement>('#insight-noise')!;
+  const clearBtn = root.querySelector<HTMLButtonElement>('#insight-clear')!;
+  const tabbar = root.querySelector<HTMLElement>('#insight-tabbar')!;
+  const panels = [...root.querySelectorAll<HTMLElement>('.insight-panel')];
+  const listView = root.querySelector<HTMLElement>('#insight-list-view')!;
+  const detailView = root.querySelector<HTMLElement>('#insight-detail-view')!;
+  const backBtn = root.querySelector<HTMLButtonElement>('#insight-back')!;
+  const sortBar = root.querySelector<HTMLElement>('#insight-sort')!;
+
+  // Sessions tab is list ⇆ full-width detail (not a cramped side panel): selecting
+  // a session swaps to the detail view; 返回 clears it back to the list.
+  function showSessionsView(): void {
+    const detailMode = selectedId !== null;
+    listView.hidden = detailMode;
+    detailView.hidden = !detailMode;
+  }
+
+  function scopeOpts(): ScopeOpts {
+    const w = TIME_WINDOWS.find(x => x.key === timeWin);
+    const sinceMs = w && w.days > 0 ? Date.now() - w.days * 86400000 : undefined;
+    return { project: project || undefined, sinceMs, analyzableOnly: !showNoise };
+  }
+
+  // Project <select> options reflect the severity+search+time scoped set (project
+  // pick itself NOT applied), so the dropdown always shows reachable projects.
+  function paintProjectOptions(): void {
+    const base = filterRecords(records, filter, q, cliFilter, { ...scopeOpts(), project: undefined });
+    const opts = projectOptions(base);
+    const cur = project;
+    projectSel.innerHTML = `<option value="">${escapeHtml(t('insights.projectAll'))}</option>` +
+      opts.map(o => `<option value="${escapeHtml(o.id)}"${o.id === cur ? ' selected' : ''}>${escapeHtml(o.id)} (${o.count})</option>`).join('');
+    if (cur && !opts.some(o => o.id === cur)) { project = ''; projectSel.value = ''; }
+  }
+
+  function showTab(): void {
+    for (const p of panels) p.hidden = p.dataset.tabpanel !== tab;
+    for (const b of tabbar.querySelectorAll<HTMLButtonElement>('[data-itab]')) {
+      const on = b.dataset.itab === tab;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-selected', String(on));
+    }
+  }
+
+  function wireSessionButtons(host: HTMLElement, jumpToSessions = false): void {
+    for (const btn of host.querySelectorAll<HTMLButtonElement>('[data-session-id]')) {
+      btn.onclick = () => {
+        if (jumpToSessions && tab !== 'sessions') { tab = 'sessions'; showTab(); paint(); }
+        void selectSession(btn.dataset.sessionId ?? '');
+      };
+    }
+  }
 
   function currentRows(): InsightRecord[] {
-    return sortRecords(filterRecords(records, filter, q, cliFilter));
+    return sortRecordsBy(filterRecords(records, filter, q, cliFilter, scopeOpts()), sessSort);
   }
 
   function paint(): void {
     if (disposed) return;
-    // Faceted CLI chips reflect the severity+search set; drop stale CLI picks that
-    // the other filters have emptied out so the list never gets stuck on nothing.
-    const cliBase = filterRecords(records, filter, q);
+    // Faceted CLI chips reflect the severity+search+scope set (CLI pick itself NOT
+    // applied); drop stale CLI picks the other filters emptied out so the list
+    // never gets stuck on nothing.
+    const cliBase = filterRecords(records, filter, q, new Set(), scopeOpts());
     const present = new Set(cliBase.map(cliIdOf));
     for (const id of [...cliFilter]) if (!present.has(id)) cliFilter.delete(id);
     cliFilterEl.innerHTML = renderCliChips(cliBase, cliFilter);
+    paintProjectOptions();
+    noiseToggle.checked = showNoise;
+    timeSel.value = timeWin;
     const rows = currentRows();
     filterButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.filter === filter));
     overviewEl.innerHTML = overviewData ? renderOverview(aggregateRecords(rows)) : '';
     listSubtitle.textContent = t('insights.listCount', { shown: rows.length, total: records.length });
-    list.innerHTML = renderSessionRows(rows, selectedId);
+    sortBar.innerHTML = renderSortBar(sessSort);
+    // When the analyzable-only default empties the list, point at the toggle so
+    // the user isn't stranded on a blank page wondering where their sessions went.
+    list.innerHTML = (!rows.length && !showNoise)
+      ? `<div class="insight-empty">${escapeHtml(t('insights.empty'))}<br><span class="mut">${escapeHtml(t('insights.emptyAnalyzableHint'))}</span></div>`
+      : renderSessionRows(rows, selectedId, true);
     const selected = rows.find(r => r.session.sessionId === selectedId) ?? records.find(r => r.session.sessionId === selectedId);
     if (!selectedId || !selected) detail.innerHTML = renderDetailShell(undefined);
-    for (const btn of list.querySelectorAll<HTMLButtonElement>('[data-session-id]')) {
-      btn.onclick = () => void selectSession(btn.dataset.sessionId ?? '');
-    }
+    wireSessionButtons(list);
+    showSessionsView();
+    distEl.innerHTML = overviewData ? renderDistribution(rows) : '';
+    hotEl.innerHTML = overviewData ? renderHotspots(rows) : '';
+    wireSessionButtons(hotEl, true);
+    showTab();
   }
 
   // Re-render the detail body in place (no refetch) after a focus/filter change.
@@ -1406,6 +1694,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
 
   async function selectSession(sessionId: string): Promise<void> {
     selectedId = sessionId;
+    showSessionsView();
     activeRec = null;
     detailTab = 'spans';
     spanFilter = 'all';
@@ -1467,6 +1756,27 @@ export function renderInsightsPage(root: HTMLElement): () => void {
 
   search.oninput = () => { q = search.value; paint(); };
   refreshBtn.onclick = () => void refresh();
+  tabbar.addEventListener('click', e => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-itab]');
+    if (!btn) return;
+    tab = (btn.dataset.itab as InsightTab) || 'overview';
+    paint();
+  });
+  backBtn.addEventListener('click', () => { selectedId = null; showSessionsView(); paint(); });
+  sortBar.addEventListener('click', e => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-sesssort]');
+    if (!btn) return;
+    sessSort = (btn.dataset.sesssort as SessSort) || 'recent';
+    paint();
+  });
+  projectSel.addEventListener('change', () => { project = projectSel.value; paint(); });
+  timeSel.addEventListener('change', () => { timeWin = timeSel.value; paint(); });
+  noiseToggle.addEventListener('change', () => { showNoise = noiseToggle.checked; paint(); });
+  clearBtn.addEventListener('click', () => {
+    q = ''; search.value = ''; filter = 'all'; cliFilter.clear();
+    project = ''; timeWin = 'all'; showNoise = false;
+    paint();
+  });
   for (const btn of filterButtons) {
     btn.onclick = () => {
       filter = (btn.dataset.filter as InsightFilter) || 'all';
