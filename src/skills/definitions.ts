@@ -1101,7 +1101,13 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
    "artifacts":[{"path":"/abs/file","kind":"file","checks":[{"type":"exists"},{"type":"contains","text":"PASS"}]}],
    "commands":[{"cmd":"python3 check.py","cwd":"/abs/workdir","expectExitCode":0,"timeoutMs":60000}]}
   \`\`\`
-  artifacts=要核验的产物（path 必须是你 L2 读得到的绝对路径）+ checks（exists/contains）；commands=可选核验命令（expectExitCode）。能结构化就结构化；实在不可测的活才退回自由文本（那样巡检只能催、不能自动 accept）。
+  artifacts=要核验的产物（path 必须是你 L2 读得到的绝对路径）+ checks（exists/contains）；commands=可选核验命令（expectExitCode）。
+- **别从零手写，挑个模板改 path/text**（手写 JSON 最容易漏双引号 / 多尾逗号 → 解析失败 → 巡检退化成只能催，自动核验失效）：
+  - 单文件存在且含某串：\`{"version":1,"artifacts":[{"path":"/abs/out.txt","kind":"file","checks":[{"type":"exists"},{"type":"contains","text":"PASS"}]}]}\`
+  - 跑命令退出码 0：\`{"version":1,"commands":[{"cmd":"pnpm -s test","cwd":"/abs/repo","expectExitCode":0,"timeoutMs":120000}]}\`
+  - 文件 + 命令组合：取上面单文件模板，再加一个 \`"commands":[...]\` 键即可。
+- **dispatch 前自检 JSON 合法**：\`echo '<hint>' | python3 -c 'import json,sys;json.load(sys.stdin);print("ok")'\` 打出 ok 再派；报错就先修双引号 / 尾逗号，别把坏 JSON 派出去。
+- 能结构化就结构化；实在不可测的活（调研 / 设计）才退回自由文本——那样巡检只能催、不能自动 accept。
 - **默认群级（chat-scope）、不开话题**：worker 被 @ 在它的 goal 群 chat-scope 会话唤起。dispatch 是**你（L2）**发起的，所以 worker 的 report 自然回你这条 L2 会话（同群、不跨群）。
 - \`dispatch\` 已自动把「干完用 \`botmux report --task <id>\` 带证据回报、别在群里口头说完成」的完成协议追加进简报，worker 照做。
 - 工作目录已在建群时 \`--working-dir\` 绑好，dispatch 免传 \`--repo\`；要先拉起 worker 待命用 \`--standby\`。
@@ -1143,7 +1149,8 @@ botmux send --chat-id "<parent 主群 chatId>" [--mention <L1/用户 open_id>] "
 - **每个 subtask 有一等 taskId**：\`dispatch\` 自动生成（或 \`--task-id\` 指定），子 bot **应**用 \`botmux report --task <taskId>\` 带证据回报（不能只在群里说完成）。但 **report 只是"快速通道"**——worker 不保证照做，所以 L2 的 \`acceptanceHint\` 写成 JSON v1、由 goal-watchdog 唤 L2 **主动核验产物**兜底（见 L2-3.5）：**完成判定的真相是"L2 核验产物达标"，worker 报没报只决定快慢、不决定成败**。
 - **证据两形态**：\`--artifact <路径>\`（你能读到的产物文件）或 inline（测试输出/关键内容/diff，自包含）；你读不到的路径不算数。
 - **账本是唯一真相源**：dispatched/reported/accepted/rejected 全落账，\`delivery list/show\` 查得到。**聊天里说的"完成"不是证据**；要把聊天内容当证据，须作为 inline 证据入账。
-- **验收留痕**：\`delivery accept/reject\` 都记下你查了哪些证据 / 跑了什么命令 / 结论原因，可回溯。
+- **验收必留硬证据（硬规矩，不是建议）**：每次 \`delivery accept\` 必须带 \`--evidence-checked\`（写清具体核验了什么：读了哪个文件的哪段内容 / 跑了什么命令得到什么结果），能跑命令核验的必带 \`--ran-command\`；\`reject\` 必带 \`--reason\`。**禁止空证据、或"看了一下没问题"式 accept**。验不动（产物不存在 / 读不到 / 不可测）就别 accept——去 reject 或催 worker，不要凭印象放行。
+- **兜底通道尤其要硬**：goal-watchdog 唤你主动核验那笔（worker 根本没 report），你的 \`evidenceChecked\` 是这笔交付**唯一**的核验记录、没有 worker report 作旁证——必须**逐条**对着 acceptanceHint 的 checks 写明结果（哪个 check 怎么验、过没过），绝不能因为"文件在那儿"就 accept。
 - **goalId = goal 群 chatId**：\`delivery list --goal <goalId>\` 就是这个项目的全景账本视图。
 
 ## 注意
