@@ -1262,23 +1262,29 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 - 对 reported 的**优先硬证据**：能跑测试就跑、能读产物就读；不可测的活才纯判断。
 - 合格 → \`botmux delivery accept --task <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject --task <taskId> --reason ... --retry-brief ...\`（自动回推 worker 话题重做）。
 
-### L2-3.5 兜底巡检（被 \`[goal-watchdog]\` 唤醒，不等 worker report）
-**worker 不保证守 report 协议**（实测有 worker 建对了产物却不 report）。daemon 有个 goal-watchdog 会唤你巡检：worker turn 结束（idle/exit）即时触发、或定时（约 5min）兜底，发现本 goal 有 \`dispatched/rejected\` 未 accepted 的任务就 daemon-native 注入一条 **\`[goal-watchdog]\`** 前缀消息，**消息正文已列出待处理的 taskId + 各自的验收 checks 清单**（结构化 criteria 已渲染成人类可读的逐条 checklist，如 \`产物 /abs/out.txt: 存在 + 含"PASS"\`、\`命令 \`pnpm test\`, 期望退出码 0\`，不再是裸 JSON）。**收到 \`[goal-watchdog]\` 前缀时，主动核验、别被动等 report**：
-1. 处理 **\`[goal-watchdog]\` 消息里列出的每个 pending task**（也可 \`botmux delivery list --goal <goalChatId> --status dispatched\` 复核，**但别加 \`--older-than\`**——daemon 既然唤了你就代表有 dispatched/rejected 在等，按年龄过滤会把刚触发的任务漏掉、白唤一趟；\`--older-than\` 只留给 L2-4 那种你自己主动扫"长期卡住"的场景）。rejected 未重交的也一并看。
-2. 逐个按它的**验收 checks 清单**（来自结构化 criteria，watchdog 消息已渲染好；要原始口径可 \`delivery show --task <id>\`）**主动核验产物**——按 artifacts 的 checks（exists/contains）读产物、按 commands 跑校验：
-   - **全通过 → 先落一笔 L2 自证 report、再 accept**（⚠️ \`delivery accept\` 必须挂在一笔 report 上才能执行——worker 没 report 时由你 L2 补一笔自证 report，把你的核验当证据入账。这是兜底能 accept 的关键，别直接 accept 会报"还没有 report"）：
+### L2-3.5 统揽巡检（被 \`[goal-watchdog]\` 唤醒 = 你主动统揽，不是被动等 report）
+**你是本 goal 的统揽监管者**——发现问题、引导 worker、必要时代 worker 完成求助/交付这类操作，都是你的活，别等 worker 自己举手、更别让机械规则替你拍板。daemon 的 goal-watchdog 会唤你（worker turn 结束即时触发 / 约 5min 定时兜底），消息正文列出待处理 taskId + 各自验收 checks 清单（结构化 criteria 已渲染成逐条 checklist）。**收到 \`[goal-watchdog]\` 时，先跑一遍统揽判断**：对每个非终态任务（dispatched/reported/blocked/rejected 未重交）给出并执行下一步——不只盯 watchdog 列的那几个，也扫最近群消息找信号。
+
+判断输入：① \`botmux delivery list --goal <goalChatId>\`（账本是真相）；② watchdog 消息渲染好的各任务 checks 清单（原始口径 \`delivery show --task <id>\`）；③ 最近群消息（worker 可能口头说"卡住/不会/没权限/做不了"——**这是信号、不是证据**）。⚠️ 复核别加 \`--older-than\`（daemon 唤了就代表有任务在等，按年龄过滤会漏掉刚触发的；\`--older-than\` 只留给 L2-4 主动扫长期卡住）。
+
+逐任务给 action：
+1. **reported（worker 已交付）**：按 checks 主动核验产物（读文件 / 跑命令）。过 → \`botmux delivery accept --task <id> --evidence-checked "<逐条写结果>" --ran-command "<核验命令>"\`；不过 → \`delivery reject --reason check_failed --retry-brief ...\`。
+2. **产物已达标但 worker 没 report**（watchdog 会提示你"产物看似达标但 worker 未交付，请判断"）：这是要你**判断**、不是让你盖章。你**独立核验**产物后三选一：
+   - 确认是真交付 → **代办**：先落一笔 L2 自证 report、再 accept，且 report summary 与 accept note **都加前缀「supervisor 代办：worker 未自报，已独立核验」**（留痕；看板据此和"worker 自己交付"区分开，不让人误以为 worker 干的）：
      \`\`\`bash
-     # ① L2 自证 report（worker 没报，你代它把"已核验产物达标"落账，拿到 reportId）
-     botmux report --task <id> --artifact <核验过的产物绝对路径> --summary "L2 兜底核验：worker 未自报，已主动核验产物达标"
-     # ② 再 accept 这笔 report，留硬证据
-     botmux delivery accept --task <id> --report <reportId> --evidence-checked "<逐条对 checks 写结果>" --ran-command "<实际跑的核验命令>"
+     botmux report --task <id> --artifact <核验过的产物绝对路径> --summary "supervisor 代办：worker 未自报，已独立核验产物达标"
+     botmux delivery accept --task <id> --report <reportId> --evidence-checked "supervisor 代办；<逐条对 checks 写结果>" --ran-command "<实际跑的核验命令>"
      \`\`\`
-     这才是兜底闭环：worker 没 report 也能验收，但 accept 必挂在一笔带证据的 report 上、账本才一致。
-   - **产物在但 check 没过 → \`delivery reject --reason check_failed --retry-brief ...\`** 回推 worker 重做。
-   - **产物不存在 → 催 worker**（\`botmux send --chat-id <goalChatId> --mention <worker>\` 提醒它干完 + report）。
-   - **该任务只有 legacy 自由文本 hint、没有结构化 criteria（不可机器核验）→ 只催 report、别臆测 done**。
-3. 巡检后 \`goal charter update\` 刷新；全 accepted → 通知 L1（L2-5）。
-**关键**：report 只是"快速通道"（有它即时唤你、快），没它 watchdog 也兜底唤你主动核验——**完成判定的真相是"L2 核验产物达标"，不是"worker 报没报"**。
+   - 产物可疑、不像真交付（像占位 / 残留 / 上个任务留下的文件）→ **别代办**，催 worker 正式交付或 \`reject\`/重派。
+   - 拿不准 → 催 worker 用 \`botmux report\` 正式交付，别臆测 done。
+3. **worker 卡住**（账本 \`blocked\`，或群里说卡 / 缺权限 / 有歧义 / 反复失败）：你**主动接手**，不等它自己跑 \`botmux help\`：
+   - 能自己解 → 给澄清指令 / 补权限 / 带更清楚的 brief 重派（\`dispatch\` 同 taskId 或 \`send --chat-id <goalChatId> --mention <worker>\`）。
+   - 自己解不了（要人授权 / 要人拍范围 / 客观做不到）→ \`botmux delivery escalate --task <id> --reason "<卡在哪、需要人做什么>" [--retry-brief ...]\`，把"需要你"推到人面前（actor=监管者，**不假冒 worker 的求助**）。
+4. **产物不存在 + 没动静** → 催 worker；只有 legacy 自由文本 hint（不可机器核验）→ 只催、别臆测 done。
+5. **escalated（已升级、等人）** → 别重复 nag，等人处理。
+
+巡检后 \`goal charter update\` 刷新；全 accepted → 通知 L1（L2-5）。
+**铁律**：机械层只会自动验收"worker 已 report 且 checks 全过"的确定性交付；其余（没 report、在喊卡、证据可疑）一律交你判断——**完成与否你说了算，但必须基于独立核验的硬证据，绝不是"文件在那儿就算完"**。
 
 ### L2-4 维护 charter + 推进依赖
 每验收一波，\`botmux goal charter update --goal <goalChatId> --expected-updated-at <ts> ...\` 刷新状态（进展/下一步）。有依赖的下一波，依赖满足了再 dispatch。**卡住/超时靠查账本**：\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的，用 \`botmux send --chat-id <goalChatId> --mention <worker>\` 去问进展或改派（不靠后台轮询）。
