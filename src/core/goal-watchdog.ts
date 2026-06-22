@@ -9,6 +9,7 @@ import { logger } from '../utils/logger.js';
 
 export const GOAL_WATCHDOG_PROMPT_PREFIX = '[goal-watchdog]';
 export const DEFAULT_GOAL_WATCHDOG_INTERVAL_MS = 5 * 60_000;
+export const DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS = 30_000;
 
 type GoalWatchdogStatus =
   | 'injected'
@@ -31,6 +32,7 @@ export interface GoalWatchdogDeps {
   ledger?: LedgerHandle;
   now?: number;
   intervalMs?: number;
+  goalChatIds?: Iterable<string>;
   lastInjectedAt?: Map<string, number>;
   inject?: (ds: DaemonSession, prompt: string) => Promise<void> | void;
 }
@@ -116,9 +118,11 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
   const lastInjectedAt = deps.lastInjectedAt ?? defaultLastInjectedAt;
   const inject = deps.inject ?? injectGoalSupervisorTurn;
   const byGoal = pendingGoalTasks(ledger.tasks());
+  const goalFilter = deps.goalChatIds ? new Set(deps.goalChatIds) : undefined;
   const results: GoalWatchdogResult[] = [];
 
   for (const [goalChatId, tasks] of byGoal) {
+    if (goalFilter && !goalFilter.has(goalChatId)) continue;
     if (tasks.length === 0) {
       results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
       continue;
@@ -148,6 +152,23 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
 }
 
 const defaultLastInjectedAt = new Map<string, number>();
+
+export async function runGoalWatchdogForGoal(input: {
+  larkAppId: string;
+  activeSessions: Map<string, DaemonSession>;
+  goalChatId: string;
+  now?: number;
+  cooldownMs?: number;
+}): Promise<GoalWatchdogResult[]> {
+  return runGoalWatchdogOnce({
+    larkAppId: input.larkAppId,
+    activeSessions: input.activeSessions,
+    now: input.now,
+    intervalMs: input.cooldownMs ?? DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
+    goalChatIds: [input.goalChatId],
+    lastInjectedAt: defaultLastInjectedAt,
+  });
+}
 
 export function startGoalWatchdog(input: {
   larkAppId: string;

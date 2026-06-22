@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   GOAL_WATCHDOG_PROMPT_PREFIX,
   pendingGoalTasks,
+  runGoalWatchdogForGoal,
   runGoalWatchdogOnce,
 } from '../src/core/goal-watchdog.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
@@ -123,5 +125,59 @@ describe('goal watchdog', () => {
       inject: () => { throw new Error('should not inject'); },
     });
     expect(rateLimited[0].status).toBe('rate-limited');
+  });
+
+  it('event trigger scopes to one goal and uses the short cooldown', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_a', 'cli_main'), ds({ chatId: 'oc_a', larkAppId: 'cli_main', sessionId: 'sa' }));
+    activeSessions.set(sessionKey('oc_b', 'cli_main'), ds({ chatId: 'oc_b', larkAppId: 'cli_main', sessionId: 'sb' }));
+    const injected: Array<{ sessionId: string; prompt: string }> = [];
+
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([
+        task('ta', 'oc_a', 'dispatched'),
+        task('tb', 'oc_b', 'dispatched'),
+      ]),
+      goalChatIds: ['oc_b'],
+      now: 10_000,
+      intervalMs: DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
+      lastInjectedAt: new Map([['oc_b', 10_000 - DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS - 1]]),
+      inject: (target, prompt) => injected.push({ sessionId: target.session.sessionId, prompt }),
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ goalChatId: 'oc_b', status: 'injected', pendingTaskIds: ['tb'], sessionId: 'sb' });
+    expect(injected).toHaveLength(1);
+    expect(injected[0].sessionId).toBe('sb');
+
+    const throttled = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([task('tb', 'oc_b', 'dispatched')]),
+      goalChatIds: ['oc_b'],
+      now: 10_000,
+      intervalMs: DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
+      lastInjectedAt: new Map([['oc_b', 9_999]]),
+      inject: () => { throw new Error('should not inject'); },
+    });
+    expect(throttled[0].status).toBe('rate-limited');
+  });
+
+  it('runGoalWatchdogForGoal targets only the requested goal', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_a', 'cli_main'), ds({ chatId: 'oc_a', larkAppId: 'cli_main', sessionId: 'sa' }));
+    activeSessions.set(sessionKey('oc_b', 'cli_main'), ds({ chatId: 'oc_b', larkAppId: 'cli_main', sessionId: 'sb' }));
+
+    const results = await runGoalWatchdogForGoal({
+      larkAppId: 'cli_main',
+      activeSessions,
+      goalChatId: 'oc_missing',
+      now: 10_000,
+      cooldownMs: 1,
+    });
+
+    expect(results).toEqual([]);
   });
 });
