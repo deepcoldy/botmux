@@ -1143,16 +1143,21 @@ $${GOAL_ENV.INPUTS_PATH}
 
 const ORCHESTRATE_SKILL = `---
 name: botmux-orchestrate
-description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 分工」+「持续的 goal 群/多话题协调与进度板」+「主 bot 汇总验收」时触发，例如多组 coder/reviewer 并行推进。若只是一个有界 DAG、跑完即散、产出单一交付物，应使用 botmux-workflow；单步任务直接处理。显式提到 botmux orchestrate / goal supervise / dispatch 派活时也使用。
+description: 作为「主 bot/编排者」做**两级编排**：L1（主群）规划 + 跟用户对齐 + 建 goal 群 + 起 L2 监管化身；L2（goal 群内的化身）派子任务给 worker、查账本验收、维护白板 charter、全部完成后通知 L1。触发：用户提到「多话题协作模式」「两级编排」「goal 群」「监管化身」，或要「把大项目拆给多个机器人并行做」「协调多个 bot」「你当总控/编排」「一个写一个 review 多组并行」，或显式提到 botmux orchestrate / goal supervise / dispatch 派活。
 ---
 
-# botmux-orchestrate — 多 bot 多话题编排
+# botmux-orchestrate — 两级编排（L1 主群总控 + L2 goal 群监管）
 
-你作为**编排者（主 bot）**，把一个大编程项目拆成若干**子项目**并行推进。
+你作为**编排者**，把大项目拆成子任务并行推进。拓扑是 **两级 agent + 两层群**：
 
-**拓扑是两层（goal=群 / subtask=群内话题）**：每个大项目(goal)开**一个独立的工作群（goal 群）**，把要用的 bot 和发起用户都拉进去；该项目的每个子项目(subtask)在 **goal 群内单开一条话题**、派给**一组 bot**（常见 coder + reviewer）。你自己常驻**主群（总控台）**——被唤起、做决策、看全局都在主群。一个群 = 一个项目：可整体分享给人、群内搜索、进群即见全貌，而不是把所有项目的子话题堆在一个群里翻不动。
+- **L1（主群主 agent）** = 你和用户对话的这个会话。职责：规划、跟用户对齐、决定用哪些 worker、建 goal 群、**起 L2**、最后收 L2 的完成通知并汇总给用户。
+- **L2（goal 群监管化身）** = 同一个主 bot 在 goal 群里的**另一个会话**（由 \`goal supervise\` 在 daemon 内创建）。职责：常驻 goal 群，真正派子任务、盯进度、验收、维护 goal 状态，全做完**主动通知 L1**。
+- **subtask = goal 群内一条话题**，派给 worker（常 coder + reviewer）。
+- **一个 goal 群 = 一个项目**（可分享 / 群内搜索 / 进群见全貌）；**主群 = 总控台**（人 + L1）。
 
-进度有两套账，别混：**账本(verified-delivery)是机器可验的真相源**（你验收/恢复只认它，见「## 可信交付」），**飞书任务清单是给人一眼看的进度板**。子 bot 干完用**结构化回报**交付证据、你**验收**合格才算完，最终汇总给用户。
+进度两套账，别混：**verified-delivery 账本 = 任务验收真相源**（L2 验收 / 恢复只认它，见「## 可信交付」）；**白板 = goal 的 charter / 状态页**（给人看、给 L2 续跑恢复用）；飞书任务清单可选。worker 结构化交付证据、L2 验收合格才算完。
+
+⚠️ **为什么要 L2、不能图省事让 L1 直接干**：① L1 在主群，若直接跨群派活，则 worker 的 report 要跨群回 L1、且 L1 盯不住 goal 群内流程；两级让监管闭环留在 goal 群（L2），report 回同群、L1 只在 milestone 收通知。② **主 bot 不能在 goal 群 @ 自己起 L2**——daemon 有 self-message guard（自己发的非 \`/close\` 消息不触发自己），所以 L2 必须用 \`goal supervise\`（daemon 内创建，绕开自消息），**绝不能** \`send --mention <自己>\`。
 
 ## 适用 & 不适用
 - 适用：一个长期项目同时满足三个结构化判据：① **多个 bot 分工**处理基本独立的子项目；② 需要持续存在的 **goal 群/多话题协调**和共享进度板；③ 主 bot 要持续收件并做最终**验收**。
@@ -1160,73 +1165,93 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 - 不适用：单步请求 / 普通改代码（直接做），或只需把下一步交给一个 bot（用 botmux-handoff）。
 
 ## 物理事实（先记牢）
-- **你和子 bot 之间没有直连**，只能靠飞书消息触发；**没有请求-响应关联**——子 bot 干完用 \`botmux report\` 把回报发回**你这条主编排话题**（不是在它自己的子话题里 @ 你——那条子话题没有你的会话，@ 会另起一个无上下文的新会话）。对你就是「话题里来了条新消息」，你被唤起（带完整上下文）后去读任务板拿结构化状态。
+- **L2 和 worker 之间没有直连**，只能靠飞书消息触发；worker 干完用 \`botmux report --task\` 把回报发回**派活者（L2）的会话**——因为 dispatch 是 L2 在 goal 群内发起的，report 自然回 L2（同群、不跨群）。worker **别**在自己的子话题里 @ L2（那会另起一个无上下文新会话）；report 落账后 L2 被唤起，去查账本拿结构化状态。
 - 开新话题靠 \`botmux dispatch\`（发种子消息 + 在线程里 @ 子 bot，子 bot 即在该话题各起独立会话）。**群模型下务必带 \`--chat-id <goal群id>\`**，话题才开在该项目的 goal 群里、而非你所在的主群（缺省会落到当前群）。**子 bot 必须已在 goal 群里且 mentionable**（有 include_bot 权限）——所以建 goal 群时就把这些 bot 一起拉进去。
 - 一条话题里可以有多个 bot（如 coder+reviewer），它们在该话题内互相 @ 协作。
-- **反方向同理（你 → 子 bot）**：子 bot 的会话只在它的子话题里。你要跟某个子 bot 说话（追问/补任务/确认），**一律 \`botmux dispatch --into <子话题root> --bot <子bot>\`** 发进它的子话题——**绝不要在主群 \`botmux send --mention <子bot>\`**，那条 @ 到不了它在子话题的会话，反而会在主群另起一个无上下文的新会话（与上面的回报问题完全对称）。子 bot 回报后你通常只需聚合，不必回它；要回也走 \`--into\`。（\`botmux send\` 已加护栏：误 @ 活跃子 bot 会被拦下并提示，确需强发才 \`--anyway\`。）
+- **反方向同理（L2 → worker）**：worker 的会话只在它的子话题里。L2 要跟某个 worker 说话（追问/补任务/确认），**一律 \`botmux dispatch --into <子话题root> --bot <worker>\`** 发进它的子话题——**绝不要在 goal 群顶层 \`botmux send --mention <worker>\`**，那 @ 到不了它在子话题的会话，反而另起一个无上下文新会话。worker 回报后 L2 通常只需聚合；要回也走 \`--into\`。（\`botmux send\` 已加护栏：误 @ 活跃 worker 会被拦下，确需强发才 \`--anyway\`。）
 
-## 流程
+## L1 流程（在主群，你和用户对话）
 
-### 1. 查花名册
-\`botmux bots list\`（见 botmux-bots）：看群里有哪些可协作 bot、能力标签、是否 mentionable。mentionable=false 的先让它 /introduce 一次。
+### L1-1 查花名册
+\`botmux bots list\`（见 botmux-bots）：看有哪些可协作 worker bot、能力标签、是否 mentionable。mentionable=false 的先让它 /introduce 一次。
 
-### 2. 拆解 + 出一版分配
-把需求拆成 N 个子项目，每个给出：**标题 / 简报(目标+验收) / 工作目录 / 指派的 bot(可一组，带角色) / 依赖**。你**主动提议一版**「子项目 ↔ bot」分配。
+### L1-2 拆解 + 跟用户对齐
+把需求拆成这个 **goal** 下的 N 个 subtask，每个给出：**标题 / 简报(目标+验收) / 指派 worker(可一组，带角色) / 依赖**。**主动提议一版**分配，用 \`botmux send\` 发给用户**一次审批**（可配合 botmux-ask 做按钮）。**没通过别建群、别起 L2。**
 
-### 3. 一次性跟用户确认
-把「子项目清单 + 分配 + 开几条话题」用 \`botmux send\` 发给用户**一次审批**（可配合 botmux-ask 做按钮确认）。用户可改、可手动指派。**没通过别派活。**
-
-### 4. 建 goal 群（本项目的工作群）
-用户确认后、派活前，先为这个大项目建一个独立 goal 群——之后所有子项目话题都开在这里。复用现成命令，把要用的 worker bot 都拉进去、并绑好工作目录：
+### L1-3 建 goal 群
+用户确认后，为这个 goal 建一个独立工作群，把要用的 worker + 用户都拉进去、绑好工作目录：
 \`\`\`bash
-botmux create-group --name "<项目名>" \\
+botmux create-group --name "<goal 名>" \\
   --bot "<coder显示名或larkAppId>" --bot "<reviewer显示名或larkAppId>" [--bot ...] \\
   --working-dir "<仓库路径>"
-# 成功后 stdout 输出新群 chatId（单行）——记住它，它就是本项目的 goalId
+# stdout 出新群 chatId（单行）——它就是本 goal 的 goalChatId
 \`\`\`
-- ⚠️ **\`create-group --bot\` 用 bot 显示名或 larkAppId**（同 \`botmux send @<name>\`）；这和 \`dispatch --bot\` 用 **open_id** 不一样，别混。
-- 拿到的 **群 chatId 就是 goalId**：后续 dispatch、查账本都用它。
-- \`--working-dir\` 给整群绑好仓库目录后，**该群里 dispatch 就不用再每次传 \`--repo\`**（子 bot 开话题自动继承）。
-- 建群命令默认把 creator 的 allowedUsers（发起用户）拉进群并转群主，他在群里就能盯整个项目进度。
-- **任务结束不自动删群**（留痕可回溯，归档以后再说）。
+- ⚠️ **\`create-group --bot\` 用显示名或 larkAppId**（同 \`botmux send @<name>\`）；和 \`dispatch --bot\` 用 **open_id** 不一样，别混。
+- \`--working-dir\` 绑好后，goal 群里 L2 / dispatch 都自动继承该目录，免再传 \`--repo\`。
+- 建群默认把发起用户拉进群并转群主，他进群就能盯全程。**结束不自动删群**（留痕）。
 
-### 5. 建共享任务板（飞书任务清单）
-用 **lark-task** 技能建一个**任务清单**（= 大项目），每个子项目建一条**任务**：
-- 负责人(member) 设为该子 bot（type=app，飞书任务支持 bot 当负责人）；
-- **把发起人（用户）加为任务清单成员/关注者**（tasklists.add_members，type=user，用他的 open_id）——否则任务板**不会出现在他的飞书任务里**，他看不到进度（这是常见漏点：建了板但没人能看到）；
-- 描述写清简报 + 验收标准；
-- 记下每条任务的 **task_guid**（后面塞进派活简报，子 bot 据此回写）。
-任务板给**人一眼看进度**，也是你的工作记忆。**主 bot 和子 bot 都可读写任务。**
-建完把任务清单链接用 \`botmux send\` 发给用户，让他确认能在飞书任务里看到。
-
-### 6. 逐个派活（在 goal 群里开话题）
-对每个子项目，把简报写进 /tmp/brief-X.md，再用 \`--chat-id <goalId>\` 把话题开进本项目的 goal 群：
+### L1-4 起 L2 监管化身（goal supervise）
+建群后**不要自己跨群派活**——改为在 goal 群起一个 L2 监管会话，把后续派活 / 验收都交给它：
 \`\`\`bash
-botmux dispatch --chat-id "<goalId>" --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --brief-file /tmp/brief-X.md
+botmux goal supervise --chat-id "<goalChatId>" \\
+  --parent-chat-id "<主群 chatId>" [--parent-root "<你当前话题 root>"] \\
+  --title "<goal 名>" [--brief "给 L2 的 goal 目标/验收口径"] [--working-dir "<仓库>"]
+# 输出 { supervisorSessionId, supervisorRootId, whiteboardId?, parent:{...} }
 \`\`\`
-**简报必须写清子 bot 的「完成协议」**，否则收不齐：
-- 你的飞书任务 ID 是 <task_guid>；
-- 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
-- 然后用 \`botmux report "子项目X 完成 + 产出位置"\` 回报（**别在本话题 @ 主bot**——会另起一个无上下文的新会话；\`botmux dispatch\` 已把这条「完成回报」协议自动追加进简报，子 bot 照做即可）；
-- coder 写完先 @ reviewer 在本话题 review，过了再标完成。
+- daemon 在 goal 群**直接创建 L2 会话**（绕开 self-message guard，不是你 @ 自己）。
+- \`--parent-*\` 把主群坐标写进 L2 的 prompt，L2 完成时据此回通知你。
+- 起好 L2 **L1 基本就交棒了**：回主群等完成通知（L1-5）。要派的 subtask 写进 \`--brief\` 交给 L2，或由 L2 按 goal 自行拆派。
 
 > repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。
 > **OnCall 省 \`--repo\` 现按 bot 计**：OnCall 绑定是 per-bot 的——只有**目标子 bot 自己**在该群绑了 OnCall（\`@该bot /oncall bind <仓库路径>\`，多个 bot 一起绑用 \`@bot1 @bot2 /oncall bind <路径>\`）或配了 \`defaultWorkingDir\` 时，dispatch 才可省 \`--repo\`。否则子 bot **不会**跨 bot 继承群目录（除非同话题已有 sibling 在跑可继承），dispatch 仍应显式传 \`--repo\`，不然子 bot 会弹「选仓库」卡。
 > 想「先把 bot 拉起待命、稍后再派具体任务」：用 \`--standby\`（只定目录不派简报），之后用 \`botmux dispatch --into <话题root> --bot ... --brief ...\` 激活。
 
-### 7. 收结果 + 验收（查账本，不信聊天）
-子 bot 用 \`botmux report --task <taskId> --summary ... --artifact <证据>\` 交付 → 你被唤起。**验收只认账本，不认聊天里说的"完成"**：
-- 先查账本拿结构化状态：\`botmux delivery list --goal <goalId>\`（本项目所有任务的 dispatched/reported/accepted/rejected）；单个看 \`botmux delivery show --task <taskId>\`。
-- 对 reported 的任务**优先用硬证据验收**：能跑测试就跑、能读产物就读；只有不可测的活（调研/设计）才纯靠判断。
-- 合格 → \`botmux delivery accept --task <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject --task <taskId> --reason ... --retry-brief ...\`（会自动回推到子 bot 话题，让它用同一 taskId 重做）。
-- 推进：有依赖的下一波，依赖满足了再 dispatch；**卡住/超时靠查账本**——\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的任务，去对应话题 \`botmux dispatch --into <root>\` @ 它问进展或改派（不靠后台轮询）。
-- 全程把关键节点用 \`botmux send\` 同步用户（人看飞书任务板也能一眼掌握）。
+### L1-5 收 L2 完成通知 → 汇总用户
+L2 把整个 goal 验收通过后会 \`botmux send --chat-id <主群>\` 回通知你。你被唤起后，可 \`botmux delivery list --goal <goalChatId>\` + \`whiteboard read\` 复核账本与状态，再给用户一份总汇总（做了什么、产出在哪、遗留项）。
 
-### 8. 汇总
-所有子项目**验收通过**（账本里都 accepted）→ 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
+## L2 流程（在 goal 群，你是监管化身）
+
+你被 \`goal supervise\` 唤起时，prompt 会告诉你：你是这个 goal 的 L2 监管化身 + 主群（parent）坐标。全程在 goal 群内闭环：
+
+### L2-1 读 / 建 goal 白板 charter
+\`\`\`bash
+botmux whiteboard current --create     # 确保本 goal 群有白板
+botmux whiteboard read --json          # 续跑时先读，拿 content + updatedAt
+botmux whiteboard update --expected-updated-at <updatedAt> "<目标/组织/进展/下一步>"
+\`\`\`
+白板 = 这个 goal 的 charter + 状态页（给人看、给你续跑恢复）。任务真相在账本，别拿白板当账本。
+（可选）要给人一个飞书原生进度板，可另用 **lark-task** 建任务清单并把用户加为成员；但 L2 的判断依据始终是账本，不是任务板。
+
+### L2-2 在 goal 群内 dispatch subtask
+对每个 subtask，把简报写进 /tmp/brief-X.md，在**本 goal 群**开话题派活：
+\`\`\`bash
+botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
+  --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" \\
+  [--task-id <默认自动>] --acceptance-hint "你打算怎么验收" --brief-file /tmp/brief-X.md
+\`\`\`
+- dispatch 是**你（L2）**发起的，所以 worker 的 report 自然回你这条 L2 会话（同群、不跨群）。
+- \`dispatch\` 已自动把「干完用 \`botmux report --task <id>\` 带证据回报、别在本话题 @ 派活者」的完成协议追加进简报，worker 照做。
+- 工作目录已在建群时 \`--working-dir\` 绑好，dispatch 免传 \`--repo\`；要先拉起 worker 待命用 \`--standby\`，之后 \`dispatch --into <话题root>\` 激活。
+- coder 写完先 @ reviewer 在本话题 review，过了再 report。
+
+### L2-3 收 + 验收（查账本，不信聊天）
+worker report → 你被唤起。**只认账本，不认聊天里说的"完成"**：
+- \`botmux delivery list --goal <goalChatId>\`（本 goal 所有任务的 dispatched/reported/accepted/rejected）；单看 \`botmux delivery show --task <taskId>\`。
+- 对 reported 的**优先硬证据**：能跑测试就跑、能读产物就读；不可测的活才纯判断。
+- 合格 → \`botmux delivery accept --task <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject --task <taskId> --reason ... --retry-brief ...\`（自动回推 worker 话题重做）。
+
+### L2-4 维护白板 + 推进依赖
+每验收一波，\`whiteboard update\` 刷新状态（进展/下一步）。有依赖的下一波，依赖满足了再 dispatch。**卡住/超时靠查账本**：\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的，去对应话题 \`dispatch --into <root>\` 问进展或改派（不靠后台轮询）。
+
+### L2-5 全部 accepted → 通知 L1
+本 goal 所有 subtask 都 accepted 后，回主群通知 L1：
+\`\`\`bash
+botmux send --chat-id "<parent 主群 chatId>" [--mention <L1/用户 open_id>] "goal 完成：各 subtask 产出 + 位置"
+\`\`\`
+这是 goal 群结果**回流主群**的唯一出口——L1 被唤起后据此汇总给用户（L1-5）。
 
 ## 登记 & 恢复（账本是真相源，记忆只是缓存）
-把「goalId(群) ↔ 子项目 ↔ taskId ↔ 话题root ↔ 指派bot」记一张小表（本地 scratch，如 /tmp/orchestrate-<项目>.json）方便手头快查。但**真相源是账本**：被唤起 / 断点续跑 / 怀疑漏了什么时，先 \`botmux delivery list --goal <goalId>\` 从账本重建状态再动手——本地小表和飞书任务板都可能过期，账本不会。
+**L2 尤其要靠查账本 + 白板恢复**：被唤起 / 断点续跑 / 怀疑漏了什么时，先 \`botmux delivery list --goal <goalChatId>\` 从账本重建任务真相、\`botmux whiteboard read --json\` 读 goal charter/状态，再动手——L2 自己的记忆、本地 scratch、飞书任务板都可能过期，账本 + 白板不会。L1 复核同理。
 
 ## 可信交付（账本：聊天不算证据，验收要留痕）
 让"派出去的活到底做没做、验没验"有据可查，不靠群里互相说"好了"：
@@ -1237,8 +1262,9 @@ botmux dispatch --chat-id "<goalId>" --title "<子项目标题>" --bot "<coder_o
 - **goalId = goal 群 chatId**：\`delivery list --goal <goalId>\` 就是这个项目的全景账本视图。
 
 ## 注意
-- **没通过用户审批不要建板/派活。**
-- 子 bot 不在群 / 不 mentionable → 先解决可达性（拉群、/introduce），否则 dispatch 的 @ 唤不起它。
+- **没通过用户审批不要建群 / 起 L2 / 派活。**
+- **起 L2 只能用 \`goal supervise\`**，绝不能在 goal 群 \`send --mention <自己>\`（self-message guard 不触发自己）。
+- worker 不在 goal 群 / 不 mentionable → 先解决可达性（建群时拉进 / /introduce），否则 dispatch 的 @ 唤不起它。
 - 一条话题别塞太多 bot；coder+reviewer 两人一组最顺。
 - 失败别硬重试同一招 ≥3 次；上报用户。
 `;
