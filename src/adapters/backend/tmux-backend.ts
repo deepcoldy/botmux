@@ -2,6 +2,7 @@ import * as pty from 'node-pty';
 import { execSync, execFileSync } from 'node:child_process';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { basename } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
 import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
@@ -348,17 +349,33 @@ export class TmuxBackend implements SessionBackend {
    */
   pasteText(text: string): void {
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['load-buffer', '-'], {
-      input: text,
-      stdio: ['pipe', 'ignore', 'ignore'],
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-    execFileSync('tmux', ['paste-buffer', '-t', this.cmdTarget, '-d', '-p'], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
+    const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
+    let loaded = false;
+    try {
+      execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
+        input: text,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      loaded = true;
+      execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.cmdTarget, '-d', '-p'], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      loaded = false;
+    } finally {
+      if (loaded) {
+        try {
+          execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
+            stdio: 'ignore',
+            timeout: 1000,
+            env: tmuxEnv(),
+          });
+        } catch { /* best-effort cleanup after a failed paste */ }
+      }
+    }
   }
 
   private exitCopyModeIfNeeded(): void {

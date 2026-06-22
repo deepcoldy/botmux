@@ -264,18 +264,34 @@ export class TmuxPipeBackend implements SessionBackend {
   pasteText(text: string): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
+    const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
     this.guardedSend('paste-buffer', () => {
-      execFileSync('tmux', ['load-buffer', '-'], {
-        input: text,
-        stdio: ['pipe', 'ignore', 'ignore'],
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
-      execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d', '-p'], {
-        stdio: 'ignore',
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
+      let loaded = false;
+      try {
+        execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
+          input: text,
+          stdio: ['pipe', 'ignore', 'ignore'],
+          timeout: 5000,
+          env: tmuxEnv(),
+        });
+        loaded = true;
+        execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', '-p'], {
+          stdio: 'ignore',
+          timeout: 5000,
+          env: tmuxEnv(),
+        });
+        loaded = false;
+      } finally {
+        if (loaded) {
+          try {
+            execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
+              stdio: 'ignore',
+              timeout: 1000,
+              env: tmuxEnv(),
+            });
+          } catch { /* best-effort cleanup after a failed paste */ }
+        }
+      }
     });
   }
 

@@ -114,10 +114,17 @@ describe('TmuxBackend.pasteText', () => {
     expect(calls[0].args).toContain('load-buffer');
     expect(calls[0].args).toContain('-');
     expect(calls[0].opts?.input).toBe('line1\n\nline2');
+    const bIdx = calls[0].args.indexOf('-b');
+    expect(bIdx).toBeGreaterThanOrEqual(0);
+    const bufferName = calls[0].args[bIdx + 1];
+    expect(bufferName).toMatch(/^botmux-[a-f0-9]{16}$/);
 
     // Call 2: paste-buffer to the session
     expect(calls[1].cmd).toBe('tmux');
     expect(calls[1].args).toContain('paste-buffer');
+    const pasteBIdx = calls[1].args.indexOf('-b');
+    expect(pasteBIdx).toBeGreaterThanOrEqual(0);
+    expect(calls[1].args[pasteBIdx + 1]).toBe(bufferName);
     expect(calls[1].args).toContain('-d');
   });
 
