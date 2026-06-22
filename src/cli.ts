@@ -41,7 +41,7 @@ import {
   generateTaskId,
   parseDeliveryDuration,
 } from './core/verified-delivery.js';
-import { REJECT_REASON, type RejectReason, type TaskStatus } from './verified-delivery/types.js';
+import { REJECT_REASON, type HelpKind, type RejectReason, type TaskStatus } from './verified-delivery/types.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -4209,6 +4209,40 @@ async function cmdWorkflowGrant(runId: string | undefined, rest: string[]): Prom
   console.log(`➕ v3 run "${runId}" 已追加一轮，loop 将带上一轮反馈重跑。`);
 }
 
+async function triggerGoalWatchdogFromCli(goalChatId: string, reason: string): Promise<{ contacted: number; injected: number; reconciled: number; busy: number; rateLimited: number }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  let injected = 0;
+  let reconciled = 0;
+  let busy = 0;
+  let rateLimited = 0;
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/watchdog`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ goalChatId, reason }),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { results?: Array<{ status?: string }> } | null;
+      const results = body?.results ?? [];
+      injected += results.filter((r) => r.status === 'injected').length;
+      reconciled += results.filter((r) => r.status === 'reconciled').length;
+      busy += results.filter((r) => r.status === 'busy').length;
+      rateLimited += results.filter((r) => r.status === 'rate-limited').length;
+    } catch {
+      // Best effort. Periodic goal-watchdog still picks the task up.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, injected, reconciled, busy, rateLimited };
+}
+
 async function cmdResume(): Promise<void> {
   const target = process.argv[3];
   if (!target) {
@@ -7275,6 +7309,85 @@ async function cmdReport(rest: string[]): Promise<void> {
   }
 }
 
+// ─── Verified delivery help (worker hand-raise) ─────────────────────────────
+
+const VERIFIED_DELIVERY_HELP_KINDS = new Set<HelpKind>(['access', 'ambiguous', 'impossible', 'repeated_failure', 'other']);
+
+async function cmdHelp(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux help — 工人显式求助，写入可信交付账本并唤醒 goal 监管者
+
+用法:
+  botmux help --task <taskId> --blocker "卡在哪" [--kind access|ambiguous|impossible|repeated_failure|other]
+
+说明:
+  这不是完成回报，也不会把任务判失败。它把任务置为 blocked，
+  由 L2 监管者先自救；只有监管者也定不了时才 delivery escalate 升级给人。`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const taskId = argValue(rest, '--task');
+  const blocker = argValue(rest, '--blocker');
+  if (!taskId) { console.error('botmux help 需要 --task <taskId>'); process.exit(1); }
+  if (!blocker?.trim()) { console.error('botmux help 需要 --blocker "卡在哪"'); process.exit(1); }
+
+  const rawKind = argValue(rest, '--kind');
+  const kind = rawKind ? rawKind.trim() as HelpKind : undefined;
+  if (kind && !VERIFIED_DELIVERY_HELP_KINDS.has(kind)) {
+    console.error('botmux help: --kind 必须是 access / ambiguous / impossible / repeated_failure / other');
+    process.exit(1);
+  }
+
+  const sessionIdArg = argValue(rest, '--session-id');
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  const sessions = loadSessions();
+  const s = sid ? sessions.get(sid) : undefined;
+  const ledger = openLedger();
+  const task = ledger.task(taskId);
+  if (!task) {
+    console.error(`未找到任务: ${taskId}`);
+    process.exit(1);
+  }
+  const goalChatId = task.chatId ?? s?.chatId;
+  if (!goalChatId) {
+    console.error(`任务 ${taskId} 缺少 goal chatId，无法唤醒监管者。`);
+    process.exit(1);
+  }
+
+  const workerOpenId = argValue(rest, '--worker-open-id') ??
+    task.workerOpenIds?.[0] ??
+    s?.creatorOpenId ??
+    s?.ownerOpenId ??
+    s?.quoteTargetSenderOpenId;
+  const blockerText = blocker.trim();
+  const keyHash = createHash('sha256').update(`${taskId}\n${kind ?? ''}\n${blockerText}`).digest('hex').slice(0, 10);
+  const result = ledger.append({
+    type: 'TaskHelpRequested',
+    actor: 'worker',
+    taskId,
+    chatId: goalChatId,
+    ts: Date.now(),
+    idempotencyKey: `help:${taskId}:${keyHash}`,
+    payload: {
+      taskId,
+      workerOpenId: workerOpenId?.trim() || undefined,
+      blocker: blockerText,
+      kind,
+    },
+  });
+
+  const watchdog = await triggerGoalWatchdogFromCli(goalChatId, `help:${taskId}`);
+  console.log(JSON.stringify({
+    success: true,
+    taskId,
+    blocked: true,
+    deduped: result.deduped,
+    goalChatId,
+    watchdog,
+  }, null, 2));
+}
+
 // ─── Verified delivery accept/reject (orchestrator-as-judge) ────────────────
 
 async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
@@ -7285,13 +7398,16 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   查看任务:
     botmux delivery show --task <taskId>
   列出任务:
-    botmux delivery list [--goal <chatId>] [--status dispatched|reported|accepted|rejected] [--older-than 2h]
+    botmux delivery list [--goal <chatId>] [--status dispatched|reported|accepted|rejected|blocked|escalated] [--older-than 2h]
   验收通过:
     botmux delivery accept --task <taskId> [--report <reportId>] \\
         [--checked-by <id>] [--note <text>] [--evidence-checked <ref>]... [--ran-command <cmd>]...
   打回重做:
     botmux delivery reject --task <taskId> [--report <reportId>] --reason <code> \\
         [--retry-brief <text>] [--expected-evidence <text>] [--checked-by <id>] [--no-push]
+  升级给人:
+    botmux delivery escalate --task <taskId> --reason <text> \\
+        [--retry-brief <text>] [--by <id>] [--session-id <L2会话id>] [--no-notify-parent]
 
 说明:
   --report 省略时默认使用该任务 latestReportId。
@@ -7306,9 +7422,9 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   if (sub === 'list') {
     const goal = argValue(rest, '--goal', '--chat-id');
     const status = argValue(rest, '--status');
-    const validStatuses = new Set<TaskStatus>(['dispatched', 'reported', 'accepted', 'rejected']);
+    const validStatuses = new Set<TaskStatus>(['dispatched', 'reported', 'accepted', 'rejected', 'blocked', 'escalated']);
     if (status && !validStatuses.has(status as TaskStatus)) {
-      console.error('delivery list: --status 必须是 dispatched / reported / accepted / rejected');
+      console.error('delivery list: --status 必须是 dispatched / reported / accepted / rejected / blocked / escalated');
       process.exit(1);
     }
     const taskStatus = status as TaskStatus | undefined;
@@ -7355,9 +7471,87 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     return;
   }
 
-  if (sub !== 'accept' && sub !== 'reject') {
+  if (sub !== 'accept' && sub !== 'reject' && sub !== 'escalate') {
     console.error(`delivery: 未知子命令 ${sub}`);
     process.exit(1);
+  }
+
+  const sessionIdArg = argValue(rest, '--session-id');
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  const sessions = loadSessions();
+  const s = sid ? sessions.get(sid) : undefined;
+  const checkedBy = argValue(rest, '--checked-by') ?? s?.larkAppId ?? s?.ownerOpenId ?? 'orchestrator';
+
+  if (sub === 'escalate') {
+    const reason = argValue(rest, '--reason')?.trim();
+    if (!reason) {
+      console.error('delivery escalate 需要 --reason <为什么需要人拍>');
+      process.exit(1);
+    }
+    const retryBrief = argValue(rest, '--retry-brief')?.trim();
+    const by = argValue(rest, '--by')?.trim() || checkedBy;
+    const result = ledger.append({
+      type: 'TaskEscalated',
+      actor: 'orchestrator',
+      taskId,
+      chatId: task.chatId,
+      ts: Date.now(),
+      idempotencyKey: `escalated:${taskId}`,
+      payload: {
+        taskId,
+        reason,
+        by,
+        retryBrief: retryBrief || undefined,
+      },
+    });
+
+    let parentNotified: boolean | undefined;
+    let attentionRaised: boolean | undefined;
+    let notifyError: string | undefined;
+    if (!argFlag(rest, '--no-notify-parent')) {
+      try {
+        if (!s?.larkAppId) throw new Error('无法推断当前 L2 session/larkAppId；可传 --session-id 或 --no-notify-parent。');
+        const daemon = findDaemon(s.larkAppId);
+        if (!daemon) throw new Error(`未找到在线 daemon (larkAppId=${s.larkAppId})`);
+        const summary = [
+          `Goal 任务需要人工决策: ${taskId}`,
+          `原因: ${reason}`,
+          retryBrief ? `建议/待确认: ${retryBrief}` : undefined,
+          task.chatId ? `goal: ${task.chatId}` : undefined,
+        ].filter(Boolean).join('\n');
+        const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/notify-parent`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            supervisorSessionId: sid,
+            goalChatId: task.chatId,
+            summary,
+            attentionKind: 'help',
+            attentionReason: reason,
+          }),
+        });
+        const body = await res.json().catch(() => null) as { ok?: boolean; error?: string; attentionRaised?: boolean } | null;
+        if (!res.ok || !body?.ok) throw new Error(body?.error ?? `daemon HTTP ${res.status}`);
+        parentNotified = true;
+        attentionRaised = !!body.attentionRaised;
+      } catch (err) {
+        parentNotified = false;
+        attentionRaised = false;
+        notifyError = err instanceof Error ? err.message : String(err);
+        console.error(`⚠️ 已写入 escalated 账本，但通知 L1/点亮看板失败：${notifyError}`);
+      }
+    }
+
+    console.log(JSON.stringify({
+      success: true,
+      taskId,
+      escalated: true,
+      deduped: result.deduped,
+      parentNotified,
+      attentionRaised,
+      notifyError,
+    }, null, 2));
+    return;
   }
 
   const reportId = argValue(rest, '--report') ?? task.latestReportId;
@@ -7370,12 +7564,6 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     console.error(`任务 ${taskId} 找不到 report: ${reportId}`);
     process.exit(1);
   }
-
-  const sessionIdArg = argValue(rest, '--session-id');
-  const sid = sessionIdArg ?? findAncestorSessionId();
-  const sessions = loadSessions();
-  const s = sid ? sessions.get(sid) : undefined;
-  const checkedBy = argValue(rest, '--checked-by') ?? s?.larkAppId ?? s?.ownerOpenId ?? 'orchestrator';
 
   if (sub === 'accept') {
     const note = argValue(rest, '--note');
@@ -7465,7 +7653,7 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
       [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
       [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
-  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>]
+  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>] [--attention[=help]]
   botmux goal charter current --goal <goal群chatId> [--create] [--title <标题>]
   botmux goal charter read --goal <goal群chatId> [--json]
   botmux goal charter update --goal <goal群chatId> --expected-updated-at <ts> <完整内容>
@@ -7569,6 +7757,7 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
   const sessionIdArg = argValue(rest, '--session-id');
   const goalArg = argValue(rest, '--goal');
   const summaryFile = argValue(rest, '--summary-file');
+  const attention = parseAttentionFlag(rest);
   let summary = argValue(rest, '--summary') ?? '';
   if (summaryFile) {
     if (!existsSync(summaryFile)) { console.error(`文件不存在: ${summaryFile}`); process.exit(1); }
@@ -7611,6 +7800,8 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
         supervisorSessionId: sid,
         goalChatId,
         summary: summary.trim(),
+        attentionKind: attention.requested ? attention.kind : undefined,
+        attentionReason: attention.requested ? summary.trim() : undefined,
       }),
     });
   } catch (err: any) {
@@ -9459,6 +9650,7 @@ switch (command) {
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
+  case 'help': await cmdHelp(process.argv.slice(3)); break;
   case 'delivery': await cmdDelivery(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'goal': await cmdGoal(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;

@@ -78,10 +78,12 @@ describe('goal watchdog', () => {
       task('t3', 'oc_a', 'reported'),
       task('t4', 'oc_b', 'accepted'),
       task('t5', undefined, 'dispatched'),
+      { ...task('t6', 'oc_a', 'blocked'), help: { blocker: '缺权限', kind: 'access', workerOpenId: 'ou_w' } },
+      { ...task('t7', 'oc_a', 'escalated'), escalation: { reason: '需要人拍' } },
     ]);
 
     expect([...grouped.keys()]).toEqual(['oc_a']);
-    expect(grouped.get('oc_a')?.map((t) => t.taskId)).toEqual(['t1', 't2', 't3']);
+    expect(grouped.get('oc_a')?.map((t) => t.taskId)).toEqual(['t1', 't2', 't3', 't6']);
   });
 
   it('injects only into an active chat-scope goal supervisor session', async () => {
@@ -128,6 +130,31 @@ describe('goal watchdog', () => {
     expect(injected[0].prompt).toContain(GOAL_WATCHDOG_PROMPT_PREFIX);
     expect(injected[0].prompt).toContain('t-legacy');
     expect(injected[0].prompt).toContain('acceptanceHint=人工验收: 读取结果文件并确认 PASS');
+  });
+
+  it('routes blocked help requests to L2 and parks escalated tasks', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+    const injected: Array<{ prompt: string }> = [];
+
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([
+        { ...task('t-blocked', 'oc_goal', 'blocked'), help: { blocker: '缺数据库权限', kind: 'access', workerOpenId: 'ou_worker' } },
+        { ...task('t-escalated', 'oc_goal', 'escalated'), escalation: { reason: '需要人确认范围' } },
+      ]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      inject: (_target, prompt) => injected.push({ prompt }),
+    });
+
+    expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'injected', pendingTaskIds: ['t-blocked'] }]);
+    expect(injected).toHaveLength(1);
+    expect(injected[0].prompt).toContain('t-blocked');
+    expect(injected[0].prompt).toContain('helpKind=access');
+    expect(injected[0].prompt).toContain('blocker=缺数据库权限');
+    expect(injected[0].prompt).not.toContain('t-escalated');
   });
 
   it('does not inject L2 for reported legacy tasks', async () => {
