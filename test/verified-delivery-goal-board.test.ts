@@ -92,6 +92,24 @@ describe('buildGoalBoard — ledger projection', () => {
     expect(t.attempts[1].verdict).toBeUndefined();
   });
 
+  it('flags machine-reconciled verdicts (via=reconcile) vs human accepts', () => {
+    const led = openLedger({ baseDir });
+    // auto-reconciled task
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-auto', chatId: 'oc_g', idempotencyKey: 'd:auto', payload: { taskId: 't-auto' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-auto', chatId: 'oc_g', idempotencyKey: 'rep:auto', payload: { taskId: 't-auto', reportId: 'ra', summary: 's', evidence: [{ kind: 'path', path: '/tmp/a' }] } }));
+    led.append(draft({ type: 'TaskAccepted', taskId: 't-auto', chatId: 'oc_g', idempotencyKey: 'acc:auto', payload: { taskId: 't-auto', reportId: 'ra', checkedBy: 'sup', via: 'reconcile' } }));
+    // human-accepted task (no via)
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-human', chatId: 'oc_g', idempotencyKey: 'd:human', payload: { taskId: 't-human' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-human', chatId: 'oc_g', idempotencyKey: 'rep:human', payload: { taskId: 't-human', reportId: 'rh', summary: 's', evidence: [{ kind: 'path', path: '/tmp/h' }] } }));
+    led.append(draft({ type: 'TaskAccepted', taskId: 't-human', chatId: 'oc_g', idempotencyKey: 'acc:human', payload: { taskId: 't-human', reportId: 'rh', checkedBy: 'ou_person' } }));
+
+    const tasks = Object.fromEntries(buildGoalBoard({ baseDir, chatId: 'oc_g' }).goals[0].tasks.map((t) => [t.taskId, t]));
+    expect(tasks['t-auto'].autoReconciled).toBe(true);
+    expect(tasks['t-auto'].attempts[0].verdictVia).toBe('reconcile');
+    expect(tasks['t-human'].autoReconciled).toBeUndefined();
+    expect(tasks['t-human'].attempts[0].verdictVia).toBeUndefined();
+  });
+
   it('carries reject reason onto the latest attempt', () => {
     const led = openLedger({ baseDir });
     led.append(draft({ type: 'TaskDispatched', taskId: 't-r', chatId: 'oc_g', idempotencyKey: 'd:r', payload: { taskId: 't-r' } }));

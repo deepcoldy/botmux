@@ -65,6 +65,11 @@ export interface AcceptanceCriteria {
 /** The current materialized state of one task (read-model, derived from events). */
 export type TaskStatus = 'dispatched' | 'reported' | 'accepted' | 'rejected';
 
+/** How a verdict was produced. Omitted ⇒ a human ruled via the `delivery` CLI;
+ *  'reconcile' ⇒ the mechanical reconciler ran the structured acceptance criteria
+ *  itself (see reconcile.ts) — so the board can distinguish 🤖 auto from 👤 human. */
+export type VerdictVia = 'reconcile';
+
 export interface TaskReportView {
   reportId: string;
   workerOpenId?: string;
@@ -76,6 +81,7 @@ export interface TaskReportView {
   checkedBy?: string;         // orchestrator openId / id
   evidenceChecked?: string[]; // which evidence the orchestrator actually inspected
   ranCommands?: string[];     // commands the orchestrator ran to verify (anti-Goodhart trail)
+  verdictVia?: VerdictVia;    // 'reconcile' when the mechanical reconciler ruled; else human/CLI
 }
 
 export interface TaskView {
@@ -124,6 +130,7 @@ export interface TaskAcceptedPayload {
   note?: string;
   evidenceChecked?: string[];
   ranCommands?: string[];
+  via?: VerdictVia;  // 'reconcile' for the mechanical reconciler; omitted for human/CLI accepts
 }
 
 export interface TaskRejectedPayload {
@@ -134,6 +141,7 @@ export interface TaskRejectedPayload {
   reason: string;
   retryBrief?: string;
   expectedEvidence?: string;
+  via?: VerdictVia;  // 'reconcile' for the mechanical reconciler; omitted for human/CLI rejects
 }
 
 /** Stable reject codes both halves share, so UI / stats can recognise them.

@@ -232,7 +232,7 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
       type: 'TaskAccepted', actor: 'orchestrator', taskId, chatId: task.chatId,
       idempotencyKey: `accepted:${taskId}:${reportId}`, ts: opts.now,
       payload: {
-        taskId, reportId, checkedBy: opts.checkedBy,
+        taskId, reportId, checkedBy: opts.checkedBy, via: 'reconcile',
         note: '对账自动验收：结构化 acceptanceCriteria 全部通过',
         evidenceChecked: verify.evidenceChecked.length ? verify.evidenceChecked : undefined,
         ranCommands: verify.ranCommands.length ? verify.ranCommands : undefined,
@@ -247,7 +247,7 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
       type: 'TaskRejected', actor: 'orchestrator', taskId, chatId: task.chatId,
       idempotencyKey: `rejected:${taskId}:${reportId}`, ts: opts.now,
       payload: {
-        taskId, reportId, checkedBy: opts.checkedBy,
+        taskId, reportId, checkedBy: opts.checkedBy, via: 'reconcile',
         reason: REJECT_REASON.CHECK_FAILED,
         retryBrief: `对账核验未通过：${verifySummary(verify)}`,
       },

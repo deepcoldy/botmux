@@ -47,6 +47,8 @@ export interface BoardReportAttempt {
   reason?: string;
   summary: string;
   workerOpenId?: string;
+  /** 'reconcile' when the mechanical reconciler ruled this attempt (else human/CLI). */
+  verdictVia?: 'reconcile';
 }
 
 export interface GoalBoardTask {
@@ -65,6 +67,8 @@ export interface GoalBoardTask {
   /** Verdict on the latest attempt, for quick board rendering. */
   latestVerdict?: 'accepted' | 'rejected';
   rejectReason?: string;
+  /** True when the latest verdict came from the mechanical reconciler (🤖 auto). */
+  autoReconciled?: boolean;
 
   // ── lifecycle timestamps (unix ms; from ledger events) ────────────────────
   dispatchedAt?: number;
@@ -177,6 +181,7 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
       if (r.verdict) a.verdict = r.verdict;
       if (r.reason) a.reason = r.reason;
       if (r.workerOpenId) a.workerOpenId = r.workerOpenId;
+      if (r.verdictVia) a.verdictVia = r.verdictVia;
       return a;
     }),
   };
@@ -184,6 +189,7 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
   else if (t.acceptanceHint) task.acceptanceHint = t.acceptanceHint;
   if (latest?.verdict) task.latestVerdict = latest.verdict;
   if (latest?.reason) task.rejectReason = latest.reason;
+  if (latest?.verdictVia === 'reconcile') task.autoReconciled = true;
   if (latest?.checkedBy) task.checkedBy = latest.checkedBy;
   if (latest?.evidenceChecked?.length) task.evidenceChecked = latest.evidenceChecked;
   if (latest?.ranCommands?.length) task.ranCommands = latest.ranCommands;

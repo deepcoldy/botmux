@@ -110,6 +110,7 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(rep.verdict).toBe('accepted');
     expect(rep.checkedBy).toBe('ou_sup');
     expect(rep.evidenceChecked).toEqual(['/x']);
+    expect(rep.verdictVia).toBe('reconcile'); // self-identifies as machine-reconciled
   });
 
   it('dispatched + verify fail → nudge, nothing written to the ledger', () => {
@@ -142,6 +143,7 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(task.status).toBe('rejected');
     expect(task.reports[0].verdict).toBe('rejected');
     expect(task.reports[0].reason).toBe('check_failed');
+    expect(task.reports[0].verdictVia).toBe('reconcile');
   });
 
   it('idempotent: re-running an accepted task does nothing', () => {
