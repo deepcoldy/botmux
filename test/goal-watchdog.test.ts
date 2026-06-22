@@ -5,6 +5,7 @@ import {
   pendingGoalTasks,
   runGoalWatchdogForGoal,
   runGoalWatchdogOnce,
+  shouldTriggerGoalWatchdogOnSessionBoundary,
 } from '../src/core/goal-watchdog.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { LedgerHandle } from '../src/verified-delivery/ledger.js';
@@ -179,5 +180,18 @@ describe('goal watchdog', () => {
     });
 
     expect(results).toEqual([]);
+  });
+
+  it('does not trigger event watchdog from the L2 supervisor session boundary', () => {
+    expect(shouldTriggerGoalWatchdogOnSessionBoundary(ds({
+      chatId: 'oc_goal',
+      title: '[Goal] Live E2E',
+      status: 'idle',
+    }))).toBe(false);
+    expect(shouldTriggerGoalWatchdogOnSessionBoundary(ds({
+      chatId: 'oc_goal',
+      title: 'worker task',
+      status: 'idle',
+    }))).toBe(true);
   });
 });

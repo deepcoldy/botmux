@@ -254,7 +254,7 @@ import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch,
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { startGoalSupervisor } from './core/goal-supervisor.js';
-import { runGoalWatchdogForGoal, startGoalWatchdog } from './core/goal-watchdog.js';
+import { runGoalWatchdogForGoal, shouldTriggerGoalWatchdogOnSessionBoundary, startGoalWatchdog } from './core/goal-watchdog.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
@@ -15835,7 +15835,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // Worker/report is only a fast path in verified delivery. When any session
       // in a goal group reaches a turn boundary, ask the L2 supervisor to inspect
       // pending tasks immediately instead of waiting for the 5m periodic sweep.
-      if (ds.scope !== 'chat' || !ds.chatId) return;
+      if (!shouldTriggerGoalWatchdogOnSessionBoundary(ds) || !ds.chatId) return;
       void triggerGoalWatchdogAcrossDaemons({
         goalChatId: ds.chatId,
         reason,
