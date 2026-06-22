@@ -4,9 +4,10 @@ import * as messageQueue from '../services/message-queue.js';
 import { getBot } from '../bot-registry.js';
 import { localeForBot } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
-import { buildNewTopicPrompt, getAvailableBots, rememberLastCliInput } from './session-manager.js';
+import { buildFollowUpContent, buildNewTopicPrompt, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { sessionKey, type DaemonSession } from './types.js';
+import { markSessionActivity } from './session-activity.js';
 
 export interface GoalSuperviseRequest {
   chatId: string;
@@ -23,6 +24,24 @@ export interface GoalSuperviseResponse {
   goalChatId: string;
   supervisorSessionId: string;
   parent: { chatId: string; rootMessageId?: string };
+}
+
+export interface GoalNotifyParentRequest {
+  supervisorSessionId?: string;
+  goalChatId?: string;
+  summary: string;
+}
+
+export interface GoalNotifyParentResponse {
+  ok: true;
+  parentSessionId: string;
+  goalChatId: string;
+}
+
+export interface GoalNotifyParentError {
+  ok: false;
+  errorCode: string;
+  error: string;
 }
 
 export interface GoalSuperviseError {
@@ -56,9 +75,7 @@ export function buildGoalSupervisorPrompt(req: GoalSuperviseRequest): string {
     parentRootLine,
     '',
     '常用完成通知命令：',
-    req.parentRoot
-      ? `botmux send --chat-id ${req.parentChatId} --quote ${req.parentRoot} --mention-back "Goal「${req.title.trim() || req.chatId}」已完成：<摘要>"`
-      : `botmux send --chat-id ${req.parentChatId} --no-mention "Goal「${req.title.trim() || req.chatId}」已完成：<摘要>"`,
+    `botmux goal notify-parent --summary "Goal「${req.title.trim() || req.chatId}」已完成：<摘要>"`,
     ...(brief ? ['', 'L1 给你的初始 brief：', brief] : []),
   ].join('\n');
 }
@@ -69,6 +86,94 @@ function findActiveBySessionId(activeSessions: Map<string, DaemonSession>, sessi
     if (ds.session.sessionId === sessionId) return ds;
   }
   return undefined;
+}
+
+function findGoalSupervisorByGoal(activeSessions: Map<string, DaemonSession>, larkAppId: string, goalChatId?: string): DaemonSession | undefined {
+  if (!goalChatId) return undefined;
+  const direct = activeSessions.get(sessionKey(goalChatId, larkAppId));
+  if (direct?.session.goalSupervisor?.goalChatId === goalChatId) return direct;
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId === larkAppId && ds.session.goalSupervisor?.goalChatId === goalChatId) return ds;
+  }
+  return undefined;
+}
+
+export function findGoalParentSession(activeSessions: Map<string, DaemonSession>, larkAppId: string, supervisor: DaemonSession): DaemonSession | undefined {
+  const meta = supervisor.session.goalSupervisor;
+  if (!meta) return undefined;
+  const bySession = findActiveBySessionId(activeSessions, meta.parentSessionId);
+  if (bySession && bySession.larkAppId === larkAppId) return bySession;
+
+  const byChat = activeSessions.get(sessionKey(meta.parentChatId, larkAppId));
+  if (byChat) return byChat;
+  if (meta.parentRoot) {
+    const byRoot = activeSessions.get(sessionKey(meta.parentRoot, larkAppId));
+    if (byRoot) return byRoot;
+  }
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== larkAppId) continue;
+    if (ds.chatId === meta.parentChatId && ds.scope === 'chat') return ds;
+    if (meta.parentRoot && ds.session.rootMessageId === meta.parentRoot) return ds;
+  }
+  return undefined;
+}
+
+export function buildGoalParentNotificationPrompt(supervisor: DaemonSession, summary: string): string {
+  const meta = supervisor.session.goalSupervisor;
+  const goalTitle = meta?.title || supervisor.session.title.replace(/^\[Goal\]\s*/, '') || supervisor.chatId;
+  return [
+    '[goal-parent-notify] L2 goal supervisor reports progress/completion.',
+    `goal: ${goalTitle}`,
+    `goalChatId: ${meta?.goalChatId ?? supervisor.chatId}`,
+    '',
+    'summary:',
+    summary.trim(),
+    '',
+    '请按 L1 流程查 goal charter / delivery ledger 做最终汇总；账本仍是真相源，不要只信这条通知。',
+  ].join('\n');
+}
+
+export async function injectGoalParentTurn(parent: DaemonSession, prompt: string): Promise<void> {
+  const content = buildFollowUpContent(prompt, parent.session.sessionId, {
+    isAdoptMode: false,
+    cliId: parent.session.cliId,
+    locale: localeForBot(parent.larkAppId),
+    larkAppId: parent.larkAppId,
+    chatId: parent.chatId,
+  });
+  markSessionActivity(parent);
+  rememberLastCliInput(parent, prompt, content);
+  if (parent.worker && !parent.worker.killed) {
+    parent.worker.send({ type: 'message', content });
+  } else {
+    forkWorker(parent, content);
+  }
+}
+
+export async function notifyGoalParent(
+  req: GoalNotifyParentRequest,
+  deps: GoalSupervisorDeps,
+): Promise<GoalNotifyParentResponse | GoalNotifyParentError> {
+  const summary = req.summary.trim();
+  if (!summary) return { ok: false, errorCode: 'missing_summary', error: 'summary is required' };
+
+  const supervisor = findActiveBySessionId(deps.activeSessions, req.supervisorSessionId) ??
+    findGoalSupervisorByGoal(deps.activeSessions, deps.larkAppId, req.goalChatId);
+  if (!supervisor || supervisor.larkAppId !== deps.larkAppId || !supervisor.session.goalSupervisor) {
+    return { ok: false, errorCode: 'supervisor_not_found', error: 'active goal supervisor session not found' };
+  }
+
+  const parent = findGoalParentSession(deps.activeSessions, deps.larkAppId, supervisor);
+  if (!parent) {
+    return { ok: false, errorCode: 'parent_not_active', error: 'active L1 parent session not found' };
+  }
+
+  await injectGoalParentTurn(parent, buildGoalParentNotificationPrompt(supervisor, summary));
+  return {
+    ok: true,
+    parentSessionId: parent.session.sessionId,
+    goalChatId: supervisor.session.goalSupervisor.goalChatId,
+  };
 }
 
 function resolveWorkingDir(req: GoalSuperviseRequest, larkAppId: string, parent?: DaemonSession): { ok: true; workingDir: string } | { ok: false; error: string } {
@@ -118,6 +223,14 @@ export async function startGoalSupervisor(
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
   session.cliId = bot.config.cliId;
+  session.goalSupervisor = {
+    goalChatId: chatId,
+    title,
+    parentChatId,
+    parentRoot: req.parentRoot,
+    parentSessionId: req.parentSessionId,
+    createdAt: new Date(now).toISOString(),
+  };
   sessionStore.updateSession(session);
 
   messageQueue.ensureQueue(anchor);
