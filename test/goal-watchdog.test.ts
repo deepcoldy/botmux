@@ -16,8 +16,9 @@ function task(
   chatId: string | undefined,
   status: TaskView['status'],
   acceptanceCriteria?: AcceptanceCriteria,
+  acceptanceHint?: string,
 ): TaskView {
-  return { taskId, chatId, status, acceptanceCriteria, reports: [] };
+  return { taskId, chatId, status, acceptanceCriteria, acceptanceHint, reports: [] };
 }
 
 function ledger(tasks: TaskView[]): LedgerHandle {
@@ -118,7 +119,7 @@ describe('goal watchdog', () => {
         version: 1,
         artifacts: [{ path: '/tmp/done.txt', kind: 'file', checks: [{ type: 'exists' }, { type: 'contains', text: 'PASS' }] }],
         commands: [{ cmd: 'python3 check.py', cwd: '/repo', expectExitCode: 0 }],
-      })]),
+      }, '{"version":1,"artifacts":[{"path":"/tmp/done.txt"}]}')]),
       now: 10_000,
       lastInjectedAt: new Map(),
       inject: (_target, prompt) => injected.push({ prompt }),
@@ -126,6 +127,7 @@ describe('goal watchdog', () => {
 
     expect(injected[0].prompt).toContain('产物 /tmp/done.txt(file): 存在 + 含"PASS"');
     expect(injected[0].prompt).toContain('命令 `python3 check.py`, cwd=/repo, 期望退出码 0');
+    expect(injected[0].prompt).not.toContain('acceptanceHint=');
   });
 
   it('skips a busy L2 and rate-limits repeated injections', async () => {
