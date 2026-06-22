@@ -33,7 +33,8 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
-import { resumeSession } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession } from './session-manager.js';
+import { parseSpawnRequest } from './session-create.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -266,17 +267,68 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
   if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  if (column) session.kanbanColumn = column;
+  // 待办池(queued)会话被拖到「进行中」= 激活：把暂存内容当首轮发给 CLI 开跑。
+  // activateQueuedSession 内部会清 queued + 把列设成 in_progress + forkWorker。
+  const activeDs = findActiveBySessionId(params.sessionId);
+  if (column === 'in_progress' && activeDs?.session.queued) {
+    await activateQueuedSession(activeDs);
+  } else if (column) {
+    session.kanbanColumn = column;
+  }
   if (position !== null) session.kanbanPosition = position;
   sessionStore.updateSession(session);
   dashboardEventBus.publish({
     type: 'session.update',
     body: {
       sessionId: params.sessionId,
-      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition },
+      // queued 一并下发：激活后 session.queued 已为 false，前端浅合并若不带这个字段
+      // 会残留 queued=true（卡片仍显示「开始」、再点 409）。!!session.queued 始终反映现态。
+      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition, queued: !!session.queued },
     },
   });
   jsonRes(res, 200, { ok: true });
+});
+
+// 待办池会话「开始」：把 parked 会话激活（发首轮、起 CLI），与拖到「进行中」同义。
+ipcRoute('POST', '/api/sessions/:sessionId/start', async (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (!ds.session.queued) return jsonRes(res, 409, { ok: false, error: 'not_queued' });
+  const r = await activateQueuedSession(ds);
+  if (!r.ok) return jsonRes(res, 500, r);
+  sessionStore.updateSession(ds.session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { kanbanColumn: ds.session.kanbanColumn, queued: false } },
+  });
+  jsonRes(res, 200, { ok: true });
+});
+
+// Dashboard「创建会话」spawn：在新建的群里为本 daemon 的 bot 拉起/暂存一条 chat-scope
+// 会话。aggregator 建完群后按模式(一起开工/lead 分配)对每个目标 bot 的 daemon 调一次。
+ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const parsed = parseSpawnRequest(body);
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+  const postBanner = !!(body as any).postBanner;
+  const r = await spawnDashboardSession(activeSessions, undefined, {
+    larkAppId: cachedLarkAppId,
+    chatId: parsed.value.chatId,
+    content: parsed.value.content,
+    column: parsed.value.column,
+    role: parsed.value.role,
+    coworkers: parsed.value.coworkers,
+    title: parsed.value.title,
+    postBanner,
+    ownerOpenId: parsed.value.ownerOpenId,
+    ownerUnionId: parsed.value.ownerUnionId,
+  });
+  if (!r.ok) return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
+  jsonRes(res, 200, r);
 });
 
 // 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，

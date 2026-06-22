@@ -26,6 +26,14 @@ export interface Session {
   kanbanColumn?: string;
   /** 看板列内手动排序位置（拖拽时取相邻卡片中点，允许小数）。 */
   kanbanPosition?: number;
+  /** Dashboard「创建会话」入待办池：会话已建（群已拉、bot 已邀请）但 CLI 还没起，
+   *  内容暂存在 queuedPrompt 里，停在看板「待办池」列。被激活（拖到进行中 / 点
+   *  「开始」/ 群里来第一条消息）时才 forkWorker 把 queuedPrompt 当首轮发给 CLI。
+   *  与 pendingRepo（等选 repo）不同——queued 会持久化，daemon 重启后仍是停起态。*/
+  queued?: boolean;
+  /** queued 会话被激活时要作为首轮发给 CLI 的原始内容（用户在弹框里写的任务）。
+   *  仅 queued===true 时有意义；激活后清空。持久化以扛 daemon 重启。 */
+  queuedPrompt?: string;
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;

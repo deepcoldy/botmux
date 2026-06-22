@@ -798,4 +798,12 @@ export const messages: Record<string, string> = {
   'sandbox.diff_failed': '读取沙盒改动失败：{detail}',
   'sandbox.workingdir_not_found': '找不到会话 workingDir',
   'sandbox.no_changes_left': '沙盒改动层已无改动',
+
+  // ─── Dashboard 创建会话（createSession）─────────────────────────────────────
+  'cmd.createSession.untitled': '新会话',
+  'cmd.createSession.banner': '📋 新会话任务：{content}',
+  'cmd.createSession.lead_preamble_intro': '你是本群的 lead（编排）bot。群里还有这些可协作的 sub bot，可按需把子任务派发给它们（在群里 @ 对应的 bot 即可把它拉起干活，也可用 botmux orchestrate / handoff）：',
+  'cmd.createSession.lead_preamble_no_subs': '（本群暂无其它可协作的 sub bot）',
+  'cmd.createSession.lead_preamble_outro': '由你决定何时、给谁分配什么。下面是用户分配的整体工作：',
+  'cmd.createSession.collab_note': '本群还有 {peers} 在和你一起并行处理同一个任务，注意协作、别重复劳动。',
 };

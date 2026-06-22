@@ -795,4 +795,12 @@ export const messages: Record<string, string> = {
   'sandbox.diff_failed': 'Reading sandbox changes failed: {detail}',
   'sandbox.workingdir_not_found': 'Session workingDir not found',
   'sandbox.no_changes_left': 'The sandbox change layer has no changes left',
+
+  // ─── Dashboard create session ──────────────────────────────────────────────
+  'cmd.createSession.untitled': 'New session',
+  'cmd.createSession.banner': '📋 New session task: {content}',
+  'cmd.createSession.lead_preamble_intro': 'You are the lead (orchestrator) bot in this chat. The following sub-bots are here and available to collaborate — delegate subtasks to them as needed (just @-mention a bot in the chat to spin it up, or use botmux orchestrate / handoff):',
+  'cmd.createSession.lead_preamble_no_subs': '(No other collaborating sub-bots in this chat yet)',
+  'cmd.createSession.lead_preamble_outro': 'You decide when and to whom to assign work. Here is the overall task assigned by the user:',
+  'cmd.createSession.collab_note': '{peers} are also working on this same task in parallel with you — coordinate and avoid duplicating effort.',
 };

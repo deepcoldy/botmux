@@ -248,6 +248,7 @@ function pageHtml(): string {
         <p>${t('sessions.subtitle')}</p>
       </div>
       <div class="sessions-view-controls">
+        <button type="button" id="create-session-btn" class="primary create-session-btn">＋ ${t('sessions.create.button')}</button>
         <span id="kanban-team-stats" class="kanban-team-stats" hidden></span>
         <select id="kanban-team" class="kanban-team-select" aria-label="${t('sessions.kanban.groupTeam')}" hidden></select>
         <div class="segmented kanban-groupby" id="kanban-groupby" role="group" aria-label="${t('sessions.kanban.groupBy')}" hidden>
@@ -318,7 +319,185 @@ function pageHtml(): string {
     <dialog id="drawer"></dialog>
     <dialog id="term-modal" class="term-modal"></dialog>
     <dialog id="history-modal" class="history-modal"></dialog>
+    <dialog id="create-session-modal" class="create-session-modal"></dialog>
   </section>`;
+}
+
+// ─── 创建会话 modal ──────────────────────────────────────────────────────────
+
+interface PickerBot { larkAppId: string; botName: string; }
+
+async function fetchPickerBots(): Promise<PickerBot[]> {
+  try {
+    const r = await fetch('/api/groups');
+    if (!r.ok) return [];
+    const data = await r.json();
+    const bots = Array.isArray(data?.bots) ? data.bots : [];
+    return bots
+      .filter((b: any) => b && typeof b.larkAppId === 'string')
+      .map((b: any) => ({ larkAppId: b.larkAppId, botName: typeof b.botName === 'string' && b.botName ? b.botName : b.larkAppId }));
+  } catch { return []; }
+}
+
+function renderCreateSessionForm(bots: PickerBot[]): string {
+  const botRows = bots.map(b => `
+    <label class="cs-bot"><input type="checkbox" name="bot" value="${escapeHtml(b.larkAppId)}"> <span>${escapeHtml(b.botName)}</span></label>`).join('');
+  return `
+    <article class="cs-card">
+      <header><h3>${t('sessions.create.title')}</h3></header>
+      <form id="cs-form">
+        <label class="form-row">
+          <span>${t('sessions.create.content')}</span>
+          <textarea name="content" rows="5" placeholder="${escapeHtml(t('sessions.create.contentPlaceholder'))}" required></textarea>
+        </label>
+        <fieldset class="cs-bots">
+          <legend>${t('sessions.create.bots')}</legend>
+          ${botRows || `<p class="cs-empty">${t('sessions.create.noBots')}</p>`}
+        </fieldset>
+        <fieldset class="cs-mode">
+          <legend>${t('sessions.create.mode')}</legend>
+          <label><input type="radio" name="mode" value="all" checked> ${t('sessions.create.modeAll')}</label>
+          <label><input type="radio" name="mode" value="lead"> ${t('sessions.create.modeLead')}</label>
+          <small>${t('sessions.create.modeHelp')}</small>
+        </fieldset>
+        <div class="cs-lead-row form-row" hidden>
+          <span>${t('sessions.create.lead')}</span>
+          <select name="lead"></select>
+          <small>${t('sessions.create.leadHelp')}</small>
+        </div>
+        <fieldset class="cs-column">
+          <legend>${t('sessions.create.column')}</legend>
+          <label><input type="radio" name="column" value="in_progress" checked> ${t('sessions.create.columnInProgress')}</label>
+          <label><input type="radio" name="column" value="backlog"> ${t('sessions.create.columnBacklog')}</label>
+          <small>${t('sessions.create.columnHelp')}</small>
+        </fieldset>
+        <details class="cs-advanced">
+          <summary>${t('sessions.create.advanced')}</summary>
+          <label class="form-row">
+            <span>${t('sessions.create.groupName')}</span>
+            <input type="text" name="name" maxlength="60" placeholder="${escapeHtml(t('sessions.create.groupNamePlaceholder'))}">
+          </label>
+          <label class="form-row">
+            <span>${t('sessions.create.workingDir')}</span>
+            <input type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/foo">
+            <small>${t('sessions.create.workingDirHelp')}</small>
+          </label>
+        </details>
+        <div class="actions cs-actions">
+          <button type="submit" class="primary">${t('sessions.create.submit')}</button>
+          <button type="button" id="cs-cancel">${t('sessions.create.cancel')}</button>
+        </div>
+      </form>
+    </article>`;
+}
+
+function setupCreateSessionModal(modal: HTMLDialogElement, btn: HTMLButtonElement): void {
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const bots = await fetchPickerBots();
+      if (bots.length === 0) { alert(t('sessions.create.noBots')); return; }
+      modal.innerHTML = renderCreateSessionForm(bots);
+      modal.showModal();
+      wireCreateSessionForm(modal, bots);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+function wireCreateSessionForm(modal: HTMLDialogElement, bots: PickerBot[]): void {
+  const form = modal.querySelector<HTMLFormElement>('#cs-form')!;
+  const leadRow = modal.querySelector<HTMLElement>('.cs-lead-row')!;
+  const leadSelect = modal.querySelector<HTMLSelectElement>('select[name=lead]')!;
+  const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
+
+  const checkedBotIds = (): string[] =>
+    Array.from(form.querySelectorAll<HTMLInputElement>('input[name=bot]:checked')).map(i => i.value);
+  const currentMode = (): string =>
+    (form.querySelector<HTMLInputElement>('input[name=mode]:checked')?.value) ?? 'all';
+
+  // lead 下拉只列「已勾选」的 bot；勾选/模式变化时重建，尽量保留原选中项。
+  function repopulateLead(): void {
+    const ids = checkedBotIds();
+    const prev = leadSelect.value;
+    // 没勾选任何机器人时，空 <select> 会渲染成一个空白小框，看着像 bug——给一个
+    // 禁用的占位项并禁用整个选择器，提示先去上面勾选。
+    if (ids.length === 0) {
+      leadSelect.innerHTML = `<option value="" disabled selected>${escapeHtml(t('sessions.create.leadPickFirst'))}</option>`;
+      leadSelect.disabled = true;
+      return;
+    }
+    leadSelect.disabled = false;
+    leadSelect.innerHTML = ids.map(id => `<option value="${escapeHtml(id)}">${escapeHtml(nameOf(id))}</option>`).join('');
+    if (ids.includes(prev)) leadSelect.value = prev;
+  }
+  function syncMode(): void {
+    if (currentMode() === 'lead') { leadRow.hidden = false; repopulateLead(); }
+    else { leadRow.hidden = true; }
+  }
+
+  form.querySelectorAll<HTMLInputElement>('input[name=mode]').forEach(r => r.addEventListener('change', syncMode));
+  form.querySelectorAll<HTMLInputElement>('input[name=bot]').forEach(c => c.addEventListener('change', () => {
+    if (currentMode() === 'lead') repopulateLead();
+  }));
+  modal.querySelector<HTMLButtonElement>('#cs-cancel')!.onclick = () => modal.close();
+
+  form.onsubmit = async ev => {
+    ev.preventDefault();
+    const fd = new FormData(form);
+    const content = ((fd.get('content') as string) ?? '').trim();
+    const larkAppIds = checkedBotIds();
+    const mode = currentMode();
+    const column = ((fd.get('column') as string) ?? 'in_progress');
+    const name = ((fd.get('name') as string) ?? '').trim();
+    const bindWorkingDir = ((fd.get('bindWorkingDir') as string) ?? '').trim();
+    const leadLarkAppId = ((fd.get('lead') as string) ?? '');
+    if (!content) { alert(t('sessions.create.errContent')); return; }
+    if (larkAppIds.length === 0) { alert(t('sessions.create.errNoBot')); return; }
+    if (mode === 'lead' && (!leadLarkAppId || !larkAppIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
+    const submitBtn = form.querySelector<HTMLButtonElement>('button[type=submit]');
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = t('sessions.create.submitting'); }
+    try {
+      const r = await fetch('/api/sessions/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content, larkAppIds, mode, column,
+          leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
+          name: name || undefined,
+          bindWorkingDir: bindWorkingDir || undefined,
+        }),
+      });
+      const body = await r.json().catch(() => null);
+      if (r.ok && body?.ok) {
+        renderCreateSessionSuccess(modal, body);
+      } else if (r.status !== 401) {
+        alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = t('sessions.create.submit'); }
+      }
+    } catch (e) {
+      alert(`${t('sessions.create.failed')}: ${e}`);
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = t('sessions.create.submit'); }
+    }
+  };
+}
+
+function renderCreateSessionSuccess(modal: HTMLDialogElement, body: any): void {
+  const link = typeof body.shareLink === 'string' && body.shareLink ? body.shareLink : '';
+  const failedN = Array.isArray(body.failed) ? body.failed.length : 0;
+  const spawnedN = Array.isArray(body.spawned) ? body.spawned.length : 0;
+  const colNote = body.column === 'backlog' ? t('sessions.create.doneBacklog') : t('sessions.create.doneInProgress');
+  const failNote = failedN > 0 ? `<p class="cs-warn">${t('sessions.create.partialFail', { n: String(failedN) })}</p>` : '';
+  modal.innerHTML = `
+    <article class="cs-card">
+      <header><h3>${t('sessions.create.doneTitle')}</h3></header>
+      <p>${escapeHtml(colNote)}（${spawnedN}）</p>
+      ${failNote}
+      ${link ? `<p><a href="${escapeHtml(link)}" target="_blank" rel="noopener">${t('sessions.create.openChat')}</a></p>` : ''}
+      <div class="actions"><button type="button" id="cs-done" class="primary">${t('sessions.create.close')}</button></div>
+    </article>`;
+  modal.querySelector<HTMLButtonElement>('#cs-done')!.onclick = () => modal.close();
 }
 
 export function renderSessionsPage(root: HTMLElement) {
@@ -345,6 +524,9 @@ export function renderSessionsPage(root: HTMLElement) {
   const teamSelect = root.querySelector<HTMLSelectElement>('#kanban-team')!;
   const teamStats = root.querySelector<HTMLElement>('#kanban-team-stats')!;
   const viewButtons = root.querySelectorAll<HTMLButtonElement>('.sessions-view-toggle [data-view]');
+  const createSessionBtn = root.querySelector<HTMLButtonElement>('#create-session-btn')!;
+  const createSessionModal = root.querySelector<HTMLDialogElement>('#create-session-modal')!;
+  setupCreateSessionModal(createSessionModal, createSessionBtn);
 
   const selected = new Set<string>();
   let sortKey = 'lastMessageAt';
@@ -1563,6 +1745,7 @@ export function renderSessionsPage(root: HTMLElement) {
         <button id="history-drawer-btn" type="button">${t('sessions.history.title')}</button>
         ${terminalControlsHtml(terminal)}
         ${canRestartSession(s) ? `<button id="restart-btn" type="button">${t('sessions.restart')}</button>` : ''}
+        ${s.queued && !closed ? `<button id="start-btn" type="button" class="primary">${t('sessions.create.start')}</button>` : ''}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
         <button id="land-btn" type="button">${t('sessions.land')}</button>
@@ -1629,6 +1812,27 @@ export function renderSessionsPage(root: HTMLElement) {
     if (closeBtn) {
       closeBtn.onclick = async () => {
         if (await closeSession(s, closeBtn)) drawer.close();
+      };
+    }
+
+    // 待办池会话「开始」：激活 parked 会话（发首轮、起 CLI）。
+    const startBtn = drawer.querySelector<HTMLButtonElement>('#start-btn');
+    if (startBtn) {
+      startBtn.onclick = async () => {
+        startBtn.disabled = true;
+        try {
+          const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/start`, { method: 'POST' });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok || body.ok === false) {
+            if (r.status !== 401) alert(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`);
+            startBtn.disabled = false;
+            return;
+          }
+          drawer.close();
+        } catch (e) {
+          alert(`${t('sessions.create.startFailed')}: ${e}`);
+          startBtn.disabled = false;
+        }
       };
     }
 

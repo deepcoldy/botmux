@@ -7582,3 +7582,40 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
   .insights-page .srow { transition: none; }
   .insights-page .srow:hover { transform: none; }
 }
+
+/* ─── 创建会话 modal ─────────────────────────────────────────────────────── */
+.create-session-btn { white-space: nowrap; }
+.create-session-modal .cs-card { padding: 20px; }
+.create-session-modal textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  color: var(--fg);
+}
+.create-session-modal fieldset {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 12px 0;
+  padding: 10px 12px;
+}
+.create-session-modal legend { padding: 0 6px; color: var(--muted); font-size: 13px; }
+.create-session-modal .cs-bots {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 4px 12px;
+}
+.create-session-modal .cs-bot { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.create-session-modal .cs-mode label,
+.create-session-modal .cs-column label { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; cursor: pointer; }
+.create-session-modal fieldset small { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.create-session-modal .cs-lead-row { margin: 12px 0; }
+.create-session-modal .cs-lead-row select { margin: 4px 0; padding: 6px 8px; }
+.create-session-modal .cs-advanced { margin: 12px 0; }
+.create-session-modal .cs-advanced summary { cursor: pointer; color: var(--muted); }
+.create-session-modal .cs-empty { color: var(--muted); margin: 0; }
+.create-session-modal .cs-warn { color: var(--warn, #c60); }

@@ -1339,7 +1339,7 @@ const server = createServer(async (req, res) => {
     }
 
     let m: RegExpMatchArray | null;
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -2181,6 +2181,129 @@ const server = createServer(async (req, res) => {
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(upstreamJson ? JSON.stringify(upstreamJson) : upstreamText);
       return;
+    }
+
+    // Dashboard「创建会话」：建飞书群 + 拉选中的 bot，然后按协作模式给各 bot 拉起/暂存
+    // 一条 chat-scope 会话。一起开工=每个被选 bot 各起一条；lead 分配=只起 lead，由它
+    // 在群里 @ 拉起 sub bot。in_progress=立即开跑；backlog=入待办池（parked，等激活）。
+    if (req.method === 'POST' && url.pathname === '/api/sessions/create') {
+      let parsed: {
+        content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
+        leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown;
+      };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const content = typeof parsed.content === 'string' ? parsed.content.replace(/\s+$/u, '') : '';
+      if (!content.trim()) return jsonRes(res, 400, { ok: false, error: 'empty_content' });
+      if (content.length > 8000) return jsonRes(res, 400, { ok: false, error: 'content_too_long' });
+      const selectedIds = Array.isArray(parsed.larkAppIds)
+        ? Array.from(new Set((parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')))
+        : [];
+      if (selectedIds.length === 0) return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
+      const mode = parsed.mode === 'lead' ? 'lead' : parsed.mode === 'all' ? 'all' : null;
+      if (!mode) return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+      const column = parsed.column === 'backlog' ? 'backlog' : parsed.column === 'in_progress' ? 'in_progress' : null;
+      if (!column) return jsonRes(res, 400, { ok: false, error: 'bad_column' });
+      const bindWorkingDir = typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
+        ? parsed.bindWorkingDir.trim() : undefined;
+      const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim().slice(0, 60) : undefined;
+
+      // 解析 creator：lead 模式 = lead bot；一起开工 = pickCreatorForGroup 在选中里挑一个在线的。
+      let creatorLarkAppId: string;
+      if (mode === 'lead') {
+        const leadLarkAppId = typeof parsed.leadLarkAppId === 'string' ? parsed.leadLarkAppId : '';
+        if (!leadLarkAppId || !selectedIds.includes(leadLarkAppId)) {
+          return jsonRes(res, 400, { ok: false, error: 'bad_lead' });
+        }
+        if (!registry.getByAppId(leadLarkAppId)) return jsonRes(res, 503, { ok: false, error: 'lead_offline' });
+        creatorLarkAppId = leadLarkAppId;
+      } else {
+        const pick = pickCreatorForGroup(selectedIds, (id) => {
+          const d = registry.getByAppId(id);
+          return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
+        });
+        if (!pick) return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
+        creatorLarkAppId = pick.creatorLarkAppId;
+      }
+
+      // creator 作用域里的操作者 open_id（首个 ou_ allowedUser）——用于邀请进群 + 转群主 + @通知。
+      // 同时取 on_（union_id，租户内跨 app 稳定）做兜底邀请：lead 模式强制 creator=lead，
+      // 万一 lead 的 allowlist 没有 ou_ 条目，open_id 解析不到、操作者就进不了群——union_id
+      // 不受 app 作用域影响，仍能把人拉进来（createGroupWithBots 走 ownerUnionIds 通道）。
+      const creatorDesc = registry.getByAppId(creatorLarkAppId)!;
+      const allowed = creatorDesc.resolvedAllowedUsers ?? [];
+      const userOpenId = allowed.find(u => u.startsWith('ou_'));
+      const ownerUnionIds = allowed.filter(u => u.startsWith('on_'));
+
+      // 建群（拉所有选中 bot + 邀请操作者 + 转群主 + @通知 + 可选绑 oncall 工作目录）。
+      let groupResp: any = null;
+      try {
+        const groupUpstream = await proxyToDaemon(creatorLarkAppId, '/api/groups/create', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            larkAppIds: selectedIds,
+            userOpenIds: userOpenId ? [userOpenId] : [],
+            ownerUnionIds,
+            transferOwnerTo: userOpenId,
+            notifyOwnerOpenId: userOpenId,
+            bindWorkingDir,
+          }),
+        });
+        groupResp = await groupUpstream.json().catch(() => null);
+        if (!groupUpstream.ok || !groupResp?.ok || typeof groupResp.chatId !== 'string') {
+          return jsonRes(res, 502, { ok: false, error: groupResp?.error ?? `group_create_http_${groupUpstream.status}` });
+        }
+      } catch {
+        return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
+      }
+      const chatId: string = groupResp.chatId;
+      const invalidBotIds: string[] = Array.isArray(groupResp.invalidBotIds) ? groupResp.invalidBotIds : [];
+
+      // spawn 目标：lead 模式只有 lead；一起开工是所有成功入群的选中 bot。
+      const joinedIds = selectedIds.filter(id => !invalidBotIds.includes(id) && !!registry.getByAppId(id));
+      const targets = mode === 'lead'
+        ? (joinedIds.includes(creatorLarkAppId) ? [creatorLarkAppId] : [])
+        : joinedIds;
+      if (targets.length === 0) {
+        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target' });
+      }
+
+      const bots = liveBots();
+      const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
+      const spawned: string[] = [];
+      const failed: Array<{ larkAppId: string; error: string }> = [];
+      await Promise.all(targets.map(async (appId) => {
+        const role = mode === 'lead' ? 'lead' : (targets.length > 1 ? 'collab' : 'solo');
+        // lead 的 coworker = 所有 sub（除自己）；collab 的 coworker = 其它并列 bot（除自己）。
+        const coworkerIds = (mode === 'lead' ? selectedIds : targets).filter(id => id !== appId);
+        const coworkers = coworkerIds.map(id => ({ name: nameOf(id) }));
+        try {
+          const up = await proxyToDaemon(appId, '/api/sessions/spawn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              chatId, content, column, role, coworkers,
+              postBanner: appId === creatorLarkAppId,
+            }),
+          });
+          const b = await up.json().catch(() => null);
+          if (up.ok && b?.ok) spawned.push(appId);
+          else failed.push({ larkAppId: appId, error: b?.error ?? `http_${up.status}` });
+        } catch (e: any) {
+          failed.push({ larkAppId: appId, error: e?.message ?? String(e) });
+        }
+      }));
+
+      return jsonRes(res, 200, {
+        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed,
+      });
     }
 
     // Public SSE — relays aggregator's listener events

@@ -1469,6 +1469,14 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  // 不变式：一旦真正起 CLI，会话就不再是「待办池(queued)」parked 态。无论由哪条
+  // 路径触发（激活按钮 / 拖到进行中 / 群里来消息抢先起会话），都在此清掉 queued
+  // 标记并落盘——否则重启后会被当 parked 恢复成 hasHistory:false 而丢掉真历史。
+  if (ds.session.queued) {
+    ds.session.queued = false;
+    ds.session.queuedPrompt = undefined;
+    sessionStore.updateSession(ds.session);
+  }
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
