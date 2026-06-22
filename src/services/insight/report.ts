@@ -874,7 +874,10 @@ function metricsForTimeline(spans: SafeSpan[]): TurnEfficiencyDiagnostic['metric
     if (isWritePhase(span.phase)) acc.edits++;
     if (span.phase === 'run') acc.runs++;
     if (span.status === 'error') acc.failures++;
-    if (span.durationMs !== undefined) acc.durationMs += span.durationMs;
+    // Exclude interactive-wait tools (ask-question / plan approval): their
+    // duration is user idle, not work — must match aggregate / buildTurnDiagnostics
+    // so the timeline turn metric doesn't show 119s of "waiting for the user".
+    if (span.durationMs !== undefined && !isInteractiveWaitTool(span.tool)) acc.durationMs += span.durationMs;
     return acc;
   }, { reads: 0, edits: 0, runs: 0, failures: 0, durationMs: 0 });
 }

@@ -824,6 +824,10 @@ describe('SafeInsightReport', () => {
       // measured duration is 0 — without the exclusion it would be flagged
       // turn_has_slow_spans, since 119s exceeds the threshold).
       expect(report.turnDiagnostics).toEqual([]);
+      // ...and the detail-view timeline metric for that turn also excludes the
+      // wait (buildTurnTimeline falls back to metricsForTimeline when there is
+      // no diagnostic — that path must exclude interactive-wait tools too).
+      expect(report.turnTimeline?.[0]?.metrics.durationMs).toBe(0);
     });
   }
 });
