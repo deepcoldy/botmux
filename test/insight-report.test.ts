@@ -728,6 +728,48 @@ describe('SafeInsightReport', () => {
     expect(JSON.stringify(spans.turnTimeline)).not.toContain('sk-abcdef1234567890');
   });
 
+  it('does not resurrect a cap-trimmed span turn as an empty narration turn, but keeps genuinely tool-less turns', () => {
+    // turn 0: a FAILING tool (high cap priority). turn 1: narration + a SUCCESS
+    // tool (low priority → trimmed when maxSpans is small). turn 2: narration
+    // only, no tool (genuinely tool-less).
+    const path = join(dir, 'claude-cap.jsonl');
+    writeFileSync(path, [
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 't0' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { id: 'a0', role: 'assistant', content: [
+        { type: 'tool_use', id: 'f0', name: 'Bash', input: { command: 'false' } },
+      ] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'f0', is_error: true, content: 'boom' }] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:03.000Z', message: { role: 'user', content: 't1' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:04.000Z', message: { id: 'a1', role: 'assistant', content: [
+        { type: 'text', text: 'CAPPED_TURN_NARRATION' },
+        { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: '/x/y.ts' } },
+      ] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:05.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'r1', content: 'ok' }] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:06.000Z', message: { role: 'user', content: 't2' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:07.000Z', message: { id: 'a2', role: 'assistant', content: [
+        { type: 'text', text: 'TOOLLESS_TURN_NARRATION' },
+      ] } }),
+    ].join('\n') + '\n', 'utf-8');
+    resolvedPath = path;
+
+    const report = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'spans', maxSpans: 1, now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    const turnIndexes = report.turnTimeline.map(t => t.turnIndex);
+    // turn 1 has a real span trimmed by the cap → must NOT become a phantom 0-op
+    // turn, and its narration must not leak past the cap.
+    expect(turnIndexes).not.toContain(1);
+    expect(JSON.stringify(report.turnTimeline)).not.toContain('CAPPED_TURN_NARRATION');
+    // turn 2 is genuinely tool-less → its narration still surfaces under the cap.
+    expect(turnIndexes).toContain(2);
+    const t2 = report.turnTimeline.find(t => t.turnIndex === 2);
+    expect(t2?.agentSay?.text).toContain('TOOLLESS_TURN_NARRATION');
+    expect(t2?.events).toEqual([]);
+  });
+
   it('renders a tool-less narration turn in the conversation replay (turn with no span)', () => {
     resolvedPath = writeClaudeNarrationFixture();
     const convo = buildSafeInsightConversation({
