@@ -10,7 +10,7 @@
 // No DAG: subtasks are flat (no deps); the lifecycle pipeline IS the progress
 // model. The "核验" stage lights amber while a report awaits verification — exactly
 // the gap the goal-watchdog fills, made visible.
-import { escapeHtml, relTime, loadNameMaps, botNameForOpenId, chatNameForId } from './ui.js';
+import { escapeHtml, relTime, loadNameMaps, botNameForOpenId, botNameForAppId, chatNameForId } from './ui.js';
 
 interface AcceptanceCheck { type: 'exists' | 'contains'; text?: string }
 interface AcceptanceArtifact { path: string; kind?: string; checks: AcceptanceCheck[] }
@@ -71,14 +71,14 @@ function goalName(g: BoardGoal): string {
   const custom = g.title && !/^Goal charter:/.test(g.title) ? cleanTitle(g.title) : '';
   return custom || chatNameForId(g.goalChatId) || shortId(g.goalChatId);
 }
-/** Resolve an actor field to a friendly name: registry name by open_id → a
- *  human label as-is (checkedBy is sometimes a label, not an open_id) → short id. */
+/** Resolve an actor field (checkedBy/worker) to a friendly agent name. checkedBy
+ *  may be an open_id, a larkAppId (cli_…), or already a plain label (e.g.
+ *  "goal-watchdog" / "claude-loopy-L2"): try the registry by open_id then by
+ *  app_id, else show the label as-is, else short id. */
 function botName(v?: string): string {
   if (!v) return '—';
-  const resolved = botNameForOpenId(v);
-  if (resolved) return resolved;
-  if (!v.startsWith('ou_')) return v; // already a human label — don't truncate
-  return shortId(v);
+  return botNameForOpenId(v) || botNameForAppId(v)
+    || (v.startsWith('ou_') || v.startsWith('cli_') ? shortId(v) : v);
 }
 function fmtDur(ms?: number): string {
   if (ms === undefined || ms < 0) return '';
@@ -133,8 +133,10 @@ function stageCell(t: BoardTask, key: string): string {
 function taskRow(t: BoardTask, selected: boolean): string {
   const verdictTag = t.status === 'rejected' && t.rejectReason
     ? `<span class="gb-reason">${escapeHtml(t.rejectReason)}</span>` : '';
-  const autoTag = t.autoReconciled
-    ? '<span class="gb-via gb-via-auto" title="监管者机器对账自动裁定（非人工）">🤖 自动对账</span>' : '';
+  const provTag = t.status !== 'accepted' ? ''
+    : t.autoReconciled
+      ? '<span class="gb-via gb-via-auto" title="goal-watchdog 机器对账：自动跑结构化验收检查后裁定">🤖 自动对账</span>'
+      : '<span class="gb-via gb-via-agent" title="监管 agent 自主核验后裁定">🧠 自主验收</span>';
   const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
     : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
   const primary = t.title
@@ -143,7 +145,7 @@ function taskRow(t: BoardTask, selected: boolean): string {
   return `<tr class="gb-trow${selected ? ' sel' : ''}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId)}">
     <td class="gb-task-id">${primary}${accTag}</td>
     ${STAGES.map(s => stageCell(t, s.key)).join('')}
-    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${autoTag}${verdictTag}</td>
+    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${provTag}${verdictTag}</td>
   </tr>`;
 }
 function gridHtml(g: BoardGoal, selTask: string | null): string {
@@ -188,7 +190,7 @@ function trailHtml(t: BoardTask): string {
     return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">worker 尚未报告</p>';
   }
   const parts: string[] = [];
-  if (t.checkedBy) parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}${t.autoReconciled ? ' <span class="gb-via gb-via-auto" title="机器对账，非人工">🤖 自动对账</span>' : ' <span class="gb-via gb-via-human" title="人工经 CLI 裁定">👤 人工</span>'}</div>`);
+  if (t.checkedBy) parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}${t.autoReconciled ? ' <span class="gb-via gb-via-auto" title="goal-watchdog 机器对账，确定性裁定">🤖 自动对账</span>' : ' <span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠 自主验收</span>'}</div>`);
   if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
   if (t.ranCommands?.length) parts.push(`<div class="gb-kv"><span>跑了命令</span><ul>${t.ranCommands.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul></div>`);
   if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e =>
@@ -201,7 +203,8 @@ function attemptsHtml(t: BoardTask): string {
     const v = a.verdict === 'accepted' ? '<span class="gb-pill gb-pill-accepted">已验收</span>'
       : a.verdict === 'rejected' ? '<span class="gb-pill gb-pill-rejected">已驳回</span>'
         : '<span class="gb-pill gb-pill-reported">待核验</span>';
-    const via = a.verdictVia === 'reconcile' ? '<span class="gb-via gb-via-auto" title="机器对账">🤖</span>' : '';
+    const via = a.verdictVia === 'reconcile' ? '<span class="gb-via gb-via-auto" title="机器对账">🤖</span>'
+      : a.verdict ? '<span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠</span>' : '';
     return `<li><div class="gb-att-head"><span class="gb-att-n">#${i + 1}</span>${v}${via}<span class="gb-att-time">${fmtTs(a.ts)}</span></div>
       <div class="gb-att-sum">${escapeHtml(a.summary)}</div>
       ${a.reason ? `<div class="gb-att-reason">原因：${escapeHtml(a.reason)}</div>` : ''}</li>`;
