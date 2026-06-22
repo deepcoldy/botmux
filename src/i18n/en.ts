@@ -605,7 +605,7 @@ export const messages: Record<string, string> = {
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',
   'worker.crash_loop_stopped': '⚠️ {cliName} crashed {count} times in 1 minute. Auto-restart disabled. Send a message to retry.',
-  'worker.crash_diagnostic_terminal': 'The web terminal now preserves the last startup output. Fix the issue, then send a new message to retry.',
+  'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
