@@ -71,7 +71,7 @@ function ds(input: {
 }
 
 describe('goal watchdog', () => {
-  it('groups only dispatched/rejected tasks by goal chat', () => {
+  it('groups non-accepted tasks by goal chat', () => {
     const grouped = pendingGoalTasks([
       task('t1', 'oc_a', 'dispatched'),
       task('t2', 'oc_a', 'rejected'),
@@ -81,7 +81,7 @@ describe('goal watchdog', () => {
     ]);
 
     expect([...grouped.keys()]).toEqual(['oc_a']);
-    expect(grouped.get('oc_a')?.map((t) => t.taskId)).toEqual(['t1', 't2']);
+    expect(grouped.get('oc_a')?.map((t) => t.taskId)).toEqual(['t1', 't2', 't3']);
   });
 
   it('injects only into an active chat-scope goal supervisor session', async () => {
@@ -128,6 +128,22 @@ describe('goal watchdog', () => {
     expect(injected[0].prompt).toContain(GOAL_WATCHDOG_PROMPT_PREFIX);
     expect(injected[0].prompt).toContain('t-legacy');
     expect(injected[0].prompt).toContain('acceptanceHint=人工验收: 读取结果文件并确认 PASS');
+  });
+
+  it('does not inject L2 for reported legacy tasks', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([task('t-reported-legacy', 'oc_goal', 'reported', undefined, '人工验收')]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      inject: () => { throw new Error('reported legacy should be handled by report wake path, not watchdog L2 fallback'); },
+    });
+
+    expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'empty', pendingTaskIds: [] }]);
   });
 
   it('skips a busy L2 and rate-limits repeated injections', async () => {
@@ -261,6 +277,63 @@ describe('goal watchdog', () => {
       expect(notifications.map((n) => n.kind)).toEqual(['accepted']);
       expect(led.task('task-pass')?.status).toBe('accepted');
       expect(led.task('task-pass')?.reports).toHaveLength(1);
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reconciles structured reported tasks using the existing report', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-reported-'));
+    try {
+      const out = join(baseDir, 'done.txt');
+      writeFileSync(out, 'PASS');
+      const led = openLedger({ baseDir });
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-reported',
+        chatId: 'oc_goal',
+        ts: 1,
+        idempotencyKey: 'dispatched:task-reported',
+        payload: {
+          taskId: 'task-reported',
+          workerOpenIds: ['ou_worker'],
+          acceptanceCriteria: {
+            version: 1,
+            artifacts: [{ path: out, checks: [{ type: 'exists' }, { type: 'contains', text: 'PASS' }] }],
+          },
+        },
+      });
+      led.append({
+        type: 'TaskReported',
+        actor: 'worker',
+        taskId: 'task-reported',
+        chatId: 'oc_goal',
+        ts: 2,
+        idempotencyKey: 'reported:report-existing',
+        payload: {
+          taskId: 'task-reported',
+          reportId: 'report-existing',
+          workerOpenId: 'ou_worker',
+          evidence: [{ kind: 'path', path: out }],
+          summary: 'worker reported PASS',
+        },
+      });
+      const notifications: any[] = [];
+      const results = await runGoalWatchdogOnce({
+        larkAppId: 'cli_main',
+        activeSessions: new Map(),
+        ledger: led,
+        now: 10_000,
+        lastInjectedAt: new Map(),
+        inject: () => { throw new Error('should not inject L2 for structured report'); },
+        notify: (event) => notifications.push(event),
+      });
+
+      expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'reconciled', pendingTaskIds: ['task-reported'] }]);
+      expect(notifications.map((n) => [n.kind, n.result.reportId])).toEqual([['accepted', 'report-existing']]);
+      expect(led.task('task-reported')?.status).toBe('accepted');
+      expect(led.task('task-reported')?.reports).toHaveLength(1);
     } finally {
       rmSync(baseDir, { recursive: true, force: true });
     }
