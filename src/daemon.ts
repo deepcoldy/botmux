@@ -129,7 +129,7 @@ import { loadEffectInputSidecar } from './workflows/effect-input.js';
 import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
 import type { RawParamInput } from './workflows/params.js';
-import { startGoalSupervisor } from './core/goal-supervisor.js';
+import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
 import { runGoalWatchdogForGoal, shouldTriggerGoalWatchdogOnSessionBoundary, startGoalWatchdog } from './core/goal-watchdog.js';
 import type { AbortCancelReason } from './workflows/runtime.js';
 import {
@@ -1930,6 +1930,39 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
     return jsonRes(res, status, result);
   }
   return jsonRes(res, 200, result);
+});
+
+// Internal: L2 supervisor notifies its L1 parent without sending a Lark
+// self-message. The parent coordinates are stored structurally on the L2
+// session by goal supervise; this route only injects into an active L1 session.
+ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
+  let raw: {
+    supervisorSessionId?: unknown;
+    goalChatId?: unknown;
+    summary?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const summary = typeof raw.summary === 'string' ? raw.summary.trim() : '';
+  if (!summary) return jsonRes(res, 400, { ok: false, errorCode: 'missing_summary', error: 'summary is required' });
+  try {
+    const result = await notifyGoalParent({
+      supervisorSessionId: typeof raw.supervisorSessionId === 'string' && raw.supervisorSessionId.trim() ? raw.supervisorSessionId.trim() : undefined,
+      goalChatId: typeof raw.goalChatId === 'string' && raw.goalChatId.trim() ? raw.goalChatId.trim() : undefined,
+      summary,
+    }, { larkAppId: currentDaemonLarkAppId, activeSessions });
+    if (!result.ok) {
+      const status = result.errorCode === 'parent_not_active' || result.errorCode === 'supervisor_not_found' ? 404 : 400;
+      return jsonRes(res, status, result);
+    }
+    return jsonRes(res, 200, result);
+  } catch (err: any) {
+    logger.warn(`[goal-notify-parent] IPC failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 // Internal: ask whichever daemon owns the goal's L2 supervisor to inspect

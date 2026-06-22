@@ -1638,6 +1638,14 @@ interface SessionData {
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   whiteboardId?: string;
+  goalSupervisor?: {
+    goalChatId: string;
+    title: string;
+    parentChatId: string;
+    parentRoot?: string;
+    parentSessionId?: string;
+    createdAt: string;
+  };
   // Markers that a real CLI ever ran in this session (vs a daemon-command
   // scratch placeholder). Persisted by the daemon; only presence is checked
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
@@ -4790,6 +4798,7 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
       [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
       [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
+  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>]
   botmux goal charter current --goal <goal群chatId> [--create] [--title <标题>]
   botmux goal charter read --goal <goal群chatId> [--json]
   botmux goal charter update --goal <goal群chatId> --expected-updated-at <ts> <完整内容>
@@ -4803,6 +4812,10 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   }
   if (sub === 'charter') {
     await cmdGoalCharter(rest[0] ?? 'current', rest.slice(1));
+    return;
+  }
+  if (sub === 'notify-parent') {
+    await cmdGoalNotifyParent(rest);
     return;
   }
   if (sub !== 'supervise') {
@@ -4879,6 +4892,68 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   try { body = await res.json(); } catch { /* */ }
   if (!res.ok || !body?.ok) {
     console.error(`goal supervise 失败: ${body?.error ?? res.statusText}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ success: true, ...body }, null, 2));
+}
+
+async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const sessionIdArg = argValue(rest, '--session-id');
+  const goalArg = argValue(rest, '--goal');
+  const summaryFile = argValue(rest, '--summary-file');
+  let summary = argValue(rest, '--summary') ?? '';
+  if (summaryFile) {
+    if (!existsSync(summaryFile)) { console.error(`文件不存在: ${summaryFile}`); process.exit(1); }
+    summary = readFileSync(summaryFile, 'utf-8');
+  }
+  if (!summary.trim()) {
+    console.error('goal notify-parent 需要 --summary <text> 或 --summary-file <path>');
+    process.exit(1);
+  }
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 L2 会话。请在 L2 CLI 会话里运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+  const sessions = loadSessions();
+  const supervisor = sessions.get(sid);
+  if (!supervisor) {
+    console.error(`未找到会话: ${sid}`);
+    process.exit(1);
+  }
+  const larkAppId = supervisor.larkAppId;
+  if (!larkAppId) {
+    console.error('无法推断 L2 会话所属 bot。');
+    process.exit(1);
+  }
+  const goalChatId = goalArg ?? supervisor.goalSupervisor?.goalChatId ?? supervisor.chatId;
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) {
+    console.error(`未找到在线 daemon (larkAppId=${larkAppId})。`);
+    process.exit(1);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/notify-parent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        supervisorSessionId: sid,
+        goalChatId,
+        summary: summary.trim(),
+      }),
+    });
+  } catch (err: any) {
+    console.error(`无法连接 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    process.exit(1);
+  }
+  let body: any = {};
+  try { body = await res.json(); } catch { /* */ }
+  if (!res.ok || !body?.ok) {
+    console.error(`goal notify-parent 失败: ${body?.error ?? res.statusText}`);
     process.exit(1);
   }
   console.log(JSON.stringify({ success: true, ...body }, null, 2));
