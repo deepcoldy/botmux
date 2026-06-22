@@ -26,6 +26,7 @@ const zhSidebar = [
       { text: 'Web 终端', link: '/web-terminal' },
       { text: '多机器人协作', link: '/multi-bot' },
       { text: '多话题协作模式', link: '/multi-topic' },
+      { text: '本地白板', link: '/whiteboard' },
       { text: '角色与团队', link: '/roles' },
       { text: 'tmux 会话常驻', link: '/tmux' },
       { text: '会话接入 Adopt', link: '/adopt' },
@@ -98,6 +99,7 @@ const enSidebar = [
       { text: 'Web Terminal', link: '/en/web-terminal' },
       { text: 'Multi-Bot Collaboration', link: '/en/multi-bot' },
       { text: 'Multi-Topic Orchestration', link: '/en/multi-topic' },
+      { text: 'Local Whiteboard', link: '/en/whiteboard' },
       { text: 'Roles & Teams', link: '/en/roles' },
       { text: 'tmux Session Persistence', link: '/en/tmux' },
       { text: 'Adopt a Session', link: '/en/adopt' },
@@ -170,7 +172,7 @@ export default defineConfig({
   search: { codeBlocks: true },
   markdown: { link: { checkDeadLinks: true } },
   builderConfig: {
-    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v22/" },
+    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v23/" },
   },
   themeConfig: {
     editLink: {
