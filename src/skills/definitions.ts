@@ -1263,10 +1263,17 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 - 合格 → \`botmux delivery accept --task <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject --task <taskId> --reason ... --retry-brief ...\`（自动回推 worker 话题重做）。
 
 ### L2-3.5 兜底巡检（被 \`[goal-watchdog]\` 唤醒，不等 worker report）
-**worker 不保证守 report 协议**（实测有 worker 建对了产物却不 report）。daemon 有个 goal-watchdog 定时（约 5min）扫账本，发现本 goal 有 \`dispatched/rejected\` 未 accepted 的任务，就 daemon-native 注入一条 **\`[goal-watchdog]\`** 前缀消息唤你巡检。**收到 \`[goal-watchdog]\` 前缀时，主动核验、别被动等 report**：
-1. \`botmux delivery list --goal <goalChatId> --status dispatched --older-than 5m\` 扫超时未交付（rejected 未重交的也一并看）。
+**worker 不保证守 report 协议**（实测有 worker 建对了产物却不 report）。daemon 有个 goal-watchdog 会唤你巡检：worker turn 结束（idle/exit）即时触发、或定时（约 5min）兜底，发现本 goal 有 \`dispatched/rejected\` 未 accepted 的任务就 daemon-native 注入一条 **\`[goal-watchdog]\`** 前缀消息，**消息正文已列出待处理的 taskId + 各自的 acceptanceHint**。**收到 \`[goal-watchdog]\` 前缀时，主动核验、别被动等 report**：
+1. 处理 **\`[goal-watchdog]\` 消息里列出的每个 pending task**（也可 \`botmux delivery list --goal <goalChatId> --status dispatched\` 复核，**但别加 \`--older-than\`**——daemon 既然唤了你就代表有 dispatched/rejected 在等，按年龄过滤会把刚触发的任务漏掉、白唤一趟；\`--older-than\` 只留给 L2-4 那种你自己主动扫"长期卡住"的场景）。rejected 未重交的也一并看。
 2. 逐个读它的 \`acceptanceHint\`（JSON v1）**主动核验产物**——按 artifacts 的 checks（exists/contains）读产物、按 commands 跑校验：
-   - **全通过 → 直接 \`delivery accept\`**（worker 没 report 也认；\`--evidence-checked\` 写核验了啥、\`--ran-command\` 写实际命令）。这就是兜底闭环。
+   - **全通过 → 先落一笔 L2 自证 report、再 accept**（⚠️ \`delivery accept\` 必须挂在一笔 report 上才能执行——worker 没 report 时由你 L2 补一笔自证 report，把你的核验当证据入账。这是兜底能 accept 的关键，别直接 accept 会报"还没有 report"）：
+     \`\`\`bash
+     # ① L2 自证 report（worker 没报，你代它把"已核验产物达标"落账，拿到 reportId）
+     botmux report --task <id> --artifact <核验过的产物绝对路径> --summary "L2 兜底核验：worker 未自报，已主动核验产物达标"
+     # ② 再 accept 这笔 report，留硬证据
+     botmux delivery accept --task <id> --report <reportId> --evidence-checked "<逐条对 checks 写结果>" --ran-command "<实际跑的核验命令>"
+     \`\`\`
+     这才是兜底闭环：worker 没 report 也能验收，但 accept 必挂在一笔带证据的 report 上、账本才一致。
    - **产物在但 check 没过 → \`delivery reject --reason check_failed --retry-brief ...\`** 回推 worker 重做。
    - **产物不存在 → 催 worker**（\`botmux send --chat-id <goalChatId> --mention <worker>\` 提醒它干完 + report）。
    - **acceptanceHint 不是 JSON v1（解析不了）→ 只催 report、别臆测 done**。
