@@ -602,7 +602,8 @@ function buildSessionHot(spans: RawInsightSpan[], cwd: string | undefined): Safe
     // raw command text, which must not cross into the summary/overview (redaction
     // invariant: command previews live only in per-session detail).
     if (span.phase === 'run' && span.intent && span.intent.kind !== 'unknown') {
-      const label = [span.intent.kind, span.intent.subject].filter(Boolean).join(' ');
+      const subj = span.intent.subject;
+      const label = subj ? (subj.startsWith(span.intent.kind) ? subj : `${span.intent.kind} ${subj}`) : span.intent.kind;
       if (label) {
         const c = cmds.get(label) ?? { cmd: label, runs: 0, fails: 0 };
         c.runs++;

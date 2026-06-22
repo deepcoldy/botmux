@@ -1466,6 +1466,9 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   let sessSort: SessSort = SESS_SORT_KEYS.includes(hp.sort as SessSort) ? hp.sort as SessSort : 'recent';
   let sessLayout: 'card' | 'table' = hp.layout === 'table' ? 'table' : 'card';
   const openHot = new Set<string>();
+  let paletteOpen = false;
+  let paletteQ = '';
+  let paletteIdx = 0;
 
   root.innerHTML = `
     <section class="page insights-page">
@@ -1475,7 +1478,10 @@ export function renderInsightsPage(root: HTMLElement): () => void {
           <h1>${escapeHtml(t('insights.title'))}</h1>
           <p>${escapeHtml(t('insights.subtitle'))}</p>
         </div>
-        <button type="button" id="insight-refresh" class="primary">${escapeHtml(t('insights.refresh'))}</button>
+        <div class="insight-head-acts">
+          <button type="button" id="insight-palette-open" class="ins-clear">${escapeHtml(t('insights.paletteOpen'))}</button>
+          <button type="button" id="insight-refresh" class="primary">${escapeHtml(t('insights.refresh'))}</button>
+        </div>
       </div>
       <form id="insight-filters" class="filters insights-filters">
         <input type="search" name="q" placeholder="${escapeHtml(t('insights.search'))}">
@@ -1512,6 +1518,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
       <div class="insight-panel" role="tabpanel" data-tabpanel="dist" hidden><div id="insight-dist"></div></div>
       <div class="insight-panel" role="tabpanel" data-tabpanel="hot" hidden><div id="insight-hot"></div></div>
       <div id="insight-modal" class="insight-modal" hidden></div>
+      <div id="insight-palette" class="insight-palette" hidden></div>
       <div id="insight-tip" class="ins-tip" role="tooltip" hidden></div>
     </section>`;
 
@@ -1533,6 +1540,8 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   const clearBtn = root.querySelector<HTMLButtonElement>('#insight-clear')!;
   const tabbar = root.querySelector<HTMLElement>('#insight-tabbar')!;
   const panels = [...root.querySelectorAll<HTMLElement>('.insight-panel')];
+  const paletteEl = root.querySelector<HTMLElement>('#insight-palette')!;
+  const paletteOpenBtn = root.querySelector<HTMLButtonElement>('#insight-palette-open')!;
   const listView = root.querySelector<HTMLElement>('#insight-list-view')!;
   const detailView = root.querySelector<HTMLElement>('#insight-detail-view')!;
   const backBtn = root.querySelector<HTMLButtonElement>('#insight-back')!;
@@ -1568,6 +1577,47 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (selectedId) p.sess = selectedId;
     try { history.replaceState(null, '', buildInsightsHash(p)); } catch { /* ignore */ }
   }
+
+  // ⌘K command palette: jump to a tab or search/open a session.
+  type PaletteItem = { type: 'tab' | 'session'; key: string; label: string; sub: string };
+  function paletteItems(): PaletteItem[] {
+    const ql = paletteQ.trim().toLowerCase();
+    const tabs: PaletteItem[] = INSIGHT_TABS
+      .map(tb => ({ type: 'tab' as const, key: tb.key, label: t(tb.label), sub: t('insights.paletteTabs') }))
+      .filter(it => !ql || it.label.toLowerCase().includes(ql));
+    const sess: PaletteItem[] = records
+      .filter(r => { const s = r.session; return !ql || `${sessionTitle(s)} ${botDisplayName(s)} ${s.cliId ?? ''}`.toLowerCase().includes(ql); })
+      .slice(0, 20)
+      .map(r => ({ type: 'session' as const, key: String(r.session.sessionId), label: sessionTitle(r.session), sub: `${botDisplayName(r.session)} · ${r.session.cliId ?? '-'}` }));
+    return [...tabs, ...sess];
+  }
+  function choosePalette(type: string, key: string): void {
+    closePalette();
+    if (type === 'tab') { tab = key as InsightTab; selectedId = null; paint(); }
+    else { tab = 'sessions'; showTab(); void selectSession(key); }
+  }
+  function paintPalette(): void {
+    if (!paletteOpen) { paletteEl.hidden = true; paletteEl.innerHTML = ''; document.body.classList.remove('insight-modal-open'); return; }
+    const items = paletteItems();
+    if (paletteIdx >= items.length) paletteIdx = Math.max(0, items.length - 1);
+    paletteEl.hidden = false;
+    document.body.classList.add('insight-modal-open');
+    paletteEl.innerHTML = `<div class="modal-backdrop" data-pal-close></div>
+      <div class="palette-panel" role="dialog" aria-modal="true">
+        <input type="search" class="palette-input" placeholder="${escapeHtml(t('insights.palettePlaceholder'))}" value="${escapeHtml(paletteQ)}">
+        <div class="palette-list">${items.length ? items.map((it, i) =>
+          `<button type="button" class="palette-item${i === paletteIdx ? ' on' : ''}" data-pal-type="${it.type}" data-pal-key="${escapeHtml(it.key)}" data-pal-i="${i}">
+            <span class="pal-label">${escapeHtml(it.label)}</span><span class="pal-sub">${escapeHtml(it.sub)}</span>
+          </button>`).join('') : `<p class="mut palette-empty">${escapeHtml(t('insights.paletteEmpty'))}</p>`}</div>
+      </div>`;
+    const input = paletteEl.querySelector<HTMLInputElement>('.palette-input');
+    if (input) { input.focus(); input.oninput = () => { paletteQ = input.value; paletteIdx = 0; paintPalette(); }; }
+    paletteEl.querySelectorAll<HTMLElement>('[data-pal-close]').forEach(el => el.addEventListener('click', closePalette));
+    paletteEl.querySelectorAll<HTMLButtonElement>('.palette-item').forEach(btn =>
+      btn.addEventListener('click', () => choosePalette(btn.dataset.palType ?? 'tab', btn.dataset.palKey ?? '')));
+  }
+  function openPalette(): void { paletteOpen = true; paletteQ = ''; paletteIdx = 0; paintPalette(); }
+  function closePalette(): void { paletteOpen = false; paintPalette(); }
 
   // Project <select> options reflect the severity+search+time scoped set (project
   // pick itself NOT applied), so the dropdown always shows reachable projects.
@@ -1976,8 +2026,25 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     paint();
   });
 
-  // Esc closes the full-text prompt modal.
-  const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && modalTurn !== null) closeModal(); };
+  paletteOpenBtn.addEventListener('click', openPalette);
+
+  // ⌘K opens the palette; Esc closes palette/modal; arrows + Enter drive the palette.
+  const onKey = (e: KeyboardEvent) => {
+    if ((e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      if (paletteOpen) closePalette(); else openPalette();
+      return;
+    }
+    if (paletteOpen) {
+      const items = paletteItems();
+      if (e.key === 'Escape') { e.preventDefault(); closePalette(); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); paletteIdx = Math.min(items.length - 1, paletteIdx + 1); paintPalette(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); paletteIdx = Math.max(0, paletteIdx - 1); paintPalette(); }
+      else if (e.key === 'Enter') { e.preventDefault(); const it = items[paletteIdx]; if (it) choosePalette(it.type, it.key); }
+      return;
+    }
+    if (e.key === 'Escape' && modalTurn !== null) closeModal();
+  };
   document.addEventListener('keydown', onKey);
 
   void loadNameMaps().then(() => { if (!disposed) paint(); });

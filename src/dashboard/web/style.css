@@ -7060,6 +7060,19 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .hot-sess { display: flex; flex-wrap: wrap; gap: 5px; padding: 2px 8px 9px; }
 .insights-page .hot-sesslink { appearance: none; -webkit-appearance: none; border: 1px solid var(--line); background: var(--ins-inner); color: var(--fg); border-radius: 6px; padding: 3px 9px; font-size: 11px; cursor: pointer; max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .insights-page .hot-sesslink:hover { border-color: var(--acc); color: var(--acc); }
+/* ⌘K command palette */
+.insights-page .insight-head-acts { display: flex; align-items: center; gap: 8px; }
+.insights-page .insight-palette { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-start; justify-content: center; }
+.insights-page .insight-palette[hidden] { display: none; }
+.insights-page .insight-palette .modal-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .5); }
+.insights-page .palette-panel { position: relative; margin-top: 12vh; width: min(560px, 92vw); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+.insights-page .palette-input { width: 100%; box-sizing: border-box; background: transparent; border: 0; border-bottom: 1px solid var(--line); color: var(--fg); font: inherit; font-size: 15px; padding: 14px 16px; outline: none; }
+.insights-page .palette-list { max-height: 50vh; overflow: auto; padding: 6px; display: grid; gap: 2px; }
+.insights-page .palette-item { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; width: 100%; appearance: none; -webkit-appearance: none; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; padding: 9px 12px; border-radius: 8px; }
+.insights-page .palette-item.on, .insights-page .palette-item:hover { background: var(--accent-soft); }
+.insights-page .pal-label { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.insights-page .pal-sub { font-size: 11px; color: var(--mut); white-space: nowrap; flex: 0 0 auto; }
+.insights-page .palette-empty { padding: 16px; text-align: center; }
 
 /* Sessions tab: full-width list ⇆ full-width detail (mirrors ASI 会话, replaces
    the cramped master-detail side panel) */
