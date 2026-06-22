@@ -5,7 +5,7 @@
 import { fork, execSync, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
@@ -1023,10 +1023,7 @@ export function killWorker(ds: DaemonSession): void {
  */
 function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
-  // A crash diagnostic shell parks under bmx-diag-<sid>. If the worker was hard
-  // -killed (OOM/SIGKILL) while parked, its killCli() never ran and the shell
-  // leaks; tear it down here too. No-op when absent / for non-tmux backends.
-  try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId)); } catch { /* benign */ }
+  reclaimParkedCrashDiagnostic(ds);
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
@@ -1035,6 +1032,20 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
   }
+}
+
+/**
+ * Reclaim a session's parked crash-diagnostic shell (`bmx-diag-<sid>`) and its
+ * captured `.ansi` file. The worker normally tears these down itself (killCli /
+ * suspend / next-message retry), but it CAN'T when it is hard-killed
+ * (OOM/SIGKILL) while parked — then the daemon must do it, on the next refork
+ * (forkWorker) or on close (destroyOrphanedBackingSession). Both ops are no-ops
+ * when absent, so this is safe to call unconditionally for tmux sessions.
+ */
+function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
+  if (getSessionPersistentBackendType(ds) !== 'tmux') return;
+  try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId)); } catch { /* benign */ }
+  try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
@@ -1512,6 +1523,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     ds.session.suspendedColdResume = undefined;
     sessionStore.updateSession(ds.session);
   }
+
+  // Re-establishing a worker also reclaims any crash-diagnostic shell a prior
+  // worker left parked but couldn't clean (hard-killed while parked, daemon
+  // still alive → next message reforks here). The fresh CLI spawns under the
+  // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
+  if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
 
   ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);
   // Claude Code blocks on the interactive folder-trust dialog the first time
@@ -2220,6 +2237,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             // same worker to destroy the diagnostic shell and retry.
             restartCounts.delete(key);
             ds.lastScreenStatus = 'idle';
+            // Survive a daemon restart: mark this as a lazy cold-resume so
+            // restore keeps the session active (re-spawns the CLI on the next
+            // message) instead of zombie-closing it when the real bmx-<sid> is
+            // found missing. ds.hasHistory is already true (set at the top of
+            // claude_exit); forkWorker clears suspendedColdResume on re-spawn.
+            ds.session.suspendedColdResume = true;
+            sessionStore.updateSession(ds.session);
           } else {
             // Non-tmux or failed diagnostic parking: keep the historical
             // cleanup path so we do not leave an unusable worker around.
