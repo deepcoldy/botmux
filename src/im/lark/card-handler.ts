@@ -887,8 +887,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const chatId = ds?.chatId ?? closedForCtx?.chatId;
     // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo / 手动填目录
     // 起会话——与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    // 注意：worktree_toggle_mode 故意不在此列——它持久写 bot 级 worktreeMultiPicker
+    // （影响该 bot 所有后续会话），属管理动作，必须走 canOperate，不能让 talk-only/
+    // chat-granted 用户借「开自己的 pending 卡」绕过去改 bot 配置。
     const pendingRepoOwnerException =
-      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit' || value.action === 'worktree_toggle_mode') && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -1604,7 +1607,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const r = await applyConfigField(ds.larkAppId, spec, next);
       if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
       const projects = lastRepoScan.get(ds.chatId) ?? [];
-      if (ds.repoCardMessageId && ds.larkAppId) { try { deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
+      // await so a rejected delete is caught here (not an unhandled rejection);
+      // a missing/already-gone card is fine — we post the fresh one regardless.
+      if (ds.repoCardMessageId && ds.larkAppId) { try { await deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
       const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
       ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
       return { toast: { type: 'info', content: t(next ? 'card.repo.toast_worktree_mode_switched' : 'card.repo.toast_worktree_mode_switched_back', undefined, locDs) } };

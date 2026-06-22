@@ -128,6 +128,7 @@ import { createSession, closeSession } from '../src/services/session-store.js';
 import { createRepoWorktree, removeRepoWorktree } from '../src/services/git-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
+import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -634,6 +635,25 @@ describe('repo select card — worktree open', () => {
     expect(createRepoWorktree).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.worktreeCreating).not.toBe(true);
+  });
+
+  it('worktree_toggle_mode requires canOperate — a non-operator (even the pending-session owner) cannot flip bot config', async () => {
+    // It writes bot-level worktreeMultiPicker (bots.json), so it must NOT ride
+    // the pendingRepoOwnerException that lets talk-only users start their own session.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_old_card' });
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValueOnce(false); // non-operator
+    const event = {
+      operator: { open_id: OWNER }, // session owner, but NOT an operator
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast).toBeUndefined();                // sensitive gate blocks silently (logs only)
+    expect(vi.mocked(applyConfigField)).not.toHaveBeenCalled(); // no bot-config write
+    expect(vi.mocked(deleteMessage)).not.toHaveBeenCalled();
   });
 
   it('rolls back already-created worktrees when a later repo in the batch fails', async () => {
