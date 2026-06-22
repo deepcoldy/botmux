@@ -70,7 +70,7 @@ export function pendingGoalTasks(tasks: TaskView[]): Map<string, TaskView[]> {
   return byGoal;
 }
 
-export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[]): string {
+export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[], inspectionFacts: Map<string, string> = new Map()): string {
   const rows = tasks.map((task) => {
     const hint = task.acceptanceHint?.trim() && !task.acceptanceCriteria
       ? ` acceptanceHint=${task.acceptanceHint.trim()}`
@@ -81,10 +81,13 @@ export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[]): 
     const help = task.help
       ? ` helpKind=${task.help.kind ?? 'other'} blocker=${task.help.blocker}`
       : '';
-    return `- ${task.taskId} status=${task.status}${hint}${help}${checks}`;
+    const fact = inspectionFacts.get(task.taskId);
+    const factLine = fact ? `\n    inspectionFact: ${fact}` : '';
+    return `- ${task.taskId} status=${task.status}${hint}${help}${checks}${factLine}`;
   }).join('\n');
   return [
-    `${GOAL_WATCHDOG_PROMPT_PREFIX} 本 goal 有未完成任务（dispatched/rejected/blocked 未 accepted），请按 orchestrate 巡检协议扫账本、主动核验产物、accept/reject/催；blocked 任务先处理 worker 求助，定不了再升级给人。`,
+    `${GOAL_WATCHDOG_PROMPT_PREFIX} 你是本 goal 的统揽监管者。请先查 charter、账本和最近群消息，再为每个非终态任务给出并执行下一步：验收/accept/reject/催/重派/升级。聊天只是触发器，证据和账本才是真相；blocked 任务先处理 worker 求助，定不了再升级给人。`,
+    '注意：机械对账只提供线索和零歧义核验；worker 未 report 但产物看似达标时，不要把它当作已完成事实，必须由你判断是代办、催交还是重派，并诚实留痕。',
     `goalChatId: ${goalChatId}`,
     '',
     'pending tasks:',
@@ -212,6 +215,7 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       continue;
     }
     const legacyTasks: TaskView[] = [];
+    const inspectionFacts = new Map<string, string>();
     let reconciled = false;
     let rateLimited = false;
     const last = lastInjectedAt.get(goalChatId) ?? 0;
@@ -224,6 +228,12 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       });
       if (reconcile.action === 'no-criteria') {
         if (task.status === 'reported') continue;
+        legacyTasks.push(task);
+      } else if (reconcile.action === 'unreported-pass') {
+        inspectionFacts.set(
+          task.taskId,
+          reconcile.inspectionFact ?? '产物已满足结构化验收标准，但 worker 未交付 report；请监管者判断是否代办、催交或重派。',
+        );
         legacyTasks.push(task);
       } else if (reconcile.action === 'blocked') {
         legacyTasks.push(task);
@@ -274,7 +284,7 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       results.push({ goalChatId, status: 'rate-limited', pendingTaskIds, sessionId: ds.session.sessionId });
       continue;
     }
-    const prompt = buildGoalWatchdogPrompt(goalChatId, legacyTasks);
+    const prompt = buildGoalWatchdogPrompt(goalChatId, legacyTasks, inspectionFacts);
     await inject(ds, prompt);
     lastInjectedAt.set(goalChatId, now);
     results.push({ goalChatId, status: 'injected', pendingTaskIds, sessionId: ds.session.sessionId });
