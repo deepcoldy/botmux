@@ -56,7 +56,7 @@ export interface GoalWatchdogNotifyEvent {
 }
 
 function isPendingForWatchdog(task: TaskView): boolean {
-  return task.status === 'dispatched' || task.status === 'rejected';
+  return task.status === 'dispatched' || task.status === 'reported' || task.status === 'rejected';
 }
 
 export function pendingGoalTasks(tasks: TaskView[]): Map<string, TaskView[]> {
@@ -220,6 +220,7 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
         defaultTimeoutMs: deps.defaultTimeoutMs,
       });
       if (reconcile.action === 'no-criteria') {
+        if (task.status === 'reported') continue;
         legacyTasks.push(task);
       } else if ((reconcile.action === 'accepted' || reconcile.action === 'rejected') && !reconcile.deduped) {
         reconciled = true;
