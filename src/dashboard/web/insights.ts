@@ -329,10 +329,11 @@ function renderPhaseMix(report: SafeInsightReport): string {
 }
 
 // ── Top-level tabs + global filter dimensions (project / time) ──────────────
-type InsightTab = 'overview' | 'sessions' | 'dist' | 'hot';
+type InsightTab = 'overview' | 'sessions' | 'flow' | 'dist' | 'hot';
 const INSIGHT_TABS: Array<{ key: InsightTab; label: string }> = [
   { key: 'overview', label: 'insights.tabOverview' },
   { key: 'sessions', label: 'insights.tabSessions' },
+  { key: 'flow', label: 'insights.tabFlow' },
   { key: 'dist', label: 'insights.tabDist' },
   { key: 'hot', label: 'insights.tabHot' },
 ];
@@ -467,6 +468,75 @@ function renderDistribution(records: InsightRecord[]): string {
     ])}
   </div>
   ${disclosureNote()}`;
+}
+
+const FLOW_PHASES = ['research', 'edit', 'run', 'delegate', 'discuss'] as const;
+
+// "行为流": where the agent's actions & wall-time land across activity phases,
+// plus each session's phase rhythm. Built from agg.phase (present in summary mode),
+// so it works at the overview level without the (detail-only) turn timeline.
+function renderFlow(records: InsightRecord[]): string {
+  const ok = records.filter(r => r.report && r.report.status === 'ok' && r.report.agg);
+  if (!ok.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
+  const tot: Record<string, { count: number; ms: number }> = {};
+  for (const p of FLOW_PHASES) tot[p] = { count: 0, ms: 0 };
+  for (const rec of ok) for (const p of FLOW_PHASES) {
+    const v = rec.report!.agg.phase?.[p];
+    if (v) { tot[p].count += v.count; tot[p].ms += v.ms; }
+  }
+  const totCount = FLOW_PHASES.reduce((s, p) => s + tot[p].count, 0) || 1;
+  const totMs = FLOW_PHASES.reduce((s, p) => s + tot[p].ms, 0) || 1;
+
+  const nodes = FLOW_PHASES.map((p, i) => {
+    const v = tot[p];
+    const cPct = Math.round((v.count / totCount) * 100);
+    const tPct = Math.round((v.ms / totMs) * 100);
+    const arrow = i < FLOW_PHASES.length - 1 ? '<span class="flow-arrow">→</span>' : '';
+    return `<div class="flow-node"><i class="flow-dot ${phaseClass(p)}"></i>
+      <strong>${escapeHtml(phaseLabel(p))}</strong>
+      <span class="flow-n">${fmtInt(v.count)}<em> · ${cPct}%</em></span>
+      <span class="flow-t">${escapeHtml(fmtMs(v.ms))}<em> · ${tPct}%</em></span></div>${arrow}`;
+  }).join('');
+
+  const bars = FLOW_PHASES.map(p => {
+    const v = tot[p];
+    const cPct = (v.count / totCount) * 100;
+    const tPct = (v.ms / totMs) * 100;
+    return `<div class="flow-brow">
+      <span class="flow-blabel"><i class="${phaseClass(p)}"></i>${escapeHtml(phaseLabel(p))}</span>
+      <span class="flow-btrack"><span class="flow-bfill ${phaseClass(p)}" style="width:${Math.max(2, cPct).toFixed(1)}%"></span><em>${Math.round(cPct)}%</em></span>
+      <span class="flow-btrack"><span class="flow-bfill ${phaseClass(p)}" style="width:${Math.max(2, tPct).toFixed(1)}%"></span><em>${Math.round(tPct)}%</em></span>
+    </div>`;
+  }).join('');
+
+  const rhythm = [...ok]
+    .sort((a, b) => agentMsOf(b.report!) - agentMsOf(a.report!))
+    .slice(0, 40)
+    .map(rec => `<button type="button" class="flow-sess" data-session-id="${escapeHtml(String(rec.session.sessionId))}">
+      <span class="flow-stitle">${escapeHtml(sessionTitle(rec.session))}</span>
+      ${renderPhaseMix(rec.report!)}
+      <span class="flow-stime">${escapeHtml(fmtMs(agentMsOf(rec.report!)))}</span></button>`)
+    .join('');
+
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.flowHint'))}</p>
+    <section class="block flow-pipe-block">
+      <h3>${escapeHtml(t('insights.flowPipeline'))}</h3>
+      <p class="mut flow-sub">${escapeHtml(t('insights.flowPipeSub'))}</p>
+      <div class="flow-pipe">${nodes}</div>
+    </section>
+    <div class="insights-overview-grid">
+      <section class="block">
+        <h3>${escapeHtml(t('insights.flowShares'))}</h3>
+        <div class="flow-bhead"><span></span><span>${escapeHtml(t('insights.flowActShare'))}</span><span>${escapeHtml(t('insights.flowTimeShare'))}</span></div>
+        <div class="flow-bars">${bars}</div>
+      </section>
+      <section class="block">
+        <h3>${escapeHtml(t('insights.flowRhythm'))}</h3>
+        <div class="flow-rhythm">${rhythm}</div>
+        <div class="rl-legend">${FLOW_PHASES.map(p => `<span class="rl-item"><i class="${phaseClass(p)}"></i>${escapeHtml(phaseLabel(p))}</span>`).join('')}</div>
+      </section>
+    </div>
+    ${disclosureNote()}`;
 }
 
 type HotAgg = { key: string; label: string; sessions: Array<{ id: string; title: string }>; reads: number; edits: number; runs: number; fails: number; count: number };
@@ -1430,7 +1500,7 @@ function buildInsightsHash(p: Record<string, string>): string {
   return '#/insights' + (q ? `?${q}` : '');
 }
 const INSIGHT_FILTERS: InsightFilter[] = ['all', 'review', 'failed', 'slow'];
-const INSIGHT_TAB_KEYS: InsightTab[] = ['overview', 'sessions', 'dist', 'hot'];
+const INSIGHT_TAB_KEYS: InsightTab[] = ['overview', 'sessions', 'flow', 'dist', 'hot'];
 const SESS_SORT_KEYS: SessSort[] = ['recent', 'review', 'spans', 'fails', 'slow', 'agent'];
 
 export function renderInsightsPage(root: HTMLElement): () => void {
@@ -1515,6 +1585,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
           <div id="insight-detail">${renderDetailShell(undefined)}</div>
         </div>
       </div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="flow" hidden><div id="insight-flow"></div></div>
       <div class="insight-panel" role="tabpanel" data-tabpanel="dist" hidden><div id="insight-dist"></div></div>
       <div class="insight-panel" role="tabpanel" data-tabpanel="hot" hidden><div id="insight-hot"></div></div>
       <div id="insight-modal" class="insight-modal" hidden></div>
@@ -1532,6 +1603,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   const refreshBtn = root.querySelector<HTMLButtonElement>('#insight-refresh')!;
   const filterButtons = [...root.querySelectorAll<HTMLButtonElement>('[data-filter]')];
   const cliFilterEl = root.querySelector<HTMLElement>('#insight-cli-filter')!;
+  const flowEl = root.querySelector<HTMLElement>('#insight-flow')!;
   const distEl = root.querySelector<HTMLElement>('#insight-dist')!;
   const hotEl = root.querySelector<HTMLElement>('#insight-hot')!;
   const projectSel = root.querySelector<HTMLSelectElement>('#insight-project')!;
@@ -1678,6 +1750,8 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (!selectedId || !selected) detail.innerHTML = renderDetailShell(undefined);
     wireSessionButtons(list);
     showSessionsView();
+    flowEl.innerHTML = overviewData ? renderFlow(rows) : '';
+    wireSessionButtons(flowEl, true);
     distEl.innerHTML = overviewData ? renderDistribution(rows) : '';
     hotEl.innerHTML = overviewData ? renderHotspots(rows, openHot) : '';
     wireSessionButtons(hotEl, true);
