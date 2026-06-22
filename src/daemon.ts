@@ -128,6 +128,7 @@ import { loadEffectInputSidecar } from './workflows/effect-input.js';
 import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
 import type { RawParamInput } from './workflows/params.js';
+import { startGoalSupervisor } from './core/goal-supervisor.js';
 import type { AbortCancelReason } from './workflows/runtime.js';
 import {
   createDefaultHostExecutorRegistry,
@@ -1847,6 +1848,53 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
+});
+
+// ─── goal supervise IPC route (internal: start an L2 supervisor in goal chat) ─
+//
+// Lark self-messages are deliberately ignored before routing, so the main bot
+// cannot @ itself in the goal group to spawn the L2 supervisor. This thin
+// daemon-native entry creates that session directly while reusing the normal
+// session store, whiteboard injection and forkWorker path.
+ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
+  let raw: {
+    chatId?: unknown;
+    parentChatId?: unknown;
+    parentRoot?: unknown;
+    title?: unknown;
+    brief?: unknown;
+    workingDir?: unknown;
+    parentSessionId?: unknown;
+    larkAppId?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const chatId = typeof raw.chatId === 'string' ? raw.chatId.trim() : '';
+  const parentChatId = typeof raw.parentChatId === 'string' ? raw.parentChatId.trim() : '';
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const targetLarkAppId = typeof raw.larkAppId === 'string' ? raw.larkAppId.trim() : '';
+  if (!chatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_chatId', error: 'chatId is required' });
+  if (!parentChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_parentChatId', error: 'parentChatId is required' });
+  if (!title) return jsonRes(res, 400, { ok: false, errorCode: 'missing_title', error: 'title is required' });
+  if (!targetLarkAppId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_larkAppId', error: 'larkAppId is required' });
+
+  const result = await startGoalSupervisor({
+    chatId,
+    parentChatId,
+    parentRoot: typeof raw.parentRoot === 'string' && raw.parentRoot.trim() ? raw.parentRoot.trim() : undefined,
+    title,
+    brief: typeof raw.brief === 'string' && raw.brief.trim() ? raw.brief : undefined,
+    workingDir: typeof raw.workingDir === 'string' && raw.workingDir.trim() ? raw.workingDir.trim() : undefined,
+    parentSessionId: typeof raw.parentSessionId === 'string' && raw.parentSessionId.trim() ? raw.parentSessionId.trim() : undefined,
+  }, { larkAppId: targetLarkAppId, activeSessions });
+  if (!result.ok) {
+    const status = result.errorCode === 'bot_not_in_chat' ? 404 : 400;
+    return jsonRes(res, status, result);
+  }
+  return jsonRes(res, 200, result);
 });
 
 // ─── session-ready IPC route (internal: Claude-family 真就绪信号) ─────────────
