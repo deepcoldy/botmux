@@ -2624,6 +2624,7 @@ export async function enforceMessageQuotaForCliInput(
   senderUnionId?: string,
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
+  opts?: { senderIsBot?: boolean },
 ): Promise<boolean> {
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
@@ -2634,6 +2635,11 @@ export async function enforceMessageQuotaForCliInput(
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
+  // 任务模式豁免：bot/app 发来的编排消息（派活/回报/对账/求助/升级）不计入「消息额度」。
+  // 额度（/grant @某人 N 条）是给「人」按条限流的；bot↔bot 是系统编排流量——能不能发已由上面的
+  // 授权闸（ev.allowed）控制，不该再被按条扣到耗尽，否则长任务会把 worker 的额度烧光、做到一半被
+  // 自动收回授权、任务卡死。owner 要限某个 bot 仍可直接撤其对话授权，与额度无关。
+  if (opts?.senderIsBot) return true;
   if (!ev.quotaKey) return true;
   if (!senderOpenId) return false;
   // 去重三态：'done' = 同条已成功扣费 → 放行（不重复扣）；'pending' = 同条扣费 in-flight 未定论
@@ -13637,7 +13643,8 @@ async function startInitialPassthroughSession(args: {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, commandContent, senderOpenId, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType)) {
+  const senderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, { senderIsBot })) {
     return;
   }
 
@@ -14035,7 +14042,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType)) {
+  const senderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, { senderIsBot })) {
     return;
   }
 
@@ -14847,7 +14855,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType, { senderIsBot: isBotSenderType })) {
     return;
   }
 
