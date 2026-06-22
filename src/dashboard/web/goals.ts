@@ -1,134 +1,316 @@
-// Goal board page (P1 #6): a read-only projection of the verified-delivery ledger
-// grouped by goal group, plus each goal's charter. Data comes from `GET /api/goals`
-// (served by buildGoalBoard() in the daemon). Self-contained fetch + 10s poll so
-// the board stays live while open; the returned dispose clears the timer.
-import { escapeHtml } from './ui.js';
+// Goal board (P1 #6) — a grid-first delivery observation console (claude×codex
+// design). Three zones: a left rail of goals (operational summary rows), a center
+// task grid where each row is a subtask and the columns are the delivery lifecycle
+// (派发→报告→核验→验收), and a right detail panel that shows the selected task's
+// verification trail. Data: GET /api/goals (buildGoalBoard read-model). Self-
+// contained fetch + 10s poll; the returned dispose clears the timer.
+//
+// Aesthetic: borrows the v3 "flight recorder" language — mono-LED task ids, status
+// LEDs, staged reveal — but stays inside the dashboard's CSS variables + themes.
+// No DAG: subtasks are flat (no deps); the lifecycle pipeline IS the progress
+// model. The "核验" stage lights amber while a report awaits verification — exactly
+// the gap the goal-watchdog fills, made visible.
+import { escapeHtml, relTime, loadNameMaps, botNameForOpenId, chatNameForId } from './ui.js';
 
 interface AcceptanceCheck { type: 'exists' | 'contains'; text?: string }
 interface AcceptanceArtifact { path: string; kind?: string; checks: AcceptanceCheck[] }
 interface AcceptanceCommand { cmd: string; cwd?: string; expectExitCode?: number; timeoutMs?: number }
 interface AcceptanceCriteria { version: number; artifacts?: AcceptanceArtifact[]; commands?: AcceptanceCommand[] }
+interface BoardEvidence { kind: 'path' | 'inline'; label: string; preview?: string; bytes?: number }
+interface BoardAttempt { reportId: string; ts?: number; verdict?: 'accepted' | 'rejected'; reason?: string; summary: string; workerOpenId?: string }
 interface BoardTask {
   taskId: string; title?: string; status: string;
-  workerOpenIds?: string[]; latestReportId?: string; reportCount: number;
+  workerOpenIds?: string[]; workerNames?: string[]; latestReportId?: string; reportCount: number;
   acceptanceCriteria?: AcceptanceCriteria; acceptanceHint?: string;
-  latestVerdict?: string; rejectReason?: string;
+  latestVerdict?: 'accepted' | 'rejected'; rejectReason?: string;
+  dispatchedAt?: number; latestReportedAt?: number; latestVerdictAt?: number; acceptedAt?: number; rejectedAt?: number;
+  checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; evidence?: BoardEvidence[];
+  attempts: BoardAttempt[];
 }
 interface BoardGoal {
   goalChatId: string; title?: string; hasCharter: boolean;
-  charterUpdatedAt?: string; charterContent?: string;
+  charterUpdatedAt?: string; charterContent?: string; lastActivityAt?: number;
   counts: { dispatched: number; reported: number; accepted: number; rejected: number; total: number };
   tasks: BoardTask[];
 }
 interface GoalBoard { goals: BoardGoal[] }
 
 const STATUS_LABEL: Record<string, string> = {
-  dispatched: '⏳ 待交付', reported: '📨 已报告', accepted: '✅ 已验收', rejected: '❌ 已驳回',
+  dispatched: '待交付', reported: '已报告', accepted: '已验收', rejected: '已驳回',
 };
 
-function fmtDate(s?: string): string {
-  if (!s) return '—';
-  try { return new Date(s).toLocaleString(); } catch { return s; }
-}
-
-function fmtAcceptance(t: BoardTask): string {
-  if (t.acceptanceCriteria) {
-    const c = t.acceptanceCriteria;
-    const parts: string[] = [];
-    for (const a of c.artifacts ?? []) {
-      const checks = (a.checks ?? []).map(ck => ck.type === 'exists' ? '存在' : `含"${ck.text}"`).join(' + ');
-      parts.push(`📄 ${a.path}: ${checks}`);
-    }
-    for (const cmd of c.commands ?? []) {
-      parts.push(`▶ ${cmd.cmd}${cmd.cwd ? ` @${cmd.cwd}` : ''} (exit ${cmd.expectExitCode ?? 0})`);
-    }
-    if (!parts.length) return '<span class="muted">—</span>';
-    return parts.map(p => `<div class="goal-accept">${escapeHtml(p)}</div>`).join('');
+// ── lifecycle stages ────────────────────────────────────────────────────────
+type StageState = 'done' | 'active' | 'fail' | 'pending';
+const STAGES: Array<{ key: string; label: string }> = [
+  { key: 'dispatch', label: '派发' },
+  { key: 'report', label: '报告' },
+  { key: 'check', label: '核验' },
+  { key: 'verdict', label: '验收' },
+];
+function stageState(t: BoardTask, key: string): StageState {
+  const reported = t.reportCount > 0;
+  const verdict = t.latestVerdict;
+  switch (key) {
+    case 'dispatch': return 'done';
+    case 'report': return reported ? 'done' : 'pending';
+    case 'check': return verdict ? 'done' : reported ? 'active' : 'pending';
+    case 'verdict':
+      if (verdict === 'accepted') return 'done';
+      if (verdict === 'rejected') return 'fail';
+      return 'pending';
+    default: return 'pending';
   }
-  if (t.acceptanceHint) return `<div class="goal-accept goal-accept-legacy" title="legacy 自由文本">${escapeHtml(t.acceptanceHint)}</div>`;
-  return '<span class="muted">—</span>';
 }
 
-function countsChips(c: BoardGoal['counts']): string {
-  const chip = (n: number, label: string) => n > 0 ? `<span class="goal-chip">${label} ${n}</span>` : '';
-  return [
-    chip(c.dispatched, '⏳'), chip(c.reported, '📨'), chip(c.accepted, '✅'), chip(c.rejected, '❌'),
-  ].join('') + `<span class="goal-chip goal-chip-total">共 ${c.total}</span>`;
+// ── formatters ──────────────────────────────────────────────────────────────
+function shortId(s: string): string { return s.length > 12 ? s.slice(0, 6) + '…' + s.slice(-4) : s; }
+/** Charters default to a "Goal charter: <id>" title — strip that noise for display. */
+function cleanTitle(s: string): string { return s.replace(/^Goal charter:\s*/, '').trim() || s; }
+/** A goal's human name: custom charter title → real Feishu group name → short id. */
+function goalName(g: BoardGoal): string {
+  const custom = g.title && !/^Goal charter:/.test(g.title) ? cleanTitle(g.title) : '';
+  return custom || chatNameForId(g.goalChatId) || shortId(g.goalChatId);
+}
+/** Resolve an actor field to a friendly name: registry name by open_id → a
+ *  human label as-is (checkedBy is sometimes a label, not an open_id) → short id. */
+function botName(v?: string): string {
+  if (!v) return '—';
+  const resolved = botNameForOpenId(v);
+  if (resolved) return resolved;
+  if (!v.startsWith('ou_')) return v; // already a human label — don't truncate
+  return shortId(v);
+}
+function fmtDur(ms?: number): string {
+  if (ms === undefined || ms < 0) return '';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${(m / 60).toFixed(1)}h`;
+}
+function fmtTs(ms?: number): string {
+  if (ms === undefined) return '—';
+  return relTime(ms);
+}
+function rejectCount(t: BoardTask): number { return t.attempts.filter(a => a.verdict === 'rejected').length; }
+
+// ── left rail: goals as operational summary rows ──────────────────────────────
+function goalRow(g: BoardGoal, selected: boolean): string {
+  const c = g.counts;
+  const pct = c.total ? Math.round((c.accepted / c.total) * 100) : 0;
+  const segs = (['accepted', 'reported', 'dispatched', 'rejected'] as const)
+    .map(k => c[k] ? `<span class="gb-seg gb-seg-${k}" style="flex:${c[k]}"></span>` : '')
+    .join('');
+  const badges = [
+    c.dispatched + c.reported > 0 ? `<span class="gb-mini gb-mini-active">${c.dispatched + c.reported} 在跑</span>` : '',
+    c.rejected > 0 ? `<span class="gb-mini gb-mini-rej">${c.rejected} 驳回</span>` : '',
+  ].join('');
+  const name = escapeHtml(goalName(g));
+  return `<button class="gb-goal${selected ? ' sel' : ''}" data-goal="${escapeHtml(g.goalChatId)}">
+    <div class="gb-goal-top">
+      <span class="gb-goal-name" title="${escapeHtml(g.goalChatId)}">${name}</span>
+      <span class="gb-goal-frac">${c.accepted}/${c.total}</span>
+    </div>
+    <div class="gb-bar" title="${pct}% 已验收">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
+    <div class="gb-goal-foot">
+      <span class="gb-badges">${badges || '<span class="gb-mini gb-mini-quiet">无在跑</span>'}</span>
+      <span class="gb-goal-time">${g.lastActivityAt ? fmtTs(g.lastActivityAt) : (g.hasCharter ? '仅 charter' : '')}</span>
+    </div>
+  </button>`;
 }
 
-function taskRow(t: BoardTask): string {
-  const worker = (t.workerOpenIds ?? []).map(w => `<code>${escapeHtml(w.slice(0, 12))}…</code>`).join(' ') || '—';
-  const verdict = t.status === 'rejected' && t.rejectReason
-    ? `<span class="goal-reject">${escapeHtml(t.rejectReason)}</span>` : '';
-  return `<tr>
-    <td><code>${escapeHtml(t.taskId)}</code></td>
-    <td>${escapeHtml(t.title ?? '—')}</td>
-    <td>${STATUS_LABEL[t.status] ?? escapeHtml(t.status)} ${verdict}</td>
-    <td>${worker}</td>
-    <td>${t.reportCount}</td>
-    <td class="goal-accept-cell">${fmtAcceptance(t)}</td>
+// ── center: task grid (rows=task, columns=lifecycle stages) ───────────────────
+function stageCell(t: BoardTask, key: string): string {
+  const st = stageState(t, key);
+  let glyph = '';
+  if (st === 'done') glyph = key === 'verdict' ? '✓' : '●';
+  else if (st === 'fail') glyph = '✗';
+  else if (st === 'active') glyph = '◌';
+  else glyph = '○';
+  const rc = key === 'verdict' && st === 'fail' && rejectCount(t) > 1 ? `<sub>×${rejectCount(t)}</sub>` : '';
+  return `<td class="gb-cell gb-st-${st}"><span class="gb-led">${glyph}</span>${rc}</td>`;
+}
+function taskRow(t: BoardTask, selected: boolean): string {
+  const verdictTag = t.status === 'rejected' && t.rejectReason
+    ? `<span class="gb-reason">${escapeHtml(t.rejectReason)}</span>` : '';
+  const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
+    : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
+  const primary = t.title
+    ? `<span class="gb-task-title">${escapeHtml(t.title)}</span><span class="gb-led-id gb-led-id-sm">${escapeHtml(shortId(t.taskId))}</span>`
+    : `<span class="gb-led-id">${escapeHtml(shortId(t.taskId))}</span>`;
+  return `<tr class="gb-trow${selected ? ' sel' : ''}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId)}">
+    <td class="gb-task-id">${primary}${accTag}</td>
+    ${STAGES.map(s => stageCell(t, s.key)).join('')}
+    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${verdictTag}</td>
   </tr>`;
 }
-
-function goalCard(g: BoardGoal): string {
-  const heading = g.title ? escapeHtml(g.title) : `<code>${escapeHtml(g.goalChatId)}</code>`;
-  const charterTag = g.hasCharter
-    ? `<span class="goal-charter-tag" title="${escapeHtml(g.charterContent ?? '')}">📋 charter · ${fmtDate(g.charterUpdatedAt)}</span>`
-    : '<span class="muted">无 charter</span>';
-  const body = g.tasks.length
-    ? `<table class="goal-task-table">
-        <thead><tr><th>taskId</th><th>标题</th><th>状态</th><th>worker</th><th>报告数</th><th>验收标准</th></tr></thead>
-        <tbody>${g.tasks.map(taskRow).join('')}</tbody>
-       </table>`
-    : '<p class="empty">该 goal 下暂无子任务</p>';
-  return `<section class="goal-card">
-    <div class="goal-card-head">
-      <h2>${heading}</h2>
-      <div class="goal-card-meta">${charterTag}</div>
-    </div>
-    <div class="goal-counts">${countsChips(g.counts)}</div>
-    ${body}
-  </section>`;
+function gridHtml(g: BoardGoal, selTask: string | null): string {
+  if (!g.tasks.length) return '<p class="gb-empty">该目标下暂无子任务</p>';
+  return `<table class="gb-grid">
+    <thead><tr><th class="gb-task-id">子任务</th>${STAGES.map(s => `<th class="gb-cell">${s.label}</th>`).join('')}<th class="gb-task-status">状态</th></tr></thead>
+    <tbody>${g.tasks.map(t => taskRow(t, t.taskId === selTask)).join('')}</tbody>
+  </table>`;
 }
 
-function pageShell(): string {
-  return `<section class="page">
+// ── right: detail panel for the selected task ─────────────────────────────────
+function acceptanceHtml(t: BoardTask): string {
+  if (t.acceptanceCriteria) {
+    const c = t.acceptanceCriteria;
+    const items: string[] = [];
+    for (const a of c.artifacts ?? []) {
+      const checks = (a.checks ?? []).map(ck => ck.type === 'exists' ? '存在' : `含"${escapeHtml(ck.text ?? '')}"`).join(' + ');
+      items.push(`<li><code>${escapeHtml(a.path)}</code> — ${checks}</li>`);
+    }
+    for (const cmd of c.commands ?? []) {
+      items.push(`<li><code>${escapeHtml(cmd.cmd)}</code>${cmd.cwd ? ` @${escapeHtml(cmd.cwd)}` : ''} → exit ${cmd.expectExitCode ?? 0}</li>`);
+    }
+    return `<ul class="gb-checklist">${items.join('') || '<li class="gb-muted">—</li>'}</ul>`;
+  }
+  if (t.acceptanceHint) return `<p class="gb-hint-legacy">${escapeHtml(t.acceptanceHint)}</p>`;
+  return '<p class="gb-muted">无验收标准（不可机器核验）</p>';
+}
+function timelineHtml(t: BoardTask): string {
+  const steps: Array<[string, number | undefined]> = [
+    ['派发', t.dispatchedAt], ['报告', t.latestReportedAt],
+    [t.latestVerdict === 'rejected' ? '驳回' : '验收', t.latestVerdictAt],
+  ];
+  const dispatched = t.dispatchedAt;
+  return `<div class="gb-timeline">${steps.filter(([, ts]) => ts !== undefined).map(([label, ts]) => {
+    const delta = (dispatched !== undefined && ts !== undefined && ts > dispatched) ? `+${fmtDur(ts - dispatched)}` : '';
+    return `<div class="gb-tl-step"><span class="gb-tl-dot"></span><span class="gb-tl-label">${label}</span>
+      <span class="gb-tl-time">${fmtTs(ts)}</span>${delta ? `<span class="gb-tl-delta">${delta}</span>` : ''}</div>`;
+  }).join('')}</div>`;
+}
+function trailHtml(t: BoardTask): string {
+  if (!t.checkedBy && !t.evidenceChecked?.length && !t.ranCommands?.length && !t.evidence?.length) {
+    return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">worker 尚未报告</p>';
+  }
+  const parts: string[] = [];
+  if (t.checkedBy) parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}</div>`);
+  if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
+  if (t.ranCommands?.length) parts.push(`<div class="gb-kv"><span>跑了命令</span><ul>${t.ranCommands.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul></div>`);
+  if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e =>
+    `<li>${e.kind === 'path' ? `<code>${escapeHtml(e.label)}</code>` : `📎 ${escapeHtml(e.label)}${e.preview ? ` <span class="gb-muted">${escapeHtml(e.preview.slice(0, 48))}</span>` : ''}`}</li>`).join('')}</ul></div>`);
+  return parts.join('');
+}
+function attemptsHtml(t: BoardTask): string {
+  if (!t.attempts.length) return '<p class="gb-muted">无报告</p>';
+  return `<ol class="gb-attempts">${t.attempts.map((a, i) => {
+    const v = a.verdict === 'accepted' ? '<span class="gb-pill gb-pill-accepted">已验收</span>'
+      : a.verdict === 'rejected' ? '<span class="gb-pill gb-pill-rejected">已驳回</span>'
+        : '<span class="gb-pill gb-pill-reported">待核验</span>';
+    return `<li><div class="gb-att-head"><span class="gb-att-n">#${i + 1}</span>${v}<span class="gb-att-time">${fmtTs(a.ts)}</span></div>
+      <div class="gb-att-sum">${escapeHtml(a.summary)}</div>
+      ${a.reason ? `<div class="gb-att-reason">原因：${escapeHtml(a.reason)}</div>` : ''}</li>`;
+  }).join('')}</ol>`;
+}
+function detailHtml(t: BoardTask | null): string {
+  if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
+  return `<div class="gb-detail-head">
+      <div class="gb-led-id gb-led-id-lg">${escapeHtml(t.taskId)}</div>
+      <span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>
+    </div>
+    ${t.title ? `<p class="gb-detail-title">${escapeHtml(t.title)}</p>` : ''}
+    ${t.workerOpenIds?.length ? `<p class="gb-detail-worker">执行 worker：${t.workerOpenIds.map((w, i) => {
+      const nm = t.workerNames?.[i]?.trim();
+      return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
+    }).join('、')}</p>` : ''}
+    <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
+    <div class="gb-sec"><h3>验收标准</h3>${acceptanceHtml(t)}</div>
+    <div class="gb-sec"><h3>验收痕迹</h3>${trailHtml(t)}</div>
+    <div class="gb-sec"><h3>报告历史 (${t.attempts.length})</h3>${attemptsHtml(t)}</div>`;
+}
+
+// ── page shell + wiring ───────────────────────────────────────────────────────
+function shell(): string {
+  return `<section class="page goalboard">
 <div class="page-heading">
-  <div>
-    <p class="eyebrow">可信交付</p>
-    <h1>目标看板</h1>
-    <p>verified-delivery 账本按 goal 群聚合的实时投影：每个目标的 charter + 子任务交付状态。</p>
-  </div>
-  <div><button type="button" id="goals-refresh">刷新</button></div>
+  <div><p class="eyebrow">可信交付</p><h1>目标看板</h1>
+  <p>每个目标下子任务的交付生命周期：派发 → 报告 → 核验 → 验收。账本是唯一真相。</p></div>
+  <div><button type="button" id="gb-refresh" class="gb-refresh-btn">↻ 刷新</button></div>
 </div>
-<div id="goals-body"><p class="empty">加载中…</p></div>
+<div class="gb-layout">
+  <aside class="gb-rail" id="gb-rail"></aside>
+  <main class="gb-main" id="gb-main"></main>
+  <aside class="gb-detail" id="gb-detail"></aside>
+</div>
 </section>`;
 }
 
 export function renderGoalsPage(root: HTMLElement): () => void {
-  root.innerHTML = pageShell();
-  const body = root.querySelector<HTMLElement>('#goals-body')!;
-  const refreshBtn = root.querySelector<HTMLButtonElement>('#goals-refresh')!;
+  root.innerHTML = shell();
+  const railEl = root.querySelector<HTMLElement>('#gb-rail')!;
+  const mainEl = root.querySelector<HTMLElement>('#gb-main')!;
+  const detailEl = root.querySelector<HTMLElement>('#gb-detail')!;
+  const refreshBtn = root.querySelector<HTMLButtonElement>('#gb-refresh')!;
+
+  let board: GoalBoard = { goals: [] };
+  let selGoal: string | null = null;
+  let selTask: string | null = null;
   let disposed = false;
+  let lastJson = ''; // skip re-render when a poll returns identical data (no flicker)
+
+  const goalOf = (id: string | null) => board.goals.find(g => g.goalChatId === id) ?? null;
+
+  function renderRail(): void {
+    railEl.innerHTML = board.goals.length
+      ? board.goals.map(g => goalRow(g, g.goalChatId === selGoal)).join('')
+      : '<p class="gb-empty">还没有任何目标 / 交付任务</p>';
+  }
+  function renderMain(): void {
+    const g = goalOf(selGoal);
+    if (!g) { mainEl.innerHTML = '<div class="gb-main-empty"><p>选择左侧一个目标查看子任务</p></div>'; return; }
+    mainEl.innerHTML = `<div class="gb-main-head">
+        <span class="gb-main-title" title="${escapeHtml(g.goalChatId)}">${escapeHtml(goalName(g))}</span>
+        <span class="gb-main-counts">已验收 ${g.counts.accepted} · 共 ${g.counts.total}${g.counts.rejected ? ` · 驳回 ${g.counts.rejected}` : ''}</span>
+      </div>${gridHtml(g, selTask)}`;
+  }
+  function renderDetail(): void {
+    const g = goalOf(selGoal);
+    detailEl.innerHTML = detailHtml(g?.tasks.find(t => t.taskId === selTask) ?? null);
+  }
+  function renderAll(): void { renderRail(); renderMain(); renderDetail(); }
+
+  // delegation on the persistent containers (only their innerHTML is replaced)
+  railEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>('.gb-goal');
+    if (!btn) return;
+    selGoal = btn.dataset.goal ?? null;
+    const g = goalOf(selGoal);
+    selTask = g?.tasks[0]?.taskId ?? null; // auto-select first task
+    renderAll();
+  });
+  mainEl.addEventListener('click', (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.gb-trow');
+    if (!row) return;
+    selTask = row.dataset.task ?? null;
+    renderMain(); renderDetail();
+  });
+  refreshBtn.onclick = () => { void load(); };
 
   async function load(): Promise<void> {
     try {
       const res = await fetch('/api/goals');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const board = await res.json() as GoalBoard;
+      const text = await res.text();
       if (disposed) return;
-      body.innerHTML = board.goals.length
-        ? board.goals.map(goalCard).join('')
-        : '<p class="empty">还没有任何 goal / 交付任务。</p>';
+      if (text === lastJson) return; // unchanged → don't repaint (kills 10s poll flicker)
+      lastJson = text;
+      board = JSON.parse(text) as GoalBoard;
+      // keep selection if still present; else default to first goal / first task
+      if (!goalOf(selGoal)) { selGoal = board.goals[0]?.goalChatId ?? null; selTask = null; }
+      const g = goalOf(selGoal);
+      if (g && !g.tasks.some(t => t.taskId === selTask)) selTask = g.tasks[0]?.taskId ?? null;
+      renderAll();
     } catch (e) {
       if (disposed) return;
-      body.innerHTML = `<p class="empty">加载失败：${escapeHtml((e as Error).message)}</p>`;
+      railEl.innerHTML = `<p class="gb-empty">加载失败：${escapeHtml((e as Error).message)}</p>`;
     }
   }
 
-  refreshBtn.onclick = () => { void load(); };
+  // resolve open_ids / chatIds → real names, then repaint (memoized globally)
+  void loadNameMaps().then(() => { if (!disposed) renderAll(); });
   void load();
   const timer = window.setInterval(() => { void load(); }, 10_000);
-
   return () => { disposed = true; window.clearInterval(timer); };
 }
