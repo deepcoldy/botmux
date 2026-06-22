@@ -552,6 +552,40 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     );
   });
 
+  it('retries the grant card on a later @blocked after a failed send (clears stale pending)', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockReturnValue(false);
+    // First send fails (transient Lark error). The pending opened just before the send
+    // must be cleared so a later @ from the same bot re-triggers a card — otherwise the
+    // sender is throttled forever and the owner never sees any grant card.
+    mockReplyMessage.mockRejectedValueOnce(new Error('lark 500'));
+
+    const makeBlocked = (messageId: string) => {
+      const event = makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        messageId,
+        content: JSON.stringify({
+          zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+        }),
+        rootId: undefined,
+      });
+      event.message.root_id = undefined as any;
+      return event;
+    };
+
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-001'));
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-002'));
+    await flushEventWork();
+
+    // The failed first send did not poison the throttle: the second @ tried again.
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+  });
+
   it('routes cross-bot @mention in chat-scope when sender is a known botmux peer', async () => {
     // Same setup as above, but the foreign bot IS in our peer cross-ref → the
     // dispatcher should route it through to handleThreadReply (which auto-

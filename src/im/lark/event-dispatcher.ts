@@ -24,7 +24,7 @@ import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.j
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled } from './grant-pending.js';
+import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
@@ -898,7 +898,12 @@ async function maybeSendGrantRequestCard(
     localeForBot(larkAppId),
   );
   await replyMessage(larkAppId, message.message_id, card, 'interactive')
-    .catch(err => logger.debug(`grant request card send failed: ${err}`));
+    .catch(err => {
+      // 发卡失败必须撤掉刚开的 pending，否则该发送方被节流压死、owner 永远看不到卡片，
+      // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
+      clearPending(larkAppId, chatId, requesterOpenId);
+      logger.debug(`grant request card send failed: ${err}`);
+    });
 }
 
 // ─── Group message access check ──────────────────────────────────────────

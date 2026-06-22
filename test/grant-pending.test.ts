@@ -74,6 +74,17 @@ describe('grant-pending', () => {
       expect(isThrottled('a1', 'oc_1', 'ou_g')).toBe(false);
     });
 
+    it('isThrottled reclaims a stale pending on its own key (no cross-key sweep needed)', () => {
+      openPending('a1', 'oc_1', 'ou_g');
+      expect(isThrottled('a1', 'oc_1', 'ou_g')).toBe(true); // fresh → throttled
+      vi.advanceTimersByTime(24 * 60 * 60 * 1000 + 1); // past STALE_PENDING_MS
+      // No other openPending/markDenied fired, so the periodic full-table sweep never ran.
+      // isThrottled itself must reclaim the abandoned pending — otherwise a lone repeat
+      // sender (or a card whose send failed) stays silently throttled until daemon restart.
+      expect(isThrottled('a1', 'oc_1', 'ou_g')).toBe(false);
+      expect(_tableSizeForTest()).toBe(0);
+    });
+
     it('a still-fresh pending is NOT reclaimed by the sweep', () => {
       const n = openPending('a1', 'oc_1', 'ou_g');
       vi.advanceTimersByTime(2 * 60 * 1000); // 2 min — well within STALE_PENDING_MS
