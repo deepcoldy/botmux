@@ -4,6 +4,7 @@ import { forkWorker } from './worker-pool.js';
 import { sessionKey, type DaemonSession } from './types.js';
 import { localeForBot } from '../i18n/index.js';
 import { openLedger, type LedgerHandle } from '../verified-delivery/ledger.js';
+import { summarizeAcceptanceCriteria } from '../verified-delivery/acceptance.js';
 import type { TaskView } from '../verified-delivery/types.js';
 import { logger } from '../utils/logger.js';
 
@@ -57,7 +58,10 @@ export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[]): 
     const hint = task.acceptanceHint?.trim()
       ? ` acceptanceHint=${task.acceptanceHint.trim()}`
       : '';
-    return `- ${task.taskId} status=${task.status}${hint}`;
+    const checks = task.acceptanceCriteria
+      ? summarizeAcceptanceCriteria(task.acceptanceCriteria).map((line) => `\n    - ${line}`).join('')
+      : '';
+    return `- ${task.taskId} status=${task.status}${hint}${checks}`;
   }).join('\n');
   return [
     `${GOAL_WATCHDOG_PROMPT_PREFIX} 本 goal 有未完成任务（dispatched/rejected 未 accepted），请按 orchestrate 巡检协议扫账本、主动核验产物、accept/reject/催。`,

@@ -91,6 +91,7 @@ import { validateTriggerRequest, type TriggerResponse } from '../services/trigge
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
+import { buildGoalBoard } from '../verified-delivery/goal-board.js';
 
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
@@ -1271,6 +1272,10 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
   // falls through to "all tasks" when no owner filter is configured (tests).
   const all = scheduleStore.listTasks().filter(t => scheduler.belongsToOwner(t));
   jsonRes(res, 200, { schedules: all.map(composeScheduleRow) });
+});
+
+ipcRoute('GET', '/api/goals', (_req, res) => {
+  jsonRes(res, 200, buildGoalBoard());
 });
 
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));

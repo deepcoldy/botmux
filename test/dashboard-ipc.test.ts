@@ -16,6 +16,7 @@ import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
+import { openLedger } from '../src/verified-delivery/ledger.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -876,6 +877,42 @@ describe('POST /api/schedules/:id/(run|pause|resume)', () => {
     const body = await res.json();
     expect(body.ok).toBe(false);
     expect(body.error).toBe('not_found');
+  });
+});
+
+describe('GET /api/goals', () => {
+  it('returns the verified-delivery goal board from the ledger', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-goals-ipc-'));
+    const prevEnv = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    process.env.SESSION_DATA_DIR = dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      openLedger().append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-goal',
+        chatId: 'oc_goal',
+        ts: 1_000,
+        idempotencyKey: 'dispatched:task-goal',
+        payload: { taskId: 'task-goal', title: 'Goal task' },
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/goals`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.goals).toHaveLength(1);
+      expect(body.goals[0]).toMatchObject({
+        goalChatId: 'oc_goal',
+        counts: { dispatched: 1, reported: 0, accepted: 0, rejected: 0, total: 1 },
+      });
+      expect(body.goals[0].tasks[0]).toMatchObject({ taskId: 'task-goal', title: 'Goal task', status: 'dispatched' });
+    } finally {
+      if (prevEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevEnv;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 

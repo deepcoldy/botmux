@@ -9,10 +9,15 @@ import {
 } from '../src/core/goal-watchdog.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { LedgerHandle } from '../src/verified-delivery/ledger.js';
-import type { TaskView } from '../src/verified-delivery/types.js';
+import type { AcceptanceCriteria, TaskView } from '../src/verified-delivery/types.js';
 
-function task(taskId: string, chatId: string | undefined, status: TaskView['status']): TaskView {
-  return { taskId, chatId, status, reports: [] };
+function task(
+  taskId: string,
+  chatId: string | undefined,
+  status: TaskView['status'],
+  acceptanceCriteria?: AcceptanceCriteria,
+): TaskView {
+  return { taskId, chatId, status, acceptanceCriteria, reports: [] };
 }
 
 function ledger(tasks: TaskView[]): LedgerHandle {
@@ -99,6 +104,28 @@ describe('goal watchdog', () => {
     expect(injected).toHaveLength(1);
     expect(injected[0].prompt).toContain(GOAL_WATCHDOG_PROMPT_PREFIX);
     expect(injected[0].prompt).toContain('t1');
+  });
+
+  it('renders structured acceptance criteria as a watchdog checklist', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+    const injected: Array<{ prompt: string }> = [];
+
+    await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([task('t-criteria', 'oc_goal', 'dispatched', {
+        version: 1,
+        artifacts: [{ path: '/tmp/done.txt', kind: 'file', checks: [{ type: 'exists' }, { type: 'contains', text: 'PASS' }] }],
+        commands: [{ cmd: 'python3 check.py', cwd: '/repo', expectExitCode: 0 }],
+      })]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      inject: (_target, prompt) => injected.push({ prompt }),
+    });
+
+    expect(injected[0].prompt).toContain('产物 /tmp/done.txt(file): 存在 + 含"PASS"');
+    expect(injected[0].prompt).toContain('命令 `python3 check.py`, cwd=/repo, 期望退出码 0');
   });
 
   it('skips a busy L2 and rate-limits repeated injections', async () => {
