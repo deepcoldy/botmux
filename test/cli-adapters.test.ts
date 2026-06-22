@@ -934,6 +934,14 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern!.test('❯ 1. Continue into TRAE CLI')).toBe(false);
   });
 
+  it('traex defers the first-prompt timeout until its readyPattern appears', () => {
+    // The whole "first message swallowed by the trust/advisory screen" fix hinges
+    // on this opt-in being present, so pin it (the worker reads it === true).
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
   it('codex-app matches runner prompt indicator', () => {
     const adapter = createCodexAppAdapter('/bin/codex');
     expect(adapter.readyPattern).toBeDefined();
