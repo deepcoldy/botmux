@@ -6,6 +6,8 @@ import { localeForBot } from '../i18n/index.js';
 import { openLedger, type LedgerHandle } from '../verified-delivery/ledger.js';
 import { summarizeAcceptanceCriteria } from '../verified-delivery/acceptance.js';
 import type { TaskView } from '../verified-delivery/types.js';
+import { reconcileTaskByCriteria, type ReconcileResult } from '../verified-delivery/reconcile.js';
+import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 
 export const GOAL_WATCHDOG_PROMPT_PREFIX = '[goal-watchdog]';
@@ -14,6 +16,7 @@ export const DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS = 30_000;
 
 type GoalWatchdogStatus =
   | 'injected'
+  | 'reconciled'
   | 'no-l2'
   | 'busy'
   | 'rate-limited'
@@ -36,6 +39,20 @@ export interface GoalWatchdogDeps {
   goalChatIds?: Iterable<string>;
   lastInjectedAt?: Map<string, number>;
   inject?: (ds: DaemonSession, prompt: string) => Promise<void> | void;
+  notify?: (event: GoalWatchdogNotifyEvent) => Promise<void> | void;
+  checkedBy?: string;
+  defaultCwd?: string;
+  defaultTimeoutMs?: number;
+}
+
+export type GoalWatchdogNotifyKind = 'accepted' | 'rejected' | 'nudge';
+
+export interface GoalWatchdogNotifyEvent {
+  kind: GoalWatchdogNotifyKind;
+  larkAppId: string;
+  goalChatId: string;
+  task: TaskView;
+  result: ReconcileResult;
 }
 
 function isPendingForWatchdog(task: TaskView): boolean {
@@ -70,6 +87,55 @@ export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[]): 
     'pending tasks:',
     rows || '- (none)',
   ].join('\n');
+}
+
+function formatFailedChecks(result: ReconcileResult): string[] {
+  return (result.verify?.checks ?? [])
+    .filter((check) => !check.ok)
+    .map((check) => `- ${check.kind} ${check.target}${check.detail ? `: ${check.detail}` : ''}`);
+}
+
+function formatPassedChecks(result: ReconcileResult): string[] {
+  return (result.verify?.checks ?? [])
+    .filter((check) => check.ok)
+    .map((check) => `- ${check.kind} ${check.target}`);
+}
+
+function workerMentionPrefix(task: TaskView): string {
+  const ids = task.workerOpenIds ?? [];
+  if (ids.length === 0) return '';
+  return `${ids.map((id) => `<at user_id="${id}"></at>`).join(' ')} `;
+}
+
+function buildGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): string {
+  const { kind, task, result } = event;
+  if (kind === 'accepted') {
+    const checks = formatPassedChecks(result).slice(0, 8).join('\n');
+    return [
+      `[goal-watchdog] 已自动验收任务 ${task.taskId}`,
+      `reportId: ${result.reportId ?? task.latestReportId ?? '(unknown)'}`,
+      checks ? `通过检查:\n${checks}` : undefined,
+    ].filter(Boolean).join('\n');
+  }
+  if (kind === 'rejected') {
+    const failed = formatFailedChecks(result).slice(0, 8).join('\n');
+    return [
+      `[goal-watchdog] 已自动打回任务 ${task.taskId}`,
+      `reportId: ${result.reportId ?? task.latestReportId ?? '(unknown)'}`,
+      failed ? `未通过检查:\n${failed}` : undefined,
+    ].filter(Boolean).join('\n');
+  }
+  const failed = formatFailedChecks(result).slice(0, 8).join('\n');
+  return [
+    `${workerMentionPrefix(task)}[goal-watchdog] 任务 ${task.taskId} 的结构化验收未通过，请补齐产物或继续修复后再 report。`,
+    failed ? `未通过检查:\n${failed}` : undefined,
+  ].filter(Boolean).join('\n');
+}
+
+async function sendGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): Promise<void> {
+  const text = buildGoalWatchdogNotification(event);
+  if (!text.trim()) return;
+  await sendMessage(event.larkAppId, event.goalChatId, text, 'text');
 }
 
 export function isGoalSupervisorTitle(title: string | undefined): boolean {
@@ -131,6 +197,7 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
   const intervalMs = deps.intervalMs ?? DEFAULT_GOAL_WATCHDOG_INTERVAL_MS;
   const lastInjectedAt = deps.lastInjectedAt ?? defaultLastInjectedAt;
   const inject = deps.inject ?? injectGoalSupervisorTurn;
+  const notify = deps.notify ?? sendGoalWatchdogNotification;
   const byGoal = pendingGoalTasks(ledger.tasks());
   const goalFilter = deps.goalChatIds ? new Set(deps.goalChatIds) : undefined;
   const results: GoalWatchdogResult[] = [];
@@ -141,8 +208,52 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
       continue;
     }
+    const legacyTasks: TaskView[] = [];
+    let reconciled = false;
+    let rateLimited = false;
+    const last = lastInjectedAt.get(goalChatId) ?? 0;
+    for (const task of tasks) {
+      const reconcile = reconcileTaskByCriteria(ledger, task.taskId, {
+        checkedBy: deps.checkedBy ?? 'goal-watchdog',
+        now,
+        defaultCwd: deps.defaultCwd,
+        defaultTimeoutMs: deps.defaultTimeoutMs,
+      });
+      if (reconcile.action === 'no-criteria') {
+        legacyTasks.push(task);
+      } else if ((reconcile.action === 'accepted' || reconcile.action === 'rejected') && !reconcile.deduped) {
+        reconciled = true;
+        try {
+          await notify({ kind: reconcile.action, larkAppId: deps.larkAppId, goalChatId, task, result: reconcile });
+        } catch (err) {
+          logger.warn(`[goal-watchdog] notify ${reconcile.action} failed goal=${goalChatId} task=${task.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      } else if (reconcile.action === 'nudge') {
+        if (last > 0 && now - last < intervalMs) {
+          rateLimited = true;
+          continue;
+        }
+        reconciled = true;
+        try {
+          await notify({ kind: 'nudge', larkAppId: deps.larkAppId, goalChatId, task, result: reconcile });
+        } catch (err) {
+          logger.warn(`[goal-watchdog] notify nudge failed goal=${goalChatId} task=${task.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+    if (legacyTasks.length === 0) {
+      if (reconciled) {
+        lastInjectedAt.set(goalChatId, now);
+        results.push({ goalChatId, status: 'reconciled', pendingTaskIds: tasks.map((task) => task.taskId) });
+      } else if (rateLimited) {
+        results.push({ goalChatId, status: 'rate-limited', pendingTaskIds: tasks.map((task) => task.taskId) });
+      } else {
+        results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
+      }
+      continue;
+    }
     const ds = findGoalSupervisorSession(deps.activeSessions, deps.larkAppId, goalChatId);
-    const pendingTaskIds = tasks.map((task) => task.taskId);
+    const pendingTaskIds = legacyTasks.map((task) => task.taskId);
     if (!ds) {
       results.push({ goalChatId, status: 'no-l2', pendingTaskIds, reason: 'no active chat-scope goal supervisor session' });
       continue;
@@ -151,12 +262,11 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       results.push({ goalChatId, status: 'busy', pendingTaskIds, sessionId: ds.session.sessionId });
       continue;
     }
-    const last = lastInjectedAt.get(goalChatId) ?? 0;
     if (last > 0 && now - last < intervalMs) {
       results.push({ goalChatId, status: 'rate-limited', pendingTaskIds, sessionId: ds.session.sessionId });
       continue;
     }
-    const prompt = buildGoalWatchdogPrompt(goalChatId, tasks);
+    const prompt = buildGoalWatchdogPrompt(goalChatId, legacyTasks);
     await inject(ds, prompt);
     lastInjectedAt.set(goalChatId, now);
     results.push({ goalChatId, status: 'injected', pendingTaskIds, sessionId: ds.session.sessionId });
@@ -204,8 +314,12 @@ export function startGoalWatchdog(input: {
         intervalMs,
       });
       const injected = results.filter((r) => r.status === 'injected');
-      if (injected.length > 0) {
-        logger.info(`[goal-watchdog] injected ${injected.length} goal supervisor turn(s): ${injected.map((r) => `${r.goalChatId}:${r.pendingTaskIds.length}`).join(', ')}`);
+      const reconciled = results.filter((r) => r.status === 'reconciled');
+      if (injected.length > 0 || reconciled.length > 0) {
+        const parts = [];
+        if (injected.length > 0) parts.push(`injected ${injected.length}: ${injected.map((r) => `${r.goalChatId}:${r.pendingTaskIds.length}`).join(', ')}`);
+        if (reconciled.length > 0) parts.push(`reconciled ${reconciled.length}: ${reconciled.map((r) => `${r.goalChatId}:${r.pendingTaskIds.length}`).join(', ')}`);
+        logger.info(`[goal-watchdog] ${parts.join('; ')}`);
       }
     } catch (err) {
       logger.warn(`[goal-watchdog] tick failed: ${err instanceof Error ? err.message : String(err)}`);
