@@ -117,6 +117,7 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         t.workerTopicRoot = p.workerTopicRoot ?? t.workerTopicRoot;
         t.workerOpenIds = p.workerOpenIds ?? t.workerOpenIds;
         t.acceptanceHint = p.acceptanceHint ?? t.acceptanceHint;
+        t.acceptanceCriteria = p.acceptanceCriteria ?? t.acceptanceCriteria;
         if (t.reports.length === 0) t.status = 'dispatched';
       } else if (e.type === 'TaskReported') {
         const p = e.payload as import('./types.js').TaskReportedPayload;
