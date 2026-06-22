@@ -12,11 +12,14 @@ describe('goal supervisor prompt', () => {
     });
 
     expect(prompt).toContain('L2 监管 agent');
+    expect(prompt).toContain('botmux whiteboard current --create');
+    expect(prompt).toContain('botmux whiteboard read --json');
     expect(prompt).toContain('botmux delivery list --goal oc_goal');
     expect(prompt).toContain('botmux dispatch --chat-id <本 goal 群 chatId>');
     expect(prompt).toContain('L1 主群 chatId: oc_main');
     expect(prompt).toContain('L1 主话题 rootMessageId: om_root');
     expect(prompt).toContain('botmux send --chat-id oc_main --quote om_root');
     expect(prompt).toContain('先整理 charter');
+    expect(prompt).not.toContain('<whiteboard');
   });
 });
