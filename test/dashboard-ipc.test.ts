@@ -26,6 +26,54 @@ function tokenAuthHeaders(secret = TEST_IPC_SECRET): Record<string, string> {
   return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
 }
 
+function parseSseFrame(raw: string): { type: string; body: any } | null {
+  let type: string | undefined;
+  let data: string | undefined;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('event:')) type = line.slice(6).trim();
+    else if (line.startsWith('data:')) data = line.slice(5).trim();
+  }
+  if (!type) return null;
+  let body: any;
+  try { body = data ? JSON.parse(data) : undefined; } catch { body = undefined; }
+  return { type, body };
+}
+
+/** Connect to an SSE endpoint and resolve with the first event matching the
+ *  predicate, or null on timeout. Aborts the stream when done. */
+async function readSseEvent(
+  url: string,
+  predicate: (e: { type: string; body: any }) => boolean,
+  timeoutMs = 3000,
+): Promise<{ type: string; body: any } | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.body) return null;
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return null;
+      buf += dec.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const frame = parseSseFrame(buf.slice(0, idx));
+        buf = buf.slice(idx + 2);
+        if (frame && predicate(frame)) return frame;
+      }
+    }
+  } catch (e) {
+    if (ctrl.signal.aborted) return null;
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    ctrl.abort();
+  }
+}
+
 let handle: IpcServerHandle | null = null;
 
 afterEach(async () => {
@@ -249,6 +297,39 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('GET /api/events', () => {
+  it('replays current active sessions as session.spawned on connect (snapshot-on-connect)', async () => {
+    // Guards the descriptor→restore race: a dashboard that subscribes AFTER an
+    // empty hydrate (or after a restore-time announce it missed) must still learn
+    // every active row. The SSE handler subscribes then replays the live registry.
+    const registry = new Map<string, any>();
+    workerPool.setActiveSessionsRegistry(registry);
+    try {
+      registry.set(sessionKey('om_snap', 'cli_app'), {
+        session: {
+          sessionId: 'snap-1', chatId: 'oc_snap', rootMessageId: 'om_snap',
+          title: 't', status: 'active', createdAt: new Date(1000).toISOString(),
+          scope: 'thread', cliId: 'codex',
+        },
+        worker: null, workerPort: null, workerToken: null,
+        larkAppId: 'cli_app', chatId: 'oc_snap', chatType: 'group', scope: 'thread',
+        spawnedAt: 1000, cliVersion: 'test', lastMessageAt: 1000, hasHistory: true,
+      });
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const ev = await readSseEvent(
+        `http://127.0.0.1:${handle.port}/api/events`,
+        e => e.type === 'session.spawned' && e.body?.session?.sessionId === 'snap-1',
+      );
+      expect(ev).not.toBeNull();
+      expect(ev!.body.session.status).toBe('starting'); // worker:null → no screen yet
+      expect(ev!.body.session.hasHistory).toBe(true);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
     }
   });
 });

@@ -1580,9 +1580,31 @@ ipcRoute('GET', '/api/events', (_req, res) => {
   // Initial flush so the client sees the connection alive immediately.
   res.write('retry: 5000\n\n');
 
+  // Subscribe BEFORE snapshotting so no event published in the gap is missed.
   const off = dashboardEventBus.subscribe(ev => {
     res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev.body)}\n\n`);
   });
+
+  // Replay the current active sessions as `session.spawned` right after
+  // subscribing. `DashboardEventBus` has no buffer/replay, and the daemon
+  // publishes its discovery descriptor BEFORE restoreActiveSessions() runs
+  // (daemon.ts) — so a dashboard that hydrates (GET /api/sessions) during the
+  // descriptor→restore window gets an EMPTY snapshot, and any restore-time
+  // `announceSessionRow()` that fires before THIS subscription is established is
+  // dropped. Without this replay the aggregator would then have neither a
+  // snapshot row nor a spawned row, and later session.update/close patches would
+  // be discarded as unknown-row. Replaying here makes SSE attach deterministic:
+  // a row registered before subscribe arrives via this snapshot; one registered
+  // after arrives via the live subscription above. Idempotent — both the
+  // aggregator and the browser store upsert by sessionId, so any row also
+  // delivered live just refreshes the same entry.
+  try {
+    for (const ds of listActiveSessions()) {
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds) })}\n\n`);
+    }
+  } catch (err) {
+    logger.warn(`[dashboard-ipc] /api/events snapshot replay failed: ${err}`);
+  }
 
   const hb = setInterval(() => {
     res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
