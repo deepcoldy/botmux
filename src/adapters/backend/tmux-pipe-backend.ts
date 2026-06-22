@@ -32,6 +32,7 @@ import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, TmuxBackend } from './tmux-backend.js';
+import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -109,6 +110,10 @@ export class TmuxPipeBackend implements SessionBackend {
   private static readonly RECENT_OUTPUT_MAX = 4096;
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private lifecycleTimer: NodeJS.Timeout | null = null;
+  /** Debounce transient pane-probe failures so one flaky `tmux display-message`
+   *  (timeout / server hiccup under fd pressure) doesn't tear down an adopted
+   *  pane that's still alive. See recordPaneProbe. (pid-death stays decisive.) */
+  private readonly livenessGate = new LivenessGate(ADOPT_LIVENESS_MAX_FAILURES);
   private cols = 200;
   private rows = 50;
   private exited = false;
@@ -463,23 +468,72 @@ export class TmuxPipeBackend implements SessionBackend {
 
   private startLifecycleWatcher(): void {
     this.stopLifecycleWatcher();
+    this.livenessGate.reset();
     this.lifecycleTimer = setInterval(() => {
       if (this.exited) return;
+      // The watched CLI pid (adopt mode) is a pure process.kill(pid,0) syscall —
+      // it can only report ESRCH (gone) or EPERM (alive), never a transient
+      // timeout / EMFILE failure. So pid-death is DECISIVE: tear down at once.
+      // This keeps the ≤1s guard against routing Lark input into the user's bare
+      // shell after the CLI exits to a still-alive pane. Only the flaky pane
+      // probe below gets debounced.
       if (!this.isCliPidAlive()) {
         process.stderr.write(`[tmux-pipe-backend] adopted CLI pid ${this.watchCliPid} exited; detaching observer\n`);
         this.handlePaneExit();
         return;
       }
-      try {
-        const paneId = execSync(
-          `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_id}'`,
-          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
-        ).trim();
-        if (!paneId) this.handlePaneExit();
-      } catch {
-        this.handlePaneExit();
-      }
+      this.recordPaneProbe(this.isPaneAddressable(2000));
     }, 1000);
+  }
+
+  /** Is the pane still addressable in tmux? This `display-message` IS the flaky,
+   *  fd/server-dependent signal (command timeout / busy server under EMFILE) —
+   *  which is why recordPaneProbe debounces it. `timeoutMs` lets the final
+   *  confirm wait longer than the 1s poll so an overloaded server can still
+   *  answer before we declare a live pane dead. */
+  private isPaneAddressable(timeoutMs: number): boolean {
+    try {
+      const paneId = execSync(
+        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_id}'`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, env: tmuxEnv() },
+      ).trim();
+      return paneId.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Debounce the (flaky) pane-addressability probe. Tearing down on the FIRST
+   * failed probe produced the spurious "⏏ /adopt的 CLI 会话已断开" — a tmux command
+   * timeout / busy server (e.g. under EMFILE fd pressure) momentarily fails the
+   * probe while the pane is still alive and the CLI still receiving messages.
+   * Only after ADOPT_LIVENESS_MAX_FAILURES consecutive failures, AND a final
+   * lenient-timeout re-probe that still fails, do we detach. Any success resets.
+   * (pid-death is handled decisively in the watcher — see startLifecycleWatcher.)
+   */
+  private recordPaneProbe(alive: boolean): void {
+    if (this.exited) return;
+    if (!this.livenessGate.record(alive)) {
+      if (!alive) {
+        process.stderr.write(
+          `[tmux-pipe-backend] adopt pane probe failed (${this.livenessGate.consecutiveFailures}/${ADOPT_LIVENESS_MAX_FAILURES}); retrying before teardown\n`,
+        );
+      }
+      return;
+    }
+    // Threshold reached — one final authoritative probe with a more lenient
+    // timeout so a transiently overloaded tmux server gets a fair chance to
+    // answer before we detach a pane that's actually still alive.
+    if (this.isPaneAddressable(3000)) {
+      this.livenessGate.reset();
+      process.stderr.write('[tmux-pipe-backend] adopt pane recovered on final check; staying attached\n');
+      return;
+    }
+    process.stderr.write(
+      `[tmux-pipe-backend] adopted pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive probe failures; detaching observer\n`,
+    );
+    this.handlePaneExit();
   }
 
   private stopLifecycleWatcher(): void {
