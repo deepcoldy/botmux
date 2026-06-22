@@ -22656,12 +22656,16 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-seg-reported { background: var(--accent); }
 .gb-seg-dispatched { background: var(--faint); }
 .gb-seg-rejected { background: var(--danger); }
+.gb-seg-blocked { background: var(--warning); }
+.gb-seg-escalated { background: var(--warning); }
 .gb-seg-empty { background: var(--border-soft); }
 .gb-goal-foot { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
 .gb-badges { display: flex; gap: 5px; flex-wrap: wrap; }
 .gb-mini { font-size: .68rem; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border-soft); }
 .gb-mini-active { color: var(--accent-strong); border-color: var(--accent-soft); background: var(--accent-soft); }
 .gb-mini-rej { color: var(--danger); border-color: var(--danger-soft); background: var(--danger-soft); }
+.gb-mini-blk { color: var(--warning); border-color: var(--warning-soft); background: var(--warning-soft); }
+.gb-mini-esc { color: #fff; border-color: var(--warning); background: var(--warning); font-weight: 600; }
 .gb-mini-quiet { color: var(--faint); }
 .gb-goal-time { font-size: .68rem; color: var(--faint); flex: none; }
 
@@ -22704,11 +22708,17 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-pill-reported { background: var(--accent-soft); color: var(--accent-strong); }
 .gb-pill-accepted { background: var(--success-soft); color: var(--success); }
 .gb-pill-rejected { background: var(--danger-soft); color: var(--danger); }
+.gb-pill-blocked { background: var(--warning-soft); color: var(--warning); }
+.gb-pill-escalated { background: var(--warning); color: #fff; }
 .gb-reason { display: block; font-size: .68rem; color: var(--danger); margin-top: 2px; }
-/* verdict provenance: machine reconcile vs human */
+/* verdict provenance: machine reconcile vs agent; + help/escalation rung */
 .gb-via { display: inline-flex; align-items: center; gap: 2px; font-size: .66rem; font-weight: 600; padding: 1px 6px; border-radius: 999px; margin-left: 6px; white-space: nowrap; letter-spacing: .01em; }
 .gb-via-auto { background: var(--accent-soft); color: var(--accent-strong); border: 1px solid color-mix(in srgb, var(--accent-strong) 30%, transparent); }
 .gb-via-agent { background: var(--surface-muted); color: var(--muted); border: 1px solid var(--border-soft); }
+.gb-via-blocked { background: var(--warning-soft); color: var(--warning); border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent); }
+.gb-via-escalated { background: var(--warning); color: #fff; }
+.gb-help-kind { font-weight: 700; color: var(--warning); }
+.gb-sec-help h3 { color: var(--warning); }
 
 /* right: detail panel */
 .gb-detail { background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 14px; position: sticky; top: 14px; max-height: calc(100vh - 180px); overflow-y: auto; }

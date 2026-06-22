@@ -26,17 +26,23 @@ interface BoardTask {
   dispatchedAt?: number; latestReportedAt?: number; latestVerdictAt?: number; acceptedAt?: number; rejectedAt?: number;
   checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; evidence?: BoardEvidence[];
   attempts: BoardAttempt[];
+  help?: { blocker: string; kind?: string; workerOpenId?: string };
+  escalation?: { reason: string; by?: string; retryBrief?: string };
 }
 interface BoardGoal {
   goalChatId: string; title?: string; hasCharter: boolean;
   charterUpdatedAt?: string; charterContent?: string; lastActivityAt?: number;
-  counts: { dispatched: number; reported: number; accepted: number; rejected: number; total: number };
+  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; total: number };
   tasks: BoardTask[];
 }
 interface GoalBoard { goals: BoardGoal[] }
 
 const STATUS_LABEL: Record<string, string> = {
   dispatched: '待交付', reported: '已报告', accepted: '已验收', rejected: '已驳回',
+  blocked: '求助中', escalated: '已升级人工',
+};
+const HELP_KIND_LABEL: Record<string, string> = {
+  access: '缺权限', ambiguous: '需求歧义', impossible: '做不到', repeated_failure: '反复失败', other: '其它',
 };
 
 // ── lifecycle stages ────────────────────────────────────────────────────────
@@ -98,10 +104,12 @@ function rejectCount(t: BoardTask): number { return t.attempts.filter(a => a.ver
 function goalRow(g: BoardGoal, selected: boolean): string {
   const c = g.counts;
   const pct = c.total ? Math.round((c.accepted / c.total) * 100) : 0;
-  const segs = (['accepted', 'reported', 'dispatched', 'rejected'] as const)
+  const segs = (['accepted', 'reported', 'dispatched', 'blocked', 'escalated', 'rejected'] as const)
     .map(k => c[k] ? `<span class="gb-seg gb-seg-${k}" style="flex:${c[k]}"></span>` : '')
     .join('');
   const badges = [
+    c.escalated > 0 ? `<span class="gb-mini gb-mini-esc">${c.escalated} 待你拍</span>` : '',
+    c.blocked > 0 ? `<span class="gb-mini gb-mini-blk">${c.blocked} 求助</span>` : '',
     c.dispatched + c.reported > 0 ? `<span class="gb-mini gb-mini-active">${c.dispatched + c.reported} 在跑</span>` : '',
     c.rejected > 0 ? `<span class="gb-mini gb-mini-rej">${c.rejected} 驳回</span>` : '',
   ].join('');
@@ -137,6 +145,11 @@ function taskRow(t: BoardTask, selected: boolean): string {
     : t.autoReconciled
       ? '<span class="gb-via gb-via-auto" title="goal-watchdog 机器对账：自动跑结构化验收检查后裁定">🤖 自动对账</span>'
       : '<span class="gb-via gb-via-agent" title="监管 agent 自主核验后裁定">🧠 自主验收</span>';
+  const helpTag = t.status === 'blocked' && t.help
+    ? `<span class="gb-via gb-via-blocked" title="${escapeHtml(t.help.blocker)}">🚧 ${escapeHtml(HELP_KIND_LABEL[t.help.kind ?? 'other'] ?? '求助')}</span>`
+    : t.status === 'escalated' && t.escalation
+      ? `<span class="gb-via gb-via-escalated" title="${escapeHtml(t.escalation.reason)}">🙋 等人拍板</span>`
+      : '';
   const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
     : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
   const primary = t.title
@@ -145,7 +158,7 @@ function taskRow(t: BoardTask, selected: boolean): string {
   return `<tr class="gb-trow${selected ? ' sel' : ''}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId)}">
     <td class="gb-task-id">${primary}${accTag}</td>
     ${STAGES.map(s => stageCell(t, s.key)).join('')}
-    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${provTag}${verdictTag}</td>
+    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${provTag}${helpTag}${verdictTag}</td>
   </tr>`;
 }
 function gridHtml(g: BoardGoal, selTask: string | null): string {
@@ -210,6 +223,20 @@ function attemptsHtml(t: BoardTask): string {
       ${a.reason ? `<div class="gb-att-reason">原因：${escapeHtml(a.reason)}</div>` : ''}</li>`;
   }).join('')}</ol>`;
 }
+function helpHtml(t: BoardTask): string {
+  const parts: string[] = [];
+  if (t.help) {
+    const kind = t.help.kind ? `<span class="gb-help-kind">${escapeHtml(HELP_KIND_LABEL[t.help.kind] ?? t.help.kind)}</span> ` : '';
+    const who = t.help.workerOpenId ? ` <span class="gb-muted">— ${escapeHtml(botName(t.help.workerOpenId))}</span>` : '';
+    parts.push(`<div class="gb-kv"><span>🚧 worker 求助</span><div>${kind}${escapeHtml(t.help.blocker)}${who}</div></div>`);
+  }
+  if (t.escalation) {
+    const by = t.escalation.by ? ` <span class="gb-muted">— ${escapeHtml(botName(t.escalation.by))}</span>` : '';
+    const brief = t.escalation.retryBrief ? `<div class="gb-att-reason">待你拍：${escapeHtml(t.escalation.retryBrief)}</div>` : '';
+    parts.push(`<div class="gb-kv"><span>🙋 升级人工</span><div>${escapeHtml(t.escalation.reason)}${by}${brief}</div></div>`);
+  }
+  return parts.join('');
+}
 function detailHtml(t: BoardTask | null): string {
   if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
   return `<div class="gb-detail-head">
@@ -221,6 +248,7 @@ function detailHtml(t: BoardTask | null): string {
       const nm = t.workerNames?.[i]?.trim();
       return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
     }).join('、')}</p>` : ''}
+    ${(t.help || t.escalation) ? `<div class="gb-sec gb-sec-help"><h3>求助 / 升级</h3>${helpHtml(t)}</div>` : ''}
     <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
     <div class="gb-sec"><h3>验收标准</h3>${acceptanceHtml(t)}</div>
     <div class="gb-sec"><h3>验收痕迹</h3>${trailHtml(t)}</div>
