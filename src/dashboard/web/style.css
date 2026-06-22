@@ -7006,6 +7006,10 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .hbfill { height: 100%; background: linear-gradient(90deg, var(--danger-soft), var(--bad)); border-radius: 6px; min-width: 3px; transform-origin: left; animation: insight-bar-grow .55s ease both; }
 .insights-page .hbval { font-size: 12px; color: var(--mut); text-align: right; white-space: nowrap; }
 .insights-page .hbval small { color: var(--ins-faint); font-size: 10px; margin-left: 5px; }
+.insights-page .ihist-jump { background: transparent; border: 0; color: var(--acc); font: inherit; font-size: 11px; cursor: pointer; padding: 0 0 0 8px; white-space: nowrap; }
+.insights-page .ihist-jump:hover { text-decoration: underline; }
+.insights-page .hbrow-click { appearance: none; -webkit-appearance: none; border: 0; background: transparent; font: inherit; color: inherit; cursor: pointer; }
+.insights-page .hbrow-click:hover { background: var(--ins-inner); }
 
 /* top-level tabs (总览 / 会话 / 分布 / 热点) — mirrors .detailtabbar */
 .insights-page .insight-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin: 4px 0 16px; }

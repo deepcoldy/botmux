@@ -374,7 +374,7 @@ function median(values: number[]): number {
 
 // One histogram card. bins is an ordered list of {label, test}; each session value
 // falls into the first matching bin. Reuses the .hbars bar styling.
-function renderHistogram(title: string, values: number[], bins: Array<{ label: string; test: (v: number) => boolean }>, fmtMedian: (n: number) => string = fmtInt): string {
+function renderHistogram(title: string, values: number[], bins: Array<{ label: string; test: (v: number) => boolean }>, fmtMedian: (n: number) => string = fmtInt, sortKey?: SessSort): string {
   const counts = bins.map(b => ({ label: b.label, count: values.filter(b.test).length }));
   const max = Math.max(1, ...counts.map(c => c.count));
   const total = Math.max(1, values.length);
@@ -383,8 +383,9 @@ function renderHistogram(title: string, values: number[], bins: Array<{ label: s
     const share = Math.round((c.count / total) * 100);
     return `<div class="hbrow"><div class="hblabel">${escapeHtml(c.label)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(c.count)}<small>${share}%</small></div></div>`;
   }).join('');
+  const jump = sortKey ? `<button type="button" class="ihist-jump" data-distsort="${sortKey}">${escapeHtml(t('insights.viewSessions'))} ›</button>` : '';
   return `<section class="block ihist">
-    <div class="ihist-head"><h3>${escapeHtml(title)}</h3><span class="mut">${escapeHtml(t('insights.distMedian', { v: fmtMedian(median(values)) }))}</span></div>
+    <div class="ihist-head"><h3>${escapeHtml(title)}</h3><span class="mut">${escapeHtml(t('insights.distMedian', { v: fmtMedian(median(values)) }))}</span>${jump}</div>
     <div class="hbars">${rows}</div>
   </section>`;
 }
@@ -405,27 +406,27 @@ function renderDistribution(records: InsightRecord[]): string {
       { label: '51–200', test: v => v > 50 && v <= 200 },
       { label: '201–500', test: v => v > 200 && v <= 500 },
       { label: '500+', test: v => v > 500 },
-    ])}
+    ], fmtInt, 'spans')}
     ${renderHistogram(t('insights.distFailed'), failed, [
       { label: '0', test: v => v === 0 },
       { label: '1–2', test: v => v >= 1 && v <= 2 },
       { label: '3–5', test: v => v >= 3 && v <= 5 },
       { label: '6–10', test: v => v >= 6 && v <= 10 },
       { label: '10+', test: v => v > 10 },
-    ])}
+    ], fmtInt, 'fails')}
     ${renderHistogram(t('insights.distSlow'), slow, [
       { label: '0', test: v => v === 0 },
       { label: '1–2', test: v => v >= 1 && v <= 2 },
       { label: '3–5', test: v => v >= 3 && v <= 5 },
       { label: '5+', test: v => v > 5 },
-    ])}
+    ], fmtInt, 'slow')}
     ${renderHistogram(t('insights.distAgentTime'), agentMin, [
       { label: '<1m', test: v => v < 1 },
       { label: '1–5m', test: v => v >= 1 && v < 5 },
       { label: '5–30m', test: v => v >= 5 && v < 30 },
       { label: '30m–2h', test: v => v >= 30 && v < 120 },
       { label: '2h+', test: v => v >= 120 },
-    ], n => `${Math.round(n)}m`)}
+    ], n => `${Math.round(n)}m`, 'agent')}
     ${rw.length ? renderHistogram(t('insights.distRw'), rw, [
       { label: '0', test: v => v === 0 },
       { label: '0–1', test: v => v > 0 && v < 1 },
@@ -475,7 +476,7 @@ function renderHotspots(records: InsightRecord[]): string {
       <h3>${escapeHtml(t('insights.hotProjects'))}</h3>
       <div class="hbars">${projects.length ? projects.map(x => {
         const pct = Math.max(4, Math.round((x.sessions / projMax) * 100));
-        return `<div class="hbrow"><div class="hblabel">${escapeHtml(x.id)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(x.sessions)}<small>${x.fails} ${escapeHtml(t('insights.hotFailsCol'))}</small></div></div>`;
+        return `<button type="button" class="hbrow hbrow-click" data-hotproject="${escapeHtml(x.id)}"><div class="hblabel">${escapeHtml(x.id)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(x.sessions)}<small>${x.fails} ${escapeHtml(t('insights.hotFailsCol'))}</small></div></button>`;
       }).join('') : `<p class="mut">-</p>`}</div>
     </section>
     <section class="block hot-sessions">
@@ -1775,6 +1776,24 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-sesssort]');
     if (!btn) return;
     sessSort = (btn.dataset.sesssort as SessSort) || 'recent';
+    paint();
+  });
+  // 分布直方图 → 跳到会话 tab 按该指标排序。
+  distEl.addEventListener('click', e => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-distsort]');
+    if (!btn) return;
+    sessSort = (btn.dataset.distsort as SessSort) || 'recent';
+    tab = 'sessions';
+    selectedId = null;
+    paint();
+  });
+  // 项目热点 → 设项目筛选并跳到会话 tab（最慢会话行的 data-session-id 由 wireSessionButtons 处理）。
+  hotEl.addEventListener('click', e => {
+    const proj = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-hotproject]');
+    if (!proj) return;
+    project = proj.dataset.hotproject || '';
+    tab = 'sessions';
+    selectedId = null;
     paint();
   });
   projectSel.addEventListener('change', () => { project = projectSel.value; paint(); });
