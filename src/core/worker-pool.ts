@@ -139,6 +139,8 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Turn boundary signal used by goal watchdog to inspect unreported tasks. */
+  onSessionIdleOrExit?: (ds: DaemonSession, reason: 'idle' | 'limited' | 'exit') => void;
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
@@ -2663,6 +2665,7 @@ function setupWorkerHandlers(
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
+            callbacks?.onSessionIdleOrExit?.(ds, ds.lastScreenStatus === 'limited' ? 'limited' : 'idle');
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
@@ -3315,6 +3318,7 @@ function setupWorkerHandlers(
         code,
       });
     }
+    callbacks?.onSessionIdleOrExit?.(ds, 'exit');
   });
 }
 
