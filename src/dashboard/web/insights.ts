@@ -558,9 +558,12 @@ const SESS_SORTS: Array<{ key: SessSort; label: string }> = [
   { key: 'slow', label: 'insights.sortSlow' },
   { key: 'agent', label: 'insights.sortAgent' },
 ];
-function renderSortBar(active: SessSort): string {
-  return `<span class="sesssort-label mut">${escapeHtml(t('insights.sortLabel'))}</span>` + SESS_SORTS.map(s =>
+function renderSortBar(active: SessSort, layout: 'card' | 'table'): string {
+  const sorts = `<span class="sesssort-label mut">${escapeHtml(t('insights.sortLabel'))}</span>` + SESS_SORTS.map(s =>
     `<button type="button" class="spanchip${s.key === active ? ' on' : ''}" data-sesssort="${s.key}">${escapeHtml(t(s.label))}</button>`).join('');
+  const layouts = `<span class="sesssort-sep"></span>` + ([['card', 'insights.layoutCard'], ['table', 'insights.layoutTable']] as const).map(([k, lbl]) =>
+    `<button type="button" class="spanchip${layout === k ? ' on' : ''}" data-sesslayout="${k}">${escapeHtml(t(lbl))}</button>`).join('');
+  return sorts + layouts;
 }
 function reviewScore(r: SafeInsightReport | null): number {
   return r?.status === 'ok' ? r.agg.failedSpans * 6 + r.agg.slowSpans * 3 + r.suggestions.filter(s => s.severity === 'bad').length * 5 : 0;
@@ -609,6 +612,44 @@ function renderSessionRows(records: InsightRecord[], selectedId: string | null, 
       </div>` : `<div class="srmsg">${escapeHtml(safeStatus(r, rec.error))}</div>`}
     </button>`;
   }).join('')}</div>`;
+}
+
+// Dense table layout for the session list (ASI 表格视图) — sticky header, tabular
+// columns; row click drills into the same full-width detail.
+function renderSessionTable(records: InsightRecord[], selectedId: string | null): string {
+  if (!records.length) return `<div class="insight-empty">${escapeHtml(t('insights.empty'))}</div>`;
+  const head = `<div class="strow sthead">
+    <span class="stc-title">${escapeHtml(t('insights.colTitle'))}</span>
+    <span class="stc-proj">${escapeHtml(t('insights.colProject'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.spansShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.failedShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.slowShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.rwShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.durShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.colTime'))}</span>
+  </div>`;
+  const rows = records.map(rec => {
+    const s = rec.session;
+    const r = rec.report;
+    const ok = r?.status === 'ok';
+    const agg = r?.agg;
+    const on = s.sessionId === selectedId ? ' on' : '';
+    const review = reportNeedsReview(r) ? ' review' : '';
+    const mid = ok
+      ? `<span class="stc-num">${fmtInt(agg!.totalSpans)}</span>
+         <span class="stc-num${agg!.failedSpans ? ' bad' : ''}">${fmtInt(agg!.failedSpans)}</span>
+         <span class="stc-num">${fmtInt(agg!.slowSpans)}</span>
+         <span class="stc-num">${agg!.readWriteRatio !== null ? agg!.readWriteRatio.toFixed(1) : '-'}</span>
+         <span class="stc-num">${escapeHtml(fmtMs(agentMsOf(r!)))}</span>`
+      : `<span class="stc-msg">${escapeHtml(safeStatus(r, rec.error))}</span>`;
+    return `<button type="button" class="strow${on}${review}${ok ? '' : ' nostat'}" data-session-id="${escapeHtml(s.sessionId)}">
+      <span class="stc-title"><strong>${escapeHtml(sessionTitle(s))}</strong><small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))}</small></span>
+      <span class="stc-proj">${escapeHtml(s.workingDir ? projectOf(rec) : '-')}</span>
+      ${mid}
+      <span class="stc-num stc-time">${escapeHtml(relTime(s.lastMessageAt ?? s.spawnedAt ?? 0))}</span>
+    </button>`;
+  }).join('');
+  return `<div class="stable">${head}${rows}</div>`;
 }
 
 // ── Diagnosis-driven detail view ────────────────────────────────────────────
@@ -1423,6 +1464,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   let timeWin = hp.time ?? 'all';
   let showNoise = hp.noise === '1';
   let sessSort: SessSort = SESS_SORT_KEYS.includes(hp.sort as SessSort) ? hp.sort as SessSort : 'recent';
+  let sessLayout: 'card' | 'table' = hp.layout === 'table' ? 'table' : 'card';
   const openHot = new Set<string>();
 
   root.innerHTML = `
@@ -1521,6 +1563,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (timeWin !== 'all') p.time = timeWin;
     if (cliFilter.size) p.cli = [...cliFilter].join(',');
     if (sessSort !== 'recent') p.sort = sessSort;
+    if (sessLayout !== 'card') p.layout = sessLayout;
     if (showNoise) p.noise = '1';
     if (selectedId) p.sess = selectedId;
     try { history.replaceState(null, '', buildInsightsHash(p)); } catch { /* ignore */ }
@@ -1575,12 +1618,12 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     filterButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.filter === filter));
     overviewEl.innerHTML = overviewData ? renderOverview(aggregateRecords(rows)) : '';
     listSubtitle.textContent = t('insights.listCount', { shown: rows.length, total: records.length });
-    sortBar.innerHTML = renderSortBar(sessSort);
+    sortBar.innerHTML = renderSortBar(sessSort, sessLayout);
     // When the analyzable-only default empties the list, point at the toggle so
     // the user isn't stranded on a blank page wondering where their sessions went.
     list.innerHTML = (!rows.length && !showNoise)
       ? `<div class="insight-empty">${escapeHtml(t('insights.empty'))}<br><span class="mut">${escapeHtml(t('insights.emptyAnalyzableHint'))}</span></div>`
-      : renderSessionRows(rows, selectedId, true);
+      : sessLayout === 'table' ? renderSessionTable(rows, selectedId) : renderSessionRows(rows, selectedId, true);
     const selected = rows.find(r => r.session.sessionId === selectedId) ?? records.find(r => r.session.sessionId === selectedId);
     if (!selectedId || !selected) detail.innerHTML = renderDetailShell(undefined);
     wireSessionButtons(list);
@@ -1874,6 +1917,8 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   });
   backBtn.addEventListener('click', () => { selectedId = null; showSessionsView(); paint(); });
   sortBar.addEventListener('click', e => {
+    const lay = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-sesslayout]');
+    if (lay) { sessLayout = lay.dataset.sesslayout === 'table' ? 'table' : 'card'; paint(); return; }
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-sesssort]');
     if (!btn) return;
     sessSort = (btn.dataset.sesssort as SessSort) || 'recent';

@@ -7083,6 +7083,23 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
   .insights-page .slist.wide .srow { grid-template-columns: 1fr; }
   .insights-page .slist.wide .srstats { justify-content: flex-start; flex-wrap: wrap; }
 }
+.insights-page .sesssort-sep { display: inline-block; width: 1px; height: 16px; background: var(--line); margin: 0 4px; vertical-align: middle; }
+/* dense table layout for the session list */
+.insights-page .stable { display: grid; gap: 1px; }
+.insights-page .strow { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr) 54px 54px 46px 54px 60px 78px; gap: 10px; align-items: center; width: 100%; appearance: none; -webkit-appearance: none; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; padding: 8px 12px; border-radius: 6px; border-left: 3px solid transparent; }
+.insights-page .strow:hover { background: var(--ins-inner); }
+.insights-page .strow.on { background: var(--accent-soft); border-left-color: var(--acc); }
+.insights-page .strow.review { border-left-color: var(--bad); }
+.insights-page .sthead { font-size: 11px; color: var(--mut); cursor: default; position: sticky; top: 56px; background: var(--panel); border-radius: 0; }
+.insights-page .sthead:hover { background: var(--panel); }
+.insights-page .stc-title { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.insights-page .stc-title strong { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.insights-page .stc-title small { font-size: 11px; color: var(--mut); }
+.insights-page .stc-proj { font-size: 12px; color: var(--mut); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.insights-page .stc-num { font-size: 12px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.insights-page .stc-num.bad { color: var(--bad); }
+.insights-page .stc-time { color: var(--mut); }
+.insights-page .strow.nostat .stc-msg { grid-column: 3 / 8; font-size: 11px; color: var(--mut); }
 
 /* session detail panel (full-width detail view) */
 .insight-detail { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
