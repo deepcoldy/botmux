@@ -573,12 +573,18 @@ export async function enforceMessageQuotaForCliInput(
   senderOpenId: string | undefined,
   messageId: string,
   anchor: string,
+  opts?: { senderIsBot?: boolean },
 ): Promise<boolean> {
   const ev = evaluateTalk(larkAppId, chatId, senderOpenId);
   if (!ev.allowed) {
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
+  // 任务模式豁免：bot/app 发来的编排消息（派活/回报/对账/求助/升级）不计入「消息额度」。
+  // 额度（/grant @某人 N 条）是给「人」按条限流的；bot↔bot 是系统编排流量——能不能发已由上面的
+  // 授权闸（ev.allowed）控制，不该再被按条扣到耗尽，否则长任务会把 worker 的额度烧光、做到一半被
+  // 自动收回授权、任务卡死。owner 要限某个 bot 仍可直接撤其对话授权，与额度无关。
+  if (opts?.senderIsBot) return true;
   if (!ev.quotaKey) return true;
   if (!senderOpenId) return false;
   // 去重三态：'done' = 同条已成功扣费 → 放行（不重复扣）；'pending' = 同条扣费 in-flight 未定论
@@ -2290,7 +2296,8 @@ async function startInitialPassthroughSession(args: {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, commandContent, senderOpenId, ownerOpenId, ownerUnionId, creatorOpenId,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor)) {
+  const senderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, { senderIsBot })) {
     return;
   }
 
@@ -2573,7 +2580,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor)) {
+  const senderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, { senderIsBot })) {
     return;
   }
 
@@ -3252,7 +3260,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, { senderIsBot: isBotSenderType })) {
     return;
   }
 
