@@ -309,8 +309,13 @@ describe('botmux whiteboard CLI', () => {
 
     const update = runCli(['goal', 'charter', 'update', '--goal', 'goal-disabled', '--expected-updated-at', base.updatedAt], 'goal charter state\n');
     expect(update.status).toBe(0);
+    const stale = runCli(['goal', 'charter', 'update', '--goal', 'goal-disabled', '--expected-updated-at', base.updatedAt], 'stale charter state\n');
+    expect(stale.status).toBe(2);
+    expect(stale.stderr).toContain('botmux goal charter read --goal goal-disabled --json');
+    expect(stale.stderr).not.toContain('botmux whiteboard read');
     const after = runCli(['goal', 'charter', 'read', '--goal', 'goal-disabled']);
     expect(after.status).toBe(0);
     expect(after.stdout).toContain('goal charter state');
+    expect(after.stdout).not.toContain('stale charter state');
   });
 });
