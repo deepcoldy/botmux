@@ -254,7 +254,13 @@ import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch,
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
-import { runGoalWatchdogForGoal, shouldTriggerGoalWatchdogOnSessionBoundary, startGoalWatchdog } from './core/goal-watchdog.js';
+import {
+  DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
+  runGoalWatchdogForGoal,
+  shouldTriggerGoalWatchdogOnSessionBoundary,
+  startGoalWatchdog,
+  type GoalWatchdogResult,
+} from './core/goal-watchdog.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
@@ -2193,6 +2199,7 @@ const lastRepoScan: Map<string, import('./services/project-scanner.js').ProjectI
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 let currentDaemonLarkAppId = '';
+const goalWatchdogRetryTimers = new Map<string, NodeJS.Timeout>();
 
 function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
@@ -2255,14 +2262,53 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
   return timer;
 }
 
+function countGoalWatchdogStatus(results: GoalWatchdogResult[], status: GoalWatchdogResult['status']): number {
+  return results.filter((r) => r.status === status).length;
+}
+
+function shouldRetryGoalWatchdog(results: GoalWatchdogResult[]): boolean {
+  return results.some((r) => r.status === 'busy');
+}
+
+function scheduleGoalWatchdogRetry(goalChatId: string, reason: string): void {
+  if (goalWatchdogRetryTimers.has(goalChatId)) return;
+  const timer = setTimeout(() => {
+    goalWatchdogRetryTimers.delete(goalChatId);
+    void runGoalWatchdogForGoalOnThisDaemon(goalChatId, `retry:${reason}`).catch((err: any) => {
+      logger.warn(`[goal-watchdog] event retry failed goal=${goalChatId}: ${err?.message ?? err}`);
+    });
+  }, DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS);
+  timer.unref?.();
+  goalWatchdogRetryTimers.set(goalChatId, timer);
+  logger.info(`[goal-watchdog] scheduled event retry goal=${goalChatId} reason=${reason} delayMs=${DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS}`);
+}
+
+async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: string): Promise<GoalWatchdogResult[]> {
+  const results = await runGoalWatchdogForGoal({
+    larkAppId: currentDaemonLarkAppId,
+    activeSessions,
+    goalChatId,
+  });
+  if (shouldRetryGoalWatchdog(results)) scheduleGoalWatchdogRetry(goalChatId, reason);
+  const injected = countGoalWatchdogStatus(results, 'injected');
+  const busy = countGoalWatchdogStatus(results, 'busy');
+  const rateLimited = countGoalWatchdogStatus(results, 'rate-limited');
+  if (injected > 0 || busy > 0 || rateLimited > 0) {
+    logger.info(`[goal-watchdog] event result goal=${goalChatId} reason=${reason} injected=${injected} busy=${busy} rateLimited=${rateLimited}`);
+  }
+  return results;
+}
+
 async function triggerGoalWatchdogAcrossDaemons(input: {
   goalChatId: string;
   reason: string;
   sourceSessionId?: string;
-}): Promise<{ contacted: number; injected: number }> {
+}): Promise<{ contacted: number; injected: number; busy: number; rateLimited: number }> {
   const daemons = listOnlineDaemons();
   let contacted = 0;
   let injected = 0;
+  let busy = 0;
+  let rateLimited = 0;
   await Promise.all(daemons.map(async (daemon) => {
     const ctrl = new AbortController();
     const tt = setTimeout(() => ctrl.abort(), 3_000);
@@ -2276,14 +2322,17 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
       contacted++;
       if (!res.ok) return;
       const body = await res.json().catch(() => null) as { results?: Array<{ status?: string }> } | null;
-      injected += body?.results?.filter((r) => r.status === 'injected').length ?? 0;
+      const results = body?.results ?? [];
+      injected += results.filter((r) => r.status === 'injected').length;
+      busy += results.filter((r) => r.status === 'busy').length;
+      rateLimited += results.filter((r) => r.status === 'rate-limited').length;
     } catch {
       // Daemon descriptors are best-effort. A dead peer will age out shortly.
     } finally {
       clearTimeout(tt);
     }
   }));
-  return { contacted, injected };
+  return { contacted, injected, busy, rateLimited };
 }
 
 /**
@@ -4199,13 +4248,10 @@ ipcRoute('POST', '/api/goal/watchdog', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
   }
   const goalChatId = typeof raw.goalChatId === 'string' ? raw.goalChatId.trim() : '';
+  const reason = typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : 'ipc';
   if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
   try {
-    const results = await runGoalWatchdogForGoal({
-      larkAppId: currentDaemonLarkAppId,
-      activeSessions,
-      goalChatId,
-    });
+    const results = await runGoalWatchdogForGoalOnThisDaemon(goalChatId, reason);
     return jsonRes(res, 200, { ok: true, results });
   } catch (err: any) {
     logger.warn(`[goal-watchdog] IPC trigger failed: ${err?.message ?? err}`);
@@ -15894,6 +15940,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }).then((results) => {
         if (results.injected > 0) {
           logger.info(`[goal-watchdog] event-triggered by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} injected=${results.injected}`);
+        } else if (results.busy > 0 || results.rateLimited > 0) {
+          logger.info(`[goal-watchdog] event observed by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} busy=${results.busy} rateLimited=${results.rateLimited}`);
         }
       }).catch((err: any) => {
         logger.warn(`[goal-watchdog] event trigger failed: ${err?.message ?? err}`);
