@@ -7023,10 +7023,20 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .insight-panel[hidden] { display: none; }
 
 /* filter-bar additions: project/time selects, analyzable toggle, clear */
-.insights-page .ins-select {
-  background: var(--ins-inner); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
-  padding: 6px 10px; font: inherit; font-size: 12px; max-width: 220px; cursor: pointer;
+/* `select.ins-select` (not just `.ins-select`) so this beats the theme-layer
+   `:root[data-theme="dark"] .page :where(...select...)` rule (same specificity,
+   defined earlier) — that rule uses a `background:` shorthand which otherwise
+   wipes our chevron and leaves a pill indistinguishable from the filter buttons.
+   appearance:none (global) already removed the native arrow, so draw it here. */
+.page.insights-page select.ins-select {
+  color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  min-height: 0; padding: 6px 28px 6px 10px; font: inherit; font-size: 12px; max-width: 220px; cursor: pointer;
+  background-color: var(--ins-inner);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%23808a99' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5 6 7.5 9 4.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
 }
+.page.insights-page select.ins-select:hover { border-color: var(--mut); }
 .insights-page .ins-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--mut); cursor: pointer; white-space: nowrap; }
 .insights-page .ins-toggle input { cursor: pointer; }
 .insights-page .ins-clear {
