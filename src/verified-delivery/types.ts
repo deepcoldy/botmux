@@ -22,6 +22,46 @@ export type Evidence =
    *  ledger line stays small (atomic append). The orchestrator reads the blob. */
   | { kind: 'inline'; ref: string; name?: string; bytes: number; preview?: string };
 
+// ─── acceptance criteria (P1 #7: field-ize the JSON-in-acceptanceHint) ─────────
+// Until P1 #7 the orchestrator's verification intent lived as an opaque JSON
+// string stuffed into `acceptanceHint`; the L2 avatar parsed it by convention and
+// the daemon never understood it. Here it becomes a first-class, validated shape:
+// dispatch can reject a malformed criteria up-front, the watchdog can render the
+// checklist, and (later) the daemon can run the checks itself without an L2.
+// The free-text `acceptanceHint` survives for back-compat (plain-language hints).
+
+/** One machine-checkable assertion about an artifact. v1 keeps the set tiny —
+ *  exactly what the e2e templates already use — so it stays trivially verifiable. */
+export type AcceptanceCheck =
+  /** The artifact path exists on the verifier's filesystem. */
+  | { type: 'exists' }
+  /** The artifact's text content contains `text` (substring, not regex). */
+  | { type: 'contains'; text: string };
+
+/** A produced artifact the orchestrator intends to verify. */
+export interface AcceptanceArtifact {
+  /** Absolute path (P0/P1: same host / shared dir as the verifier). */
+  path: string;
+  kind?: 'file' | 'dir';
+  checks: AcceptanceCheck[];
+}
+
+/** A command the orchestrator intends to run to verify the delivery. */
+export interface AcceptanceCommand {
+  cmd: string;
+  cwd?: string;
+  /** Expected process exit code (default 0 when omitted). */
+  expectExitCode?: number;
+  timeoutMs?: number;
+}
+
+/** Structured, validated form of the orchestrator's verification plan. */
+export interface AcceptanceCriteria {
+  version: 1;
+  artifacts?: AcceptanceArtifact[];
+  commands?: AcceptanceCommand[];
+}
+
 /** The current materialized state of one task (read-model, derived from events). */
 export type TaskStatus = 'dispatched' | 'reported' | 'accepted' | 'rejected';
 
@@ -44,7 +84,8 @@ export interface TaskView {
   title?: string;
   workerTopicRoot?: string;   // where to dispatch --into for reject/redo
   workerOpenIds?: string[];
-  acceptanceHint?: string;    // how the orchestrator intends to verify (drives "make it verifiable")
+  acceptanceHint?: string;    // legacy free-text intent (kept for back-compat / display)
+  acceptanceCriteria?: AcceptanceCriteria; // P1 #7: structured, validated verify plan (preferred)
   status: TaskStatus;
   latestReportId?: string;
   reports: TaskReportView[];  // every attempt, in order
@@ -59,6 +100,7 @@ export interface TaskDispatchedPayload {
   workerOpenIds?: string[];
   brief?: string;
   acceptanceHint?: string;
+  acceptanceCriteria?: AcceptanceCriteria;
 }
 
 export interface TaskReportedPayload {
