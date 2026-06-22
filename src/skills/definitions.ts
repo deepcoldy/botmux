@@ -1235,8 +1235,15 @@ charter 只承载 goal 的目标 / 约束 / 共识 / 进展 / 下一步（给人
 \`\`\`bash
 botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
   --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" \\
-  [--task-id <默认自动>] --acceptance-hint "你打算怎么验收" --brief-file /tmp/brief-X.md
+  [--task-id <默认自动>] --acceptance-hint '<JSON v1 验收口径,见下>' --brief-file /tmp/brief-X.md
 \`\`\`
+- **\`--acceptance-hint\` 写成结构化 JSON v1**（不是自由文本）——worker 万一不 report，goal-watchdog 唤你巡检时你才能**机器可读地自动核验产物**（见 L2-3.5）。schema：
+  \`\`\`json
+  {"version":1,
+   "artifacts":[{"path":"/abs/file","kind":"file","checks":[{"type":"exists"},{"type":"contains","text":"PASS"}]}],
+   "commands":[{"cmd":"python3 check.py","cwd":"/abs/workdir","expectExitCode":0,"timeoutMs":60000}]}
+  \`\`\`
+  artifacts=要核验的产物（path 必须是你 L2 读得到的绝对路径）+ checks（exists/contains）；commands=可选核验命令（expectExitCode）。能结构化就结构化；实在不可测的活才退回自由文本（那样巡检只能催、不能自动 accept）。
 - **默认群级（chat-scope）、不开话题**：worker 被 @ 在它的 goal 群 chat-scope 会话唤起。dispatch 是**你（L2）**发起的，所以 worker 的 report 自然回你这条 L2 会话（同群、不跨群）。
 - \`dispatch\` 已自动把「干完用 \`botmux report --task <id>\` 带证据回报、别在群里口头说完成」的完成协议追加进简报，worker 照做。
 - 工作目录已在建群时 \`--working-dir\` 绑好，dispatch 免传 \`--repo\`；要先拉起 worker 待命用 \`--standby\`。
@@ -1248,6 +1255,17 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 - \`botmux delivery list --goal <goalChatId>\`（本 goal 所有任务的 dispatched/reported/accepted/rejected）；单看 \`botmux delivery show --task <taskId>\`。
 - 对 reported 的**优先硬证据**：能跑测试就跑、能读产物就读；不可测的活才纯判断。
 - 合格 → \`botmux delivery accept --task <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject --task <taskId> --reason ... --retry-brief ...\`（自动回推 worker 话题重做）。
+
+### L2-3.5 兜底巡检（被 \`[goal-watchdog]\` 唤醒，不等 worker report）
+**worker 不保证守 report 协议**（实测有 worker 建对了产物却不 report）。daemon 有个 goal-watchdog 定时（约 5min）扫账本，发现本 goal 有 \`dispatched/rejected\` 未 accepted 的任务，就 daemon-native 注入一条 **\`[goal-watchdog]\`** 前缀消息唤你巡检。**收到 \`[goal-watchdog]\` 前缀时，主动核验、别被动等 report**：
+1. \`botmux delivery list --goal <goalChatId> --status dispatched --older-than 5m\` 扫超时未交付（rejected 未重交的也一并看）。
+2. 逐个读它的 \`acceptanceHint\`（JSON v1）**主动核验产物**——按 artifacts 的 checks（exists/contains）读产物、按 commands 跑校验：
+   - **全通过 → 直接 \`delivery accept\`**（worker 没 report 也认；\`--evidence-checked\` 写核验了啥、\`--ran-command\` 写实际命令）。这就是兜底闭环。
+   - **产物在但 check 没过 → \`delivery reject --reason check_failed --retry-brief ...\`** 回推 worker 重做。
+   - **产物不存在 → 催 worker**（\`botmux send --chat-id <goalChatId> --mention <worker>\` 提醒它干完 + report）。
+   - **acceptanceHint 不是 JSON v1（解析不了）→ 只催 report、别臆测 done**。
+3. 巡检后 \`goal charter update\` 刷新；全 accepted → 通知 L1（L2-5）。
+**关键**：report 只是"快速通道"（有它即时唤你、快），没它 watchdog 也兜底唤你主动核验——**完成判定的真相是"L2 核验产物达标"，不是"worker 报没报"**。
 
 ### L2-4 维护 charter + 推进依赖
 每验收一波，\`botmux goal charter update --goal <goalChatId> --expected-updated-at <ts> ...\` 刷新状态（进展/下一步）。有依赖的下一波，依赖满足了再 dispatch。**卡住/超时靠查账本**：\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的，用 \`botmux send --chat-id <goalChatId> --mention <worker>\` 去问进展或改派（不靠后台轮询）。
@@ -1264,7 +1282,7 @@ botmux send --chat-id "<parent 主群 chatId>" [--mention <L1/用户 open_id>] "
 
 ## 可信交付（账本：聊天不算证据，验收要留痕）
 让"派出去的活到底做没做、验没验"有据可查，不靠群里互相说"好了"：
-- **每个 subtask 有一等 taskId**：\`dispatch\` 自动生成（或 \`--task-id\` 指定），子 bot 必须 \`botmux report --task <taskId>\` 带证据回报，不能只在群里说完成。
+- **每个 subtask 有一等 taskId**：\`dispatch\` 自动生成（或 \`--task-id\` 指定），子 bot **应**用 \`botmux report --task <taskId>\` 带证据回报（不能只在群里说完成）。但 **report 只是"快速通道"**——worker 不保证照做，所以 L2 的 \`acceptanceHint\` 写成 JSON v1、由 goal-watchdog 唤 L2 **主动核验产物**兜底（见 L2-3.5）：**完成判定的真相是"L2 核验产物达标"，worker 报没报只决定快慢、不决定成败**。
 - **证据两形态**：\`--artifact <路径>\`（你能读到的产物文件）或 inline（测试输出/关键内容/diff，自包含）；你读不到的路径不算数。
 - **账本是唯一真相源**：dispatched/reported/accepted/rejected 全落账，\`delivery list/show\` 查得到。**聊天里说的"完成"不是证据**；要把聊天内容当证据，须作为 inline 证据入账。
 - **验收留痕**：\`delivery accept/reject\` 都记下你查了哪些证据 / 跑了什么命令 / 结论原因，可回溯。
