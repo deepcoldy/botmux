@@ -148,6 +148,42 @@ describe('TmuxBackend.pasteText', () => {
     expect(calls[0].opts?.input).toBe(content);
     expect(calls[0].opts?.stdio).toEqual(['pipe', 'ignore', 'ignore']);
   });
+
+  // Each paste must use its OWN named buffer; reusing a name would reopen the
+  // cross-session race the named-buffer scheme exists to kill.
+  it('uses a fresh named buffer for each paste', () => {
+    const be = createBackend();
+    be.pasteText('one');
+    be.pasteText('two');
+
+    const loadCalls = getCalls().filter(c => c.args.includes('load-buffer'));
+    const firstBuffer = loadCalls[0].args[loadCalls[0].args.indexOf('-b') + 1];
+    const secondBuffer = loadCalls[1].args[loadCalls[1].args.indexOf('-b') + 1];
+    expect(firstBuffer).toMatch(/^botmux-[a-f0-9]{16}$/);
+    expect(secondBuffer).not.toBe(firstBuffer);
+  });
+
+  // load OK but paste-buffer throws: the named buffer was created but -d never
+  // ran, so the finally{} must delete it (else named buffers accumulate on the
+  // tmux server over repeated paste failures).
+  it('deletes the named buffer when paste-buffer fails', () => {
+    const be = createBackend();
+    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
+      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      return '' as any;
+    }) as any);
+
+    // TmuxBackend.pasteText has no guardedSend wrapper, so the paste failure
+    // propagates — but the finally{} cleanup still runs first.
+    expect(() => be.pasteText('boom')).toThrow();
+
+    const calls = getCalls();
+    const loadArgs = calls.find(c => c.args.includes('load-buffer'))!.args;
+    const bufferName = loadArgs[loadArgs.indexOf('-b') + 1];
+    const deleteCall = calls.find(c => c.args.includes('delete-buffer'));
+    expect(deleteCall).toBeDefined();
+    expect(deleteCall!.args[deleteCall!.args.indexOf('-b') + 1]).toBe(bufferName);
+  });
 });
 
 // ---------------------------------------------------------------------------

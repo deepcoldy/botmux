@@ -161,6 +161,28 @@ describe('TmuxPipeBackend input addressing', () => {
     expect(firstBuffer).not.toBe(secondBuffer);
   });
 
+  it('deletes the named buffer when paste-buffer fails (cleanup, no leak)', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    // load-buffer succeeds, paste-buffer throws → the -d delete never runs, so
+    // the finally{} must delete the SAME named buffer. guardedSend swallows the
+    // failure (pane ALIVE via the default execSync mock) so pasteText must not throw.
+    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
+      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      return '' as any;
+    }) as any);
+
+    expect(() => be.pasteText('boom')).not.toThrow();
+
+    const calls = getExecFileCalls().map(call => call[1] as string[]);
+    const loadArgs = calls.find(args => args.includes('load-buffer'))!;
+    const bufferName = loadArgs[loadArgs.indexOf('-b') + 1];
+    const deleteArgs = calls.find(args => args.includes('delete-buffer'));
+    expect(deleteArgs).toBeDefined();
+    expect(deleteArgs![deleteArgs!.indexOf('-b') + 1]).toBe(bufferName);
+  });
+
   it('write delegates to sendText (literal send-keys)', () => {
     const be = new TmuxPipeBackend('0:2.0');
     be.spawn('', [], spawnOpts());
