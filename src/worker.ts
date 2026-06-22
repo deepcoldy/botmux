@@ -19,7 +19,7 @@ import { isAbsolute, join } from 'node:path';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
-import { shouldWriteNow } from './utils/input-gate.js';
+import { shouldReleaseFirstPromptTimeout, shouldWriteNow } from './utils/input-gate.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
@@ -186,6 +186,14 @@ let readySignalTimer: ReturnType<typeof setTimeout> | null = null;
  *  back. The real signal lands within ~ms of the input box rendering, so this is
  *  pure insurance against a missing/failed hook — generous but bounded. */
 const READY_SIGNAL_TIMEOUT_MS = 45_000;
+/** Soft fallback for CLIs that never emit an idle/ready signal during startup.
+ *  Legacy adapters release queued first input here. Adapters that opt into
+ *  deferFirstPromptTimeoutUntilReady wait for the real readyPattern until the
+ *  hard cap below. */
+const FIRST_PROMPT_TIMEOUT_MS = 15_000;
+/** Hard cap for startup screens that outlive the soft fallback. Prevents a
+ *  changed/missing readyPattern from trapping the first queued input forever. */
+const FIRST_PROMPT_HARD_TIMEOUT_MS = 90_000;
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
@@ -4363,28 +4371,45 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
   }
 
-  // Fallback: if the CLI takes too long to show its prompt (e.g. slow
-  // plugin init, or a spinner blocks the idle detector), unblock screen
-  // updates AND deliver any queued prompts so the first user message
-  // isn't stranded until the second message arrives. markNewTurn() sets a
-  // clean baseline at the current cursor position so only content written
-  // *after* this point appears in the card.
-  setTimeout(() => {
-    if (awaitingFirstPrompt) {
-      awaitingFirstPrompt = false;
-      renderer?.markNewTurn();
-      log('First prompt timeout — enabling screen updates and flushing queued messages');
-      if (backend && cliAdapter?.busyPattern && probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) {
-        return;
-      }
-      // For type-ahead adapters (Codex/CoCo/TRAE/Claude) the TUI is booted
-      // enough to park input even if the idle detector hasn't fired yet.
-      // Directly invoking markPromptReady() would claim the CLI is idle
-      // while it's still mid-boot, so flushPending() alone is safer — it
-      // respects typeAheadAllowed and drains pendingMessages now.
-      if (cliAdapter?.supportsTypeAhead) flushPending();
+  // Fallback: if the CLI takes too long to show its prompt (e.g. slow plugin
+  // init, or a spinner blocks the idle detector), unblock screen updates AND
+  // deliver any queued prompts so the first user message isn't stranded until
+  // the second message arrives. Some adapters opt into deferring the soft
+  // fallback until readyPattern, but still get a hard cap below.
+  // markNewTurn() sets a clean baseline at the current cursor position so only
+  // content written *after* this point appears in the card.
+  const firstPromptBackend = backend;
+  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
+    if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    if (!shouldReleaseFirstPromptTimeout({
+      deferFirstPromptTimeoutUntilReady: cliAdapter?.deferFirstPromptTimeoutUntilReady === true,
+      hasReadyPattern: !!cliAdapter?.readyPattern,
+      elapsedMs,
+      hardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
+    })) {
+      const hardWaitMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
+      log(`First prompt timeout — ${cliName()} still waiting for readyPattern before flushing queued messages`);
+      const hardTimer = setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_HARD_TIMEOUT_MS, true), hardWaitMs);
+      hardTimer.unref?.();
+      return;
     }
-  }, 15_000);
+
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();
+    log(forced
+      ? `WARN First prompt hard timeout — ${cliName()} readyPattern did not arrive; forcing queued message flush`
+      : 'First prompt timeout — enabling screen updates and flushing queued messages');
+    if (backend && cliAdapter?.busyPattern && probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) {
+      return;
+    }
+    // For type-ahead adapters (Codex/CoCo/Claude/TraeX) the TUI is usually booted
+    // enough to park input even if the idle detector hasn't fired yet. Directly
+    // invoking markPromptReady() would claim the CLI is idle while it's still
+    // mid-boot, so flushPending() alone is safer — it respects typeAheadAllowed
+    // and drains pendingMessages now.
+    if (cliAdapter?.supportsTypeAhead) flushPending();
+  };
+  setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
 }
 
 function killCli(): void {

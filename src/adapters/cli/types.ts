@@ -229,6 +229,13 @@ export interface CliAdapter {
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
 
+  /** When true, the worker's soft first-prompt timeout keeps queued input held
+   *  until this adapter's `readyPattern` appears. Use only for CLIs whose startup
+   *  screens can accept and swallow stdin before the real composer exists; the
+   *  worker still enforces a longer hard timeout so the first prompt cannot hang
+   *  forever if the ready marker changes or the CLI stalls. */
+  readonly deferFirstPromptTimeoutUntilReady?: boolean;
+
   /** When true, worker may squash additional queued Lark messages into the
    *  pending tail instead of preserving one botmux turn per queued message.
    *  Keep this opt-in: most adapters rely on distinct turnId / card routing. */
