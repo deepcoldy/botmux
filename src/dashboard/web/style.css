@@ -22756,6 +22756,10 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-pill-accepted { background: var(--success-soft); color: var(--success); }
 .gb-pill-rejected { background: var(--danger-soft); color: var(--danger); }
 .gb-reason { display: block; font-size: .68rem; color: var(--danger); margin-top: 2px; }
+/* verdict provenance: machine reconcile vs human */
+.gb-via { display: inline-flex; align-items: center; gap: 2px; font-size: .66rem; font-weight: 600; padding: 1px 6px; border-radius: 999px; margin-left: 6px; white-space: nowrap; letter-spacing: .01em; }
+.gb-via-auto { background: var(--accent-soft); color: var(--accent-strong); border: 1px solid color-mix(in srgb, var(--accent-strong) 30%, transparent); }
+.gb-via-human { background: var(--surface-muted); color: var(--muted); }
 
 /* right: detail panel */
 .gb-detail { background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 14px; position: sticky; top: 14px; max-height: calc(100vh - 180px); overflow-y: auto; }
