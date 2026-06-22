@@ -26,6 +26,7 @@ import { getWhiteboard, readWhiteboard } from '../services/whiteboard-store.js';
 import type {
   AcceptanceCriteria, Evidence, LedgerEvent, TaskStatus, TaskView,
   TaskReportedPayload, TaskAcceptedPayload, TaskRejectedPayload,
+  TaskHelpView, TaskEscalationView,
 } from './types.js';
 
 /** A compact, display-safe descriptor of one piece of evidence (no blob inlined). */
@@ -85,6 +86,12 @@ export interface GoalBoardTask {
 
   /** Every attempt, oldest→newest, for the detail-panel timeline. */
   attempts: BoardReportAttempt[];
+
+  // ── help / escalation rung (the "stuck worker" path) ──────────────────────
+  /** Latest help request (worker → supervisor); present when blocked/handled. */
+  help?: TaskHelpView;
+  /** Latest escalation (supervisor → human); present once escalated. */
+  escalation?: TaskEscalationView;
 }
 
 export interface GoalBoardGoal {
@@ -99,7 +106,7 @@ export interface GoalBoardGoal {
   charterContent?: string;
   /** Most recent delivery activity across this goal's tasks (unix ms). */
   lastActivityAt?: number;
-  counts: { dispatched: number; reported: number; accepted: number; rejected: number; total: number };
+  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; total: number };
   tasks: GoalBoardTask[];
 }
 
@@ -113,9 +120,10 @@ export function goalCharterId(goal: string): string {
   return `goal_${hash}`;
 }
 
-/** Order tasks within a goal: active (dispatched/reported) before terminal, then
- *  by ledger order (which is dispatch order, since taskIds aren't time-sortable). */
-const STATUS_RANK: Record<TaskStatus, number> = { dispatched: 0, reported: 1, rejected: 2, accepted: 3 };
+/** Order tasks within a goal: needs-attention (escalated→human, blocked→supervisor)
+ *  first, then active (dispatched/reported), then terminal — by ledger order
+ *  (which is dispatch order, since taskIds aren't time-sortable). */
+const STATUS_RANK: Record<TaskStatus, number> = { escalated: -2, blocked: -1, dispatched: 0, reported: 1, rejected: 2, accepted: 3 };
 
 /** Per-task timing + per-report timing, derived from the raw event stream. */
 interface TaskTiming {
@@ -190,6 +198,8 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
   if (latest?.verdict) task.latestVerdict = latest.verdict;
   if (latest?.reason) task.rejectReason = latest.reason;
   if (latest?.verdictVia === 'reconcile') task.autoReconciled = true;
+  if (t.help) task.help = t.help;
+  if (t.escalation) task.escalation = t.escalation;
   if (latest?.checkedBy) task.checkedBy = latest.checkedBy;
   if (latest?.evidenceChecked?.length) task.evidenceChecked = latest.evidenceChecked;
   if (latest?.ranCommands?.length) task.ranCommands = latest.ranCommands;
@@ -233,7 +243,7 @@ export function buildGoalBoard(opts: { baseDir?: string; chatId?: string } = {})
       try { charterContent = readWhiteboard(meta.id, { allowDisabled: true, missingAsEmpty: true }); } catch { /* tolerate */ }
     }
 
-    const counts = { dispatched: 0, reported: 0, accepted: 0, rejected: 0, total: tasks.length };
+    const counts = { dispatched: 0, reported: 0, accepted: 0, rejected: 0, blocked: 0, escalated: 0, total: tasks.length };
     for (const t of tasks) counts[t.status] += 1;
 
     const boardTasks = tasks

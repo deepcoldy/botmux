@@ -119,7 +119,10 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         t.workerNames = p.workerNames ?? t.workerNames;
         t.acceptanceHint = p.acceptanceHint ?? t.acceptanceHint;
         t.acceptanceCriteria = p.acceptanceCriteria ?? t.acceptanceCriteria;
-        if (t.reports.length === 0) t.status = 'dispatched';
+        // A (re)dispatch re-activates a fresh OR a help-blocked/escalated task —
+        // it's the supervisor's "go again" after addressing the blocker. It must
+        // NOT clobber a reported/accepted/rejected task (late metadata dispatch).
+        if (t.reports.length === 0 || t.status === 'blocked' || t.status === 'escalated') t.status = 'dispatched';
       } else if (e.type === 'TaskReported') {
         const p = e.payload as import('./types.js').TaskReportedPayload;
         const t = ensure(e.taskId, e.chatId);
@@ -143,6 +146,18 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         const r = findReport(t, p.reportId);
         if (r) { r.verdict = 'rejected'; r.reason = p.reason; r.checkedBy = p.checkedBy; r.verdictVia = p.via ?? r.verdictVia; }
         if (p.reportId === t.latestReportId) t.status = 'rejected';
+      } else if (e.type === 'TaskHelpRequested') {
+        const p = e.payload as import('./types.js').TaskHelpRequestedPayload;
+        const t = ensure(e.taskId, e.chatId);
+        t.help = { blocker: p.blocker, kind: p.kind, workerOpenId: p.workerOpenId };
+        // A help request parks the task as 'blocked' awaiting the supervisor — but
+        // never overrides a terminal verdict (a late help after accept is noise).
+        if (t.status !== 'accepted' && t.status !== 'rejected') t.status = 'blocked';
+      } else if (e.type === 'TaskEscalated') {
+        const p = e.payload as import('./types.js').TaskEscalatedPayload;
+        const t = ensure(e.taskId, e.chatId);
+        t.escalation = { reason: p.reason, by: p.by, retryBrief: p.retryBrief };
+        if (t.status !== 'accepted' && t.status !== 'rejected') t.status = 'escalated';
       }
     }
     return byTask;

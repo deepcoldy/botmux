@@ -27,7 +27,7 @@ describe('buildGoalBoard — ledger projection', () => {
     const board = buildGoalBoard({ baseDir });
     expect(board.goals.map((g) => g.goalChatId).sort()).toEqual(['oc_g1', 'oc_g2']);
     const g1 = board.goals.find((g) => g.goalChatId === 'oc_g1')!;
-    expect(g1.counts).toEqual({ dispatched: 1, reported: 0, accepted: 1, rejected: 0, total: 2 });
+    expect(g1.counts).toEqual({ dispatched: 1, reported: 0, accepted: 1, rejected: 0, blocked: 0, escalated: 0, total: 2 });
     expect(g1.hasCharter).toBe(false); // no whiteboard created in this test
     // active task (dispatched) sorts before terminal (accepted)
     expect(g1.tasks.map((t) => t.taskId)).toEqual(['t-a', 't-b']);

@@ -141,6 +141,12 @@ export type ReconcileAction =
   | 'no-criteria'
   /** Already terminal-accepted; nothing to do. */
   | 'already-accepted'
+  /** Worker raised a help request (status=blocked) — NOT a failed delivery; the
+   *  caller routes it to the supervisor to self-resolve/escalate, never reject. */
+  | 'blocked'
+  /** Supervisor escalated to a human (status=escalated) — parked, awaiting the
+   *  human; the caller must NOT re-verify or nag. */
+  | 'escalated'
   /** taskId not present in the ledger. */
   | 'unknown-task';
 
@@ -198,6 +204,10 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
   const task = ledger.task(taskId);
   if (!task) return { taskId, action: 'unknown-task' };
   if (task.status === 'accepted') return { taskId, action: 'already-accepted' };
+  // A help/escalation is not a delivery to verify — never run checks (and never
+  // reject) on it. The watchdog routes blocked → supervisor, escalated → parked.
+  if (task.status === 'blocked') return { taskId, action: 'blocked' };
+  if (task.status === 'escalated') return { taskId, action: 'escalated' };
   const criteria = task.acceptanceCriteria;
   if (!criteria) return { taskId, action: 'no-criteria' };
 

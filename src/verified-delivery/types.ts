@@ -2,14 +2,22 @@
  * verified-delivery/types.ts — the seam contract between the two halves of the
  * "trusted delivery spine" P0 (claude: worker-side report; codex: orchestrator
  * verify/handoff). This is a PURPOSE-BUILT minimal ledger, NOT the collab
- * control-plane: 4 events, idempotency, materialize. We borrow collab's
- * *pattern* (append-only + idempotent + materialized read-model), not its files
- * or its Run/referee/proposal semantics.
+ * control-plane: a deliberately small event set, idempotency, materialize. We
+ * borrow collab's *pattern* (append-only + idempotent + materialized read-model),
+ * not its files or its Run/referee/proposal semantics.
  *
  * The whole spine in one sentence: a worker cannot self-declare done in chat —
  * it must `botmux report --task <id>` with evidence the orchestrator can verify;
  * the orchestrator (the LLM judge) accepts or rejects; the Feishu task board is
  * only a human-facing projection, the ledger is the truth.
+ *
+ * Beyond the success path there is a HELP/ESCALATION rung (so a stuck worker has
+ * a dignified exit instead of faking "done" or going silent): the worker raises
+ * `TaskHelpRequested` (status→blocked); the supervisor self-resolves (re-dispatch
+ * / clarify) or, when only a human can decide, raises `TaskEscalated`
+ * (status→escalated) which lights the dashboard "需要你" via the parent session.
+ * Help is a ledger event — NOT a chat message — for the same reason completion is:
+ * chat can be missed, the ledger is discovered by querying it.
  */
 
 /** Where a delivered result actually is, so the orchestrator can verify it. */
@@ -62,8 +70,13 @@ export interface AcceptanceCriteria {
   commands?: AcceptanceCommand[];
 }
 
-/** The current materialized state of one task (read-model, derived from events). */
-export type TaskStatus = 'dispatched' | 'reported' | 'accepted' | 'rejected';
+/** The current materialized state of one task (read-model, derived from events).
+ *  blocked = worker raised a help request, awaiting the supervisor.
+ *  escalated = supervisor couldn't resolve, awaiting a human decision. */
+export type TaskStatus = 'dispatched' | 'reported' | 'accepted' | 'rejected' | 'blocked' | 'escalated';
+
+/** Why a worker is stuck (kept tiny + enum-like so the board/stats can group). */
+export type HelpKind = 'access' | 'ambiguous' | 'impossible' | 'repeated_failure' | 'other';
 
 /** How a verdict was produced. Omitted ⇒ a human ruled via the `delivery` CLI;
  *  'reconcile' ⇒ the mechanical reconciler ran the structured acceptance criteria
@@ -84,6 +97,20 @@ export interface TaskReportView {
   verdictVia?: VerdictVia;    // 'reconcile' when the mechanical reconciler ruled; else human/CLI
 }
 
+/** The latest help request raised on a task (worker → supervisor). */
+export interface TaskHelpView {
+  blocker: string;            // what's blocking — the whole point, required
+  kind?: HelpKind;
+  workerOpenId?: string;      // who raised it
+}
+
+/** The latest escalation raised on a task (supervisor → human). */
+export interface TaskEscalationView {
+  reason: string;             // why a human is needed
+  by?: string;                // supervisor/orchestrator id who escalated
+  retryBrief?: string;        // context / what the human should decide
+}
+
 export interface TaskView {
   taskId: string;
   chatId?: string;
@@ -99,6 +126,10 @@ export interface TaskView {
   status: TaskStatus;
   latestReportId?: string;
   reports: TaskReportView[];  // every attempt, in order
+  /** Latest help request (present once a worker has ever raised one). */
+  help?: TaskHelpView;
+  /** Latest escalation (present once the supervisor has ever escalated). */
+  escalation?: TaskEscalationView;
 }
 
 // ─── events (exactly four) ───────────────────────────────────────────────────
@@ -144,6 +175,25 @@ export interface TaskRejectedPayload {
   via?: VerdictVia;  // 'reconcile' for the mechanical reconciler; omitted for human/CLI rejects
 }
 
+/** Worker → supervisor: "I'm stuck and can't finish." A deliberate hand-raise,
+ *  distinct from a silent stall (watchdog/reconcile handles that) and from a
+ *  failed report (reject). The supervisor self-resolves or escalates. */
+export interface TaskHelpRequestedPayload {
+  taskId: string;
+  workerOpenId?: string;
+  blocker: string;
+  kind?: HelpKind;
+}
+
+/** Supervisor → human: "I can't resolve this; a person must decide." Lights the
+ *  dashboard "需要你" on the parent (L1) session via daemon-native notify. */
+export interface TaskEscalatedPayload {
+  taskId: string;
+  reason: string;
+  by?: string;
+  retryBrief?: string;
+}
+
 /** Stable reject codes both halves share, so UI / stats can recognise them.
  *  Detail/instructions ride in retryBrief / expectedEvidence, not in the code. */
 export const REJECT_REASON = {
@@ -160,7 +210,9 @@ export type LedgerEventType =
   | 'TaskDispatched'
   | 'TaskReported'
   | 'TaskAccepted'
-  | 'TaskRejected';
+  | 'TaskRejected'
+  | 'TaskHelpRequested'
+  | 'TaskEscalated';
 
 export type LedgerActor = 'orchestrator' | 'worker';
 
@@ -178,7 +230,9 @@ export interface LedgerEventDraft {
     | TaskDispatchedPayload
     | TaskReportedPayload
     | TaskAcceptedPayload
-    | TaskRejectedPayload;
+    | TaskRejectedPayload
+    | TaskHelpRequestedPayload
+    | TaskEscalatedPayload;
 }
 
 /** A persisted ledger line. */
