@@ -1563,11 +1563,11 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; wrap
   };
 }
 
-function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+function liveBots(): { larkAppId: string; botName: string; botOpenId?: string; cliId?: string }[] {
   const ids = configuredCliIds();
   return registry.list().map(d => {
     const b = withConfiguredCliId(d, ids);
-    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+    return { larkAppId: b.larkAppId, botName: b.botName, botOpenId: b.botOpenId, cliId: b.cliId };
   });
 }
 
@@ -1739,6 +1739,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
         }
         cur.memberBots.push({
           larkAppId: d.larkAppId,
+          botOpenId: d.botOpenId,
           botName: d.botName,
           cliId: d.cliId,
           inChat: true,
@@ -1758,7 +1759,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
     const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
     for (const b of onlineBots) {
       if (!present.has(b.larkAppId)) {
-        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
+        c.memberBots.push({ larkAppId: b.larkAppId, botOpenId: b.botOpenId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
       }
     }
   }
@@ -3040,9 +3041,10 @@ const server = createServer(async (req, res) => {
       // same matrix shape. Public-read carve-out: oncall bindings carry
       // workingDir (repo/customer paths) so we scrub when unauthed.
       const matrix = await buildGroupsMatrix();
+      const publicBots = matrix.bots.map(({ botOpenId: _botOpenId, ...rest }) => rest);
       return jsonRes(res, 200, {
         chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
-        bots: matrix.bots,
+        bots: authed ? matrix.bots : publicBots,
       });
     }
 

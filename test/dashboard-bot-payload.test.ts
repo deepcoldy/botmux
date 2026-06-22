@@ -5,11 +5,13 @@ describe('dashboard bot payload helpers', () => {
   it('includes authoritative cliId in group roster bot summaries', () => {
     expect(botSummaryPayload({
       larkAppId: 'cli_traex',
+      botOpenId: 'ou_traex',
       botName: 'TraeX',
       botAvatarUrl: 'https://example.test/avatar.png',
       cliId: 'traex',
     })).toEqual({
       larkAppId: 'cli_traex',
+      botOpenId: 'ou_traex',
       botName: 'TraeX',
       botAvatarUrl: 'https://example.test/avatar.png',
       cliId: 'traex',

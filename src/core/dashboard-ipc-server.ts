@@ -111,7 +111,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -1342,6 +1342,24 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+function currentBotForGroups() {
+  if (!cachedLarkAppId) return null;
+  let bot: ReturnType<typeof getBot> | null = null;
+  try {
+    bot = getBot(cachedLarkAppId);
+  } catch {
+    // Tests and older daemon startup windows can have larkAppId before the
+    // registry entry is hydrated. Keep /api/groups best-effort.
+  }
+  return {
+    larkAppId: cachedLarkAppId,
+    botOpenId: getBotOpenId(cachedLarkAppId),
+    botName: getBotName() || bot?.botName || cachedLarkAppId,
+    cliId: bot?.config?.cliId,
+    defaultOncall: bot?.config?.defaultOncall,
+  };
+}
+
 ipcRoute('GET', '/api/groups', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
@@ -1362,7 +1380,8 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         .map(b => b.name);
       return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, observedBotNames };
     });
-    jsonRes(res, 200, { chats: enriched });
+    const selfBot = currentBotForGroups();
+    jsonRes(res, 200, { chats: enriched, bots: selfBot ? [selfBot] : [] });
   } catch (e) {
     jsonRes(res, 502, { error: String(e) });
   }
