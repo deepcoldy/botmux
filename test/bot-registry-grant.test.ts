@@ -107,6 +107,13 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rc3', larkAppSecret: 's' }]))[0].restrictGrantCommands).toBeUndefined();
   });
 
+  it('parses autoGrantRequestCards as default-on with explicit false override', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ag1', larkAppSecret: 's' }]))[0].autoGrantRequestCards).toBeUndefined();
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ag2', larkAppSecret: 's', autoGrantRequestCards: true }]))[0].autoGrantRequestCards).toBeUndefined();
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ag3', larkAppSecret: 's', autoGrantRequestCards: false }]))[0].autoGrantRequestCards).toBe(false);
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ag4', larkAppSecret: 's', autoGrantRequestCards: 'false' }]))[0].autoGrantRequestCards).toBeUndefined();
+  });
+
   it('parses regularGroupReplyMode: keeps new-topic|shared, drops chat/invalid/absent to undefined', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyMode: 'new-topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1b', larkAppSecret: 's', regularGroupReplyMode: 'shared' }]))[0].regularGroupReplyMode).toBe('shared');

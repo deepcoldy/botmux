@@ -76,7 +76,7 @@ export const messages: Record<string, string> = {
 
   // 群内授权卡片
   'card.grant.title': '🔑 使用授权',
-  'card.grant.body_request': '用户 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
+  'card.grant.body_request': '对象 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
   'card.grant.body_owner': '是否授权 **{name}** 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.body_owner_multi': '是否授权 {names} 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.btn_chat': '授权本群对话',

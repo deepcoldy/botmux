@@ -35,11 +35,13 @@ vi.mock('../src/utils/atomic-write.js', () => ({
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
+const mockGetOwnerOpenId = vi.fn(() => undefined as string | undefined);
 const mockIsChatOncallBoundForAnyBot = vi.fn<(chatId: string) => boolean>(() => false);
 const mockFindOncallChat = vi.fn<(larkAppId: string, chatId: string) => { chatId: string; workingDir: string } | undefined>(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
   getAllBots: () => mockGetAllBots(),
+  getOwnerOpenId: (...args: any[]) => mockGetOwnerOpenId(...args),
   findOncallChat: (...args: any[]) => mockFindOncallChat(...(args as [string, string])),
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
 }));
@@ -123,6 +125,7 @@ function setupBotState(opts?: {
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared';
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
   autoStartOnNewTopic?: boolean;
+  autoGrantRequestCards?: boolean;
   chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared'>;
   p2pMode?: 'thread' | 'chat';
 }) {
@@ -140,6 +143,7 @@ function setupBotState(opts?: {
       regularGroupReplyMode: opts?.regularGroupReplyMode,
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
+      autoGrantRequestCards: opts?.autoGrantRequestCards,
       chatReplyModes: opts?.chatReplyModes,
       p2pMode: opts?.p2pMode,
     },
@@ -327,6 +331,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     mockReplyMessage.mockClear();
+    mockGetOwnerOpenId.mockReset();
+    mockGetOwnerOpenId.mockReturnValue(undefined);
     mockGetCachedChatMode.mockReset();
     mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
@@ -449,6 +455,59 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('sends a grant request card when an unknown external bot is @blocked and the toggle is on', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('keeps the unknown external bot @blocked path silent when auto grant cards are disabled', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: false });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
   it('routes cross-bot @mention in chat-scope when sender is a known botmux peer', async () => {

@@ -69,6 +69,7 @@
 | `chatGrants` | 按群的 per-user 授权 `{ "oc_xxx": ["ou_yyy"] }`，仅放行 `canTalk`。一般由 `/grant` 卡片写入，也可手配 |
 | `messageQuota` | 消息额度开关 `{ "defaultLimit": N }`：配了正整数后，不带数字的 `/grant` 套用 N 条额度；不配则授权无限。仅约束 talk 授权，不影响 `canOperate` |
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
+| `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 
 ## 卡片与终端
 

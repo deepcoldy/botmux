@@ -880,6 +880,7 @@ export function canOperate(larkAppId: string, _chatId: string | undefined, sende
 async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined,
 ): Promise<void> {
+  if (getBot(larkAppId).config.autoGrantRequestCards === false) return;
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
@@ -1488,6 +1489,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
                 && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
                 && !hasChatGrant(larkAppId, chatId, senderOpenId)
                 && !hasGlobalGrant(larkAppId, senderOpenId)) {
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId);
               return;
             }
           }

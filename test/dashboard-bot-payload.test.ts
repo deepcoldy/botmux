@@ -33,4 +33,14 @@ describe('dashboard bot payload helpers', () => {
       error: 'http_503',
     });
   });
+
+  it('defaults auto grant request cards on and preserves explicit off', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      autoGrantRequestCards: true,
+    });
+    expect(botDefaultsPayload(daemon, { autoGrantRequestCards: false })).toMatchObject({
+      autoGrantRequestCards: false,
+    });
+  });
 });

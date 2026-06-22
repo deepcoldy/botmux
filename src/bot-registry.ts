@@ -178,6 +178,12 @@ export interface BotConfig {
    */
   restrictGrantCommands?: boolean;
   /**
+   * 自动授权申请卡开关。默认开启（undefined = on）：群里有人或外部 bot 明确 @ 本 bot
+   * 但被 talk 权限闸挡住时，给 owner 弹 /grant 申请卡。显式 false 时静默丢弃，
+   * 保留原来的强权限闸但不刷卡。
+   */
+  autoGrantRequestCards?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -834,6 +840,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       messageQuota,
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
+      // Default is ON, so only explicit false is meaningful/persisted.
+      autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       customPassthroughCommands,
       startupCommands,
       env,

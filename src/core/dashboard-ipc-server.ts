@@ -1159,6 +1159,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
+    autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     p2pMode,
     maxLiveWorkers,
@@ -1211,6 +1212,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
 // Per-bot 授权偏好。Body 任意子集：
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
+//   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
 //   • messageQuotaDefaultLimit: number|null — 默认消息额度（null = 关闭，正整数 = 启用）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -1221,10 +1223,11 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
   }
-  const body = raw as { restrictGrantCommands?: unknown; messageQuotaDefaultLimit?: unknown };
+  const body = raw as { restrictGrantCommands?: unknown; autoGrantRequestCards?: unknown; messageQuotaDefaultLimit?: unknown };
 
-  const patch: { restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null } = {};
+  const patch: { restrictGrantCommands?: boolean; autoGrantRequestCards?: boolean; messageQuotaDefaultLimit?: number | null } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
+  if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   // null（含 JSON null）= 关闭默认额度；number = 设定（store 内再校验正整数）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;

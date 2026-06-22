@@ -2005,7 +2005,8 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
-    // any subset of `{ restrictGrantCommands?: boolean, messageQuotaDefaultLimit?: number|null }`.
+    // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
+    // messageQuotaDefaultLimit?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
       const appId = decodeURIComponent(mBotGrantPrefs[1]);

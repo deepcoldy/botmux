@@ -69,6 +69,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card, but can also be configured by hand |
 | `messageQuota` | Message-quota switch `{ "defaultLimit": N }`: once a positive integer is configured, a `/grant` without a number applies an N-message quota; if not configured, authorization is unlimited. Only constrains talk authorization, does not affect `canOperate` |
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
+| `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
 
 ## Cards and terminal
 
