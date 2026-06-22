@@ -202,9 +202,12 @@ export function getCliDisplayName(cliId: CliId): string {
   return cliDisplayNames[cliId] ?? cliId;
 }
 
-/** Escape Lark markdown special characters in user-controlled strings. */
+/** Escape Lark markdown special characters in user-controlled strings.
+ *  `<`/`>` are escaped too so an attacker-controlled name (e.g. a foreign
+ *  bot's app name surfaced in the grant card) cannot inject a literal
+ *  `<at id=…></at>` tag and spoof a mention in a `lark_md` body. */
 function escapeMd(s: string): string {
-  return s.replace(/[*_~`\[\]\\]/g, c => `\\${c}`);
+  return s.replace(/[*_~`\[\]\\<>]/g, c => `\\${c}`);
 }
 
 function sidebarUrl(url: string): string {

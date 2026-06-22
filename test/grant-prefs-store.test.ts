@@ -98,6 +98,69 @@ describe('grant-prefs store', () => {
     expect(registry.getBot('app_default').config.restrictGrantCommands).toBeUndefined();
   });
 
+  it('defaults autoGrantRequestCards to true when unset', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').autoGrantRequestCards).toBe(true);
+  });
+
+  it('persists autoGrantRequestCards=false and syncs in-memory config', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotGrantPrefs('app_default', { autoGrantRequestCards: false });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.autoGrantRequestCards).toBe(false);
+
+    expect(readConfig().autoGrantRequestCards).toBe(false);
+    expect(registry.getBot('app_default').config.autoGrantRequestCards).toBe(false);
+  });
+
+  it('removes autoGrantRequestCards key when toggled back on (default stays tidy)', async () => {
+    writeConfig({ autoGrantRequestCards: false });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    // Sanity: explicit false is parsed and surfaced before we flip it back.
+    expect(store.getBotGrantPrefs('app_default').autoGrantRequestCards).toBe(false);
+
+    const r = await store.updateBotGrantPrefs('app_default', { autoGrantRequestCards: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.autoGrantRequestCards).toBe(true);
+
+    // Default-on → key deleted from disk and in-memory config (undefined === on).
+    expect(readConfig().autoGrantRequestCards).toBeUndefined();
+    expect(registry.getBot('app_default').config.autoGrantRequestCards).toBeUndefined();
+  });
+
+  it('partial patch preserves an explicit autoGrantRequestCards=false', async () => {
+    writeConfig({ autoGrantRequestCards: false });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // Flip only restrict; the auto-card opt-out must survive the read-modify-write.
+    await store.updateBotGrantPrefs('app_default', { restrictGrantCommands: true });
+
+    const disk = readConfig();
+    expect(disk.restrictGrantCommands).toBe(true);
+    expect(disk.autoGrantRequestCards).toBe(false);
+  });
+
+  it('getBotGrantPrefs catch-fallback returns autoGrantRequestCards=true for an unknown bot', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // Unregistered bot → getBot throws → safe defaults (auto-card on).
+    expect(store.getBotGrantPrefs('app_missing')).toEqual({
+      restrictGrantCommands: false,
+      autoGrantRequestCards: true,
+      messageQuotaDefaultLimit: null,
+    });
+  });
+
   it('null defaultLimit deletes messageQuota but preserves quotaState counters', async () => {
     writeConfig({
       messageQuota: { defaultLimit: 5 },

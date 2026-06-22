@@ -101,6 +101,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+// grant-pending is a real (unmocked) module-level table; reset it per test so the
+// grant-card throttle state never leaks across cases (it backs the @blocked card path).
+import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -330,6 +333,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     capturedHandlers = {};
     __resetAnchorQueues();
     __resetEventClaimsForTest();
+    _resetGrantPending();
     mockReplyMessage.mockClear();
     mockGetOwnerOpenId.mockReset();
     mockGetOwnerOpenId.mockReturnValue(undefined);
@@ -508,6 +512,44 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('throttles repeat @blocked mentions from the same bot+chat to a single grant card', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    const makeBlocked = (messageId: string) => {
+      const event = makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        messageId,
+        content: JSON.stringify({
+          zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+        }),
+        rootId: undefined,
+      });
+      event.message.root_id = undefined as any;
+      return event;
+    };
+
+    // Two distinct messages (distinct message_id → both clear event-dedup) from the
+    // SAME bot in the SAME chat. The throttle keys on bot:chat:target, so the second
+    // is suppressed while the first card is still pending.
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-001'));
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-002'));
+    await flushEventWork();
+
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
   });
 
   it('routes cross-bot @mention in chat-scope when sender is a known botmux peer', async () => {

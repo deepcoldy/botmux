@@ -16,7 +16,7 @@ import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripLeadingMentions } from './message-parser.js';
-import { recordObservedBots } from '../../services/observed-bots-store.js';
+import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
@@ -884,8 +884,14 @@ async function maybeSendGrantRequestCard(
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
-  const name = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name
-    ?? requesterOpenId;
+  // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
+  // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
+  // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
+  const mentionName = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name;
+  const observedName = mentionName
+    ? undefined
+    : listObservedBots(config.session.dataDir, larkAppId, chatId).find(b => b.openId === requesterOpenId)?.name;
+  const name = mentionName ?? observedName ?? requesterOpenId;
   const nonce = openPending(larkAppId, chatId, requesterOpenId, getBot(larkAppId).config.messageQuota?.defaultLimit);
   const card = buildGrantCard(
     { ownerOpenId: owner, targets: [{ openId: requesterOpenId, name: String(name) }], chatId, nonce, mode: 'request' },
