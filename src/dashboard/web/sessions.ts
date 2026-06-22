@@ -356,8 +356,8 @@ function renderCreateSessionForm(bots: PickerBot[]): string {
         </fieldset>
         <fieldset class="cs-mode">
           <legend>${t('sessions.create.mode')}</legend>
-          <label><input type="radio" name="mode" value="all" checked> ${t('sessions.create.modeAll')}</label>
-          <label><input type="radio" name="mode" value="lead"> ${t('sessions.create.modeLead')}</label>
+          <label><input type="radio" name="mode" value="lead" checked> ${t('sessions.create.modeLead')}</label>
+          <label><input type="radio" name="mode" value="all"> ${t('sessions.create.modeAll')}</label>
           <small>${t('sessions.create.modeHelp')}</small>
         </fieldset>
         <div class="cs-lead-row form-row" hidden>
@@ -441,6 +441,8 @@ function wireCreateSessionForm(modal: HTMLDialogElement, bots: PickerBot[]): voi
   form.querySelectorAll<HTMLInputElement>('input[name=bot]').forEach(c => c.addEventListener('change', () => {
     if (currentMode() === 'lead') repopulateLead();
   }));
+  // 按默认模式(Lead 分配)初始化 Lead 行的显隐——一起开工时整行不展示。
+  syncMode();
   modal.querySelector<HTMLButtonElement>('#cs-cancel')!.onclick = () => modal.close();
 
   form.onsubmit = async ev => {
