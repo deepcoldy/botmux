@@ -176,9 +176,13 @@ describe('ZellijObserveBackend liveness debounce', () => {
     }
   });
 
-  it('a live web-attach client resets a partial pane-failure streak (no detach across attach)', () => {
-    // While attached we don't pane-probe (avoids flicker); the streak must be
-    // discarded so it can't trip the instant the client connects.
+  it('setLiveAttach(true) resets a partial pane-failure streak at the attach transition', () => {
+    // 2 failures, then a brief attach+detach that crosses NO liveness tick. If
+    // setLiveAttach reset the streak, a single post-detach failure leaves the
+    // gate at 1 (no detach). If it did NOT reset (e.g. relying only on the
+    // per-tick reset), the gate would still be 2 and this one failure would hit
+    // the threshold → detach. So this pins the reset to setLiveAttach itself —
+    // it would go red if that reset were removed.
     vi.useFakeTimers();
     const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
     try {
@@ -191,10 +195,15 @@ describe('ZellijObserveBackend liveness debounce', () => {
       vi.advanceTimersByTime(2_000);   // 2 pane failures (gate at 2, no detach)
       expect(exits).toEqual([]);
 
-      be.setLiveAttach(true);          // web terminal connects → pane probe paused
-      vi.advanceTimersByTime(10_000);  // pid stays alive; streak was reset
+      be.setLiveAttach(true);          // attach resets the streak immediately…
+      be.setLiveAttach(false);         // …and detaches before any liveness tick
 
+      vi.advanceTimersByTime(1_000);   // ONE more failure → gate is 1, not 3
       expect(exits).toEqual([]);
+
+      // And the gate genuinely counts from 1: two further failures DO trip it.
+      vi.advanceTimersByTime(2_000);
+      expect(exits).toEqual([[0, null]]);
     } finally {
       killSpy.mockRestore();
       vi.useRealTimers();

@@ -97,9 +97,11 @@ export class ZellijObserveBackend implements ObserveBackend {
     // While a live web-attach client is connected, skip the list-panes `action`
     // (it makes the zellij server repaint every attached client → flicker). The
     // attach PTY's own exit covers pane/session death and the pid check above
-    // covers CLI exit — nothing flaky left to probe. Discard any partial pane
-    // failure streak so it can't bite the moment the client detaches.
-    if (this.liveAttachCount > 0) { this.livenessGate.reset(); return; }
+    // covers CLI exit — nothing flaky left to probe. The partial pane-failure
+    // streak was already discarded the moment the client attached (see
+    // setLiveAttach), and nothing increments the gate while attached, so there's
+    // nothing to reset here.
+    if (this.liveAttachCount > 0) return;
     // (a) The list-panes pane probe IS the flaky signal (busy server) — debounce.
     this.recordPaneProbe(this.isPaneAlive());
   }
@@ -144,6 +146,11 @@ export class ZellijObserveBackend implements ObserveBackend {
     this.liveAttachCount = Math.max(0, this.liveAttachCount + (active ? 1 : -1));
     if (this.exited) return;
     if (this.liveAttachCount > 0) {
+      // Pane probing pauses while attached → discard any partial pane-failure
+      // streak NOW, at the attach transition, not on the next liveness tick. A
+      // brief attach that opens and closes BETWEEN ticks would otherwise leave a
+      // stale streak that trips the moment the client detaches.
+      this.livenessGate.reset();
       if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
     } else if (!this.pollTimer) {
       this.pollTimer = setInterval(() => this.poll(), POLL_MS);
