@@ -31,6 +31,12 @@ import {
   t,
   ui,
 } from './ui.js';
+import {
+  IDLE_CLEANUP_HOUR_OPTIONS,
+  parseIdleCleanupHours,
+  selectIdleCleanupCandidates,
+  type IdleCleanupHours,
+} from '../session-cleanup.js';
 
 function th(sort: string, label: string): string {
   return `<th data-sort="${sort}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</th>`;
@@ -271,6 +277,20 @@ function pageHtml(): string {
       ${renderCliFilterGroup()}
       <label class="filter-toggle"><input type="checkbox" name="active" checked> <span>${t('sessions.activeOnly')}</span></label>
     </form>
+    <div id="idle-cleanup-bar" class="idle-cleanup-bar">
+      <div class="idle-cleanup-summary">
+        <span class="idle-cleanup-dot" aria-hidden="true"></span>
+        <span id="idle-cleanup-count" class="idle-cleanup-count"></span>
+      </div>
+      <div class="idle-cleanup-controls">
+        <span class="idle-cleanup-label">${t('sessions.idleCleanupOlderThan')}</span>
+        <div id="idle-cleanup-threshold" class="idle-cleanup-thresholds" role="group" aria-label="${t('sessions.idleCleanupThreshold')}">
+          ${IDLE_CLEANUP_HOUR_OPTIONS.map(hours => `<button type="button" data-hours="${hours}" aria-pressed="${hours === 24 ? 'true' : 'false'}">${hours === 168 ? '7d' : `${hours}H`}</button>`).join('')}
+        </div>
+        <button type="button" id="idle-cleanup-run" class="contrast idle-cleanup-run">${t('sessions.idleCleanupRun')}</button>
+      </div>
+      <span id="idle-cleanup-status" class="idle-cleanup-status" aria-live="polite"></span>
+    </div>
     <div id="bulk-bar" class="bulk-bar" hidden>
       <span id="bulk-count"></span>
       <button type="button" id="bulk-close" class="contrast">${t('sessions.closeSelected')}</button>
@@ -311,6 +331,10 @@ export function renderSessionsPage(root: HTMLElement) {
   const bulkCountSpan = root.querySelector<HTMLElement>('#bulk-count')!;
   const bulkCloseBtn = root.querySelector<HTMLButtonElement>('#bulk-close')!;
   const bulkClearBtn = root.querySelector<HTMLButtonElement>('#bulk-clear')!;
+  const idleCleanupThreshold = root.querySelector<HTMLElement>('#idle-cleanup-threshold')!;
+  const idleCleanupBtn = root.querySelector<HTMLButtonElement>('#idle-cleanup-run')!;
+  const idleCleanupCount = root.querySelector<HTMLElement>('#idle-cleanup-count')!;
+  const idleCleanupStatus = root.querySelector<HTMLElement>('#idle-cleanup-status')!;
   const table = root.querySelector<HTMLTableElement>('#sessions-table')!;
   const board = root.querySelector<HTMLElement>('#sessions-board')!;
   const kanban = root.querySelector<HTMLElement>('#sessions-kanban')!;
@@ -366,6 +390,28 @@ export function renderSessionsPage(root: HTMLElement) {
   let kanbanTeamKey: string = (() => {
     try { return window.localStorage.getItem(KANBAN_TEAM_STORAGE_KEY) ?? ''; } catch { return ''; }
   })();
+  let idleCleanupBusy = false;
+  let idleCleanupHours: IdleCleanupHours = 24;
+
+  function selectedIdleCleanupHours(): IdleCleanupHours {
+    return idleCleanupHours;
+  }
+
+  function idleCleanupLabel(hours: IdleCleanupHours): string {
+    return hours === 168 ? '7d' : `${hours}H`;
+  }
+
+  function currentIdleCleanupCandidates(): any[] {
+    return selectIdleCleanupCandidates([...store.sessions.values()], selectedIdleCleanupHours());
+  }
+
+  function paintIdleCleanupThresholds(): void {
+    idleCleanupThreshold.querySelectorAll<HTMLButtonElement>('button[data-hours]').forEach(btn => {
+      const active = parseIdleCleanupHours(btn.dataset.hours) === idleCleanupHours;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+  }
 
   async function loadKanbanTeams(): Promise<void> {
     if (kanbanTeamsLoading || kanbanTeamsLoaded) return;
@@ -1259,6 +1305,13 @@ export function renderSessionsPage(root: HTMLElement) {
     selectAllBox.indeterminate = selectedInView > 0 && selectedInView < selectable.length;
   }
 
+  function syncIdleCleanupUi(): void {
+    const count = currentIdleCleanupCandidates().length;
+    idleCleanupCount.textContent = t('sessions.idleCleanupCount', { count });
+    idleCleanupBtn.disabled = idleCleanupBusy || count === 0;
+    paintIdleCleanupThresholds();
+  }
+
   function paintViewToggle(): void {
     viewButtons.forEach(btn => {
       const active = btn.dataset.view === viewMode;
@@ -1313,6 +1366,7 @@ export function renderSessionsPage(root: HTMLElement) {
     paintSortHeaders();
     paintCliFilterCount();
     syncBulkUi(visibleRows);
+    syncIdleCleanupUi();
   }
 
   async function locateSession(s: any, locateBtn?: HTMLButtonElement): Promise<void> {
@@ -1977,6 +2031,54 @@ export function renderSessionsPage(root: HTMLElement) {
     selected.clear();
     rerender();
     if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
+  });
+
+  idleCleanupThreshold.addEventListener('click', e => {
+    const btn = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-hours]');
+    if (!btn) return;
+    const next = parseIdleCleanupHours(btn.dataset.hours);
+    if (!next || next === idleCleanupHours) return;
+    idleCleanupHours = next;
+    idleCleanupStatus.textContent = '';
+    syncIdleCleanupUi();
+  });
+
+  idleCleanupBtn.addEventListener('click', async () => {
+    const hours = selectedIdleCleanupHours();
+    const candidates = currentIdleCleanupCandidates();
+    if (candidates.length === 0) return;
+    const label = idleCleanupLabel(hours);
+    if (!confirm(t('sessions.idleCleanupConfirm', { count: candidates.length, threshold: label }))) return;
+    idleCleanupBusy = true;
+    idleCleanupBtn.disabled = true;
+    idleCleanupStatus.textContent = t('sessions.idleCleanupRunning');
+    try {
+      const r = await fetch('/api/sessions/cleanup-idle', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ olderThanHours: hours }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (r.status !== 401) alert(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`);
+        idleCleanupStatus.textContent = '';
+        return;
+      }
+      for (const item of body?.results ?? []) {
+        if (item?.ok && item?.sessionId) selected.delete(String(item.sessionId));
+      }
+      idleCleanupStatus.textContent = t('sessions.idleCleanupDone', {
+        closed: Number(body?.closed ?? 0),
+        failed: Number(body?.failed ?? 0),
+      });
+      rerender();
+    } catch (e) {
+      alert(`${t('sessions.idleCleanupFailed')}: ${e}`);
+      idleCleanupStatus.textContent = '';
+    } finally {
+      idleCleanupBusy = false;
+      syncIdleCleanupUi();
+    }
   });
 
   table.querySelectorAll<HTMLTableCellElement>('th[data-sort]').forEach(header => {

@@ -71,6 +71,7 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient } from './platform/tunnel-client.js';
+import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -861,6 +862,37 @@ const server = createServer(async (req, res) => {
           : s;
       });
       return jsonRes(res, 200, { sessions });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
+      let body: { olderThanHours?: unknown };
+      try {
+        body = await readJsonBody(req) as { olderThanHours?: unknown };
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
+      if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
+
+      const result = await cleanupIdleSessions(aggregator.getSessions(), olderThanHours, async s => {
+        try {
+          const upstream = await proxyToDaemon(
+            s.larkAppId as string,
+            `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
+            { method: 'POST' },
+          );
+          const text = await upstream.text();
+          let parsed: any = null;
+          try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+          return {
+            sessionId: s.sessionId,
+            ok: upstream.ok && parsed?.ok !== false,
+            error: upstream.ok && parsed?.ok !== false ? undefined : (parsed?.error ?? `http_${upstream.status}`),
+          };
+        } catch (e: any) {
+          return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };
+        }
+      });
+      return jsonRes(res, 200, result);
     }
     if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
       const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);

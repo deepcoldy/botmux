@@ -2070,6 +2070,157 @@ fieldset legend {
 
 .bulk-bar[hidden] { display: none; }
 .bulk-bar #bulk-count { font-weight: 800; margin-right: 4px; }
+.idle-cleanup-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 10px 0 2px;
+  padding: 8px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
+}
+.idle-cleanup-summary,
+.idle-cleanup-controls {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+.idle-cleanup-controls {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.idle-cleanup-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.idle-cleanup-count,
+.idle-cleanup-status,
+.idle-cleanup-label {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+.idle-cleanup-count {
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+  color: var(--fg);
+  font-size: 12.5px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.idle-cleanup-label {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+.idle-cleanup-thresholds {
+  display: inline-grid;
+  grid-auto-flow: column;
+  gap: 2px;
+  min-height: 32px;
+  padding: 2px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-muted);
+}
+.idle-cleanup-thresholds button {
+  min-height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.idle-cleanup-thresholds button:hover:not(.active) {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--border-soft) 60%, transparent);
+}
+.idle-cleanup-thresholds button.active {
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+}
+.idle-cleanup-run {
+  min-height: 32px;
+  padding: 0 15px;
+  font-weight: 800;
+  transition: transform .16s ease, background-color .16s ease, border-color .16s ease, color .16s ease;
+}
+.idle-cleanup-run:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+.idle-cleanup-run:active:not(:disabled) {
+  transform: scale(.98);
+}
+.idle-cleanup-status {
+  grid-column: 1 / -1;
+  justify-self: end;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--success) 24%, var(--border-soft));
+  background: color-mix(in srgb, var(--success) 8%, var(--surface));
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 800;
+}
+.idle-cleanup-status:empty {
+  display: none;
+}
+:root[data-theme="dark"] .idle-cleanup-bar {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow: none;
+}
+:root[data-theme="dark"] .idle-cleanup-count,
+:root[data-theme="dark"] .idle-cleanup-thresholds button.active {
+  background: rgba(255, 255, 255, 0.06);
+}
+:root[data-theme="dark"] .idle-cleanup-thresholds {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: rgba(255, 255, 255, 0.09);
+}
+:root[data-theme="dark"] .idle-cleanup-status {
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+@media (max-width: 720px) {
+  .idle-cleanup-bar {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  .idle-cleanup-controls {
+    justify-content: flex-start;
+  }
+  .idle-cleanup-thresholds {
+    flex: 1 1 180px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-auto-flow: column;
+  }
+  .idle-cleanup-thresholds button {
+    min-width: 0;
+    padding: 0 8px;
+  }
+  .idle-cleanup-run {
+    flex: 1 1 118px;
+  }
+  .idle-cleanup-status {
+    justify-self: start;
+  }
+}
 input.row-select,
 #select-all { cursor: pointer; }
 
