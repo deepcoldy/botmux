@@ -747,15 +747,58 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('should have 6 top-level elements: dir+skip, switch, worktree form, manual form, note', () => {
+    it('single mode (default): 6 elements — dir+skip, switch, worktree row, manual form, note', () => {
       const card = parse(buildRepoSelectCard(projects));
       expect(card.elements).toHaveLength(6);
       expect(card.elements[0].tag).toBe('column_set'); // 当前工作目录 + 直接开启会话
       expect(card.elements[1].tag).toBe('hr');
       expect(card.elements[2].tag).toBe('action');     // 选择仓库并切换 dropdown
-      expect(card.elements[3].tag).toBe('form');       // worktree multi-select + branch + submit
+      expect(card.elements[3].tag).toBe('column_set'); // worktree dropdown + 🔀 多仓库 toggle (one row)
       expect(card.elements[4].tag).toBe('form');       // manual entry
       expect(card.elements[5].tag).toBe('note');
+    });
+
+    it('single mode: worktree dropdown weight-fills + toggle button auto-right in ONE column_set (mirrors manual row, no wrap)', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const row = card.elements[3];
+      expect(row.tag).toBe('column_set');
+      expect(row.flex_mode).toBe('none');                       // forces one line on mobile too
+      expect(row.columns[0].width).toBe('weighted');            // dropdown fills, like the manual input
+      const sel = row.columns[0].elements[0];
+      expect(sel.tag).toBe('select_static');
+      expect(sel.value.key).toBe('repo_worktree');
+      const btnCol = row.columns[row.columns.length - 1];
+      expect(btnCol.width).toBe('auto');                        // button hugs the right edge, aligns with 使用此目录
+      const toggle = btnCol.elements[0];
+      expect(toggle.tag).toBe('button');
+      expect(toggle.value.action).toBe('worktree_toggle_mode');
+      expect(toggle.value.root_id).toBe('om_root');
+    });
+
+    it('multi mode: worktree row becomes the inline multi-select form + a 🔀 单仓库 toggle row', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root', undefined, true));
+      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_worktree_submit_form');
+      expect(form).toBeDefined();
+      const sel = deepFind({ elements: [form] }, 'multi_select_static').find((s: any) => s.name === 'repo_worktree_paths');
+      expect(sel?.required).toBe(true);
+      const branch = deepFind({ elements: [form] }, 'input').find((i: any) => i.name === 'repo_worktree_branch');
+      expect(branch).toBeDefined();
+      const submit = deepFind({ elements: [form] }, 'button').find((b: any) => b.name === 'repo_worktree_submit');
+      expect(submit.value.action).toBe('repo_worktree_submit');
+      // No single-select dropdown in multi mode
+      expect(deepFind(card, 'select_static').find((s: any) => s.value?.key === 'repo_worktree')).toBeUndefined();
+      // a right-aligned toggle row to switch back to single
+      const toggleBtn = deepFind(card, 'button').find((b: any) => b.value?.action === 'worktree_toggle_mode');
+      expect(toggleBtn).toBeDefined();
+    });
+
+    it('mode toggle is omitted with only one main repo (batching one repo is pointless)', () => {
+      const single: ProjectInfo[] = [
+        { name: 'alpha', path: '/home/user/alpha', type: 'repo', branch: 'main' },
+        { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
+      ];
+      const card = parse(buildRepoSelectCard(single));
+      expect(deepFind(card, 'button').find((b: any) => b.value?.action === 'worktree_toggle_mode')).toBeUndefined();
     });
 
     it('manual-entry form carries an input + form_submit button (same row via column_set)', () => {
@@ -784,44 +827,33 @@ describe('buildRepoSelectCard', () => {
 
   // ── Worktree-open dropdown ─────────────────────────────────────────────
 
-  describe('worktree-open dropdown', () => {
+  describe('worktree-open dropdown (single mode)', () => {
+    // Single mode (default): the worktree control is an INSTANT single-select
+    // (pick a repo → fires immediately, no submit). Multi mode is reached via the
+    // persisted 「切换多仓库选择器」toggle (covered above).
     function worktreeSelect(card: any): any {
-      return deepFind(card, 'multi_select_static').find((sel: any) => sel.name === 'repo_worktree_paths');
+      return deepFind(card, 'select_static').find((sel: any) => sel.value?.key === 'repo_worktree');
     }
 
     it('should list only main repos (no existing worktrees)', () => {
       const card = parse(buildRepoSelectCard(projects));
       const sel = worktreeSelect(card);
-      expect(sel.tag).toBe('multi_select_static');
-      expect(sel.required).toBe(true);
-      expect(sel.width).toBe('fill');
-      expect(sel.options).toHaveLength(2);
+      expect(sel.tag).toBe('select_static');
+      expect(sel.value.key).toBe('repo_worktree');
       const labels = sel.options.map((o: any) => o.text.content);
+      expect(labels).toHaveLength(2);
       expect(labels.join()).toContain('alpha');
       expect(labels.join()).toContain('gamma');
       expect(labels.join()).not.toContain('beta');
     });
 
-    it('should carry the repo path as the option value and root_id on the form submit button', () => {
+    it('fires instantly: carries the repo path as the option value and root_id (no submit button)', () => {
       const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
       const sel = worktreeSelect(card);
       expect(sel.options[0].value).toBe('/home/user/alpha');
-      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_worktree_submit_form');
-      const btn = deepFind({ elements: [form] }, 'button').find((b: any) => b.name === 'repo_worktree_submit');
-      expect(btn.value.root_id).toBe('om_root');
-    });
-
-    it('renders a branch input and submit button for selected worktree repos', () => {
-      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
-      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_worktree_submit_form');
-      expect(form).toBeDefined();
-      const input = deepFind({ elements: [form] }, 'input').find((i: any) => i.name === 'repo_worktree_branch');
-      expect(input).toBeDefined();
-      const btn = deepFind({ elements: [form] }, 'button').find((b: any) => b.name === 'repo_worktree_submit');
-      expect(btn.text.content).toBe('创建 worktree');
-      expect(btn.action_type).toBe('form_submit');
-      expect(btn.value.action).toBe('repo_worktree_submit');
-      expect(btn.value.root_id).toBe('om_root');
+      expect(sel.value.root_id).toBe('om_root');
+      // No worktree form / submit button in single mode.
+      expect(card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_worktree_submit_form')).toBeUndefined();
     });
 
     it('should be omitted when no main repos exist', () => {

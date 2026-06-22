@@ -9,7 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
 import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
@@ -39,7 +39,7 @@ import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 
@@ -864,7 +864,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -888,7 +888,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo / 手动填目录
     // 起会话——与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
     const pendingRepoOwnerException =
-      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit' || value.action === 'worktree_toggle_mode') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -1593,6 +1593,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       );
     }
 
+    if (actionType === 'worktree_toggle_mode' && ds) {
+      // Flip the persisted per-bot worktree picker mode (single ⇄ multi), then
+      // re-send a fresh repo card in the new mode — a form can't ride an
+      // in-place patch, so the old card is withdrawn and a new one posted.
+      const locDs = localeForBot(ds.larkAppId);
+      const spec = findConfigField('worktreeMultiPicker');
+      if (!spec) return;
+      const next = getBot(ds.larkAppId).config.worktreeMultiPicker !== true;
+      const r = await applyConfigField(ds.larkAppId, spec, next);
+      if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
+      const projects = lastRepoScan.get(ds.chatId) ?? [];
+      if (ds.repoCardMessageId && ds.larkAppId) { try { deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
+      const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
+      ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      return { toast: { type: 'info', content: t(next ? 'card.repo.toast_worktree_mode_switched' : 'card.repo.toast_worktree_mode_switched_back', undefined, locDs) } };
+    }
+
     if (actionType === 'repo_worktree_submit' && ds) {
       const locDs = localeForBot(ds.larkAppId);
       const selectedPaths = stringListFromLarkMultiSelect(action?.form_value?.repo_worktree_paths);
@@ -1875,29 +1892,43 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     void (async () => {
       try {
         let creation;
+        // Track each successful (sourceRepo → created worktree) so a later repo's
+        // failure in a multi-repo batch can roll the earlier ones back instead of
+        // leaking orphaned worktree dirs/branches.
+        const created: Array<{ repo: string; result: { path: string; branch: string; baseRef: string } }> = [];
         try {
           const branch = action?.value?.branch?.trim() || undefined;
           const slug = branch ? undefined : await worktreeSlugFromContextAI(targetDs.session.title, targetDs.pendingPrompt);
-          const creations = [];
           for (const repoPath of selectedWorktreePaths) {
-            creations.push(await createRepoWorktree(repoPath, {
+            const result = await createRepoWorktree(repoPath, {
               branch,
               slug,
               worktreePath: selectedWorktreePaths.length > 1 && parentPath
                 ? join(parentPath, worktreeChildNameForRepo(repoPath, cached))
                 : undefined,
-            }));
+            });
+            created.push({ repo: repoPath, result });
           }
           creation = selectedWorktreePaths.length > 1 && parentPath
             ? {
                 path: parentPath,
-                branch: branch ?? creations.map(c => c.branch).join(', '),
-                baseRef: Array.from(new Set(creations.map(c => c.baseRef))).join(', '),
+                branch: branch ?? created.map(c => c.result.branch).join(', '),
+                baseRef: Array.from(new Set(created.map(c => c.result.baseRef))).join(', '),
               }
-            : creations[0]!;
+            : created[0]!.result;
         } catch (e) {
-          logger.warn(`[${tag(targetDs)}] Worktree creation failed for ${selectedPath}: ${e instanceof Error ? e.message : e}`);
-          await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, locTarget));
+          // The repo that threw is the one right after the last success.
+          const failedRepo = selectedWorktreePaths[created.length] ?? selectedPath;
+          const errMsg = e instanceof Error ? e.message : String(e);
+          logger.warn(`[${tag(targetDs)}] Worktree creation failed for ${failedRepo}: ${errMsg}`);
+          let rolledBack = 0;
+          for (const c of created) {
+            try { await removeRepoWorktree(c.repo, c.result.path); rolledBack++; }
+            catch (re) { logger.warn(`[${tag(targetDs)}] rollback of ${c.result.path} failed: ${re instanceof Error ? re.message : re}`); }
+          }
+          await sessionReply(rootId, rolledBack > 0
+            ? t('card.repo.worktree_rolled_back', { repo: pathBasename(failedRepo), error: errMsg, count: rolledBack }, locTarget)
+            : t('cmd.repo.worktree_failed', { error: errMsg }, locTarget));
           return;
         }
         if (sessionChanged()) return notSwitched(creation, 'mid-flight');

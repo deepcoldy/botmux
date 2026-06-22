@@ -51,7 +51,6 @@ export interface DaemonSession {
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
-  pendingWorktreePaths?: string[]; // selected repo paths from the worktree multi-select card
   pendingPrompt?: string;        // original user message to send after repo is selected
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default

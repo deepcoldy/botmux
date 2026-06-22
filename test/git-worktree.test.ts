@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, slugFromWorktreeText } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -151,6 +151,20 @@ describe('createRepoWorktree', () => {
     expect(res.branch).toBe('feat/group');
     expect(existsSync(join(target, '.git'))).toBe(true);
     expect(git(target, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feat/group');
+  });
+
+  it('removeRepoWorktree detaches the worktree dir so the slot is reusable (rollback)', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const target = join(tempRoot, 'rollback-parent', 'proj');
+    const res = await createRepoWorktree(repo, { branch: 'feat/rollback', worktreePath: target });
+    expect(existsSync(join(target, '.git'))).toBe(true);
+
+    await removeRepoWorktree(repo, res.path);
+
+    expect(existsSync(target)).toBe(false);
+    // git no longer tracks the worktree, so the path is free for a retry
+    expect(git(repo, 'worktree', 'list')).not.toContain(target);
   });
 
   it('checks out an existing local branch instead of recreating it', async () => {

@@ -910,7 +910,58 @@ export function buildPrivateSnapshotCard(
  * Build a Feishu interactive card with a dropdown selector for projects.
  * Returns a JSON string suitable for msg_type: 'interactive'.
  */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale): string {
+/** The worktree multi-select form element (multi_select + branch input + submit),
+ *  inlined into the repo card when the bot is in multi-repo-picker mode. */
+function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; content: string }; value: string }>, rootMessageId?: string, locale?: Locale): any {
+  return {
+    tag: 'form',
+    name: 'repo_worktree_submit_form',
+    elements: [
+      {
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'default',
+        columns: [
+          {
+            tag: 'column', width: 'weighted', weight: 2, vertical_align: 'center',
+            elements: [{
+              tag: 'multi_select_static',
+              name: 'repo_worktree_paths',
+              required: true,
+              width: 'fill',
+              placeholder: { tag: 'plain_text', content: t('card.repo.placeholder_worktree_multi', undefined, locale) },
+              options: worktreeOptions,
+            }],
+          },
+          {
+            tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+            elements: [{
+              tag: 'input',
+              name: 'repo_worktree_branch',
+              placeholder: { tag: 'plain_text', content: t('card.repo.worktree_branch_placeholder', undefined, locale) },
+            }],
+          },
+          {
+            tag: 'column', width: 'auto', vertical_align: 'center',
+            elements: [{
+              tag: 'button',
+              name: 'repo_worktree_submit',
+              text: { tag: 'plain_text', content: t('card.btn.worktree_repo', undefined, locale) },
+              type: 'default',
+              action_type: 'form_submit',
+              value: { action: 'repo_worktree_submit', root_id: rootMessageId ?? '' },
+            }],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/** Repo selection card. `multiPicker` (persisted per-bot via worktreeMultiPicker)
+ *  flips the worktree control between an instant single-select dropdown (false)
+ *  and the inline multi-select form (true). */
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -994,63 +1045,66 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
           },
         ],
       },
-      ...(worktreeOptions.length > 0 ? [{
-        tag: 'form',
-        name: 'repo_worktree_submit_form',
-        elements: [
+      // Worktree open. Two modes, persisted per-bot (worktreeMultiPicker):
+      //   • single (default) — instant single-select dropdown + a short 「🔀 多仓库」
+      //     button on the SAME action row (a select_static can't live in a
+      //     column_set, so it can't be weight-filled like the manual input; a short
+      //     a column_set so the dropdown weight-fills and the toggle button hugs
+      //     the right edge — same row, same alignment as the manual-entry row,
+      //     and it never wraps on mobile (the column_set forces one line). A
+      //     select_static CAN live in a column_set (it renders + fires); only the
+      //     `action` *container* tag is rejected inside a column.
+      //   • multi — the inline multi-select form, with a 「🔀 单仓库」toggle on its
+      //     own right-aligned row below (the form already fills its row).
+      // The toggle flips the persisted mode for all of this bot's future sessions
+      // (only shown with 2+ main repos — batching a single repo is pointless).
+      ...(worktreeOptions.length > 0 ? (multiPicker ? [
+        worktreeMultiForm(worktreeOptions, rootMessageId, locale),
+        ...(worktreeOptions.length > 1 ? [{
+          tag: 'column_set',
+          flex_mode: 'none',
+          horizontal_spacing: 'default',
+          columns: [
+            {
+              tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+              elements: [{ tag: 'div', text: { tag: 'lark_md', content: t('card.repo.worktree_now_multi', undefined, locale) } }],
+            },
+            {
+              tag: 'column', width: 'auto', vertical_align: 'center',
+              elements: [{
+                tag: 'button',
+                text: { tag: 'plain_text', content: t('card.btn.worktree_to_single', undefined, locale) },
+                type: 'default',
+                value: { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
+              }],
+            },
+          ],
+        }] : []),
+      ] : [{
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'default',
+        columns: [
           {
-            tag: 'column_set',
-            flex_mode: 'none',
-            horizontal_spacing: 'default',
-            columns: [
-              {
-                tag: 'column',
-                width: 'weighted',
-                weight: 2,
-                vertical_align: 'center',
-                elements: [
-                  {
-                    tag: 'multi_select_static',
-                    name: 'repo_worktree_paths',
-                    required: true,
-                    width: 'fill',
-                    placeholder: { tag: 'plain_text', content: t('card.repo.placeholder_worktree', undefined, locale) },
-                    options: worktreeOptions,
-                  },
-                ],
-              },
-              {
-                tag: 'column',
-                width: 'weighted',
-                weight: 1,
-                vertical_align: 'center',
-                elements: [
-                  {
-                    tag: 'input',
-                    name: 'repo_worktree_branch',
-                    placeholder: { tag: 'plain_text', content: t('card.repo.worktree_branch_placeholder', undefined, locale) },
-                  },
-                ],
-              },
-              {
-                tag: 'column',
-                width: 'auto',
-                vertical_align: 'center',
-                elements: [
-                  {
-                    tag: 'button',
-                    name: 'repo_worktree_submit',
-                    text: { tag: 'plain_text', content: t('card.btn.worktree_repo', undefined, locale) },
-                    type: 'default',
-                    action_type: 'form_submit',
-                    value: { action: 'repo_worktree_submit', root_id: rootMessageId ?? '' },
-                  },
-                ],
-              },
-            ],
+            tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+            elements: [{
+              tag: 'select_static',
+              placeholder: { tag: 'plain_text', content: t('card.repo.placeholder_worktree', undefined, locale) },
+              options: worktreeOptions,
+              value: { key: 'repo_worktree', root_id: rootMessageId ?? '' },
+            }],
           },
+          ...(worktreeOptions.length > 1 ? [{
+            tag: 'column', width: 'auto', vertical_align: 'center',
+            elements: [{
+              tag: 'button',
+              text: { tag: 'plain_text', content: t('card.btn.worktree_to_multi', undefined, locale) },
+              type: 'default',
+              value: { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
+            }],
+          }] : []),
         ],
-      }] : []),
+      }]) : []),
       // Manual entry: type any existing local directory the scan didn't surface
       // (mirrors `/repo <path>`). form_submit hands the input back under
       // value.action='repo_manual_submit' with form_value.repo_manual_path.

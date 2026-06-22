@@ -17,6 +17,8 @@ export const messages: Record<string, string> = {
   'card.btn.skip_repo': '▶️ Start Session Directly',
   'card.btn.manual_repo': 'Use This Directory',
   'card.btn.worktree_repo': 'Create Worktree',
+  'card.btn.worktree_to_multi': '🔀 Multi-repo',
+  'card.btn.worktree_to_single': '🔀 Single-repo',
   'card.btn.half_page_up': '⇞ Page ½ Up',
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
@@ -61,7 +63,12 @@ export const messages: Record<string, string> = {
   'card.repo.current_active': 'Current working directory:',
   'card.repo.current_marker': ' ← current',
   'card.repo.note': 'You can also reply `/repo <N>` (e.g. `/repo 1`), or `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`) to skip this card. `/repo wt <N|name> [branch]` opens a fresh worktree off the remote default branch.',
-  'card.repo.placeholder_worktree': '🌿 Select one or more repos for new worktrees',
+  'card.repo.placeholder_worktree': '🌿 Open a repo as a new worktree',
+  'card.repo.placeholder_worktree_multi': '🌿 Select one or more repos for new worktrees',
+  'card.repo.worktree_now_multi': 'Multi-repo picker on (default for this bot’s future sessions)',
+  'card.repo.toast_worktree_mode_switched': 'Switched to the multi-repo picker; default for this bot’s future sessions (tap again to switch back).',
+  'card.repo.toast_worktree_mode_switched_back': 'Switched back to the single-repo picker; default for this bot’s future sessions (tap again for multi).',
+  'card.repo.worktree_rolled_back': 'Worktree creation failed on {repo}: {error}. Rolled back {count} worktree(s) already created in this batch.',
   'card.repo.toast_worktree_creating': 'Creating worktree — will post in the thread when done…',
 
   // In-group authorization card

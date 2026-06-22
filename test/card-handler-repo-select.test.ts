@@ -37,6 +37,15 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn(),
 }));
 
+vi.mock('../src/services/bot-config-store.js', () => ({
+  findConfigField: vi.fn((key: string) => key === 'worktreeMultiPicker'
+    ? { key, configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false }
+    : undefined),
+  applyConfigField: vi.fn(async () => ({ ok: true, newText: 'on' })),
+  coerceConfigValue: vi.fn(),
+  getConfigCardData: vi.fn(),
+}));
+
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
@@ -92,6 +101,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
+  removeRepoWorktree: vi.fn(async () => {}),
   dirSuffixForBranch: (branch: string) => branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch',
 }));
 
@@ -115,7 +125,9 @@ import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-hand
 import { forkWorker, killWorker, deliverEphemeralOrReply } from '../src/core/worker-pool.js';
 import { getAvailableBots } from '../src/core/session-manager.js';
 import { createSession, closeSession } from '../src/services/session-store.js';
-import { createRepoWorktree } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree } from '../src/services/git-worktree.js';
+import { applyConfigField } from '../src/services/bot-config-store.js';
+import { deleteMessage } from '../src/im/lark/client.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -599,6 +611,50 @@ describe('repo select card — worktree open', () => {
       worktreePath: undefined,
     });
     expect(ds.workingDir).toBe('/repos/alpha-feat-one');
+  });
+
+  it('worktree_toggle_mode flips the persisted picker mode and re-sends a fresh repo card', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_old_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('info');
+    // persisted the flipped mode (config undefined → true)
+    expect(vi.mocked(applyConfigField)).toHaveBeenCalledWith('app_test', expect.objectContaining({ configKey: 'worktreeMultiPicker' }), true);
+    // withdrew the old card and posted a fresh interactive repo card
+    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_old_card');
+    const interactiveCall = sessionReply.mock.calls.find(c => c[2] === 'interactive');
+    expect(interactiveCall).toBeDefined();
+    expect(createRepoWorktree).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).not.toBe(true);
+  });
+
+  it('rolls back already-created worktrees when a later repo in the batch fails', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(createRepoWorktree)
+      .mockResolvedValueOnce({ path: '/repos/feat-multi/alpha', branch: 'feat/multi', baseRef: 'origin/master' })
+      .mockRejectedValueOnce(new Error('boom on beta'));
+
+    await handleCardAction(makeWorktreeSubmitEvent('feat/multi', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(createRepoWorktree).toHaveBeenCalledTimes(2);
+    // the first repo's worktree (already on disk) is rolled back, not leaked
+    expect(removeRepoWorktree).toHaveBeenCalledTimes(1);
+    expect(removeRepoWorktree).toHaveBeenCalledWith('/repos/alpha', '/repos/feat-multi/alpha');
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true); // still recoverable — card stays
+    const replies = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(replies).toContain('回滚');
+    expect(replies).toContain('boom on beta');
   });
 });
 

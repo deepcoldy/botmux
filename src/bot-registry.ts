@@ -282,6 +282,13 @@ export interface BotConfig {
    */
   autoStartOnNewTopic?: boolean;
   /**
+   * Worktree picker mode on the repo-select card. When true, the worktree
+   * control renders the multi-repo selector (pick N repos + branch) instead of
+   * the single-select dropdown. Toggled from the card's 「切换多仓库选择器」button;
+   * persists so all of this bot's future sessions default to it. Default false.
+   */
+  worktreeMultiPicker?: boolean;
+  /**
    * Per-bot DEFAULT session mode for regular Lark groups (overridable per-chat
    * via `/reply-mode` → `chatReplyModes`). Resolved by
    * `chat-reply-mode-store.regularGroupDefaultMode`.
@@ -851,6 +858,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
       // meaningful; 'chat' (the flat default) and anything else normalize to
       // undefined so bots.json stays clean.

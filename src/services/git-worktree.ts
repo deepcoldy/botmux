@@ -234,3 +234,13 @@ export async function createRepoWorktree(
   logger.info(`[git-worktree] created ${wtPath} (branch ${branch} from ${baseRef})`);
   return { path: wtPath, branch, baseRef };
 }
+
+/** Remove a worktree created by {@link createRepoWorktree}. Used to roll back the
+ *  worktrees already built when a later repo in a multi-repo batch fails — leaves
+ *  the branch in place (it may be a pre-existing branch we only checked out, and a
+ *  dangling auto-named branch is harmless) and only detaches/deletes the worktree
+ *  dir so a retry doesn't trip over "worktree target already exists". */
+export async function removeRepoWorktree(repo: string, worktreePath: string): Promise<void> {
+  await git(['worktree', 'remove', '--force', worktreePath], repo, 30_000);
+  logger.info(`[git-worktree] removed worktree ${worktreePath}`);
+}

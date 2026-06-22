@@ -1585,7 +1585,7 @@ export async function handleCommand(
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
-        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId, loc);
+        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId, loc, ds ? getBot(ds.larkAppId).config.worktreeMultiPicker : undefined);
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) {
           ds.repoCardMessageId = repoCardMsgId;
