@@ -625,7 +625,7 @@ function buildSessionHot(spans: RawInsightSpan[], cwd: string | undefined): Safe
     }
     if (span.status === 'error') {
       const result = span.result?.category ?? 'tool_error';
-      const key = `${span.tool} ${result}`;
+      const key = `${span.tool}\u0000${result}`;
       const e = errs.get(key) ?? { tool: span.tool, result, count: 0 };
       e.count++;
       errs.set(key, e);

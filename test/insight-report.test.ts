@@ -198,6 +198,20 @@ function writeClaudeLateFailureFixture(): string {
   return path;
 }
 
+// One blocking interactive tool (ask-question / plan approval) whose result
+// arrives 119s later — the user was away, not the agent working. Used to prove
+// that wait time is counted as an action but never as work-time or a slow span.
+function writeClaudeInteractiveWaitFixture(tool: string): string {
+  const path = join(dir, 'claude-wait.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'ask me' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'w1', name: tool, input: {} }] } }),
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:02:00.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'answered' }] } }),
+  ];
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
 // turn 0: prompt + narration + a tool_use span. turn 1: prompt + narration, NO
 // tool (a fully tool-less turn). Used to prove agent narration is gated to
 // detail=spans / conversation, and that a tool-less turn still renders.
@@ -786,4 +800,30 @@ describe('SafeInsightReport', () => {
     const turn0Say = convo.messages.find(m => m.turnIndex === 0 && m.role === 'agent' && !!m.text && !m.event);
     expect(turn0Say?.text).toContain('Looking into it');
   });
+
+  for (const tool of ['AskUserQuestion', 'ExitPlanMode']) {
+    it(`counts ${tool} as an action but never as work-time or a slow span`, () => {
+      resolvedPath = writeClaudeInteractiveWaitFixture(tool);
+      const report = buildSafeInsightReport({
+        cliId: 'claude-code',
+        sessionId: 's1',
+        cwd: dir,
+      }, { detail: 'spans', now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+      // The action is counted...
+      expect(report.agg.totalSpans).toBe(1);
+      expect(report.agg.phase.discuss.count).toBe(1);
+      // ...but the 119s spent waiting for the user is NOT work-time...
+      expect(report.agg.phase.discuss.ms).toBe(0);
+      // ...and never a slow span, even though 119s exceeds the 60s slow threshold.
+      expect(report.agg.slowSpans).toBe(0);
+      expect(report.suggestions.find(s => s.id === 'slow_span')).toBeUndefined();
+      expect(report.diagnostics.find(d => d.id === 'slow_span')).toBeUndefined();
+      expect(report.spans?.[0]?.tags ?? []).not.toContain('slow');
+      // ...so the wait-only turn yields no attention diagnostic at all (its
+      // measured duration is 0 — without the exclusion it would be flagged
+      // turn_has_slow_spans, since 119s exceeds the threshold).
+      expect(report.turnDiagnostics).toEqual([]);
+    });
+  }
 });
