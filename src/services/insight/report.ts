@@ -7,6 +7,7 @@ import { parseClaudeInsight } from './claude-span-reader.js';
 import { parseCodexInsight } from './codex-span-reader.js';
 import { safeErrorMessage, toSafeSpan } from './redact.js';
 import type {
+  AgentSay,
   InsightDetail,
   InsightDiagnosticKind,
   InsightConversationMessage,
@@ -820,6 +821,7 @@ function buildTurnTimeline(
   turnDiagnostics: TurnEfficiencyDiagnostic[],
   turnPrompts: TurnPromptPreview[] | undefined,
   turnContext: TurnContextPoint[] | undefined,
+  turnAgentSay?: AgentSay[],
 ): TurnTimelineTurn[] {
   if (!spans) return [];
   const diagByTurn = new Map(turnDiagnostics.map(d => [d.turnIndex, d]));
@@ -840,6 +842,7 @@ function buildTurnTimeline(
         turnIndex,
         severity: diag?.severity ?? 'info',
         ...(turnPrompts?.[turnIndex] ? { prompt: turnPrompts[turnIndex] } : {}),
+        ...(turnAgentSay?.[turnIndex]?.text ? { agentSay: turnAgentSay[turnIndex] } : {}),
         ...(turnContext?.[turnIndex] ? { context: turnContext[turnIndex] } : {}),
         headline: diag?.headline ?? { id: 'turn_normal', params: metrics },
         metrics,
@@ -890,6 +893,20 @@ function buildConversationProjection(turns: TurnTimelineTurn[]): InsightConversa
         text: turn.prompt.text,
         truncated: turn.prompt.truncated,
         ...(turn.prompt.source ? { source: turn.prompt.source } : {}),
+      });
+    }
+    if (turn.agentSay?.text) {
+      // Agent narration as a 'say' message (role 'agent', text but no event) — sits
+      // before the turn's operations so the replay reads 你说 → agent 说 → agent 做.
+      messages.push({
+        id: `turn-${turn.turnIndex}-say`,
+        turnIndex: turn.turnIndex,
+        role: 'agent',
+        severity: turn.severity,
+        tags: turn.tags,
+        author: 'agent',
+        text: turn.agentSay.text,
+        truncated: turn.agentSay.truncated,
       });
     }
     for (let i = 0; i < turn.events.length; i++) {
@@ -948,7 +965,7 @@ function buildDetailTimelineFromParsed(parsed: InsightParseResult, slowThreshold
   const tags = tagsForVisibleSpans(parsed.spans, slowThresholdMs);
   const safeSpans = attachSpanDetails(parsed.spans.map((span, index) => toSafeSpan(span, parsed.firstEventMs, tags[index]))) ?? [];
   const turnDiagnostics = buildTurnDiagnostics(parsed.spans, slowThresholdMs);
-  return buildTurnTimeline(safeSpans, turnDiagnostics, parsed.turnPrompts, parsed.turnContext);
+  return buildTurnTimeline(safeSpans, turnDiagnostics, parsed.turnPrompts, parsed.turnContext, parsed.turnAgentSay);
 }
 
 function resolveAndParseForPrompt(
@@ -1064,7 +1081,7 @@ export function buildSafeInsightReport(q: InsightReportQuery, opts: BuildInsight
   const visible = attachSpanDetails(visibleRaw?.map((s, index) => toSafeSpan(s, parsed.firstEventMs, visibleTags?.[index])));
   const diagnostics = diagnosticsFor(suggestions, agg, parsed.spans, visibleRaw, slowThresholdMs);
   const turnDiagnostics = buildTurnDiagnostics(visibleRaw, slowThresholdMs);
-  const turnTimeline = buildTurnTimeline(visible, turnDiagnostics, detail === 'spans' ? parsed.turnPrompts : undefined, detail === 'spans' ? parsed.turnContext : undefined);
+  const turnTimeline = buildTurnTimeline(visible, turnDiagnostics, detail === 'spans' ? parsed.turnPrompts : undefined, detail === 'spans' ? parsed.turnContext : undefined, detail === 'spans' ? parsed.turnAgentSay : undefined);
   const report: SafeInsightReport = {
     sessionId: q.sessionId,
     cliId: q.cliId ?? 'unknown',

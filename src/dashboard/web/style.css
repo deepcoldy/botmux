@@ -6850,6 +6850,62 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .hbtrack { background: var(--ins-inner); border-radius: 6px; height: 14px; overflow: hidden; }
 .insights-page .hbfill { height: 100%; background: linear-gradient(90deg, var(--danger-soft), var(--bad)); border-radius: 6px; min-width: 3px; transform-origin: left; animation: insight-bar-grow .55s ease both; }
 .insights-page .hbval { font-size: 12px; color: var(--mut); text-align: right; white-space: nowrap; }
+.insights-page .hbval small { color: var(--ins-faint); font-size: 10px; margin-left: 5px; }
+
+/* top-level tabs (总览 / 会话 / 分布 / 热点) — mirrors .detailtabbar */
+.insights-page .insight-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin: 4px 0 16px; }
+.insights-page .itab {
+  background: transparent; color: var(--mut); border: 1px solid transparent; border-bottom: 0;
+  border-radius: 8px 8px 0 0; padding: 8px 16px; font: inherit; font-size: 13px; cursor: pointer; margin-bottom: -1px;
+  transition: color .12s ease, background .12s ease;
+}
+.insights-page .itab:hover { color: var(--fg); }
+.insights-page .itab.on { color: var(--fg); background: var(--panel); border-color: var(--line); font-weight: 600; }
+.insights-page .insight-panel[hidden] { display: none; }
+
+/* filter-bar additions: project/time selects, analyzable toggle, clear */
+.insights-page .ins-select {
+  background: var(--ins-inner); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 10px; font: inherit; font-size: 12px; max-width: 220px; cursor: pointer;
+}
+.insights-page .ins-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--mut); cursor: pointer; white-space: nowrap; }
+.insights-page .ins-toggle input { cursor: pointer; }
+.insights-page .ins-clear {
+  background: transparent; color: var(--mut); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 12px; font: inherit; font-size: 12px; cursor: pointer;
+}
+.insights-page .ins-clear:hover { color: var(--fg); border-color: var(--acc); }
+
+/* distribution histograms + hotspots grids */
+.insights-page .ihist-grid,
+.insights-page .hot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+.insights-page .ihist-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.insights-page .ihist-head h3 { margin: 0; }
+.insights-page .hot-sessions, .insights-page .hot-note { grid-column: 1 / -1; }
+.insights-page .hot-note { margin-top: 2px; }
+
+/* Sessions tab: full-width list ⇆ full-width detail (mirrors ASI 会话, replaces
+   the cramped master-detail side panel) */
+.insights-page #insight-list-view .insight-list-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.insights-page .sesssort { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.insights-page .sesssort-label { font-size: 11px; margin-right: 2px; }
+.insights-page .ins-back {
+  background: transparent; color: var(--mut); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 14px; font: inherit; font-size: 12px; cursor: pointer; margin-bottom: 12px;
+}
+.insights-page .ins-back:hover { color: var(--fg); border-color: var(--acc); }
+.insights-page #insight-detail-view .insight-detail { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+/* full-width rich rows */
+.insights-page .slist.wide { max-height: none; overflow: visible; gap: 10px; }
+.insights-page .slist.wide .srow { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; padding: 13px 16px; }
+.insights-page .slist.wide .srmain strong { -webkit-line-clamp: 1; font-size: 14px; }
+.insights-page .slist.wide .mph { max-width: 440px; height: 8px; }
+.insights-page .slist.wide .srstats { flex-wrap: nowrap; justify-content: flex-end; align-items: center; }
+.insights-page .slist.wide .srmsg { justify-self: end; }
+@media (max-width: 760px) {
+  .insights-page .slist.wide .srow { grid-template-columns: 1fr; }
+  .insights-page .slist.wide .srstats { justify-content: flex-start; flex-wrap: wrap; }
+}
 
 /* workbench: session list | detail (master-detail) */
 .insight-workbench { display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr); gap: 14px; align-items: start; }
@@ -7274,6 +7330,10 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .cbub-body .md-body { font-size: 13px; }
 .insights-page .cbub-foot { display: flex; justify-content: flex-end; }
 .insights-page .cbub-ops { background: var(--ins-recess); max-width: 88%; }
+/* agent narration ("说了什么") inside the agent bubble, above its operations */
+.insights-page .cbub-saywrap { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 8px; }
+.insights-page .cbub-say { font-size: 13px; color: var(--fg); border-left: 2px solid var(--acc); padding-left: 9px; overflow-wrap: anywhere; word-break: break-word; }
+.insights-page .cbub-say .md-body { font-size: 13px; }
 .insights-page .cbub-ops-list { display: flex; flex-direction: column; gap: 3px; }
 .insights-page .cop-line { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 12px; padding: 3px 5px; border-radius: 6px; }
 .insights-page .cop-line.clickable { cursor: pointer; }
