@@ -86,6 +86,16 @@ function botName(v?: string): string {
   return botNameForOpenId(v) || botNameForAppId(v)
     || (v.startsWith('ou_') || v.startsWith('cli_') ? shortId(v) : v);
 }
+/** A 'supervisor 代办' accept: the worker never filed a genuine report, so L2
+ *  bridged the gap — filed a self-report + accept after independent verification.
+ *  The orchestrate skill marks the report/accept with this prefix; we surface it
+ *  so the board never reads as if the worker delivered it themselves. */
+const SUPERVISOR_BRIDGE_MARK = 'supervisor 代办';
+function supervisorBridged(t: BoardTask): boolean {
+  if (t.status !== 'accepted' || t.autoReconciled) return false;
+  const acc = t.attempts.find((a) => a.verdict === 'accepted') ?? t.attempts[t.attempts.length - 1];
+  return !!acc?.summary?.includes(SUPERVISOR_BRIDGE_MARK);
+}
 function fmtDur(ms?: number): string {
   if (ms === undefined || ms < 0) return '';
   const s = Math.round(ms / 1000);
@@ -143,8 +153,10 @@ function taskRow(t: BoardTask, selected: boolean): string {
     ? `<span class="gb-reason">${escapeHtml(t.rejectReason)}</span>` : '';
   const provTag = t.status !== 'accepted' ? ''
     : t.autoReconciled
-      ? '<span class="gb-via gb-via-auto" title="goal-watchdog 机器对账：自动跑结构化验收检查后裁定">🤖 自动对账</span>'
-      : '<span class="gb-via gb-via-agent" title="监管 agent 自主核验后裁定">🧠 自主验收</span>';
+      ? '<span class="gb-via gb-via-auto" title="goal-watchdog 机器对账：worker 已交付，自动跑结构化验收检查后裁定">🤖 自动对账</span>'
+      : supervisorBridged(t)
+        ? '<span class="gb-via gb-via-bridge" title="worker 未自报，监管者独立核验后代办交付+验收">🤝 监管者代办</span>'
+        : '<span class="gb-via gb-via-agent" title="监管 agent 自主核验后裁定">🧠 自主验收</span>';
   const helpTag = t.status === 'blocked' && t.help
     ? `<span class="gb-via gb-via-blocked" title="${escapeHtml(t.help.blocker)}">🚧 ${escapeHtml(HELP_KIND_LABEL[t.help.kind ?? 'other'] ?? '求助')}</span>`
     : t.status === 'escalated' && t.escalation
@@ -203,7 +215,14 @@ function trailHtml(t: BoardTask): string {
     return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">worker 尚未报告</p>';
   }
   const parts: string[] = [];
-  if (t.checkedBy) parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}${t.autoReconciled ? ' <span class="gb-via gb-via-auto" title="goal-watchdog 机器对账，确定性裁定">🤖 自动对账</span>' : ' <span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠 自主验收</span>'}</div>`);
+  if (t.checkedBy) {
+    const prov = t.autoReconciled
+      ? ' <span class="gb-via gb-via-auto" title="goal-watchdog 机器对账，worker 已交付，确定性裁定">🤖 自动对账</span>'
+      : supervisorBridged(t)
+        ? ' <span class="gb-via gb-via-bridge" title="worker 未自报，监管者独立核验后代办交付+验收">🤝 监管者代办</span>'
+        : ' <span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠 自主验收</span>';
+    parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}${prov}</div>`);
+  }
   if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
   if (t.ranCommands?.length) parts.push(`<div class="gb-kv"><span>跑了命令</span><ul>${t.ranCommands.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul></div>`);
   if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e =>
