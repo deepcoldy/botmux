@@ -5377,6 +5377,7 @@ import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { openLedger } from './verified-delivery/ledger.js';
 import { buildReport, parseArtifactText } from './verified-delivery/report.js';
+import { parseAcceptanceCriteria } from './verified-delivery/acceptance.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
@@ -6923,6 +6924,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const taskId = (!intoRoot && !standby)
     ? (explicitTaskId?.trim() || generateTaskId({ title: title.trim() || '子项目', brief }))
     : undefined;
+  const parsedAcceptance = taskId ? parseAcceptanceCriteria(acceptanceHint) : { structured: false };
+  if (parsedAcceptance.error) {
+    console.error(`验收标准非法: ${parsedAcceptance.error}`);
+    process.exit(1);
+  }
 
   // Append the verified-delivery protocol so the dispatched sub-bot reports via
   // `botmux report --task <id>` with evidence the orchestrator can verify. This
@@ -7037,6 +7043,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           workerOpenIds: built.mentionedOpenIds,
           brief,
           acceptanceHint: acceptanceHint?.trim() || undefined,
+          acceptanceCriteria: parsedAcceptance.criteria,
         },
       });
     }
