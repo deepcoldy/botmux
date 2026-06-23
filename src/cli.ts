@@ -7525,6 +7525,7 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
           body: JSON.stringify({
             supervisorSessionId: sid,
             goalChatId: task.chatId,
+            taskId,
             summary,
             attentionKind: 'help',
             attentionReason: reason,
@@ -7653,7 +7654,7 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
       [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
       [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
-  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>] [--attention[=help]]
+  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>] [--task <taskId>] [--attention[=help]] [--done]
   botmux goal charter current --goal <goal群chatId> [--create] [--title <标题>]
   botmux goal charter read --goal <goal群chatId> [--json]
   botmux goal charter update --goal <goal群chatId> --expected-updated-at <ts> <完整内容>
@@ -7756,6 +7757,8 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
   const goalArg = argValue(rest, '--goal');
+  const taskId = argValue(rest, '--task');
+  const done = argFlag(rest, '--done') || argFlag(rest, '--complete');
   const summaryFile = argValue(rest, '--summary-file');
   const attention = parseAttentionFlag(rest);
   let summary = argValue(rest, '--summary') ?? '';
@@ -7799,9 +7802,11 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
       body: JSON.stringify({
         supervisorSessionId: sid,
         goalChatId,
+        taskId,
         summary: summary.trim(),
         attentionKind: attention.requested ? attention.kind : undefined,
         attentionReason: attention.requested ? summary.trim() : undefined,
+        done,
       }),
     });
   } catch (err: any) {

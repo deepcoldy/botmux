@@ -1256,7 +1256,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'goal_cleanup_confirm', 'goal_cleanup_skip'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1342,6 +1342,42 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         type: 'warning',
         content: 'v2 workflow 已下线；旧卡片不再可操作，请迁移定义后使用 /workflow。',
       },
+    };
+  }
+
+  if (value?.action === 'goal_cleanup_confirm') {
+    const goalChatId = value.goal_chat_id;
+    if (!goalChatId) {
+      return { toast: { type: 'error', content: '缺少 goal_chat_id，无法清理。' } };
+    }
+    let closed = 0;
+    for (const ds of [...activeSessions.values()]) {
+      if (ds.chatId !== goalChatId || ds.scope !== 'chat') continue;
+      if (larkAppId && ds.larkAppId !== larkAppId) continue;
+      killWorker(ds);
+      sessionStore.closeSession(ds.session.sessionId);
+      activeSessions.delete(sessionKey(sessionAnchorId(ds), ds.larkAppId));
+      closed++;
+    }
+    logger.info(`[goal-cleanup] ${operatorOpenId ?? '?'} closed ${closed} chat-scope sessions for goal=${goalChatId}`);
+    return {
+      config: { wide_screen_mode: true },
+      header: { template: 'green', title: { tag: 'plain_text', content: 'Goal 会话已清理' } },
+      elements: [{
+        tag: 'div',
+        text: { tag: 'lark_md', content: `已清理 **${closed}** 个 goal 群 chat-scope 会话。\n\nGoal 群保留，不退群、不删群。` },
+      }],
+    };
+  }
+
+  if (value?.action === 'goal_cleanup_skip') {
+    return {
+      config: { wide_screen_mode: true },
+      header: { template: 'blue', title: { tag: 'plain_text', content: 'Goal 会话暂不清理' } },
+      elements: [{
+        tag: 'div',
+        text: { tag: 'lark_md', content: '已保留 goal 群内会话。需要时可再次确认清理。' },
+      }],
     };
   }
 

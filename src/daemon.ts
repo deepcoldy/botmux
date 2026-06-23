@@ -54,6 +54,7 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
+import { getGoalParentNotification, rememberGoalParentNotification, type GoalParentNotificationRecord } from './services/goal-parent-notification-store.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
@@ -244,7 +245,7 @@ import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoF
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
-import { normalizeBrand } from './im/lark/lark-hosts.js';
+import { chatAppLink, normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
@@ -256,6 +257,7 @@ import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
+  injectGoalSupervisorTurn,
   runGoalWatchdogForGoal,
   shouldTriggerGoalWatchdogOnSessionBoundary,
   startGoalWatchdog,
@@ -4244,28 +4246,206 @@ function goalNotifyOwnerOpenId(parent?: DaemonSession): string | undefined {
 async function sendGoalHumanAttention(input: {
   parent?: DaemonSession;
   supervisor?: DaemonSession;
+  taskId?: string;
   summary: string;
   attentionKind: string;
   attentionReason: string;
+  done?: boolean;
 }): Promise<{ sent: boolean; error?: string }> {
-  const parentChatId = input.parent?.chatId ?? input.supervisor?.session.goalSupervisor?.parentChatId;
+  const meta = input.supervisor?.session.goalSupervisor;
+  const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
   if (!parentChatId) return { sent: false, error: 'missing_parent_chat' };
   const larkAppId = input.parent?.larkAppId ?? input.supervisor?.larkAppId ?? currentDaemonLarkAppId;
   const ownerOpenId = goalNotifyOwnerOpenId(input.parent);
   const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
+  const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
+  const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
+  const goalLink = goalChatId ? chatAppLink(goalChatId, normalizeBrand(getBot(larkAppId).config.brand)) : undefined;
   const text = [
-    `${mention}[goal] 任务需要你拍板`,
+    `${mention}${input.done ? '[goal] Goal 已完成，等待确认' : '[goal] 任务需要你拍板'}`,
+    goalTitle ? `Goal: ${goalTitle}` : undefined,
+    goalChatId ? `goalChatId: ${goalChatId}` : undefined,
+    input.taskId ? `taskId: ${input.taskId}` : undefined,
+    goalLink ? `打开 goal 群: ${goalLink}` : undefined,
     `类型: ${input.attentionKind}`,
     `原因: ${input.attentionReason}`,
     '',
     input.summary,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
   try {
-    await sendMessage(larkAppId, parentChatId, text, 'text');
+    const messageId = await sendMessage(larkAppId, parentChatId, text, 'text');
+    if (messageId && goalChatId) {
+      rememberGoalParentNotification({
+        messageId,
+        larkAppId,
+        parentChatId,
+        parentRoot: meta?.parentRoot,
+        parentSessionId: meta?.parentSessionId,
+        supervisorSessionId: input.supervisor?.session.sessionId,
+        goalChatId,
+        goalTitle,
+        taskId: input.taskId,
+        summary: input.summary,
+        attentionKind: input.attentionKind,
+        attentionReason: input.attentionReason,
+        done: input.done,
+        createdAt: Date.now(),
+      });
+    }
     return { sent: true };
   } catch (err) {
     return { sent: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+function buildGoalCompletionConfirmCard(input: {
+  ownerOpenId?: string;
+  goalTitle?: string;
+  goalChatId: string;
+  goalLink?: string;
+  summary: string;
+  supervisorSessionId?: string;
+}): string {
+  const mention = input.ownerOpenId ? `<at id=${input.ownerOpenId}></at> ` : '';
+  const title = input.goalTitle ?? input.goalChatId;
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: 'green', title: { tag: 'plain_text', content: `Goal 完成：${title}` } },
+    elements: [
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: [
+            `${mention}L2 监管者报告 goal 已完成。`,
+            `**Goal**: ${title}`,
+            `**goalChatId**: \`${input.goalChatId}\``,
+            input.goalLink ? `[打开 goal 群](${input.goalLink})` : undefined,
+            '',
+            input.summary,
+          ].filter(Boolean).join('\n'),
+        },
+      },
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '结束并清理会话' },
+            type: 'primary',
+            value: {
+              action: 'goal_cleanup_confirm',
+              goal_chat_id: input.goalChatId,
+              supervisor_session_id: input.supervisorSessionId ?? '',
+            },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '暂不' },
+            type: 'default',
+            value: {
+              action: 'goal_cleanup_skip',
+              goal_chat_id: input.goalChatId,
+              supervisor_session_id: input.supervisorSessionId ?? '',
+            },
+          },
+        ],
+      },
+    ],
+  });
+}
+
+async function sendGoalCompletionConfirmation(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  summary: string;
+}): Promise<{ sent: boolean; error?: string }> {
+  const meta = input.supervisor?.session.goalSupervisor;
+  const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
+  const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
+  if (!parentChatId) return { sent: false, error: 'missing_parent_chat' };
+  if (!goalChatId) return { sent: false, error: 'missing_goal_chat' };
+  const larkAppId = input.parent?.larkAppId ?? input.supervisor?.larkAppId ?? currentDaemonLarkAppId;
+  const ownerOpenId = goalNotifyOwnerOpenId(input.parent);
+  const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
+  const goalLink = chatAppLink(goalChatId, normalizeBrand(getBot(larkAppId).config.brand));
+  const card = buildGoalCompletionConfirmCard({
+    ownerOpenId,
+    goalTitle,
+    goalChatId,
+    goalLink,
+    summary: input.summary,
+    supervisorSessionId: input.supervisor?.session.sessionId,
+  });
+  try {
+    const messageId = await sendMessage(larkAppId, parentChatId, card, 'interactive');
+    if (messageId) {
+      rememberGoalParentNotification({
+        messageId,
+        larkAppId,
+        parentChatId,
+        parentRoot: meta?.parentRoot,
+        parentSessionId: meta?.parentSessionId,
+        supervisorSessionId: input.supervisor?.session.sessionId,
+        goalChatId,
+        goalTitle,
+        summary: input.summary,
+        done: true,
+        createdAt: Date.now(),
+      });
+    }
+    return { sent: true };
+  } catch (err) {
+    return { sent: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function goalParentReplyCandidates(parsed: Pick<LarkMessage, 'parentId' | 'rootId' | 'messageId'>): string[] {
+  return [parsed.parentId, parsed.rootId]
+    .filter((id): id is string => !!id && id !== parsed.messageId);
+}
+
+function findGoalNotificationRecordForReply(parsed: Pick<LarkMessage, 'parentId' | 'rootId' | 'messageId'>): GoalParentNotificationRecord | undefined {
+  for (const id of goalParentReplyCandidates(parsed)) {
+    const rec = getGoalParentNotification(id);
+    if (rec) return rec;
+  }
+  return undefined;
+}
+
+function buildGoalParentReplyPrompt(record: GoalParentNotificationRecord, parsed: LarkMessage): string {
+  return [
+    '[goal-parent-reply] L1/人类在主群回复了 goal 升级/完成通知。请把这条回复作为新的人工指示纳入本 goal 的统揽判断。',
+    `goal: ${record.goalTitle ?? record.goalChatId}`,
+    `goalChatId: ${record.goalChatId}`,
+    record.taskId ? `taskId: ${record.taskId}` : undefined,
+    `parentNotificationId: ${record.messageId}`,
+    `replyMessageId: ${parsed.messageId}`,
+    '',
+    'human reply:',
+    parsed.content.trim(),
+    '',
+    '请先查 goal charter 和 delivery ledger，再决定是澄清 worker、重派、accept/reject、或继续升级给人。',
+  ].filter(Boolean).join('\n');
+}
+
+async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string, chatId?: string): Promise<boolean> {
+  if (parsed.senderType === 'app' || parsed.senderType === 'bot') return false;
+  const record = findGoalNotificationRecordForReply(parsed);
+  if (!record || record.larkAppId !== larkAppId) return false;
+  if (chatId && record.parentChatId !== chatId) return false;
+  const supervisor = findGoalSupervisorForNotify({
+    supervisorSessionId: record.supervisorSessionId,
+    goalChatId: record.goalChatId,
+  });
+  if (!supervisor) {
+    logger.warn(`[goal-parent-reply] no active L2 for goal=${record.goalChatId} reply=${parsed.messageId}`);
+    return false;
+  }
+  await injectGoalSupervisorTurn(supervisor, buildGoalParentReplyPrompt(record, parsed));
+  logger.info(`[goal-parent-reply] routed parent reply ${parsed.messageId.substring(0, 12)} to L2 ${supervisor.session.sessionId.substring(0, 8)} goal=${record.goalChatId}`);
+  return true;
 }
 
 // Internal: L2 supervisor notifies its L1 parent without sending a Lark
@@ -4275,9 +4455,11 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
   let raw: {
     supervisorSessionId?: unknown;
     goalChatId?: unknown;
+    taskId?: unknown;
     summary?: unknown;
     attentionKind?: unknown;
     attentionReason?: unknown;
+    done?: unknown;
   };
   try {
     raw = await readJsonBody(req);
@@ -4294,9 +4476,11 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
   const notifyReq = {
     supervisorSessionId: typeof raw.supervisorSessionId === 'string' && raw.supervisorSessionId.trim() ? raw.supervisorSessionId.trim() : undefined,
     goalChatId: typeof raw.goalChatId === 'string' && raw.goalChatId.trim() ? raw.goalChatId.trim() : undefined,
+    taskId: typeof raw.taskId === 'string' && raw.taskId.trim() ? raw.taskId.trim() : undefined,
     summary,
     attentionKind: attentionKind || undefined,
     attentionReason: attentionReason || undefined,
+    done: raw.done === true,
   };
   const supervisorForHumanNotify = findGoalSupervisorForNotify(notifyReq);
   try {
@@ -4304,13 +4488,36 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     let parentDs: DaemonSession | undefined;
     let humanNotified = false;
     let humanNotifyError: string | undefined;
+    let completionCardSent = false;
+    let completionCardError: string | undefined;
     if (!result.ok) {
+      if (result.errorCode === 'parent_not_active' && supervisorForHumanNotify && notifyReq.done) {
+        const card = await sendGoalCompletionConfirmation({
+          supervisor: supervisorForHumanNotify,
+          summary,
+        });
+        completionCardSent = card.sent;
+        completionCardError = card.error;
+        if (completionCardSent) {
+          return jsonRes(res, 200, {
+            ok: true,
+            parentActive: false,
+            goalChatId: supervisorForHumanNotify.session.goalSupervisor?.goalChatId,
+            done: true,
+            attentionRaised: false,
+            completionCardSent,
+            warning: result.errorCode,
+          });
+        }
+      }
       if (result.errorCode === 'parent_not_active' && attentionKind && attentionReason && supervisorForHumanNotify) {
         const direct = await sendGoalHumanAttention({
           supervisor: supervisorForHumanNotify,
+          taskId: notifyReq.taskId,
           summary,
           attentionKind,
           attentionReason,
+          done: notifyReq.done,
         });
         humanNotified = direct.sent;
         humanNotifyError = direct.error;
@@ -4319,6 +4526,8 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
             ok: true,
             parentActive: false,
             goalChatId: supervisorForHumanNotify.session.goalSupervisor?.goalChatId,
+            taskId: notifyReq.taskId,
+            done: notifyReq.done,
             attentionRaised: false,
             humanNotified,
             warning: result.errorCode,
@@ -4326,9 +4535,10 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
         }
       }
       const status = result.errorCode === 'parent_not_active' || result.errorCode === 'supervisor_not_found' ? 404 : 400;
-      return jsonRes(res, status, { ...result, humanNotified, humanNotifyError });
+      return jsonRes(res, status, { ...result, humanNotified, humanNotifyError, completionCardSent, completionCardError });
     }
     let attentionRaised = false;
+    parentDs = findActiveSessionById(result.parentSessionId);
     if (attentionKind && attentionReason) {
       for (const ds of activeSessions.values()) {
         if (ds.session.sessionId !== result.parentSessionId) continue;
@@ -4342,9 +4552,11 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
       const direct = await sendGoalHumanAttention({
         parent: parentDs,
         supervisor: supervisorForHumanNotify,
+        taskId: notifyReq.taskId,
         summary,
         attentionKind,
         attentionReason,
+        done: notifyReq.done,
       });
       humanNotified = direct.sent;
       humanNotifyError = direct.error;
@@ -4352,7 +4564,19 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
         logger.warn(`[goal-notify-parent] human attention send failed: ${humanNotifyError}`);
       }
     }
-    return jsonRes(res, 200, { ...result, attentionRaised, humanNotified, humanNotifyError });
+    if (notifyReq.done && supervisorForHumanNotify) {
+      const card = await sendGoalCompletionConfirmation({
+        parent: parentDs,
+        supervisor: supervisorForHumanNotify,
+        summary,
+      });
+      completionCardSent = card.sent;
+      completionCardError = card.error;
+      if (completionCardError) {
+        logger.warn(`[goal-notify-parent] completion card send failed: ${completionCardError}`);
+      }
+    }
+    return jsonRes(res, 200, { ...result, attentionRaised, humanNotified, humanNotifyError, completionCardSent, completionCardError });
   } catch (err: any) {
     logger.warn(`[goal-notify-parent] IPC failed: ${err?.message ?? err}`);
     return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
@@ -14566,6 +14790,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   learnFromMentions(larkAppId, parsed.mentions);
+
+  if (await maybeRouteGoalParentReply(parsed, larkAppId, ctxChatId ?? data?.message?.chat_id)) {
+    return;
+  }
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
