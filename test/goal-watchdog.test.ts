@@ -353,9 +353,11 @@ describe('goal watchdog', () => {
         },
       });
       const notifications: any[] = [];
+      const activeSessions = new Map<string, DaemonSession>();
+      activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
       const results = await runGoalWatchdogOnce({
         larkAppId: 'cli_main',
-        activeSessions: new Map(),
+        activeSessions,
         ledger: led,
         now: 10_000,
         lastInjectedAt: new Map(),
@@ -367,6 +369,61 @@ describe('goal watchdog', () => {
       expect(notifications.map((n) => [n.kind, n.result.reportId])).toEqual([['accepted', 'report-existing']]);
       expect(led.task('task-reported')?.status).toBe('accepted');
       expect(led.task('task-reported')?.reports).toHaveLength(1);
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reconcile or notify from a daemon that does not own the L2 supervisor', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-no-l2-'));
+    try {
+      const out = join(baseDir, 'done.txt');
+      writeFileSync(out, 'PASS');
+      const led = openLedger({ baseDir });
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-reported',
+        chatId: 'oc_goal',
+        ts: 1,
+        idempotencyKey: 'dispatched:task-reported',
+        payload: {
+          taskId: 'task-reported',
+          workerOpenIds: ['ou_worker'],
+          acceptanceCriteria: {
+            version: 1,
+            artifacts: [{ path: out, checks: [{ type: 'exists' }, { type: 'contains', text: 'PASS' }] }],
+          },
+        },
+      });
+      led.append({
+        type: 'TaskReported',
+        actor: 'worker',
+        taskId: 'task-reported',
+        chatId: 'oc_goal',
+        ts: 2,
+        idempotencyKey: 'reported:report-existing',
+        payload: {
+          taskId: 'task-reported',
+          reportId: 'report-existing',
+          workerOpenId: 'ou_worker',
+          evidence: [{ kind: 'path', path: out }],
+          summary: 'worker reported PASS',
+        },
+      });
+
+      const results = await runGoalWatchdogOnce({
+        larkAppId: 'cli_worker',
+        activeSessions: new Map(),
+        ledger: led,
+        now: 10_000,
+        lastInjectedAt: new Map(),
+        notify: () => { throw new Error('non-L2 daemon must not notify'); },
+        inject: () => { throw new Error('non-L2 daemon must not inject'); },
+      });
+
+      expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'no-l2', pendingTaskIds: ['task-reported'] }]);
+      expect(led.task('task-reported')?.status).toBe('reported');
     } finally {
       rmSync(baseDir, { recursive: true, force: true });
     }
@@ -395,9 +452,11 @@ describe('goal watchdog', () => {
       });
       const lastInjectedAt = new Map<string, number>();
       const notifications: any[] = [];
+      const activeSessions = new Map<string, DaemonSession>();
+      activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
       const first = await runGoalWatchdogOnce({
         larkAppId: 'cli_main',
-        activeSessions: new Map(),
+        activeSessions,
         ledger: led,
         now: 10_000,
         intervalMs: 30_000,
@@ -406,7 +465,7 @@ describe('goal watchdog', () => {
       });
       const second = await runGoalWatchdogOnce({
         larkAppId: 'cli_main',
-        activeSessions: new Map(),
+        activeSessions,
         ledger: led,
         now: 20_000,
         intervalMs: 30_000,

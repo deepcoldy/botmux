@@ -4214,6 +4214,60 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
   return jsonRes(res, 200, result);
 });
 
+function findActiveSessionById(sessionId?: string): DaemonSession | undefined {
+  if (!sessionId) return undefined;
+  for (const ds of activeSessions.values()) {
+    if (ds.session.sessionId === sessionId) return ds;
+  }
+  return undefined;
+}
+
+function findGoalSupervisorForNotify(input: { supervisorSessionId?: string; goalChatId?: string }): DaemonSession | undefined {
+  const bySession = findActiveSessionById(input.supervisorSessionId);
+  if (bySession?.session.goalSupervisor) return bySession;
+  const goalChatId = input.goalChatId;
+  if (!goalChatId) return undefined;
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId === currentDaemonLarkAppId && ds.session.goalSupervisor?.goalChatId === goalChatId) return ds;
+  }
+  return undefined;
+}
+
+function goalNotifyOwnerOpenId(parent?: DaemonSession): string | undefined {
+  return parent?.session.ownerOpenId
+    ?? parent?.ownerOpenId
+    ?? parent?.session.lastCallerOpenId
+    ?? parent?.session.creatorOpenId
+    ?? getOwnerOpenId(parent?.larkAppId ?? currentDaemonLarkAppId);
+}
+
+async function sendGoalHumanAttention(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  summary: string;
+  attentionKind: string;
+  attentionReason: string;
+}): Promise<{ sent: boolean; error?: string }> {
+  const parentChatId = input.parent?.chatId ?? input.supervisor?.session.goalSupervisor?.parentChatId;
+  if (!parentChatId) return { sent: false, error: 'missing_parent_chat' };
+  const larkAppId = input.parent?.larkAppId ?? input.supervisor?.larkAppId ?? currentDaemonLarkAppId;
+  const ownerOpenId = goalNotifyOwnerOpenId(input.parent);
+  const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
+  const text = [
+    `${mention}[goal] 任务需要你拍板`,
+    `类型: ${input.attentionKind}`,
+    `原因: ${input.attentionReason}`,
+    '',
+    input.summary,
+  ].join('\n');
+  try {
+    await sendMessage(larkAppId, parentChatId, text, 'text');
+    return { sent: true };
+  } catch (err) {
+    return { sent: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 // Internal: L2 supervisor notifies its L1 parent without sending a Lark
 // self-message. The parent coordinates are stored structurally on the L2
 // session by goal supervise; this route only injects into an active L1 session.
@@ -4237,30 +4291,68 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     ? raw.attentionReason.replace(/\s+/g, ' ').trim().slice(0, 500)
     : summary.replace(/\s+/g, ' ').trim().slice(0, 500);
   if (!summary) return jsonRes(res, 400, { ok: false, errorCode: 'missing_summary', error: 'summary is required' });
+  const notifyReq = {
+    supervisorSessionId: typeof raw.supervisorSessionId === 'string' && raw.supervisorSessionId.trim() ? raw.supervisorSessionId.trim() : undefined,
+    goalChatId: typeof raw.goalChatId === 'string' && raw.goalChatId.trim() ? raw.goalChatId.trim() : undefined,
+    summary,
+    attentionKind: attentionKind || undefined,
+    attentionReason: attentionReason || undefined,
+  };
+  const supervisorForHumanNotify = findGoalSupervisorForNotify(notifyReq);
   try {
-    const result = await notifyGoalParent({
-      supervisorSessionId: typeof raw.supervisorSessionId === 'string' && raw.supervisorSessionId.trim() ? raw.supervisorSessionId.trim() : undefined,
-      goalChatId: typeof raw.goalChatId === 'string' && raw.goalChatId.trim() ? raw.goalChatId.trim() : undefined,
-      summary,
-      attentionKind: attentionKind || undefined,
-      attentionReason: attentionReason || undefined,
-    }, { larkAppId: currentDaemonLarkAppId, activeSessions });
+    const result = await notifyGoalParent(notifyReq, { larkAppId: currentDaemonLarkAppId, activeSessions });
+    let parentDs: DaemonSession | undefined;
+    let humanNotified = false;
+    let humanNotifyError: string | undefined;
     if (!result.ok) {
+      if (result.errorCode === 'parent_not_active' && attentionKind && attentionReason && supervisorForHumanNotify) {
+        const direct = await sendGoalHumanAttention({
+          supervisor: supervisorForHumanNotify,
+          summary,
+          attentionKind,
+          attentionReason,
+        });
+        humanNotified = direct.sent;
+        humanNotifyError = direct.error;
+        if (humanNotified) {
+          return jsonRes(res, 200, {
+            ok: true,
+            parentActive: false,
+            goalChatId: supervisorForHumanNotify.session.goalSupervisor?.goalChatId,
+            attentionRaised: false,
+            humanNotified,
+            warning: result.errorCode,
+          });
+        }
+      }
       const status = result.errorCode === 'parent_not_active' || result.errorCode === 'supervisor_not_found' ? 404 : 400;
-      return jsonRes(res, status, result);
+      return jsonRes(res, status, { ...result, humanNotified, humanNotifyError });
     }
     let attentionRaised = false;
     if (attentionKind && attentionReason) {
       for (const ds of activeSessions.values()) {
         if (ds.session.sessionId !== result.parentSessionId) continue;
+        parentDs = ds;
         ds.agentAttention = { kind: attentionKind, reason: attentionReason, at: Date.now() };
         publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'goal_escalation', kind: attentionKind, message: attentionReason });
         attentionRaised = true;
         break;
       }
+      const direct = await sendGoalHumanAttention({
+        parent: parentDs,
+        supervisor: supervisorForHumanNotify,
+        summary,
+        attentionKind,
+        attentionReason,
+      });
+      humanNotified = direct.sent;
+      humanNotifyError = direct.error;
+      if (humanNotifyError) {
+        logger.warn(`[goal-notify-parent] human attention send failed: ${humanNotifyError}`);
+      }
     }
-    return jsonRes(res, 200, { ...result, attentionRaised });
+    return jsonRes(res, 200, { ...result, attentionRaised, humanNotified, humanNotifyError });
   } catch (err: any) {
     logger.warn(`[goal-notify-parent] IPC failed: ${err?.message ?? err}`);
     return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
