@@ -1215,7 +1215,7 @@ botmux goal supervise --chat-id "<goalChatId>" \\
 ### L1-5 收 L2 完成通知 → 汇总用户 + 确认结束
 L2 把整个 goal 验收通过后会用 \`goal notify-parent --done\` 把你唤起（daemon-native，注入 \`[goal-parent-notify]\`）+ 给发起人发一张"结束确认卡"。**这条通知只是唤醒、不是真相源**：你被唤起后必须 \`botmux delivery list --goal <goalChatId>\` + \`botmux goal charter read --goal <goalChatId> --json\` 复核账本与状态，给用户一份总汇总（做了什么、产出在哪、遗留项）。
 - **结束确认卡**：发起人点 [结束并清理] → daemon 关闭该 goal 群所有 chat-scope 会话（L2 + workers，**群保留、不退群不删群**）；点 [暂不] → 不动，随时可再结束。
-- **人给进行中的 goal 下发决定/补充**：goal 中途若升级到人（求助），人可直接在主群**回复**那条升级消息，daemon 会把内容自动下发给对应 goal 群的 L2（人不用切群）；L2 收到后接着处理（补信息 / 重派 / 收尾）。
+- **人给进行中的 goal 下发决定/补充**：goal 中途升级到人（求助/escalate）时，那条"需要你拍板"通知由专用信使 bot **「loopy-中控」（panel）** 代发到主群（不是 L1/L2 自己发——避免同 bot 自消息被 self-guard 挡、也让路由按身份精准不误捕）。人**回复/引用** loopy-中控 发的那条通知，daemon 会把内容下发给对应 goal 群的 L2（人不用切群）；或在 dashboard goal 看板的子任务详情里用「下发决策」框发。L2 收到后接着处理（补信息 / 重派 / 收尾）。
 
 ## L2 流程（在 goal 群，你是 chat-scope 监管化身）
 
@@ -1281,7 +1281,7 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
    - 拿不准 → 催 worker 用 \`botmux report\` 正式交付，别臆测 done。
 3. **worker 卡住**（账本 \`blocked\`，或群里说卡 / 缺权限 / 有歧义 / 反复失败）：你**主动接手**，不等它自己跑 \`botmux help\`：
    - 能自己解 → 给澄清指令 / 补权限 / 带更清楚的 brief 重派（\`dispatch\` 同 taskId 或 \`send --chat-id <goalChatId> --mention <worker>\`）。
-   - 自己解不了（要人授权 / 要人拍范围 / 客观做不到）→ \`botmux delivery escalate --task <id> --reason "<卡在哪、需要人做什么>" [--retry-brief ...]\`，把"需要你"推到人面前（actor=监管者，**不假冒 worker 的求助**）。
+   - 自己解不了（要人授权 / 要人拍范围 / 客观做不到）→ \`botmux delivery escalate --task <id> --reason "<卡在哪、需要人做什么>" [--retry-brief ...]\`，把"需要你"推到人面前（actor=监管者，**不假冒 worker 的求助**）。命令不变；daemon 会用信使 bot **「loopy-中控」** 把这条"需要你"代发到主群（不是你自己发，所以能正常唤起 L1 + 人能直接回复它下发指示）。
 4. **产物不存在 + 没动静** → 催 worker；只有 legacy 自由文本 hint（不可机器核验）→ 只催、别臆测 done。
 5. **escalated（已升级、等人）** → 别重复 nag，等人处理。
 
