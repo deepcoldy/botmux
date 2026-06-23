@@ -150,8 +150,13 @@ export type ReconcileAction =
   | 'unreported-pass'
   /** Verify failed on a worker's pending report → ledger is now rejected. */
   | 'rejected'
-  /** Verify failed and nothing is on the ledger yet → caller should nudge worker;
-   *  we deliberately do NOT fabricate a failed report. */
+  /** Verify failed and there is no pending report to reject — either the worker
+   *  has not delivered yet, or a prior delivery was already rejected and the worker
+   *  has not re-reported. We deliberately do NOT fabricate a failed report. The
+   *  mechanical layer must NOT keep mechanically @-ing the worker (the bug 老滕
+   *  caught: a rejected/escalated task getting nagged every tick). It surfaces an
+   *  inspectionFact (see ReconcileResult.inspectionFact) and defers to the
+   *  supervisor (L2), who owns guiding the worker / 催 / 重派 / 升级. */
   | 'nudge'
   /** No structured criteria → caller falls back to the LLM watchdog injection. */
   | 'no-criteria'
@@ -218,7 +223,7 @@ function verifyTrailText(v: AcceptanceVerifyResult): string {
  *   pass + pending report .............. accept that report (auto-verify a real delivery)
  *   pass + no report ................... unreported-pass (no write; → supervisor decides)
  *   fail + pending report .............. reject that report
- *   fail + no pending report ........... nudge            (no write)
+ *   fail + no pending report ........... nudge            (no write; → supervisor via inspectionFact)
  */
 export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, opts: ReconcileOpts): ReconcileResult {
   const task = ledger.task(taskId);
@@ -286,7 +291,22 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
     return { taskId, action: 'rejected', verify, reportId, deduped: res.deduped };
   }
 
-  // Nothing delivered to the ledger yet → don't fabricate a failed report; the
-  // caller nudges the worker with the failed checks instead.
-  return { taskId, action: 'nudge', verify };
+  // Verify failed and there is no pending report to reject. We do NOT fabricate a
+  // failed report, and — per 统揽 — the caller must NOT mechanically @ the worker
+  // every tick (that's the bug 老滕 caught: a rejected/escalated task being nagged
+  // forever). Surface a fact for the supervisor (L2) to own the next step:
+  // guide/催 the worker to (re)report, 重派, or 升级. Distinguish "rejected but not
+  // re-delivered" from "never delivered" so L2 doesn't repeat itself.
+  const wasRejected = task.status === 'rejected';
+  const hadReports = (task.reports?.length ?? 0) > 0;
+  const head = wasRejected || hadReports
+    ? `任务 ${taskId} 之前的交付已被驳回、worker 尚未重新 report，结构化复核仍未通过（${verifySummary(verify)}）。`
+    : `任务 ${taskId} 尚无有效交付，结构化验收未通过（${verifySummary(verify)}）。`;
+  const inspectionFact = [
+    head,
+    '未通过明细：',
+    verifyTrailText(verify),
+    '请你（监管者）判断并执行下一步：引导/催 worker 修复后重新 botmux report、必要时重派或升级给人；不要机械重复催促。',
+  ].join('\n');
+  return { taskId, action: 'nudge', verify, inspectionFact };
 }

@@ -110,7 +110,7 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(led.task('t1')!.status).toBe('dispatched'); // still pending — supervisor owns the call
   });
 
-  it('dispatched + verify fail → nudge, nothing written to the ledger', () => {
+  it('dispatched + verify fail → nudge, nothing written, surfaces a "尚无有效交付" fact for L2', () => {
     const led = dispatched('t2');
     const before = led.read().length;
     const r = reconcileTaskByCriteria(led, 't2', { checkedBy: 'sup', now: TS, verify: fail });
@@ -118,6 +118,24 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(r.verify?.passed).toBe(false);
     expect(led.read()).toHaveLength(before); // no fabricated failed report
     expect(led.task('t2')!.status).toBe('dispatched');
+    // The mechanical layer no longer @s the worker; it hands L2 a fact to act on.
+    expect(r.inspectionFact).toContain('尚无有效交付');
+    expect(r.inspectionFact).toContain('不要机械重复催促');
+  });
+
+  it('rejected + still failing + worker has not re-reported → nudge with a "已被驳回、尚未重新 report" fact (no perpetual @worker)', () => {
+    // Reproduce 老滕's bug: a task driven to rejected that the worker hasn't re-delivered
+    // must NOT be mechanically nagged every tick — it returns to L2 with context.
+    const led = dispatched('t-rej');
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-rej', chatId: 'oc_g', idempotencyKey: 'reported:t-rej-r1', payload: { taskId: 't-rej', reportId: 't-rej-r1', summary: 'try', evidence: [{ kind: 'path', path: '/tmp/vd-demo/x.txt' }] } }));
+    reconcileTaskByCriteria(led, 't-rej', { checkedBy: 'sup', now: TS, verify: fail }); // → rejects r1
+    expect(led.task('t-rej')!.status).toBe('rejected');
+    const before = led.read().length;
+    const r = reconcileTaskByCriteria(led, 't-rej', { checkedBy: 'sup', now: TS, verify: fail }); // re-run, no new report
+    expect(r.action).toBe('nudge');
+    expect(led.read()).toHaveLength(before); // idempotent, no fabricated event
+    expect(r.inspectionFact).toContain('已被驳回');
+    expect(r.inspectionFact).toContain('尚未重新 report');
   });
 
   it('worker reported + verify pass → accepts the existing report (no synthetic report)', () => {
