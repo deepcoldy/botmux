@@ -230,6 +230,18 @@ describe('decideDashboardAuth — public surface', () => {
     expect(d.kind).toBe('allow');
   });
 
+  it('DELETE /api/whiteboards/:id without token → deny401', () => {
+    const d = decideDashboardAuth({
+      method: 'DELETE',
+      pathname: '/api/whiteboards/wb_test',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+      publicReadOnly: true,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
   it('GET /game/index.html — HD2D office shell allow without any token', () => {
     const d = decideDashboardAuth({
       method: 'GET',

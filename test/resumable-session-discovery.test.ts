@@ -84,6 +84,50 @@ describe('discoverClaudeFamilySessions', () => {
     expect(out.map((s) => s.cliSessionId).sort()).toEqual(['ext-discuss-1', 'ext-discuss-2']);
   });
 
+  // Regression (whiteboard /adopt leak): Claude-family CLIs with
+  // injectsSessionContext=true get routing/identity/session_id via system
+  // prompt, so when no team/group role is configured the botmux prompt STARTS
+  // with the <whiteboard> block directly. No ^-anchored pattern matched that
+  // opening (they only allowed <whiteboard> as a middle element), so such
+  // botmux-origin Claude sessions leaked into /adopt as if external.
+  it('drops botmux-origin Claude sessions whose prompt opens with <whiteboard>', async () => {
+    writeSession('-root-wb', 'wb-open-1', [
+      { type: 'user', cwd: '/root/wb', message: { role: 'user', content: '<whiteboard id="wb_abc123def45678">\n本地项目上下文；需要时读取：`botmux whiteboard read --id wb_abc123def45678`。\n更新状态：`botmux whiteboard update --id wb_abc123def45678`。\n</whiteboard>\n\n<user_message>\n@Claude do the thing\n</user_message>' } },
+    ]);
+    // A standalone session in the same project survives.
+    writeSession('-root-wb', 'wb-open-ext', [
+      { type: 'user', cwd: '/root/wb', message: { role: 'user', content: 'just a normal prompt I typed' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['wb-open-ext']);
+  });
+
+  // The ^<whiteboard>-opening pattern matches ANY board id (id="[^"]+"), not
+  // just the default `wb_` prefix — a user-created board (`create --id
+  // <custom>`) bound to a Claude-family + role-less session also opens with
+  // <whiteboard id="<custom>"> and must be dropped from /adopt.
+  it('drops botmux-origin Claude sessions opening with a custom-id <whiteboard>', async () => {
+    writeSession('-root-wb', 'wb-custom-1', [
+      { type: 'user', cwd: '/root/wb', message: { role: 'user', content: '<whiteboard id="my-custom-board">\n本地项目上下文\n</whiteboard>\n\n<user_message>\ndo the thing\n</user_message>' } },
+    ]);
+    writeSession('-root-wb', 'wb-custom-ext', [
+      { type: 'user', cwd: '/root/wb', message: { role: 'user', content: 'just a normal prompt I typed' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['wb-custom-ext']);
+  });
+
+  // The <whiteboard>-opening pattern is structural (^-anchored + id="wb_…" +
+  // <user_message> adjacency), so an external session that merely DISCUSSES a
+  // whiteboard tag in prose (mid-sentence, no envelope) must NOT be mis-flagged.
+  it('keeps external Claude sessions that only mention <whiteboard> in prose', async () => {
+    writeSession('-root-wb', 'wb-prose-1', [
+      { type: 'user', cwd: '/root/wb', message: { role: 'user', content: 'I am documenting the <whiteboard id="wb_x"> block that botmux injects; how should I describe it?' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['wb-prose-1']);
+  });
+
   it('drops empty / command-only sessions (no real user prompt)', async () => {
     writeSession('-root-proj', 'ffff6666-0000-0000-0000-000000000006', [
       { type: 'user', cwd: '/root/proj', message: { role: 'user', content: '<local-command-caveat>...</local-command-caveat>' } },
@@ -210,6 +254,47 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     ]);
     const out = await discoverRolloutSessions(sessionsRoot, 10);
     expect(out.map((s) => s.cliSessionId)).toEqual(['sid-ext-reminder-discuss']);
+  });
+
+  // Whiteboard now sits between <botmux_reminder> and <user_message>; a
+  // botmux-generated rollout carrying it must still be dropped (structural
+  // match), not adopted as external.
+  it('drops botmux-origin rollouts with whiteboard between reminder and user_message (new-topic shape)', async () => {
+    writeRollout('2026/06/16', 'rollout-bmx-wb-newtopic.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bmx-wb-newtopic', cwd: '/root/x' } },
+      {
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: '<botmux_routing>\nuse botmux send\n</botmux_routing>\n\n<identity>\n  <name>Codex Bot</name>\n  <open_id>ou_bot</open_id>\n</identity>\n\n<session_id>sess-wb</session_id>\n\n<role context="team" chat_id="oc_team">\nreviewer\n</role>\n\n<whiteboard id="wb_x">\nread/update via botmux whiteboard\n</whiteboard>\n\n<user_message>\nactual prompt\n</user_message>',
+        },
+      },
+    ]);
+    writeRollout('2026/06/17', 'rollout-ext-wb-newtopic.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-ext-wb-newtopic', cwd: '/root/y' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'a prompt typed straight into codex' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['sid-ext-wb-newtopic']);
+  });
+
+  it('drops botmux-origin rollouts with whiteboard between reminder and user_message (follow-up shape)', async () => {
+    writeRollout('2026/06/18', 'rollout-bmx-wb-followup.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bmx-wb-followup', cwd: '/root/x' } },
+      {
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: '<session_id>sess-wb2</session_id>\n\n<role context="team" chat_id="oc_team">\nreviewer\n</role>\n\n<botmux_reminder>reply via botmux send</botmux_reminder>\n\n<whiteboard id="wb_y">\nread/update via botmux whiteboard\n</whiteboard>\n\n<user_message>\nactual prompt\n</user_message>',
+        },
+      },
+    ]);
+    writeRollout('2026/06/19', 'rollout-ext-wb-followup.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-ext-wb-followup', cwd: '/root/y' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'a prompt typed straight into codex' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['sid-ext-wb-followup']);
   });
 
   // Regression (Codex blocker 2): legacy botmux rollouts may carry a

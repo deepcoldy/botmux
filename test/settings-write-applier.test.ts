@@ -27,16 +27,21 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
       Object.assign(storedDashboard, patch);
       return storedDashboard;
     }),
+    mergeGlobalConfig: vi.fn((patch) => {
+      Object.assign(storedGlobal, patch);
+    }),
     mergeMaintenanceConfig: vi.fn((patch) => {
       Object.assign(storedMaintenance, patch);
       return storedMaintenance;
     }),
+    setGlobalLocale: vi.fn(),
     parseMaintenancePatch: vi.fn((body: any) => {
       if (!body || typeof body !== 'object') return { ok: false, error: 'empty' } as const;
       return { ok: true, patch: body as MaintenanceConfig } as const;
     }),
     isLocalDevInstall: vi.fn(() => false),
     resolveDashboardSettings: vi.fn(() => settingsView),
+    isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
     ...overrides,
   };
 }
@@ -78,6 +83,17 @@ describe('applySettingsWrite happy paths', () => {
       autoUpdate: { enabled: true, time: '04:00' },
     });
   });
+
+  // Regression guard: the inline PUT /api/settings handler on master supported a
+  // `whiteboard.enabled` toggle. When that handler was extracted into
+  // applySettingsWrite, the field MUST be preserved or the master feature
+  // silently regresses on merge (no test previously covered it).
+  it('writes whiteboard.enabled toggle via mergeGlobalConfig', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ whiteboard: { enabled: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ whiteboard: { enabled: true } });
+  });
 });
 
 describe('applySettingsWrite — validation errors', () => {
@@ -96,6 +112,24 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('invalid_openTerminalInFeishu');
+  });
+
+  it('rejects non-object whiteboard → invalid_whiteboard', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ whiteboard: 'on' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_whiteboard');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-boolean whiteboard.enabled → invalid_whiteboard_enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ whiteboard: { enabled: 'yes' } }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_whiteboard_enabled');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
   it('refuses enabling autoUpdate on a local-dev install → local_dev_no_autoupdate', async () => {

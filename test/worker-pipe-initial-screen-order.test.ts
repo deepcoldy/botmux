@@ -37,13 +37,37 @@ describe('worker pipe initial screen ordering', () => {
     expect(queuedProbeIdx).toBeGreaterThan(queueLogIdx);
   });
 
-  it('rechecks busy-pattern adapters after first prompt timeout', () => {
+  it('rechecks busy-pattern adapters after first prompt timeout fallback unlocks startup', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const timeoutIdx = source.indexOf("log('First prompt timeout — enabling screen updates and flushing queued messages');");
-    const probeIdx = source.indexOf('probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)', timeoutIdx);
+    const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
+    const releaseIdx = source.indexOf('awaitingFirstPrompt = false;', fallbackStart);
+    const probeIdx = source.indexOf('probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)', releaseIdx);
 
-    expect(timeoutIdx).toBeGreaterThan(-1);
-    expect(probeIdx).toBeGreaterThan(timeoutIdx);
+    expect(fallbackStart).toBeGreaterThan(-1);
+    expect(releaseIdx).toBeGreaterThan(fallbackStart);
+    expect(probeIdx).toBeGreaterThan(-1);
+    expect(probeIdx).toBeGreaterThan(releaseIdx);
+  });
+
+  it('gates the first-prompt soft timeout through shouldReleaseFirstPromptTimeout with a hard cap', () => {
+    // Pin the defer-then-hard-cap structure, not just the probe ordering. Without
+    // this, reverting the closure to an unconditional 15s force-flush (the exact
+    // bug this fix closes) would keep the ordering guard above green.
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
+    const releaseIdx = source.indexOf('awaitingFirstPrompt = false;', fallbackStart);
+    const gateIdx = source.indexOf('shouldReleaseFirstPromptTimeout(', fallbackStart);
+    const hardCapIdx = source.indexOf('FIRST_PROMPT_HARD_TIMEOUT_MS', fallbackStart);
+    const hardTimerIdx = source.indexOf('releaseFirstPromptTimeout(FIRST_PROMPT_HARD_TIMEOUT_MS, true)', fallbackStart);
+
+    expect(fallbackStart).toBeGreaterThan(-1);
+    // The defer gate must be consulted BEFORE the queue is released.
+    expect(gateIdx).toBeGreaterThan(fallbackStart);
+    expect(gateIdx).toBeLessThan(releaseIdx);
+    // A hard cap + hard-timer reschedule must exist so a deferred CLI cannot
+    // trap the first queued prompt forever.
+    expect(hardCapIdx).toBeGreaterThan(fallbackStart);
+    expect(hardTimerIdx).toBeGreaterThan(fallbackStart);
   });
 
   it('limits busy-pattern idle probes to the active status region', () => {

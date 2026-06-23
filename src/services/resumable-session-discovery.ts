@@ -102,10 +102,27 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
   // blocks first, then the wrapper. External prompts may discuss these tags
   // mid-text, but they don't start with this structural envelope.
   /^<user_message>[\s\S]*?<\/user_message>/,
-  /^<botmux_routing>[\s\S]*?<\/botmux_routing>\s*(?:<identity>[\s\S]*?<\/identity>\s*)?<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?<user_message>[\s\S]*?<\/user_message>/,
-  /^<role\s+context="(?:team|group)"\s+chat_id="[^"]+">[\s\S]*?<\/role>\s*(?:<session_id>[^<]+<\/session_id>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?<user_message>[\s\S]*?<\/user_message>/,
-  /^<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?<user_message>[\s\S]*?<\/user_message>/,
-  /^<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*<user_message>[\s\S]*?<\/user_message>/,
+  // The optional <whiteboard> block sits between <botmux_reminder> and
+  // <user_message> (new-topic prompts place it before <user_message> too), so
+  // each reminder-bearing envelope makes it optional there to stay structural —
+  // a botmux-generated prompt with <whiteboard> must still drop, not get adopted.
+  /^<botmux_routing>[\s\S]*?<\/botmux_routing>\s*(?:<identity>[\s\S]*?<\/identity>\s*)?<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
+  /^<role\s+context="(?:team|group)"\s+chat_id="[^"]+">[\s\S]*?<\/role>\s*(?:<session_id>[^<]+<\/session_id>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
+  /^<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
+  /^<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
+  // Claude-family CLIs (injectsSessionContext=true) get routing/identity/
+  // session_id via system prompt, so those blocks are NOT in the user turn —
+  // when no team/group role is configured either, the prompt STARTS with the
+  // <whiteboard> context block directly. None of the patterns above match a
+  // `^<whiteboard>` opening (they only allow <whiteboard> as a middle element
+  // after routing/role/session_id/reminder), so such botmux-origin Claude
+  // sessions leaked into the /adopt picker as if external. The trailing
+  // <user_message> envelope adjacency is structural — an external session
+  // discussing whiteboards never starts with this shape. id matches any value
+  // (not just the default `wb_` prefix) so a user-created board bound to a
+  // Claude-family + role-less session (`create --id <custom>`) is also dropped,
+  // consistent with the three `<whiteboard\b` patterns above.
+  /^<whiteboard\s+id="[^"]+"\s*>[\s\S]*?<\/whiteboard>\s*<user_message>[\s\S]*?<\/user_message>/,
   /^用户发送了：\s*\n-{3,}/,
   // Modern envelope: the `</user_message>` close butted up against one of
   // botmux's trailing blocks (claude → <sender>, codex/traex → <session_id>,

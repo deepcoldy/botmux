@@ -1,4 +1,5 @@
 import type { CliId } from '../adapters/cli/types.js';
+import { sanitizePerBotEnv } from '../core/per-bot-env.js';
 
 export const CLI_ID_CHOICES: Record<string, CliId> = {
   '1': 'claude-code',
@@ -182,6 +183,15 @@ export function botProcessName(
 ): string {
   const name = typeof bot.name === 'string' ? normalizeBotProcessName(bot.name) : undefined;
   return `${prefix}-${name ?? index}`;
+}
+
+/**
+ * Sanitize a bot entry's `env` object into a clean `KEY -> string` map (valid
+ * env-var names + string/number/boolean values; botmux-reserved keys dropped).
+ * Thin wrapper over {@link sanitizePerBotEnv} for callers that hold a bot entry.
+ */
+export function botProcessEnv(bot: { env?: unknown }): Record<string, string> {
+  return sanitizePerBotEnv(bot?.env);
 }
 
 export function normalizeBotConfig<T extends Record<string, any>>(bot: T): T {

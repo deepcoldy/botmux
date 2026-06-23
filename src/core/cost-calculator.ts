@@ -2,17 +2,14 @@
  * Session cost calculator — computes token usage from JSONL logs.
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
-import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
-import { expandHome } from './working-dir.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
-import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../services/codex-transcript.js';
-import { cocoEventsPathForSession } from '../services/coco-transcript.js';
-import { findCursorTranscriptByChatId } from '../services/cursor-transcript.js';
-import { findTraexRolloutBySessionId } from '../services/traex-transcript.js';
+import {
+  __resetTranscriptResolverCacheForTest,
+  cachedTranscriptPathLookup,
+  resolveSessionTranscriptPath,
+} from '../services/transcript-resolver.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -43,16 +40,7 @@ export interface SessionTokenUsageQuery {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 export function getSessionJsonlPath(sessionId: string, cwd: string): string | null {
-  return getClaudeSessionJsonlPath(sessionId, cwd, join(homedir(), '.claude'));
-}
-
-function getClaudeSessionJsonlPath(sessionId: string, cwd: string, dataDir: string): string | null {
-  const resolvedCwd = resolve(expandHome(cwd));
-  // Claude stores sessions at ~/.claude/projects/<project-key>/<sessionId>.jsonl
-  // where project-key = absolute path with non [A-Za-z0-9-] chars replaced by -
-  const projectKey = resolvedCwd.replace(/[^A-Za-z0-9-]/g, '-');
-  const jsonlPath = join(dataDir, 'projects', projectKey, `${sessionId}.jsonl`);
-  return existsSync(jsonlPath) ? jsonlPath : null;
+  return resolveSessionTranscriptPath({ cliId: 'claude-code', sessionId, cwd })?.path ?? null;
 }
 
 export function getSessionCost(sessionId: string, cwd: string): SessionCost | null {
@@ -306,49 +294,13 @@ const USAGE_FILE_CACHE_MAX_ENTRIES = 512;
  *  most once per interval — keeps row composition off the disk. */
 const USAGE_REPARSE_MIN_INTERVAL_MS = 15_000;
 
-const sessionPathCache = new Map<string, { path: string | null; atMs: number }>();
-const SESSION_PATH_CACHE_MAX_ENTRIES = 1024;
-/** A missed lookup (transcript not on disk yet) is retried only after this
- *  window — fresh sessions otherwise trigger a directory scan per row render. */
-const PATH_MISS_RETRY_MS = 30_000;
 /** Aiden checkpoint paths move as the session progresses (latest.json points
  *  at a new checkpoint id per turn), so positive hits expire quickly too. */
 const AIDEN_PATH_HIT_TTL_MS = 15_000;
 
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
-  sessionPathCache.clear();
-}
-
-/** Memoize a transcript-path lookup. `hitTtlMs === null` means a found path
- *  is trusted forever (rollout/transcript files never move); misses are
- *  retried after PATH_MISS_RETRY_MS — or immediately when `retryMiss` is set
- *  (ledger reads must see lazily created transcripts at turn boundaries).
- *  `refreshHit` additionally re-resolves a cached positive hit — for sources
- *  whose path MOVES between turns (aiden checkpoints), a fresh ledger read
- *  must not settle for a stale path inside the hit TTL. */
-function cachedPathLookup(
-  key: string,
-  hitTtlMs: number | null,
-  lookup: () => string | null,
-  opts?: { retryMiss?: boolean; refreshHit?: boolean },
-): string | null {
-  const now = Date.now();
-  const cached = sessionPathCache.get(key);
-  if (cached) {
-    if (cached.path !== null) {
-      if (!opts?.refreshHit && (hitTtlMs === null || now - cached.atMs < hitTtlMs)) return cached.path;
-    } else if (!opts?.retryMiss && now - cached.atMs < PATH_MISS_RETRY_MS) {
-      return null;
-    }
-  }
-  if (sessionPathCache.size >= SESSION_PATH_CACHE_MAX_ENTRIES && !sessionPathCache.has(key)) {
-    const oldest = sessionPathCache.keys().next().value;
-    if (oldest !== undefined) sessionPathCache.delete(oldest);
-  }
-  const path = lookup();
-  sessionPathCache.set(key, { path, atMs: now });
-  return path;
+  __resetTranscriptResolverCacheForTest();
 }
 
 function cloneAggregate(agg: TokenUsageAggregate): TokenUsageAggregate {
@@ -547,62 +499,10 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
   };
 }
 
-/** Resolve a Claude-family fork's (seed / relay) data root EXACTLY as the worker
- *  does, so usage reads hit the same transcript the CLI wrote. The adapter
- *  derives the root per-fork (seed → `<pkg>/.claude-runtime`; relay → `~/.relay`,
- *  see deriveSeedDataDir / deriveRelayDataDir) and the worker spawns the CLI
- *  with `spawnEnv = { CLAUDE_CONFIG_DIR: <that root> }`, which *overrides* any
- *  inherited env (worker.ts: process.env first, then adapter.spawnEnv). So a
- *  botmux-spawned seed/relay ALWAYS writes to the adapter-derived root —
- *  regardless of whether the daemon itself has CLAUDE_CONFIG_DIR set. We must
- *  read from the same place; consulting the daemon's own env (the old
- *  `process.env.CLAUDE_CONFIG_DIR || ~/.claude-runtime`) would diverge from
- *  where the CLI actually wrote. `claudeDataDir` is the single source of truth.
- *  Cached so the dashboard read path doesn't shell out (`which`) per refresh.
- *
- *  Uses the DEFAULT binary (no per-bot cliPathOverride); a custom path would
- *  resolve a different root, but that narrow case was already unsupported here. */
-const claudeForkDataDirCache = new Map<string, string>();
-function claudeForkDataDir(cliId: 'seed' | 'relay'): string {
-  const cached = claudeForkDataDirCache.get(cliId);
-  if (cached) return cached;
-  const dir = createCliAdapterSync(cliId).claudeDataDir ?? join(homedir(), '.claude-runtime');
-  claudeForkDataDirCache.set(cliId, dir);
-  return dir;
-}
-
-function tokenUsagePathForSession(q: SessionTokenUsageQuery): string | null {
-  const sid = q.cliSessionId || q.sessionId;
-  switch (q.cliId) {
-    case 'claude-code':
-      return q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, join(homedir(), '.claude')) : null;
-    case 'seed':
-    case 'relay':
-      return q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, claudeForkDataDir(q.cliId)) : null;
-    case 'codex':
-      return cachedPathLookup(`codex:${q.sessionId}:${q.cliSessionId ?? ''}`, null, () => {
-        const codexSid = q.cliSessionId || findCodexSessionIdByBotmuxSessionId(q.sessionId) || q.sessionId;
-        return findCodexRolloutBySessionId(codexSid) ?? null;
-      }, { retryMiss: q.fresh });
-    case 'coco':
-      return cocoEventsPathForSession(sid);
-    case 'cursor':
-      return cachedPathLookup(`cursor:${sid}`, null, () => findCursorTranscriptByChatId(sid) ?? null, { retryMiss: q.fresh });
-    case 'traex':
-      return cachedPathLookup(`traex:${sid}`, null, () => findTraexRolloutBySessionId(sid) ?? null, { retryMiss: q.fresh });
-    case 'antigravity':
-      return q.cliSessionId
-        ? join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl')
-        : null;
-    default:
-      return null;
-  }
-}
-
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
   if (q.cliId === 'aiden') {
     const sid = q.cliSessionId || q.sessionId;
-    const checkpointPath = cachedPathLookup(
+    const checkpointPath = cachedTranscriptPathLookup(
       `aiden:${q.sessionId}:${sid}:${q.cwd ?? ''}`,
       AIDEN_PATH_HIT_TTL_MS,
       () =>
@@ -614,9 +514,9 @@ export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsa
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
     return readSessionTokenUsageFile(checkpointPath, 'aiden', { fresh: q.fresh });
   }
-  const path = tokenUsagePathForSession(q);
-  if (!path || !existsSync(path)) return null;
-  return readSessionTokenUsageFile(path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  const resolved = resolveSessionTranscriptPath(q);
+  if (!resolved || !existsSync(resolved.path)) return null;
+  return readSessionTokenUsageFile(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
 }
 
 export function formatNumber(n: number): string {

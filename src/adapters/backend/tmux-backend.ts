@@ -2,9 +2,11 @@ import * as pty from 'node-pty';
 import { execSync, execFileSync } from 'node:child_process';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { basename } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
 import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -67,6 +69,17 @@ export class TmuxBackend implements SessionBackend {
   /** Derive tmux session name from a session UUID. */
   static sessionName(sessionId: string): string {
     return `bmx-${sessionId.slice(0, 8)}`;
+  }
+
+  /**
+   * Name of the parked crash-diagnostic shell session. DISTINCT from
+   * {@link sessionName} on purpose: the diagnostic shell must never collide with
+   * the live CLI's backing-session name, or restore/cold-resume/`botmux resume`
+   * would reattach the bare shell as if it were the CLI. Stays `bmx-`-prefixed
+   * so adopt-discovery still skips it.
+   */
+  static diagnosticSessionName(sessionId: string): string {
+    return `bmx-diag-${sessionId.slice(0, 8)}`;
   }
 
   /** Check if a named tmux session exists. */
@@ -152,6 +165,41 @@ export class TmuxBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Create a parked diagnostic session after a CLI has exited. The worker uses
+   * this only after it has already captured the failed pane's output, so the
+   * browser can still attach to `bmx-*` and see the startup error while daemon
+   * auto-restart is paused.
+   */
+  static parkDiagnosticSession(name: string, opts: { cwd: string; cols: number; rows: number; contentPath: string }): boolean {
+    try {
+      TmuxBackend.killSession(name);
+      const shellSpec = resolveUserShell();
+      execFileSync('tmux', [
+        'new-session',
+        '-d',
+        '-s', name,
+        '-x', String(opts.cols),
+        '-y', String(opts.rows),
+        '--',
+        shellSpec.shell, ...shellSpec.flags, '-c', DIAGNOSTIC_SHELL_SCRIPT, '_',
+        opts.cwd,
+        opts.contentPath,
+        shellSpec.shell,
+      ], {
+        stdio: 'ignore',
+        cwd: opts.cwd,
+        env: tmuxEnv(),
+        timeout: 5000,
+      });
+      configureTmuxSessionOptions(name);
+      return true;
+    } catch (err) {
+      logger.warn(`[tmux:${name}] failed to park diagnostic session: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
   // ─── SessionBackend implementation ────────────────────────────────────────
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
@@ -212,7 +260,7 @@ export class TmuxBackend implements SessionBackend {
       //     could `unset` or `export` over it before the CLI sees it. env(1)
       //     injection happens after rcfile load and is authoritative.
       const shellSpec = resolveUserShell();
-      const envAssignments = buildBotmuxEnvAssignments(opts.env);
+      const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
       // Debug knob — when on, the wrapper does NOT `exec` the CLI; it runs the
       // CLI as a child and then drops into an interactive `$shell -i` so the
       // user can poke at PATH / NVM / pnpm in the web terminal after exiting
@@ -255,21 +303,7 @@ export class TmuxBackend implements SessionBackend {
     // backfill options added after the session was originally created.
     // Setting an already-applied option is idempotent.
     setTimeout(() => {
-      try {
-        const t = shellescape(this.sessionName);
-        const env = tmuxEnv();
-        execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
-        execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
-        // set-clipboard is a server option — enable OSC 52 passthrough for web copy
-        execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
-        execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
-        // Prevent web terminal clients (smaller viewport) from shrinking the
-        // tmux window.  If a web client at 80×24 causes tmux to resize the
-        // window down, reflowed content shifts buffer positions and the
-        // terminal renderer's baseline tracking breaks — historical output
-        // leaks into the streaming card.
-        execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
-      } catch { /* session may not be ready yet — benign */ }
+      configureTmuxSessionOptions(this.sessionName);
     }, 500);
   }
 
@@ -347,17 +381,33 @@ export class TmuxBackend implements SessionBackend {
    */
   pasteText(text: string): void {
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['load-buffer', '-'], {
-      input: text,
-      stdio: ['pipe', 'ignore', 'ignore'],
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-    execFileSync('tmux', ['paste-buffer', '-t', this.cmdTarget, '-d', '-p'], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
+    const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
+    let loaded = false;
+    try {
+      execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
+        input: text,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      loaded = true;
+      execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.cmdTarget, '-d', '-p'], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      loaded = false;
+    } finally {
+      if (loaded) {
+        try {
+          execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
+            stdio: 'ignore',
+            timeout: 1000,
+            env: tmuxEnv(),
+          });
+        } catch { /* best-effort cleanup after a failed paste */ }
+      }
+    }
   }
 
   private exitCopyModeIfNeeded(): void {
@@ -548,13 +598,29 @@ const BOTMUX_INJECTED_ENV_KEYS = [
  * `IS_SANDBOX` for instance is only set when the daemon is running as root.
  * Pure function for unit-testing without spawning tmux.
  */
-export function buildBotmuxEnvAssignments(env: NodeJS.ProcessEnv | undefined): string[] {
-  if (!env) return [];
+export function buildBotmuxEnvAssignments(
+  env: NodeJS.ProcessEnv | undefined,
+  injectEnv?: Record<string, string>,
+): string[] {
   const out: string[] = [];
-  for (const key of BOTMUX_INJECTED_ENV_KEYS) {
-    const val = env[key];
-    if (val === undefined) continue;
-    out.push(`${key}=${val}`);
+  if (env) {
+    for (const key of BOTMUX_INJECTED_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+  }
+  // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
+  // bot's provider creds win over any same-named leftover, and emitted ONLY
+  // here (the per-pane `/usr/bin/env` prefix) — never via the tmux client env —
+  // so they don't pollute the shared server global and leak across bots. These
+  // are argv items consumed as `"$@"` by the shell wrapper, so values with
+  // spaces / quotes / `$` need no escaping. Re-sanitized defensively (the value
+  // crossed an IPC boundary from the daemon).
+  if (injectEnv) {
+    for (const [key, val] of Object.entries(sanitizePerBotEnv(injectEnv))) {
+      out.push(`${key}=${val}`);
+    }
   }
   return out;
 }
@@ -573,6 +639,16 @@ export function buildBotmuxEnvAssignments(env: NodeJS.ProcessEnv | undefined): s
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
 export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && exec /usr/bin/env "$@"`;
+
+export const DIAGNOSTIC_SHELL_SCRIPT = [
+  'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
+  REDACTED_ENV_UNSET_CLAUSE,
+  'clear',
+  `printf '\\033[1;31m[botmux] Agent CLI exited. Auto-restart is paused and the last terminal output is preserved below.\\033[0m\\n\\n'`,
+  'cat -- "$2" 2>/dev/null || true',
+  `printf '\\n\\033[1;33m[botmux] Fix the startup error, then send a new message to retry. Type exit to close this diagnostic shell.\\033[0m\\n'`,
+  'exec "$3" -i',
+].join('; ');
 
 /**
  * Debug variant of the wrapper script — same prelude, but the CLI runs as
@@ -624,6 +700,23 @@ function specForKind(shell: string, kind: ShellKind): ShellSpec {
   else if (kind === 'zsh') flags.push('-l', '-i');
   // 'sh' adds nothing — POSIX sh has no portable interactive rcfile.
   return { shell, flags };
+}
+
+function configureTmuxSessionOptions(sessionName: string): void {
+  try {
+    const t = shellescape(sessionName);
+    const env = tmuxEnv();
+    execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+    execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
+    // set-clipboard is a server option — enable OSC 52 passthrough for web copy
+    execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
+    execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
+    // Prevent web terminal clients (smaller viewport) from shrinking the
+    // tmux window. If a web client at 80x24 causes tmux to resize the window
+    // down, reflowed content shifts buffer positions and historical output
+    // leaks into the streaming card.
+    execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+  } catch { /* session may not be ready yet — benign */ }
 }
 
 /** Classify a shell binary path by basename. Returns null for shells whose

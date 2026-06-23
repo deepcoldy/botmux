@@ -163,6 +163,59 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.skills).toBeUndefined();
   });
 
+  it('sets/sanitizes/unsets per-bot env (JSON) and masks values in the apply result', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('env')!;
+    expect(spec.kind).toBe('json');
+    expect(spec.effect).toBe('next-session');
+
+    // sanitize: drop reserved key, keep provider creds, stringify primitives
+    const coerced = store.coerceConfigValue(
+      spec,
+      '{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"glm-key","BOTMUX_SESSION_ID":"hijack","TIMEOUT":30}',
+    );
+    expect(coerced).toEqual({
+      ok: true,
+      value: {
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        ANTHROPIC_AUTH_TOKEN: 'glm-key',
+        TIMEOUT: '30',
+      },
+    });
+    if (!coerced.ok) throw new Error('coerce failed');
+
+    const r1 = await store.applyConfigField('app_default', spec, coerced.value);
+    expect(r1.ok).toBe(true);
+    // Persisted verbatim (sanitized) to bots.json + memory…
+    expect(readConfig().env).toEqual({
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      ANTHROPIC_AUTH_TOKEN: 'glm-key',
+      TIMEOUT: '30',
+    });
+    expect(registry.getBot('app_default').config.env).toEqual({
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      ANTHROPIC_AUTH_TOKEN: 'glm-key',
+      TIMEOUT: '30',
+    });
+    // …but the human-facing text masks the values (no token leak in /config get).
+    if (r1.ok) {
+      expect(r1.newText).not.toContain('glm-key');
+      expect(r1.newText).not.toContain('api.z.ai');
+      expect(r1.newText).toContain('ANTHROPIC_AUTH_TOKEN=••••');
+    }
+
+    // a fully-invalid object (only reserved/garbage keys) is rejected
+    expect(store.coerceConfigValue(spec, '{"BOTMUX_X":"y","1BAD":"z"}')).toEqual({ ok: false, reason: 'invalid_json' });
+    // non-object JSON rejected
+    expect(store.coerceConfigValue(spec, '"a-string"')).toEqual({ ok: false, reason: 'invalid_json' });
+    expect(store.coerceConfigValue(spec, '[1,2]')).toEqual({ ok: false, reason: 'invalid_json' });
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().env).toBeUndefined();
+    expect(registry.getBot('app_default').config.env).toBeUndefined();
+  });
+
   it('boolean field writes true / deletes key on false (keeps bots.json tidy)', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('disableStreamingCard')!;

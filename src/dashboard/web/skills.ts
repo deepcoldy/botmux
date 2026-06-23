@@ -5,6 +5,13 @@ interface SkillRow {
   description?: string;
   tags?: string[];
   source?: Record<string, any>;
+  rootDir?: string;
+}
+
+interface NativeSkillGroup {
+  cliId: string;
+  rootDir: string;
+  skills: SkillRow[];
 }
 
 interface BotRow {
@@ -32,13 +39,15 @@ interface SkillJob {
 
 let state: {
   skills: SkillRow[];
+  nativeSkillGroups: NativeSkillGroup[];
   bots: BotRow[];
   trustProjectSkills: 'off' | 'all';
   delivery: 'auto' | 'prompt' | 'native';
-} = { skills: [], bots: [], trustProjectSkills: 'off', delivery: 'auto' };
+} = { skills: [], nativeSkillGroups: [], bots: [], trustProjectSkills: 'off', delivery: 'auto' };
 let loadError: string | null = null;
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
 let installedSkillsPage = 0;
+let activeDiscoveryGroupKey: string | null = null;
 
 function pageHtml(): string {
   return `<section class="page">
@@ -58,9 +67,20 @@ function sourceLabel(skill: SkillRow): string {
   const source = skill.source ?? {};
   if (source.type === 'github') return `github:${source.owner}/${source.repo}/${source.path ?? ''}`;
   if (source.type === 'git') return `${source.url ?? 'git'}#${source.path ?? ''}`;
-  if (source.type === 'local-link') return 'local-link';
-  if (source.type === 'local-copy') return 'local-copy';
+  if (source.type === 'local-link') return nativeLibraryLabel(source.path) ?? t('skills.sourceLocalLink');
+  if (source.type === 'local-copy') return t('skills.sourceBotmuxCopy');
   return String(source.type ?? 'unknown');
+}
+
+function nativeLibraryLabel(path?: string): string | null {
+  const p = String(path ?? '').replace(/\\/g, '/');
+  if (p.includes('/.codex/skills/')) return t('skills.sourceCodex');
+  if (p.includes('/.claude/skills/')) return t('skills.sourceClaude');
+  if (p.includes('/.trae/skills/')) return t('skills.sourceTrae');
+  if (p.includes('/.cursor/skills/')) return t('skills.sourceCursor');
+  if (p.includes('/.gemini/skills/')) return t('skills.sourceGemini');
+  if (p.includes('/.config/opencode/skills/')) return t('skills.sourceOpenCode');
+  return null;
 }
 
 function priorityNames(policy?: SkillPolicy | null): string[] {
@@ -81,6 +101,24 @@ function installedSkillNames(): Set<string> {
   return new Set(state.skills.map(skill => skill.name));
 }
 
+function discoveryGroupKey(group: NativeSkillGroup): string {
+  return `${group.cliId}\n${group.rootDir}`;
+}
+
+function discoveryGroups(): NativeSkillGroup[] {
+  return state.nativeSkillGroups;
+}
+
+function activeDiscoveryGroup(groups: NativeSkillGroup[]): NativeSkillGroup | undefined {
+  if (groups.length === 0) return undefined;
+  const active = activeDiscoveryGroupKey
+    ? groups.find(group => discoveryGroupKey(group) === activeDiscoveryGroupKey)
+    : undefined;
+  const fallback = active ?? groups.find(group => group.skills.length > 0) ?? groups[0];
+  activeDiscoveryGroupKey = discoveryGroupKey(fallback);
+  return fallback;
+}
+
 function referencingBotLabels(skillName: string): string[] {
   return state.bots
     .filter(bot => priorityNames(bot.skills).includes(skillName))
@@ -97,8 +135,11 @@ function renderInstallForm(): string {
       </span>
     </div>
     <div class="skills-install-grid">
-      <label><span>${t('skills.source')}</span>
-        <input type="text" data-install="source" placeholder="${t('skills.sourcePlaceholder')}">
+      <label class="skills-source-label"><span>${t('skills.source')}</span>
+        <div class="skills-source-control">
+          <input type="text" data-install="source" placeholder="${t('skills.sourcePlaceholder')}">
+          <button type="button" data-action="discover-native-skills">${t('skills.discover')}</button>
+        </div>
       </label>
       <div class="bd-section-note skills-install-note">
         <span><strong>${t('skills.sourceHelpRemoteLabel')}</strong>${t('skills.sourceHelpRemote')}</span>
@@ -118,6 +159,61 @@ function renderInstallForm(): string {
   </article>`;
 }
 
+function renderDiscoveryDialog(): string {
+  const installed = installedSkillNames();
+  const groups = discoveryGroups();
+  const active = activeDiscoveryGroup(groups);
+  const content = !active
+    ? `<p class="empty">${t('skills.discoverEmpty')}</p>`
+    : `<div class="skills-discovery-tabs" role="tablist" aria-label="${t('skills.discoverTitle')}">
+        ${groups.map(group => {
+          const key = discoveryGroupKey(group);
+          const selected = key === discoveryGroupKey(active);
+          return `<button type="button" role="tab" data-discovery-tab="${escapeHtml(key)}" class="${selected ? 'selected' : ''}" aria-selected="${selected ? 'true' : 'false'}">
+            <strong>${escapeHtml(group.cliId)}</strong>
+            <small>${t('skills.skillCount', { count: group.skills.length })}</small>
+          </button>`;
+        }).join('')}
+      </div>
+      <div class="skills-discovery-path"><code>${escapeHtml(active.rootDir)}</code></div>
+      ${groups.map(group => {
+        const key = discoveryGroupKey(group);
+        const selected = active && key === discoveryGroupKey(active);
+        return `<section class="skills-discovery-group" data-discovery-panel="${escapeHtml(key)}" ${selected ? '' : 'hidden'}>
+          ${group.skills.length === 0
+            ? `<p class="empty">${t('skills.discoverGroupEmpty')}</p>`
+            : `<div class="skills-discovery-list">
+              ${group.skills.map(skill => {
+                const already = installed.has(skill.name);
+                const path = skill.rootDir ?? skill.source?.root ?? '';
+                return `<label class="skills-discovery-row${already ? ' installed' : ''}">
+                  <input type="checkbox" data-discovered-skill value="${escapeHtml(path)}" ${already ? 'disabled' : ''}>
+                  <span>
+                    <strong>${escapeHtml(skill.name)}</strong>
+                    ${skill.description ? `<small>${escapeHtml(skill.description)}</small>` : ''}
+                  </span>
+                  ${already ? `<em>${t('skills.discoverRegistered')}</em>` : ''}
+                </label>`;
+              }).join('')}
+            </div>`}
+        </section>`;
+      }).join('')}`;
+  return `<dialog class="skills-discovery-dialog" id="skills-discovery-dialog">
+    <article>
+      <header>
+        <h3>${t('skills.discoverTitle')}</h3>
+        <p>${t('skills.discoverHelp')}</p>
+      </header>
+      <div class="skills-discovery-body">${content}</div>
+      <footer class="actions">
+        <button type="button" data-action="toggle-discovered-skills">${t('skills.discoverSelectAll')}</button>
+        <button type="button" class="primary" data-action="register-discovered-skills">${t('skills.discoverRegister')}</button>
+        <button type="button" data-action="close-discovery">${t('skills.discoverClose')}</button>
+      </footer>
+    </article>
+  </dialog>`;
+}
+
 function renderInstalledSkills(): string {
   if (state.skills.length === 0) return `<p class="empty">${t('skills.empty')}</p>`;
   clampInstalledSkillsPage();
@@ -129,7 +225,7 @@ function renderInstalledSkills(): string {
       <div class="skills-row-body">
         <strong>${escapeHtml(skill.name)}</strong>
         ${skill.description ? `<p>${escapeHtml(skill.description)}</p>` : ''}
-        <small>${escapeHtml(sourceLabel(skill))}</small>
+        <small class="skills-source-badge">${escapeHtml(sourceLabel(skill))}</small>
       </div>
       <div class="skills-card-actions">
         <button type="button" data-action="update-skill">${t('skills.update')}</button>
@@ -308,6 +404,7 @@ function renderBody(): string {
         ${renderInstalledSkills()}
       </section>
     </section>
+    ${renderDiscoveryDialog()}
   </div>`;
 }
 
@@ -319,10 +416,14 @@ async function loadData(): Promise<void> {
     ]);
     const skillsBody = await skillsRes.json().catch(() => ({}));
     const botsBody = await botsRes.json().catch(() => ({}));
-    if (!skillsRes.ok) throw new Error(skillsBody?.error ?? `skills HTTP ${skillsRes.status}`);
+    if (!skillsRes.ok) {
+      const error = skillsBody?.error ?? `skills HTTP ${skillsRes.status}`;
+      throw new Error(error === 'not_found_yet' || error === 'not_found' ? t('skills.apiUnavailable') : error);
+    }
     if (!botsRes.ok) throw new Error(botsBody?.error ?? `bots HTTP ${botsRes.status}`);
     state = {
       skills: Array.isArray(skillsBody.skills) ? skillsBody.skills : [],
+      nativeSkillGroups: Array.isArray(skillsBody.nativeSkillGroups) ? skillsBody.nativeSkillGroups : [],
       bots: Array.isArray(botsBody.bots) ? botsBody.bots : [],
       trustProjectSkills: skillsBody.trustProjectSkills === 'all' ? 'all' : 'off',
       delivery: skillsBody.delivery === 'prompt' || skillsBody.delivery === 'native' ? skillsBody.delivery : 'auto',
@@ -391,13 +492,13 @@ export async function renderSkillsPage(root: HTMLElement): Promise<void> {
     wire();
   }
 
-  async function waitForSkillJob(job: SkillJob, statusEl: HTMLElement | null): Promise<void> {
+  async function waitForSkillJob(job: SkillJob, statusEl: HTMLElement | null, refreshOnSuccess = true): Promise<void> {
     let current = job;
     showStatus(statusEl, t('skills.jobRunning'), true);
     for (;;) {
       if (current.status === 'succeeded') {
         showStatus(statusEl, t('skills.saved'), true);
-        await refresh();
+        if (refreshOnSuccess) await refresh();
         return;
       }
       if (current.status === 'failed') {
@@ -407,6 +508,19 @@ export async function renderSkillsPage(root: HTMLElement): Promise<void> {
       const body = await jsonRequest(`/api/skills/jobs/${encodeURIComponent(current.id)}`, { method: 'GET' });
       current = body.job as SkillJob;
     }
+  }
+
+  function activeDiscoveryPanel(): HTMLElement | null {
+    return bodyEl.querySelector<HTMLElement>('[data-discovery-panel]:not([hidden])');
+  }
+
+  function updateDiscoveryToggleButton(): void {
+    const button = bodyEl.querySelector<HTMLButtonElement>('[data-action="toggle-discovered-skills"]');
+    if (!button) return;
+    const inputs = [...(activeDiscoveryPanel()?.querySelectorAll<HTMLInputElement>('[data-discovered-skill]:not(:disabled)') ?? [])];
+    const hasUnchecked = inputs.some(input => !input.checked);
+    button.textContent = inputs.length > 0 && !hasUnchecked ? t('skills.discoverClearSelection') : t('skills.discoverSelectAll');
+    button.disabled = inputs.length === 0;
   }
 
   function wire(): void {
@@ -424,6 +538,73 @@ export async function renderSkillsPage(root: HTMLElement): Promise<void> {
           body: JSON.stringify({ source, path: path || undefined, ref: ref || undefined }),
         });
         await waitForSkillJob(body.job as SkillJob, statusEl);
+      } catch (err: any) {
+        showStatus(statusEl, `${t('skills.failed')}: ${err?.message ?? err}`, false);
+      } finally {
+        if (button) button.disabled = false;
+      }
+    });
+
+    bodyEl.querySelector<HTMLButtonElement>('[data-action="discover-native-skills"]')?.addEventListener('click', () => {
+      bodyEl.querySelector<HTMLDialogElement>('#skills-discovery-dialog')?.showModal();
+      updateDiscoveryToggleButton();
+    });
+
+    bodyEl.querySelector<HTMLButtonElement>('[data-action="close-discovery"]')?.addEventListener('click', () => {
+      bodyEl.querySelector<HTMLDialogElement>('#skills-discovery-dialog')?.close();
+    });
+
+    bodyEl.querySelectorAll<HTMLButtonElement>('[data-discovery-tab]').forEach(button => {
+      button.addEventListener('click', () => {
+        const key = button.dataset.discoveryTab ?? '';
+        activeDiscoveryGroupKey = key;
+        bodyEl.querySelectorAll<HTMLButtonElement>('[data-discovery-tab]').forEach(tab => {
+          const selected = tab.dataset.discoveryTab === key;
+          tab.classList.toggle('selected', selected);
+          tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+        });
+        bodyEl.querySelectorAll<HTMLElement>('[data-discovery-panel]').forEach(panel => {
+          panel.hidden = panel.dataset.discoveryPanel !== key;
+        });
+        const group = state.nativeSkillGroups.find(item => discoveryGroupKey(item) === key);
+        const pathEl = bodyEl.querySelector<HTMLElement>('.skills-discovery-path code');
+        if (pathEl && group) pathEl.textContent = group.rootDir;
+        updateDiscoveryToggleButton();
+      });
+    });
+
+    bodyEl.querySelectorAll<HTMLInputElement>('[data-discovered-skill]').forEach(input => {
+      input.addEventListener('change', updateDiscoveryToggleButton);
+    });
+
+    bodyEl.querySelector<HTMLButtonElement>('[data-action="toggle-discovered-skills"]')?.addEventListener('click', () => {
+      const inputs = [...(activeDiscoveryPanel()?.querySelectorAll<HTMLInputElement>('[data-discovered-skill]:not(:disabled)') ?? [])];
+      const next = inputs.some(input => !input.checked);
+      inputs.forEach(input => { input.checked = next; });
+      updateDiscoveryToggleButton();
+    });
+
+    bodyEl.querySelector<HTMLButtonElement>('[data-action="register-discovered-skills"]')?.addEventListener('click', async () => {
+      const dialog = bodyEl.querySelector<HTMLDialogElement>('#skills-discovery-dialog');
+      const panel = bodyEl.querySelector<HTMLElement>('.skills-install-panel');
+      const statusEl = status(panel);
+      const selected = [...bodyEl.querySelectorAll<HTMLInputElement>('[data-discovered-skill]:checked:not(:disabled)')]
+        .map(input => input.value)
+        .filter(Boolean);
+      if (selected.length === 0) {
+        showStatus(statusEl, t('skills.discoverNothingSelected'), false);
+        return;
+      }
+      const button = bodyEl.querySelector<HTMLButtonElement>('[data-action="register-discovered-skills"]');
+      try {
+        if (button) button.disabled = true;
+        showStatus(statusEl, t('skills.discoverRegisteringBatch', { total: selected.length }), true);
+        await jsonRequest('/api/skills/install-local-links', {
+          method: 'POST',
+          body: JSON.stringify({ sources: selected }),
+        });
+        dialog?.close();
+        await refresh();
       } catch (err: any) {
         showStatus(statusEl, `${t('skills.failed')}: ${err?.message ?? err}`, false);
       } finally {

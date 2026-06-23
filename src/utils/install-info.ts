@@ -44,6 +44,13 @@ export function botmuxCliEntry(): string {
   return join(packageRoot(), 'dist', 'cli.js');
 }
 
+/** Absolute path to this install's root (the dir holding package.json). For a
+ *  source checkout this is the git working tree — used to derive a real version
+ *  via `git describe` when package.json is the unbuilt 0.0.0. */
+export function botmuxInstallRoot(): string {
+  return packageRoot();
+}
+
 /** Walk up from this module to the nearest dir containing package.json. */
 function packageRoot(): string {
   let dir = dirname(fileURLToPath(import.meta.url));

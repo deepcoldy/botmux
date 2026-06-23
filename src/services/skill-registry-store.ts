@@ -61,6 +61,38 @@ export function installLocalSkill(dir: string, opts: { link: boolean }): SkillPa
   return registry.skills[pkg.name];
 }
 
+export function installLocalSkillLinks(dirs: readonly string[]): SkillPackage[] {
+  const uniqueDirs = [...new Set(dirs.map((dir) => resolve(dir)))];
+  // Collapse by skill NAME (last-wins), not just by path: the registry is
+  // keyed by name, and the discovery dialog can surface the same skill name
+  // under multiple CLI roots (e.g. botmux's own builtin skills are installed
+  // into every CLI's skillsDir). Without this, two distinct dirs with the same
+  // name would write twice and the returned array would carry a duplicate.
+  const byName = new Map<string, SkillPackage>();
+  for (const sourceDir of uniqueDirs) {
+    let pkg: SkillPackage;
+    try {
+      // id defaults to name for a local-link (rootDir === sourceDir), so a
+      // single load is sufficient — no provisional re-load needed.
+      pkg = loadSkillPackage(sourceDir, { source: { type: 'local-link', path: sourceDir } });
+    } catch (err: any) {
+      // Name the offending dir so an opaque missing_skill_md/invalid_skill_name
+      // (e.g. a SKILL.md removed between discovery and registration) is actionable.
+      throw new Error(`local_link_failed:${sourceDir}:${err?.message ?? String(err)}`);
+    }
+    byName.set(pkg.name, pkg);
+  }
+  const now = new Date().toISOString();
+  const registry = readSkillRegistry();
+  const installed: SkillPackage[] = [];
+  for (const pkg of byName.values()) {
+    registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+    installed.push(registry.skills[pkg.name]);
+  }
+  writeSkillRegistry(registry);
+  return installed;
+}
+
 function sourceId(url: string): string {
   return createHash('sha256').update(url).digest('hex').slice(0, 16);
 }

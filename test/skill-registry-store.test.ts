@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { skillRegistryPath } from '../src/core/skills/registry-paths.js';
-import { installLocalSkill, readSkillRegistry, removeInstalledSkill } from '../src/services/skill-registry-store.js';
+import { installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -45,6 +45,45 @@ describe('skill registry store', () => {
 
     expect(pkg.rootDir).toBe(realpathSync(join(src, 'review')));
     expect(readSkillRegistry().skills.review.source.type).toBe('local-link');
+  });
+
+  it('installs multiple local links with one registry write path', () => {
+    write(join(src, 'api', 'SKILL.md'), '---\nname: api\n---\n# API');
+    write(join(src, 'docs', 'SKILL.md'), '---\nname: docs\n---\n# Docs');
+
+    const packages = installLocalSkillLinks([join(src, 'api'), join(src, 'docs')]);
+    const registry = readSkillRegistry();
+
+    expect(packages.map(pkg => pkg.name).sort()).toEqual(['api', 'docs']);
+    expect(registry.skills.api.source).toMatchObject({ type: 'local-link', path: join(src, 'api') });
+    expect(registry.skills.docs.source).toMatchObject({ type: 'local-link', path: join(src, 'docs') });
+    expect(registry.skills.api.rootDir).toBe(realpathSync(join(src, 'api')));
+    expect(registry.skills.docs.rootDir).toBe(realpathSync(join(src, 'docs')));
+  });
+
+  it('collapses same-named local links to one entry (last wins) without duplicating the result', () => {
+    // The discovery dialog can surface the same skill name under multiple CLI
+    // roots (e.g. botmux's own builtin skills live in every CLI's skillsDir).
+    // Selecting both must not write twice nor return a duplicate package.
+    write(join(src, 'codex', 'send', 'SKILL.md'), '---\nname: send\ndescription: from codex\n---\n# Send');
+    write(join(src, 'claude', 'send', 'SKILL.md'), '---\nname: send\ndescription: from claude\n---\n# Send');
+
+    const packages = installLocalSkillLinks([join(src, 'codex', 'send'), join(src, 'claude', 'send')]);
+    const registry = readSkillRegistry();
+
+    expect(packages.map(pkg => pkg.name)).toEqual(['send']); // deduped — not ['send','send']
+    // Last selection wins for the surviving registry entry's path.
+    expect(registry.skills.send.source).toMatchObject({ type: 'local-link', path: join(src, 'claude', 'send') });
+    expect(registry.skills.send.rootDir).toBe(realpathSync(join(src, 'claude', 'send')));
+  });
+
+  it('aborts the whole batch and names the offending dir when a source is invalid', () => {
+    write(join(src, 'good', 'SKILL.md'), '---\nname: good\n---\n# Good');
+    const missing = join(src, 'gone'); // no SKILL.md
+
+    expect(() => installLocalSkillLinks([join(src, 'good'), missing])).toThrow(new RegExp(`local_link_failed:.*gone`));
+    // All-or-nothing: nothing registered when any source fails.
+    expect(readSkillRegistry().skills.good).toBeUndefined();
   });
 
   it('removes the registry entry and store copy for local-copy installs', () => {

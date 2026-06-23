@@ -6,7 +6,7 @@ import { getBot } from '../bot-registry.js';
 import { getChatMode, sendMessage } from '../im/lark/client.js';
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
-import { buildFollowUpContent, buildNewTopicPrompt, getAvailableBots, rememberLastCliInput } from './session-manager.js';
+import { buildFollowUpContent, buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import * as messageQueue from '../services/message-queue.js';
@@ -122,12 +122,14 @@ export async function triggerSessionTurn(
   }
 
   if (ds?.worker && !ds.worker.killed) {
+    ensureSessionWhiteboard(ds);
     const content = buildFollowUpContent(prompt, ds.session.sessionId, {
       isAdoptMode: false,
       cliId: ds.session.cliId,
       locale: localeForBot(larkAppId),
       larkAppId,
       chatId,
+      whiteboardId: ds.session.whiteboardId,
     });
     markSessionActivity(ds);
     rememberLastCliInput(ds, prompt, content);
@@ -165,20 +167,6 @@ export async function triggerSessionTurn(
   sessionStore.updateSession(session);
 
   messageQueue.ensureQueue(anchor);
-  const promptInput = buildNewTopicPrompt(
-    prompt,
-    session.sessionId,
-    bot.config.cliId,
-    bot.config.cliPathOverride,
-    undefined,
-    undefined,
-    await getAvailableBots(larkAppId, chatId),
-    undefined,
-    { name: bot.botName, openId: bot.botOpenId },
-    localeForBot(larkAppId),
-    undefined,
-    { larkAppId, chatId },
-  );
 
   const newDs: DaemonSession = {
     session,
@@ -195,6 +183,22 @@ export async function triggerSessionTurn(
     hasHistory: false,
     workingDir: wd.workingDir,
   };
+
+  ensureSessionWhiteboard(newDs);
+  const promptInput = buildNewTopicPrompt(
+    prompt,
+    session.sessionId,
+    bot.config.cliId,
+    bot.config.cliPathOverride,
+    undefined,
+    undefined,
+    await getAvailableBots(larkAppId, chatId),
+    undefined,
+    { name: bot.botName, openId: bot.botOpenId },
+    localeForBot(larkAppId),
+    undefined,
+    { larkAppId, chatId, whiteboardId: newDs.session.whiteboardId },
+  );
 
   deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
   rememberLastCliInput(newDs, prompt, promptInput);

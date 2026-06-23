@@ -50,6 +50,9 @@ export interface SessionRow {
   /** Repo-selection card is waiting for a click — the CLI has not spawned yet.
    *  Feeds the board view's needs-you column. */
   pendingRepo?: boolean;
+  /** Dashboard「创建会话」入待办池：会话已建但 CLI 未起（parked），等激活才开跑。
+   *  前端据此在卡片上显示「待开始 / 开始」入口、并把卡片钉在待办池列。 */
+  queued?: boolean;
   /** A TUI prompt card is open and waiting for the user's choice.
    *  Feeds the board view's needs-you column. */
   tuiPromptActive?: boolean;
@@ -100,7 +103,9 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
-    status: ds.lastScreenStatus ?? 'starting',
+    // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
+    // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
+    status: ds.session.queued ? 'idle' : (ds.lastScreenStatus ?? 'starting'),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
@@ -123,6 +128,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     hasHistory: ds.hasHistory,
     feishuChatLink: feishuChatLink(ds.chatId, getBotBrand(ds.larkAppId)),
     pendingRepo: !!ds.pendingRepo,
+    queued: !!ds.session.queued,
     tuiPromptActive: !!ds.tuiPromptCardId,
     agentAttention: ds.agentAttention
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }

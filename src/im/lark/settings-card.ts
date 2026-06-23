@@ -383,7 +383,7 @@ export type PatchBuildResult =
 export function buildPatchFromAction(
   action: string,
   value: Record<string, string>,
-  formValue: Record<string, string>,
+  formValue: Record<string, unknown>,
 ): PatchBuildResult {
   switch (action) {
     case SETTINGS_ACTION_TOGGLE: {

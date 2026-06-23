@@ -1354,6 +1354,30 @@ describe('handleSessionsCardAction', () => {
       expect(cardJson).toContain('第 1/5 页');
     });
 
+    it('back_to_list with source page → restores that page, not page 1', async () => {
+      // 25 rows / PAGE_SIZE=5 = 5 pages; detail card was opened from page 3 and
+      // threads `page=3` back through the 🔙 button (M8 — consistent with
+      // schedules/workflows detail cards).
+      const sessions = Array.from({ length: 25 }, (_, i) =>
+        row({ sessionId: `s_${i}`, title: `t-${i}`, status: 'idle' }),
+      );
+      const requestSpy = vi.fn(async () => ({ status: 200, body: { sessions }, raw: '' }));
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER, page: '3' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+      expect(r.card?.type).toBe('raw');
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('第 3/5 页');
+    });
+
     it('non-admin → toast, no GET', async () => {
       const requestSpy = vi.fn();
       const deps = {

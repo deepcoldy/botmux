@@ -41,10 +41,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       ? j.regularGroupMentionMode
       : 'always',
     restrictGrantCommands: j?.restrictGrantCommands === true,
+    autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'chat' ? 'chat' : 'thread',
     maxLiveWorkers: typeof j?.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
+    env: typeof j?.env === 'string' ? j.env : '',
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

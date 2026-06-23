@@ -306,6 +306,7 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 - One-click locate back to the Feishu thread / open Web Terminal / multi-select batch close
 - Create a new group with auto owner-transfer + @-mention notification
 - Disband or leave a chat (associated sessions auto-closed)
+- **Session Insights** (owner-only, read-only): parse each session's transcript to view action spans / work timeline / context curve / failure aggregates + diagnostic suggestions; send `/insight` in chat for the current session's summary card
 - **Workflows console**:
   - Run List (5 s poll) + Run Detail with summary, dangling-work red panel, node/activity table, event timeline, and a **parallel-execution timeline** (attempt-level), auto-stopping polling once the run reaches a terminal state
   - **Cancel a run directly from the dashboard**; approve / reject `humanGate` with reviewer comments
@@ -327,6 +328,32 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
 6. Click "Get Write Link" on the card to receive a write-enabled terminal URL via DM
 7. The CLI replies in the thread via the `botmux send` command (wired through the `botmux-send` Skill)
+
+---
+
+### Per-Bot Environment Variables (run a bot on GLM / a third-party provider)
+
+Each `bots.json` entry can define its own `env` object, injected into **that bot's CLI process**. Typical use: run one bot on a GLM Coding Plan / third-party Anthropic·OpenAI-compatible provider while another keeps using official Claude — just point the former at the provider's endpoint and key:
+
+```json
+{
+  "cliId": "claude-code",
+  "workingDir": "~/projects",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "your GLM Coding Plan key"
+  }
+}
+```
+
+> For GLM in China use `https://open.bigmodel.cn/api/anthropic`. For an OpenAI-protocol CLI like Codex, set `OPENAI_BASE_URL` / `OPENAI_API_KEY` (the provider's OpenAI-compatible endpoint) instead of `ANTHROPIC_*`. Also handy for `HTTPS_PROXY` or CLI feature flags.
+
+Notes:
+
+- `env` accepts valid env-var names with string/number/boolean values; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored, so config can't hijack session routing or creds.
+- Injected **per session** into the CLI process (effective from the next session). On the tmux/zellij backends it goes in via each pane's `/usr/bin/env` prefix, **never the shared server env**, so one bot's provider config can't leak into another's.
+- Also editable in the dashboard ("Bot defaults → Environment variables", owner-authenticated) or via `/config set env '{...}'`.
+- Not a secret vault: values live in `bots.json` and the process environment in plaintext, visible to local diagnostic tools.
 
 ---
 

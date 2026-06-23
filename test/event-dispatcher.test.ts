@@ -35,11 +35,13 @@ vi.mock('../src/utils/atomic-write.js', () => ({
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
+const mockGetOwnerOpenId = vi.fn(() => undefined as string | undefined);
 const mockIsChatOncallBoundForAnyBot = vi.fn<(chatId: string) => boolean>(() => false);
 const mockFindOncallChat = vi.fn<(larkAppId: string, chatId: string) => { chatId: string; workingDir: string } | undefined>(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
   getAllBots: () => mockGetAllBots(),
+  getOwnerOpenId: (...args: any[]) => mockGetOwnerOpenId(...args),
   findOncallChat: (...args: any[]) => mockFindOncallChat(...(args as [string, string])),
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
 }));
@@ -99,6 +101,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+// grant-pending is a real (unmocked) module-level table; reset it per test so the
+// grant-card throttle state never leaks across cases (it backs the @blocked card path).
+import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -123,6 +128,7 @@ function setupBotState(opts?: {
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared';
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
   autoStartOnNewTopic?: boolean;
+  autoGrantRequestCards?: boolean;
   chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared'>;
   p2pMode?: 'thread' | 'chat';
 }) {
@@ -140,6 +146,7 @@ function setupBotState(opts?: {
       regularGroupReplyMode: opts?.regularGroupReplyMode,
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
+      autoGrantRequestCards: opts?.autoGrantRequestCards,
       chatReplyModes: opts?.chatReplyModes,
       p2pMode: opts?.p2pMode,
     },
@@ -326,7 +333,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     capturedHandlers = {};
     __resetAnchorQueues();
     __resetEventClaimsForTest();
+    _resetGrantPending();
     mockReplyMessage.mockClear();
+    mockGetOwnerOpenId.mockReset();
+    mockGetOwnerOpenId.mockReturnValue(undefined);
     mockGetCachedChatMode.mockReset();
     mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
@@ -449,6 +459,131 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('sends a grant request card when an unknown external bot is @blocked and the toggle is on', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('keeps the unknown external bot @blocked path silent when auto grant cards are disabled', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: false });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('throttles repeat @blocked mentions from the same bot+chat to a single grant card', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    const makeBlocked = (messageId: string) => {
+      const event = makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        messageId,
+        content: JSON.stringify({
+          zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+        }),
+        rootId: undefined,
+      });
+      event.message.root_id = undefined as any;
+      return event;
+    };
+
+    // Two distinct messages (distinct message_id → both clear event-dedup) from the
+    // SAME bot in the SAME chat. The throttle keys on bot:chat:target, so the second
+    // is suppressed while the first card is still pending.
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-001'));
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-002'));
+    await flushEventWork();
+
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('retries the grant card on a later @blocked after a failed send (clears stale pending)', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockReturnValue(false);
+    // First send fails (transient Lark error). The pending opened just before the send
+    // must be cleared so a later @ from the same bot re-triggers a card — otherwise the
+    // sender is throttled forever and the owner never sees any grant card.
+    mockReplyMessage.mockRejectedValueOnce(new Error('lark 500'));
+
+    const makeBlocked = (messageId: string) => {
+      const event = makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        messageId,
+        content: JSON.stringify({
+          zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+        }),
+        rootId: undefined,
+      });
+      event.message.root_id = undefined as any;
+      return event;
+    };
+
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-001'));
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-002'));
+    await flushEventWork();
+
+    // The failed first send did not poison the throttle: the second @ tried again.
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
   });
 
   it('routes cross-bot @mention in chat-scope when sender is a known botmux peer', async () => {

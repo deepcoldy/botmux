@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { composeRowFromActive } from '../src/core/dashboard-rows.js';
-import { publishAttentionPatch, announcePendingRepoSession, clearAgentAttention } from '../src/core/session-activity.js';
+import { announcePendingRepoSession, announceSessionRow, clearAgentAttention, publishAttentionPatch } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { attentionWaitSince } from '../src/dashboard/web/ui.js';
 import {
@@ -145,6 +145,17 @@ describe('attention signals', () => {
     expect(row.sessionId).toBe('sess-1');
     expect(row.pendingRepo).toBe(true);
     expect(row.status).toBe('starting'); // no screen yet → starting
+  });
+
+  it('announceSessionRow publishes a full session.spawned row for restored active sessions', () => {
+    const seen = collectEvents();
+    announceSessionRow(makeDs({ hasHistory: true }));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].type).toBe('session.spawned');
+    const row = (seen[0] as any).body.session;
+    expect(row.sessionId).toBe('sess-1');
+    expect(row.hasHistory).toBe(true);
+    expect(row.status).toBe('starting');
   });
 
   it('announcePendingRepoSession is a no-op when the session is not pending', () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseDashboardSkillInstallRequest, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
+import { MAX_LOCAL_LINK_SOURCES, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
 
 describe('dashboard skill install request parsing', () => {
   it('rejects lightweight install errors before starting a job', () => {
@@ -52,6 +52,18 @@ describe('dashboard skill install request parsing', () => {
       path: 'skills/runbook',
       ref: 'main',
     });
+  });
+
+  it('sanitizes batch local-link sources: trims, drops blanks/non-strings, dedups', () => {
+    expect(parseInstallLocalLinksSources({ sources: ['  /a/skills/x  ', '', '/a/skills/x', 42, null, '/b/skills/y'] }))
+      .toEqual(['/a/skills/x', '/b/skills/y']);
+    // Non-object / non-array / missing sources → empty (route maps to sources_required).
+    expect(parseInstallLocalLinksSources({ sources: 'not-an-array' })).toEqual([]);
+    expect(parseInstallLocalLinksSources({})).toEqual([]);
+    expect(parseInstallLocalLinksSources(null)).toEqual([]);
+    expect(parseInstallLocalLinksSources('garbage')).toEqual([]);
+    expect(parseInstallLocalLinksSources({ sources: ['   ', ''] })).toEqual([]);
+    expect(MAX_LOCAL_LINK_SOURCES).toBeGreaterThan(0);
   });
 
   it('auto-links native local skill library paths without a dashboard toggle', () => {

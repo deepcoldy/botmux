@@ -38,8 +38,16 @@ import {
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode } from './global-config.js';
-import { isLocalDevInstall } from './utils/install-info.js';
+import { mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
+import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
+import { GITHUB_REPO } from './core/restart-report.js';
+import { spawnDetachedRestart, npmGlobalUpdateLockTarget } from './core/maintenance.js';
+import { writeRestartIntent } from './services/restart-intent-store.js';
+import { withFileLock } from './utils/file-lock.js';
+import { spawn } from 'node:child_process';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -68,6 +76,7 @@ import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
+  installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
   updateInstalledSkillAsync,
@@ -75,13 +84,22 @@ import {
 import { redactGitUrlCredentials } from './core/skills/sources.js';
 import { loadBotConfigs } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
-import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
+import { installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
+import { mergeSafeInsightOverviews } from './services/insight/report.js';
+import type { SafeInsightOverview } from './services/insight/types.js';
+import { readPlatformBinding } from './platform/binding.js';
+import { startPlatformTunnelClient } from './platform/tunnel-client.js';
+import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+/** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
+ *  aggregate latency when one daemon's insight parse is slow or hung. */
+const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
@@ -172,6 +190,8 @@ interface ResolvedDashboardSettings {
   /** True when running from a source checkout — the Settings UI greys out the
    *  auto-update toggle (npm-global only). */
   localDevInstall: boolean;
+  /** Optional local project whiteboard. Disabled by default. */
+  whiteboard: WhiteboardConfig;
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
@@ -183,6 +203,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
+    whiteboard: { enabled: global.whiteboard?.enabled === true },
   };
 }
 
@@ -257,6 +278,68 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   for await (const c of req) chunks.push(c as Buffer);
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   return raw ? JSON.parse(raw) : {};
+}
+
+/** Fast in-process guard against double-clicks within this dashboard process.
+ *  Cross-process serialization against the maintenance auto-update (a different
+ *  process) is handled separately by the shared file lock in the run route. */
+let updateInFlight = false;
+
+// Cache the upstream version/changelog lookups so the nav-badge check + the
+// Settings card don't hammer the npm registry / GitHub on every page load.
+// GitHub's unauthenticated API is only 60 req/h per IP, so caching the changelog
+// also keeps us from exhausting it. Failures cache briefly so they self-heal.
+const LATEST_TTL_MS = 30 * 60_000;
+const CHANGELOG_TTL_MS = 15 * 60_000;
+const FAILURE_TTL_MS = 60_000;
+let latestVersionCache: { value: string | null; at: number } | null = null;
+let changelogCache: { key: string; value: ChangelogResult; at: number } | null = null;
+
+async function cachedLatestVersion(now = Date.now()): Promise<string | null> {
+  const ttl = latestVersionCache?.value ? LATEST_TTL_MS : FAILURE_TTL_MS;
+  if (latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache.value;
+  const value = await fetchLatestVersion();
+  latestVersionCache = { value, at: now };
+  return value;
+}
+
+async function cachedChangelog(current: string, now = Date.now()): Promise<ChangelogResult> {
+  const ttl = changelogCache?.value.ok ? CHANGELOG_TTL_MS : FAILURE_TTL_MS;
+  if (changelogCache && changelogCache.key === current && now - changelogCache.at < ttl) return changelogCache.value;
+  const value = await fetchReleasesSince(current);
+  changelogCache = { key: current, value, at: now };
+  return value;
+}
+
+/**
+ * Run `npm install -g botmux@latest` for the manual-update flow WITHOUT blocking
+ * the event loop (async spawn, not execSync — the dashboard must keep serving
+ * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
+ * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
+ * a fixed literal — no shell interpolation of untrusted input.
+ */
+function runNpmInstallLatest(): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn('npm', ['install', '-g', 'botmux@latest'], {
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32', // resolve npm.cmd on Windows
+    });
+    let tail = '';
+    const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
+    child.stdout?.on('data', capture);
+    child.stderr?.on('data', capture);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('npm install timed out after 180s'));
+    }, 180_000);
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`npm exited ${code}: ${tail.trim().slice(-500)}`));
+    });
+  });
 }
 
 /**
@@ -358,7 +441,7 @@ function serveFileAbs(res: ServerResponse, fp: string): boolean {
   return true;
 }
 
-function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const fp = resolve(WEB_DIR, rel);
   const webRoot = resolve(WEB_DIR);
@@ -368,7 +451,23 @@ function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: strin
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
-    res.writeHead(200, { 'content-type': MIME[extname(fp)] ?? 'application/octet-stream' });
+    // Bundle filenames are fixed (app.js/style.css), so without revalidation
+    // browsers heuristic-cache them and serve a stale build after a deploy
+    // (new JS + old CSS → broken layout). `no-cache` + an mtime/size ETag makes
+    // the browser revalidate every load: 304 when unchanged (cheap), fresh 200
+    // when the build changed. No manual hard-refresh needed after deploy.
+    const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    const headers: Record<string, string> = {
+      'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
+      'cache-control': 'no-cache',
+      etag,
+    };
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers);
+      res.end();
+      return true;
+    }
+    res.writeHead(200, headers);
     res.end(readFileSync(fp));
     return true;
   } catch {
@@ -715,12 +814,31 @@ function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
   };
 }
 
+function dashboardSkillCliIds(): CliId[] {
+  const ids = new Set<CliId>();
+  try {
+    for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
+  } catch {
+    // Fall back to daemon descriptors below when persistent config is unavailable.
+  }
+  for (const bot of registry.list()) {
+    if (bot.cliId) ids.add(bot.cliId as CliId);
+  }
+  return [...ids];
+}
+
 function dashboardSkillsPayload(): Record<string, unknown> {
   const globalSkills = readGlobalConfig().skills ?? {};
+  const nativeSkillGroups = discoverNativeCliSkillGroups(dashboardSkillCliIds())
+    .map(group => ({
+      ...group,
+      skills: group.skills.map(sanitizeSkillForDashboard),
+    }));
   return {
     skills: Object.values(readSkillRegistry().skills)
       .sort((a, b) => a.name.localeCompare(b.name))
       .map(sanitizeSkillForDashboard),
+    nativeSkillGroups,
     trustProjectSkills: globalSkills.trustProjectSkills ?? 'off',
     delivery: globalSkills.delivery ?? 'auto',
   };
@@ -920,6 +1038,75 @@ const server = createServer(async (req, res) => {
       });
       return jsonRes(res, 200, { sessions });
     }
+    if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
+      let body: { olderThanHours?: unknown; sessionIds?: unknown };
+      try {
+        body = await readJsonBody(req) as { olderThanHours?: unknown; sessionIds?: unknown };
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
+      if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
+
+      // WYSIWYG: the UI scopes cleanup to the rows currently visible under the
+      // page filters and sends their sessionIds, so the closed set matches the
+      // confirmed count. We still hand the scoped rows to cleanupIdleSessions,
+      // which re-validates each is a genuine idle candidate — a stale/forged id
+      // can never close a non-idle session. Omitting sessionIds (e.g. an older
+      // client) falls back to a deployment-wide sweep. Cap the id set so a giant
+      // body can't blow up the Set build.
+      const idScope = Array.isArray(body?.sessionIds)
+        ? new Set((body.sessionIds as unknown[]).slice(0, 10000).map(String))
+        : null;
+      const rows = aggregator.getSessions();
+      const scoped = idScope ? rows.filter(s => idScope.has(s.sessionId)) : rows;
+
+      const result = await cleanupIdleSessions(scoped, olderThanHours, async s => {
+        try {
+          const upstream = await proxyToDaemon(
+            s.larkAppId as string,
+            `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
+            { method: 'POST' },
+          );
+          const text = await upstream.text();
+          let parsed: any = null;
+          try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+          // The daemon close route always replies 200 {ok:true}; treat anything
+          // else (incl. an unparseable/missing body) as a failure rather than a
+          // silent success.
+          const ok = upstream.ok && parsed?.ok === true;
+          return {
+            sessionId: s.sessionId,
+            ok,
+            error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
+          };
+        } catch (e: any) {
+          return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };
+        }
+      });
+      return jsonRes(res, 200, result);
+    }
+    if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
+      // Per-daemon timeout + isolate failures: an upstream insight parse can be
+      // heavy, so a slow/hung daemon must not stall the aggregated summary. A
+      // timed-out / errored chunk drops to null and is filtered out below.
+      const chunks = await Promise.all(registry.list().map(async d => {
+        try {
+          const upstream = await proxyToDaemon(d.larkAppId, `/api/insights/summary?limit=${limit}`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(INSIGHT_FANOUT_TIMEOUT_MS),
+          });
+          if (!upstream.ok) return null;
+          const body = await upstream.json().catch(() => null) as { overview?: SafeInsightOverview } | null;
+          return body?.overview ?? null;
+        } catch {
+          return null;
+        }
+      }));
+      const overview = mergeSafeInsightOverviews(chunks.filter((x): x is SafeInsightOverview => !!x), { limit });
+      return jsonRes(res, 200, { ok: true, overview });
+    }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       // Public-read carve-out: the row carries CONTENT (prompt = business
       // instructions) and a bound `workingDir` (repo/customer path) — strip
@@ -949,6 +1136,89 @@ const server = createServer(async (req, res) => {
       const result = await applySettingsWrite(parsed, settingsWriteApplierDeps);
       if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.error });
       return jsonRes(res, 200, { ok: true, settings: result.settings });
+    }
+
+    // ─── Version & manual update ─────────────────────────────────────────────
+    // `npm install -g` and a host restart are privileged: none of these paths
+    // are on PUBLIC_READ_PATHS, so decideDashboardAuth already 401s an
+    // unauthenticated caller (in both normal and public-read mode). The explicit
+    // `authed` guards on the two mutations are defense-in-depth for host actions.
+    if (req.method === 'GET' && url.pathname === '/api/update/status') {
+      const current = resolveCurrentVersion();
+      // Compare against the npm `latest` dist-tag (always stable; the update
+      // button installs `@latest`). isNewerVersion uses semver precedence, so a
+      // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
+      // 2.86.0) is NOT flagged behind — exactly the canary case we want.
+      const latest = await cachedLatestVersion();
+      return jsonRes(res, 200, {
+        current,
+        latest,
+        behind: !!latest && isNewerVersion(latest, current),
+        localDevInstall: isLocalDevInstall(),
+        node: checkNode(),
+        installs: detectBotmuxInstalls(),
+      });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/update/changelog') {
+      const current = resolveCurrentVersion();
+      const result = await cachedChangelog(current);
+      return jsonRes(res, 200, {
+        current,
+        ok: result.ok,
+        rateLimited: result.rateLimited === true,
+        releases: result.releases,
+        releasesUrl: `https://github.com/${GITHUB_REPO}/releases`,
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/run') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      const node = checkNode();
+      if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+      if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      updateInFlight = true;
+      const oldVersion = botmuxVersion();
+      // Acquire the shared cross-process lock so a scheduled maintenance
+      // auto-update (running in the bot-0 daemon) can't `npm install -g` at the
+      // same time. `acquired` distinguishes "lock held by maintenance" (409)
+      // from "npm itself failed" (500). Short wait: don't block the request on a
+      // full in-progress install — report busy fast.
+      let acquired = false;
+      try {
+        await withFileLock(npmGlobalUpdateLockTarget(), async () => {
+          acquired = true;
+          await runNpmInstallLatest();
+        }, { maxWaitMs: 2_000 });
+      } catch (e) {
+        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        return jsonRes(res, 500, { ok: false, error: 'npm_failed', detail: e instanceof Error ? e.message : String(e) });
+      } finally {
+        updateInFlight = false;
+      }
+      const newVersion = botmuxVersion();
+      return jsonRes(res, 200, { ok: true, oldVersion, newVersion, changed: newVersion !== oldVersion });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/restart') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      let body: Record<string, unknown> = {};
+      try {
+        const parsed = await readJsonBody(req);
+        if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
+      } catch { /* empty / bad body → plain restart */ }
+      const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
+      // After a manual update, leave an `update` breadcrumb so the fresh daemon
+      // DMs the owner the changelog (reuses the restart-report pipeline). A plain
+      // restart leaves none here; cmdRestart writes a `manual` breadcrumb itself.
+      if (upd && typeof upd.oldVersion === 'string' && typeof upd.newVersion === 'string' && upd.oldVersion !== upd.newVersion) {
+        try {
+          writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
+        } catch { /* breadcrumb is best-effort */ }
+      }
+      spawnDetachedRestart('dashboard');
+      return jsonRes(res, 200, { ok: true });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/skills') {
@@ -1002,6 +1272,27 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/skills/install-local-links') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const sources = parseInstallLocalLinksSources(parsed);
+      if (sources.length === 0) return jsonRes(res, 400, { ok: false, error: 'sources_required' });
+      if (sources.length > MAX_LOCAL_LINK_SOURCES) return jsonRes(res, 400, { ok: false, error: 'too_many_sources' });
+      try {
+        const skills = installLocalSkillLinks(sources);
+        // Frontend re-fetches /api/skills (refresh()) after success, so we keep
+        // the response lean — no need to spread a full dashboardSkillsPayload()
+        // (which would re-run the native-skill discovery scan a second time).
+        return jsonRes(res, 200, { ok: true, installed: skills.map(sanitizeSkillForDashboard) });
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
+      }
+    }
+
     let mSkillJob: RegExpMatchArray | null;
     if (req.method === 'GET' && (mSkillJob = url.pathname.match(/^\/api\/skills\/jobs\/([^/]+)$/))) {
       const job = skillJobs.get(decodeURIComponent(mSkillJob[1]));
@@ -1041,6 +1332,27 @@ const server = createServer(async (req, res) => {
         affectedBots: refs.bots,
         ...dashboardSkillsPayload(),
       });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
+      return jsonRes(res, 200, { enabled: whiteboardEnabled(), whiteboards: listWhiteboards() });
+    }
+    const mWhiteboard = url.pathname.match(/^\/api\/whiteboards\/([^/]+)$/);
+    if (req.method === 'GET' && mWhiteboard) {
+      try {
+        const id = decodeURIComponent(mWhiteboard[1]);
+        return jsonRes(res, 200, { enabled: whiteboardEnabled(), id, content: readWhiteboard(id, { allowDisabled: true }) });
+      } catch (err: any) {
+        return jsonRes(res, 404, { ok: false, error: err?.message ?? 'whiteboard_not_found' });
+      }
+    }
+    if (req.method === 'DELETE' && mWhiteboard) {
+      try {
+        const id = decodeURIComponent(mWhiteboard[1]);
+        return jsonRes(res, 200, deleteWhiteboard(id));
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: err?.message ?? 'whiteboard_delete_failed' });
+      }
     }
 
     if (await handleConnectorApi(req, res, url)) {
@@ -1145,7 +1457,7 @@ const server = createServer(async (req, res) => {
     }
 
     let m: RegExpMatchArray | null;
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -1208,6 +1520,30 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/history${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
+    // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
+    // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/insight${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight\/turn\/([^/]+)$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const turnIndex = decodeURIComponent(m[2]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/insight/turn/${turnIndex}${url.search ?? ''}`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -1610,6 +1946,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
+    // `{ env: string }` (raw JSON text; '' = clear).
+    let mBotEnv: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotEnv = url.pathname.match(/^\/api\/bots\/([^/]+)\/env$/))) {
+      const appId = decodeURIComponent(mBotEnv[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-env`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/sandbox — proxy to that bot's daemon. Body `{ enabled: boolean }`.
     let mBotSandbox: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotSandbox = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox$/))) {
@@ -1665,7 +2019,8 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
-    // any subset of `{ restrictGrantCommands?: boolean, messageQuotaDefaultLimit?: number|null }`.
+    // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
+    // messageQuotaDefaultLimit?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
       const appId = decodeURIComponent(mBotGrantPrefs[1]);
@@ -1793,6 +2148,128 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Dashboard「创建会话」：建飞书群 + 拉选中的 bot，然后按协作模式给各 bot 拉起/暂存
+    // 一条 chat-scope 会话。一起开工=每个被选 bot 各起一条；lead 分配=只起 lead，由它
+    // 在群里 @ 拉起 sub bot。in_progress=立即开跑；backlog=入待办池（parked，等激活）。
+    if (req.method === 'POST' && url.pathname === '/api/sessions/create') {
+      let parsed: {
+        content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
+        leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown;
+      };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const content = typeof parsed.content === 'string' ? parsed.content.replace(/\s+$/u, '') : '';
+      if (!content.trim()) return jsonRes(res, 400, { ok: false, error: 'empty_content' });
+      const selectedIds = Array.isArray(parsed.larkAppIds)
+        ? Array.from(new Set((parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')))
+        : [];
+      if (selectedIds.length === 0) return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
+      const mode = parsed.mode === 'lead' ? 'lead' : parsed.mode === 'all' ? 'all' : null;
+      if (!mode) return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+      const column = parsed.column === 'backlog' ? 'backlog' : parsed.column === 'in_progress' ? 'in_progress' : null;
+      if (!column) return jsonRes(res, 400, { ok: false, error: 'bad_column' });
+      const bindWorkingDir = typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
+        ? parsed.bindWorkingDir.trim() : undefined;
+      const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim().slice(0, 60) : undefined;
+
+      // 解析 creator：lead 模式 = lead bot；一起开工 = pickCreatorForGroup 在选中里挑一个在线的。
+      let creatorLarkAppId: string;
+      if (mode === 'lead') {
+        const leadLarkAppId = typeof parsed.leadLarkAppId === 'string' ? parsed.leadLarkAppId : '';
+        if (!leadLarkAppId || !selectedIds.includes(leadLarkAppId)) {
+          return jsonRes(res, 400, { ok: false, error: 'bad_lead' });
+        }
+        if (!registry.getByAppId(leadLarkAppId)) return jsonRes(res, 503, { ok: false, error: 'lead_offline' });
+        creatorLarkAppId = leadLarkAppId;
+      } else {
+        const pick = pickCreatorForGroup(selectedIds, (id) => {
+          const d = registry.getByAppId(id);
+          return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
+        });
+        if (!pick) return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
+        creatorLarkAppId = pick.creatorLarkAppId;
+      }
+
+      // creator 作用域里的操作者 open_id（首个 ou_ allowedUser）——用于邀请进群 + 转群主 + @通知。
+      // 同时取 on_（union_id，租户内跨 app 稳定）做兜底邀请：lead 模式强制 creator=lead，
+      // 万一 lead 的 allowlist 没有 ou_ 条目，open_id 解析不到、操作者就进不了群——union_id
+      // 不受 app 作用域影响，仍能把人拉进来（createGroupWithBots 走 ownerUnionIds 通道）。
+      const creatorDesc = registry.getByAppId(creatorLarkAppId)!;
+      const allowed = creatorDesc.resolvedAllowedUsers ?? [];
+      const userOpenId = allowed.find(u => u.startsWith('ou_'));
+      const ownerUnionIds = allowed.filter(u => u.startsWith('on_'));
+
+      // 建群（拉所有选中 bot + 邀请操作者 + 转群主 + @通知 + 可选绑 oncall 工作目录）。
+      let groupResp: any = null;
+      try {
+        const groupUpstream = await proxyToDaemon(creatorLarkAppId, '/api/groups/create', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            larkAppIds: selectedIds,
+            userOpenIds: userOpenId ? [userOpenId] : [],
+            ownerUnionIds,
+            transferOwnerTo: userOpenId,
+            notifyOwnerOpenId: userOpenId,
+            bindWorkingDir,
+          }),
+        });
+        groupResp = await groupUpstream.json().catch(() => null);
+        if (!groupUpstream.ok || !groupResp?.ok || typeof groupResp.chatId !== 'string') {
+          return jsonRes(res, 502, { ok: false, error: groupResp?.error ?? `group_create_http_${groupUpstream.status}` });
+        }
+      } catch {
+        return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
+      }
+      const chatId: string = groupResp.chatId;
+      const invalidBotIds: string[] = Array.isArray(groupResp.invalidBotIds) ? groupResp.invalidBotIds : [];
+
+      // spawn 目标：lead 模式只有 lead；一起开工是所有成功入群的选中 bot。
+      const joinedIds = selectedIds.filter(id => !invalidBotIds.includes(id) && !!registry.getByAppId(id));
+      const targets = mode === 'lead'
+        ? (joinedIds.includes(creatorLarkAppId) ? [creatorLarkAppId] : [])
+        : joinedIds;
+      if (targets.length === 0) {
+        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target' });
+      }
+
+      const bots = liveBots();
+      const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
+      const spawned: string[] = [];
+      const failed: Array<{ larkAppId: string; error: string }> = [];
+      await Promise.all(targets.map(async (appId) => {
+        const role = mode === 'lead' ? 'lead' : (targets.length > 1 ? 'collab' : 'solo');
+        // lead 的 coworker = 所有 sub（除自己）；collab 的 coworker = 其它并列 bot（除自己）。
+        const coworkerIds = (mode === 'lead' ? selectedIds : targets).filter(id => id !== appId);
+        const coworkers = coworkerIds.map(id => ({ name: nameOf(id) }));
+        try {
+          const up = await proxyToDaemon(appId, '/api/sessions/spawn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              chatId, content, column, role, coworkers,
+              postBanner: appId === creatorLarkAppId,
+            }),
+          });
+          const b = await up.json().catch(() => null);
+          if (up.ok && b?.ok) spawned.push(appId);
+          else failed.push({ larkAppId: appId, error: b?.error ?? `http_${up.status}` });
+        } catch (e: any) {
+          failed.push({ larkAppId: appId, error: e?.message ?? String(e) });
+        }
+      }));
+
+      return jsonRes(res, 200, {
+        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed,
+      });
+    }
+
     // Public SSE — relays aggregator's listener events
     if (req.method === 'GET' && url.pathname === '/events') {
       res.writeHead(200, {
@@ -1848,6 +2325,7 @@ listenWithProbe({
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  startPlatformTunnelIfBound();
 }).catch((err) => {
   logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
   process.exit(1);
@@ -1864,11 +2342,40 @@ const federationSync = setInterval(() => {
 }, 2 * 60 * 1000);
 federationSync.unref();
 
+// 中心化平台隧道（已绑定才启动；每台机器一个，跑在 dashboard 进程里）
+let platformTunnel: { stop(): void } | null = null;
+function readBotmuxVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dirname(__dirname), 'package.json'), 'utf8'));
+    return pkg.version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+function startPlatformTunnelIfBound(): void {
+  try {
+    const binding = readPlatformBinding();
+    if (!binding) return;
+    const version = readBotmuxVersion();
+    platformTunnel = startPlatformTunnelClient({
+      binding,
+      getDashboardPort: () => boundDashboardPort,
+      getDashboardToken: () => activeToken,
+      getVersion: () => version,
+      log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
+    });
+    logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);
+  } catch (e) {
+    logger.warn(`[platform-tunnel] 启动失败: ${(e as Error).message}`);
+  }
+}
+
 // Graceful shutdown
 function shutdown(): void {
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();
+  platformTunnel?.stop();
   server.close(() => process.exit(0));
   // Hard-exit fallback after 5s
   setTimeout(() => process.exit(0), 5_000).unref();

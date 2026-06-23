@@ -9,9 +9,10 @@
  * rendered by `buildNewTopicPrompt` in `session-manager.ts`.
  */
 import { t, type Locale } from '../../i18n/index.js';
+import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 
 export function buildBotmuxShellHints(locale?: Locale): string[] {
-  return [
+  const hints = [
     t('ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
     t('ai.shell.how_to_send', undefined, locale),
@@ -21,10 +22,24 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.when_to_send', undefined, locale),
     t('ai.shell.mention_gate', undefined, locale),
   ];
+  if (whiteboardEnabled()) {
+    hints.push('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私；更新默认用中文。');
+  }
+  return hints;
 }
 
-/** @deprecated Use `buildBotmuxShellHints(locale)` instead. Kept for any external callers. */
-export const BOTMUX_SHELL_HINTS: string[] = buildBotmuxShellHints();
+/** @deprecated Use `buildBotmuxShellHints(locale)` instead. Kept for any external callers.
+ *  Static legacy value must not read runtime config at module import time. */
+export const BOTMUX_SHELL_HINTS: string[] = [
+  t('ai.shell.intro'),
+  t('ai.shell.commands_are_shell'),
+  t('ai.shell.how_to_send'),
+  t('ai.shell.multiline_heredoc'),
+  t('ai.shell.heredoc_example'),
+  t('ai.shell.helpers'),
+  t('ai.shell.when_to_send'),
+  t('ai.shell.mention_gate'),
+];
 
 /**
  * Build the `<botmux_routing>` (+ optional `<identity>`) text injected via a
@@ -69,6 +84,12 @@ export function buildBotmuxSystemPromptText(opts: {
         '</identity>',
       ]
       : [];
+  const whiteboardRouting = whiteboardEnabled()
+    ? [
+      '',
+      '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论仍必须`botmux send`。',
+    ]
+    : [];
   return [
     '<botmux_routing>',
     t('ai.routing.intro', undefined, locale),
@@ -83,6 +104,7 @@ export function buildBotmuxSystemPromptText(opts: {
     t('ai.routing.usage_files', undefined, locale),
     t('ai.routing.usage_history', undefined, locale),
     t('ai.routing.usage_bots_list', undefined, locale),
+    ...whiteboardRouting,
     '</botmux_routing>',
     ...identityBlock,
   ].join('\n');

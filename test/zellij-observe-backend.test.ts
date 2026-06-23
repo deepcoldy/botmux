@@ -2,11 +2,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Capture every `zellij` invocation the observe backend makes. dump-screen
 // returns bare-`\n` content (as real zellij does) so we can assert normalisation.
+// `listPanesResult` is mutable so the liveness tests can simulate a pane that
+// transiently disappears and comes back.
 const calls: string[][] = [];
+let listPanesResult: () => string = () => JSON.stringify([{ id: 2, is_plugin: false }]);
 vi.mock('node:child_process', () => ({
   execFileSync: (bin: string, args: string[]) => {
     calls.push([bin, ...args]);
     if (args.includes('dump-screen')) return 'line one\nline two\nline three\n';
+    if (args.includes('list-panes')) return listPanesResult();
     return '';
   },
 }));
@@ -65,5 +69,144 @@ describe('ZellijObserveBackend input encoding', () => {
     // continues from the previous end column (the misalignment 申晗 hit).
     expect(be.captureViewport()).toBe('line one\r\nline two\r\nline three\r\n');
     expect(be.captureCurrentScreen()).toBe('line one\r\nline two\r\nline three\r\n');
+  });
+});
+
+describe('ZellijObserveBackend liveness debounce', () => {
+  const ALIVE = () => JSON.stringify([{ id: 2, is_plugin: false }]);
+  const GONE = () => '[]';
+  const opts = () => ({ cwd: '/tmp', cols: 80, rows: 24, env: process.env as Record<string, string> });
+
+  beforeEach(() => {
+    calls.length = 0;
+    listPanesResult = ALIVE;
+  });
+
+  it('does NOT detach on a single transient list-panes failure that recovers', () => {
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+    try {
+      const be = new ZellijObserveBackend(S, P, { cliPid: 999 });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], opts());
+
+      listPanesResult = GONE;
+      vi.advanceTimersByTime(1_000);   // 1 failed liveness probe
+      listPanesResult = ALIVE;
+      vi.advanceTimersByTime(8_000);   // sustained recovery
+      expect(exits).toEqual([]);
+    } finally {
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('detaches only after 3 consecutive pane-gone probes + a failed confirm', () => {
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+    try {
+      const be = new ZellijObserveBackend(S, P, { cliPid: 999 });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], opts());
+
+      listPanesResult = GONE;
+      vi.advanceTimersByTime(2_000);   // 2 failures — debounced
+      expect(exits).toEqual([]);
+      vi.advanceTimersByTime(1_000);   // 3rd + failed confirm ⇒ detach
+      expect(exits).toEqual([[0, null]]);
+    } finally {
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('detaches IMMEDIATELY when the pid is gone (pid is decisive, not debounced)', () => {
+    // process.kill(pid,0) can only report ESRCH/EPERM — never a transient
+    // failure — so a dead pid tears down on the first tick to keep the user's
+    // Lark input out of the shell the pane drops back to.
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: NodeJS.Signals | 0) => {
+      if (pid === 999 && sig === 0) {
+        const e: NodeJS.ErrnoException = new Error('gone');
+        e.code = 'ESRCH';
+        throw e;
+      }
+      return true;
+    }) as typeof process.kill);
+    try {
+      listPanesResult = ALIVE;          // pane never disappears — only the pid is gone
+      const be = new ZellijObserveBackend(S, P, { cliPid: 999 });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], opts());
+
+      vi.advanceTimersByTime(1_000);    // first liveness tick ⇒ detach now
+      expect(exits).toEqual([[0, null]]);
+    } finally {
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('stays attached when the pane reappears on the final confirm (overload, not death)', () => {
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+    try {
+      let listCalls = 0;
+      listPanesResult = () => {
+        listCalls += 1;
+        // 3 polled probes miss the pane (busy server) …
+        if (listCalls <= 3) return '[]';
+        // … but the final confirm re-probe finds it ⇒ still alive.
+        return JSON.stringify([{ id: 2, is_plugin: false }]);
+      };
+      const be = new ZellijObserveBackend(S, P, { cliPid: 999 });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], opts());
+
+      vi.advanceTimersByTime(3_000);   // 3 failed polls + 1 successful confirm
+      expect(exits).toEqual([]);       // recovered on the confirm — no detach
+      expect(listCalls).toBe(4);
+    } finally {
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('setLiveAttach(true) resets a partial pane-failure streak at the attach transition', () => {
+    // 2 failures, then a brief attach+detach that crosses NO liveness tick. If
+    // setLiveAttach reset the streak, a single post-detach failure leaves the
+    // gate at 1 (no detach). If it did NOT reset (e.g. relying only on the
+    // per-tick reset), the gate would still be 2 and this one failure would hit
+    // the threshold → detach. So this pins the reset to setLiveAttach itself —
+    // it would go red if that reset were removed.
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+    try {
+      const be = new ZellijObserveBackend(S, P, { cliPid: 999 });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], opts());
+
+      listPanesResult = GONE;
+      vi.advanceTimersByTime(2_000);   // 2 pane failures (gate at 2, no detach)
+      expect(exits).toEqual([]);
+
+      be.setLiveAttach(true);          // attach resets the streak immediately…
+      be.setLiveAttach(false);         // …and detaches before any liveness tick
+
+      vi.advanceTimersByTime(1_000);   // ONE more failure → gate is 1, not 3
+      expect(exits).toEqual([]);
+
+      // And the gate genuinely counts from 1: two further failures DO trip it.
+      vi.advanceTimersByTime(2_000);
+      expect(exits).toEqual([[0, null]]);
+    } finally {
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

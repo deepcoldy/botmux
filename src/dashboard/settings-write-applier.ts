@@ -99,6 +99,8 @@ export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
   | 'invalid_repoPickerMode'
+  | 'invalid_whiteboard'
+  | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
   | 'invalid_maintenance' // ← never returned literally; surfaces parseMaintenancePatch's reason instead
   | 'local_dev_no_autoupdate'
@@ -153,6 +155,19 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_repoPickerMode' };
     }
     deps.mergeGlobalConfig({ repoPickerMode: v });
+    touched = true;
+  }
+
+  if ('whiteboard' in obj) {
+    const raw = obj.whiteboard;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_whiteboard' };
+    }
+    const wb = raw as Record<string, unknown>;
+    if (typeof wb.enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_whiteboard_enabled' };
+    }
+    deps.mergeGlobalConfig({ whiteboard: { enabled: wb.enabled } });
     touched = true;
   }
 

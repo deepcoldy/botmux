@@ -1,0 +1,91 @@
+// `botmux bind <blob>` —— 把这台机器绑定到中心化平台。
+// <blob> 是平台网页生成的自包含凭证（内含平台地址 + 绑定 token），
+// 因此本仓库源码里不出现任何平台域名。
+import { randomBytes } from 'node:crypto';
+import { hostname } from 'node:os';
+import { readPlatformBinding, writePlatformBinding } from './binding.js';
+
+/** 解码平台生成的 bind blob：base64url(JSON{u:平台地址, t:绑定token})。 */
+function decodeBindBlob(blob: string): { platformUrl: string; token: string } | null {
+  try {
+    const obj = JSON.parse(Buffer.from(blob, 'base64url').toString('utf8'));
+    if (obj && typeof obj.u === 'string' && typeof obj.t === 'string') {
+      return { platformUrl: obj.u.replace(/\/$/, ''), token: obj.t };
+    }
+  } catch {
+    /* not a blob */
+  }
+  return null;
+}
+
+export async function cmdBind(args: string[]): Promise<void> {
+  let arg = '';
+  let platformOverride = '';
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--platform' || a === '-p') platformOverride = args[++i] || '';
+    else if (a.startsWith('--platform=')) platformOverride = a.slice('--platform='.length);
+    else if (!a.startsWith('-') && !arg) arg = a;
+  }
+  if (!arg) {
+    console.error('用法: botmux bind <绑定凭证>');
+    console.error('  到平台网页「绑定新机器」复制完整命令执行即可。');
+    process.exit(1);
+    return;
+  }
+
+  // 优先把参数当自包含 blob 解（内含平台地址）；否则回退「裸 token + 显式平台地址」
+  const decoded = decodeBindBlob(arg);
+  let platformUrl: string;
+  let code: string;
+  if (decoded) {
+    platformUrl = decoded.platformUrl;
+    code = decoded.token;
+  } else {
+    platformUrl = (platformOverride || process.env.BOTMUX_PLATFORM_URL || '').replace(/\/$/, '');
+    code = arg;
+    if (!platformUrl) {
+      console.error('绑定凭证无法解析；请用平台网页给出的完整 `botmux bind <凭证>` 命令。');
+      process.exit(1);
+      return;
+    }
+  }
+
+  // 复用已有 machineId（重绑保持机器身份不变）
+  const existing = readPlatformBinding();
+  const machineId = existing?.machineId || randomBytes(8).toString('hex');
+  const name = existing?.name || hostname();
+
+  let res: Response;
+  try {
+    res = await fetch(`${platformUrl}/api/bind`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code, machineId }),
+    });
+  } catch (e) {
+    console.error(`连接平台失败（${platformUrl}）: ${String(e)}`);
+    process.exit(1);
+    return;
+  }
+
+  const body = (await res.json().catch(() => ({}))) as { machineId?: string; machineToken?: string; error?: string };
+  if (!res.ok || !body.machineToken) {
+    const reason = body.error || `HTTP ${res.status}`;
+    console.error(`绑定失败: ${reason}`);
+    if (reason.includes('invalid') || reason.includes('expired')) console.error('  绑定凭证无效或已过期，请回平台重新生成。');
+    process.exit(1);
+    return;
+  }
+
+  writePlatformBinding({
+    platformUrl,
+    machineId: body.machineId || machineId,
+    machineToken: body.machineToken,
+    name,
+  });
+
+  console.log(`✓ 已绑定到平台 ${platformUrl}`);
+  console.log(`  机器名: ${name}`);
+  console.log('  运行 `botmux dashboard` 后，平台即可看到并打开这台机器的 dashboard。');
+}

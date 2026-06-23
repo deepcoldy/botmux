@@ -10,6 +10,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
+import { sanitizePerBotEnv } from './core/per-bot-env.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 
@@ -177,6 +178,12 @@ export interface BotConfig {
    */
   restrictGrantCommands?: boolean;
   /**
+   * 自动授权申请卡开关。默认开启（undefined = on）：群里有人或外部 bot 明确 @ 本 bot
+   * 但被 talk 权限闸挡住时，给 owner 弹 /grant 申请卡。显式 false 时静默丢弃，
+   * 保留原来的强权限闸但不刷卡。
+   */
+  autoGrantRequestCards?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -196,6 +203,16 @@ export interface BotConfig {
    * is trimmed and gets a leading `/` if missing; arguments (spaces) preserved.
    */
   startupCommands?: string[];
+  /**
+   * Optional per-bot environment variables, injected into THIS bot's CLI
+   * process (e.g. `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` to run the bot
+   * on GLM / a third-party Anthropic-compatible provider, an `HTTPS_PROXY`, or
+   * a CLI feature flag). Sanitized at load via {@link sanitizePerBotEnv}
+   * (valid env-var names + string/number/boolean values; botmux-reserved keys
+   * dropped). Delivered per-session as SpawnOpts.injectEnv so it never pollutes
+   * the shared tmux/zellij server env. Missing/empty → undefined.
+   */
+  env?: Record<string, string>;
   /**
    * Optional per-bot priority skill policy. Missing means botmux does not alter
    * the underlying CLI's native skill discovery or spawn arguments.
@@ -270,6 +287,13 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /**
+   * Worktree picker mode on the repo-select card. When true, the worktree
+   * control renders the multi-repo selector (pick N repos + branch) instead of
+   * the single-select dropdown. Toggled from the card's 「切换多仓库选择器」button;
+   * persists so all of this bot's future sessions default to it. Default false.
+   */
+  worktreeMultiPicker?: boolean;
   /**
    * Per-bot DEFAULT session mode for regular Lark groups (overridable per-chat
    * via `/reply-mode` → `chatReplyModes`). Resolved by
@@ -752,6 +776,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const startupCommandsList = normalizeStartupCommandList(entry.startupCommands);
     const startupCommands = startupCommandsList.length > 0 ? startupCommandsList : undefined;
 
+    // env：per-bot 环境变量（如代理 / 第三方服务商端点 ANTHROPIC_BASE_URL+AUTH_TOKEN）。
+    // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
+    const sanitizedEnv = sanitizePerBotEnv(entry.env);
+    const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
+
     const skills = readBotSkillPolicy(entry.skills);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
@@ -816,8 +845,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       messageQuota,
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
+      // Default is ON, so only explicit false is meaningful/persisted.
+      autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       customPassthroughCommands,
       startupCommands,
+      env,
       skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
@@ -839,6 +871,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
       // meaningful; 'chat' (the flat default) and anything else normalize to
       // undefined so bots.json stays clean.

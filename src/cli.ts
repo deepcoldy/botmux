@@ -16,6 +16,7 @@
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
+ *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
@@ -72,6 +73,15 @@ import {
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
 import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import {
+  createWhiteboard,
+  ensureDefaultWhiteboard,
+  getWhiteboard,
+  listWhiteboards,
+  readWhiteboard,
+  whiteboardEnabled,
+  whiteboardPath,
+} from './services/whiteboard-store.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
@@ -277,6 +287,19 @@ function ecosystemConfig(): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
+    // A graceful daemon shutdown exits 0 (SIGTERM/SIGINT → drain → process.exit(0)).
+    // Tell pm2 that exit 0 is intentional so it does NOT autorestart the daemon
+    // while `botmux restart` is tearing the fleet down — otherwise pm2 revives
+    // each daemon (after restart_delay) the instant our parallel SIGTERM drains
+    // it, and re-deleting those revivals one-by-one re-serializes the teardown
+    // (~13s of churn for 31 bots). Crashes (non-zero exit / killed by signal)
+    // are NOT in this list, so genuine crash-autorestart is preserved.
+    stop_exit_codes: [0],
+    // pm2's default kill_timeout (1.6s) is SHORTER than the daemon's own
+    // SHUTDOWN_GRACE_MS (3s), so any daemon pm2 has to signal directly gets
+    // SIGKILL'd mid-drain → orphaned (ppid=1) workers. Give pm2 headroom past
+    // the daemon's graceful-drain budget so it never force-kills mid-shutdown.
+    kill_timeout: 3500,
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
     node_args: [
@@ -310,6 +333,10 @@ function ecosystemConfig(): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
+    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit-0
+    // during a fleet teardown, and don't SIGKILL mid-shutdown. (See baseApp.)
+    stop_exit_codes: [0],
+    kill_timeout: 3500,
     error_file: join(LOG_DIR, 'dashboard-error.log'),
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
@@ -1214,25 +1241,73 @@ function cleanupStaleDaemonDescriptors(): void {
   }
 }
 
+/** Block the current thread for `ms`. Safe here: the restart CLI is a one-shot
+ *  process, so stalling its event loop during the shutdown poll is harmless. */
+function sleepSyncMs(ms: number): void {
+  if (ms <= 0) return;
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* SAB unavailable → no-op */ }
+}
+
 /** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
 function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
+  let entries: Array<{ name: string; pid: number; online: boolean }>;
   try {
-    const output = pm2Capture(['jlist'], home);
-    const apps = JSON.parse(output) as any[];
-    for (const app of apps) {
-      if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
-        try {
-          runPm2(['delete', app.name], false, home, 10_000);
-        } catch (e) {
-          // Don't swallow silently — a failed delete here used to leave the
-          // restart half-done with no trace. Surface it (the auto-restart
-          // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
-          console.error(`[restart] pm2 delete ${app.name} failed: ${e instanceof Error ? e.message : e}`);
-        }
-      }
-    }
+    const apps = JSON.parse(pm2Capture(['jlist'], home)) as any[];
+    entries = (Array.isArray(apps) ? apps : [])
+      .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
+      .map(a => ({ name: String(a.name), pid: Number(a.pid) || 0, online: a?.pm2_env?.status === 'online' }));
   } catch (e) {
     console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
+    return;
+  }
+  if (entries.length === 0) return;
+  const names = entries.map(e => e.name);
+
+  // Parallel graceful shutdown. pm2's own delete stops apps one-at-a-time
+  // (async eachLimit, concurrency 1) and each botmux daemon's drain eats pm2's
+  // full kill_timeout (~1.6s) → ~N×1.6s serial (~38s for 31 bots). Instead we
+  // SIGTERM every online daemon AT ONCE so their graceful drains overlap (the
+  // daemon's SIGTERM handler detaches workers within SHUTDOWN_GRACE_MS), wait
+  // once for them all to exit, then let pm2 delete reap the now-dead entries
+  // instantly. Orphan-safe: each daemon runs its FULL graceful drain and we wait
+  // for real exit before pm2 touches it — avoiding the mid-drain SIGKILL the old
+  // path forced (pm2 kill_timeout 1.6s < daemon SHUTDOWN_GRACE_MS 3s).
+  const pids = entries.filter(e => e.online && e.pid > 0).map(e => e.pid);
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  // Poll until every signalled daemon has exited (bounded). SHUTDOWN_GRACE_MS is
+  // 3s; give headroom. Exits early the moment the last one dies.
+  const deadline = Date.now() + 5_000;
+  let alive = pids.slice();
+  while (alive.length > 0 && Date.now() < deadline) {
+    sleepSyncMs(50);
+    alive = alive.filter(pid => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  }
+
+  // Reap pm2 entries. Processes are already dead → each delete is instant, and
+  // ONE batched `pm2 delete name1 name2 …` collapses N pm2 CLI cold-boots
+  // (~315ms each) into one. A revived (autorestart, gated by restart_delay)
+  // instance is still removed by name.
+  const batchTimeout = Math.max(15_000, names.length * 2_500);
+  try {
+    runPm2(['delete', ...names], false, home, batchTimeout);
+    return;
+  } catch (e) {
+    // pm2's batched delete (async eachLimit) aborts on the first failed name,
+    // so a mid-batch failure can leave stragglers. Fall back to the resilient
+    // per-name loop that try/catches each name independently.
+    console.error(`[restart] batched pm2 delete failed, falling back to per-name: ${e instanceof Error ? e.message : e}`);
+  }
+  for (const name of names) {
+    try {
+      runPm2(['delete', name], false, home, 10_000);
+    } catch (e) {
+      // Don't swallow silently — a failed delete here used to leave the
+      // restart half-done with no trace. Surface it (the auto-restart
+      // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
+      console.error(`[restart] pm2 delete ${name} failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
 }
 
@@ -1555,6 +1630,7 @@ interface SessionData {
   currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
+  whiteboardId?: string;
   // Markers that a real CLI ever ran in this session (vs a daemon-command
   // scratch placeholder). Persisted by the daemon; only presence is checked
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
@@ -2632,6 +2708,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   voice                配置语音总结（高级功能，独立于 setup）— 交互式填 TTS 引擎+凭证
        voice status    查看当前语音配置（凭证打码）
        voice disable   关闭语音功能（移除配置）
+  whiteboard status|enable|disable
+                       本地项目白板（默认关闭；enable 只打开能力，不创建白板）
+       current --create / list / read / update / write --yes
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -2779,6 +2858,249 @@ function positionals(args: string[], booleanFlags: string[] = []): string[] {
     out.push(a);
   }
   return out;
+}
+
+function readStdinUtf8(): string {
+  // On a TTY, readFileSync(0) blocks waiting for terminal EOF (Ctrl+D) with no
+  // prompt — `whiteboard update` with no text and no pipe looked frozen. Treat
+  // a TTY as "no stdin input" so the caller's empty-content guard surfaces a
+  // real error instead of an indefinite hang.
+  if (process.stdin.isTTY) return '';
+  try { return readFileSync(0, 'utf-8'); } catch { return ''; }
+}
+
+function currentWhiteboardContext(args: string[]): { session?: SessionData; larkAppId?: string; chatId?: string; workingDir?: string; sessionId?: string } {
+  const sessionIdArg = argValue(args, '--session-id');
+  const sessions = loadSessions();
+  const sid = sessionIdArg || findAncestorSessionId() || undefined;
+  const session = sid ? sessions.get(sid) : undefined;
+  return {
+    session,
+    sessionId: session?.sessionId ?? sid,
+    larkAppId: argValue(args, '--lark-app-id', '--app-id') ?? session?.larkAppId ?? process.env.LARK_APP_ID,
+    chatId: argValue(args, '--chat-id') ?? session?.chatId,
+    workingDir: argValue(args, '--working-dir', '--repo') ?? session?.workingDir ?? process.cwd(),
+  };
+}
+
+function requireWhiteboardEnabled(): void {
+  if (whiteboardEnabled()) return;
+  console.error('Whiteboard is disabled. Enable it with `botmux whiteboard enable` or the dashboard Settings page.');
+  process.exit(2);
+}
+
+// Boolean flags valid on `read`/`update`/`write` that must NOT be parsed as
+// value-taking. Without this hint, `positionals()` treats e.g. a bare `--yes`
+// as a value flag and swallows the *following* positional arg as its "value" —
+// the content ends up empty and the board is silently blanked (a shared
+// current-state snapshot lost with no history). `--create` belongs to
+// `current`, `--yes` to `write`, `--json` to `read`; all harmless to declare
+// together so content parsing never mis-eats a flag's neighbor.
+const WHITEBOARD_BOOLEAN_FLAGS = ['--create', '--yes', '--json'];
+
+function whiteboardContentFromArgs(args: string[], booleanFlags: string[] = []): string {
+  const file = argValue(args, '--content-file', '--file');
+  if (file) return readFileSync(file, 'utf-8');
+  const pos = positionals(args, booleanFlags);
+  return pos.length > 0 ? pos.join(' ') : readStdinUtf8();
+}
+
+/** Translate store-level whiteboard write errors into friendly CLI exits. The
+ *  store throws stable machine codes (whiteboard_cas_mismatch /
+ *  whiteboard_empty_content / whiteboard_not_found); map each to a clear,
+ *  actionable message so an agent or human reading stderr knows what to do
+ *  next instead of seeing a bare code. Always exits. */
+function handleWhiteboardWriteError(e: unknown, id: string): never {
+  const msg = (e as Error)?.message ?? String(e);
+  if (msg === 'whiteboard_cas_mismatch') {
+    console.error(
+      `Whiteboard was modified since you last read it (CAS mismatch). Re-run ` +
+      `\`botmux whiteboard read --id ${id} --json\` to get the latest content ` +
+      `+ updatedAt, re-merge your changes against it, then update again with ` +
+      `--expected-updated-at <new updatedAt>.`,
+    );
+    process.exit(2);
+  }
+  if (msg === 'whiteboard_empty_content') {
+    console.error('Refusing to write empty whiteboard content. Pass text as args, pipe stdin, or use --content-file <path>. (The board is a shared current-state snapshot and cannot be blanked.)');
+    process.exit(2);
+  }
+  if (msg === 'whiteboard_not_found') {
+    console.error(`Whiteboard not found: ${id}`);
+    process.exit(1);
+  }
+  console.error(`Whiteboard write failed: ${msg}`);
+  process.exit(1);
+}
+
+async function cmdWhiteboard(sub: string, rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const action = sub || 'status';
+  if (action === 'help' || action === '--help' || action === '-h') {
+    console.log(`botmux whiteboard <command>
+
+Commands:
+  status                       Show whether whiteboard is enabled
+  enable | disable             Toggle optional whiteboard feature (does not create boards)
+  list                         List local whiteboards (read-only, even when disabled)
+  current [--create]           Show current default board; --create ensures it when enabled
+  create [--id ID] [--title T] Create a board for current/bound context
+  read [--id ID] [--json]      Read board.md (requires enabled). --json emits
+                               { id, updatedAt, content } so a caller can CAS on update
+  path [--id ID]               Print board/meta/log paths
+  update [--id ID] [text...]   Replace board.md current state (or stdin / --content-file).
+                               --expected-updated-at <ts> refuses the write if the board
+                               changed since that version (CAS); exit 2 with a re-read hint
+  write --yes [--id ID] ...    Force-overwrite board.md; --yes required. Also honors
+                               --expected-updated-at when supplied
+
+Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
+    return;
+  }
+
+  if (action === 'status') {
+    console.log(JSON.stringify({ enabled: whiteboardEnabled(), count: listWhiteboards().length }, null, 2));
+    return;
+  }
+  if (action === 'enable' || action === 'on') {
+    mergeGlobalConfig({ whiteboard: { enabled: true } as any });
+    console.log('Whiteboard enabled. No board was created; a board is ensured only when first needed.');
+    return;
+  }
+  if (action === 'disable' || action === 'off') {
+    mergeGlobalConfig({ whiteboard: { enabled: false } as any });
+    console.log('Whiteboard disabled. Existing boards remain on disk and dashboard can show history read-only.');
+    return;
+  }
+  if (action === 'list' || action === 'ls') {
+    const boards = listWhiteboards().map(b => ({ id: b.id, title: b.title, scope: b.scope, larkAppId: b.larkAppId, chatId: b.chatId, workingDir: b.workingDir, updatedAt: b.updatedAt, path: b.path }));
+    console.log(JSON.stringify({ enabled: whiteboardEnabled(), boards }, null, 2));
+    return;
+  }
+
+  if (action === 'current') {
+    requireWhiteboardEnabled();
+    const id = argValue(rest, '--id');
+    if (id) {
+      const meta = getWhiteboard(id);
+      if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+      console.log(JSON.stringify({ enabled: true, current: meta, path: whiteboardPath(id) }, null, 2));
+      return;
+    }
+    const ctx = currentWhiteboardContext(rest);
+    let meta = ctx.session?.whiteboardId ? getWhiteboard(ctx.session.whiteboardId) : undefined;
+    if (!meta && argFlag(rest, '--create')) {
+      meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+      if (ctx.session) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    }
+    if (!meta) {
+      console.log(JSON.stringify({ enabled: true, current: null, hint: 'Run `botmux whiteboard current --create` to ensure the default board.' }, null, 2));
+      return;
+    }
+    console.log(JSON.stringify({ enabled: true, current: meta, path: whiteboardPath(meta.id) }, null, 2));
+    return;
+  }
+
+  if (action === 'create') {
+    requireWhiteboardEnabled();
+    const ctx = currentWhiteboardContext(rest);
+    const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+    if (ctx.session && !ctx.session.whiteboardId) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
+    return;
+  }
+
+  // Anything reaching here must be one of the file-operating subcommands; the
+  // earlier branches (help/status/enable/disable/list/current/create) already
+  // returned. Reject unknown actions BEFORE computing an id — otherwise a typo
+  // like `post` fell through to the misleading "No whiteboard id" error.
+  if (!['read', 'path', 'update', 'write'].includes(action)) {
+    console.error(`Unknown whiteboard command: ${action}`);
+    process.exit(1);
+  }
+  if (['read', 'update', 'write'].includes(action)) requireWhiteboardEnabled();
+
+  const explicitId = argValue(rest, '--id');
+  const ctx = currentWhiteboardContext(rest);
+  let id = explicitId ?? ctx.session?.whiteboardId;
+  if (!id && whiteboardEnabled() && action === 'update') {
+    const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+    id = meta.id;
+    if (ctx.session) { ctx.session.whiteboardId = id; saveSession(ctx.session); }
+  }
+  if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
+
+  if (action === 'read') {
+    requireWhiteboardEnabled();
+    // Default: stream raw board.md to stdout (back-compat for agents/skills
+    // that treat stdout as the board content). `--json` returns
+    // { id, updatedAt, content } so an agent can capture the version it read
+    // and pass it back as --expected-updated-at on update — the compare-and-set
+    // that turns the read→merge→update flow from blind last-writer-wins into a
+    // conflict-detecting update.
+    if (argFlag(rest, '--json')) {
+      const meta = getWhiteboard(id);
+      if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+      console.log(JSON.stringify({ id: meta.id, updatedAt: meta.updatedAt, content: readWhiteboard(id) }));
+    } else {
+      process.stdout.write(readWhiteboard(id));
+    }
+    return;
+  }
+  if (action === 'path') {
+    const meta = getWhiteboard(id);
+    if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+    console.log(JSON.stringify({ board: meta, path: whiteboardPath(id) }, null, 2));
+    return;
+  }
+  if (action === 'update') {
+    requireWhiteboardEnabled();
+    const content = whiteboardContentFromArgs(rest, WHITEBOARD_BOOLEAN_FLAGS);
+    if (!content.trim()) {
+      console.error('Refusing to write empty whiteboard content. Pass text as args, pipe stdin, or use --content-file <path>. (The board is a shared current-state snapshot and cannot be blanked.)');
+      process.exit(2);
+    }
+    // Optional CAS: the agent passes the updatedAt it observed at read time.
+    // If the board changed in between, the store refuses with
+    // whiteboard_cas_mismatch → friendly exit 2 so the agent re-reads/merges
+    // instead of silently clobbering the other writer's update.
+    const expectedUpdatedAt = argValue(rest, '--expected-updated-at');
+    const { writeWhiteboard } = await import('./services/whiteboard-store.js');
+    try {
+      const meta = writeWhiteboard(id, content, { actor: ctx.sessionId, kind: 'update', expectedUpdatedAt });
+      console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, id);
+    }
+    return;
+  }
+  if (action === 'write') {
+    requireWhiteboardEnabled();
+    if (!argFlag(rest, '--yes')) {
+      console.error('Refusing to overwrite whiteboard without --yes. Prefer `botmux whiteboard update` for current-state updates.');
+      process.exit(2);
+    }
+    const content = whiteboardContentFromArgs(rest, WHITEBOARD_BOOLEAN_FLAGS);
+    if (!content.trim()) {
+      console.error('Refusing to write empty whiteboard content. Pass text as args, pipe stdin, or use --content-file <path>. (The board is a shared current-state snapshot and cannot be blanked.)');
+      process.exit(2);
+    }
+    // `write --yes` is the human force-overwrite escape hatch, but if a CAS
+    // version is supplied we still honor it — a conscious writer that knows
+    // the base version should still get a conflict signal rather than clobber.
+    const expectedUpdatedAt = argValue(rest, '--expected-updated-at');
+    const { writeWhiteboard } = await import('./services/whiteboard-store.js');
+    try {
+      const meta = writeWhiteboard(id, content, { actor: ctx.sessionId, expectedUpdatedAt });
+      console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, id);
+    }
+    return;
+  }
+
+  console.error(`Unknown whiteboard command: ${action}`);
+  process.exit(1);
 }
 
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
@@ -5239,6 +5561,12 @@ switch (command) {
   case 'status':  cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(); break;
+  case 'bind': {
+    // `botmux bind <code>` — 把本机绑定到中心化平台
+    const { cmdBind } = await import('./platform/bind.js');
+    await cmdBind(process.argv.slice(3));
+    break;
+  }
   case 'list':
   case 'ls':      await cmdList(); break;
   case 'delete':
@@ -5298,6 +5626,8 @@ switch (command) {
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'lang':     await cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;
+  case 'whiteboard':
+  case 'wb':       await cmdWhiteboard(process.argv[3] ?? 'status', process.argv.slice(4)); break;
   case 'thread':   {
     // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
     // pre-rename scripts/skills surface the rename instead of "unknown command".

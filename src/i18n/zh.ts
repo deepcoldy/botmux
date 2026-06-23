@@ -19,6 +19,9 @@ export const messages: Record<string, string> = {
   'card.btn.takeover': '🔄 接管',
   'card.btn.skip_repo': '▶️ 直接开启会话',
   'card.btn.manual_repo': '使用此目录',
+  'card.btn.worktree_repo': '创建 worktree',
+  'card.btn.worktree_to_multi': '🔀 多仓库',
+  'card.btn.worktree_to_single': '🔀 单仓库',
   'card.btn.half_page_up': '⇞ 上半屏',
   'card.btn.half_page_down': '⇟ 下半屏',
   'card.btn.send_custom': '📝 发送自定义回复',
@@ -57,15 +60,23 @@ export const messages: Record<string, string> = {
   'card.repo.placeholder_switch': '选择仓库并切换',
   'card.repo.manual_placeholder': '输入任意工作目录，如 /path/to/project 或 ~/projects/foo',
   'card.repo.manual_empty': '请输入工作目录路径',
+  'card.repo.worktree_empty': '请至少选择一个仓库',
+  'card.repo.worktree_branch_placeholder': '分支名（可选；多选时作为父目录名）',
+  'card.repo.worktree_child_conflict': '多个仓库会映射到相同 worktree 子目录：{names}。请先调整项目名或改用单项目创建。',
   'card.repo.current_active': '当前工作目录：',
   'card.repo.current_marker': ' ← 当前',
   'card.repo.note': '也可以回复 `/repo <编号>` 切换（如 `/repo 1`），或直接 `/repo <路径|项目名>`（如 `/repo botmux`、`/repo ~/projects/foo`）跳过本卡片；`/repo wt <编号|项目名> [分支名]` 基于远端默认分支新建 worktree 打开',
   'card.repo.placeholder_worktree': '🌿 选仓库新建 worktree 打开',
+  'card.repo.placeholder_worktree_multi': '🌿 选择一个或多个仓库新建 worktree',
+  'card.repo.worktree_now_multi': '多仓库选择器已开启（本 bot 后续会话默认）',
+  'card.repo.toast_worktree_mode_switched': '已切到多仓库选择器，本 bot 后续会话默认生效（可再点切回）。',
+  'card.repo.toast_worktree_mode_switched_back': '已切回单仓库选择器，本 bot 后续会话默认生效（可再点切到多仓库）。',
+  'card.repo.worktree_rolled_back': '{repo} 创建 worktree 失败：{error}。已回滚本批次此前创建的 {count} 个 worktree。',
   'card.repo.toast_worktree_creating': '正在创建 worktree，完成后会在话题里通知…',
 
   // 群内授权卡片
   'card.grant.title': '🔑 使用授权',
-  'card.grant.body_request': '用户 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
+  'card.grant.body_request': '发送方 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
   'card.grant.body_owner': '是否授权 **{name}** 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.body_owner_multi': '是否授权 {names} 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.btn_chat': '授权本群对话',
@@ -188,6 +199,14 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.insight.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /insight。',
+  'cmd.insight.unsupported': 'ℹ️ 该 CLI 暂不支持 insight 分析（目前仅 Claude Code / Codex）。',
+  'cmd.insight.no_transcript': 'ℹ️ 还没找到本会话的 transcript，跑几轮后再试。',
+  'cmd.insight.parse_error': '⚠️ 解析本会话 transcript 失败。',
+  'cmd.insight.no_spans': 'ℹ️ 本会话还没有可分析的工具 span。',
+  'cmd.insight.header': '📊 本会话 insight',
+  'cmd.insight.metrics_line': '指标：span {total} · 失败 {failed} · 慢 {slow} · 读改比 {rw} · 压缩 {compactions}',
+  'cmd.insight.suggestions_label': '建议',
   'cmd.card.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /card。',
   'cmd.term.operator_only': '⚠️ 仅授权用户（allowedUsers）可以用 /term 获取可操作终端链接。',
   'cmd.term.no_session': '当前话题没有活跃会话，/term 需要一个跑着的会话。',
@@ -589,6 +608,8 @@ export const messages: Record<string, string> = {
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ /adopt的 CLI 会话已断开',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
+  'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
+  'worker.crash_recent_output': '最近终端输出：',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',
@@ -1050,4 +1071,12 @@ export const messages: Record<string, string> = {
   'sandbox.diff_failed': '读取沙盒改动失败：{detail}',
   'sandbox.workingdir_not_found': '找不到会话 workingDir',
   'sandbox.no_changes_left': '沙盒改动层已无改动',
+
+  // ─── Dashboard 创建会话（createSession）─────────────────────────────────────
+  'cmd.createSession.untitled': '新会话',
+  'cmd.createSession.banner': '📋 新会话任务：{content}',
+  'cmd.createSession.lead_preamble_intro': '你是本群的 lead（编排）bot。群里还有这些可协作的 sub bot，可按需把子任务派发给它们（在群里 @ 对应的 bot 即可把它拉起干活，也可用 botmux orchestrate / handoff）：',
+  'cmd.createSession.lead_preamble_no_subs': '（本群暂无其它可协作的 sub bot）',
+  'cmd.createSession.lead_preamble_outro': '由你决定何时、给谁分配什么。下面是用户分配的整体工作：',
+  'cmd.createSession.collab_note': '本群还有 {peers} 在和你一起并行处理同一个任务，注意协作、别重复劳动。',
 };

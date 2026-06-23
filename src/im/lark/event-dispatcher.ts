@@ -16,7 +16,7 @@ import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripLeadingMentions } from './message-parser.js';
-import { recordObservedBots } from '../../services/observed-bots-store.js';
+import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
@@ -24,7 +24,7 @@ import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.j
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled } from './grant-pending.js';
+import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
@@ -902,18 +902,30 @@ export function canOperate(larkAppId: string, _chatId: string | undefined, sende
 async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined,
 ): Promise<void> {
+  if (getBot(larkAppId).config.autoGrantRequestCards === false) return;
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
-  const name = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name
-    ?? requesterOpenId;
+  // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
+  // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
+  // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
+  const mentionName = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name;
+  const observedName = mentionName
+    ? undefined
+    : listObservedBots(config.session.dataDir, larkAppId, chatId).find(b => b.openId === requesterOpenId)?.name;
+  const name = mentionName ?? observedName ?? requesterOpenId;
   const nonce = openPending(larkAppId, chatId, requesterOpenId, getBot(larkAppId).config.messageQuota?.defaultLimit);
   const card = buildGrantCard(
     { ownerOpenId: owner, targets: [{ openId: requesterOpenId, name: String(name) }], chatId, nonce, mode: 'request' },
     localeForBot(larkAppId),
   );
   await replyMessage(larkAppId, message.message_id, card, 'interactive')
-    .catch(err => logger.debug(`grant request card send failed: ${err}`));
+    .catch(err => {
+      // 发卡失败必须撤掉刚开的 pending，否则该发送方被节流压死、owner 永远看不到卡片，
+      // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
+      clearPending(larkAppId, chatId, requesterOpenId);
+      logger.debug(`grant request card send failed: ${err}`);
+    });
 }
 
 // ─── Group message access check ──────────────────────────────────────────
@@ -1510,6 +1522,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
                 && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
                 && !hasChatGrant(larkAppId, chatId, senderOpenId)
                 && !hasGlobalGrant(larkAppId, senderOpenId)) {
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId);
               return;
             }
           }

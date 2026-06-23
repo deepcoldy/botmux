@@ -32,3 +32,18 @@ export function shouldWriteNow(state: {
   // Type-ahead is only safe after the TUI has booted at least once.
   return state.supportsTypeAhead && !state.awaitingFirstPrompt;
 }
+
+export function shouldReleaseFirstPromptTimeout(state: {
+  /** Adapter wants the soft timeout to wait for a real readyPattern. */
+  deferFirstPromptTimeoutUntilReady: boolean;
+  /** There is a readyPattern that can eventually prove the input box exists. */
+  hasReadyPattern: boolean;
+  /** Milliseconds elapsed since this CLI spawn armed the first-prompt timer. */
+  elapsedMs: number;
+  /** Absolute hard cap for keeping the first prompt queued. */
+  hardTimeoutMs: number;
+}): boolean {
+  if (!state.deferFirstPromptTimeoutUntilReady) return true;
+  if (!state.hasReadyPattern) return true;
+  return state.elapsedMs >= state.hardTimeoutMs;
+}

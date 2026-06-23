@@ -157,6 +157,7 @@ export function buildSessionsCard(
               action: SESSIONS_ACTION_DETAIL,
               invoker_open_id: opts.invokerOpenId,
               session_id: e.sessionId,
+              page: String(meta.page),
               ...navFields,
             },
           },
@@ -294,6 +295,9 @@ export interface BuildSessionsDetailCardOpts {
    *  button (single back affordance). */
   origin?: 'overview';
   pageSize?: number;
+  /** Source list page. Detail buttons round-trip this so BACK_TO_LIST restores
+   *  the page that opened the detail card (instead of always resetting to 1). */
+  sourcePage?: number;
   /** Dashboard scope. Threaded into locate/close/resume/back buttons. */
   scope?: 'global';
   /** Web terminal URL for the openTerminal button; null renders it disabled. */
@@ -386,6 +390,9 @@ export function buildSessionsDetailCard(
   const backNav: Record<string, string> = {};
   const effectivePageSize = clampPageSize(opts.pageSize);
   if (opts.origin === 'overview') backNav.origin = 'overview';
+  if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage) && opts.sourcePage >= 1) {
+    backNav.page = String(Math.floor(opts.sourcePage));
+  }
   if (effectivePageSize !== PAGE_SIZE) backNav.page_size = String(effectivePageSize);
   if (opts.scope === 'global') backNav.dashboard_scope = 'global';
   // Track reason notes to render below the action row in row order.
@@ -710,6 +717,9 @@ export async function handleSessionsCardAction(
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+  const parsedNavPage = Number.parseInt(value.page ?? '', 10);
+  const navPage: number | undefined =
+    Number.isFinite(parsedNavPage) && parsedNavPage >= 1 ? parsedNavPage : undefined;
   const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
   const pathSuffix = navScope === 'global' ? '?scope=global' : '';
 
@@ -732,6 +742,7 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
       terminalUrl: buildSessionTerminalUrl(row),
       feishuChatLink: row.feishuChatLink ?? null,
@@ -813,6 +824,7 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
       terminalUrl: buildSessionTerminalUrl(synth),
       feishuChatLink: synth.feishuChatLink ?? null,
@@ -932,6 +944,7 @@ export async function handleSessionsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
       terminalUrl: buildSessionTerminalUrl(after),
       feishuChatLink: after.feishuChatLink ?? null,
@@ -948,7 +961,7 @@ export async function handleSessionsCardAction(
       {
         invokerOpenId: operatorOpenId,
         locale,
-        page: 1,
+        page: navPage ?? 1,
         pageSize: navPageSize,
         origin: navOrigin,
         scope: navScope,

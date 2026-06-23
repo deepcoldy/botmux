@@ -16,6 +16,9 @@ export const messages: Record<string, string> = {
   'card.btn.takeover': '🔄 Take Over',
   'card.btn.skip_repo': '▶️ Start Session Directly',
   'card.btn.manual_repo': 'Use This Directory',
+  'card.btn.worktree_repo': 'Create Worktree',
+  'card.btn.worktree_to_multi': '🔀 Multi-repo',
+  'card.btn.worktree_to_single': '🔀 Single-repo',
   'card.btn.half_page_up': '⇞ Page ½ Up',
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
@@ -54,15 +57,23 @@ export const messages: Record<string, string> = {
   'card.repo.placeholder_switch': 'Pick a repo to switch to',
   'card.repo.manual_placeholder': 'Enter any working directory, e.g. /path/to/project or ~/projects/foo',
   'card.repo.manual_empty': 'Please enter a working directory path',
+  'card.repo.worktree_empty': 'Please select at least one repo',
+  'card.repo.worktree_branch_placeholder': 'Branch name (optional; used as parent dir for multi-select)',
+  'card.repo.worktree_child_conflict': 'Multiple repos would map to the same worktree child directory: {names}. Rename the project first or create one worktree at a time.',
   'card.repo.current_active': 'Current working directory:',
   'card.repo.current_marker': ' ← current',
   'card.repo.note': 'You can also reply `/repo <N>` (e.g. `/repo 1`), or `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`) to skip this card. `/repo wt <N|name> [branch]` opens a fresh worktree off the remote default branch.',
   'card.repo.placeholder_worktree': '🌿 Open a repo as a new worktree',
+  'card.repo.placeholder_worktree_multi': '🌿 Select one or more repos for new worktrees',
+  'card.repo.worktree_now_multi': 'Multi-repo picker on (default for this bot’s future sessions)',
+  'card.repo.toast_worktree_mode_switched': 'Switched to the multi-repo picker; default for this bot’s future sessions (tap again to switch back).',
+  'card.repo.toast_worktree_mode_switched_back': 'Switched back to the single-repo picker; default for this bot’s future sessions (tap again for multi).',
+  'card.repo.worktree_rolled_back': 'Worktree creation failed on {repo}: {error}. Rolled back {count} worktree(s) already created in this batch.',
   'card.repo.toast_worktree_creating': 'Creating worktree — will post in the thread when done…',
 
   // In-group authorization card
   'card.grant.title': '🔑 Access Request',
-  'card.grant.body_request': 'User **{name}** is requesting to use me in this chat. <at id={owner}></at> allow them to talk to me here?',
+  'card.grant.body_request': 'Sender **{name}** is requesting to use me in this chat. <at id={owner}></at> allow them to talk to me here?',
   'card.grant.body_owner': 'Grant **{name}** permission to talk to me in this chat? (<at id={owner}></at>)',
   'card.grant.body_owner_multi': 'Grant {names} permission to talk to me in this chat? (<at id={owner}></at>)',
   'card.grant.btn_chat': 'Grant talk in this chat',
@@ -185,6 +196,14 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
+  'cmd.insight.operator_only': '⚠️ Only authorized users (allowedUsers) can use /insight.',
+  'cmd.insight.unsupported': 'ℹ️ Insight analysis is not available for this CLI (currently Claude Code / Codex only).',
+  'cmd.insight.no_transcript': 'ℹ️ No transcript found for this session yet — try again after a few turns.',
+  'cmd.insight.parse_error': '⚠️ Failed to parse this session\'s transcript.',
+  'cmd.insight.no_spans': 'ℹ️ No analyzable tool spans in this session yet.',
+  'cmd.insight.header': '📊 Insight for this session',
+  'cmd.insight.metrics_line': 'Metrics: spans {total} · failed {failed} · slow {slow} · read/write {rw} · compactions {compactions}',
+  'cmd.insight.suggestions_label': 'Suggestions',
   'cmd.card.operator_only': '⚠️ Only authorized users (allowedUsers) can use /card.',
   'cmd.term.operator_only': '⚠️ Only authorized users (allowedUsers) can use /term to get the operable terminal link.',
   'cmd.term.no_session': 'No active session in this topic — /term needs a running session.',
@@ -586,6 +605,8 @@ export const messages: Record<string, string> = {
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',
   'worker.crash_loop_stopped': '⚠️ {cliName} crashed {count} times in 1 minute. Auto-restart disabled. Send a message to retry.',
+  'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
+  'worker.crash_recent_output': 'Recent terminal output:',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',
@@ -1047,4 +1068,12 @@ export const messages: Record<string, string> = {
   'sandbox.diff_failed': 'Reading sandbox changes failed: {detail}',
   'sandbox.workingdir_not_found': 'Session workingDir not found',
   'sandbox.no_changes_left': 'The sandbox change layer has no changes left',
+
+  // ─── Dashboard create session ──────────────────────────────────────────────
+  'cmd.createSession.untitled': 'New session',
+  'cmd.createSession.banner': '📋 New session task: {content}',
+  'cmd.createSession.lead_preamble_intro': 'You are the lead (orchestrator) bot in this chat. The following sub-bots are here and available to collaborate — delegate subtasks to them as needed (just @-mention a bot in the chat to spin it up, or use botmux orchestrate / handoff):',
+  'cmd.createSession.lead_preamble_no_subs': '(No other collaborating sub-bots in this chat yet)',
+  'cmd.createSession.lead_preamble_outro': 'You decide when and to whom to assign work. Here is the overall task assigned by the user:',
+  'cmd.createSession.collab_note': '{peers} are also working on this same task in parallel with you — coordinate and avoid duplicating effort.',
 };

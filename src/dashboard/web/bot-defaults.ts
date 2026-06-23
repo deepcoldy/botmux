@@ -230,7 +230,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -478,6 +478,25 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </div>`;
   }
 
+  // 环境变量 env：注入到本 bot CLI 进程的环境变量（JSON 对象），如让某个 bot 走 GLM/
+  // 第三方服务商（ANTHROPIC_BASE_URL+ANTHROPIC_AUTH_TOKEN）或设 HTTPS_PROXY。next-session
+  // 生效（下个新会话起注入）。PUT /api/bots/:appId/env 落 bots.json，跨后端按会话注入
+  // （不进共享 tmux server 全局 env，不会串到别的 bot）。
+  function renderEnvSection(b: any): string {
+    const val: string = typeof b.env === 'string' ? b.env : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionEnv')}</h4>
+      <p class="bd-section-note">${t('botDefaults.envHelp')}</p>
+      <textarea data-input="env" rows="5"
+        placeholder="${escapeHtml(t('botDefaults.envPlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(val)}</textarea>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-env">${t('botDefaults.envSave')}</button>
+        <span class="oncall-status" data-env-status></span>
+      </div>
+    </div>`;
+  }
+
   // File sandbox (oncall): a per-bot toggle. ON → this bot's sessions run inside
   // a per-session bwrap file sandbox (Linux). Auto-saves on change.
   function renderSandboxSection(b: any): string {
@@ -502,13 +521,20 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       : t('botDefaults.quotaStateOn', { count: quota });
   }
 
-  // 授权（/grant）相关：命令限制开关（auto-save 复选框）+ 默认消息额度（数字输入 + 保存/关闭按钮，
-  // 空＝关闭无限）。两者都通过 PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
+  // 授权（/grant）相关：自动申请卡、命令限制开关 + 默认消息额度。都通过
+  // PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
   function renderGrantSection(b: any): string {
     const restrict = b.restrictGrantCommands === true;
+    const autoCard = b.autoGrantRequestCards !== false;
     const quota: number | null = typeof b.messageQuotaDefaultLimit === 'number' ? b.messageQuotaDefaultLimit : null;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionGrant')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-auto-grant-card" ${autoCard ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.autoGrantCard')}</strong>
+        <small>${t('botDefaults.autoGrantCardHelp')}</small></span>
+      </label>
       <label class="toggle-row">
         <input type="checkbox" data-action="toggle-restrict-grant" ${restrict ? 'checked' : ''}>
         <span class="switch" aria-hidden="true"></span>
@@ -1070,7 +1096,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
-      // ── 授权偏好：命令限制开关 + 默认消息额度 ──────────────────────────
+      // ── 授权偏好：自动申请卡 + 命令限制开关 + 默认消息额度 ──────────────
+      const autoGrantCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-grant-card]');
       const restrictCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-restrict-grant]');
       const quotaInput = card.querySelector<HTMLInputElement>('input[data-input=quotaLimit]');
       const quotaSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-quota]');
@@ -1078,10 +1105,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       const grantStatusEl = card.querySelector<HTMLSpanElement>('[data-grant-status]');
       const quotaStateEl = card.querySelector<HTMLElement>('[data-quota-state]');
 
-      // PUT a partial grant-prefs patch ({ restrictGrantCommands? } and/or
-      // { messageQuotaDefaultLimit: number|null }). Mirrors putCardPref.
+      // PUT a partial grant-prefs patch ({ autoGrantRequestCards? },
+      // { restrictGrantCommands? } and/or { messageQuotaDefaultLimit: number|null }).
+      // Mirrors putCardPref.
       async function putGrantPref(
-        patch: { restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
+        patch: { autoGrantRequestCards?: boolean; restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
         selfEl: HTMLInputElement | HTMLButtonElement,
       ) {
         if (!grantStatusEl) return;
@@ -1101,6 +1129,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             const next: number | null = typeof body.messageQuotaDefaultLimit === 'number' ? body.messageQuotaDefaultLimit : null;
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
+              cached.autoGrantRequestCards = body.autoGrantRequestCards !== false;
               cached.restrictGrantCommands = body.restrictGrantCommands === true;
               cached.messageQuotaDefaultLimit = next;
             }
@@ -1120,6 +1149,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         }
       }
 
+      if (autoGrantCardCb) {
+        autoGrantCardCb.addEventListener('change', () => {
+          putGrantPref({ autoGrantRequestCards: autoGrantCardCb.checked }, autoGrantCardCb);
+        });
+      }
       if (restrictCb) {
         restrictCb.addEventListener('change', () => {
           putGrantPref({ restrictGrantCommands: restrictCb.checked }, restrictCb);
@@ -1245,6 +1279,45 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             startupStatusEl.classList.add('hint-warn-inline');
           } finally {
             startupSaveBtn.disabled = false;
+          }
+        });
+      }
+
+      // ── 环境变量 env（JSON 对象；空＝清除） ──────────────────────────────
+      const envEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=env]');
+      const envSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-env]');
+      const envStatusEl = card.querySelector<HTMLSpanElement>('[data-env-status]');
+      if (envEl && envSaveBtn) {
+        envSaveBtn.addEventListener('click', async () => {
+          if (!envStatusEl) return;
+          envStatusEl.textContent = '';
+          envStatusEl.className = 'oncall-status';
+          envSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/env`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ env: envEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              envStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              envStatusEl.classList.add('hint-ok');
+              // Server returns the sanitized, pretty-printed JSON — reflect it
+              // back so the textarea shows exactly what was persisted.
+              const next: string = typeof body.env === 'string' ? body.env : '';
+              envEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.env = next;
+            } else {
+              envStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              envStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            envStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            envStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            envSaveBtn.disabled = false;
           }
         });
       }

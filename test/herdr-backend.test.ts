@@ -222,6 +222,55 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it('per-bot injectEnv is threaded into the herdr server + agent-start env (so the forked CLI inherits it)', () => {
+    // Fresh start so ensureServer actually boots a `herdr server`: first
+    // session-list probe empty (→ boot), subsequent probes running (→ ready).
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', [], {
+      cwd: '/work', cols: 80, rows: 24,
+      env: { BOTMUX_SESSION_ID: 'sess_x' },
+      injectEnv: { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_AUTH_TOKEN: 'glm-key' },
+    });
+
+    // The daemon forks the CLI, so the SERVER spawn env is what the CLI inherits.
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn).toBeDefined();
+    expect(serverSpawn![2].env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
+    expect(serverSpawn![2].env.ANTHROPIC_AUTH_TOKEN).toBe('glm-key');
+    expect(serverSpawn![2].env.BOTMUX_SESSION_ID).toBe('sess_x'); // base env preserved
+    // agent-start call carries it too (defense in depth).
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('glm-key');
+    be.kill();
+  });
+
+  it('without injectEnv the server env carries only the base env (no provider keys)', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: { BOTMUX_SESSION_ID: 'sess_x' } });
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn![2].env.BOTMUX_SESSION_ID).toBe('sess_x');
+    expect(serverSpawn![2].env.ANTHROPIC_BASE_URL).toBeUndefined();
+    be.kill();
+  });
+
   it('reattach reuses an existing agent without re-running `agent start`', () => {
     // Reuse is gated on isReattach: only a genuine daemon-restart reattach to a
     // still-alive session adopts the existing `botmux` row. A fresh spawn (incl.

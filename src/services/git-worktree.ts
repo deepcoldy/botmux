@@ -9,7 +9,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { logger } from '../utils/logger.js';
 
@@ -30,6 +30,8 @@ export interface CreateRepoWorktreeOptions {
   branch?: string;
   /** Semantic auto-name seed; creates `wt/<slug>` and dir `<repo>-wt-<slug>`. */
   slug?: string;
+  /** Explicit target directory. Used by multi-repo worktree groups. */
+  worktreePath?: string;
 }
 
 async function git(args: string[], cwd: string, timeoutMs = 10_000): Promise<string> {
@@ -71,7 +73,7 @@ async function resolveBaseRef(repo: string): Promise<string> {
 }
 
 /** Branch names may contain `/` etc. — flatten to a filesystem-safe suffix. */
-function dirSuffixForBranch(branch: string): string {
+export function dirSuffixForBranch(branch: string): string {
   return branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch';
 }
 
@@ -144,37 +146,66 @@ export async function createRepoWorktree(
 
   let branch = opts.branch?.trim() ?? '';
   let wtPath: string;
+  const explicitPath = opts.worktreePath ? resolve(opts.worktreePath) : undefined;
   // Sanitize the auto-name seed up front: a slug with no latin/digit tokens
   // (e.g. all-CJK) collapses to nothing → fall through to the `wt/N` path
   // rather than throwing or emitting an opaque hash.
   const slug = branch ? undefined : slugFromWorktreeText(opts.slug);
   if (branch) {
-    wtPath = join(parent, `${repoBase}-${dirSuffixForBranch(branch)}`);
+    wtPath = explicitPath ?? join(parent, `${repoBase}-${dirSuffixForBranch(branch)}`);
     if (existsSync(wtPath)) throw new Error(`worktree target already exists: ${wtPath}`);
   } else if (slug) {
-    for (let n = 1;; n++) {
-      if (n > 1000) throw new Error(`no free wt/${slug} slot under 1000`);
-      const candidateSlug = n === 1 ? slug : `${slug}-${n}`;
-      const candidateBranch = `wt/${candidateSlug}`;
-      const candPath = join(parent, `${repoBase}-${dirSuffixForBranch(candidateBranch)}`);
-      if (existsSync(candPath) ||
-        (await localBranchExists(repo, candidateBranch)) ||
-        (await remoteBranchExists(repo, candidateBranch))) continue;
-      branch = candidateBranch;
-      wtPath = candPath;
-      break;
+    if (explicitPath) {
+      for (let n = 1;; n++) {
+        if (n > 1000) throw new Error(`no free wt/${slug} slot under 1000`);
+        const candidateSlug = n === 1 ? slug : `${slug}-${n}`;
+        const candidateBranch = `wt/${candidateSlug}`;
+        if ((await localBranchExists(repo, candidateBranch)) ||
+          (await remoteBranchExists(repo, candidateBranch))) continue;
+        branch = candidateBranch;
+        wtPath = explicitPath;
+        break;
+      }
+      if (existsSync(wtPath)) throw new Error(`worktree target already exists: ${wtPath}`);
+    } else {
+      for (let n = 1;; n++) {
+        if (n > 1000) throw new Error(`no free wt/${slug} slot under 1000`);
+        const candidateSlug = n === 1 ? slug : `${slug}-${n}`;
+        const candidateBranch = `wt/${candidateSlug}`;
+        const candPath = join(parent, `${repoBase}-${dirSuffixForBranch(candidateBranch)}`);
+        if (existsSync(candPath) ||
+          (await localBranchExists(repo, candidateBranch)) ||
+          (await remoteBranchExists(repo, candidateBranch))) continue;
+        branch = candidateBranch;
+        wtPath = candPath;
+        break;
+      }
     }
   } else {
-    let n = 1;
-    for (;; n++) {
-      if (n > 1000) throw new Error('no free wt/N slot under 1000');
-      const candPath = join(parent, `${repoBase}-wt-${n}`);
-      if (existsSync(candPath) || (await localBranchExists(repo, `wt/${n}`))) continue;
-      branch = `wt/${n}`;
-      wtPath = candPath;
-      break;
+    if (explicitPath) {
+      let n = 1;
+      for (;; n++) {
+        if (n > 1000) throw new Error('no free wt/N slot under 1000');
+        if (await localBranchExists(repo, `wt/${n}`)) continue;
+        branch = `wt/${n}`;
+        wtPath = explicitPath;
+        break;
+      }
+      if (existsSync(wtPath)) throw new Error(`worktree target already exists: ${wtPath}`);
+    } else {
+      let n = 1;
+      for (;; n++) {
+        if (n > 1000) throw new Error('no free wt/N slot under 1000');
+        const candPath = join(parent, `${repoBase}-wt-${n}`);
+        if (existsSync(candPath) || (await localBranchExists(repo, `wt/${n}`))) continue;
+        branch = `wt/${n}`;
+        wtPath = candPath;
+        break;
+      }
     }
   }
+
+  mkdirSync(dirname(wtPath), { recursive: true });
 
   if (await localBranchExists(repo, branch)) {
     // Existing branch: check it out as-is (git rejects it if the branch is
@@ -202,4 +233,14 @@ export async function createRepoWorktree(
   await git(['worktree', 'add', '-b', branch, wtPath, baseRef], repo, 60_000);
   logger.info(`[git-worktree] created ${wtPath} (branch ${branch} from ${baseRef})`);
   return { path: wtPath, branch, baseRef };
+}
+
+/** Remove a worktree created by {@link createRepoWorktree}. Used to roll back the
+ *  worktrees already built when a later repo in a multi-repo batch fails — leaves
+ *  the branch in place (it may be a pre-existing branch we only checked out, and a
+ *  dangling auto-named branch is harmless) and only detaches/deletes the worktree
+ *  dir so a retry doesn't trip over "worktree target already exists". */
+export async function removeRepoWorktree(repo: string, worktreePath: string): Promise<void> {
+  await git(['worktree', 'remove', '--force', worktreePath], repo, 30_000);
+  logger.info(`[git-worktree] removed worktree ${worktreePath}`);
 }

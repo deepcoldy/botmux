@@ -33,6 +33,25 @@ export function shouldAutoLinkLocalSkillPath(rawPath: string): boolean {
   ));
 }
 
+/** Upper bound on a single batch local-link registration. Bounds the inline,
+ *  synchronous loadSkillPackage loop (realpath + read per dir) that runs on the
+ *  daemon event loop, so a runaway/garbage `sources` array can't stall message
+ *  handling. Comfortably above any realistic native-skill count. */
+export const MAX_LOCAL_LINK_SOURCES = 512;
+
+/** Parse + sanitize the `sources` of POST /api/skills/install-local-links:
+ *  keep only non-empty trimmed strings, dedup, preserving order. Pure so the
+ *  endpoint's validation has a regression guard (the route just maps the result
+ *  to sources_required / too_many_sources / install). */
+export function parseInstallLocalLinksSources(body: unknown): string[] {
+  const obj = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  const raw = Array.isArray(obj.sources) ? obj.sources : [];
+  const trimmed = raw
+    .filter((source): source is string => typeof source === 'string' && source.trim().length > 0)
+    .map((source) => source.trim());
+  return [...new Set(trimmed)];
+}
+
 export function parseDashboardSkillInstallRequest(body: Record<string, unknown>): DashboardSkillInstallRequest {
   const source = typeof body.source === 'string' ? body.source.trim() : '';
   if (!source) throw new Error('source_required');

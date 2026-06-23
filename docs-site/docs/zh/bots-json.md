@@ -48,6 +48,27 @@
 | `backendType` | 会话后端，可选 `pty` / `tmux` / `herdr` / `zellij`。留空**自动检测**：tmux 可用选 `tmux`，否则 `pty`（`herdr`、`zellij` 不会被自动选中，需显式指定）。`tmux` / `herdr` / `zellij` 都是持久会话，对应二进制探测失败时自动回落 `pty`（`zellij` 需 ≥ 0.44）；`pty` 直连进程、不跨重启持久。见 [tmux 后端](/tmux) |
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
+| `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
+
+### 接入 GLM / 第三方服务商（per-bot env）
+
+让某个 bot 跑 GLM Coding Plan（或其它 Anthropic 兼容服务商），另一个 bot 仍跑官方 Claude——给前者配 `env`：
+
+```json
+{
+  "cliId": "claude-code",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "你的 GLM Coding Plan key"
+  }
+}
+```
+
+- GLM 国内站把 `ANTHROPIC_BASE_URL` 换成 `https://open.bigmodel.cn/api/anthropic`。
+- 给 Codex 这类 OpenAI 协议 CLI 接入时，填 `OPENAI_BASE_URL` / `OPENAI_API_KEY`（服务商的 OpenAI 兼容端点）而非 `ANTHROPIC_*`。
+- **隔离**：env 按会话注入到 CLI 进程，全后端一致（tmux / zellij 经每个 pane 注入，绝不写共享 server 全局），所以一个 bot 的服务商配置不会串到别的 bot。
+- **安全**：值以明文存在 `bots.json` 与进程环境，不是密钥保险箱；`/config get` 等聊天面会脱敏显示（dashboard 编辑器 owner 鉴权后显示原值）。
+- 改完下个**新会话**生效。
 
 ## 工作目录
 
@@ -69,6 +90,7 @@
 | `chatGrants` | 按群的 per-user 授权 `{ "oc_xxx": ["ou_yyy"] }`，仅放行 `canTalk`。一般由 `/grant` 卡片写入，也可手配 |
 | `messageQuota` | 消息额度开关 `{ "defaultLimit": N }`：配了正整数后，不带数字的 `/grant` 套用 N 条额度；不配则授权无限。仅约束 talk 授权，不影响 `canOperate` |
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
+| `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 
 ## 卡片与终端
 
