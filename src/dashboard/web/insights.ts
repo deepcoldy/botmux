@@ -2162,6 +2162,10 @@ export function renderInsightsPage(root: HTMLElement): () => void {
       return;
     }
     if (paletteOpen) {
+      // While an IME (CJK) composition is active, Enter/Arrow confirm or move the
+      // candidate list — don't hijack them to select/close the palette. keyCode 229
+      // is the legacy "composition in progress" signal for browsers without isComposing.
+      if (e.isComposing || e.keyCode === 229) return;
       const items = paletteItems();
       if (e.key === 'Escape') { e.preventDefault(); closePalette(); }
       else if (e.key === 'ArrowDown') { e.preventDefault(); paletteIdx = Math.min(items.length - 1, paletteIdx + 1); paintPaletteList(); }

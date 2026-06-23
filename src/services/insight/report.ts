@@ -1201,8 +1201,10 @@ export function buildSafeInsightReport(q: InsightReportQuery, opts: BuildInsight
     report.meta.capped = parsed.spans.length > visible.length;
     report.workSummary = buildWorkSummary(visibleRaw ?? [], visible, q.cwd);
     // Delegated sub-agents (Claude only) — one extra file parse each, so detail-mode only.
+    // Route through the shared parse cache so repeated detail fetches don't re-read
+    // unchanged sub-agent transcripts.
     if (resolved.kind === 'claude') {
-      const lanes = buildSubagentLanes(resolved.path);
+      const lanes = buildSubagentLanes(resolved.path, p => cachedParseForKind('claude', p));
       if (lanes.length) report.subagents = lanes;
     }
   }

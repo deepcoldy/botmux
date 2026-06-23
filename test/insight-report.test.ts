@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,6 +17,7 @@ vi.mock('../src/services/transcript-resolver.js', () => ({
 }));
 
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../src/services/insight/report.js';
+import { buildSubagentLanes } from '../src/services/insight/subagent-reader.js';
 
 let dir = '';
 
@@ -961,5 +962,52 @@ describe('SafeInsightReport', () => {
     expect(overview.agg.phase.research.count).toBe(5);
     expect(overview.agg.phase.edit.count).toBe(5);
     expect(overview.agg.readWriteRatio).toBe(1);
+  });
+});
+
+describe('buildSubagentLanes', () => {
+  const MAX_SUBAGENTS = 40;
+  function writeSubagentFiles(sessionId: string, n: number): string {
+    const subdir = join(dir, sessionId, 'subagents');
+    mkdirSync(subdir, { recursive: true });
+    for (let i = 0; i < n; i++) {
+      writeFileSync(join(subdir, `agent-${i}.jsonl`), '{}\n', 'utf-8');
+      writeFileSync(join(subdir, `agent-${i}.meta.json`), JSON.stringify({ agentType: 'Explore', description: `task ${i}` }), 'utf-8');
+    }
+    return join(dir, `${sessionId}.jsonl`);
+  }
+
+  it('parses at most MAX_SUBAGENTS transcripts even when the dir holds far more', () => {
+    const mainPath = writeSubagentFiles('many', 50);
+    let calls = 0;
+    // The cap is applied to the candidate set BEFORE parsing, so a session with
+    // hundreds of sub-agent files can't trigger hundreds of full parses.
+    const lanes = buildSubagentLanes(mainPath, p => { calls++; expect(p).toContain('subagents'); return { spans: [] }; });
+    expect(calls).toBe(MAX_SUBAGENTS);
+    expect(lanes.length).toBe(MAX_SUBAGENTS);
+  });
+
+  it('returns [] (and never parses) when there is no subagents dir', () => {
+    const lanes = buildSubagentLanes(join(dir, 'nope.jsonl'), () => { throw new Error('should not parse'); });
+    expect(lanes).toEqual([]);
+  });
+
+  it('rolls up phase/reads/edits/runs/failures/duration and safe-projects the meta', () => {
+    const mainPath = writeSubagentFiles('one', 1);
+    const lanes = buildSubagentLanes(mainPath, () => ({ spans: [
+      { phase: 'research', tool: 'Read', status: 'ok', durationMs: 10 },
+      { phase: 'edit', tool: 'Edit', status: 'error', durationMs: 20 },
+      { phase: 'run', tool: 'Bash', status: 'ok' },
+      // Interactive-wait tool: counted as an action but its wall-clock is excluded.
+      { phase: 'discuss', tool: 'AskUserQuestion', status: 'ok', durationMs: 99999 },
+    ] }));
+    expect(lanes.length).toBe(1);
+    expect(lanes[0]!.reads).toBe(1);
+    expect(lanes[0]!.edits).toBe(1);
+    expect(lanes[0]!.runs).toBe(1);
+    expect(lanes[0]!.failures).toBe(1);
+    expect(lanes[0]!.durationMs).toBe(30);
+    expect(lanes[0]!.agentType).toBe('Explore');
+    expect(lanes[0]!.task?.text).toContain('task');
   });
 });

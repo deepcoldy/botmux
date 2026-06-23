@@ -37,10 +37,19 @@ function emptyPhase(): Record<InsightPhase, { count: number; ms: number }> {
   return out;
 }
 
+type LaneSpan = { phase: InsightPhase; tool: string; status: string; durationMs?: number };
+/** Inject the caller's cached parser so repeated detail fetches of the same
+ *  session don't re-read unchanged sub-agent transcripts. Defaults to a fresh
+ *  parse for standalone use / tests. */
+type SubagentParse = (path: string) => { spans?: LaneSpan[] } | null;
+
 /** Roll up the delegated sub-agents for a Claude session into safe lanes.
  *  Returns [] when there is no subagents dir (most sessions). Detail-mode only —
  *  it parses one extra file per sub-agent, so never call it for the overview. */
-export function buildSubagentLanes(mainPath: string): SafeSubagentLane[] {
+export function buildSubagentLanes(
+  mainPath: string,
+  parse: SubagentParse = parseClaudeInsight,
+): SafeSubagentLane[] {
   const dir = subagentsDir(mainPath);
   if (!existsSync(dir)) return [];
   let files: string[];
@@ -49,22 +58,31 @@ export function buildSubagentLanes(mainPath: string): SafeSubagentLane[] {
   } catch {
     return [];
   }
-  const lanes: SafeSubagentLane[] = [];
+  // Stat is cheap (no content read); parse is not. Drop oversized files and pick
+  // the MAX_SUBAGENTS most-recent transcripts BEFORE parsing — otherwise a session
+  // that accumulated hundreds of sub-agent files would force hundreds of full
+  // parses just to return the top 40 (the final cap bounds output, not work).
+  const candidates: Array<{ jsonlPath: string; metaPath: string; mtimeMs: number }> = [];
   for (const file of files) {
     const jsonlPath = join(dir, file);
     try {
-      if (statSync(jsonlPath).size > MAX_SUBAGENT_BYTES) continue;
+      const st = statSync(jsonlPath);
+      if (st.size > MAX_SUBAGENT_BYTES) continue;
+      candidates.push({ jsonlPath, metaPath: join(dir, file.replace(/\.jsonl$/, '.meta.json')), mtimeMs: st.mtimeMs });
     } catch {
       continue;
     }
-    const meta = readMeta(join(dir, file.replace(/\.jsonl$/, '.meta.json')));
-    let spans: Array<{ phase: InsightPhase; tool: string; status: string; durationMs?: number }>;
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const lanes: SafeSubagentLane[] = [];
+  for (const { jsonlPath, metaPath } of candidates.slice(0, MAX_SUBAGENTS)) {
+    let spans: LaneSpan[];
     try {
-      const parsed = parseClaudeInsight(jsonlPath) as { spans: typeof spans };
-      spans = parsed.spans ?? [];
+      spans = parse(jsonlPath)?.spans ?? [];
     } catch {
       continue;
     }
+    const meta = readMeta(metaPath);
     const phase = emptyPhase();
     let reads = 0;
     let edits = 0;
