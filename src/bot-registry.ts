@@ -235,6 +235,12 @@ export interface BotConfig {
    */
   disableStreamingCard?: boolean;
   /**
+   * When true, suppress the lightweight GoGoGo → DONE message reactions used as
+   * progress markers in card-off sessions. Missing/false preserves the current
+   * card-off reaction behavior.
+   */
+  silentTurnReactions?: boolean;
+  /**
    * Conversation mode for 1:1 private chats (DMs) with the bot:
    *   - 'thread' (default, stored as undefined): every top-level DM message
    *     starts a fresh thread-scoped session — the official/legacy behavior,
@@ -856,6 +862,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      silentTurnReactions: entry.silentTurnReactions === true || undefined,
       // Only 'chat' is meaningful; 'thread' (and anything else) normalizes to
       // undefined — the legacy thread-per-message default. Keeps bots.json clean.
       p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,

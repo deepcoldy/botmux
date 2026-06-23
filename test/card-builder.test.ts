@@ -17,6 +17,7 @@ import {
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildPrivateSnapshotCard,
+  buildConfigCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -54,6 +55,12 @@ function buttonTexts(actions: any[]): string[] {
   return actions
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
+}
+
+function allActions(card: any): any[] {
+  return card.elements
+    .filter((e: any) => e.tag === 'action')
+    .flatMap((e: any) => e.actions ?? []);
 }
 
 function expectSidebarUrl(actual: string, targetUrl: string): void {
@@ -119,6 +126,45 @@ describe('getCliDisplayName', () => {
 
   it('should return "Pi" for pi', () => {
     expect(getCliDisplayName('pi')).toBe('Pi');
+  });
+});
+
+describe('buildConfigCard', () => {
+  it('renders silentTurnReactions as a card-behaviour toggle', () => {
+    const card = parse(buildConfigCard({
+      larkAppId: 'app_cfg',
+      botName: 'Config Bot',
+      cliId: 'codex',
+      cliOptions: [{ id: 'codex', label: 'Codex' }],
+      model: null,
+      modelChoices: [],
+      lang: null,
+      p2pMode: null,
+      brandLabel: null,
+      defaultWorkingDir: null,
+      autoStartPrompt: null,
+      customPassthroughCommands: null,
+      startupCommands: null,
+      teamRole: null,
+      quota: null,
+      admins: 1,
+      booleans: [
+        { key: 'disableStreamingCard', on: false },
+        { key: 'silentTurnReactions', on: true },
+        { key: 'writableTerminalLinkInCard', on: false },
+        { key: 'privateCard', on: false },
+        { key: 'autoStartOnGroupJoin', on: false },
+        { key: 'autoStartOnNewTopic', on: false },
+        { key: 'disableCliBypass', on: false },
+        { key: 'restrictGrantCommands', on: false },
+      ],
+    }, 'en'));
+
+    const toggle = allActions(card).find((a: any) => a.value?.field === 'silentTurnReactions');
+    expect(toggle).toBeTruthy();
+    expect(toggle.value.action).toBe('config_toggle');
+    expect(toggle.type).toBe('primary');
+    expect(toggle.text.content).toContain('Disable status reactions');
   });
 });
 

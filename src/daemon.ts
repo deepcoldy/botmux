@@ -341,6 +341,12 @@ function streamingCardDisabledFor(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
+function silentTurnReactionsFor(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.silentTurnReactions === true;
+  } catch { return false; }
+}
+
 function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
   const paths = [
     join(config.session.dataDir, `sessions-${larkAppId}.json`),
@@ -366,13 +372,14 @@ export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: stri
   // This call site is the per-message acceptance point, so it also drives the
   // two-phase turn reaction. It's auto-enabled exactly for card-off sessions
   // (streaming card disabled): those have no live status card, so the ✋→✅ on
-  // the user's message is the only lightweight progress signal. When the
-  // streaming card is on it already shows status, so we stay silent.
+  // the user's message is the only lightweight progress signal. Bots can opt
+  // out via silentTurnReactions for low-noise observer scenarios.
   // React 冲! on the triggering message the instant it's accepted. Binding to the
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
   if (!streamingCardDisabledFor(ds)) return;
+  if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
   if (!triggerMessageId.startsWith('om_')) return;
   if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;

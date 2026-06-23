@@ -162,6 +162,12 @@ function streamingCardDisabled(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
+function silentTurnReactions(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.silentTurnReactions === true;
+  } catch { return false; }
+}
+
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
 // card body (token included). Returns undefined unless the bot enabled it AND
 // the worker port/token are known. Exported for card-handler's re-renders so the
@@ -2407,9 +2413,11 @@ const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
  * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
  * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
  * acceptance point (`noteTurnReceived`); when the worker next returns to idle we
- * flip every pending ✋ on this session to ✅ DONE and clear the list. Binding the
- * start to the message (not a status edge) means type-ahead / busy-batched
- * messages each get their own reaction and all settle together here.
+ * flip every pending ✋ on this session to ✅ DONE and clear the list. When
+ * silentTurnReactions is enabled after a ✋ has already landed, we only remove
+ * that received reaction and do not add DONE. Binding the start to the message
+ * (not a status edge) means type-ahead / busy-batched messages each get their
+ * own reaction and all settle together here.
  *
  * Every Feishu call is best-effort — a failure only means a missing emoji, so it
  * must never throw into the status pipeline (callers invoke as `void`).
@@ -2419,6 +2427,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   if (!list || list.length === 0) return;
   // Detach the batch first so a second idle edge can't double-flip it.
   ds.pendingAckReactions = [];
+  const silent = silentTurnReactions(ds);
   for (const ack of list) {
     if (ack.reactionId) {
       try {
@@ -2427,6 +2436,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
         logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
       }
     }
+    if (silent) continue;
     try {
       await addReaction(ds.larkAppId, ack.messageId, DONE_REACTION_EMOJI_TYPE);
     } catch (err: any) {
