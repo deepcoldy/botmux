@@ -214,6 +214,16 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
       continue;
     }
+    const ds = findGoalSupervisorSession(deps.activeSessions, deps.larkAppId, goalChatId);
+    if (!ds) {
+      results.push({
+        goalChatId,
+        status: 'no-l2',
+        pendingTaskIds: tasks.map((task) => task.taskId),
+        reason: 'no active chat-scope goal supervisor session',
+      });
+      continue;
+    }
     const legacyTasks: TaskView[] = [];
     const inspectionFacts = new Map<string, string>();
     let reconciled = false;
@@ -270,12 +280,7 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       }
       continue;
     }
-    const ds = findGoalSupervisorSession(deps.activeSessions, deps.larkAppId, goalChatId);
     const pendingTaskIds = legacyTasks.map((task) => task.taskId);
-    if (!ds) {
-      results.push({ goalChatId, status: 'no-l2', pendingTaskIds, reason: 'no active chat-scope goal supervisor session' });
-      continue;
-    }
     if (isBusy(ds)) {
       results.push({ goalChatId, status: 'busy', pendingTaskIds, sessionId: ds.session.sessionId });
       continue;
