@@ -2,10 +2,14 @@
  * PR3 `/dashboard sessions` slice 1 — card builder + callback handler tests.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 import type { SessionRow } from '../src/core/dashboard-rows.js';
 import { composeDetail } from '../src/dashboard/session-card-model.js';
+import { globalConfigPath } from '../src/global-config.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildSessionsCard,
@@ -22,6 +26,24 @@ import {
 
 const INVOKER = 'ou_owner';
 const LARK_APP_ID = 'cli_test';
+
+// The terminal button's URL wrapping depends on the global dashboard setting
+// `openTerminalInFeishu` (read via readGlobalConfig at card-build time): default
+// → direct URL, opt-in → Feishu sidebar applink wrapper. Isolate HOME to an
+// empty temp dir so these tests deterministically see the DEFAULT (no
+// config.json → direct URL), independent of whatever the test runner's real
+// ~/.botmux/config.json holds. readGlobalConfig's read cache is keyed on the
+// resolved config path, so stubbing HOME forces a fresh read of the empty dir.
+let sessionsCardTestHome: string;
+beforeEach(() => {
+  sessionsCardTestHome = mkdtempSync(join(tmpdir(), 'botmux-sessions-card-'));
+  vi.stubEnv('HOME', sessionsCardTestHome);
+  mkdirSync(dirname(globalConfigPath()), { recursive: true });
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(sessionsCardTestHome, { recursive: true, force: true });
+});
 
 function row(over: Partial<SessionRow> = {}): SessionRow {
   return {
