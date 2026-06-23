@@ -4437,6 +4437,19 @@ function buildGoalParentReplyPrompt(record: GoalParentNotificationRecord, parsed
   ].filter(Boolean).join('\n');
 }
 
+function buildGoalDashboardDecisionPrompt(input: { goalChatId: string; taskId?: string; text: string }): string {
+  return [
+    '[人工决策] 来自 dashboard 的人工指示。请作为本 goal 的 L2 监管者处理这条决策。',
+    `goalChatId: ${input.goalChatId}`,
+    input.taskId ? `taskId: ${input.taskId}` : undefined,
+    '',
+    'decision:',
+    input.text,
+    '',
+    '请先查 goal charter 和 delivery ledger，再据此引导 worker、代办、重派、accept/reject、关闭升级或继续升级给人，并把关键判断留痕到账本/charter。',
+  ].filter(Boolean).join('\n');
+}
+
 async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string, chatId?: string): Promise<boolean> {
   if (parsed.senderType === 'app' || parsed.senderType === 'bot') return false;
   const record = findGoalNotificationRecordForReply(parsed);
@@ -4464,6 +4477,29 @@ async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string,
   logger.info(`[goal-parent-reply] routed parent reply ${parsed.messageId.substring(0, 12)} to L2 ${supervisor.session.sessionId.substring(0, 8)} goal=${record.goalChatId}`);
   return true;
 }
+
+ipcRoute('POST', '/api/goals/:goalChatId/decision', async (req, res, params) => {
+  let raw: { taskId?: unknown; text?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = params.goalChatId?.trim();
+  const text = typeof raw.text === 'string' ? raw.text.trim() : '';
+  const taskId = typeof raw.taskId === 'string' && raw.taskId.trim() ? raw.taskId.trim() : undefined;
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, error: 'missing_goalChatId' });
+  if (!text) return jsonRes(res, 400, { ok: false, error: 'missing_text' });
+  const supervisor = findGoalSupervisorForNotify({ goalChatId });
+  if (!supervisor) return jsonRes(res, 404, { ok: false, error: 'no_supervisor' });
+  await injectGoalSupervisorTurn(supervisor, buildGoalDashboardDecisionPrompt({ goalChatId, taskId, text }));
+  return jsonRes(res, 200, {
+    ok: true,
+    goalChatId,
+    taskId,
+    supervisorSessionId: supervisor.session.sessionId,
+  });
+});
 
 // Internal: L2 supervisor notifies its L1 parent without sending a Lark
 // self-message. The parent coordinates are stored structurally on the L2
