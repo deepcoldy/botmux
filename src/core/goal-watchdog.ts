@@ -45,7 +45,7 @@ export interface GoalWatchdogDeps {
   defaultTimeoutMs?: number;
 }
 
-export type GoalWatchdogNotifyKind = 'accepted' | 'rejected' | 'nudge';
+export type GoalWatchdogNotifyKind = 'accepted' | 'rejected';
 
 export interface GoalWatchdogNotifyEvent {
   kind: GoalWatchdogNotifyKind;
@@ -107,12 +107,6 @@ function formatPassedChecks(result: ReconcileResult): string[] {
     .map((check) => `- ${check.kind} ${check.target}`);
 }
 
-function workerMentionPrefix(task: TaskView): string {
-  const ids = task.workerOpenIds ?? [];
-  if (ids.length === 0) return '';
-  return `${ids.map((id) => `<at user_id="${id}"></at>`).join(' ')} `;
-}
-
 function buildGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): string {
   const { kind, task, result } = event;
   if (kind === 'accepted') {
@@ -131,11 +125,7 @@ function buildGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): string {
       failed ? `未通过检查:\n${failed}` : undefined,
     ].filter(Boolean).join('\n');
   }
-  const failed = formatFailedChecks(result).slice(0, 8).join('\n');
-  return [
-    `${workerMentionPrefix(task)}[goal-watchdog] 任务 ${task.taskId} 的结构化验收未通过，请补齐产物或继续修复后再 report。`,
-    failed ? `未通过检查:\n${failed}` : undefined,
-  ].filter(Boolean).join('\n');
+  return '';
 }
 
 async function sendGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): Promise<void> {
@@ -227,7 +217,6 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
     const legacyTasks: TaskView[] = [];
     const inspectionFacts = new Map<string, string>();
     let reconciled = false;
-    let rateLimited = false;
     const last = lastInjectedAt.get(goalChatId) ?? 0;
     for (const task of tasks) {
       const reconcile = reconcileTaskByCriteria(ledger, task.taskId, {
@@ -257,24 +246,17 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
           logger.warn(`[goal-watchdog] notify ${reconcile.action} failed goal=${goalChatId} task=${task.taskId}: ${err instanceof Error ? err.message : String(err)}`);
         }
       } else if (reconcile.action === 'nudge') {
-        if (last > 0 && now - last < intervalMs) {
-          rateLimited = true;
-          continue;
-        }
-        reconciled = true;
-        try {
-          await notify({ kind: 'nudge', larkAppId: deps.larkAppId, goalChatId, task, result: reconcile });
-        } catch (err) {
-          logger.warn(`[goal-watchdog] notify nudge failed goal=${goalChatId} task=${task.taskId}: ${err instanceof Error ? err.message : String(err)}`);
-        }
+        inspectionFacts.set(
+          task.taskId,
+          reconcile.inspectionFact ?? '结构化验收未通过；请监管者统揽判断：引导 worker、重派、要求重新 report，或升级给人。',
+        );
+        legacyTasks.push(task);
       }
     }
     if (legacyTasks.length === 0) {
       if (reconciled) {
         lastInjectedAt.set(goalChatId, now);
         results.push({ goalChatId, status: 'reconciled', pendingTaskIds: tasks.map((task) => task.taskId) });
-      } else if (rateLimited) {
-        results.push({ goalChatId, status: 'rate-limited', pendingTaskIds: tasks.map((task) => task.taskId) });
       } else {
         results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
       }
@@ -311,7 +293,7 @@ export async function runGoalWatchdogForGoal(input: {
     larkAppId: input.larkAppId,
     activeSessions: input.activeSessions,
     now: input.now,
-    intervalMs: input.cooldownMs ?? DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
+    intervalMs: input.cooldownMs ?? DEFAULT_GOAL_WATCHDOG_INTERVAL_MS,
     goalChatIds: [input.goalChatId],
     lastInjectedAt: defaultLastInjectedAt,
   });
