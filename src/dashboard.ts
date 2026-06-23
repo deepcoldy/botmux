@@ -2200,7 +2200,6 @@ const server = createServer(async (req, res) => {
       }
       const content = typeof parsed.content === 'string' ? parsed.content.replace(/\s+$/u, '') : '';
       if (!content.trim()) return jsonRes(res, 400, { ok: false, error: 'empty_content' });
-      if (content.length > 8000) return jsonRes(res, 400, { ok: false, error: 'content_too_long' });
       const selectedIds = Array.isArray(parsed.larkAppIds)
         ? Array.from(new Set((parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')))
         : [];

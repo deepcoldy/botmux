@@ -23,7 +23,6 @@ export type CreateSessionColumn = (typeof CREATE_SESSION_COLUMNS)[number];
 export type SpawnRole = 'solo' | 'lead' | 'collab';
 export const SPAWN_ROLES: readonly SpawnRole[] = ['solo', 'lead', 'collab'];
 
-export const CREATE_SESSION_CONTENT_MAX = 8000;
 const TITLE_MAX = 50;
 
 export interface Coworker {
@@ -141,7 +140,6 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
   const rawContent = typeof b.content === 'string' ? b.content : '';
   const content = rawContent.replace(/\s+$/u, '');
   if (!content.trim()) return { ok: false, error: 'empty_content' };
-  if (content.length > CREATE_SESSION_CONTENT_MAX) return { ok: false, error: 'content_too_long' };
   const column = normalizeCreateColumn(b.column);
   if (!column) return { ok: false, error: 'bad_column' };
   const role = normalizeSpawnRole(b.role);

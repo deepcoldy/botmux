@@ -7,7 +7,6 @@ import {
   composeSpawnUserContent,
   buildLeadDispatchPreamble,
   buildCollabNote,
-  CREATE_SESSION_CONTENT_MAX,
 } from '../src/core/session-create.js';
 
 describe('normalizeCreateMode / normalizeCreateColumn', () => {
@@ -64,9 +63,11 @@ describe('parseSpawnRequest', () => {
     expect(parseSpawnRequest({ ...base, content: '' })).toMatchObject({ ok: false, error: 'empty_content' });
   });
 
-  it('rejects content over the size cap', () => {
-    const huge = 'a'.repeat(CREATE_SESSION_CONTENT_MAX + 1);
-    expect(parseSpawnRequest({ ...base, content: huge })).toMatchObject({ ok: false, error: 'content_too_long' });
+  it('accepts very long content (no size cap — owner-authed input)', () => {
+    const huge = 'a'.repeat(50000);
+    const r = parseSpawnRequest({ ...base, content: huge });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.content.length).toBe(50000);
   });
 
   it('rejects bad column / role', () => {
