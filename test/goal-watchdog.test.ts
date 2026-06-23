@@ -200,7 +200,7 @@ describe('goal watchdog', () => {
     expect(rateLimited[0].status).toBe('rate-limited');
   });
 
-  it('event trigger scopes to one goal and uses the short cooldown', async () => {
+  it('event trigger scopes to one goal and honors the shared cooldown', async () => {
     const activeSessions = new Map<string, DaemonSession>();
     activeSessions.set(sessionKey('oc_a', 'cli_main'), ds({ chatId: 'oc_a', larkAppId: 'cli_main', sessionId: 'sa' }));
     activeSessions.set(sessionKey('oc_b', 'cli_main'), ds({ chatId: 'oc_b', larkAppId: 'cli_main', sessionId: 'sb' }));
@@ -429,7 +429,7 @@ describe('goal watchdog', () => {
     }
   });
 
-  it('nudges structured failing tasks and rate-limits repeated nudges', async () => {
+  it('hands structured failing tasks to L2 and rate-limits repeated injections', async () => {
     const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-nudge-'));
     try {
       const missing = join(baseDir, 'missing.txt');
@@ -452,6 +452,7 @@ describe('goal watchdog', () => {
       });
       const lastInjectedAt = new Map<string, number>();
       const notifications: any[] = [];
+      const injected: string[] = [];
       const activeSessions = new Map<string, DaemonSession>();
       activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
       const first = await runGoalWatchdogOnce({
@@ -462,6 +463,7 @@ describe('goal watchdog', () => {
         intervalMs: 30_000,
         lastInjectedAt,
         notify: (event) => notifications.push(event),
+        inject: (_target, prompt) => injected.push(prompt),
       });
       const second = await runGoalWatchdogOnce({
         larkAppId: 'cli_main',
@@ -471,11 +473,16 @@ describe('goal watchdog', () => {
         intervalMs: 30_000,
         lastInjectedAt,
         notify: (event) => notifications.push(event),
+        inject: () => { throw new Error('should be rate-limited'); },
       });
 
-      expect(first).toMatchObject([{ status: 'reconciled', pendingTaskIds: ['task-fail'] }]);
+      expect(first).toMatchObject([{ status: 'injected', pendingTaskIds: ['task-fail'] }]);
       expect(second).toMatchObject([{ status: 'rate-limited', pendingTaskIds: ['task-fail'] }]);
-      expect(notifications.map((n) => n.kind)).toEqual(['nudge']);
+      expect(notifications).toEqual([]);
+      expect(injected).toHaveLength(1);
+      expect(injected[0]).toContain('task-fail');
+      expect(injected[0]).toContain('未通过明细');
+      expect(injected[0]).toContain('不要机械重复催促');
       expect(led.task('task-fail')?.status).toBe('dispatched');
     } finally {
       rmSync(baseDir, { recursive: true, force: true });
