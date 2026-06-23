@@ -1458,12 +1458,13 @@ export async function spawnDashboardSession(
 
   // 可见任务横幅：只由 creator/lead 那次 spawn 发一条，给群成员交代这群是干嘛的。
   // 纯文本、不 @ 任何 bot，不会误触发其它 bot。rootMessageId 存它仅为留痕（chat-scope
-  // 路由不看 rootMessageId）。失败不致命。
+  // 路由不看 rootMessageId）。失败不致命。横幅发完整内容——之前 slice(0,300) 会把超
+  // 300 字的任务在群里截断（用户看着像"内容丢了"，其实会话拿到的是全文，只是横幅被切）。
   let bannerMessageId: string | undefined;
   if (args.postBanner) {
     try {
       const { sendMessage } = await import('../im/lark/client.js');
-      bannerMessageId = await sendMessage(larkAppId, chatId, t('cmd.createSession.banner', { content: content.slice(0, 300) }, locale));
+      bannerMessageId = await sendMessage(larkAppId, chatId, t('cmd.createSession.banner', { content }, locale));
     } catch (err: any) {
       logger.warn(`[createSession] banner send failed in ${chatId}: ${err?.message ?? err}`);
     }

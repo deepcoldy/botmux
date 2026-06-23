@@ -117,6 +117,18 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
   });
 
+  it('banner posts the FULL content (no 300-char truncation that dropped the tail in the group)', async () => {
+    const active = new Map<string, DaemonSession>();
+    // >300 chars so the tail sits past the old slice(0,300) cutoff
+    const longContent = '前缀内容'.repeat(90) + '怎么验\n1. 第一步\n2. 第二步收尾';
+    expect(longContent.length).toBeGreaterThan(300);
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: longContent, column: 'backlog', role: 'solo', postBanner: true,
+    });
+    const bannerText = sendMessageMock.mock.calls[0][2] as string;
+    expect(bannerText).toContain('第二步收尾'); // tail must survive — was dropped by the 300-char slice
+  });
+
   it('lead-role backlog stores the orchestration preamble in queuedPrompt (preserved through activation)', async () => {
     const active = new Map<string, DaemonSession>();
     await spawnDashboardSession(active, undefined, {
