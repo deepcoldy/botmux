@@ -2,7 +2,7 @@
 
 ## Runtime environment
 
-- **Node.js ≥ 20**
+- **Node.js ≥ 22**
 - **AI coding CLI / local agent app**: at least one installed and authenticated, with the executable on your `PATH`:
   - `claude` (Claude Code), `codex`, `cursor-agent` (Cursor), `gemini`, `opencode`, `coco` (Trae / CoCo), `agy` (Antigravity), `hermes`, etc.
 - **tmux ≥ 3.x** (optional): once installed, session persistence is enabled automatically — restarting the daemon doesn't interrupt the CLI.
