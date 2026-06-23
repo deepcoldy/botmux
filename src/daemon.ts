@@ -16,7 +16,7 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, getOwnerOpenId, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, getOwnerOpenId, getBotBrand, getGoalPanelConfig, isGoalPanelApp, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -2021,6 +2021,32 @@ function goalNotifyOwnerOpenId(parent?: DaemonSession): string | undefined {
     ?? getOwnerOpenId(parent?.larkAppId ?? currentDaemonLarkAppId);
 }
 
+function goalPanelLarkAppId(): string | undefined {
+  return getGoalPanelConfig()?.larkAppId;
+}
+
+function goalParentSenderCandidates(...fallbacks: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const candidate of [goalPanelLarkAppId(), ...fallbacks]) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    out.push(candidate);
+  }
+  return out;
+}
+
+function uniqueLarkAppIds(...candidates: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const candidate of candidates) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    out.push(candidate);
+  }
+  return out;
+}
+
 async function sendGoalHumanAttention(input: {
   parent?: DaemonSession;
   supervisor?: DaemonSession;
@@ -2033,47 +2059,52 @@ async function sendGoalHumanAttention(input: {
   const meta = input.supervisor?.session.goalSupervisor;
   const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
   if (!parentChatId) return { sent: false, error: 'missing_parent_chat' };
-  const larkAppId = input.parent?.larkAppId ?? input.supervisor?.larkAppId ?? currentDaemonLarkAppId;
   const ownerOpenId = goalNotifyOwnerOpenId(input.parent);
-  const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
   const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
   const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
-  const goalLink = goalChatId ? chatAppLink(goalChatId, normalizeBrand(getBot(larkAppId).config.brand)) : undefined;
-  const text = [
-    `${mention}${input.done ? '[goal] Goal 已完成，等待确认' : '[goal] 任务需要你拍板'}`,
-    goalTitle ? `Goal: ${goalTitle}` : undefined,
-    goalChatId ? `goalChatId: ${goalChatId}` : undefined,
-    input.taskId ? `taskId: ${input.taskId}` : undefined,
-    goalLink ? `打开 goal 群: ${goalLink}` : undefined,
-    `类型: ${input.attentionKind}`,
-    `原因: ${input.attentionReason}`,
-    '',
-    input.summary,
-  ].filter(Boolean).join('\n');
-  try {
-    const messageId = await sendMessage(larkAppId, parentChatId, text, 'text');
-    if (messageId && goalChatId) {
-      rememberGoalParentNotification({
-        messageId,
-        larkAppId,
-        parentChatId,
-        parentRoot: meta?.parentRoot,
-        parentSessionId: meta?.parentSessionId,
-        supervisorSessionId: input.supervisor?.session.sessionId,
-        goalChatId,
-        goalTitle,
-        taskId: input.taskId,
-        summary: input.summary,
-        attentionKind: input.attentionKind,
-        attentionReason: input.attentionReason,
-        done: input.done,
-        createdAt: Date.now(),
-      });
+  const candidates = goalParentSenderCandidates(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
+  let lastError: string | undefined;
+  for (const larkAppId of candidates) {
+    const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
+    const goalLink = goalChatId ? chatAppLink(goalChatId, getBotBrand(larkAppId)) : undefined;
+    const text = [
+      `${mention}${input.done ? '[goal] Goal 已完成，等待确认' : '[goal] 任务需要你拍板'}`,
+      goalTitle ? `Goal: ${goalTitle}` : undefined,
+      goalChatId ? `goalChatId: ${goalChatId}` : undefined,
+      input.taskId ? `taskId: ${input.taskId}` : undefined,
+      goalLink ? `打开 goal 群: ${goalLink}` : undefined,
+      `类型: ${input.attentionKind}`,
+      `原因: ${input.attentionReason}`,
+      '',
+      input.summary,
+    ].filter(Boolean).join('\n');
+    try {
+      const messageId = await sendMessage(larkAppId, parentChatId, text, 'text');
+      if (messageId && goalChatId) {
+        rememberGoalParentNotification({
+          messageId,
+          larkAppId,
+          parentChatId,
+          parentRoot: meta?.parentRoot,
+          parentSessionId: meta?.parentSessionId,
+          supervisorSessionId: input.supervisor?.session.sessionId,
+          goalChatId,
+          goalTitle,
+          taskId: input.taskId,
+          summary: input.summary,
+          attentionKind: input.attentionKind,
+          attentionReason: input.attentionReason,
+          done: input.done,
+          createdAt: Date.now(),
+        });
+      }
+      return { sent: true };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      logger.warn(`[goal-human-attention] send via ${larkAppId} failed: ${lastError}`);
     }
-    return { sent: true };
-  } catch (err) {
-    return { sent: false, error: err instanceof Error ? err.message : String(err) };
   }
+  return { sent: false, error: lastError ?? 'no_sender_available' };
 }
 
 function buildGoalCompletionConfirmCard(input: {
@@ -2144,39 +2175,47 @@ async function sendGoalCompletionConfirmation(input: {
   const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
   if (!parentChatId) return { sent: false, error: 'missing_parent_chat' };
   if (!goalChatId) return { sent: false, error: 'missing_goal_chat' };
-  const larkAppId = input.parent?.larkAppId ?? input.supervisor?.larkAppId ?? currentDaemonLarkAppId;
   const ownerOpenId = goalNotifyOwnerOpenId(input.parent);
   const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
-  const goalLink = chatAppLink(goalChatId, normalizeBrand(getBot(larkAppId).config.brand));
-  const card = buildGoalCompletionConfirmCard({
-    ownerOpenId,
-    goalTitle,
-    goalChatId,
-    goalLink,
-    summary: input.summary,
-    supervisorSessionId: input.supervisor?.session.sessionId,
-  });
-  try {
-    const messageId = await sendMessage(larkAppId, parentChatId, card, 'interactive');
-    if (messageId) {
-      rememberGoalParentNotification({
-        messageId,
-        larkAppId,
-        parentChatId,
-        parentRoot: meta?.parentRoot,
-        parentSessionId: meta?.parentSessionId,
-        supervisorSessionId: input.supervisor?.session.sessionId,
-        goalChatId,
-        goalTitle,
-        summary: input.summary,
-        done: true,
-        createdAt: Date.now(),
-      });
+  // Keep completion cards on the supervisor/parent identity for now: the
+  // goal_cleanup_confirm card action still closes local daemon sessions only.
+  // Moving it to the panel daemon must land together with cross-daemon cleanup.
+  const candidates = uniqueLarkAppIds(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
+  let lastError: string | undefined;
+  for (const larkAppId of candidates) {
+    const goalLink = chatAppLink(goalChatId, getBotBrand(larkAppId));
+    const card = buildGoalCompletionConfirmCard({
+      ownerOpenId,
+      goalTitle,
+      goalChatId,
+      goalLink,
+      summary: input.summary,
+      supervisorSessionId: input.supervisor?.session.sessionId,
+    });
+    try {
+      const messageId = await sendMessage(larkAppId, parentChatId, card, 'interactive');
+      if (messageId) {
+        rememberGoalParentNotification({
+          messageId,
+          larkAppId,
+          parentChatId,
+          parentRoot: meta?.parentRoot,
+          parentSessionId: meta?.parentSessionId,
+          supervisorSessionId: input.supervisor?.session.sessionId,
+          goalChatId,
+          goalTitle,
+          summary: input.summary,
+          done: true,
+          createdAt: Date.now(),
+        });
+      }
+      return { sent: true };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      logger.warn(`[goal-completion-confirm] send via ${larkAppId} failed: ${lastError}`);
     }
-    return { sent: true };
-  } catch (err) {
-    return { sent: false, error: err instanceof Error ? err.message : String(err) };
   }
+  return { sent: false, error: lastError ?? 'no_sender_available' };
 }
 
 function goalParentReplyCandidates(parsed: Pick<LarkMessage, 'parentId' | 'messageId'>): string[] {
@@ -2229,6 +2268,7 @@ function buildGoalDashboardDecisionPrompt(input: { goalChatId: string; taskId?: 
 }
 
 async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string, chatId?: string): Promise<boolean> {
+  if (!isGoalPanelApp(larkAppId)) return false;
   if (parsed.senderType === 'app' || parsed.senderType === 'bot') return false;
   const record = findGoalNotificationRecordForReply(parsed);
   if (!record || record.larkAppId !== larkAppId) return false;
@@ -2769,6 +2809,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // every event that flows through us teaches the cache without touching
   // the contact API. Must run before any await on the sender resolver.
   learnFromMentions(larkAppId, parsed.mentions);
+
+  if (await maybeRouteGoalParentReply(parsed, larkAppId, chatId)) {
+    return;
+  }
+  if (isGoalPanelApp(larkAppId)) {
+    return;
+  }
 
   let content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
@@ -3336,6 +3383,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   learnFromMentions(larkAppId, parsed.mentions);
 
   if (await maybeRouteGoalParentReply(parsed, larkAppId, ctxChatId ?? data?.message?.chat_id)) {
+    return;
+  }
+  // goal-panel is a sender-only relay. It only reacts to explicit replies to
+  // panel-sent goal notifications; ordinary parent-chat messages must remain
+  // silent so the panel never becomes a noisy conversational bot.
+  if (isGoalPanelApp(larkAppId)) {
     return;
   }
 

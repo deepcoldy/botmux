@@ -23,6 +23,7 @@ import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
 import { config } from '../config.js';
+import { getGoalPanelConfig } from '../bot-registry.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -69,10 +70,15 @@ export interface CreateGroupResult {
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
+  const panelLarkAppId = getGoalPanelConfig()?.larkAppId;
+  const invitedBotIds = Array.from(new Set([
+    ...opts.larkAppIds,
+    ...(panelLarkAppId ? [panelLarkAppId] : []),
+  ]));
   // Filter creator out of the bot invite list. createChat does this defensively
   // too, but doing it here makes the service contract explicit and keeps
   // invalidBotIds reporting stable across underlying API changes.
-  const otherBots = opts.larkAppIds.filter(id => id !== opts.creatorLarkAppId);
+  const otherBots = invitedBotIds.filter(id => id !== opts.creatorLarkAppId);
   const r = await createChat(opts.creatorLarkAppId, {
     name: opts.name,
     botIds: otherBots,
@@ -149,6 +155,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
 
   const oncallBindings: CreateGroupResult['oncallBindings'] = [];
   const invalidBots = new Set(r.invalidBotIds);
+  // Sender-only goal panel is invited for relay visibility, but it is not a
+  // worker and should not receive oncall bindings or role bootstrap prompts.
   const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
     .filter(id => !invalidBots.has(id));
   const bindWorkingDir = opts.bindWorkingDir?.trim();
