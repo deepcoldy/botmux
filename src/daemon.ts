@@ -4494,10 +4494,9 @@ function buildGoalDashboardDecisionPrompt(input: { goalChatId: string; taskId?: 
 }
 
 async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string, chatId?: string): Promise<boolean> {
-  if (!isGoalPanelApp(larkAppId)) return false;
   if (parsed.senderType === 'app' || parsed.senderType === 'bot') return false;
   const record = findGoalNotificationRecordForReply(parsed);
-  if (!record || record.larkAppId !== larkAppId) return false;
+  if (!record) return false;
   if (chatId && record.parentChatId !== chatId) return false;
   const supervisor = findGoalSupervisorForNotify({
     supervisorSessionId: record.supervisorSessionId,
@@ -4510,7 +4509,7 @@ async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string,
   await injectGoalSupervisorTurn(supervisor, buildGoalParentReplyPrompt(record, parsed));
   try {
     await sendMessage(
-      larkAppId,
+      record.larkAppId,
       record.parentChatId,
       `[goal] 已把你的回复转给 goal「${record.goalTitle ?? record.goalChatId}」的监管者。`,
       'text',
