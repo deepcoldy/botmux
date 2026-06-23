@@ -179,6 +179,18 @@ describe('handleDashboardCommand — admin dispatch DMs the invoking admin', () 
     expect(dm.calls[0].content).toContain('/dashboard');
   });
 
+  it('admin /dashboard Help → normalizes subcommand case before dispatch', async () => {
+    const deps = makeDeps();
+    const dm = captureDM();
+    await handleDashboardCommand(
+      makeMessage({ content: '/dashboard Help' }), 'Help', 'om_root', 'oc_test', deps, 'cli_x',
+      { ...adminLookup([OWNER]), sendUserMessage: dm.sendUserMessage },
+    );
+    expect(dm.calls.length).toBe(1);
+    expect(dm.calls[0].content).toContain('/dashboard');
+    expect(dm.calls[0].content).not.toContain('Help');
+  });
+
   // NOTE: empty-args default routing (`/dashboard` → overview) is exercised
   // in dashboard-overview-command.test.ts now that overview has a real
   // handler; tested there with a stubbed Route B client.

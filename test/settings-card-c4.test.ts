@@ -606,6 +606,51 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
     expect((deps.sessionReply as any).mock.calls[0][1]).toContain('📬');
   });
 
+  it('admin /dashboard Settings → routes to real settings handler', async () => {
+    const requestSpy = vi.fn(async () => ({
+      status: 200,
+      body: { settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } },
+      raw: '',
+    }));
+    const createClient = vi.fn(() => ({ request: requestSpy } as any));
+    const dmCalls: Array<{ openId: string; content: string; msgType?: string }> = [];
+    const sendUserMessage = async (_a: string, openId: string, content: string, msgType?: string) => {
+      dmCalls.push({ openId, content, msgType });
+      return 'om_dm';
+    };
+    const deps: CommandHandlerDeps = {
+      activeSessions: new Map() as any,
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getActiveCount: () => 0,
+      lastRepoScan: new Map() as any,
+    };
+    const message = {
+      senderId: INVOKER,
+      senderUnionId: undefined,
+      content: '/dashboard Settings',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+    } as LarkMessage;
+
+    await handleDashboardCommand(
+      message,
+      'Settings',
+      'om_root',
+      'oc_test',
+      deps,
+      LARK_APP_ID,
+      {
+        getOwnerOpenId: () => INVOKER,
+        sendUserMessage,
+        settings: { createClient, sendUserMessage },
+      },
+    );
+
+    expect(requestSpy).toHaveBeenCalledWith({ method: 'GET', path: '/__daemon/settings-snapshot' });
+    expect(dmCalls.length).toBe(1);
+    expect(dmCalls[0].content).toContain('Dashboard');
+  });
+
   it('non-admin /dashboard settings → owner_only in topic, never calls client', async () => {
     const createClient = vi.fn(() => ({ request: vi.fn() } as any));
     const sendUserMessage = vi.fn(async () => 'om_dm');

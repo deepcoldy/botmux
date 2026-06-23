@@ -21,11 +21,11 @@
  * `randomNonce` / `secret` are all injectable.
  */
 
-import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
+import { loadDashboardSecret } from './auth.js';
 import { signDaemonRequest } from './daemon-internal-auth.js';
 
 const DEFAULT_DASHBOARD_URL = 'http://127.0.0.1:7891';
@@ -41,6 +41,8 @@ export interface DaemonClientOptions {
   dashboardUrl?: string;
   /** Override the HMAC key. Production loads from `.dashboard-secret` if omitted. */
   secret?: string;
+  /** Override `.dashboard-secret` path (tests). */
+  secretPath?: string;
   /** Identifier this daemon reports in the `X-Botmux-Daemon-AppId` header (audit, not authn). */
   appId: string;
   /** Override `fetch` (tests). */
@@ -89,8 +91,10 @@ function defaultNonce(): string {
   return randomBytes(32).toString('base64url');
 }
 
-function loadSecretFromFile(): string {
-  return readFileSync(SECRET_PATH_DEFAULT, 'utf8').trim();
+function loadSecretFromFile(secretPath: string): string {
+  const secret = loadDashboardSecret(secretPath);
+  if (!secret) throw new Error('dashboard_secret_missing');
+  return secret;
 }
 
 /**
@@ -117,7 +121,8 @@ function sleep(ms: number): Promise<void> {
 
 export function createDaemonClient(opts: DaemonClientOptions): DaemonClient {
   const dashboardUrl = opts.dashboardUrl ?? DEFAULT_DASHBOARD_URL;
-  const secret = opts.secret ?? loadSecretFromFile();
+  const secret = opts.secret?.trim() ?? loadSecretFromFile(opts.secretPath ?? SECRET_PATH_DEFAULT);
+  if (!secret) throw new Error('dashboard_secret_missing');
   const appId = opts.appId;
   const fetchFn = opts.fetch ?? fetch;
   const now = opts.now ?? Date.now;

@@ -2,7 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import {
-  readFileSync, existsSync, chmodSync, mkdirSync, statSync, createReadStream,
+  readFileSync, existsSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -14,7 +14,7 @@ import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  loadPersistedToken, persistToken,
+  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -90,13 +90,24 @@ const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
 
 function loadOrCreateSecret(): string {
-  if (existsSync(SECRET_PATH)) return readFileSync(SECRET_PATH, 'utf8').trim();
-  const s = randomBytes(32).toString('base64url');
-  mkdirSync(dirname(SECRET_PATH), { recursive: true });
-  atomicWriteFileSync(SECRET_PATH, s, { mode: 0o600 });
-  chmodSync(SECRET_PATH, 0o600);
-  logger.info(`[dashboard] Generated dashboard secret at ${SECRET_PATH}`);
-  return s;
+  let existing: string | null;
+  try {
+    existing = loadDashboardSecret(SECRET_PATH);
+  } catch (e) {
+    logger.error(`[dashboard] Failed to read dashboard secret at ${SECRET_PATH}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  if (existing) return existing;
+
+  const existed = existsSync(SECRET_PATH);
+  try {
+    const secret = loadOrCreateDashboardSecret(SECRET_PATH);
+    logger.info(`[dashboard] ${existed ? 'Regenerated empty' : 'Generated'} dashboard secret at ${SECRET_PATH}`);
+    return secret;
+  } catch (e) {
+    logger.error(`[dashboard] Failed to create dashboard secret at ${SECRET_PATH}: ${(e as Error).message}`);
+    process.exit(1);
+  }
 }
 
 // The active dashboard token is persisted to disk so a previously-issued

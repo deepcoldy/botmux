@@ -81,7 +81,10 @@ export async function handleDashboardCommand(
   };
 
   // ─── Dispatch (admin-only zone) ───
-  const sub = args.trim().split(/\s+/)[0] || 'overview';
+  const trimmedArgs = args.trim();
+  const rawSub = trimmedArgs.split(/\s+/)[0] || 'overview';
+  const sub = rawSub.toLowerCase();
+  const subArgs = trimmedArgs ? trimmedArgs.slice(rawSub.length).trimStart() : '';
 
   if (sub === 'help') {
     await reply(buildHelpText(loc));
@@ -89,33 +92,27 @@ export async function handleDashboardCommand(
   }
 
   if (sub === 'settings') {
-    const settingsArgs = args.replace(/^settings\s*/, '');
-    return handleDashboardSettings(message, settingsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.settings);
+    return handleDashboardSettings(message, subArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.settings);
   }
 
   if (sub === 'sessions') {
-    const sessionsArgs = args.replace(/^sessions\s*/, '');
-    return handleDashboardSessions(message, sessionsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.sessions);
+    return handleDashboardSessions(message, subArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.sessions);
   }
 
   if (sub === 'schedules') {
-    const schedulesArgs = args.replace(/^schedules\s*/, '');
-    return handleDashboardSchedules(message, schedulesArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.schedules);
+    return handleDashboardSchedules(message, subArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.schedules);
   }
 
   if (sub === 'workflows') {
-    const workflowsArgs = args.replace(/^workflows\s*/, '');
-    return handleDashboardWorkflows(message, workflowsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.workflows);
+    return handleDashboardWorkflows(message, subArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.workflows);
   }
 
   if (sub === 'groups') {
-    const groupsArgs = args.replace(/^groups\s*/, '');
-    return handleDashboardGroups(message, groupsArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.groups);
+    return handleDashboardGroups(message, subArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.groups);
   }
 
   if (sub === 'overview') {
-    const overviewArgs = args.replace(/^overview\s*/, '');
-    return handleDashboardOverview(message, overviewArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.overview);
+    return handleDashboardOverview(message, subArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.overview);
   }
 
   if (DASHBOARD_MODULES.includes(sub as DashboardModule)) {

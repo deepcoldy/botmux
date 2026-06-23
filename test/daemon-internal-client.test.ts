@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createDaemonClient,
@@ -84,6 +88,36 @@ describe('happy paths', () => {
     const r = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
     expect(r.raw).toBe('plain text');
     expect(r.body).toBe('plain text');
+  });
+});
+
+describe('secret loading', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('throws clearly when the default-loaded secret file is whitespace-only', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-client-secret-'));
+    dirs.push(dir);
+    const secretPath = join(dir, '.dashboard-secret');
+    writeFileSync(secretPath, '  \n');
+
+    expect(() => createDaemonClient({
+      appId: 'cli_test',
+      dashboardUrl: 'http://127.0.0.1:7891',
+      secretPath,
+      fetch: vi.fn() as unknown as typeof fetch,
+    })).toThrow('dashboard_secret_missing');
+  });
+
+  it('throws clearly when an explicit secret override is whitespace-only', () => {
+    expect(() => createDaemonClient({
+      appId: 'cli_test',
+      dashboardUrl: 'http://127.0.0.1:7891',
+      secret: '  \n',
+      fetch: vi.fn() as unknown as typeof fetch,
+    })).toThrow('dashboard_secret_missing');
   });
 });
 

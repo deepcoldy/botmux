@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import {
-  mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
+  mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
-  loadPersistedToken, persistToken,
+  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from '../src/dashboard/auth.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
@@ -118,6 +118,33 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
   it('loadPersistedToken returns null when path is a directory (unreadable)', () => {
     // dir itself exists but is not a file — read throws, helper swallows.
     expect(loadPersistedToken(dir)).toBeNull();
+  });
+});
+
+describe('dashboard secret persistence', () => {
+  let dir: string;
+  let secretPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-secret-'));
+    secretPath = join(dir, 'nested', '.dashboard-secret');
+  });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('loadDashboardSecret returns null when file is absent or whitespace-only', () => {
+    expect(loadDashboardSecret(secretPath)).toBeNull();
+    const p = join(dir, 'empty-secret');
+    writeFileSync(p, '   \n');
+    expect(loadDashboardSecret(p)).toBeNull();
+  });
+
+  it('loadOrCreateDashboardSecret overwrites whitespace-only file with a fresh 0600 secret', () => {
+    mkdirSync(join(dir, 'nested'));
+    writeFileSync(secretPath, ' \n');
+    const secret = loadOrCreateDashboardSecret(secretPath);
+    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(loadDashboardSecret(secretPath)).toBe(secret);
+    expect(statSync(secretPath).mode & 0o777).toBe(0o600);
   });
 });
 

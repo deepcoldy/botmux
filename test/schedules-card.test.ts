@@ -922,6 +922,17 @@ describe('handleSchedulesCardAction', () => {
       expect(r.card).toBeUndefined();
     });
 
+    it('POST 200 with ok=false → toast pause_failed, no card', async () => {
+      const deps = makePauseDeps('sch_a', true, { status: 200, body: { ok: false, error: 'not_found' } });
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_PAUSE, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('暂停失败');
+      expect(r.toast?.content).toContain('not_found');
+      expect(r.card).toBeUndefined();
+    });
+
     it('POST throws → toast pause_failed (err.message), no card', async () => {
       const tasks = [task({ id: 'sch_a', enabled: true })];
       const requestSpy = vi.fn(async (req: any) => {
@@ -1067,6 +1078,18 @@ describe('handleSchedulesCardAction', () => {
       expect(r.toast?.content).toContain('恢复失败');
       expect(r.toast?.content).toContain('http_500');
       expect(r.card).toBeUndefined();
+    });
+
+    it('POST 200 with ok=false → toast resume_failed, no refetch or success redraw', async () => {
+      const deps = makeResumeDeps('sch_a', false, { status: 200, body: { ok: false, error: 'not_found' } });
+      const r = await handleSchedulesCardAction(
+        makeAction({ action: SCHEDULES_ACTION_RESUME, invoker_open_id: INVOKER, schedule_id: 'sch_a' }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('恢复失败');
+      expect(r.toast?.content).toContain('not_found');
+      expect(r.card).toBeUndefined();
+      expect(deps.requestSpy.mock.calls.map((c: any[]) => c[0].method)).toEqual(['GET', 'POST']);
     });
 
     it('POST throws → toast resume_failed (err.message), no card', async () => {
@@ -1313,6 +1336,23 @@ describe('handleSchedulesCardAction', () => {
       expect(r.toast?.content).toContain('修改投递方式失败');
       expect(r.toast?.content).toContain('delivery_boom');
       expect(r.card).toBeUndefined();
+    });
+
+    it('POST 200 with ok=false → toast delivery_failed, no refetch or success redraw', async () => {
+      const deps = makeDeliveryDeps('sch_a', 'origin', { status: 200, body: { ok: false, error: 'local_not_toggleable' } });
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_delivery: 'new-topic',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast?.content).toContain('修改投递方式失败');
+      expect(r.toast?.content).toContain('local_not_toggleable');
+      expect(r.card).toBeUndefined();
+      expect(deps.requestSpy.mock.calls.map((c: any[]) => c[0].method)).toEqual(['GET', 'POST']);
     });
 
     it('refetch missing after successful POST → fallback synth renders target delivery', async () => {

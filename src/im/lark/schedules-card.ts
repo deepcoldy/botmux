@@ -68,6 +68,15 @@ function toneIcon(tone: string): string {
   }
 }
 
+type DaemonClientResponse = Awaited<ReturnType<DaemonClient['request']>>;
+
+function routeBWriteFailureReason(resp: DaemonClientResponse): string | undefined {
+  const body = (resp.body ?? {}) as Record<string, unknown>;
+  if (resp.status !== 200) return String(body.error ?? `http_${resp.status}`);
+  if (body.ok === false) return String(body.error ?? 'ok_false');
+  return undefined;
+}
+
 /**
  * Sort schedules per the Web UI semantics:
  *  - enabled first (paused tasks sink),
@@ -832,11 +841,10 @@ export async function handleSchedulesCardAction(
     } catch (e) {
       return errorToast(failedKey, { reason: (e as Error).message }, locale);
     }
-    if (resp.status !== 200) {
-      const body = (resp.body ?? {}) as Record<string, unknown>;
-      const reason = String(body.error ?? `http_${resp.status}`);
+    const failureReason = routeBWriteFailureReason(resp);
+    if (failureReason) {
       // Preserve user state — do NOT redraw card on failure.
-      return errorToast(failedKey, { reason }, locale);
+      return errorToast(failedKey, { reason: failureReason }, locale);
     }
 
     if (verb === 'pause') {
@@ -925,10 +933,9 @@ export async function handleSchedulesCardAction(
     } catch (e) {
       return errorToast(failedKey, { reason: (e as Error).message }, locale);
     }
-    if (resp.status !== 200) {
-      const body = (resp.body ?? {}) as Record<string, unknown>;
-      const reason = String(body.error ?? `http_${resp.status}`);
-      return errorToast(failedKey, { reason }, locale);
+    const failureReason = routeBWriteFailureReason(resp);
+    if (failureReason) {
+      return errorToast(failedKey, { reason: failureReason }, locale);
     }
 
     const responseDeliver =

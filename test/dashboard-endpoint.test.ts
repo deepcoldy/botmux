@@ -112,6 +112,12 @@ describe('callDashboard', () => {
     expect(r).toEqual({ ok: false, reason: 'no-secret' });
   });
 
+  it('returns no-secret when the secret file is whitespace-only', async () => {
+    writeFileSync(join(dir, '.dashboard-secret'), ' \n');
+    const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl: makeFetch({}) });
+    expect(r).toEqual({ ok: false, reason: 'no-secret' });
+  });
+
   it('rotates against the recorded port when it IS the dashboard', async () => {
     setPort(7891);
     const r = await callDashboard({
