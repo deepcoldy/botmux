@@ -2289,6 +2289,7 @@ function scheduleGoalWatchdogRetry(goalChatId: string, reason: string): void {
 }
 
 async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: string): Promise<GoalWatchdogResult[]> {
+  if (isGoalPanelApp(currentDaemonLarkAppId)) return [];
   const results = await runGoalWatchdogForGoal({
     larkAppId: currentDaemonLarkAppId,
     activeSessions,
@@ -16779,10 +16780,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[v3] progress-card cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
   });
 
-  const goalWatchdogTimer = startGoalWatchdog({
-    larkAppId: cfg.larkAppId,
-    activeSessions,
-  });
+  const goalWatchdogTimer = isGoalPanelApp(cfg.larkAppId)
+    ? undefined
+    : startGoalWatchdog({
+      larkAppId: cfg.larkAppId,
+      activeSessions,
+    });
 
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot
