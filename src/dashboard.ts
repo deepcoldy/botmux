@@ -2711,6 +2711,47 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/goals') {
       return jsonRes(res, 200, buildGoalBoard());
     }
+    const mGoalDecision = url.pathname.match(/^\/api\/goals\/([^/]+)\/decision$/);
+    if (req.method === 'POST' && mGoalDecision) {
+      const goalChatId = decodeURIComponent(mGoalDecision[1]);
+      let parsed: any;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const text = typeof parsed?.text === 'string' ? parsed.text.trim() : '';
+      const taskId = typeof parsed?.taskId === 'string' && parsed.taskId.trim() ? parsed.taskId.trim() : undefined;
+      if (!text) return jsonRes(res, 400, { ok: false, error: 'missing_text' });
+      const body = JSON.stringify({ taskId, text });
+      let contacted = 0;
+      let lastError: any = null;
+      for (const d of registry.list()) {
+        try {
+          const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goals/${encodeURIComponent(goalChatId)}/decision`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body,
+            signal: AbortSignal.timeout(3_000),
+          });
+          contacted++;
+          const txt = await upstream.text();
+          let json: any = null;
+          try { json = txt ? JSON.parse(txt) : null; } catch { /* keep null */ }
+          if (upstream.ok && json?.ok) return jsonRes(res, 200, json);
+          if (json?.error !== 'no_supervisor') lastError = json ?? { status: upstream.status, body: txt };
+        } catch (err: any) {
+          lastError = { error: err?.message ?? String(err) };
+        }
+      }
+      return jsonRes(res, 404, {
+        ok: false,
+        error: 'no_supervisor',
+        goalChatId,
+        contacted,
+        lastError,
+      });
+    }
     const mWhiteboard = url.pathname.match(/^\/api\/whiteboards\/([^/]+)$/);
     if (req.method === 'GET' && mWhiteboard) {
       try {
