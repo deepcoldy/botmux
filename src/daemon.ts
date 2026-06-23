@@ -2205,6 +2205,7 @@ const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 let currentDaemonLarkAppId = '';
 const goalWatchdogRetryTimers = new Map<string, NodeJS.Timeout>();
+const goalParentReplyRoutes: Map<string, number> = new BoundedMap(1000);
 
 function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
@@ -4464,7 +4465,7 @@ function findGoalNotificationRecordForReply(parsed: Pick<LarkMessage, 'parentId'
   return undefined;
 }
 
-function buildGoalParentReplyPrompt(record: GoalParentNotificationRecord, parsed: LarkMessage): string {
+function buildGoalParentReplyPrompt(record: GoalParentNotificationRecord, parsed: Pick<LarkMessage, 'messageId' | 'content'>): string {
   return [
     '[goal-parent-reply] L1/人类在主群回复了 goal 升级/完成通知。请把这条回复作为新的人工指示纳入本 goal 的统揽判断。',
     `goal: ${record.goalTitle ?? record.goalChatId}`,
@@ -4478,6 +4479,63 @@ function buildGoalParentReplyPrompt(record: GoalParentNotificationRecord, parsed
     '',
     '请先查 goal charter 和 delivery ledger，再决定是澄清 worker、重派、accept/reject、或继续升级给人。',
   ].filter(Boolean).join('\n');
+}
+
+function goalParentReplyRouteKey(record: GoalParentNotificationRecord, replyMessageId: string): string {
+  return `${record.messageId}:${replyMessageId}`;
+}
+
+async function routeGoalParentReplyToLocal(record: GoalParentNotificationRecord, parsed: Pick<LarkMessage, 'messageId' | 'content'>): Promise<{ routed: boolean; deduped?: boolean; error?: string; supervisorSessionId?: string }> {
+  const key = goalParentReplyRouteKey(record, parsed.messageId);
+  if (goalParentReplyRoutes.has(key)) return { routed: true, deduped: true };
+  const supervisor = findGoalSupervisorForNotify({
+    supervisorSessionId: record.supervisorSessionId,
+    goalChatId: record.goalChatId,
+  });
+  if (!supervisor) return { routed: false, error: 'no_supervisor' };
+  goalParentReplyRoutes.set(key, Date.now());
+  try {
+    await injectGoalSupervisorTurn(supervisor, buildGoalParentReplyPrompt(record, parsed));
+    return { routed: true, supervisorSessionId: supervisor.session.sessionId };
+  } catch (err) {
+    goalParentReplyRoutes.delete(key);
+    return { routed: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function routeGoalParentReplyAcrossDaemons(record: GoalParentNotificationRecord, parsed: Pick<LarkMessage, 'messageId' | 'content'>): Promise<{ contacted: number; routed: number; deduped: number }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  let routed = 0;
+  let deduped = 0;
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/route-parent-reply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          record,
+          reply: {
+            messageId: parsed.messageId,
+            content: parsed.content,
+          },
+        }),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { routed?: boolean; deduped?: boolean } | null;
+      if (body?.routed && body.deduped) deduped++;
+      else if (body?.routed) routed++;
+    } catch {
+      // Daemon descriptors are best-effort. A dead peer will age out shortly.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, routed, deduped };
 }
 
 function buildGoalDashboardDecisionPrompt(input: { goalChatId: string; taskId?: string; text: string }): string {
@@ -4498,28 +4556,62 @@ async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string,
   const record = findGoalNotificationRecordForReply(parsed);
   if (!record) return false;
   if (chatId && record.parentChatId !== chatId) return false;
-  const supervisor = findGoalSupervisorForNotify({
-    supervisorSessionId: record.supervisorSessionId,
-    goalChatId: record.goalChatId,
-  });
-  if (!supervisor) {
-    logger.warn(`[goal-parent-reply] no active L2 for goal=${record.goalChatId} reply=${parsed.messageId}`);
-    return false;
+  const local = await routeGoalParentReplyToLocal(record, parsed);
+  let routed = local.routed && !local.deduped;
+  let routedSessionId = local.supervisorSessionId;
+  if (!local.routed) {
+    const remote = await routeGoalParentReplyAcrossDaemons(record, parsed);
+    routed = remote.routed > 0;
+    if (!routed && remote.deduped === 0) {
+      logger.warn(`[goal-parent-reply] no active L2 for goal=${record.goalChatId} reply=${parsed.messageId} contacted=${remote.contacted}`);
+      return false;
+    }
   }
-  await injectGoalSupervisorTurn(supervisor, buildGoalParentReplyPrompt(record, parsed));
   try {
-    await sendMessage(
-      record.larkAppId,
-      record.parentChatId,
-      `[goal] 已把你的回复转给 goal「${record.goalTitle ?? record.goalChatId}」的监管者。`,
-      'text',
-    );
+    if (routed) {
+      await sendMessage(
+        record.larkAppId,
+        record.parentChatId,
+        `[goal] 已把你的回复转给 goal「${record.goalTitle ?? record.goalChatId}」的监管者。`,
+        'text',
+      );
+    }
   } catch (err) {
     logger.warn(`[goal-parent-reply] failed to send parent ack: ${err instanceof Error ? err.message : String(err)}`);
   }
-  logger.info(`[goal-parent-reply] routed parent reply ${parsed.messageId.substring(0, 12)} to L2 ${supervisor.session.sessionId.substring(0, 8)} goal=${record.goalChatId}`);
+  logger.info(`[goal-parent-reply] routed parent reply ${parsed.messageId.substring(0, 12)} to L2 ${routedSessionId?.substring(0, 8) ?? 'remote'} goal=${record.goalChatId}`);
   return true;
 }
+
+ipcRoute('POST', '/api/goal/route-parent-reply', async (req, res) => {
+  let raw: { record?: unknown; reply?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const rec = raw.record as Partial<GoalParentNotificationRecord> | undefined;
+  const reply = raw.reply as Partial<Pick<LarkMessage, 'messageId' | 'content'>> | undefined;
+  if (!rec || typeof rec.messageId !== 'string' || typeof rec.larkAppId !== 'string' || typeof rec.parentChatId !== 'string' || typeof rec.goalChatId !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_record' });
+  }
+  if (!reply || typeof reply.messageId !== 'string' || typeof reply.content !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_reply' });
+  }
+  const result = await routeGoalParentReplyToLocal(rec as GoalParentNotificationRecord, {
+    messageId: reply.messageId,
+    content: reply.content,
+  });
+  if (!result.routed) {
+    return jsonRes(res, 404, { ok: false, error: result.error ?? 'no_supervisor' });
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    routed: true,
+    deduped: result.deduped === true,
+    supervisorSessionId: result.supervisorSessionId,
+  });
+});
 
 ipcRoute('POST', '/api/goals/:goalChatId/decision', async (req, res, params) => {
   let raw: { taskId?: unknown; text?: unknown };
