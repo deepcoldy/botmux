@@ -1,5 +1,6 @@
 import { sendMessage as defaultSendMessage } from '../im/lark/client.js';
 import { BoundedMap } from '../utils/bounded-map.js';
+import { recordGoalNarration } from '../services/goal-narration-store.js';
 
 const sentNarrations: Map<string, number> = new BoundedMap(2000);
 
@@ -93,7 +94,13 @@ export async function emitGoalNarration(input: EmitGoalNarrationInput, deps: Emi
   sentNarrations.set(key, Date.now());
   try {
     const sendMessage = deps.sendMessage ?? defaultSendMessage;
-    const messageId = await sendMessage(input.larkAppId, input.goalChatId, buildGoalNarrationText(input.event), 'text');
+    const text = buildGoalNarrationText(input.event);
+    const messageId = await sendMessage(input.larkAppId, input.goalChatId, text, 'text');
+    // Mirror to the per-goal narration log so the dashboard board shows the same
+    // event stream as the chat (esp. 「人类决策到达」, which is not a ledger fact).
+    // Best-effort: the store swallows its own errors and never throws.
+    const taskId = 'taskId' in input.event ? input.event.taskId : undefined;
+    recordGoalNarration({ goalChatId: input.goalChatId, type: input.event.type, taskId, text, ts: Date.now() });
     return { sent: true, messageId };
   } catch (err) {
     sentNarrations.delete(key);

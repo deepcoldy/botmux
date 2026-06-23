@@ -29,11 +29,13 @@ interface BoardTask {
   help?: { blocker: string; kind?: string; workerOpenId?: string };
   escalation?: { reason: string; by?: string; retryBrief?: string };
 }
+interface BoardNarration { goalChatId: string; type: string; taskId?: string; text: string; ts: number }
 interface BoardGoal {
   goalChatId: string; title?: string; hasCharter: boolean;
   charterUpdatedAt?: string; charterContent?: string; lastActivityAt?: number;
   counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; total: number };
   tasks: BoardTask[];
+  narrations?: BoardNarration[];
 }
 interface GoalBoard { goals: BoardGoal[] }
 
@@ -275,6 +277,21 @@ function decisionHtml(t: BoardTask, goalChatId: string): string {
     </div>
   </div>`;
 }
+// Event stream — the same clean human-readable narration the goal chat shows
+// (人类决策到达 / 监管者关键动作). Mirrors chat ⇄ dashboard so a human watching
+// the board follows the loop without reading L2's terminal cards. n.text already
+// carries the emoji + body; we just lay it out with a relative timestamp.
+function narrationsHtml(g: BoardGoal): string {
+  const ns = g.narrations ?? [];
+  if (!ns.length) return '';
+  return `<div class="gb-narr">
+    <div class="gb-narr-head">📣 事件流 <span class="gb-narr-sub">人类决策 / 监管动作 · 与群内一致</span></div>
+    <ul class="gb-narr-list">${ns.map(n => `<li class="gb-narr-item gb-narr-${escapeHtml(n.type)}">
+        <span class="gb-narr-text">${escapeHtml(n.text).replace(/\n/g, '<br>')}</span>
+        <time class="gb-narr-ts" title="${n.ts ? escapeHtml(new Date(n.ts).toLocaleString()) : ''}">${n.ts ? relTime(n.ts) : ''}</time>
+      </li>`).join('')}</ul>
+  </div>`;
+}
 function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
   if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
   return `<div class="gb-detail-head">
@@ -336,7 +353,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     mainEl.innerHTML = `<div class="gb-main-head">
         <span class="gb-main-title" title="${escapeHtml(g.goalChatId)}">${escapeHtml(goalName(g))}</span>
         <span class="gb-main-counts">已验收 ${g.counts.accepted} · 共 ${g.counts.total}${g.counts.rejected ? ` · 驳回 ${g.counts.rejected}` : ''}</span>
-      </div>${gridHtml(g, selTask)}`;
+      </div>${gridHtml(g, selTask)}${narrationsHtml(g)}`;
   }
   const decideDraft: Record<string, string> = {}; // preserve an in-progress decision across poll repaints
   function renderDetail(): void {
