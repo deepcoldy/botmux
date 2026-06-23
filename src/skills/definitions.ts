@@ -1212,8 +1212,10 @@ botmux goal supervise --chat-id "<goalChatId>" \\
 > **OnCall 省 \`--repo\` 现按 bot 计**：OnCall 绑定是 per-bot 的——只有**目标子 bot 自己**在该群绑了 OnCall（\`@该bot /oncall bind <仓库路径>\`，多个 bot 一起绑用 \`@bot1 @bot2 /oncall bind <路径>\`）或配了 \`defaultWorkingDir\` 时，dispatch 才可省 \`--repo\`。否则子 bot **不会**跨 bot 继承群目录（除非同话题已有 sibling 在跑可继承），dispatch 仍应显式传 \`--repo\`，不然子 bot 会弹「选仓库」卡。
 > 想「先把 bot 拉起待命、稍后再派具体任务」：用 \`--standby\`（只定目录不派简报），之后用 \`botmux dispatch --into <话题root> --bot ... --brief ...\` 激活。
 
-### L1-5 收 L2 完成通知 → 汇总用户
-L2 把整个 goal 验收通过后会用 \`goal notify-parent\` 把你唤起（daemon-native，注入一条 \`[goal-parent-notify]\` 前缀消息，不走飞书）。**这条通知只是唤醒、不是真相源**：你被唤起后必须 \`botmux delivery list --goal <goalChatId>\` + \`botmux goal charter read --goal <goalChatId> --json\` 复核账本与状态，再给用户一份总汇总（做了什么、产出在哪、遗留项）。
+### L1-5 收 L2 完成通知 → 汇总用户 + 确认结束
+L2 把整个 goal 验收通过后会用 \`goal notify-parent --done\` 把你唤起（daemon-native，注入 \`[goal-parent-notify]\`）+ 给发起人发一张"结束确认卡"。**这条通知只是唤醒、不是真相源**：你被唤起后必须 \`botmux delivery list --goal <goalChatId>\` + \`botmux goal charter read --goal <goalChatId> --json\` 复核账本与状态，给用户一份总汇总（做了什么、产出在哪、遗留项）。
+- **结束确认卡**：发起人点 [结束并清理] → daemon 关闭该 goal 群所有 chat-scope 会话（L2 + workers，**群保留、不退群不删群**）；点 [暂不] → 不动，随时可再结束。
+- **人给进行中的 goal 下发决定/补充**：goal 中途若升级到人（求助），人可直接在主群**回复**那条升级消息，daemon 会把内容自动下发给对应 goal 群的 L2（人不用切群）；L2 收到后接着处理（补信息 / 重派 / 收尾）。
 
 ## L2 流程（在 goal 群，你是 chat-scope 监管化身）
 
@@ -1289,11 +1291,15 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 ### L2-4 维护 charter + 推进依赖
 每验收一波，\`botmux goal charter update --goal <goalChatId> --expected-updated-at <ts> ...\` 刷新状态（进展/下一步）。有依赖的下一波，依赖满足了再 dispatch。**卡住/超时靠查账本**：\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的，用 \`botmux send --chat-id <goalChatId> --mention <worker>\` 去问进展或改派（不靠后台轮询）。
 
-### L2-5 全部 accepted → 通知 L1
-本 goal 所有 subtask 都 accepted 后，用 \`goal notify-parent\` 回通知 L1（**不是** \`send --chat-id 主群\`）：
+### L2-5 全部 accepted → 封板 charter + 通知 L1 确认结束
+本 goal 所有 subtask 都 accepted 后，**先把最终小结写进 charter 封板，再用 \`goal notify-parent --done\` 唤 L1 + 给发起人发"结束确认卡"**：
 \`\`\`bash
-botmux goal notify-parent --summary "Goal 已完成：各 subtask 产出 + 位置 + 遗留项"
+# ① 先把 goal 最终小结写进 charter（做了什么 / 各产出在哪 / 关键证据 / 遗留项）——封板可回溯
+botmux goal charter update --goal "<goalChatId>" --expected-updated-at <updatedAt> "<最终小结整段>"
+# ② 再带 --done 通知 L1 → daemon 给发起人发"Goal 完成，结束并清理会话?"的按钮卡
+botmux goal notify-parent --done --summary "Goal 已完成：各 subtask 产出 + 位置 + 遗留项"
 \`\`\`
+- **\`--done\` 是"完成封板"标志**：带它 daemon 才给人发结束确认卡（人点 [结束并清理] → 关闭本 goal 群所有会话、群保留；[暂不] → 不动）。中途的进度 / 求助通知**不带** \`--done\`。
 - **为什么不用 \`send --chat-id 主群\`**：L1/L2 是同一个 bot，L2 \`send\` 到主群对 L1 是 self-message → 被 self-guard 挡、唤不起 L1。\`goal notify-parent\` 是 daemon-native 唤起（按 supervise 时存的 parent 坐标定位 L1 会话、注入 \`[goal-parent-notify]\` turn），绕开 self-guard。
 - session 在 L2 上下文里自动推断（也可 \`--session-id <L2>\` / \`--goal <goalChatId>\` 显式指定）；长摘要用 \`--summary-file <path>\`。
 - 这是 goal 群结果**回流主群**的唯一出口——L1 被唤起后查账本 / charter 汇总给用户（L1-5）。
