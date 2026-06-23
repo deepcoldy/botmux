@@ -23,6 +23,7 @@
 import { createHash } from 'node:crypto';
 import { openLedger } from './ledger.js';
 import { getWhiteboard, readWhiteboard } from '../services/whiteboard-store.js';
+import { readGoalNarrations, type GoalNarrationRecord } from '../services/goal-narration-store.js';
 import type {
   AcceptanceCriteria, Evidence, LedgerEvent, TaskStatus, TaskView,
   TaskReportedPayload, TaskAcceptedPayload, TaskRejectedPayload,
@@ -108,6 +109,9 @@ export interface GoalBoardGoal {
   lastActivityAt?: number;
   counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; total: number };
   tasks: GoalBoardTask[];
+  /** Recent human-readable narration events (newest first) — the same clean
+   *  stream the goal chat shows, incl. 「人类决策到达」(not a ledger fact). */
+  narrations?: GoalNarrationRecord[];
 }
 
 export interface GoalBoard {
@@ -257,6 +261,8 @@ export function buildGoalBoard(opts: { baseDir?: string; chatId?: string } = {})
       }
     }
 
+    const narrations = goalChatId === '(no-chat)' ? [] : readGoalNarrations(goalChatId, 20);
+
     goals.push({
       goalChatId,
       title: meta?.title,
@@ -266,6 +272,7 @@ export function buildGoalBoard(opts: { baseDir?: string; chatId?: string } = {})
       lastActivityAt,
       counts,
       tasks: boardTasks,
+      ...(narrations.length ? { narrations } : {}),
     });
   }
 

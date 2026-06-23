@@ -22817,6 +22817,19 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-muted { color: var(--faint); font-size: .8rem; margin: 0; }
 .gb-empty { color: var(--faint); font-size: .85rem; padding: 14px; }
 
+/* event stream — narration mirror of the goal chat (人类决策 / 监管动作) */
+.gb-narr { margin: 0; padding: 13px 14px; border-top: 1px solid var(--border-soft); }
+.gb-narr-head { font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); margin-bottom: 10px; }
+.gb-narr-sub { text-transform: none; letter-spacing: 0; color: var(--faint); font-size: .7rem; margin-left: 6px; }
+.gb-narr-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.gb-narr-item { display: flex; gap: 10px; align-items: flex-start; font-size: .8rem; line-height: 1.5; padding: 4px 0 4px 10px; border-left: 2px solid var(--border-soft); }
+.gb-narr-text { color: var(--fg); flex: 1; min-width: 0; }
+.gb-narr-ts { color: var(--faint); font-family: var(--mono); font-size: .7rem; flex: none; white-space: nowrap; }
+.gb-narr-human-decision { border-left-color: var(--accent); }
+.gb-narr-accepted { border-left-color: var(--success, #2e9e5b); }
+.gb-narr-rejected { border-left-color: var(--danger, #d23f3f); }
+.gb-narr-escalated, .gb-narr-help { border-left-color: var(--warning); }
+
 @keyframes gbPulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 @keyframes gbRowIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .gb-trow { animation: none; } .gb-st-active .gb-led { animation: none; } }
