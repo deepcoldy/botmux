@@ -9,6 +9,7 @@ import { loadSkillPackage } from '../core/skills/package.js';
 import { skillRegistryPath, skillSourcesDir, skillStoreDir } from '../core/skills/registry-paths.js';
 import type { SkillPackage, SkillSource } from '../core/skills/types.js';
 import { assertAllowedGitProtocol, assertNoGitUrlCredentials, assertSafeGitRef, assertSafeGitSkillPath, githubToGitUrl, redactGitUrlCredentials } from '../core/skills/sources.js';
+import { safeCwd } from '../utils/safe-cwd.js';
 
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const execFileAsync = promisify(execFile);
@@ -236,7 +237,10 @@ function ensureGitSource(url: string): string {
   if (existsSync(join(dir, '.git'))) {
     git(['fetch', '--tags', '--prune'], dir);
   } else {
-    git(['clone', '--', url, dir]);
+    // clone writes to the absolute `dir`; the cwd is irrelevant to the result but
+    // git reads getcwd() at startup — reachable from the dashboard (cwd=PKG_ROOT,
+    // possibly deleted), so pin a guaranteed-live cwd. See utils/safe-cwd.
+    git(['clone', '--', url, dir], safeCwd());
   }
   return dir;
 }
@@ -249,7 +253,9 @@ async function ensureGitSourceAsync(url: string): Promise<string> {
   if (existsSync(join(dir, '.git'))) {
     await gitAsync(['fetch', '--tags', '--prune'], dir);
   } else {
-    await gitAsync(['clone', '--', url, dir]);
+    // See ensureGitSource: pin a live cwd so git's startup getcwd() can't ENOENT
+    // when the dashboard's PKG_ROOT cwd has been deleted.
+    await gitAsync(['clone', '--', url, dir], safeCwd());
   }
   return dir;
 }

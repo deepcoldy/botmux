@@ -27,6 +27,7 @@ import { anyDaemonBusy } from './daemon-heartbeat.js';
 import { writeRestartIntent, type RestartIntent } from '../services/restart-intent-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from '../utils/install-info.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { safeCwd } from '../utils/safe-cwd.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -177,7 +178,7 @@ export function buildRestartLauncher(
 
 function setsidAvailable(): boolean {
   try {
-    execSync('command -v setsid', { stdio: 'ignore' });
+    execSync('command -v setsid', { stdio: 'ignore', cwd: safeCwd() });
     return true;
   } catch {
     return false;
@@ -205,6 +206,10 @@ export function spawnDetachedRestart(reason: string): void {
   }
   const { cmd, args } = buildRestartLauncher(process.execPath, botmuxCliEntry(), setsidAvailable());
   const child = spawn(cmd, args, {
+    // The dashboard reaches this path with cwd=PKG_ROOT (its checkout dir), which
+    // may have been deleted — setsid/node read getcwd at startup and would crash
+    // on a dead cwd. setsid does NOT change cwd, so override it here. See safe-cwd.
+    cwd: safeCwd(),
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
     env: process.env,
@@ -235,7 +240,10 @@ function productionDeps(): MaintenanceDeps {
       // timeout fast so the tick logs it and slips to the next day (the manual
       // update is already bumping to latest anyway).
       withFileLockSync(npmGlobalUpdateLockTarget(), () => {
-        execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+        // Daemon cwd (~/.botmux) is already safe, but pin an explicit live cwd so
+        // every privileged `npm install -g` spawn shares the same invariant and
+        // can't regress into the dashboard's dead-cwd bug via copy-paste.
+        execSync('npm install -g botmux@latest', { stdio: 'inherit', cwd: safeCwd() });
       }, { maxWaitMs: 500 });
     },
     writeIntent: (intent) => writeRestartIntent(intent),

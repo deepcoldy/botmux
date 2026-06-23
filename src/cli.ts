@@ -328,7 +328,12 @@ function ecosystemConfig(): string {
   apps.push({
     name: 'botmux-dashboard',
     script: join(PKG_ROOT, 'dist', 'dashboard.js'),
-    cwd: PKG_ROOT,
+    // NOT PKG_ROOT: a checkout/worktree can be deleted out from under us, leaving
+    // the dashboard with a dead cwd that crashes any child it spawns (npm/node/git
+    // → uv_cwd ENOENT). ~/.botmux is created early and never deleted. The `script`
+    // path stays absolute (PKG_ROOT-based) so pm2 still locates the bundle. The
+    // dashboard server resolves all paths via __dirname/homedir, never cwd.
+    cwd: CONFIG_DIR,
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
