@@ -24,6 +24,7 @@ import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
 import { config } from '../config.js';
+import { getGoalPanelConfig } from '../bot-registry.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -108,10 +109,15 @@ export async function transferGroupOwner(opts: TransferGroupOwnerOpts): Promise<
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
+  const panelLarkAppId = getGoalPanelConfig()?.larkAppId;
+  const invitedBotIds = Array.from(new Set([
+    ...opts.larkAppIds,
+    ...(panelLarkAppId ? [panelLarkAppId] : []),
+  ]));
   // Filter creator out of the bot invite list. createChat does this defensively
   // too, but doing it here makes the service contract explicit and keeps
   // invalidBotIds reporting stable across underlying API changes.
-  const otherBots = opts.larkAppIds.filter(id => id !== opts.creatorLarkAppId);
+  const otherBots = invitedBotIds.filter(id => id !== opts.creatorLarkAppId);
   // 飞书 chat.create 的 bot_id_list 上限仅 5、chatMembers.create 的 id_list 同样很小（实测 >5 即 400）。
   // 故建群时不带 bot（只 creator + 邀请人），所有 bot 一律按每批 5 个增量加入，避免触顶。批里只要有
   // 一个非法 id（如已停用的 app），飞书会整批拒（code≠0）→ 逐个重试以保住同批的有效 bot。失败并入 invalidBotIds。
@@ -210,6 +216,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
 
   const oncallBindings: CreateGroupResult['oncallBindings'] = [];
   const invalidBots = new Set(r.invalidBotIds);
+  // Sender-only goal panel is invited for relay visibility, but it is not a
+  // worker and should not receive oncall bindings or role bootstrap prompts.
   const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
     .filter(id => !invalidBots.has(id));
   const bindWorkingDir = opts.bindWorkingDir?.trim();
