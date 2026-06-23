@@ -29,15 +29,23 @@ export interface GoalSuperviseResponse {
 export interface GoalNotifyParentRequest {
   supervisorSessionId?: string;
   goalChatId?: string;
+  taskId?: string;
   summary: string;
   attentionKind?: string;
   attentionReason?: string;
+  done?: boolean;
 }
 
 export interface GoalNotifyParentResponse {
   ok: true;
   parentSessionId: string;
   goalChatId: string;
+  goalTitle?: string;
+  parentChatId: string;
+  parentRoot?: string;
+  supervisorSessionId: string;
+  taskId?: string;
+  done?: boolean;
   attentionKind?: string;
   attentionReason?: string;
 }
@@ -177,6 +185,12 @@ export async function notifyGoalParent(
     ok: true,
     parentSessionId: parent.session.sessionId,
     goalChatId: supervisor.session.goalSupervisor.goalChatId,
+    goalTitle: supervisor.session.goalSupervisor.title,
+    parentChatId: supervisor.session.goalSupervisor.parentChatId,
+    parentRoot: supervisor.session.goalSupervisor.parentRoot,
+    supervisorSessionId: supervisor.session.sessionId,
+    taskId: req.taskId,
+    done: req.done,
     attentionKind: req.attentionKind,
     attentionReason: req.attentionReason,
   };
