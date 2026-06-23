@@ -31,6 +31,7 @@ export type {
 } from './types.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+export type BotHandler = 'goal-panel';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
@@ -73,7 +74,6 @@ export interface ContentTriggerConfig {
     prompt: string;
   };
 }
-
 function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (typeof raw !== 'string') return undefined;
   const v = raw.trim().toLowerCase();
@@ -826,6 +826,13 @@ export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
   /**
+   * Optional runtime handler for non-CLI bot identities.
+   *   - goal-panel: sender-only relay for goal parent notifications/replies.
+   *     It owns Lark events but never spawns a CLI session and is hidden from
+   *     worker/collaboration candidate lists.
+   */
+  handler?: BotHandler;
+  /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
    * （见 {@link normalizeBrand}），向后兼容。决定 SDK Client / WSClient 的
@@ -1286,6 +1293,7 @@ export interface BotState {
 }
 
 const bots = new Map<string, BotState>();
+const transientBotClients = new Map<string, Lark.Client>();
 
 export function __testOnly_resetBotRegistry(): void {
   bots.clear();
@@ -1378,6 +1386,7 @@ const larkLogger = {
 };
 
 export function registerBot(cfg: BotConfig): BotState {
+  transientBotClients.delete(cfg.larkAppId);
   const client = new Lark.Client({
     appId: cfg.larkAppId,
     appSecret: cfg.larkAppSecret,
@@ -1411,7 +1420,20 @@ export function getBot(larkAppId: string): BotState {
 }
 
 export function getBotClient(larkAppId: string): Lark.Client {
-  return getBot(larkAppId).client;
+  const registered = bots.get(larkAppId);
+  if (registered) return registered.client;
+  const cached = transientBotClients.get(larkAppId);
+  if (cached) return cached;
+  const cfg = getConfiguredBotConfig(larkAppId);
+  if (!cfg) return getBot(larkAppId).client;
+  const client = new Lark.Client({
+    appId: cfg.larkAppId,
+    appSecret: cfg.larkAppSecret,
+    domain: sdkDomain(normalizeBrand(cfg.brand)),
+    logger: larkLogger,
+  });
+  transientBotClients.set(larkAppId, client);
+  return client;
 }
 
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
@@ -1434,11 +1456,48 @@ export function getBotOpenId(larkAppId: string): string | undefined {
  * 会话）→ 归一为 'feishu'。仅用于派生 applink 等 host，缺省 feishu 安全。
  */
 export function getBotBrand(larkAppId: string | undefined): Brand {
-  return normalizeBrand(larkAppId ? bots.get(larkAppId)?.config.brand : undefined);
+  return normalizeBrand(larkAppId ? getConfiguredBotConfig(larkAppId)?.brand : undefined);
 }
 
 export function getAllBots(): BotState[] {
   return Array.from(bots.values());
+}
+
+function configuredBotConfigs(): BotConfig[] {
+  const inMem = Array.from(bots.values()).map((bot) => bot.config);
+  try {
+    const fromDisk = loadBotConfigs();
+    const seen = new Set(inMem.map((cfg) => cfg.larkAppId));
+    for (const cfg of fromDisk) {
+      if (!seen.has(cfg.larkAppId)) inMem.push(cfg);
+    }
+  } catch {
+    // Some unit tests intentionally run without a bots.json. In-memory configs
+    // remain authoritative in that case.
+  }
+  return inMem;
+}
+
+export function getConfiguredBotConfig(larkAppId: string | undefined): BotConfig | undefined {
+  if (!larkAppId) return undefined;
+  return bots.get(larkAppId)?.config
+    ?? configuredBotConfigs().find((cfg) => cfg.larkAppId === larkAppId);
+}
+
+export function isGoalPanelConfig(cfg: Pick<BotConfig, 'handler'> | undefined): boolean {
+  return cfg?.handler === 'goal-panel';
+}
+
+export function isGoalPanelApp(larkAppId: string | undefined): boolean {
+  return isGoalPanelConfig(getConfiguredBotConfig(larkAppId));
+}
+
+export function getGoalPanelConfig(): BotConfig | undefined {
+  return configuredBotConfigs().find((cfg) => isGoalPanelConfig(cfg));
+}
+
+export function getGoalPanelBot(): BotState | undefined {
+  return Array.from(bots.values()).find((bot) => isGoalPanelConfig(bot.config));
 }
 
 /**
@@ -1832,6 +1891,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
+      handler: entry.handler === 'goal-panel' ? 'goal-panel' : undefined,
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
