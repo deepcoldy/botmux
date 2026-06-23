@@ -98,8 +98,6 @@ export interface GroupDetailDto {
   name: string;
   ownerId?: string;
   members: GroupDetailMemberDto[];
-  /** True iff at least one member has status='in' (otherwise disband makes no sense). */
-  canDisband: boolean;
 }
 
 export interface GroupListPage {
@@ -276,21 +274,11 @@ export function buildGroupDetail(chat: GroupsChatInput, bots: ReadonlyArray<Grou
     };
   });
 
-  const canDisband = members.some(m => m.status === 'in');
-
   return {
     chatId: chat.chatId,
     chatIdSuffix: chatIdSuffix(chat.chatId),
     name: chat.name ?? chat.chatId,
     ownerId: chat.ownerId,
     members,
-    canDisband,
   };
-}
-
-/** Check whether `input` matches `groupName` for the disband three-step confirmation. */
-export function isDisbandConfirmed(input: string | undefined | null, groupName: string): boolean {
-  if (typeof input !== 'string') return false;
-  if (typeof groupName !== 'string' || groupName.trim().length === 0) return false;
-  return input.trim().toLowerCase() === groupName.trim().toLowerCase();
 }

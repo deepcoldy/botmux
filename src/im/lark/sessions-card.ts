@@ -46,6 +46,7 @@ const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
 /** Default page size for standalone and overview-drilldown list cards. */
 const PAGE_SIZE = 5;
+const MAX_PAGE_SIZE = 100;
 
 /** Hard cap on `select_static` option count for the "jump to page" picker.
  *  Lark caps select options around this; we also keep payload small. Above
@@ -61,6 +62,11 @@ function toneIcon(tone: string): string {
     case 'neutral': return '⚪';
     default:        return '⚫';
   }
+}
+
+function clampPageSize(pageSize: number | undefined): number {
+  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return PAGE_SIZE;
+  return Math.min(Math.floor(pageSize), MAX_PAGE_SIZE);
 }
 
 export interface BuildSessionsCardOpts {
@@ -87,10 +93,7 @@ export function buildSessionsCard(
   opts: BuildSessionsCardOpts,
   nowMs: number,
 ): string {
-  const effectivePageSize =
-    typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
-      ? Math.floor(opts.pageSize)
-      : PAGE_SIZE;
+  const effectivePageSize = clampPageSize(opts.pageSize);
   const sorted = sortByStatus(composeEntries(rows, nowMs));
   const { items, meta } = paginate(sorted, opts.page, effectivePageSize);
 
@@ -381,15 +384,9 @@ export function buildSessionsDetailCard(
   // active state shows close (danger); closed state replaces close with
   // resume so the user can revive the session.
   const backNav: Record<string, string> = {};
+  const effectivePageSize = clampPageSize(opts.pageSize);
   if (opts.origin === 'overview') backNav.origin = 'overview';
-  if (
-    typeof opts.pageSize === 'number'
-    && Number.isFinite(opts.pageSize)
-    && opts.pageSize > 0
-    && opts.pageSize !== PAGE_SIZE
-  ) {
-    backNav.page_size = String(Math.floor(opts.pageSize));
-  }
+  if (effectivePageSize !== PAGE_SIZE) backNav.page_size = String(effectivePageSize);
   if (opts.scope === 'global') backNav.dashboard_scope = 'global';
   // Track reason notes to render below the action row in row order.
   const reasonNotes: { key: string; titleKey?: string }[] = [];

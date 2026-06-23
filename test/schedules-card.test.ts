@@ -218,6 +218,7 @@ describe('buildSchedulesCard', () => {
     for (const b of detailButtons) {
       expect(String(b.text?.content ?? '')).toContain('📂');
       expect(b.value.invoker_open_id).toBe(INVOKER);
+      expect(b.value.page).toBe('1');
     }
   });
 
@@ -425,6 +426,17 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(delivery.value.target_delivery).toBe('new-topic');
   });
 
+  it('scope=global → detail shows owning bot and chat', () => {
+    const detail = detailFor({
+      id: 'sch_global_detail',
+      larkAppId: 'cli_aa80',
+      botName: 'zkd-codex-bot',
+      chatId: 'oc_global_chat',
+    });
+    const json = buildSchedulesDetailCard(detail, { ...baseOpts, scope: 'global' });
+    expect(json).toContain('所属：zkd-codex-bot · oc\\\\_global\\\\_chat');
+  });
+
   it('delivery=new-topic → shows current delivery and use-origin button', () => {
     const detail = detailFor({ id: 'sch_new_topic', deliver: 'new-topic' });
     const json = buildSchedulesDetailCard(detail, baseOpts);
@@ -485,14 +497,15 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     }
   });
 
-  it('detail with origin=overview AND overridden pageSize=3 → all actions carry origin AND page_size', () => {
+  it('detail with origin=overview AND overridden pageSize=3 → all actions carry origin/page/page_size', () => {
     const detail = detailFor({ id: 'sch_override', enabled: true });
-    const json = buildSchedulesDetailCard(detail, { ...baseOpts, origin: 'overview', pageSize: 3 });
+    const json = buildSchedulesDetailCard(detail, { ...baseOpts, origin: 'overview', pageSize: 3, sourcePage: 2 });
     const parsed = JSON.parse(json);
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
     const acts = actionRow.actions as any[];
     for (const a of acts) {
       expect(a.value.origin).toBe('overview');
+      expect(a.value.page).toBe('2');
       expect(a.value.page_size).toBe('3');
     }
   });
@@ -646,17 +659,17 @@ describe('handleSchedulesCardAction', () => {
     expect(cardJson).toContain('↩ 总览');
   });
 
-  it('back_to_list with origin=overview → rebuilt list is drilldown shape', async () => {
+  it('back_to_list with origin=overview → rebuilt list restores source page and drilldown shape', async () => {
     const tasks = Array.from({ length: 12 }, (_, i) => task({ id: `t_${i}`, name: `task-${i}`, enabled: true }));
     const deps = makeDeps({
       createClient: vi.fn(() => ({ request: vi.fn(async () => ({ status: 200, body: { schedules: tasks }, raw: '' })) } as any)),
     });
     const r = await handleSchedulesCardAction(
-      makeAction({ action: SCHEDULES_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER, origin: 'overview', page_size: '5' }),
+      makeAction({ action: SCHEDULES_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER, origin: 'overview', page: '2', page_size: '5' }),
       LARK_APP_ID, deps,
     );
     const cardJson = JSON.stringify(r.card?.data);
-    expect(cardJson).toContain('第 1/3 页');
+    expect(cardJson).toContain('第 2/3 页');
     expect(cardJson).toContain('dash_overview_refresh');
   });
 
@@ -1373,7 +1386,7 @@ describe('handleSchedulesCardAction', () => {
 
   // ─── Slice 2a: BACK TO LIST ─────────────────────────────────────────
   describe('action=dash_schedules_back_to_list', () => {
-    it('GET schedules-list → returns { card } with list card body at page 1', async () => {
+    it('GET schedules-list → returns { card } with list card body at source page', async () => {
       const tasks = Array.from({ length: 25 }, (_, i) =>
         task({ id: `t_${i}`, name: `task-${i}`, enabled: true }),
       );
@@ -1385,7 +1398,7 @@ describe('handleSchedulesCardAction', () => {
         nowMs: () => Date.parse('2026-06-09T12:00:00.000Z'),
       };
       const r = await handleSchedulesCardAction(
-        makeAction({ action: SCHEDULES_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER }),
+        makeAction({ action: SCHEDULES_ACTION_BACK_TO_LIST, invoker_open_id: INVOKER, page: '4' }),
         LARK_APP_ID, deps as any,
       );
       expect(requestSpy).toHaveBeenCalledOnce();
@@ -1394,8 +1407,8 @@ describe('handleSchedulesCardAction', () => {
       expect(r.card?.type).toBe('raw');
       const cardJson = JSON.stringify(r.card?.data);
       expect(cardJson).toContain('Dashboard 定时任务');
-      // page 1 of 5 pages (25 / 5; PAGE_SIZE=5 after 2026-06-10 unification).
-      expect(cardJson).toContain('第 1/5 页');
+      // Source page 4 of 5 pages (25 / 5; PAGE_SIZE=5 after 2026-06-10 unification).
+      expect(cardJson).toContain('第 4/5 页');
     });
 
     it('non-admin → toast, no GET', async () => {

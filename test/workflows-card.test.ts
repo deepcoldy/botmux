@@ -401,6 +401,7 @@ describe('buildWorkflowsCard — slice 2a inline 📂 详情 buttons', () => {
     for (const b of detailButtons) {
       expect(String(b.text?.content ?? '')).toContain('📂');
       expect(b.value.invoker_open_id).toBe(INVOKER);
+      expect(b.value.page).toBe('1');
     }
   });
 });
@@ -694,12 +695,13 @@ describe('buildWorkflowsDetailCard (slice 2a)', () => {
     expect(json).not.toContain('dash_overview_refresh');
   });
 
-  it('origin=overview + pageSize=3 override → cancel/back values carry origin AND page_size', () => {
+  it('origin=overview + pageSize=3 override → cancel/back values carry origin/page/page_size', () => {
     const detail = detailFor({ status: 'running' });
     const json = buildWorkflowsDetailCard(detail, {
       ...baseOpts,
       origin: 'overview',
       pageSize: 3,
+      sourcePage: 2,
     });
     const parsed = JSON.parse(json);
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
@@ -710,8 +712,10 @@ describe('buildWorkflowsDetailCard (slice 2a)', () => {
       (a: any) => a.value?.action === WORKFLOWS_ACTION_BACK_TO_LIST,
     );
     expect(cancel.value.origin).toBe('overview');
+    expect(cancel.value.page).toBe('2');
     expect(cancel.value.page_size).toBe('3');
     expect(back.value.origin).toBe('overview');
+    expect(back.value.page).toBe('2');
     expect(back.value.page_size).toBe('3');
   });
 
@@ -1221,16 +1225,17 @@ describe('handleWorkflowsCardAction — overview drilldown', () => {
     expect(cardJson).toContain('dash_overview_refresh');
   });
 
-  it('BACK_TO_LIST with origin=overview → rebuilt list has ↩ 总览 and threads origin onto child buttons', async () => {
-    const runs: WorkflowRunInput[] = [
-      run({ runId: 'r_b1', workflowId: 'wfB1', status: 'running' }),
-    ];
+  it('BACK_TO_LIST with origin=overview → rebuilt list restores source page and threads origin onto child buttons', async () => {
+    const runs: WorkflowRunInput[] = Array.from({ length: 12 }, (_, i) =>
+      run({ runId: `r_b${i}`, workflowId: `wfB${i}`, status: 'running' }),
+    );
     const deps = makeListDeps(runs);
     const r = await handleWorkflowsCardAction(
       makeAction({
         action: WORKFLOWS_ACTION_BACK_TO_LIST,
         invoker_open_id: INVOKER,
         origin: 'overview',
+        page: '2',
       }),
       LARK_APP_ID,
       deps,
@@ -1238,6 +1243,7 @@ describe('handleWorkflowsCardAction — overview drilldown', () => {
     expect(r.card?.type).toBe('raw');
     const cardJson = JSON.stringify(r.card?.data);
     expect(cardJson).toContain('↩ 总览');
+    expect(cardJson).toContain('第 2/3 页');
     // Detail button (per-row) and refresh button must both carry origin=overview.
     const card: any = r.card?.data;
     const allBtns = (card.elements as any[])
@@ -1299,6 +1305,7 @@ describe('handleWorkflowsCardAction — overview drilldown', () => {
         invoker_open_id: INVOKER,
         run_id: 'r_dp',
         origin: 'overview',
+        page: '2',
         page_size: '3',
       }),
       LARK_APP_ID,
@@ -1314,8 +1321,10 @@ describe('handleWorkflowsCardAction — overview drilldown', () => {
       (a: any) => a.value?.action === WORKFLOWS_ACTION_BACK_TO_LIST,
     );
     expect(cancel.value.origin).toBe('overview');
+    expect(cancel.value.page).toBe('2');
     expect(cancel.value.page_size).toBe('3');
     expect(back.value.origin).toBe('overview');
+    expect(back.value.page).toBe('2');
     expect(back.value.page_size).toBe('3');
   });
 });

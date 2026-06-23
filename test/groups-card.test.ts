@@ -320,6 +320,24 @@ describe('buildGroupsCard', () => {
       expect(rowDivs.length).toBe(3);
     });
 
+    it('oversized pageSize is clamped before button values are written', () => {
+      const chats150 = Array.from({ length: 150 }, (_, i) =>
+        chat({ chatId: `oc_big_${i}`, name: `big-${i}` }),
+      );
+      const json = buildGroupsCard(
+        matrix(chats150),
+        { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 999 },
+      );
+      const parsed = JSON.parse(json);
+      expect(JSON.stringify(parsed)).toContain('第 1/2 页');
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      for (const b of allButtons) {
+        if (b.value?.page_size !== undefined) expect(b.value.page_size).toBe('100');
+      }
+    });
+
     it('origin=overview → footer renders "↩ 总览" with action=dash_overview_refresh', () => {
       const json = buildGroupsCard(
         matrix(chats12),

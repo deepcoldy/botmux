@@ -6,7 +6,6 @@ import {
   buildGroupRows,
   chatIdSuffix,
   filterGroups,
-  isDisbandConfirmed,
   paginateGroups,
   type GroupsBotInput,
   type GroupsChatInput,
@@ -206,7 +205,7 @@ describe('groups-card-model · buildGroupDetail', () => {
     expect(claude.unbind.enabled).toBe(true);
   });
 
-  it('isOwnerBot reflects chat.ownerId === larkAppId; canDisband=true iff at least one member is in chat', () => {
+  it('isOwnerBot reflects chat.ownerId === larkAppId', () => {
     const ownedChat: GroupsChatInput = {
       chatId: 'oc_owned',
       name: 'owned',
@@ -216,29 +215,6 @@ describe('groups-card-model · buildGroupDetail', () => {
     const owned = buildGroupDetail(ownedChat, BOTS);
     expect(owned.members.find(m => m.larkAppId === 'cli_codex')!.isOwnerBot).toBe(true);
     expect(owned.members.find(m => m.larkAppId === 'cli_claude')!.isOwnerBot).toBe(false);
-    expect(owned.canDisband).toBe(true);
-
-    const noOneIn: GroupsChatInput = {
-      chatId: 'oc_emptied',
-      name: 'emptied',
-      memberBots: BOTS.map(b => ({ larkAppId: b.larkAppId, botName: b.botName, inChat: false })),
-    };
-    expect(buildGroupDetail(noOneIn, BOTS).canDisband).toBe(false);
-  });
-});
-
-describe('groups-card-model · isDisbandConfirmed', () => {
-  it('matches with trim + case-insensitivity; rejects empty / partial / substring containment', () => {
-    expect(isDisbandConfirmed('TeamRoom', 'TeamRoom')).toBe(true);
-    expect(isDisbandConfirmed('  teamroom  ', 'TeamRoom')).toBe(true);
-    expect(isDisbandConfirmed('TEAMROOM', 'TeamRoom')).toBe(true);
-
-    expect(isDisbandConfirmed('', 'TeamRoom')).toBe(false);
-    expect(isDisbandConfirmed('Team', 'TeamRoom')).toBe(false); // substring, not equal
-    expect(isDisbandConfirmed('TeamRoomExtra', 'TeamRoom')).toBe(false);
-    expect(isDisbandConfirmed(undefined, 'TeamRoom')).toBe(false);
-    expect(isDisbandConfirmed(null, 'TeamRoom')).toBe(false);
-    expect(isDisbandConfirmed('any', '')).toBe(false); // empty group name disallowed
   });
 });
 

@@ -93,6 +93,7 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.schedules.detail.kind_label',
   'card.dashboard.schedules.detail.display_label',
   'card.dashboard.schedules.detail.delivery_label',
+  'card.dashboard.schedules.detail.owner_label',
   'card.dashboard.schedules.detail.next_label',
   'card.dashboard.schedules.detail.last_label',
   'card.dashboard.schedules.detail.status_label',
@@ -314,6 +315,15 @@ describe('PR3 i18n placeholders', () => {
     const en = t('card.dashboard.help.unknown_module', { module: 'foo' }, 'en');
     expect(zh).toContain('foo');
     expect(en).toContain('foo');
+  });
+});
+
+describe('PR3 dashboard i18n key symmetry', () => {
+  it('card.dashboard.* key sets are symmetric between zh and en', () => {
+    const dashboardKeys = (messages: Record<string, string>): string[] =>
+      Object.keys(messages).filter(key => key.startsWith('card.dashboard.')).sort();
+    expect(dashboardKeys(zhMessages).filter(key => !dashboardKeys(enMessages).includes(key))).toEqual([]);
+    expect(dashboardKeys(enMessages).filter(key => !dashboardKeys(zhMessages).includes(key))).toEqual([]);
   });
 });
 

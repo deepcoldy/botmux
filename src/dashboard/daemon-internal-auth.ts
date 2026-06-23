@@ -203,10 +203,9 @@ export interface VerifyOptions {
 }
 
 /**
- * Read a single header value. Duplicate (array-valued) headers are rejected
- * rather than silently picking the first — an attacker who can inject an extra
- * `X-Botmux-Daemon-Sig: ...` line would otherwise be able to override the one
- * the daemon meant to send.
+ * Read a single header value. Node normally comma-joins duplicate wire headers;
+ * array-valued headers can still appear in tests/custom callers. Accept only
+ * strings so malformed arrays fail as missing headers instead of picking one.
  */
 function headerStr(req: IncomingMessage, name: string): string | undefined {
   const v = req.headers[name];

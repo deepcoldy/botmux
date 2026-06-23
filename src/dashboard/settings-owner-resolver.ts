@@ -45,7 +45,7 @@ export async function isAuthorizedForGlobalSettings(
   if (trimmed.length === 0) return false;
   if (!trimmed.startsWith('on_')) return false;
 
-  const resolve = deps.resolveOwnerCandidates ?? defaultResolveOwnerCandidates;
+  const resolve = deps.resolveOwnerCandidates ?? (() => defaultResolveOwnerCandidates({ skipNames: true }));
 
   let candidates: OwnerCandidate[];
   try {

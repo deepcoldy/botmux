@@ -225,6 +225,7 @@ export function buildWorkflowsCard(
               action: WORKFLOWS_ACTION_DETAIL,
               invoker_open_id: opts.invokerOpenId,
               run_id: dto.runId,
+              page: String(paged.page),
               ...navFields,
             },
           },
@@ -393,6 +394,9 @@ export interface BuildWorkflowsDetailCardOpts {
    *  button. */
   origin?: 'overview';
   pageSize?: number;
+  /** Source list page. Detail actions round-trip this so BACK_TO_LIST restores
+   *  the page that opened the detail card. */
+  sourcePage?: number;
   /** Dashboard scope. Threaded into cancel/back buttons. */
   scope?: 'global';
 }
@@ -533,6 +537,9 @@ export function buildWorkflowsDetailCard(
   // the cancel button (round-trip preservation) and the back button.
   const backNav: Record<string, string> = {};
   if (opts.origin === 'overview') backNav.origin = 'overview';
+  if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage) && opts.sourcePage >= 1) {
+    backNav.page = String(Math.floor(opts.sourcePage));
+  }
   if (
     typeof opts.pageSize === 'number'
     && Number.isFinite(opts.pageSize)
@@ -729,6 +736,9 @@ export async function handleWorkflowsCardAction(
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+  const parsedNavPage = Number.parseInt(value.page ?? '', 10);
+  const navPage: number | undefined =
+    Number.isFinite(parsedNavPage) && parsedNavPage >= 1 ? parsedNavPage : undefined;
   const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
   const listPathSuffix = navScope === 'global' ? '&scope=global' : '';
   const writePathSuffix = navScope === 'global' ? '?scope=global' : '';
@@ -752,6 +762,7 @@ export async function handleWorkflowsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -826,12 +837,13 @@ export async function handleWorkflowsCardAction(
       nowMs: now(),
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3c) BACK TO LIST — rebuild list card at page 1 ─────────────────
+  // ─── 3c) BACK TO LIST — rebuild list card at the source page ─────────
   if (action === WORKFLOWS_ACTION_BACK_TO_LIST) {
     const r = await safeGetWorkflowsList(client, locale, listPathSuffix);
     if ('errorResult' in r) return r.errorResult;
@@ -840,7 +852,7 @@ export async function handleWorkflowsCardAction(
       {
         invokerOpenId: operatorOpenId,
         locale,
-        page: 1,
+        page: navPage ?? 1,
         pageSize: navPageSize,
         origin: navOrigin,
         scope: navScope,

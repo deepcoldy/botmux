@@ -168,6 +168,19 @@ describe('schedule-card-model · computeNextNRuns', () => {
     const t = makeTask({ parsed: interval(0) });
     expect(computeNextNRuns(t, 5, { nowMs: FIXED_NOW })).toEqual([]);
   });
+
+  it('skips long-overdue interval runs arithmetically and returns future timestamps', () => {
+    const t = makeTask({
+      parsed: interval(1),
+      lastRunAt: new Date(FIXED_NOW - 400_000 * 60_000).toISOString(),
+    });
+    const runs = computeNextNRuns(t, 3, { nowMs: FIXED_NOW });
+    expect(runs.map(r => Date.parse(r))).toEqual([
+      FIXED_NOW + 60_000,
+      FIXED_NOW + 120_000,
+      FIXED_NOW + 180_000,
+    ]);
+  });
 });
 
 describe('schedule-card-model · invariants', () => {

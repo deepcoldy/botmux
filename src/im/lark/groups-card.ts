@@ -53,6 +53,7 @@ const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
 /** Default page size for standalone and overview-drilldown list cards. */
 const PAGE_SIZE = 5;
+const MAX_PAGE_SIZE = 100;
 
 /** Hard cap on `select_static` option count for the "jump to page" picker.
  *  Lark caps select options around this; we also keep payload small. Above
@@ -113,10 +114,16 @@ type GroupsMatrix = {
   bots: ReadonlyArray<GroupsBotInput>;
 };
 
+function clampPageSize(pageSize: number | undefined): number {
+  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return PAGE_SIZE;
+  return Math.min(Math.floor(pageSize), MAX_PAGE_SIZE);
+}
+
 function buildNavFields(opts: { pageSize?: number; origin?: 'overview'; scope?: 'global' }): Record<string, string> {
   const navFields: Record<string, string> = {};
+  const effectivePageSize = clampPageSize(opts.pageSize);
   if (opts.origin === 'overview') navFields.origin = 'overview';
-  if (opts.pageSize !== undefined && opts.pageSize !== PAGE_SIZE) navFields.page_size = String(opts.pageSize);
+  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
   return navFields;
 }
@@ -126,10 +133,7 @@ export function buildGroupsCard(
   matrix: GroupsMatrix,
   opts: BuildGroupsCardOpts,
 ): string {
-  const effectivePageSize =
-    typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
-      ? Math.floor(opts.pageSize)
-      : PAGE_SIZE;
+  const effectivePageSize = clampPageSize(opts.pageSize);
 
   // Project EVERY chat into a row DTO ourselves rather than going through
   // `buildGroupRows`, because the pipeline helper also paginates and would

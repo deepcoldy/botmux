@@ -126,7 +126,7 @@ const MAX_PAGE_SIZE = 100;
 const TERMINAL_STATUSES: ReadonlySet<WorkflowRunStatus> = new Set(['succeeded', 'failed', 'cancelled']);
 
 /** Map a RunStatus to its UI dot (tone + pulse + i18n label key). Pure, deterministic. */
-export function statusToDot(status: WorkflowRunStatus): RunStatusDot {
+export function statusToDot(status: WorkflowRunStatus | string): RunStatusDot {
   switch (status) {
     case 'pending':
       return { tone: 'neutral', pulse: false, label: 'workflows.status.pending' };
@@ -140,6 +140,8 @@ export function statusToDot(status: WorkflowRunStatus): RunStatusDot {
       return { tone: 'danger', pulse: false, label: 'workflows.status.failed' };
     case 'cancelled':
       return { tone: 'neutral', pulse: false, label: 'workflows.status.cancelled' };
+    default:
+      return { tone: 'neutral', pulse: false, label: 'workflows.status.unknown' };
   }
 }
 

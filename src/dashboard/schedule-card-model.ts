@@ -300,7 +300,10 @@ export function computeNextNRuns(
     const stepMs = minutes * 60_000;
     const lastMs = task.lastRunAt ? Date.parse(task.lastRunAt) : NaN;
     let next = Number.isFinite(lastMs) ? lastMs + stepMs : ctx.nowMs + stepMs;
-    while (next <= ctx.nowMs) next += stepMs;
+    if (next <= ctx.nowMs) {
+      const skipped = Math.floor((ctx.nowMs - next) / stepMs) + 1;
+      next += skipped * stepMs;
+    }
     const out: string[] = [];
     for (let i = 0; i < n; i++) {
       out.push(new Date(next).toISOString());

@@ -41,6 +41,14 @@ describe('workflow-card-model · statusToDot', () => {
     expect(labels.size).toBe(6); // all 6 labels distinct
     expect(tones.size).toBe(6);  // all 6 composite keys distinct
   });
+
+  it('maps unknown statuses to a neutral fallback dot', () => {
+    expect(statusToDot('mystery')).toEqual({
+      tone: 'neutral',
+      pulse: false,
+      label: 'workflows.status.unknown',
+    });
+  });
 });
 
 describe('workflow-card-model · formatElapsedMs', () => {

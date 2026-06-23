@@ -265,6 +265,21 @@ describe('buildSessionsCard', () => {
       expect(detailButtons.length).toBe(3);
     });
 
+    it('oversized pageSize is clamped before button values are written', () => {
+      const rows150 = Array.from({ length: 150 }, (_, i) =>
+        row({ sessionId: `sess_big_${i}`, title: `big-${i}`, status: 'idle' }),
+      );
+      const json = buildSessionsCard(rows150, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 999 }, NOW);
+      const parsed = JSON.parse(json);
+      expect(JSON.stringify(parsed)).toContain('第 1/2 页');
+      const allButtons = (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions ?? []);
+      for (const b of allButtons) {
+        if (b.value?.page_size !== undefined) expect(b.value.page_size).toBe('100');
+      }
+    });
+
     it('origin=overview → footer renders "↩ 总览" with action=dash_overview_refresh', () => {
       const json = buildSessionsCard(rows, { invokerOpenId: INVOKER, locale: 'zh', page: 1, pageSize: 5, origin: 'overview' }, NOW);
       const parsed = JSON.parse(json);

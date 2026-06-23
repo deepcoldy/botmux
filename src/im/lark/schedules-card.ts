@@ -184,6 +184,7 @@ export function buildSchedulesCard(
               action: SCHEDULES_ACTION_DETAIL,
               invoker_open_id: opts.invokerOpenId,
               schedule_id: dto.id,
+              page: String(page),
               ...navFields,
             },
           },
@@ -343,6 +344,19 @@ function botLabelFromRow(row: ScheduleRowDto): string {
   return '—';
 }
 
+/** Resolve the owning bot label for a schedule detail row. */
+function botLabelFromDetail(detail: ScheduleDetailDto): string {
+  const raw = detail.raw as { botName?: string; larkAppId?: string };
+  if (typeof raw.botName === 'string' && raw.botName.length > 0) return raw.botName;
+  if (typeof detail.larkAppId === 'string' && detail.larkAppId.length > 0) {
+    return `bot:${detail.larkAppId.slice(-6)}`;
+  }
+  if (typeof raw.larkAppId === 'string' && raw.larkAppId.length > 0) {
+    return `bot:${raw.larkAppId.slice(-6)}`;
+  }
+  return '—';
+}
+
 function deliveryLabel(deliver: ScheduleDelivery, locale: Locale): string {
   switch (deliver) {
     case 'new-topic':
@@ -368,6 +382,9 @@ export interface BuildSchedulesDetailCardOpts {
    *  return-to-overview). Detail itself does NOT render return-to-overview. */
   origin?: 'overview';
   pageSize?: number;
+  /** Source list page. Detail buttons round-trip this so BACK_TO_LIST restores
+   *  the page that opened the detail card. */
+  sourcePage?: number;
   /** Global-scope flag threaded into action buttons and rebuilt cards. */
   scope?: 'global';
 }
@@ -433,17 +450,29 @@ export function buildSchedulesDetailCard(
       opts.locale,
     ),
   );
+  if (opts.scope === 'global') {
+    infoLines.push(
+      t(
+        'card.dashboard.schedules.detail.owner_label',
+        {
+          bot: escapeLarkMd(botLabelFromDetail(detail)),
+          chat: escapeLarkMd(detail.chatId ?? '—'),
+        },
+        opts.locale,
+      ),
+    );
+  }
   infoLines.push(
     t(
       'card.dashboard.schedules.detail.next_label',
-      { rel: escapeLarkMd(detail.nextRunAt ?? '—') },
+      { time: escapeLarkMd(detail.nextRunAt ?? '—') },
       opts.locale,
     ),
   );
   infoLines.push(
     t(
       'card.dashboard.schedules.detail.last_label',
-      { rel: escapeLarkMd(detail.lastRunAt ?? '—') },
+      { time: escapeLarkMd(detail.lastRunAt ?? '—') },
       opts.locale,
     ),
   );
@@ -505,6 +534,9 @@ export function buildSchedulesDetailCard(
   // success, so users may then press 🔙 返回 and expect the drilldown list.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
+  if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage) && opts.sourcePage >= 1) {
+    navFields.page = String(Math.floor(opts.sourcePage));
+  }
   if (
     typeof opts.pageSize === 'number'
     && Number.isFinite(opts.pageSize)
@@ -766,6 +798,9 @@ export async function handleSchedulesCardAction(
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
+  const parsedNavPage = Number.parseInt(value.page ?? '', 10);
+  const navPage: number | undefined =
+    Number.isFinite(parsedNavPage) && parsedNavPage >= 1 ? parsedNavPage : undefined;
   const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
   const listPathSuffix = navScope === 'global' ? '?scope=global' : '';
   const writePathSuffix = navScope === 'global' ? '?scope=global' : '';
@@ -788,6 +823,7 @@ export async function handleSchedulesCardAction(
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -857,6 +893,7 @@ export async function handleSchedulesCardAction(
         locale,
         origin: navOrigin,
         pageSize: navPageSize,
+        sourcePage: navPage,
         scope: navScope,
       });
       return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -888,6 +925,7 @@ export async function handleSchedulesCardAction(
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -960,12 +998,13 @@ export async function handleSchedulesCardAction(
       locale,
       origin: navOrigin,
       pageSize: navPageSize,
+      sourcePage: navPage,
       scope: navScope,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
   }
 
-  // ─── 3d) BACK TO LIST — rebuild list card at page 1 ─────────────────
+  // ─── 3d) BACK TO LIST — rebuild list card at the source page ─────────
   if (action === SCHEDULES_ACTION_BACK_TO_LIST) {
     const r = await safeGetSchedulesList(client, locale, listPathSuffix);
     if ('errorResult' in r) return r.errorResult;
@@ -974,7 +1013,7 @@ export async function handleSchedulesCardAction(
       {
         invokerOpenId: operatorOpenId,
         locale,
-        page: 1,
+        page: navPage ?? 1,
         pageSize: navPageSize,
         origin: navOrigin,
         scope: navScope,
