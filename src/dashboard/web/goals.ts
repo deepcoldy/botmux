@@ -364,7 +364,15 @@ export function renderGoalsPage(root: HTMLElement): () => void {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ taskId: task, text }),
       });
-      if (!res.ok) throw new Error(res.status === 404 ? '决策通道未就绪（需 daemon 升级）' : `下发失败：HTTP ${res.status}`);
+      if (!res.ok) {
+        let code = '';
+        try { code = (await res.json())?.error ?? ''; } catch { /* non-json */ }
+        throw new Error(
+          code === 'no_supervisor' ? '该 goal 当前没有在线监管者(L2)，无法下发（会话可能已关）'
+          : code === 'missing_text' ? '指示不能为空'
+          : `下发失败：${code || 'HTTP ' + res.status}`,
+        );
+      }
       if (ta) ta.value = '';
       delete decideDraft[task];
       setStatus('✓ 已下发给监管者', 'gb-decide-ok');
