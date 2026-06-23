@@ -9,6 +9,7 @@ import type { TaskView } from '../verified-delivery/types.js';
 import { reconcileTaskByCriteria, type ReconcileResult } from '../verified-delivery/reconcile.js';
 import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
+import { emitGoalNarration } from '../verified-delivery/narration.js';
 
 export const GOAL_WATCHDOG_PROMPT_PREFIX = '[goal-watchdog]';
 export const DEFAULT_GOAL_WATCHDOG_INTERVAL_MS = 5 * 60_000;
@@ -129,9 +130,33 @@ function buildGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): string {
 }
 
 async function sendGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): Promise<void> {
-  const text = buildGoalWatchdogNotification(event);
-  if (!text.trim()) return;
-  await sendMessage(event.larkAppId, event.goalChatId, text, 'text');
+  const eventId = event.result.eventId ?? event.result.reportId ?? event.task.latestReportId ?? 'unknown';
+  if (event.kind === 'accepted') {
+    await emitGoalNarration({
+      larkAppId: event.larkAppId,
+      goalChatId: event.goalChatId,
+      event: {
+        type: 'accepted',
+        key: `narr:accepted:${event.task.taskId}:${eventId}`,
+        taskId: event.task.taskId,
+        title: event.task.title,
+        mode: '自动对账',
+      },
+    }, { sendMessage });
+    return;
+  }
+  if (event.kind === 'rejected') {
+    await emitGoalNarration({
+      larkAppId: event.larkAppId,
+      goalChatId: event.goalChatId,
+      event: {
+        type: 'rejected',
+        key: `narr:rejected:${event.task.taskId}:${eventId}`,
+        taskId: event.task.taskId,
+        reason: event.result.verify ? `对账核验未通过：${formatFailedChecks(event.result).join('；') || '检查未通过'}` : 'check_failed',
+      },
+    }, { sendMessage });
+  }
 }
 
 export function isGoalSupervisorTitle(title: string | undefined): boolean {

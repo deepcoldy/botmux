@@ -5412,6 +5412,7 @@ import { config } from './config.js';
 import { openLedger } from './verified-delivery/ledger.js';
 import { buildReport, parseArtifactText } from './verified-delivery/report.js';
 import { parseAcceptanceCriteria } from './verified-delivery/acceptance.js';
+import { emitGoalNarration } from './verified-delivery/narration.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
@@ -7378,6 +7379,18 @@ async function cmdHelp(rest: string[]): Promise<void> {
   });
 
   const watchdog = await triggerGoalWatchdogFromCli(goalChatId, `help:${taskId}`);
+  if (!result.deduped && s?.larkAppId) {
+    await emitDeliveryNarrationFromCli({
+      larkAppId: s.larkAppId,
+      goalChatId,
+      event: {
+        type: 'help',
+        key: `narr:help:${taskId}:${result.event.eventId}`,
+        taskId,
+        detail: blockerText,
+      },
+    });
+  }
   console.log(JSON.stringify({
     success: true,
     taskId,
@@ -7386,6 +7399,16 @@ async function cmdHelp(rest: string[]): Promise<void> {
     goalChatId,
     watchdog,
   }, null, 2));
+}
+
+async function emitDeliveryNarrationFromCli(input: Parameters<typeof emitGoalNarration>[0]): Promise<void> {
+  try {
+    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+    for (const cfg of loadBotConfigs()) registerBot(cfg);
+    await emitGoalNarration(input);
+  } catch (err) {
+    console.error(`⚠️ 已写入账本，但 goal 群播报失败：${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // ─── Verified delivery accept/reject (orchestrator-as-judge) ────────────────
@@ -7504,6 +7527,18 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
         retryBrief: retryBrief || undefined,
       },
     });
+    if (!result.deduped && s?.larkAppId) {
+      await emitDeliveryNarrationFromCli({
+        larkAppId: s.larkAppId,
+        goalChatId: task.chatId,
+        event: {
+          type: 'escalated',
+          key: `narr:escalated:${taskId}:${result.event.eventId}`,
+          taskId,
+          reason,
+        },
+      });
+    }
 
     let parentNotified: boolean | undefined;
     let attentionRaised: boolean | undefined;
@@ -7586,6 +7621,22 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
         ranCommands: ranCommands.length ? ranCommands : undefined,
       },
     });
+    if (!result.deduped && s?.larkAppId) {
+      const mode = note && /代办|supervisor/i.test(note)
+        ? '监管者代办'
+        : '监管者验收';
+      await emitDeliveryNarrationFromCli({
+        larkAppId: s.larkAppId,
+        goalChatId: task.chatId,
+        event: {
+          type: 'accepted',
+          key: `narr:accepted:${taskId}:${result.event.eventId}`,
+          taskId,
+          title: task.title,
+          mode,
+        },
+      });
+    }
     console.log(JSON.stringify({ success: true, taskId, reportId, accepted: true, deduped: result.deduped }));
     return;
   }
@@ -7613,6 +7664,18 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
       expectedEvidence: expectedEvidence?.trim() || undefined,
     },
   });
+  if (!result.deduped && s?.larkAppId) {
+    await emitDeliveryNarrationFromCli({
+      larkAppId: s.larkAppId,
+      goalChatId: task.chatId,
+      event: {
+        type: 'rejected',
+        key: `narr:rejected:${taskId}:${result.event.eventId}`,
+        taskId,
+        reason,
+      },
+    });
+  }
 
   let retryMessageId: string | undefined;
   if (!argFlag(rest, '--no-push')) {

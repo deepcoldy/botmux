@@ -180,6 +180,8 @@ export interface ReconcileResult {
   reportId?: string;
   /** Whether the verdict append deduped (idempotent re-run). */
   deduped?: boolean;
+  /** Ledger event id for accepted/rejected writes; useful for narration/audit refs. */
+  eventId?: string;
   /** For 'unreported-pass' only: a human-readable fact the caller injects to the
    *  supervisor (L2) so it can decide 代办/催交/重派. Never a ledger write. */
   inspectionFact?: string;
@@ -260,7 +262,7 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
           ranCommands: verify.ranCommands.length ? verify.ranCommands : undefined,
         },
       });
-      return { taskId, action: 'accepted', verify, reportId, deduped: res.deduped };
+      return { taskId, action: 'accepted', verify, reportId, deduped: res.deduped, eventId: res.event.eventId };
     }
     // Artifacts satisfy the criteria but the worker NEVER filed a report. The
     // mechanical layer must not fabricate a completion (the bug 老滕 caught: a
@@ -288,7 +290,7 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
         retryBrief: `对账核验未通过：${verifySummary(verify)}`,
       },
     });
-    return { taskId, action: 'rejected', verify, reportId, deduped: res.deduped };
+    return { taskId, action: 'rejected', verify, reportId, deduped: res.deduped, eventId: res.event.eventId };
   }
 
   // Verify failed and there is no pending report to reject. We do NOT fabricate a
