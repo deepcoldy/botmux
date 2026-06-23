@@ -76,6 +76,12 @@ import type { DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 
+// Daemon process start (module load ≈ daemon boot). Used by the SSE snapshot
+// replay to bound the "recently closed" set to sessions that flipped
+// active→closed during THIS run — i.e. restore-time zombies — without replaying
+// the entire closed-session history on every connect.
+const PROCESS_START_MS = Date.now();
+
 export interface IpcServerHandle {
   port: number;
   close: () => Promise<void>;
@@ -1602,8 +1608,30 @@ ipcRoute('GET', '/api/events', (_req, res) => {
   // aggregator and the browser store upsert by sessionId, so any row also
   // delivered live just refreshes the same entry.
   try {
+    const activeIds = new Set<string>();
     for (const ds of listActiveSessions()) {
+      activeIds.add(ds.session.sessionId);
       res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds) })}\n\n`);
+    }
+    // Also replay sessions CLOSED during this run as `session.spawned` carrying a
+    // closed row. The active-only replay above can't cover a restore-time zombie:
+    // restoreActiveSessions registers it, announces it, then immediately probes it
+    // 'missing' and closeSession()s it (evicting it from the active Map) — all
+    // before a racing dashboard's SSE subscription exists. By connect time it is
+    // neither in the active Map nor was it a closed row at the dashboard's early
+    // (pre-restore) hydrate, so without this it stays invisible (or, if the
+    // dashboard cached it active from before the restart, lingers as a stale
+    // active row — hydrateSessions only upserts, never deletes absent rows).
+    // Bounded to closedAt >= PROCESS_START_MS so we replay only this run's
+    // closures (the full closed history is already served by GET /api/sessions
+    // on hydrate). `session.spawned` (not session.update) because the row may be
+    // unknown to the client — both consumers upsert by sessionId, and the closed
+    // row's status:'closed' overwrites any stale active entry.
+    for (const s of sessionStore.listSessions()) {
+      if (s.status !== 'closed' || activeIds.has(s.sessionId)) continue;
+      const closedMs = s.closedAt ? Date.parse(s.closedAt) : NaN;
+      if (!Number.isFinite(closedMs) || closedMs < PROCESS_START_MS) continue;
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromClosed(s) })}\n\n`);
     }
   } catch (err) {
     logger.warn(`[dashboard-ipc] /api/events snapshot replay failed: ${err}`);
