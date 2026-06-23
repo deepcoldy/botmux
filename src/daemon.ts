@@ -4401,15 +4401,22 @@ async function sendGoalCompletionConfirmation(input: {
   }
 }
 
-function goalParentReplyCandidates(parsed: Pick<LarkMessage, 'parentId' | 'rootId' | 'messageId'>): string[] {
-  return [parsed.parentId, parsed.rootId]
+function goalParentReplyCandidates(parsed: Pick<LarkMessage, 'parentId' | 'messageId'>): string[] {
+  // Only explicit quote/reply to the notification should route back to L2.
+  // `rootId` identifies the whole Lark topic/thread; using it here hijacks
+  // unrelated replies in the parent conversation.
+  return [parsed.parentId]
     .filter((id): id is string => !!id && id !== parsed.messageId);
 }
 
 function findGoalNotificationRecordForReply(parsed: Pick<LarkMessage, 'parentId' | 'rootId' | 'messageId'>): GoalParentNotificationRecord | undefined {
   for (const id of goalParentReplyCandidates(parsed)) {
     const rec = getGoalParentNotification(id);
-    if (rec) return rec;
+    if (!rec) continue;
+    // Completion cards are terminal acknowledgements; later discussion in the
+    // parent thread must stay with L1/humans instead of being swallowed by L2.
+    if (rec.done) continue;
+    return rec;
   }
   return undefined;
 }
@@ -4444,6 +4451,16 @@ async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string,
     return false;
   }
   await injectGoalSupervisorTurn(supervisor, buildGoalParentReplyPrompt(record, parsed));
+  try {
+    await sendMessage(
+      larkAppId,
+      record.parentChatId,
+      `[goal] 已把你的回复转给 goal「${record.goalTitle ?? record.goalChatId}」的监管者。`,
+      'text',
+    );
+  } catch (err) {
+    logger.warn(`[goal-parent-reply] failed to send parent ack: ${err instanceof Error ? err.message : String(err)}`);
+  }
   logger.info(`[goal-parent-reply] routed parent reply ${parsed.messageId.substring(0, 12)} to L2 ${supervisor.session.sessionId.substring(0, 8)} goal=${record.goalChatId}`);
   return true;
 }
