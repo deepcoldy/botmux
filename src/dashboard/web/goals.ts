@@ -256,7 +256,26 @@ function helpHtml(t: BoardTask): string {
   }
   return parts.join('');
 }
-function detailHtml(t: BoardTask | null): string {
+/** Human-in-the-loop decision box — the dashboard counterpart of replying in the
+ *  Feishu goal group. The human types an instruction / supplied info and it is
+ *  injected into the goal's L2 supervisor turn (POST /api/goals/:goalChatId/
+ *  decision), which then guides the worker / 代办 / 重派 / closes the escalation.
+ *  Shown for the states that actually need a human call (升级人工 / worker 求助);
+ *  the ledger stays the truth — this only feeds L2 a decision, never writes a verdict. */
+function decisionHtml(t: BoardTask, goalChatId: string): string {
+  if (!(t.escalation || t.status === 'blocked')) return '';
+  const cue = t.escalation ? '这条已升级到你，拍个方向给监管者' : 'worker 在求助，给监管者一个处置指示';
+  return `<div class="gb-sec gb-sec-decide" data-goal="${escapeHtml(goalChatId)}" data-task="${escapeHtml(t.taskId)}">
+    <h3>下发决策 → 监管者</h3>
+    <p class="gb-decide-hint">${cue}。它会去引导 worker / 代办 / 重派 / 关闭升级；账本仍是唯一真相。</p>
+    <textarea class="gb-decide-input" rows="3" placeholder="例如：权限我已开通让 worker 重试；或：改用方案 B 重派；或：这条放弃，标记不做…"></textarea>
+    <div class="gb-decide-row">
+      <button type="button" class="gb-decide-send">下发给监管者</button>
+      <span class="gb-decide-status" aria-live="polite"></span>
+    </div>
+  </div>`;
+}
+function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
   if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
   return `<div class="gb-detail-head">
       <div class="gb-led-id gb-led-id-lg">${escapeHtml(t.taskId)}</div>
@@ -268,6 +287,7 @@ function detailHtml(t: BoardTask | null): string {
       return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
     }).join('、')}</p>` : ''}
     ${(t.help || t.escalation) ? `<div class="gb-sec gb-sec-help"><h3>求助 / 升级</h3>${helpHtml(t)}</div>` : ''}
+    ${goalChatId ? decisionHtml(t, goalChatId) : ''}
     <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
     <div class="gb-sec"><h3>验收标准</h3>${acceptanceHtml(t)}</div>
     <div class="gb-sec"><h3>验收痕迹</h3>${trailHtml(t)}</div>
@@ -318,11 +338,42 @@ export function renderGoalsPage(root: HTMLElement): () => void {
         <span class="gb-main-counts">已验收 ${g.counts.accepted} · 共 ${g.counts.total}${g.counts.rejected ? ` · 驳回 ${g.counts.rejected}` : ''}</span>
       </div>${gridHtml(g, selTask)}`;
   }
+  const decideDraft: Record<string, string> = {}; // preserve an in-progress decision across poll repaints
   function renderDetail(): void {
     const g = goalOf(selGoal);
-    detailEl.innerHTML = detailHtml(g?.tasks.find(t => t.taskId === selTask) ?? null);
+    detailEl.innerHTML = detailHtml(g?.tasks.find(t => t.taskId === selTask) ?? null, selGoal);
+    const ta = detailEl.querySelector<HTMLTextAreaElement>('.gb-decide-input');
+    if (ta && selTask && decideDraft[selTask]) ta.value = decideDraft[selTask];
   }
   function renderAll(): void { renderRail(); renderMain(); renderDetail(); }
+
+  async function sendDecision(btn: HTMLButtonElement): Promise<void> {
+    const sec = btn.closest<HTMLElement>('.gb-sec-decide');
+    if (!sec) return;
+    const goal = sec.dataset.goal ?? '';
+    const task = sec.dataset.task ?? '';
+    const ta = sec.querySelector<HTMLTextAreaElement>('.gb-decide-input');
+    const statusEl = sec.querySelector<HTMLElement>('.gb-decide-status');
+    const setStatus = (msg: string, cls = '') => { if (statusEl) { statusEl.textContent = msg; statusEl.className = `gb-decide-status${cls ? ' ' + cls : ''}`; } };
+    const text = (ta?.value ?? '').trim();
+    if (!text) { setStatus('先写点指示再下发'); return; }
+    btn.disabled = true;
+    setStatus('下发中…');
+    try {
+      const res = await fetch(`/api/goals/${encodeURIComponent(goal)}/decision`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ taskId: task, text }),
+      });
+      if (!res.ok) throw new Error(res.status === 404 ? '决策通道未就绪（需 daemon 升级）' : `下发失败：HTTP ${res.status}`);
+      if (ta) ta.value = '';
+      delete decideDraft[task];
+      setStatus('✓ 已下发给监管者', 'gb-decide-ok');
+    } catch (err) {
+      setStatus((err as Error).message, 'gb-decide-err');
+    } finally {
+      btn.disabled = false;
+    }
+  }
 
   // delegation on the persistent containers (only their innerHTML is replaced)
   railEl.addEventListener('click', (e) => {
@@ -339,6 +390,21 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     selTask = row.dataset.task ?? null;
     renderMain(); renderDetail();
   });
+  // decision box (escalated / 求助 tasks): persist the draft, send on click or Ctrl/⌘+Enter
+  detailEl.addEventListener('input', (e) => {
+    const ta = (e.target as HTMLElement).closest<HTMLTextAreaElement>('.gb-decide-input');
+    if (ta && selTask) decideDraft[selTask] = ta.value;
+  });
+  detailEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.gb-decide-send');
+    if (btn) void sendDecision(btn);
+  });
+  detailEl.addEventListener('keydown', (e) => {
+    const ke = e as KeyboardEvent;
+    if (!(ke.ctrlKey || ke.metaKey) || ke.key !== 'Enter') return;
+    const ta = (ke.target as HTMLElement).closest<HTMLElement>('.gb-decide-input');
+    ta?.closest<HTMLElement>('.gb-sec-decide')?.querySelector<HTMLButtonElement>('.gb-decide-send')?.click();
+  });
   refreshBtn.onclick = () => { void load(); };
 
   async function load(): Promise<void> {
@@ -354,7 +420,10 @@ export function renderGoalsPage(root: HTMLElement): () => void {
       if (!goalOf(selGoal)) { selGoal = board.goals[0]?.goalChatId ?? null; selTask = null; }
       const g = goalOf(selGoal);
       if (g && !g.tasks.some(t => t.taskId === selTask)) selTask = g.tasks[0]?.taskId ?? null;
-      renderAll();
+      // don't yank the caret out of the decision box if a poll repaint lands mid-typing
+      const typing = (document.activeElement as HTMLElement | null)?.classList.contains('gb-decide-input')
+        && detailEl.contains(document.activeElement);
+      if (typing) { renderRail(); renderMain(); } else { renderAll(); }
     } catch (e) {
       if (disposed) return;
       railEl.innerHTML = `<p class="gb-empty">加载失败：${escapeHtml((e as Error).message)}</p>`;

@@ -22721,6 +22721,20 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-help-kind { font-weight: 700; color: var(--warning); }
 .gb-sec-help h3 { color: var(--warning); }
 
+/* human-in-the-loop decision box (escalated / 求助 tasks) */
+.gb-sec-decide { margin-top: 16px; padding: 12px; border: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border-soft)); border-radius: var(--radius); background: color-mix(in srgb, var(--warning) 7%, transparent); }
+.gb-sec-decide h3 { color: var(--warning); margin: 0 0 6px; }
+.gb-decide-hint { font-size: .75rem; color: var(--muted); margin: 0 0 8px; line-height: 1.5; }
+.gb-decide-input { width: 100%; box-sizing: border-box; font: inherit; font-size: .8rem; resize: vertical; padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface); color: var(--fg); }
+.gb-decide-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.gb-decide-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.gb-decide-send { font: inherit; font-size: .78rem; font-weight: 600; padding: 6px 14px; border: none; border-radius: 8px; background: var(--accent); color: var(--on-accent, #fff); cursor: pointer; }
+.gb-decide-send:hover { background: var(--accent-strong); }
+.gb-decide-send:disabled { opacity: .55; cursor: default; }
+.gb-decide-status { font-size: .74rem; color: var(--muted); }
+.gb-decide-status.gb-decide-ok { color: var(--success, #2e9e5b); }
+.gb-decide-status.gb-decide-err { color: var(--danger, #d23f3f); }
+
 /* right: detail panel */
 .gb-detail { background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 14px; position: sticky; top: 14px; max-height: calc(100vh - 180px); overflow-y: auto; }
 .gb-detail-empty, .gb-main-empty { color: var(--faint); text-align: center; padding: 40px 16px; font-size: .85rem; }
