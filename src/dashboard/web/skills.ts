@@ -12,6 +12,8 @@ interface NativeSkillGroup {
   cliId: string;
   rootDir: string;
   skills: SkillRow[];
+  /** Tab label (Claude plugin / marketplace groups set this); falls back to cliId. */
+  label?: string;
 }
 
 interface BotRow {
@@ -170,7 +172,7 @@ function renderDiscoveryDialog(): string {
           const key = discoveryGroupKey(group);
           const selected = key === discoveryGroupKey(active);
           return `<button type="button" role="tab" data-discovery-tab="${escapeHtml(key)}" class="${selected ? 'selected' : ''}" aria-selected="${selected ? 'true' : 'false'}">
-            <strong>${escapeHtml(group.cliId)}</strong>
+            <strong>${escapeHtml(group.label ?? group.cliId)}</strong>
             <small>${t('skills.skillCount', { count: group.skills.length })}</small>
           </button>`;
         }).join('')}

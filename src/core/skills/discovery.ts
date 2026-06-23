@@ -1,6 +1,6 @@
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import { loadSkillPackage } from './package.js';
@@ -10,6 +10,10 @@ export interface NativeCliSkillGroup {
   cliId: CliId;
   rootDir: string;
   skills: SkillPackage[];
+  /** Dashboard tab label. Absent → render `cliId` (a CLI's flat native skills
+   *  tab). Set for Claude plugin / marketplace groups so they're distinguishable
+   *  from — and from each other beside — the plain `claude` tab. */
+  label?: string;
 }
 
 function expandHome(path: string): string {
@@ -41,6 +45,54 @@ function discoverSkillRoot(root: string): SkillPackage[] {
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/**
+ * Discover skills that live inside Claude Code's plugin system — which the flat
+ * `<claudeDataDir>/skills` scan never reaches. Two sources, each surfaced as its
+ * own labelled group so the dashboard can show + register them like any other
+ * discovered skill:
+ *   1. Enabled plugins in `plugins/installed_plugins.json` → each install's
+ *      `<installPath>/skills/<name>/SKILL.md` (e.g. the `frontend-design` plugin).
+ *   2. Marketplace skill collections at `plugins/marketplaces/<m>/skills/`
+ *      (e.g. `anthropic-agent-skills`, the anthropics/skills repo).
+ * Plugins with no `skills/` dir (e.g. gopls-lsp) contribute nothing.
+ */
+export function discoverClaudePluginSkillGroups(
+  claudeDataDir: string,
+  cliId: CliId,
+  seen: Set<string> = new Set(),
+): NativeCliSkillGroup[] {
+  const pluginsRoot = join(claudeDataDir, 'plugins');
+  const out: NativeCliSkillGroup[] = [];
+
+  const addGroup = (skillsRoot: string, label: string): void => {
+    if (seen.has(skillsRoot)) return;
+    const skills = discoverSkillRoot(skillsRoot);
+    if (skills.length === 0) return; // no SKILL.md under here — nothing to show
+    seen.add(skillsRoot);
+    out.push({ cliId, rootDir: skillsRoot, label, skills });
+  };
+
+  // 1. Enabled plugins (installed_plugins.json → <installPath>/skills).
+  try {
+    const parsed = JSON.parse(readFileSync(join(pluginsRoot, 'installed_plugins.json'), 'utf-8')) as {
+      plugins?: Record<string, Array<{ installPath?: string }>>;
+    };
+    for (const [key, entries] of Object.entries(parsed.plugins ?? {})) {
+      const pluginName = key.split('@')[0]; // "frontend-design@marketplace" → "frontend-design"
+      for (const entry of entries ?? []) {
+        if (entry?.installPath) addGroup(join(entry.installPath, 'skills'), `${pluginName} (plugin)`);
+      }
+    }
+  } catch { /* no/unreadable installed_plugins.json — fine */ }
+
+  // 2. Marketplace-level skill collections (marketplaces/<m>/skills).
+  for (const marketplace of listSkillDirs(join(pluginsRoot, 'marketplaces'))) {
+    addGroup(join(marketplace, 'skills'), `${basename(marketplace)} (marketplace)`);
+  }
+
+  return out;
+}
+
 export function discoverNativeCliSkillGroups(cliIds: readonly CliId[]): NativeCliSkillGroup[] {
   const out: NativeCliSkillGroup[] = [];
   const seen = new Set<string>();
@@ -63,6 +115,11 @@ export function discoverNativeCliSkillGroups(cliIds: readonly CliId[]): NativeCl
       if (seen.has(root)) continue;
       seen.add(root);
       out.push({ cliId, rootDir: root, skills: discoverSkillRoot(root) });
+    }
+    // Claude Code plugin system: skills bundled inside enabled plugins or
+    // marketplaces, which the flat native-skills scan above never reaches.
+    if (adapter.claudeDataDir) {
+      out.push(...discoverClaudePluginSkillGroups(expandHome(adapter.claudeDataDir), cliId, seen));
     }
   }
   return out;
