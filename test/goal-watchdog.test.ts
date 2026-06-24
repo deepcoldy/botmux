@@ -722,4 +722,85 @@ describe('goal watchdog', () => {
       rmSync(baseDir, { recursive: true, force: true });
     }
   });
+
+  it('deterministically reassigns stale dispatched tasks before prompting L2', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-reassign-'));
+    try {
+      const led = openLedger({ baseDir });
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-dead',
+        chatId: 'oc_goal',
+        ts: 1,
+        idempotencyKey: 'dispatched:task-dead',
+        payload: {
+          taskId: 'task-dead',
+          workerOpenIds: ['ou_worker'],
+          workerNames: ['dead-worker'],
+          workerLarkAppIds: ['cli_dead'],
+          workerCliIds: ['codex'],
+        },
+      });
+      const activeSessions = new Map<string, DaemonSession>();
+      activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+      const reassigned: string[] = [];
+      const results = await runGoalWatchdogOnce({
+        larkAppId: 'cli_main',
+        activeSessions,
+        ledger: led,
+        now: 10 * 60_000,
+        reassignGraceMs: 60_000,
+        lastInjectedAt: new Map(),
+        reassignDeadWorker: (task, goalChatId) => {
+          reassigned.push(`${goalChatId}:${task.taskId}`);
+          return { status: 'reassigned', reason: 'worker_killed' };
+        },
+        inject: () => { throw new Error('reassigned task must not also wake L2'); },
+      });
+
+      expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'reassigned', pendingTaskIds: ['task-dead'] }]);
+      expect(reassigned).toEqual(['oc_goal:task-dead']);
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reassign freshly dispatched tasks inside the grace window', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-reassign-grace-'));
+    try {
+      const led = openLedger({ baseDir });
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-fresh',
+        chatId: 'oc_goal',
+        ts: 10_000,
+        idempotencyKey: 'dispatched:task-fresh',
+        payload: {
+          taskId: 'task-fresh',
+          workerOpenIds: ['ou_worker'],
+          workerLarkAppIds: ['cli_dead'],
+        },
+      });
+      const activeSessions = new Map<string, DaemonSession>();
+      activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+      const injected: string[] = [];
+      const results = await runGoalWatchdogOnce({
+        larkAppId: 'cli_main',
+        activeSessions,
+        ledger: led,
+        now: 20_000,
+        reassignGraceMs: 60_000,
+        lastInjectedAt: new Map(),
+        reassignDeadWorker: () => { throw new Error('fresh dispatch must not reassign'); },
+        inject: (_target, prompt) => injected.push(prompt),
+      });
+
+      expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'injected', pendingTaskIds: ['task-fresh'] }]);
+      expect(injected).toHaveLength(1);
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -5,7 +5,7 @@ import { sessionKey, type DaemonSession } from './types.js';
 import { localeForBot } from '../i18n/index.js';
 import { openLedger, type LedgerHandle } from '../verified-delivery/ledger.js';
 import { summarizeAcceptanceCriteria } from '../verified-delivery/acceptance.js';
-import type { LedgerEvent, TaskReportedPayload, TaskView } from '../verified-delivery/types.js';
+import type { LedgerEvent, TaskDispatchedPayload, TaskReportedPayload, TaskView } from '../verified-delivery/types.js';
 import { reconcileTaskByCriteria, type ReconcileResult } from '../verified-delivery/reconcile.js';
 import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -16,6 +16,7 @@ export const GOAL_WATCHDOG_PROMPT_PREFIX = '[goal-watchdog]';
 export const DEFAULT_GOAL_WATCHDOG_INTERVAL_MS = 5 * 60_000;
 export const DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS = 30_000;
 export const DEFAULT_GOAL_WATCHDOG_REPORT_GRACE_MS = 15_000;
+export const DEFAULT_GOAL_WATCHDOG_REASSIGN_GRACE_MS = 5 * 60_000;
 
 type GoalWatchdogStatus =
   | 'injected'
@@ -23,6 +24,7 @@ type GoalWatchdogStatus =
   | 'no-l2'
   | 'revived'
   | 'revive-skipped'
+  | 'reassigned'
   | 'busy'
   | 'rate-limited'
   | 'grace'
@@ -53,6 +55,8 @@ export interface GoalWatchdogDeps {
   reviveSupervisor?: (goalChatId: string) => Promise<GoalWatchdogReviveResult> | GoalWatchdogReviveResult;
   onReviveFailure?: (event: GoalWatchdogReviveFailureEvent) => Promise<void> | void;
   workerHealthFacts?: (task: TaskView, goalChatId: string) => Promise<string[]> | string[];
+  reassignDeadWorker?: (task: TaskView, goalChatId: string, now: number) => Promise<GoalWatchdogReassignResult> | GoalWatchdogReassignResult;
+  reassignGraceMs?: number;
 }
 
 export type GoalWatchdogReviveResult =
@@ -65,6 +69,10 @@ export interface GoalWatchdogReviveFailureEvent {
   error: string;
   pendingTaskIds: string[];
 }
+
+export type GoalWatchdogReassignResult =
+  | { status: 'reassigned'; reason?: string }
+  | { status: 'not-dead' | 'skipped'; reason?: string };
 
 export type GoalWatchdogNotifyKind = 'accepted' | 'rejected';
 
@@ -248,6 +256,16 @@ function latestReportAtByTask(events: LedgerEvent[]): Map<string, number> {
   return out;
 }
 
+function latestDispatchAtByTask(events: LedgerEvent[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const event of events) {
+    if (event.type !== 'TaskDispatched') continue;
+    const payload = event.payload as TaskDispatchedPayload;
+    out.set(payload.taskId, event.ts);
+  }
+  return out;
+}
+
 export async function injectGoalSupervisorTurn(ds: DaemonSession, prompt: string): Promise<void> {
   const content = buildFollowUpContent(prompt, ds.session.sessionId, {
     isAdoptMode: false,
@@ -270,10 +288,13 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
   const now = deps.now ?? Date.now();
   const intervalMs = deps.intervalMs ?? DEFAULT_GOAL_WATCHDOG_INTERVAL_MS;
   const reportGraceMs = deps.reportGraceMs ?? DEFAULT_GOAL_WATCHDOG_REPORT_GRACE_MS;
+  const reassignGraceMs = deps.reassignGraceMs ?? DEFAULT_GOAL_WATCHDOG_REASSIGN_GRACE_MS;
   const lastInjectedAt = deps.lastInjectedAt ?? defaultLastInjectedAt;
   const inject = deps.inject ?? injectGoalSupervisorTurn;
   const notify = deps.notify ?? sendGoalWatchdogNotification;
-  const latestReportAt = latestReportAtByTask(ledger.read());
+  const events = ledger.read();
+  const latestReportAt = latestReportAtByTask(events);
+  const latestDispatchAt = latestDispatchAtByTask(events);
   const byGoal = pendingGoalTasks(ledger.tasks());
   const goalFilter = deps.goalChatIds ? new Set(deps.goalChatIds) : undefined;
   const results: GoalWatchdogResult[] = [];
@@ -375,9 +396,24 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
     const legacyTasks: TaskView[] = [];
     const inspectionFacts = new Map<string, string>();
     const graceTaskIds: string[] = [];
+    const reassignedTaskIds: string[] = [];
     let reconciled = false;
     const last = lastInjectedAt.get(goalChatId) ?? 0;
     for (const task of tasks) {
+      if (task.status === 'dispatched' && deps.reassignDeadWorker) {
+        const dispatchAt = latestDispatchAt.get(task.taskId);
+        if (dispatchAt !== undefined && now - dispatchAt >= reassignGraceMs) {
+          try {
+            const reassign = await deps.reassignDeadWorker(task, goalChatId, now);
+            if (reassign.status === 'reassigned') {
+              reassignedTaskIds.push(task.taskId);
+              continue;
+            }
+          } catch (err) {
+            logger.warn(`[goal-watchdog] reassign check failed goal=${goalChatId} task=${task.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      }
       if (task.status === 'reported') {
         const reportAt = latestReportAt.get(task.taskId);
         if (reportAt !== undefined && now - reportAt < reportGraceMs) {
@@ -433,6 +469,8 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       if (reconciled) {
         lastInjectedAt.set(goalChatId, now);
         results.push({ goalChatId, status: 'reconciled', pendingTaskIds: tasks.map((task) => task.taskId) });
+      } else if (reassignedTaskIds.length > 0) {
+        results.push({ goalChatId, status: 'reassigned', pendingTaskIds: reassignedTaskIds });
       } else if (graceTaskIds.length > 0) {
         results.push({
           goalChatId,
@@ -473,6 +511,8 @@ export async function runGoalWatchdogForGoal(input: {
   cooldownMs?: number;
   onReviveFailure?: GoalWatchdogDeps['onReviveFailure'];
   workerHealthFacts?: GoalWatchdogDeps['workerHealthFacts'];
+  reassignDeadWorker?: GoalWatchdogDeps['reassignDeadWorker'];
+  reassignGraceMs?: number;
 }): Promise<GoalWatchdogResult[]> {
   return runGoalWatchdogOnce({
     larkAppId: input.larkAppId,
@@ -483,6 +523,8 @@ export async function runGoalWatchdogForGoal(input: {
     lastInjectedAt: defaultLastInjectedAt,
     onReviveFailure: input.onReviveFailure,
     workerHealthFacts: input.workerHealthFacts,
+    reassignDeadWorker: input.reassignDeadWorker,
+    reassignGraceMs: input.reassignGraceMs,
     reviveSupervisor: async (goalChatId) => {
       const r = await ensureGoalSupervisorFromRegistry(goalChatId, {
         larkAppId: input.larkAppId,
@@ -501,6 +543,8 @@ export function startGoalWatchdog(input: {
   intervalMs?: number;
   onReviveFailure?: GoalWatchdogDeps['onReviveFailure'];
   workerHealthFacts?: GoalWatchdogDeps['workerHealthFacts'];
+  reassignDeadWorker?: GoalWatchdogDeps['reassignDeadWorker'];
+  reassignGraceMs?: number;
 }): NodeJS.Timeout | null {
   const disabled = process.env.BOTMUX_GOAL_WATCHDOG === '0' || process.env.BOTMUX_GOAL_WATCHDOG === 'false';
   if (disabled) {
@@ -517,6 +561,8 @@ export function startGoalWatchdog(input: {
         intervalMs,
         onReviveFailure: input.onReviveFailure,
         workerHealthFacts: input.workerHealthFacts,
+        reassignDeadWorker: input.reassignDeadWorker,
+        reassignGraceMs: input.reassignGraceMs,
         reviveSupervisor: async (goalChatId) => {
           const r = await ensureGoalSupervisorFromRegistry(goalChatId, {
             larkAppId: input.larkAppId,
@@ -530,11 +576,13 @@ export function startGoalWatchdog(input: {
       const injected = results.filter((r) => r.status === 'injected');
       const reconciled = results.filter((r) => r.status === 'reconciled');
       const revived = results.filter((r) => r.status === 'revived');
-      if (injected.length > 0 || reconciled.length > 0 || revived.length > 0) {
+      const reassigned = results.filter((r) => r.status === 'reassigned');
+      if (injected.length > 0 || reconciled.length > 0 || revived.length > 0 || reassigned.length > 0) {
         const parts = [];
         if (injected.length > 0) parts.push(`injected ${injected.length}: ${injected.map((r) => `${r.goalChatId}:${r.pendingTaskIds.length}`).join(', ')}`);
         if (reconciled.length > 0) parts.push(`reconciled ${reconciled.length}: ${reconciled.map((r) => `${r.goalChatId}:${r.pendingTaskIds.length}`).join(', ')}`);
         if (revived.length > 0) parts.push(`revived ${revived.length}: ${revived.map((r) => `${r.goalChatId}:${r.pendingTaskIds.length}`).join(', ')}`);
+        if (reassigned.length > 0) parts.push(`reassigned ${reassigned.length}: ${reassigned.map((r) => `${r.goalChatId}:${r.pendingTaskIds.join('|')}`).join(', ')}`);
         logger.info(`[goal-watchdog] ${parts.join('; ')}`);
       }
     } catch (err) {
