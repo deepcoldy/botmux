@@ -68,6 +68,49 @@ const HELP_KINDS: ReadonlySet<string> = new Set<HelpKind>([
   'access', 'ambiguous', 'impossible', 'repeated_failure', 'other',
 ]);
 
+function oneLine(value: string): string {
+  return value.replace(/\r?\n/g, ' ').trim();
+}
+
+export function formatReportEnvelope(input: {
+  taskId: string;
+  summary: string;
+  reportId?: string;
+  evidence: EnvelopeEvidence[];
+}): string {
+  const lines = [
+    REPORT_ENVELOPE_HEADER,
+    `taskId: ${oneLine(input.taskId)}`,
+    input.reportId ? `reportId: ${oneLine(input.reportId)}` : undefined,
+    `summary: ${oneLine(input.summary)}`,
+  ].filter(Boolean) as string[];
+  if (input.evidence.length > 0) {
+    lines.push('evidence:');
+    for (const ev of input.evidence) {
+      if (ev.kind === 'path') lines.push(`- path: ${oneLine(ev.path)}`);
+      else if (ev.kind === 'url') lines.push(`- url: ${oneLine(ev.url)}`);
+      else {
+        const name = ev.name ? `name=${oneLine(ev.name)} ` : '';
+        lines.push(`- inline: ${name}${oneLine(ev.text)}`);
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+export function formatHelpEnvelope(input: {
+  taskId: string;
+  blocker: string;
+  helpKind?: HelpKind;
+}): string {
+  return [
+    HELP_ENVELOPE_HEADER,
+    `taskId: ${oneLine(input.taskId)}`,
+    input.helpKind ? `kind: ${input.helpKind}` : undefined,
+    `blocker: ${oneLine(input.blocker)}`,
+  ].filter(Boolean).join('\n');
+}
+
 /** Strip leading "@xxx " mention tokens that Lark prepends so the header can be
  *  matched on the first meaningful line (mirrors narration.stripLeadingMentions). */
 function stripLeadingMentions(line: string): string {
