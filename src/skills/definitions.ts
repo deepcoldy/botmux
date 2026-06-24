@@ -1125,6 +1125,22 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
 - 给 worker 的 brief 只放该 subtask 需要的上下文（含你从 charter 摘录的相关目标 / 约束），别把整份 charter 倒给它。
 - coder 写完先 @ reviewer review，过了再 report。
 
+#### L2-2.5 派给跨设备 / 非-botmux worker（外部 worker，P0）
+本机 botmux worker 不用管这节（照常 \`botmux report\`，享进程探活 + 自动重派）。要把**别人机器上的 botmux bot**、**非-botmux 的 agent**、甚至**人**纳入当 worker 时：
+- **授权 = 把它的飞书 open_id 记进该 task 的 \`workerOpenIds\`**（dispatch 指定 / 你建 task 时带上）。只有"被派了这个活的人"发的交付才会被摄取入账，其它当普通聊天忽略。
+- **它在 goal 群里用「交付信封」交活 / 求助**（纯文本，你的 daemon 自动摄取成 TaskReported / TaskHelpRequested）。把下面格式**抄进给它的 brief**，让它照发：
+  \`\`\`
+  [botmux-report v1]
+  taskId: <taskId>
+  summary: <一句话说清交付了什么>
+  evidence:
+  - inline: name=out <自包含的关键输出/结果>
+  - url: <可访问的链接，如 CI 日志>
+  \`\`\`
+  求助：\`[botmux-help v1]\` + \`taskId:\` + \`kind:\`(access/ambiguous/impossible/repeated_failure/other) + \`blocker:\`。
+- **证据必须你够得到**：远程 worker 的本机文件你**读不到**，所以证据用 \`inline\`(自包含) 或 \`url\`(你能 fetch)，**别用本机 \`path\`**——验收口径(acceptanceHint)也据此设计。
+- **存活降级**：远程/外部 worker 的进程探不到 → 系统**不自动重派**；超时没等到信封就由你催，再不行 \`delivery escalate\` 升级给人（别假装能判它死活）。
+
 ### L2-3 收 + 验收（查账本，不信聊天）
 worker report → 你被唤起。**只认账本，不认聊天里说的"完成"**：
 - \`botmux delivery list --goal <goalChatId>\`（本 goal 所有任务的 dispatched/reported/accepted/rejected）；单看 \`botmux delivery show --task <taskId>\`。
