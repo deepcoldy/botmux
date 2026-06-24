@@ -240,6 +240,15 @@ function isAidenWrapper(tokens: ReadonlyArray<string>): boolean {
   return tokens[0] === 'aiden';
 }
 
+/** wrapper 前缀首 token 是否为 cjadk 装配启动器（`cjadk <agent>`）。cjadk 的 `code` 子命令
+ *  把 `-c, --command` 占为己用（commander 选项），会吞掉 botmux 给 codex 注入的
+ *  `-c shell_environment_policy.set.BOTMUX_*=…`（绑到 cjadk 的 --command，当成"要运行的命令"
+ *  → 报 `… is not installed. Please install it first.`）——故 cjadk codex 转发前要把它改写成
+ *  codex 的长形式 `--config`（见 {@link rewriteCjadkCodexConfigArgs}）。 */
+function isCjadkWrapper(tokens: ReadonlyArray<string>): boolean {
+  return tokens[0] === 'cjadk';
+}
+
 /** 是否为 botmux 经 codex `-c` 注入的「把 BOTMUX_* 塞进 shell 工具环境」配置覆盖值。
  *  只认 botmux 自己注入的 `shell_environment_policy.set.BOTMUX_` 前缀，绝不误伤用户
  *  自带的 `-c key=val`。 */
@@ -271,8 +280,10 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
  * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders
  * 通道，不丢功能。`-c` 按 botmux 注入特征精确识别——只剥值以 `shell_environment_policy.set.BOTMUX_`
  * 开头者，用户自带的 `-c key=val` 一律不动；`--settings` 则沿用 aiden x claude 历来的兼容策略
- * 整体剥离（复用 {@link stripSettingsArgs}，不区分来源）。原生启动及 ttadk/cjadk 等「裸透传」
- * 网关不走本函数，仍保留 `-c`（它们的 launcher 接受并转发给真 CLI，照常生效）。
+ * 整体剥离（复用 {@link stripSettingsArgs}，不区分来源）。原生启动及 ttadk 等「裸透传」网关
+ * 不走本函数，仍保留 `-c`（它们的 launcher 接受并转发给真 CLI，照常生效）。cjadk 走单独的
+ * {@link rewriteCjadkCodexConfigArgs}（它的 `code` 子命令把 `-c` 占为 `--command`，要改写成
+ * `--config` 才能透传，而非剥离——故不复用本函数）。
  *
  * 关键：识别按 botmux 注入特征（`--settings` 的语义 + `-c …BOTMUX_` 前缀）而非按某个具体 CLI——
  * 任何适配器将来注入**同形态**的 config 覆盖，经 aiden 网关时都会被一并剥掉，不会重蹈 codex 覆辙。
@@ -286,6 +297,38 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
   for (let i = 0; i < afterSettings.length; i++) {
     const a = afterSettings[i]!;
     if (a === '-c' && isBotmuxShellEnvConfigValue(afterSettings[i + 1])) { i++; continue; }
+    out.push(a);
+  }
+  return out;
+}
+
+/**
+ * cjadk codex 专用改写：把 botmux 给 codex 注入的 `-c shell_environment_policy.set.BOTMUX_*=…`
+ * 改写成 codex 的长形式 `--config shell_environment_policy.set.BOTMUX_*=…`。
+ *
+ * 起因：cjadk 的 `code` 子命令用 commander 定义了 `-c, --command <cmd>`（"运行自定义命令而非默认
+ * agent 命令"），即便 `allowUnknownOption(true)`，**已定义**的 `-c` 仍被 cjadk 自己吃掉绑到
+ * `--command`，不会透传给真 codex——于是 cjadk 把 `shell_environment_policy.set.BOTMUX_SESSION_ID="…"`
+ * 当成"要运行的命令"，报 `… is not installed. Please install it first.`（本次只在 cjadk codex 复现的根因；
+ * cjadk claude 不受影响是因为 claude 注入的是 `--settings` 而非 `-c`）。
+ *
+ * codex 的 `--config` 是 `-c` 的长形式（`-c, --config <key=value>`），而 cjadk 的 `code` 子命令**未定义**
+ * `--config`，故 `--config …` 落入 cjadk 的 passthrough（`allowUnknownOption`）原样转发给真 codex，效果与 `-c`
+ * 完全一致。相比 aiden 路径的整条剥离，改写**保留**了把 BOTMUX_SESSION_ID 注入 codex shell 工具环境的通道。
+ *
+ * 只改写 botmux 自己注入的那一处（值以 `shell_environment_policy.set.BOTMUX_` 开头），用户自带的 `-c key=val`
+ * 一律不动。非 codex 的 cjadk 形态（cjadk claude 带 `--settings`、不带 `-c BOTMUX`）经此函数是 no-op，
+ * `--settings` 照常保留透传。
+ */
+export function rewriteCjadkCodexConfigArgs(args: ReadonlyArray<string>): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '-c' && isBotmuxShellEnvConfigValue(args[i + 1])) {
+      out.push('--config', args[i + 1]!);
+      i++;
+      continue;
+    }
     out.push(a);
   }
   return out;
@@ -359,7 +402,9 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  * 由 wrapperCli 前缀 + 底层 CLI 的 args 构造实际 spawn 的 `{ bin, args }`。
  *   - bin = 前缀首 token（经 binResolver 走 PATH 解析）
  *   - args = 前缀其余 token + CLI 参数（aiden `aiden x <cli>` 形态会先经
- *     {@link stripWrapperUnsafeArgs} 剥掉 botmux 注入、aiden 拒收的 `--settings`/`-c`）
+ *     {@link stripWrapperUnsafeArgs} 剥掉 botmux 注入、aiden 拒收的 `--settings`/`-c`；
+ *     cjadk `cjadk <agent>` 形态走 {@link rewriteCjadkCodexConfigArgs} 把 codex 注入的 `-c`
+ *     改写成 cjadk 不会吞掉的 `--config`）
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
  * 前缀为空时返回 `{ bin: '', args }`，调用方据此跳过（不改写 spawn）。
  */
@@ -372,7 +417,10 @@ export function buildWrappedLaunch(
   const tokens = parseWrapperCli(wrapperCli);
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
   if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
-  const forwarded = isAidenWrapper(tokens) ? stripWrapperUnsafeArgs(cliArgs) : [...cliArgs];
+  let forwarded: string[];
+  if (isAidenWrapper(tokens)) forwarded = stripWrapperUnsafeArgs(cliArgs);
+  else if (isCjadkWrapper(tokens)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs);
+  else forwarded = [...cliArgs];
   return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwarded] };
 }
 

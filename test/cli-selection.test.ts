@@ -300,14 +300,29 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
   });
 
-  it('keeps the codex -c override for the bare-passthrough cjadk codex gateway', () => {
+  // Regression (only reproduces on cjadk codex): cjadk's `code` subcommand defines
+  // `-c, --command <cmd>` (commander), so botmux's injected
+  // `-c shell_environment_policy.set.BOTMUX_SESSION_ID=…` was captured as cjadk's
+  // --command and NOT forwarded to codex → cjadk tried to run the value as a custom
+  // command and errored `… is not installed. Please install it first.`. Rewrite to
+  // codex's long form `--config` (which cjadk does NOT define → allowUnknownOption
+  // passes it through to real codex), preserving the BOTMUX_SESSION_ID shell-env channel.
+  it('rewrites the botmux codex -c override to --config for cjadk codex', () => {
     const out = buildWrappedLaunch('cjadk codex', [
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
     ]);
-    // cjadk forwards CLI args verbatim to the real codex, which accepts -c — keep it.
-    expect(out.args).toEqual(['codex', '--no-alt-screen', '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"']);
+    expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['codex', '--no-alt-screen', '--config', 'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"']);
+    // cjadk's `-c`/`--command` collision is gone — no bare -c reaches the launcher.
+    expect(out.args).not.toContain('-c');
+  });
+
+  it('does not rewrite a user-supplied -c that is not a botmux override (cjadk codex)', () => {
+    const out = buildWrappedLaunch('cjadk codex', ['-c', 'model_reasoning_effort="high"', '--no-alt-screen']);
+    // User-owned -c is left untouched (its semantics are the user's to own, not ours).
+    expect(out.args).toEqual(['codex', '-c', 'model_reasoning_effort="high"', '--no-alt-screen']);
   });
 
   it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {
@@ -416,8 +431,8 @@ describe('codex adapter × aiden wrapper (regression for commit 10d3e61)', () =>
 
   // Cross-CLI guard: any aiden `aiden x <cli>` wrapper must drop a botmux-injected
   // `-c shell_environment_policy.set.BOTMUX_*` override, so a future adapter that
-  // mirrors Codex's injection cannot re-break aiden launches. Bare-passthrough
-  // gateways (ttadk/cjadk) intentionally keep it.
+  // mirrors Codex's injection cannot re-break aiden launches. ttadk keeps it
+  // (bare-passthrough); cjadk rewrites it to --config (see the cjadk regression below).
   it('no aiden built-in wrapper forwards a botmux -c override', () => {
     const codexArgs = [
       '--dangerously-bypass-approvals-and-sandbox',
@@ -433,6 +448,39 @@ describe('codex adapter × aiden wrapper (regression for commit 10d3e61)', () =>
       const out = buildWrappedLaunch(w, codexArgs);
       expect(forwardsBotmuxC(out.args), `${w} must not forward botmux -c`).toBe(false);
     }
+  });
+});
+
+// End-to-end regression (only reproduces on cjadk codex): cjadk's `code` subcommand
+// owns `-c/--command`, so botmux's injected `-c shell_environment_policy.set.BOTMUX_*`
+// was eaten as cjadk's custom-command and never reached codex (cjadk errored
+// `… is not installed`). The wrapper layer must rewrite it to codex's long-form
+// `--config` (cjadk passes unknown options through), keeping the session-env channel.
+describe('codex adapter × cjadk wrapper (cjadk -c/--command collision)', () => {
+  const codex = createCodexAdapter('/usr/bin/codex');
+
+  const BOTMUX_OVERRIDE_RE = /^shell_environment_policy\.set\.BOTMUX_/;
+  const findConfigOverride = (args: ReadonlyArray<string>, flag: string): string | undefined => {
+    const i = args.findIndex((a, j) => a === flag && BOTMUX_OVERRIDE_RE.test(args[j + 1] ?? ''));
+    return i === -1 ? undefined : args[i + 1];
+  };
+
+  it('cjadk codex rewrites the botmux -c override to --config (fresh launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    const out = buildWrappedLaunch('cjadk codex', args);
+    expect(out.bin).toBe('cjadk');
+    // No bare `-c` survives (would collide with cjadk's --command); the override now rides --config.
+    expect(findConfigOverride(out.args, '-c')).toBeUndefined();
+    expect(findConfigOverride(out.args, '--config')).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
+  });
+
+  it('cjadk codex rewrites the botmux -c override to --config (resume launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-uuid' });
+    expect(args).toContain('resume');               // sanity: exercised the resume branch
+    const out = buildWrappedLaunch('cjadk codex', args);
+    expect(findConfigOverride(out.args, '-c')).toBeUndefined();
+    expect(findConfigOverride(out.args, '--config')).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
+    expect(out.args).toContain('codex-uuid');        // resume target survives
   });
 });
 
