@@ -254,6 +254,7 @@ export function chatAvatarHtml(opts: ChatAvatarOpts): string {
 // /api/groups 的注册表 + 群列表把 id 解析成人话。加载失败静默降级显示原值——
 // 纯展示增强，不挡核心功能。
 const botNameByAppId = new Map<string, string>();
+const botNameByOpenId = new Map<string, string>();
 const chatNameById = new Map<string, string>();
 const chatAvatarById = new Map<string, string>();
 let nameMapsPromise: Promise<void> | null = null;
@@ -309,6 +310,10 @@ export function loadNameMaps(): Promise<void> {
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));
         }
+        // open_id → friendly name: lets id-only consumers (goal board worker /
+        // checkedBy fields) show real bot names. Populated once /api/groups bots
+        // carry botOpenId; harmless no-op until then.
+        if (b.botOpenId && b.botName) botNameByOpenId.set(String(b.botOpenId), String(b.botName));
         if (b.botAvatarUrl) {
           if (b.larkAppId) botAvatarByAppId.set(b.larkAppId, String(b.botAvatarUrl));
           if (b.botName) botAvatarByName.set(String(b.botName), String(b.botAvatarUrl));
@@ -331,6 +336,16 @@ export function loadNameMaps(): Promise<void> {
 /** 按 larkAppId 查注册表友好名（含 localStorage 回灌的缓存）；查不到返回 undefined。 */
 export function botNameForAppId(appId?: string): string | undefined {
   return appId ? botNameByAppId.get(appId) : undefined;
+}
+
+/** 按 bot 的 open_id 查友好名（goal 看板 worker/checkedBy 用）；查不到返回 undefined。 */
+export function botNameForOpenId(openId?: string): string | undefined {
+  return openId ? botNameByOpenId.get(openId) : undefined;
+}
+
+/** 群 chatId → 群名（goal 看板用）；查不到返回 undefined。 */
+export function chatNameForId(chatId?: string): string | undefined {
+  return chatId ? chatNameById.get(chatId) : undefined;
 }
 
 /** 会话所属 bot 的显示名：注册表友好名 → 会话自带 botName（非 id 时）→ id。 */

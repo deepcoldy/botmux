@@ -26,10 +26,19 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
+import {
+  appendVerifiedDeliveryInstructions,
+  buildDeliveryListRows,
+  buildRejectRetryContent,
+  generateTaskId,
+  parseDeliveryDuration,
+} from './core/verified-delivery.js';
+import { REJECT_REASON, type HelpKind, type RejectReason, type TaskStatus } from './verified-delivery/types.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -1631,6 +1640,14 @@ interface SessionData {
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   whiteboardId?: string;
+  goalSupervisor?: {
+    goalChatId: string;
+    title: string;
+    parentChatId: string;
+    parentRoot?: string;
+    parentSessionId?: string;
+    createdAt: string;
+  };
   // Markers that a real CLI ever ran in this session (vs a daemon-command
   // scratch placeholder). Persisted by the daemon; only presence is checked
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
@@ -2464,6 +2481,40 @@ function findDaemon(larkAppId?: string): { ipcPort: number; larkAppId: string } 
   return all[0] ?? null;
 }
 
+async function triggerGoalWatchdogFromCli(goalChatId: string, reason: string): Promise<{ contacted: number; injected: number; reconciled: number; busy: number; rateLimited: number }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  let injected = 0;
+  let reconciled = 0;
+  let busy = 0;
+  let rateLimited = 0;
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/watchdog`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ goalChatId, reason }),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { results?: Array<{ status?: string }> } | null;
+      const results = body?.results ?? [];
+      injected += results.filter((r) => r.status === 'injected').length;
+      reconciled += results.filter((r) => r.status === 'reconciled').length;
+      busy += results.filter((r) => r.status === 'busy').length;
+      rateLimited += results.filter((r) => r.status === 'rate-limited').length;
+    } catch {
+      // Best effort. Periodic goal-watchdog still picks the task up.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, injected, reconciled, busy, rateLimited };
+}
+
 async function cmdResume(): Promise<void> {
   const target = process.argv[3];
   if (!target) {
@@ -2711,6 +2762,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   whiteboard status|enable|disable
                        本地项目白板（默认关闭；enable 只打开能力，不创建白板）
        current --create / list / read / update / write --yes
+  goal supervise       在 goal 群启动 L2 监管会话（daemon-native，不依赖自 @ 路由）
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -2910,12 +2962,13 @@ function whiteboardContentFromArgs(args: string[], booleanFlags: string[] = []):
  *  whiteboard_empty_content / whiteboard_not_found); map each to a clear,
  *  actionable message so an agent or human reading stderr knows what to do
  *  next instead of seeing a bare code. Always exits. */
-function handleWhiteboardWriteError(e: unknown, id: string): never {
+function handleWhiteboardWriteError(e: unknown, id: string, opts?: { rereadCommand?: string }): never {
   const msg = (e as Error)?.message ?? String(e);
   if (msg === 'whiteboard_cas_mismatch') {
+    const reread = opts?.rereadCommand ?? `botmux whiteboard read --id ${id} --json`;
     console.error(
       `Whiteboard was modified since you last read it (CAS mismatch). Re-run ` +
-      `\`botmux whiteboard read --id ${id} --json\` to get the latest content ` +
+      `\`${reread}\` to get the latest content ` +
       `+ updatedAt, re-merge your changes against it, then update again with ` +
       `--expected-updated-at <new updatedAt>.`,
     );
@@ -3442,6 +3495,10 @@ import { buildImageCardElements, brandFooterSegment } from './im/lark/md-card.js
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
+import { openLedger } from './verified-delivery/ledger.js';
+import { buildReport, parseArtifactText } from './verified-delivery/report.js';
+import { parseAcceptanceCriteria } from './verified-delivery/acceptance.js';
+import { emitGoalNarration } from './verified-delivery/narration.js';
 import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attentionUsageError } from './services/send-policy.js';
 
 /**
@@ -4180,25 +4237,27 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 }
 
-// ─── Dispatch subcommand (Phase 0: open a sub-project thread + assign bots) ───
+// ─── Dispatch subcommand (Phase 0: assign bots in a goal chat / optional topic) ───
 
 async function cmdDispatch(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux dispatch — 开子项目话题、把 bot 拉进去协作（含 repo 预设 / 待命 / 追加）
+    console.log(`botmux dispatch — 在 goal 群派活、把 bot 拉进去协作（含 repo 预设 / 待命 / 追加）
 
 用法:
-  新开话题派活:
+  群级派活（默认，不开话题）:
     botmux dispatch --title "子项目标题" --bot <open_id[:名字[:角色]]> [--bot ...] \\
-        [--brief "简报" | --brief-file <path>] [--repo <工作目录>] [--standby]
+        [--brief "简报" | --brief-file <path>] [--repo <工作目录>] [--standby] \\
+        [--task-id <id>] [--acceptance-hint <text>] [--new-topic]
   往已有话题追加（激活待命 bot / 追加协调）:
     botmux dispatch --into <话题根消息id> --bot <spec> [--bot ...] (--brief ... | --brief-file ...)
 
 说明:
-  新开话题: 发一条顶层「子项目」种子消息，在它线程里把 bot @ 进来各起独立会话。
+  默认群级派活: 在目标群直接 @ worker，适合单 worker / 顺序 / 轻量子任务。
+  --new-topic: 显式开隔离话题，适合多 worker 并行、深度协作或防刷屏。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
-  --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
+  --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 或群级消息派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
-  返回 JSON（含 seedMessageId / threadRootId），供编排者登记 子项目↔话题。
+  返回 JSON（含 delivery=chat|thread），供编排者登记派活位置。
 
 选项:
   --title <t>           子项目标题（新开话题时必填）
@@ -4207,6 +4266,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief-file <path>   从文件读取简报
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
+  --new-topic           显式为本次派活开独立话题（默认不开）
+  --task-id <id>        覆盖可信交付任务号（默认自动生成 task-<slug>-<hash8>）
+  --acceptance-hint <t> 主 agent 打算如何验收，随任务简报和账本一起传给 worker
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
   --session-id <id>     指定来源会话（默认自动推断）`);
@@ -4220,7 +4282,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const overrideChatId = argValue(rest, '--chat-id');
   const repo = argValue(rest, '--repo');
   const intoRoot = argValue(rest, '--into');
+  const explicitTaskId = argValue(rest, '--task-id');
+  const acceptanceHint = argValue(rest, '--acceptance-hint');
   const standby = rest.includes('--standby');
+  const newTopic = rest.includes('--new-topic');
   const botSpecs = argValues(rest, '--bot');
 
   let brief = argValue(rest, '--brief') ?? '';
@@ -4229,15 +4294,28 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     brief = readFileSync(briefFile, 'utf-8');
   }
 
-  // Append the report-back protocol so the dispatched sub-bot reports via
-  // `botmux report` (which routes to the orchestrator's OWN session) rather than
-  // @-ing the orchestrator in its sub-topic — which has no orchestrator session
-  // and would spawn a fresh, context-less one. Skipped for --standby (no brief).
+  const taskId = (!intoRoot && !standby)
+    ? (explicitTaskId?.trim() || generateTaskId({ title: title.trim() || '子项目', brief }))
+    : undefined;
+  const parsedAcceptance = taskId ? parseAcceptanceCriteria(acceptanceHint) : { structured: false };
+  if (parsedAcceptance.error) {
+    console.error(`验收标准非法: ${parsedAcceptance.error}`);
+    process.exit(1);
+  }
+
+  // Append the verified-delivery protocol so the dispatched sub-bot reports via
+  // `botmux report --task <id>` with evidence the orchestrator can verify. This
+  // still routes to the orchestrator's OWN session rather than @-ing the
+  // orchestrator in the sub-topic. Skipped for --standby / --into follow-ups.
   if (brief.trim()) {
-    brief = brief.trimEnd() +
-      '\n\n— 完成回报 —\n' +
-      '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` 把结果回报给主编排会话；' +
-      '不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+    if (taskId) {
+      brief = appendVerifiedDeliveryInstructions({ brief, taskId, acceptanceHint });
+    } else {
+      brief = brief.trimEnd() +
+        '\n\n— 完成回报 —\n' +
+        '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` 把结果回报给主编排会话；' +
+        '不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+    }
   }
 
   // ── Flag validation ──
@@ -4251,6 +4329,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (standby && intoRoot) {
     console.error('--standby 与 --into 不能同用。');
+    process.exit(1);
+  }
+  if (newTopic && intoRoot) {
+    console.error('--new-topic 与 --into 不能同用。');
     process.exit(1);
   }
   if (!standby && !brief.trim()) {
@@ -4277,6 +4359,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error(`dispatch 构建失败: ${err.message}`);
     process.exit(1);
   }
+  const workerNameByOpenId = new Map(bots.map(b => [b.openId, b.name?.trim() || b.openId]));
+  const workerNames = built.mentionedOpenIds.map(openId => workerNameByOpenId.get(openId) ?? openId);
 
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
@@ -4290,11 +4374,37 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
+  const appId = s.larkAppId!;
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
-  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  let botConfigs: ReturnType<typeof loadBotConfigs> = [];
+  try {
+    botConfigs = loadBotConfigs();
+    for (const cfg of botConfigs) registerBot(cfg);
+  } catch { /* best effort */ }
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  let botInfoEntries: BotInfoEntry[] = [];
+  try {
+    const botInfoPath = join(resolveDataDir(), 'bots-info.json');
+    if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
+  } catch { /* best effort */ }
+  let senderScopedBotOpenIds: Record<string, string> = {};
+  try {
+    const crossRefPath = join(resolveDataDir(), `bot-openids-${appId}.json`);
+    if (existsSync(crossRefPath)) senderScopedBotOpenIds = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
+  } catch { /* best effort */ }
+  const workerMetas = resolveDispatchWorkerMetas({
+    openIds: built.mentionedOpenIds,
+    bots,
+    workerNames,
+    botConfigs,
+    botInfoEntries,
+    senderScopedBotOpenIds,
+  });
+  const workerLarkAppIds = workerMetas.map((meta) => meta.larkAppId);
+  const workerCliIds = workerMetas.map((meta) => meta.cliId);
+  const hasWorkerMeta = workerLarkAppIds.some(Boolean) || workerCliIds.some(Boolean);
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
-  const appId = s.larkAppId!;
   const briefJson = JSON.stringify({ zh_cn: { title: '', content: built.threadContent } });
 
   try {
@@ -4308,55 +4418,89 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       return;
     }
 
-    // New-thread mode.
-    // 1. Seed (thread root) — top-level header; gives the thread something to hang off.
-    const seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
+    // Default chat-scope mode: post directly into the goal group so L2 and
+    // workers share the project-room timeline. `--new-topic` keeps the old
+    // isolated-thread path as an explicit escape hatch for noisy/parallel work.
+    let seedId: string | undefined;
+    let primeId: string | undefined;
+    let kickoffId: string | undefined;
+    if (newTopic) {
+      seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
+    }
 
-    // Record the orchestrator's coords for this sub-topic, keyed by the seed
-    // (which becomes every dispatched sub-bot's session.rootMessageId). The
-    // sub-bot's `botmux report` looks this up to route its report back into the
-    // orchestrator's OWN session. Lives in the shared data dir so every bot's
-    // daemon (one-per-bot) can read it. Best-effort — report-back degrades to a
-    // clear error if absent.
-    try {
-      const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
-      let reg: Record<string, unknown> = {};
-      try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* corrupt → reset */ }
-      reg[seedId] = {
-        orchRoot: s.rootMessageId ?? '',
-        orchChatId: s.chatId,
-        orchScope: s.scope ?? 'thread',
-        orchAppId: s.larkAppId,
-        title: title.trim(),
-        bots: built.mentionedOpenIds,
-      };
-      // 原子写：共享 data dir，其它 bot 的 daemon 会并发读这个注册表。
-      atomicWriteFileSync(regPath, JSON.stringify(reg, null, 2));
-    } catch { /* registry is best-effort */ }
+    if (taskId) {
+      openLedger().append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId,
+        chatId: targetChatId,
+        ts: Date.now(),
+        idempotencyKey: `dispatched:${taskId}`,
+        payload: {
+          taskId,
+          title: title.trim(),
+          workerTopicRoot: seedId,
+          workerOpenIds: built.mentionedOpenIds,
+          workerNames,
+          workerLarkAppIds: hasWorkerMeta ? workerLarkAppIds : undefined,
+          workerCliIds: hasWorkerMeta ? workerCliIds : undefined,
+          brief,
+          acceptanceHint: acceptanceHint?.trim() || undefined,
+          acceptanceCriteria: parsedAcceptance.criteria,
+        },
+      });
+    }
+
+    if (seedId) {
+      // Record the orchestrator's coords for this sub-topic, keyed by the seed
+      // (which becomes every dispatched sub-bot's session.rootMessageId). The
+      // default chat-scope flow relies on same-goal-group report fallback and
+      // does not need this registry.
+      try {
+        const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+        let reg: Record<string, unknown> = {};
+        try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* corrupt → reset */ }
+        reg[seedId] = {
+          orchRoot: s.rootMessageId ?? '',
+          orchChatId: s.chatId,
+          orchScope: s.scope ?? 'thread',
+          orchAppId: s.larkAppId,
+          title: title.trim(),
+          taskId: taskId ?? undefined,
+          bots: built.mentionedOpenIds,
+        };
+        // 原子写：共享 data dir，其它 bot 的 daemon 会并发读这个注册表。
+        atomicWriteFileSync(regPath, JSON.stringify(reg, null, 2));
+      } catch { /* registry is best-effort */ }
+    }
 
     // 2. Optional repo prime — a plain TEXT message "@bot /repo <path>" (like a
     //    human types) so each sub-bot spawns idle in that dir (no repo-select
     //    card). Text goes through resolveMentions cleanly; a structured post
     //    drops the /repo arg in the live event. `/repo` is an existing command,
     //    so this needs no change on the receiving bot's daemon.
-    let primeId: string | undefined;
     if (repo) {
       const prime = buildRepoPrimeText({ path: repo, bots });
-      primeId = await replyMessage(appId, seedId, prime.text, 'text', true);
+      primeId = seedId
+        ? await replyMessage(appId, seedId, prime.text, 'text', true)
+        : await sendMessage(appId, targetChatId, prime.text, 'text');
     }
 
-    // 3. Brief kickoff — reply_in_thread @-ing the bots so each spawns its own
-    //    thread-scoped session. Skipped in --standby (bots wait for a later --into).
-    let kickoffId: string | undefined;
+    // 3. Brief kickoff — default posts into the goal group; `--new-topic`
+    //    replies inside the seed thread. Skipped in --standby.
     if (!standby) {
-      kickoffId = await replyMessage(appId, seedId, briefJson, 'post', true);
+      kickoffId = seedId
+        ? await replyMessage(appId, seedId, briefJson, 'post', true)
+        : await sendMessage(appId, targetChatId, briefJson, 'post');
     }
 
     console.log(JSON.stringify({
       success: true,
       mode: standby ? 'standby' : 'dispatch',
-      seedMessageId: seedId,
-      threadRootId: seedId,
+      delivery: seedId ? 'thread' : 'chat',
+      taskId: taskId ?? null,
+      seedMessageId: seedId ?? null,
+      threadRootId: seedId ?? null,
       primeMessageId: primeId,
       kickoffMessageId: kickoffId,
       repo: repo ?? null,
@@ -4390,15 +4534,23 @@ async function cmdReport(rest: string[]): Promise<void> {
 用法:
   botmux report "子项目X 完成，产出在 …"
   botmux report --content-file <path>
+  botmux report --task <taskId> "完成说明" --artifact <产物路径> [--artifact ...]
 
 说明:
   「多话题协作模式」里你（子 bot）干完后不要在本话题 @ 主bot——本话题没有主bot的会话，
   @ 会另起一个无上下文的新会话。本命令把回报发回主编排会话所在的话题、并 @ 主编排 bot，
   使其带完整上下文继续聚合。仅在被 botmux dispatch 派活的子项目会话里可用。
 
+  带 --task：这是「可信交付」回报——把完成记录连同证据落到账本，主 agent 据此验收。
+  没有证据（--artifact / --artifact-text）的 --task 回报会被拒绝（不算完成）。
+
 选项:
-  --content-file <path>  从文件读取回报内容
-  --session-id <id>      指定来源会话（默认自动推断）`);
+  --content-file <path>       从文件读取回报内容（即完成说明 summary）
+  --session-id <id>           指定来源会话（默认自动推断）
+  --task <taskId>             被派活时简报里给你的任务号；带上即走可信交付
+  --artifact <path>           产物路径证据（主 agent 必须读得到），可重复
+  --artifact-text <name=内容>  自包含内容证据（测试输出/文件片段/diff），可重复
+  --id <reportId>             显式 reportId（崩溃重试严格幂等；默认按内容派生）`);
     return;
   }
 
@@ -4429,6 +4581,41 @@ async function cmdReport(rest: string[]): Promise<void> {
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+
+  // Verified delivery: when this report names a task (`--task`), record a
+  // TaskReported on the ledger with evidence BEFORE waking the orchestrator —
+  // the ledger is the durable truth, the wake below is just the trigger.
+  // Backward-compatible: no --task ⇒ legacy free-form report-back, unchanged.
+  const taskId = argValue(rest, '--task');
+  let reportedLedger: { reportId: string; deduped: boolean } | undefined;
+  if (taskId) {
+    const artifacts = argValues(rest, '--artifact');
+    const inline = parseArtifactText(argValues(rest, '--artifact-text'));
+    if (artifacts.length === 0 && inline.length === 0) {
+      console.error(
+        'verified report 需要至少一项证据:\n' +
+        '  --artifact <path>            主 agent 读得到的产物路径\n' +
+        '  --artifact-text <name=内容>   自包含内容(测试输出/文件片段/diff)');
+      process.exit(1);
+    }
+    try {
+      const led = openLedger();
+      const { draft, reportId } = buildReport({
+        taskId,
+        summary: content.trim(),
+        ts: Date.now(),
+        chatId: s.chatId,
+        reportId: argValue(rest, '--id'),
+        artifacts,
+        inline,
+      }, led);
+      const res = led.append(draft);
+      reportedLedger = { reportId, deduped: res.deduped };
+    } catch (err: any) {
+      console.error(`ledger 写入失败: ${err.message}`);
+      process.exit(1);
+    }
+  }
 
   // Resolve where the report goes + who to @. Same-machine: the dispatch registry
   // (keyed by this sub-bot's thread root) carries the orchestrator's exact coords.
@@ -4479,11 +4666,699 @@ async function cmdReport(rest: string[]): Promise<void> {
       orchestrator: tgt.orchOpenId,
       viaRegistry: !!entry,
       messageId: msgId,
+      ...(reportedLedger ? { task: taskId, reportId: reportedLedger.reportId, ledgerDeduped: reportedLedger.deduped } : {}),
     }));
   } catch (err: any) {
     console.error(`report 失败: ${err.message}`);
     process.exit(1);
   }
+}
+
+// ─── Verified delivery help (worker hand-raise) ─────────────────────────────
+
+const VERIFIED_DELIVERY_HELP_KINDS = new Set<HelpKind>(['access', 'ambiguous', 'impossible', 'repeated_failure', 'other']);
+
+async function cmdHelp(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux help — 工人显式求助，写入可信交付账本并唤醒 goal 监管者
+
+用法:
+  botmux help --task <taskId> --blocker "卡在哪" [--kind access|ambiguous|impossible|repeated_failure|other]
+
+说明:
+  这不是完成回报，也不会把任务判失败。它把任务置为 blocked，
+  由 L2 监管者先自救；只有监管者也定不了时才 delivery escalate 升级给人。`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const taskId = argValue(rest, '--task');
+  const blocker = argValue(rest, '--blocker');
+  if (!taskId) { console.error('botmux help 需要 --task <taskId>'); process.exit(1); }
+  if (!blocker?.trim()) { console.error('botmux help 需要 --blocker "卡在哪"'); process.exit(1); }
+
+  const rawKind = argValue(rest, '--kind');
+  const kind = rawKind ? rawKind.trim() as HelpKind : undefined;
+  if (kind && !VERIFIED_DELIVERY_HELP_KINDS.has(kind)) {
+    console.error('botmux help: --kind 必须是 access / ambiguous / impossible / repeated_failure / other');
+    process.exit(1);
+  }
+
+  const sessionIdArg = argValue(rest, '--session-id');
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  const sessions = loadSessions();
+  const s = sid ? sessions.get(sid) : undefined;
+  const ledger = openLedger();
+  const task = ledger.task(taskId);
+  if (!task) {
+    console.error(`未找到任务: ${taskId}`);
+    process.exit(1);
+  }
+  const goalChatId = task.chatId ?? s?.chatId;
+  if (!goalChatId) {
+    console.error(`任务 ${taskId} 缺少 goal chatId，无法唤醒监管者。`);
+    process.exit(1);
+  }
+
+  const workerOpenId = argValue(rest, '--worker-open-id') ??
+    task.workerOpenIds?.[0] ??
+    s?.creatorOpenId ??
+    s?.ownerOpenId ??
+    s?.quoteTargetSenderOpenId;
+  const blockerText = blocker.trim();
+  const keyHash = createHash('sha256').update(`${taskId}\n${kind ?? ''}\n${blockerText}`).digest('hex').slice(0, 10);
+  const result = ledger.append({
+    type: 'TaskHelpRequested',
+    actor: 'worker',
+    taskId,
+    chatId: goalChatId,
+    ts: Date.now(),
+    idempotencyKey: `help:${taskId}:${keyHash}`,
+    payload: {
+      taskId,
+      workerOpenId: workerOpenId?.trim() || undefined,
+      blocker: blockerText,
+      kind,
+    },
+  });
+
+  const watchdog = await triggerGoalWatchdogFromCli(goalChatId, `help:${taskId}`);
+  if (!result.deduped && s?.larkAppId) {
+    await emitDeliveryNarrationFromCli({
+      larkAppId: s.larkAppId,
+      goalChatId,
+      event: {
+        type: 'help',
+        key: `narr:help:${taskId}:${result.event.eventId}`,
+        taskId,
+        detail: blockerText,
+      },
+    });
+  }
+  console.log(JSON.stringify({
+    success: true,
+    taskId,
+    blocked: true,
+    deduped: result.deduped,
+    goalChatId,
+    watchdog,
+  }, null, 2));
+}
+
+async function emitDeliveryNarrationFromCli(input: Parameters<typeof emitGoalNarration>[0]): Promise<void> {
+  try {
+    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+    for (const cfg of loadBotConfigs()) registerBot(cfg);
+    await emitGoalNarration(input);
+  } catch (err) {
+    console.error(`⚠️ 已写入账本，但 goal 群播报失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+// ─── Verified delivery accept/reject (orchestrator-as-judge) ────────────────
+
+async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
+  if (!sub || sub === '--help' || sub === '-h' || rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux delivery — 可信交付账本的主 agent 验收/打回
+
+用法:
+  查看任务:
+    botmux delivery show --task <taskId>
+  列出任务:
+    botmux delivery list [--goal <chatId>] [--status dispatched|reported|accepted|rejected|blocked|escalated] [--older-than 2h]
+  验收通过:
+    botmux delivery accept --task <taskId> [--report <reportId>] \\
+        [--checked-by <id>] [--note <text>] [--evidence-checked <ref>]... [--ran-command <cmd>]...
+  打回重做:
+    botmux delivery reject --task <taskId> [--report <reportId>] --reason <code> \\
+        [--retry-brief <text>] [--expected-evidence <text>] [--checked-by <id>] [--no-push]
+  升级给人:
+    botmux delivery escalate --task <taskId> --reason <text> \\
+        [--retry-brief <text>] [--by <id>] [--session-id <L2会话id>] [--no-notify-parent]
+
+说明:
+  --report 省略时默认使用该任务 latestReportId。
+  --goal 按 goal 群 chatId 过滤；--older-than 按任务最后一条账本事件时间计算。
+  常用 reason: ${Object.values(REJECT_REASON).join(' / ')}
+  reject 默认会把 retryBrief/expectedEvidence 回推到派活 worker 话题；--no-push 仅写账本。`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const ledger = openLedger();
+  if (sub === 'list') {
+    const goal = argValue(rest, '--goal', '--chat-id');
+    const status = argValue(rest, '--status');
+    const validStatuses = new Set<TaskStatus>(['dispatched', 'reported', 'accepted', 'rejected', 'blocked', 'escalated']);
+    if (status && !validStatuses.has(status as TaskStatus)) {
+      console.error('delivery list: --status 必须是 dispatched / reported / accepted / rejected / blocked / escalated');
+      process.exit(1);
+    }
+    const taskStatus = status as TaskStatus | undefined;
+    const olderThanRaw = argValue(rest, '--older-than');
+    let olderThanMs: number | undefined;
+    if (olderThanRaw) {
+      try {
+        olderThanMs = parseDeliveryDuration(olderThanRaw);
+      } catch (err: any) {
+        console.error(`delivery list: ${err.message}`);
+        process.exit(1);
+      }
+    }
+    const rows = buildDeliveryListRows({
+      events: ledger.read(),
+      tasks: ledger.tasks(goal),
+      status: taskStatus,
+      olderThanMs,
+    });
+    console.log(JSON.stringify({
+      success: true,
+      goal,
+      status,
+      olderThan: olderThanRaw,
+      count: rows.length,
+      tasks: rows,
+    }, null, 2));
+    return;
+  }
+
+  const taskId = argValue(rest, '--task');
+  if (!taskId) {
+    console.error('缺少 --task <taskId>');
+    process.exit(1);
+  }
+
+  const task = ledger.task(taskId);
+  if (!task) {
+    console.error(`未找到任务: ${taskId}`);
+    process.exit(1);
+  }
+  if (sub === 'show') {
+    console.log(JSON.stringify({ success: true, task }, null, 2));
+    return;
+  }
+
+  if (sub !== 'accept' && sub !== 'reject' && sub !== 'escalate') {
+    console.error(`delivery: 未知子命令 ${sub}`);
+    process.exit(1);
+  }
+
+  const sessionIdArg = argValue(rest, '--session-id');
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  const sessions = loadSessions();
+  const s = sid ? sessions.get(sid) : undefined;
+  const checkedBy = argValue(rest, '--checked-by') ?? s?.larkAppId ?? s?.ownerOpenId ?? 'orchestrator';
+
+  if (sub === 'escalate') {
+    const reason = argValue(rest, '--reason')?.trim();
+    if (!reason) {
+      console.error('delivery escalate 需要 --reason <为什么需要人拍>');
+      process.exit(1);
+    }
+    const retryBrief = argValue(rest, '--retry-brief')?.trim();
+    const by = argValue(rest, '--by')?.trim() || checkedBy;
+    const result = ledger.append({
+      type: 'TaskEscalated',
+      actor: 'orchestrator',
+      taskId,
+      chatId: task.chatId,
+      ts: Date.now(),
+      idempotencyKey: `escalated:${taskId}`,
+      payload: {
+        taskId,
+        reason,
+        by,
+        retryBrief: retryBrief || undefined,
+      },
+    });
+    if (!result.deduped && s?.larkAppId) {
+      await emitDeliveryNarrationFromCli({
+        larkAppId: s.larkAppId,
+        goalChatId: task.chatId,
+        event: {
+          type: 'escalated',
+          key: `narr:escalated:${taskId}:${result.event.eventId}`,
+          taskId,
+          reason,
+        },
+      });
+    }
+
+    let parentNotified: boolean | undefined;
+    let attentionRaised: boolean | undefined;
+    let notifyError: string | undefined;
+    if (!argFlag(rest, '--no-notify-parent')) {
+      try {
+        if (!s?.larkAppId) throw new Error('无法推断当前 L2 session/larkAppId；可传 --session-id 或 --no-notify-parent。');
+        const daemon = findDaemon(s.larkAppId);
+        if (!daemon) throw new Error(`未找到在线 daemon (larkAppId=${s.larkAppId})`);
+        const summary = [
+          `Goal 任务需要人工决策: ${taskId}`,
+          `原因: ${reason}`,
+          retryBrief ? `建议/待确认: ${retryBrief}` : undefined,
+          task.chatId ? `goal: ${task.chatId}` : undefined,
+        ].filter(Boolean).join('\n');
+        const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/notify-parent`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            supervisorSessionId: sid,
+            goalChatId: task.chatId,
+            taskId,
+            summary,
+            attentionKind: 'help',
+            attentionReason: reason,
+          }),
+        });
+        const body = await res.json().catch(() => null) as { ok?: boolean; error?: string; attentionRaised?: boolean } | null;
+        if (!res.ok || !body?.ok) throw new Error(body?.error ?? `daemon HTTP ${res.status}`);
+        parentNotified = true;
+        attentionRaised = !!body.attentionRaised;
+      } catch (err) {
+        parentNotified = false;
+        attentionRaised = false;
+        notifyError = err instanceof Error ? err.message : String(err);
+        console.error(`⚠️ 已写入 escalated 账本，但通知 L1/点亮看板失败：${notifyError}`);
+      }
+    }
+
+    console.log(JSON.stringify({
+      success: true,
+      taskId,
+      escalated: true,
+      deduped: result.deduped,
+      parentNotified,
+      attentionRaised,
+      notifyError,
+    }, null, 2));
+    return;
+  }
+
+  const reportId = argValue(rest, '--report') ?? task.latestReportId;
+  if (!reportId) {
+    console.error(`任务 ${taskId} 还没有 report，无法 ${sub}`);
+    process.exit(1);
+  }
+  const report = task.reports.find((r) => r.reportId === reportId);
+  if (!report) {
+    console.error(`任务 ${taskId} 找不到 report: ${reportId}`);
+    process.exit(1);
+  }
+
+  if (sub === 'accept') {
+    const note = argValue(rest, '--note');
+    const evidenceChecked = argValues(rest, '--evidence-checked');
+    const ranCommands = argValues(rest, '--ran-command');
+    const result = ledger.append({
+      type: 'TaskAccepted',
+      actor: 'orchestrator',
+      taskId,
+      chatId: task.chatId,
+      ts: Date.now(),
+      idempotencyKey: `accepted:${taskId}:${reportId}`,
+      payload: {
+        taskId,
+        reportId,
+        checkedBy,
+        note: note?.trim() || undefined,
+        evidenceChecked: evidenceChecked.length ? evidenceChecked : undefined,
+        ranCommands: ranCommands.length ? ranCommands : undefined,
+      },
+    });
+    if (!result.deduped && s?.larkAppId) {
+      const mode = note && /代办|supervisor/i.test(note)
+        ? '监管者代办'
+        : '监管者验收';
+      await emitDeliveryNarrationFromCli({
+        larkAppId: s.larkAppId,
+        goalChatId: task.chatId,
+        event: {
+          type: 'accepted',
+          key: `narr:accepted:${taskId}:${result.event.eventId}`,
+          taskId,
+          title: task.title,
+          mode,
+        },
+      });
+    }
+    console.log(JSON.stringify({ success: true, taskId, reportId, accepted: true, deduped: result.deduped }));
+    return;
+  }
+
+  const reason = argValue(rest, '--reason') as RejectReason | undefined;
+  if (!reason) {
+    console.error(`缺少 --reason <code>。常用: ${Object.values(REJECT_REASON).join(' / ')}`);
+    process.exit(1);
+  }
+  const retryBrief = argValue(rest, '--retry-brief');
+  const expectedEvidence = argValue(rest, '--expected-evidence');
+  const result = ledger.append({
+    type: 'TaskRejected',
+    actor: 'orchestrator',
+    taskId,
+    chatId: task.chatId,
+    ts: Date.now(),
+    idempotencyKey: `rejected:${taskId}:${reportId}`,
+    payload: {
+      taskId,
+      reportId,
+      checkedBy,
+      reason,
+      retryBrief: retryBrief?.trim() || undefined,
+      expectedEvidence: expectedEvidence?.trim() || undefined,
+    },
+  });
+  if (!result.deduped && s?.larkAppId) {
+    await emitDeliveryNarrationFromCli({
+      larkAppId: s.larkAppId,
+      goalChatId: task.chatId,
+      event: {
+        type: 'rejected',
+        key: `narr:rejected:${taskId}:${result.event.eventId}`,
+        taskId,
+        reason,
+      },
+    });
+  }
+
+  let retryMessageId: string | undefined;
+  if (!argFlag(rest, '--no-push')) {
+    if (!task.workerTopicRoot && !task.chatId) {
+      console.error(`任务 ${taskId} 没有 workerTopicRoot/chatId，已写入 rejected 账本，但无法回推重做要求。`);
+      console.log(JSON.stringify({ success: true, taskId, reportId, rejected: true, deduped: result.deduped, pushed: false }));
+      return;
+    }
+    if (!s?.larkAppId) {
+      console.error(`无法推断当前主 agent session/larkAppId，已写入 rejected 账本，但无法回推。可在 Lark 会话内运行或传 --no-push。`);
+      console.log(JSON.stringify({ success: true, taskId, reportId, rejected: true, deduped: result.deduped, pushed: false }));
+      return;
+    }
+    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+    try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+    const { replyMessage, sendMessage } = await import('./im/lark/client.js');
+    const content = buildRejectRetryContent({ task, reportId, reason, retryBrief, expectedEvidence });
+    const postJson = JSON.stringify({ zh_cn: { title: '', content } });
+    retryMessageId = task.workerTopicRoot
+      ? await replyMessage(s.larkAppId, task.workerTopicRoot, postJson, 'post', true)
+      : await sendMessage(s.larkAppId, task.chatId!, postJson, 'post');
+  }
+  console.log(JSON.stringify({
+    success: true,
+    taskId,
+    reportId,
+    rejected: true,
+    deduped: result.deduped,
+    pushed: !!retryMessageId,
+    retryMessageId,
+  }));
+}
+
+async function cmdGoal(sub: string, rest: string[]): Promise<void> {
+  if (!sub || sub === '--help' || sub === '-h' || rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux goal — goal 群监管会话工具
+
+用法:
+  botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
+      [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
+      [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
+  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>] [--task <taskId>] [--attention[=help]] [--done]
+  botmux goal charter current --goal <goal群chatId> [--create] [--title <标题>]
+  botmux goal charter read --goal <goal群chatId> [--json]
+  botmux goal charter update --goal <goal群chatId> --expected-updated-at <ts> <完整内容>
+  botmux goal charter path --goal <goal群chatId>
+
+说明:
+  daemon-native 地在 goal 群起一个 chat-scope L2 supervisor 会话，绕开 Lark 自消息不会路由的限制。
+  默认从当前 L1 会话推断 parent-chat-id / parent-root / working-dir / bot daemon。
+  goal charter 复用 whiteboard 存储/CAS，但不受全局 whiteboard enable 开关控制，也不会自动注入任何会话。`);
+    return;
+  }
+  if (sub === 'charter') {
+    await cmdGoalCharter(rest[0] ?? 'current', rest.slice(1));
+    return;
+  }
+  if (sub === 'notify-parent') {
+    await cmdGoalNotifyParent(rest);
+    return;
+  }
+  if (sub !== 'supervise') {
+    console.error('未知 goal 子命令。用法见 botmux goal --help');
+    process.exit(1);
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const chatId = argValue(rest, '--chat-id');
+  const title = argValue(rest, '--title') ?? '';
+  const sessionIdArg = argValue(rest, '--session-id');
+  const parentChatIdArg = argValue(rest, '--parent-chat-id');
+  const parentRootArg = argValue(rest, '--parent-root');
+  const workingDir = argValue(rest, '--working-dir');
+  const briefFile = argValue(rest, '--brief-file');
+  let brief = argValue(rest, '--brief') ?? '';
+  if (briefFile) {
+    if (!existsSync(briefFile)) { console.error(`文件不存在: ${briefFile}`); process.exit(1); }
+    brief = readFileSync(briefFile, 'utf-8');
+  }
+
+  if (!chatId) { console.error('goal supervise 需要 --chat-id <goal群chatId>'); process.exit(1); }
+  if (!title.trim()) { console.error('goal supervise 需要 --title <goal标题>'); process.exit(1); }
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  let parentChatId = parentChatIdArg;
+  let parentRoot = parentRootArg;
+  let larkAppId: string | undefined;
+  if (sid) {
+    const sessions = loadSessions();
+    const s = sessions.get(sid);
+    if (s) {
+      larkAppId = s.larkAppId;
+      parentChatId ??= s.chatId;
+      parentRoot ??= s.rootMessageId;
+    }
+  }
+  if (!larkAppId) {
+    console.error('无法推断 L1 会话所属 bot。请在 L1 CLI 会话里运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+  if (!parentChatId) {
+    console.error('无法推断 parent-chat-id，请传 --parent-chat-id <主群chatId>。');
+    process.exit(1);
+  }
+
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) {
+    console.error(`未找到在线 daemon (larkAppId=${larkAppId})。`);
+    process.exit(1);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/supervise`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        larkAppId,
+        chatId,
+        parentChatId,
+        parentRoot,
+        title: title.trim(),
+        brief,
+        workingDir,
+        parentSessionId: sid,
+      }),
+    });
+  } catch (err: any) {
+    console.error(`无法连接 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    process.exit(1);
+  }
+  let body: any = {};
+  try { body = await res.json(); } catch { /* */ }
+  if (!res.ok || !body?.ok) {
+    console.error(`goal supervise 失败: ${body?.error ?? res.statusText}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ success: true, ...body }, null, 2));
+}
+
+async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const sessionIdArg = argValue(rest, '--session-id');
+  const goalArg = argValue(rest, '--goal');
+  const taskId = argValue(rest, '--task');
+  const done = argFlag(rest, '--done') || argFlag(rest, '--complete');
+  const summaryFile = argValue(rest, '--summary-file');
+  const attention = parseAttentionFlag(rest);
+  let summary = argValue(rest, '--summary') ?? '';
+  if (summaryFile) {
+    if (!existsSync(summaryFile)) { console.error(`文件不存在: ${summaryFile}`); process.exit(1); }
+    summary = readFileSync(summaryFile, 'utf-8');
+  }
+  if (!summary.trim()) {
+    console.error('goal notify-parent 需要 --summary <text> 或 --summary-file <path>');
+    process.exit(1);
+  }
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 L2 会话。请在 L2 CLI 会话里运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+  const sessions = loadSessions();
+  const supervisor = sessions.get(sid);
+  if (!supervisor) {
+    console.error(`未找到会话: ${sid}`);
+    process.exit(1);
+  }
+  const larkAppId = supervisor.larkAppId;
+  if (!larkAppId) {
+    console.error('无法推断 L2 会话所属 bot。');
+    process.exit(1);
+  }
+  const goalChatId = goalArg ?? supervisor.goalSupervisor?.goalChatId ?? supervisor.chatId;
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) {
+    console.error(`未找到在线 daemon (larkAppId=${larkAppId})。`);
+    process.exit(1);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/notify-parent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        supervisorSessionId: sid,
+        goalChatId,
+        taskId,
+        summary: summary.trim(),
+        attentionKind: attention.requested ? attention.kind : undefined,
+        attentionReason: attention.requested ? summary.trim() : undefined,
+        done,
+      }),
+    });
+  } catch (err: any) {
+    console.error(`无法连接 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    process.exit(1);
+  }
+  let body: any = {};
+  try { body = await res.json(); } catch { /* */ }
+  if (!res.ok || !body?.ok) {
+    console.error(`goal notify-parent 失败: ${body?.error ?? res.statusText}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ success: true, ...body }, null, 2));
+}
+
+function goalCharterId(goal: string): string {
+  const hash = createHash('sha256').update(goal).digest('hex').slice(0, 16);
+  return `goal_${hash}`;
+}
+
+function goalCharterTitle(goal: string, title?: string): string {
+  return title?.trim() || `Goal charter: ${goal.slice(0, 12)}`;
+}
+
+function ensureGoalCharter(goal: string, title?: string) {
+  const id = goalCharterId(goal);
+  const existing = getWhiteboard(id);
+  if (existing && !existing.archived) return existing;
+  return createWhiteboard({
+    id,
+    title: goalCharterTitle(goal, title),
+    scope: 'custom',
+    chatId: goal,
+  }, { allowDisabled: true });
+}
+
+async function cmdGoalCharter(action: string, rest: string[]): Promise<void> {
+  if (!action || action === '--help' || action === '-h' || rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux goal charter <command>
+
+Commands:
+  current --goal <chatId> [--create] [--title <t>]
+      Show the deterministic charter board for a goal group; --create ensures it.
+  read --goal <chatId> [--json]
+      Read the goal charter board. --json emits { id, updatedAt, content } for CAS.
+  update --goal <chatId> --expected-updated-at <ts> <content>
+      Replace the goal charter current-state snapshot using CAS.
+  path --goal <chatId>
+      Print the underlying board/meta/log paths.
+
+This command intentionally bypasses the global whiteboard feature flag and never
+attaches the board to a session, so it cannot trigger <whiteboard> prompt injection.`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const goal = argValue(rest, '--goal', '--chat-id');
+  if (!goal) {
+    console.error('goal charter 需要 --goal <goal群chatId>');
+    process.exit(1);
+  }
+  const id = goalCharterId(goal);
+
+  if (action === 'current') {
+    let meta = getWhiteboard(id);
+    if (!meta && argFlag(rest, '--create')) {
+      meta = ensureGoalCharter(goal, argValue(rest, '--title'));
+    }
+    console.log(JSON.stringify({
+      enabled: whiteboardEnabled(),
+      goal,
+      current: meta ?? null,
+      path: meta ? whiteboardPath(id) : undefined,
+      hint: meta ? undefined : 'Run `botmux goal charter current --goal <chatId> --create` to ensure the goal charter.',
+    }, null, 2));
+    return;
+  }
+
+  if (action === 'read') {
+    const meta = getWhiteboard(id);
+    if (!meta) { console.error(`Goal charter not found for ${goal}. Run \`botmux goal charter current --goal ${goal} --create\`.`); process.exit(1); }
+    if (argFlag(rest, '--json')) {
+      console.log(JSON.stringify({ id: meta.id, updatedAt: meta.updatedAt, content: readWhiteboard(id, { allowDisabled: true }) }));
+    } else {
+      process.stdout.write(readWhiteboard(id, { allowDisabled: true }));
+    }
+    return;
+  }
+
+  if (action === 'path') {
+    const meta = getWhiteboard(id);
+    if (!meta) { console.error(`Goal charter not found for ${goal}. Run \`botmux goal charter current --goal ${goal} --create\`.`); process.exit(1); }
+    console.log(JSON.stringify({ goal, board: meta, path: whiteboardPath(id) }, null, 2));
+    return;
+  }
+
+  if (action === 'update' || action === 'write') {
+    const meta = getWhiteboard(id) ?? ensureGoalCharter(goal, argValue(rest, '--title'));
+    if (action === 'write' && !argFlag(rest, '--yes')) {
+      console.error('Refusing to overwrite goal charter without --yes. Prefer `botmux goal charter update` with --expected-updated-at.');
+      process.exit(2);
+    }
+    const content = whiteboardContentFromArgs(rest, [...WHITEBOARD_BOOLEAN_FLAGS, '--yes']);
+    if (!content.trim()) {
+      console.error('Refusing to write empty goal charter content. Pass text as args, pipe stdin, or use --content-file <path>.');
+      process.exit(2);
+    }
+    const expectedUpdatedAt = argValue(rest, '--expected-updated-at');
+    const { writeWhiteboard } = await import('./services/whiteboard-store.js');
+    try {
+      const updated = writeWhiteboard(meta.id, content, {
+        actor: 'goal-charter',
+        kind: action === 'update' ? 'goal-charter-update' : 'goal-charter-write',
+        expectedUpdatedAt,
+        allowDisabled: true,
+      });
+      console.log(JSON.stringify({ ok: true, goal, board: updated }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, meta.id, { rereadCommand: `botmux goal charter read --goal ${goal} --json` });
+    }
+    return;
+  }
+
+  console.error(`Unknown goal charter command: ${action}`);
+  process.exit(1);
 }
 
 // ─── Create-group subcommand ─────────────────────────────────────────────────
@@ -5604,6 +6479,9 @@ switch (command) {
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
+  case 'help': await cmdHelp(process.argv.slice(3)); break;
+  case 'delivery': await cmdDelivery(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'goal': await cmdGoal(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;

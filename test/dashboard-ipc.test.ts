@@ -14,6 +14,7 @@ import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeTeamRoleFile } from '../src/core/role-resolver.js';
+import { openLedger } from '../src/verified-delivery/ledger.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -515,6 +516,42 @@ describe('POST /api/schedules/:id/(run|pause|resume)', () => {
   });
 });
 
+describe('GET /api/goals', () => {
+  it('returns the verified-delivery goal board from the ledger', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-goals-ipc-'));
+    const prevEnv = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    process.env.SESSION_DATA_DIR = dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      openLedger().append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-goal',
+        chatId: 'oc_goal',
+        ts: 1_000,
+        idempotencyKey: 'dispatched:task-goal',
+        payload: { taskId: 'task-goal', title: 'Goal task' },
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/goals`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.goals).toHaveLength(1);
+      expect(body.goals[0]).toMatchObject({
+        goalChatId: 'oc_goal',
+        counts: { dispatched: 1, reported: 0, accepted: 0, rejected: 0, total: 1 },
+      });
+      expect(body.goals[0].tasks[0]).toMatchObject({ taskId: 'task-goal', title: 'Goal task', status: 'dispatched' });
+    } finally {
+      if (prevEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevEnv;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('SSE /api/events', () => {
   it('delivers a published event to a connected client', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -595,6 +632,15 @@ describe('GET /api/groups (Phase B)', () => {
 
   it('lists chats from groups-store when larkAppId set', async () => {
     setLarkAppId('test-app');
+    const bot = registerBot({
+      larkAppId: 'test-app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+    } as any);
+    bot.botOpenId = 'ou_test_bot';
+    bot.botName = 'Codex Test Bot';
     const spy = vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
       { chatId: 'oc_1', name: 'team' },
     ]);
@@ -602,10 +648,15 @@ describe('GET /api/groups (Phase B)', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body.bots).toEqual([{
+      larkAppId: 'test-app',
+      botOpenId: 'ou_test_bot',
+      botName: 'Codex Test Bot',
+      cliId: 'codex',
+    }]);
     // Each chat now carries an `oncallChat` enrichment (null when unbound)
     // so the dashboard matrix can render toggle state without a second
-    // round-trip. With no bot registered for 'test-app' the lookup falls
-    // back to undefined → null in the response.
+    // round-trip.
     // `firstSeenAt` is the per-bot creation-order proxy added so the
     // dashboard can sort newly-added chats to the top. In this test the
     // store hasn't been init()'d (no daemon), so the value degrades to

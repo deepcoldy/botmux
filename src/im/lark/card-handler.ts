@@ -38,6 +38,8 @@ import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js'
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
+import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
+import { emitGoalNarration } from '../../verified-delivery/narration.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
@@ -1044,7 +1046,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'goal_cleanup_confirm', 'goal_cleanup_skip'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1119,6 +1121,67 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
     return;
+  }
+
+  if (value?.action === 'goal_cleanup_confirm') {
+    const goalChatId = value.goal_chat_id;
+    if (!goalChatId) {
+      return { toast: { type: 'error', content: '缺少 goal_chat_id，无法清理。' } };
+    }
+    // Fan out to EVERY online daemon (self included): each closes its own
+    // chat-scope sessions bound to this goal. A goal group hosts workers from
+    // several bots, and each bot's sessions live in its own daemon process —
+    // so the old card-owner-local loop left the other bots' workers orphaned
+    // (F5). Mirrors routeGoalParentReplyAcrossDaemons: all peers, concurrent,
+    // per-call timeout, best-effort (a dead peer ages out of the registry).
+    const perDaemon = await Promise.all(listOnlineDaemons().map(async (d) => {
+      const ctrl = new AbortController();
+      const tt = setTimeout(() => ctrl.abort(), 5_000);
+      try {
+        const r = await fetch(
+          `http://127.0.0.1:${d.ipcPort}/api/goal/${encodeURIComponent(goalChatId)}/cleanup-local`,
+          { method: 'POST', signal: ctrl.signal },
+        );
+        const body = await r.json().catch(() => null) as { closed?: number } | null;
+        return typeof body?.closed === 'number' ? body.closed : 0;
+      } catch (err) {
+        logger.warn(`[goal-cleanup] fanout to ${d.larkAppId}@${d.ipcPort} failed: ${err}`);
+        return 0;
+      } finally {
+        clearTimeout(tt);
+      }
+    }));
+    const closed = perDaemon.reduce((a, b) => a + b, 0);
+    logger.info(`[goal-cleanup] ${operatorOpenId ?? '?'} closed ${closed} chat-scope sessions across daemons for goal=${goalChatId}`);
+    // Narrate into the goal group so observers see the cleanup actually fired —
+    // the sessions are gone, but the card is sent by the bot directly (not via a
+    // session), so the goal group still gets a visible 🧹 marker.
+    if (larkAppId) {
+      await emitGoalNarration({
+        larkAppId,
+        goalChatId,
+        event: { type: 'cleanup', key: `narr:cleanup:${goalChatId}:${cardMessageId ?? closed}`, closed },
+      }).catch(err => logger.warn(`[goal-cleanup] narration failed: ${err}`));
+    }
+    return {
+      config: { wide_screen_mode: true },
+      header: { template: 'green', title: { tag: 'plain_text', content: 'Goal 会话已清理' } },
+      elements: [{
+        tag: 'div',
+        text: { tag: 'lark_md', content: `已清理 **${closed}** 个 goal 群 chat-scope 会话（已覆盖全部 bot/daemon）。\n\nGoal 群保留，不退群、不删群。` },
+      }],
+    };
+  }
+
+  if (value?.action === 'goal_cleanup_skip') {
+    return {
+      config: { wide_screen_mode: true },
+      header: { template: 'blue', title: { tag: 'plain_text', content: 'Goal 会话暂不清理' } },
+      elements: [{
+        tag: 'div',
+        text: { tag: 'lark_md', content: '已保留 goal 群内会话。需要时可再次确认清理。' },
+      }],
+    };
   }
 
   // Handle session card button actions (restart/close)

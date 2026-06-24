@@ -1006,74 +1006,197 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 const ORCHESTRATE_SKILL = `---
 name: botmux-orchestrate
-description: 作为「主 bot/编排者」把一个大项目拆成多个子项目，在普通群里自动开多话题、把不同 bot（常 coder+reviewer 一组）派进各话题并行干活，用飞书任务清单当共享进度板，收齐结果再汇总。触发：用户提到「多话题协作模式」，或要「把大项目拆给多个机器人并行做」「协调多个 bot」「多话题并行推进」「你当总控/编排」「一个写一个 review 多组并行」，或显式提到 botmux orchestrate / botmux dispatch 派活。
+description: 作为「主 bot/编排者」做**两级编排**：L1（主群）规划 + 跟用户对齐 + 建 goal 群 + 起 L2 监管化身；L2（goal 群内的化身）派子任务给 worker、查账本验收、维护 goal charter、全部完成后通知 L1。触发：用户提到「群协作模式」「两级编排」「goal 群」「监管化身」，或要「把大项目拆给多个机器人并行做」「协调多个 bot」「你当总控/编排」「一个写一个 review 多组并行」，或显式提到 botmux orchestrate / goal supervise / dispatch 派活。
 ---
 
-# botmux-orchestrate — 多 bot 多话题编排
+# botmux-orchestrate — 两级编排（L1 主群总控 + L2 goal 群监管，默认群级会话）
 
-你作为**编排者（主 bot）**，把一个大编程项目拆成若干**子项目**，每个子项目在群里**单开一条话题**、派给**一组 bot**（常见：一个写代码 coder + 一个 review）并行推进；用一张**飞书任务清单**当所有人共享的进度板，子 bot 干完回报后你聚合、推进、最终汇总给用户。
+你作为**编排者**，把大项目拆成子任务并行推进。拓扑是 **两级 agent + 两层群，默认群级会话、不开话题**：
+
+- **L1（主群主 agent）** = 你和用户对话的这个会话。职责：规划、跟用户对齐、决定用哪些 worker、建 goal 群、**起 L2**、最后收 L2 的完成通知并汇总给用户。
+- **L2（goal 群监管化身）** = 同一个主 bot 在 goal 群里的 **chat-scope 会话**（由 \`goal supervise\` 在 daemon 内创建，不是话题会话）。职责：常驻 goal 群，真正派子任务、盯进度、验收、维护 goal charter，全做完**主动通知 L1**。
+- **subtask = goal 群级会话里的一次 dispatch**（靠账本 taskId 区分、**默认不开话题**），派给 worker（常 coder + reviewer）。
+- **一个 goal 群 = 一个项目**（可分享 / 群内搜索 / 进群见全貌）；**主群 = 总控台**（人 + L1）。
+
+### 为什么默认群级、不开话题
+- worker 干活的中间过程（读写文件、跑命令）都在它自己工作目录里，**不进群**；真正进 goal 群的只有三类结构化消息——L2 dispatch、worker report、L2 accept/reject，低频、规整。**隔离靠账本 taskId，不靠会话物理隔离**，所以 goal 群本身就清爽、可搜索、可分享、可回溯。
+- **话题已废弃**：话题太长后不能分享 / 搜索 / 回溯。\`dispatch\` 默认群级（chat-scope）。
+- **并行天然隔离**：不同 worker = goal 群里各自一个 chat-scope 会话，天然隔开；只有**同一个 worker 同时干多个 subtask** 才会在它那一个会话里串。
+- **逃生阀**：真要物理隔离（同一 worker 高并发、或超大规模并行），用**子群**（和「goal=群」同构，可搜索可分享；report 跨群回流方案评估中，P1），**不要**退回话题；\`dispatch --new-topic\` 的底层能力保留，但协议默认不用它。
+
+进度两套账，别混：**verified-delivery 账本 = 任务验收真相源**（L2 验收 / 恢复只认它，见「## 可信交付」）；**goal charter（独立存储，不绑全局白板、不自动注入任何会话）= goal 的目标 / 共识 / 状态页**（给人看、给 L2 续跑恢复用）；飞书任务清单可选。worker 结构化交付证据、L2 验收合格才算完。
+
+⚠️ **为什么要 L2、不能图省事让 L1 直接干**：① L1 在主群，若直接跨群派活，则 worker 的 report 要跨群回 L1、且 L1 盯不住 goal 群内流程；两级让监管闭环留在 goal 群（L2），report 回同群、L1 只在 milestone 收通知。② **主 bot 不能在 goal 群 @ 自己起 L2**——daemon 有 self-message guard（自己发的非 \`/close\` 消息不触发自己），所以 L2 必须用 \`goal supervise\`（daemon 内创建，绕开自消息），**绝不能** \`send --mention <自己>\`。
+
+## 群内可读播报（让人跟得上闭环，自动）
+为了让人在 goal 群里**直接看懂**任务闭环（而不是去读 L2 的终端截图卡），daemon 会在关键状态变更时**自动**往 goal 群发一张干净中文卡：人类决策到达（dashboard 决策 / 主群回复 loopy-中控 注入 L2 成功）、accept、reject、escalate、help、监管者代办。触发点在 \`delivery accept/reject/escalate/help\` 命令出口 + reconcile/watchdog 写账成功 + 决策注入成功，**自动去重**。
+- **你（L2）照常跑命令即可，不要再手动 \`botmux send\` 重复播报同一件事**（accept/reject/升级/代办都已自动出卡，手动再发=和自动卡重复刷屏）。
+- 你自己的 \`botmux send\` 只留给自动卡覆盖不到的：追问 / 唤起 worker、里程碑 charter 摘要、需要给人的额外说明或判断理由。
+- dispatch / report 这类高频低层默认**不**播（避免刷屏）；要全生命周期时间线是后续 C 档开关。
 
 ## 适用 & 不适用
 - 适用：一个需求大到该拆成多个**基本独立**的子项目、由**多个 bot 并行**做。
 - 不适用：单个小任务（直接做，或用 botmux-handoff 交棒即可）。
 
-## 物理事实（先记牢）
-- **你和子 bot 之间没有直连**，只能靠飞书消息触发；**没有请求-响应关联**——子 bot 干完用 \`botmux report\` 把回报发回**你这条主编排话题**（不是在它自己的子话题里 @ 你——那条子话题没有你的会话，@ 会另起一个无上下文的新会话）。对你就是「话题里来了条新消息」，你被唤起（带完整上下文）后去读任务板拿结构化状态。
-- 开新话题靠 \`botmux dispatch\`（发种子消息 + 在线程里 @ 子 bot，子 bot 即在该话题各起独立会话）。**子 bot 必须已在群里且 mentionable**（有 include_bot 权限）。
-- 一条话题里可以有多个 bot（如 coder+reviewer），它们在该话题内互相 @ 协作。
-- **反方向同理（你 → 子 bot）**：子 bot 的会话只在它的子话题里。你要跟某个子 bot 说话（追问/补任务/确认），**一律 \`botmux dispatch --into <子话题root> --bot <子bot>\`** 发进它的子话题——**绝不要在主群 \`botmux send --mention <子bot>\`**，那条 @ 到不了它在子话题的会话，反而会在主群另起一个无上下文的新会话（与上面的回报问题完全对称）。子 bot 回报后你通常只需聚合，不必回它；要回也走 \`--into\`。（\`botmux send\` 已加护栏：误 @ 活跃子 bot 会被拦下并提示，确需强发才 \`--anyway\`。）
+## 物理事实（群级模型，先记牢）
+- **L2 和 worker 之间没有直连**，只能靠飞书消息触发。worker 在 goal 群的 **chat-scope 会话**（不分话题，一个 worker 在本群就一个会话）；L2 \`dispatch\` 后 worker 被 @ 唤起干活，干完用 \`botmux report --task\` 把回报发回**派活者（L2）的会话**——dispatch 是 L2 在本 goal 群发起的，report 自然回同群 L2、不跨群。worker **别**在群里口头说"完成"，要 \`report --task\` 落账，L2 被唤起后查账本拿结构化状态。
+- \`botmux dispatch\` **默认群级（chat-scope）、不开话题**：发任务消息 + 在 goal 群 @ 子 bot，子 bot 在它的 goal 群 chat-scope 会话被唤起。**务必带 \`--chat-id <goalChatId>\`**，活才派进该项目的 goal 群、而非你所在的主群（缺省落当前群）。**子 bot 必须已在 goal 群里且 mentionable**（有 include_bot 权限）——所以建 goal 群时就把这些 bot 一起拉进去。
+- **群级模式的好处（反方向 L2 → worker）**：同一 worker 的多次交互都落在它那一个 chat-scope 会话里，**上下文自然累积**。L2 要追问 / 补充 / 确认某个 worker，直接 \`botmux send --chat-id <goalChatId> --mention <worker>\` 就能唤起它（同一 chat-scope 会话、带上下文，**不会**像旧话题模式那样另起无上下文新会话）；要**补派新 subtask** 才用 \`dispatch\`（带新 taskId）。
+- 一个 subtask 可由多个 bot 协作（如 coder+reviewer），它们在 goal 群里互相 @ 协作；coder 写完先 @ reviewer review，过了再 report。
 
-## 流程
+## L1 流程（在主群，你和用户对话）
 
-### 1. 查花名册
-\`botmux bots list\`（见 botmux-bots）：看群里有哪些可协作 bot、能力标签、是否 mentionable。mentionable=false 的先让它 /introduce 一次。
+### L1-1 查花名册
+\`botmux bots list\`（见 botmux-bots）：看有哪些可协作 worker bot、能力标签、是否 mentionable。mentionable=false 的先让它 /introduce 一次。
 
-### 2. 拆解 + 出一版分配
-把需求拆成 N 个子项目，每个给出：**标题 / 简报(目标+验收) / 工作目录 / 指派的 bot(可一组，带角色) / 依赖**。你**主动提议一版**「子项目 ↔ bot」分配。
+### L1-2 拆解 + 跟用户对齐
+把需求拆成这个 **goal** 下的 N 个 subtask，每个给出：**标题 / 简报(目标+验收) / 指派 worker(可一组，带角色) / 依赖**。**主动提议一版**分配，用 \`botmux send\` 发给用户**一次审批**（可配合 botmux-ask 做按钮）。**没通过别建群、别起 L2。**
 
-### 3. 一次性跟用户确认
-把「子项目清单 + 分配 + 开几条话题」用 \`botmux send\` 发给用户**一次审批**（可配合 botmux-ask 做按钮确认）。用户可改、可手动指派。**没通过别派活。**
-
-### 4. 建共享任务板（飞书任务清单）
-用 **lark-task** 技能建一个**任务清单**（= 大项目），每个子项目建一条**任务**：
-- 负责人(member) 设为该子 bot（type=app，飞书任务支持 bot 当负责人）；
-- **把发起人（用户）加为任务清单成员/关注者**（tasklists.add_members，type=user，用他的 open_id）——否则任务板**不会出现在他的飞书任务里**，他看不到进度（这是常见漏点：建了板但没人能看到）；
-- 描述写清简报 + 验收标准；
-- 记下每条任务的 **task_guid**（后面塞进派活简报，子 bot 据此回写）。
-任务板给**人一眼看进度**，也是你的工作记忆。**主 bot 和子 bot 都可读写任务。**
-建完把任务清单链接用 \`botmux send\` 发给用户，让他确认能在飞书任务里看到。
-
-### 5. 逐个派活（开话题）
-对每个子项目，把简报写进 /tmp/brief-X.md，再：
+### L1-3 建 goal 群
+用户确认后，为这个 goal 建一个独立工作群，把要用的 worker + 用户都拉进去、绑好工作目录：
 \`\`\`bash
-botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
+botmux create-group --name "<goal 名>" \\
+  --bot "<coder显示名或larkAppId>" --bot "<reviewer显示名或larkAppId>" [--bot ...] \\
+  --working-dir "<仓库路径>"
+# stdout 出新群 chatId（单行）——它就是本 goal 的 goalChatId
 \`\`\`
-**简报必须写清子 bot 的「完成协议」**，否则收不齐：
-- 你的飞书任务 ID 是 <task_guid>；
-- 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
-- 然后用 \`botmux report "子项目X 完成 + 产出位置"\` 回报（**别在本话题 @ 主bot**——会另起一个无上下文的新会话；\`botmux dispatch\` 已把这条「完成回报」协议自动追加进简报，子 bot 照做即可）；
-- coder 写完先 @ reviewer 在本话题 review，过了再标完成。
+- ⚠️ **\`create-group --bot\` 用显示名或 larkAppId**（同 \`botmux send @<name>\`）；和 \`dispatch --bot\` 用 **open_id** 不一样，别混。
+- \`--working-dir\` 绑好后，goal 群里 L2 / dispatch 都自动继承该目录，免再传 \`--repo\`。
+- 建群默认把发起用户拉进群并转群主，他进群就能盯全程。**结束不自动删群**（留痕）。
 
-> repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。
-> **OnCall 群可省 \`--repo\`**：群若开了 OnCall 并绑了工作目录（\`/oncall <仓库路径>\` 或 dashboard），所有 dispatch 都不用再传 \`--repo\`——子 bot spawn 时按群查 OnCall 绑定（写在共享 bots.json，跨 bot/跨 daemon 都读得到）自动继承该目录，子话题同理。只有当某子项目要用**和群目录不同的仓库**时才单独传 \`--repo\` 覆盖。
-> 想「先把 bot 拉起待命、稍后再派具体任务」：用 \`--standby\`（只定目录不派简报），之后用 \`botmux dispatch --into <话题root> --bot ... --brief ...\` 激活。
+### L1-4 起 L2 监管化身（goal supervise）
+建群后**不要自己跨群派活**——改为在 goal 群起一个 L2 监管会话，把后续派活 / 验收都交给它：
+\`\`\`bash
+botmux goal supervise --chat-id "<goalChatId>" \\
+  --parent-chat-id "<主群 chatId>" [--parent-root "<你当前话题 root>"] --session-id "<你当前会话 session_id>" \\
+  --title "<goal 名>" [--brief "给 L2 的 goal 目标/验收口径"] [--working-dir "<仓库>"]
+# 输出 { supervisorSessionId, parent:{...} }（chat-scope L2，无话题 root）；charter 由 L2 自己 goal charter current --create 确保
+\`\`\`
+- daemon 在 goal 群**直接创建 L2 的 chat-scope 会话**（绕开 self-message guard，不是你 @ 自己）。
+- \`--parent-*\` + \`--session-id\` 把主群坐标 + 你这条 L1 会话写进 L2 的 prompt；L2 完成时用 \`goal notify-parent\` 据此精准唤起你（daemon-native，不发飞书）。**\`--session-id\` 填 prompt 顶部 \`<session_id>\` 的值**——这样不论你 L1 是话题还是群级会话都能被准确回定位（否则只能靠 chatId/parent-root 兜底，话题会话可能找不准）。
+- 起好 L2 **L1 基本就交棒了**：回主群等完成通知（L1-5）。要派的 subtask 写进 \`--brief\` 交给 L2，或由 L2 按 goal 自行拆派。
+- 🔒 **goal 群对话默认收窄（安全）**：\`goal supervise\` 会把这个 goal 群登记为「授权制」——群里只有**发起人（群主）+ 编排用的自家 bot（L2 / worker，peer 互信）**能和 bot 对话；其他人 @ bot 会被拦下（弹授权卡，需群主显式 grant 才放行）。这样即便日后把第三方拉进 goal 群，也没人能随意占用你的 bot / 烧额度。普通 \`/g\` 群不受影响（仍是开放 oncall）。
+- ♻️ **L2 监工会自愈（不用你操心）**：\`goal supervise\` 把这个 goal 的监工坐标登记下来后，万一 L2 因崩溃/网络挂掉，daemon 的 goal-watchdog 发现"还有未完成任务却没活 L2"时会**自动按登记信息重起 L2**，不用你重新 \`goal supervise\`。带崩溃预算：短时间内反复挂会停止复活、转而**升级给人**（避免无限重启）。被自动复活后 L2 会重新 \`delivery list\` + \`goal charter read\` 重建状态、接着巡检。
 
-### 6. 收结果 + 推进
-子 bot \`botmux report\` → 你（主编排会话，带完整上下文）被唤起 → 读任务板确认完成、看产出。然后：
-- 有依赖的下一波：依赖满足了再 dispatch 下一批；
-- 卡住/超时：去对应话题 \`botmux dispatch --into <root>\` @ 它问进展，或改派；
-- 全程把关键节点用 \`botmux send\` 同步用户（人看任务板也能一眼掌握）。
+### L1-5 收 L2 完成通知 → 汇总用户 + 确认结束
+L2 把整个 goal 验收通过后会用 \`goal notify-parent --done\` 把你唤起（daemon-native，注入 \`[goal-parent-notify]\`）+ 给发起人发一张"结束确认卡"。**这条通知只是唤醒、不是真相源**：你被唤起后必须 \`botmux delivery list --goal <goalChatId>\` + \`botmux goal charter read --goal <goalChatId> --json\` 复核账本与状态，给用户一份总汇总（做了什么、产出在哪、遗留项）。
+- **结束确认卡**：发起人点 [结束并清理] → daemon 关闭该 goal 群所有 chat-scope 会话（L2 + workers，**群保留、不退群不删群**）；点 [暂不] → 不动，随时可再结束。
+- **人给进行中的 goal 下发决定/补充**：goal 中途升级到人（求助/escalate）时，那条"需要你拍板"通知由专用信使 bot **「loopy-中控」（panel）** 代发到主群（不是 L1/L2 自己发——避免同 bot 自消息被 self-guard 挡、也让路由按身份精准不误捕）。人**回复/引用** loopy-中控 发的那条通知，daemon 会把内容下发给对应 goal 群的 L2（人不用切群）；或在 dashboard goal 看板的子任务详情里用「下发决策」框发。L2 收到后接着处理（补信息 / 重派 / 收尾）。
 
-### 7. 汇总
-所有子项目完成 → 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
+## L2 流程（在 goal 群，你是 chat-scope 监管化身）
 
-## 登记（别丢上下文）
-把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 /tmp/orchestrate-<项目>.json）；断点续跑/被唤起时据此恢复。
+你被 \`goal supervise\` 唤起时，prompt 会告诉你：你是这个 goal 的 L2 监管化身 + 主群（parent）坐标。全程在 goal 群内闭环：
+
+### L2-1 读 / 建 goal charter（独立命令，不依赖全局白板、不自动注入）
+goal charter = 这个 goal 的目标 / 组织 / 共识 / 进展 / 下一步。**独立存储**：不走全局 \`whiteboard enable\`、**不会被自动注入任何会话**（worker 绝不会无意中吃到它）；只有你（L2）主动读写。
+\`\`\`bash
+botmux goal charter current --goal "<goalChatId>" --create              # 确保本 goal 有 charter(没有就建)
+botmux goal charter read --goal "<goalChatId>" --json                   # 续跑先读，拿 content + updatedAt
+botmux goal charter update --goal "<goalChatId>" --expected-updated-at <updatedAt> "<整段当前状态>"
+\`\`\`
+charter 只承载 goal 的目标 / 约束 / 共识 / 进展 / 下一步（给人看、给你续跑恢复）；**任务真相在 verified-delivery 账本**，别拿 charter 当账本。
+- **goal 维度、不侵入 worker**：charter 是 goal 这一层的事实，只进你（L2）。给 worker 的 brief 里**由你手动摘录** charter 里该 worker 需要的目标 / 约束**片段**，而不是把整份 charter 塞给它——worker 只拿到与自己 subtask 相关的最小上下文。
+- （可选）给人一个飞书原生进度板可另用 **lark-task**；里程碑时也可把 charter 摘要 \`botmux send\` 播报到 goal 群，让人实时看到进度。但 L2 的判断依据始终是账本。
+
+### L2-2 在 goal 群群级 dispatch subtask（默认不开话题）
+对每个 subtask，把简报写进 /tmp/brief-X.md，在**本 goal 群**群级派活：
+\`\`\`bash
+botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
+  --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" \\
+  [--task-id <默认自动>] --acceptance-hint '<JSON v1 验收口径,见下>' --brief-file /tmp/brief-X.md
+\`\`\`
+- **\`--acceptance-hint\` 写成结构化 JSON v1**（不是自由文本）——worker 万一不 report，goal-watchdog 唤你巡检时你才能**机器可读地自动核验产物**（见 L2-3.5）。**dispatch 现在会服务端校验这段 JSON v1**：以 \`{\` 开头即按结构化处理，非法（坏 JSON / 缺 path / 未知 check.type 等）会 **fail-fast 拒派、不落账**，所以坏 schema 根本进不了账本（自由文本仍放行，只是巡检退化成只能催）。schema：
+  \`\`\`json
+  {"version":1,
+   "artifacts":[{"path":"/abs/file","kind":"file","checks":[{"type":"exists"},{"type":"contains","text":"PASS"}]}],
+   "commands":[{"cmd":"python3 check.py","cwd":"/abs/workdir","expectExitCode":0,"timeoutMs":60000}]}
+  \`\`\`
+  artifacts=要核验的产物（path 必须是你 L2 读得到的绝对路径）+ checks（exists/contains）；commands=可选核验命令（expectExitCode）。
+- **别从零手写，挑个模板改 path/text**（手写 JSON 最容易漏双引号 / 多尾逗号 → 解析失败 → 巡检退化成只能催，自动核验失效）：
+  - 单文件存在且含某串：\`{"version":1,"artifacts":[{"path":"/abs/out.txt","kind":"file","checks":[{"type":"exists"},{"type":"contains","text":"PASS"}]}]}\`
+  - 跑命令退出码 0：\`{"version":1,"commands":[{"cmd":"pnpm -s test","cwd":"/abs/repo","expectExitCode":0,"timeoutMs":120000}]}\`
+  - 文件 + 命令组合：取上面单文件模板，再加一个 \`"commands":[...]\` 键即可。
+- **dispatch 会替你校验**：派非法 JSON 会被直接拒（带具体错因，如"artifacts[0]: 缺少非空 path"），照提示修双引号 / 尾逗号 / 缺字段再派即可。想派前先本地确认也行（可选）：\`echo '<hint>' | python3 -c 'import json,sys;json.load(sys.stdin);print("ok")'\`。
+- 能结构化就结构化；实在不可测的活（调研 / 设计）才退回自由文本——那样巡检只能催、不能自动 accept。
+- **默认群级（chat-scope）、不开话题**：worker 被 @ 在它的 goal 群 chat-scope 会话唤起。dispatch 是**你（L2）**发起的，所以 worker 的 report 自然回你这条 L2 会话（同群、不跨群）。
+- \`dispatch\` 已自动把「干完用 \`botmux report --task <id>\` 带证据回报、别在群里口头说完成」的完成协议追加进简报，worker 照做。
+- **worker 的「需人定夺 / 卡住」只走你(L2)**：要人拍板 / 缺权限 / 有歧义，worker 该用 \`botmux help --task <id>\`（落账并唤你）或直接 @ 你，**绝不自己越级 @ 群外的人 / 老板**——越级 @ 会和你随后的正式升级重复、两次打扰人。对外升级由你(L2)统一用 \`delivery escalate\` 做。简报里把这条对 worker 写明（dispatch 追加的协议也会带，但你派多 bot 协作[coder+reviewer]时尤其强调一句）。
+- 工作目录已在建群时 \`--working-dir\` 绑好，dispatch 免传 \`--repo\`；要先拉起 worker 待命用 \`--standby\`。
+- 给 worker 的 brief 只放该 subtask 需要的上下文（含你从 charter 摘录的相关目标 / 约束），别把整份 charter 倒给它。
+- coder 写完先 @ reviewer review，过了再 report。
+
+### L2-3 收 + 验收（查账本，不信聊天）
+worker report → 你被唤起。**只认账本，不认聊天里说的"完成"**：
+- \`botmux delivery list --goal <goalChatId>\`（本 goal 所有任务的 dispatched/reported/accepted/rejected）；单看 \`botmux delivery show --task <taskId>\`。
+- 对 reported 的**优先硬证据**：能跑测试就跑、能读产物就读；不可测的活才纯判断。
+- 合格 → \`botmux delivery accept --task <taskId> --evidence-checked ...\`；不合格 → \`botmux delivery reject --task <taskId> --reason ... --retry-brief ...\`（自动回推 worker 话题重做）。
+
+### L2-3.5 统揽巡检（被 \`[goal-watchdog]\` 唤醒 = 你主动统揽，不是被动等 report）
+**你是本 goal 的统揽监管者**——发现问题、引导 worker、必要时代 worker 完成求助/交付这类操作，都是你的活，别等 worker 自己举手、更别让机械规则替你拍板。daemon 的 goal-watchdog 会唤你（worker turn 结束即时触发 / 约 5min 定时兜底），消息正文列出待处理 taskId + 各自验收 checks 清单（结构化 criteria 已渲染成逐条 checklist）。**收到 \`[goal-watchdog]\` 时，先跑一遍统揽判断**：对每个非终态任务（dispatched/reported/blocked/rejected 未重交）给出并执行下一步——不只盯 watchdog 列的那几个，也扫最近群消息找信号。
+
+判断输入：① \`botmux delivery list --goal <goalChatId>\`（账本是真相）；② watchdog 消息渲染好的各任务 checks 清单（原始口径 \`delivery show --task <id>\`）；③ 最近群消息（worker 可能口头说"卡住/不会/没权限/做不了"——**这是信号、不是证据**）。⚠️ 复核别加 \`--older-than\`（daemon 唤了就代表有任务在等，按年龄过滤会漏掉刚触发的；\`--older-than\` 只留给 L2-4 主动扫长期卡住）。
+
+逐任务给 action：
+1. **reported（worker 已交付）**：按 checks 主动核验产物（读文件 / 跑命令）。过 → \`botmux delivery accept --task <id> --evidence-checked "<逐条写结果>" --ran-command "<核验命令>"\`；不过 → \`delivery reject --reason check_failed --retry-brief ...\`。
+2. **产物已达标但 worker 没 report**（watchdog 会提示你"产物看似达标但 worker 未交付，请判断"）：这是要你**判断**、不是让你盖章。你**独立核验**产物后三选一：
+   - 确认是真交付 → **代办**：先落一笔 L2 自证 report、再 accept，且 report summary 与 accept note **都加前缀「supervisor 代办：worker 未自报，已独立核验」**（留痕；看板据此和"worker 自己交付"区分开，不让人误以为 worker 干的）：
+     \`\`\`bash
+     botmux report --task <id> --artifact <核验过的产物绝对路径> --summary "supervisor 代办：worker 未自报，已独立核验产物达标"
+     botmux delivery accept --task <id> --report <reportId> --evidence-checked "supervisor 代办；<逐条对 checks 写结果>" --ran-command "<实际跑的核验命令>"
+     \`\`\`
+   - 产物可疑、不像真交付（像占位 / 残留 / 上个任务留下的文件）→ **别代办**，催 worker 正式交付或 \`reject\`/重派。
+   - 拿不准 → 催 worker 用 \`botmux report\` 正式交付，别臆测 done。
+3. **worker 卡住**（账本 \`blocked\`，或群里说卡 / 缺权限 / 有歧义 / 反复失败）：你**主动接手**，不等它自己跑 \`botmux help\`：
+   - 能自己解 → 给澄清指令 / 补权限 / 带更清楚的 brief 重派（\`dispatch\` 同 taskId 或 \`send --chat-id <goalChatId> --mention <worker>\`）。
+   - 自己解不了（要人授权 / 要人拍范围 / 客观做不到）→ \`botmux delivery escalate --task <id> --reason "<卡在哪、需要人做什么>" [--retry-brief ...]\`，把"需要你"推到人面前（actor=监管者，**不假冒 worker 的求助**）。命令不变；daemon 会用信使 bot **「loopy-中控」** 把这条"需要你"代发到主群（不是你自己发，所以能正常唤起 L1 + 人能直接回复它下发指示）。
+     **⚠️ task 级升级一律走 \`delivery escalate\`**——它一条命令同时干三件事：写 \`TaskEscalated\` 进账本（看板转「🙋 已升级」）+ 在 **goal 群自动出「⚠️ 升级给人」播报卡**（群里人看得到这事升级了）+ 通知 L1 / 点亮看板。**别拿 \`goal notify-parent --attention\` 去升级单个 task**：那条只把通知推到主群，**不写账本、也不在 goal 群出升级卡** → goal 群里的人完全看不到发生了升级。\`goal notify-parent\` 只用于 goal 级进度 / \`--done\` 收尾，不替代 task 升级。
+4. **产物不存在 + 没动静** → 催 worker；只有 legacy 自由文本 hint（不可机器核验）→ 只催、别臆测 done。
+5. **escalated（已升级、等人）** → 别重复 nag，等人处理。
+
+**worker 掉线兜底（别机械催死人；多数情况系统已替你处理）**：daemon 发现某 dispatched 任务的 worker 可能掉线时，会按真实存活状态分流：
+- **worker 真死透（其 daemon 在线、但 goal 群里它的会话缺失/closed 或进程 killed）→ 系统自动同 bot 重派**：watchdog 确认死透（派活 5min 后才判、不误伤 busy/慢）后**自动**带原 taskId 重派 + @ 原 worker 重新接手 + 在群里发「🔄 已自动重派」卡（幂等：同 task 15min 窗口只重派一次）。**你看到 🔄 卡时别再重派**——系统做了，你只接管监督：查 charter/ledger/群历史确认新会话在推进。**只有**缺重派元数据的老任务系统没自动处理，才由你 \`dispatch\` 同 taskId 兜底。
+- **worker 整个 daemon 离线（重派没地方落）**：系统**不**往黑洞重派 → 注入 \`[worker-health]\` 交你判断：等它回来 / 缩 scope / \`delivery escalate\` 升级给人。
+- **session=suspended / workerProcess=none 但可恢复（只是休眠、没死）**：一条 \`send --chat-id <goalChatId> --mention <worker>\` 冷唤醒接着干，**别重派**（浪费 + 可能丢进度）。
+- **busy 超时（还在跑但很久没动静）**：先看产物进展，给时间或问一句，别急着重派。
+- **同一 task 反复被自动重派**（worker 起来又死）→ 别干等系统死循环，\`delivery escalate\` 升级给人。
+
+巡检后 \`goal charter update\` 刷新；全 accepted → 通知 L1（L2-5）。
+**铁律**：机械层只会自动验收"worker 已 report 且 checks 全过"的确定性交付；其余（没 report、在喊卡、证据可疑）一律交你判断——**完成与否你说了算，但必须基于独立核验的硬证据，绝不是"文件在那儿就算完"**。
+
+### L2-4 维护 charter + 推进依赖
+每验收一波，\`botmux goal charter update --goal <goalChatId> --expected-updated-at <ts> ...\` 刷新状态（进展/下一步）。有依赖的下一波，依赖满足了再 dispatch。**卡住/超时靠查账本**：\`botmux delivery list --status dispatched --older-than 2h\` 扫出长期没回报的，用 \`botmux send --chat-id <goalChatId> --mention <worker>\` 去问进展或改派（不靠后台轮询）。
+
+### L2-5 全部 accepted → 封板 charter + 通知 L1 确认结束
+本 goal 所有 subtask 都 accepted 后，**先把最终小结写进 charter 封板，再用 \`goal notify-parent --done\` 唤 L1 + 给发起人发"结束确认卡"**：
+\`\`\`bash
+# ① 先把 goal 最终小结写进 charter（做了什么 / 各产出在哪 / 关键证据 / 遗留项）——封板可回溯
+botmux goal charter update --goal "<goalChatId>" --expected-updated-at <updatedAt> "<最终小结整段>"
+# ② 再带 --done 通知 L1 → daemon 给发起人发"Goal 完成，结束并清理会话?"的按钮卡
+botmux goal notify-parent --done --summary "Goal 已完成：各 subtask 产出 + 位置 + 遗留项"
+\`\`\`
+- **\`--done\` 是"完成封板"标志**：带它 daemon 才给人发结束确认卡（人点 [结束并清理] → 关闭本 goal 群所有会话、群保留；[暂不] → 不动）。中途的进度 / 求助通知**不带** \`--done\`。
+- **为什么不用 \`send --chat-id 主群\`**：L1/L2 是同一个 bot，L2 \`send\` 到主群对 L1 是 self-message → 被 self-guard 挡、唤不起 L1。\`goal notify-parent\` 是 daemon-native 唤起（按 supervise 时存的 parent 坐标定位 L1 会话、注入 \`[goal-parent-notify]\` turn），绕开 self-guard。
+- session 在 L2 上下文里自动推断（也可 \`--session-id <L2>\` / \`--goal <goalChatId>\` 显式指定）；长摘要用 \`--summary-file <path>\`。
+- 这是 goal 群结果**回流主群**的唯一出口——L1 被唤起后查账本 / charter 汇总给用户（L1-5）。
+
+## 登记 & 恢复（账本是真相源，记忆只是缓存）
+**L2 尤其要靠查账本 + charter 恢复**：被唤起 / 断点续跑 / 怀疑漏了什么时，先 \`botmux delivery list --goal <goalChatId>\` 从账本重建任务真相、\`botmux goal charter read --goal <goalChatId> --json\` 读 goal 目标/状态，再动手——L2 自己的记忆、本地 scratch、飞书任务板都可能过期，账本 + charter 不会。L1 复核同理。
+
+## 可信交付（账本：聊天不算证据，验收要留痕）
+让"派出去的活到底做没做、验没验"有据可查，不靠群里互相说"好了"：
+- **每个 subtask 有一等 taskId**：\`dispatch\` 自动生成（或 \`--task-id\` 指定），子 bot **应**用 \`botmux report --task <taskId>\` 带证据回报（不能只在群里说完成）。但 **report 只是"快速通道"**——worker 不保证照做，所以 L2 的 \`acceptanceHint\` 写成 JSON v1、由 goal-watchdog 唤 L2 **主动核验产物**兜底（见 L2-3.5）：**完成判定的真相是"L2 核验产物达标"，worker 报没报只决定快慢、不决定成败**。
+- **证据两形态**：\`--artifact <路径>\`（你能读到的产物文件）或 inline（测试输出/关键内容/diff，自包含）；你读不到的路径不算数。
+- **账本是唯一真相源**：dispatched/reported/accepted/rejected 全落账，\`delivery list/show\` 查得到。**聊天里说的"完成"不是证据**；要把聊天内容当证据，须作为 inline 证据入账。
+- **验收必留硬证据（硬规矩，不是建议）**：每次 \`delivery accept\` 必须带 \`--evidence-checked\`（写清具体核验了什么：读了哪个文件的哪段内容 / 跑了什么命令得到什么结果），能跑命令核验的必带 \`--ran-command\`；\`reject\` 必带 \`--reason\`。**禁止空证据、或"看了一下没问题"式 accept**。验不动（产物不存在 / 读不到 / 不可测）就别 accept——去 reject 或催 worker，不要凭印象放行。
+- **兜底通道尤其要硬**：goal-watchdog 唤你主动核验那笔（worker 根本没 report），你的 \`evidenceChecked\` 是这笔交付**唯一**的核验记录、没有 worker report 作旁证——必须**逐条**对着验收 checks 清单写明结果（哪个 check 怎么验、过没过），绝不能因为"文件在那儿"就 accept。
+- **goalId = goal 群 chatId**：\`delivery list --goal <goalId>\` 就是这个项目的全景账本视图。
 
 ## 注意
-- **没通过用户审批不要建板/派活。**
-- 子 bot 不在群 / 不 mentionable → 先解决可达性（拉群、/introduce），否则 dispatch 的 @ 唤不起它。
-- 一条话题别塞太多 bot；coder+reviewer 两人一组最顺。
+- **没通过用户审批不要建群 / 起 L2 / 派活。**
+- **起 L2 只能用 \`goal supervise\`**，绝不能在 goal 群 \`send --mention <自己>\`（self-message guard 不触发自己）。
+- **默认群级、不开话题**；要物理隔离用子群（P1，回流方案评估中），别退回话题。
+- worker 不在 goal 群 / 不 mentionable → 先解决可达性（建群时拉进 / /introduce），否则 dispatch 的 @ 唤不起它。
+- 一个 subtask 别塞太多 bot；coder+reviewer 两人一组最顺。
 - 失败别硬重试同一招 ≥3 次；上报用户。
 `;
 

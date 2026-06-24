@@ -16,7 +16,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
-import { getBot, getAllBots, getOwnerOpenId, findOncallChatForAnyBot } from '../bot-registry.js';
+import { getBot, getAllBots, isGoalPanelApp, getOwnerOpenId, findOncallChatForAnyBot } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
@@ -167,7 +167,7 @@ export async function getAvailableBots(
       // a same-cliId peer. Only surface bots we can RELIABLY @-mention from
       // here: an unreliable open_id (peer self-view / appId fallback) would make
       // the model's `botmux send --mention <open_id>` miss its target.
-      .filter(b => b.larkAppId !== currentAppId && b.mentionable)
+      .filter(b => b.larkAppId !== currentAppId && b.mentionable && !isGoalPanelApp(b.larkAppId))
       .map(b => ({
         name: b.name,
         displayName: b.displayName,

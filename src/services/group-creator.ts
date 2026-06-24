@@ -69,10 +69,17 @@ export interface CreateGroupResult {
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
+  // The goal panel is NOT auto-invited here. This service backs every group
+  // creation path (/g, /relay --create, dashboard create, `botmux create-group`),
+  // so injecting the panel unconditionally dragged the sender-only relay into
+  // ordinary user groups too. The panel's whole job (escalation OUT + human
+  // reply RETURN) happens in the PARENT chat, never the new group, so no path
+  // needs it here. If one ever does, make it an explicit caller opt-in.
+  const invitedBotIds = Array.from(new Set(opts.larkAppIds));
   // Filter creator out of the bot invite list. createChat does this defensively
   // too, but doing it here makes the service contract explicit and keeps
   // invalidBotIds reporting stable across underlying API changes.
-  const otherBots = opts.larkAppIds.filter(id => id !== opts.creatorLarkAppId);
+  const otherBots = invitedBotIds.filter(id => id !== opts.creatorLarkAppId);
   const r = await createChat(opts.creatorLarkAppId, {
     name: opts.name,
     botIds: otherBots,
@@ -149,6 +156,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
 
   const oncallBindings: CreateGroupResult['oncallBindings'] = [];
   const invalidBots = new Set(r.invalidBotIds);
+  // Oncall bindings + role bootstrap go to the bots that actually joined: the
+  // creator (implicit member) plus the requested peers minus Lark-rejected ones.
   const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
     .filter(id => !invalidBots.has(id));
   const bindWorkingDir = opts.bindWorkingDir?.trim();

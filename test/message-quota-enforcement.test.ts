@@ -227,4 +227,42 @@ describe('message quota enforcement', () => {
     expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_retry');
     expect(mocks.commitCharge).toHaveBeenCalledWith('quota_app', 'om_retry');
   });
+
+  // ─── 任务模式：bot↔bot 编排流量旁路消息额度 ───────────────────────────────
+  // 监管者↔worker 的派活/回报/对账/求助/升级是系统编排流量；能不能发由授权闸控制，
+  // 但不该被「按条扣的人类消息额度」烧穿导致 worker 中途被收回授权、任务卡死。
+  it('bot/app orchestration traffic bypasses message quota (chat grant)', async () => {
+    await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_bot1', 'om_anchor', { senderIsBot: true }))
+      .resolves.toBe(true);
+    // 旁路发生在扣费之前：beginCharge / consumeQuota 都不应触发
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
+  it('bot-sender bypass also covers oncall chats carrying a default quota', async () => {
+    const bot = registerBot({
+      larkAppId: 'quota_oncall',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      oncallChats: [{ chatId: 'oc_oncall', workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    bot.config.messageQuota = { defaultLimit: 5 };
+    // 真人在 oncall 群（配了 defaultLimit）→ 照常按条扣额度
+    await expect(enforceMessageQuotaForCliInput('quota_oncall', 'oc_oncall', 'ou_human', 'om_h', 'om_anchor'))
+      .resolves.toBe(true);
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_oncall', 'chat:oc_oncall:ou_human', 5);
+    mocks.consumeQuota.mockClear();
+    // 同一 oncall 群里的 bot worker → 旁路，不扣额度
+    await expect(enforceMessageQuotaForCliInput('quota_oncall', 'oc_oncall', 'ou_botworker', 'om_b', 'om_anchor', { senderIsBot: true }))
+      .resolves.toBe(true);
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
+  it('a bot sender that cannot talk is still dropped (bypass skips quota, not the talk gate)', async () => {
+    await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_stranger', 'om_botnope', 'om_anchor', { senderIsBot: true }))
+      .resolves.toBe(false);
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
 });

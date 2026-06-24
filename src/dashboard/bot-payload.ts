@@ -1,5 +1,6 @@
 export interface DashboardBotDescriptor {
   larkAppId: string;
+  botOpenId?: string | null;
   botName?: string | null;
   botAvatarUrl?: string;
   cliId?: string;
@@ -8,6 +9,7 @@ export interface DashboardBotDescriptor {
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
   return {
     larkAppId: bot.larkAppId,
+    ...(bot.botOpenId ? { botOpenId: bot.botOpenId } : {}),
     botName: bot.botName,
     ...(bot.botAvatarUrl ? { botAvatarUrl: bot.botAvatarUrl } : {}),
     ...(bot.cliId ? { cliId: bot.cliId } : {}),

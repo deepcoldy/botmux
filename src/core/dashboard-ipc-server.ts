@@ -55,6 +55,7 @@ import { triggerSessionTurn } from './trigger-session.js';
 import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest } from '../services/trigger-types.js';
+import { buildGoalBoard } from '../verified-delivery/goal-board.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -70,7 +71,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
 import type { DaemonSession } from './types.js';
@@ -194,6 +195,27 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+// Close THIS daemon's chat-scope sessions bound to a goal chat. The goal-cleanup
+// card button fans this out to every online daemon, because each bot's workers
+// live in their own daemon process — a card-owner-local loop (the old behavior)
+// left cross-bot workers orphaned. Idempotent: re-running just closes nothing.
+ipcRoute('POST', '/api/goal/:goalChatId/cleanup-local', async (_req, res, params) => {
+  const goalChatId = params.goalChatId;
+  if (!goalChatId) return jsonRes(res, 400, { closed: 0, error: 'missing_goal_chat' });
+  const targets = listActiveSessions().filter(s => s.chatId === goalChatId && s.scope === 'chat');
+  let closed = 0;
+  for (const ds of targets) {
+    try {
+      await closeSession(ds.session.sessionId);
+      closed++;
+    } catch (err) {
+      logger.warn(`[goal-cleanup-local] close ${ds.session.sessionId} failed: ${err}`);
+    }
+  }
+  if (closed > 0) logger.info(`[goal-cleanup-local] closed ${closed} chat-scope sessions for goal=${goalChatId}`);
+  jsonRes(res, 200, { closed });
 });
 
 /** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
@@ -881,6 +903,10 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
   jsonRes(res, 200, { schedules: all.map(composeScheduleRow) });
 });
 
+ipcRoute('GET', '/api/goals', (_req, res) => {
+  jsonRes(res, 200, buildGoalBoard());
+});
+
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
@@ -927,6 +953,24 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+function currentBotForGroups() {
+  if (!cachedLarkAppId) return null;
+  let bot: ReturnType<typeof getBot> | null = null;
+  try {
+    bot = getBot(cachedLarkAppId);
+  } catch {
+    // Tests and older daemon startup windows can have larkAppId before the
+    // registry entry is hydrated. Keep /api/groups best-effort.
+  }
+  return {
+    larkAppId: cachedLarkAppId,
+    botOpenId: getBotOpenId(cachedLarkAppId),
+    botName: getBotName() || bot?.botName || cachedLarkAppId,
+    cliId: bot?.config?.cliId,
+    defaultOncall: bot?.config?.defaultOncall,
+  };
+}
+
 ipcRoute('GET', '/api/groups', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
@@ -947,7 +991,8 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         .map(b => b.name);
       return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, observedBotNames };
     });
-    jsonRes(res, 200, { chats: enriched });
+    const selfBot = currentBotForGroups();
+    jsonRes(res, 200, { chats: enriched, bots: selfBot ? [selfBot] : [] });
   } catch (e) {
     jsonRes(res, 502, { error: String(e) });
   }
