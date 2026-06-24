@@ -35,7 +35,7 @@ import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { AskArgsError, parseAskOptions } from './core/ask-args.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
-import { resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
+import { normalizeDispatchBotsForSender, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
 import {
   appendVerifiedDeliveryInstructions,
   buildDeliveryListRows,
@@ -7049,16 +7049,6 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  let built;
-  try {
-    built = buildDispatchMessages({ title: title.trim() || '子项目', brief, bots });
-  } catch (err: any) {
-    console.error(`dispatch 构建失败: ${err.message}`);
-    process.exit(1);
-  }
-  const workerNameByOpenId = new Map(bots.map(b => [b.openId, b.name?.trim() || b.openId]));
-  const workerNames = built.mentionedOpenIds.map(openId => workerNameByOpenId.get(openId) ?? openId);
-
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
@@ -7091,6 +7081,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const crossRefPath = join(resolveDataDir(), `bot-openids-${appId}.json`);
     if (existsSync(crossRefPath)) senderScopedBotOpenIds = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
   } catch { /* best effort */ }
+  bots = normalizeDispatchBotsForSender({
+    bots,
+    botInfoEntries,
+    senderScopedBotOpenIds,
+  });
+  let built;
+  try {
+    built = buildDispatchMessages({ title: title.trim() || '子项目', brief, bots });
+  } catch (err: any) {
+    console.error(`dispatch 构建失败: ${err.message}`);
+    process.exit(1);
+  }
+  const workerNameByOpenId = new Map(bots.map(b => [b.openId, b.name?.trim() || b.openId]));
+  const workerNames = built.mentionedOpenIds.map(openId => workerNameByOpenId.get(openId) ?? openId);
   const workerMetas = resolveDispatchWorkerMetas({
     openIds: built.mentionedOpenIds,
     bots,
@@ -7460,11 +7464,26 @@ async function cmdHelp(rest: string[]): Promise<void> {
       const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
       try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
       const { sendMessage } = await import('./im/lark/client.js');
+      const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+      let reg: Record<string, any> = {};
+      try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* */ }
+      const entry = s.rootMessageId ? reg[s.rootMessageId] : undefined;
+      const tgt = resolveReportTarget({
+        registryEntry: entry,
+        sessionChatId: s.chatId,
+        creatorOpenId: s.creatorOpenId,
+        ownerOpenId: s.ownerOpenId,
+        quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
+      });
+      const helpEnvelope = formatHelpEnvelope({ taskId, blocker: blockerText, helpKind: kind });
+      const supervisorOpenId = tgt.orchOpenId?.trim();
       envelopeMessageId = await sendMessage(
         s.larkAppId,
         goalChatId,
-        formatHelpEnvelope({ taskId, blocker: blockerText, helpKind: kind }),
-        'text',
+        supervisorOpenId
+          ? JSON.stringify({ zh_cn: { title: '', content: buildReportContent({ orchOpenId: supervisorOpenId, content: helpEnvelope }) } })
+          : helpEnvelope,
+        supervisorOpenId ? 'post' : 'text',
       );
     } catch (err) {
       console.error(`⚠️ 已写入 help 账本，但 goal 群求助信封发送失败：${err instanceof Error ? err.message : String(err)}`);
