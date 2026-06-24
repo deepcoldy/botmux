@@ -59,6 +59,13 @@ import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { getGoalParentNotification, rememberGoalParentNotification, type GoalParentNotificationRecord } from './services/goal-parent-notification-store.js';
 import { getGoalChat } from './services/goal-chat-store.js';
+import {
+  listDueGoalNotificationRetries,
+  markGoalNotificationRetryAttempt,
+  removeGoalNotificationRetry,
+  upsertGoalNotificationRetry,
+  type GoalNotificationRetryRecord,
+} from './services/goal-notification-retry-store.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
@@ -4457,7 +4464,15 @@ function uniqueLarkAppIds(...candidates: Array<string | undefined>): string[] {
   return out;
 }
 
-async function sendGoalHumanAttention(input: {
+function shortHash(input: string): string {
+  return createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+function retryBackoffMs(attempts: number): number {
+  return Math.min(15 * 60_000, 60_000 * 2 ** Math.max(0, attempts - 1));
+}
+
+function retryRecordFromHumanAttention(input: {
   parent?: DaemonSession;
   supervisor?: DaemonSession;
   taskId?: string;
@@ -4465,46 +4480,104 @@ async function sendGoalHumanAttention(input: {
   attentionKind: string;
   attentionReason: string;
   done?: boolean;
-}): Promise<{ sent: boolean; error?: string }> {
+}): GoalNotificationRetryRecord | null {
   const meta = input.supervisor?.session.goalSupervisor;
   const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
-  if (!parentChatId) return { sent: false, error: 'missing_parent_chat' };
-  const ownerOpenId = goalNotifyOwnerOpenId(input.parent);
   const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
+  if (!parentChatId || !goalChatId) return null;
   const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
   const candidates = goalParentSenderCandidates(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
+  const now = Date.now();
+  return {
+    id: `human:${goalChatId}:${input.taskId ?? 'goal'}:${input.attentionKind}:${shortHash(`${input.attentionReason}\n${input.summary}`)}`,
+    ownerLarkAppId: currentDaemonLarkAppId,
+    kind: 'human-attention',
+    candidates,
+    parentChatId,
+    parentRoot: meta?.parentRoot,
+    parentSessionId: meta?.parentSessionId,
+    supervisorSessionId: input.supervisor?.session.sessionId,
+    goalChatId,
+    goalTitle,
+    taskId: input.taskId,
+    summary: input.summary,
+    attentionKind: input.attentionKind,
+    attentionReason: input.attentionReason,
+    done: input.done,
+    ownerOpenId: goalNotifyOwnerOpenId(input.parent),
+    attempts: 0,
+    nextAttemptAt: now + 60_000,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function retryRecordFromCompletion(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  summary: string;
+}): GoalNotificationRetryRecord | null {
+  const meta = input.supervisor?.session.goalSupervisor;
+  const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
+  const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
+  if (!parentChatId || !goalChatId) return null;
+  const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
+  const candidates = uniqueLarkAppIds(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
+  const now = Date.now();
+  return {
+    id: `completion:${goalChatId}:${shortHash(input.summary)}`,
+    ownerLarkAppId: currentDaemonLarkAppId,
+    kind: 'completion-confirm',
+    candidates,
+    parentChatId,
+    parentRoot: meta?.parentRoot,
+    parentSessionId: meta?.parentSessionId,
+    supervisorSessionId: input.supervisor?.session.sessionId,
+    goalChatId,
+    goalTitle,
+    summary: input.summary,
+    done: true,
+    ownerOpenId: goalNotifyOwnerOpenId(input.parent),
+    attempts: 0,
+    nextAttemptAt: now + 60_000,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord): Promise<{ sent: boolean; error?: string }> {
   let lastError: string | undefined;
-  for (const larkAppId of candidates) {
-    const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
-    const goalLink = goalChatId ? chatAppLink(goalChatId, getBotBrand(larkAppId)) : undefined;
+  for (const larkAppId of record.candidates) {
+    const mention = record.ownerOpenId ? `<at user_id="${record.ownerOpenId}"></at> ` : '';
+    const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
     const text = [
-      `${mention}${input.done ? '[goal] Goal 已完成，等待确认' : '[goal] 任务需要你拍板'}`,
-      goalTitle ? `Goal: ${goalTitle}` : undefined,
-      goalChatId ? `goalChatId: ${goalChatId}` : undefined,
-      input.taskId ? `taskId: ${input.taskId}` : undefined,
-      goalLink ? `打开 goal 群: ${goalLink}` : undefined,
-      `类型: ${input.attentionKind}`,
-      `原因: ${input.attentionReason}`,
+      `${mention}${record.done ? '[goal] Goal 已完成，等待确认' : '[goal] 任务需要你拍板'}`,
+      record.goalTitle ? `Goal: ${record.goalTitle}` : undefined,
+      `goalChatId: ${record.goalChatId}`,
+      record.taskId ? `taskId: ${record.taskId}` : undefined,
+      `打开 goal 群: ${goalLink}`,
+      `类型: ${record.attentionKind ?? 'blocked'}`,
+      `原因: ${record.attentionReason ?? record.summary}`,
       '',
-      input.summary,
+      record.summary,
     ].filter(Boolean).join('\n');
     try {
-      const messageId = await sendMessage(larkAppId, parentChatId, text, 'text');
-      if (messageId && goalChatId) {
+      const messageId = await sendMessage(larkAppId, record.parentChatId, text, 'text');
+      if (messageId) {
         rememberGoalParentNotification({
           messageId,
           larkAppId,
-          parentChatId,
-          parentRoot: meta?.parentRoot,
-          parentSessionId: meta?.parentSessionId,
-          supervisorSessionId: input.supervisor?.session.sessionId,
-          goalChatId,
-          goalTitle,
-          taskId: input.taskId,
-          summary: input.summary,
-          attentionKind: input.attentionKind,
-          attentionReason: input.attentionReason,
-          done: input.done,
+          parentChatId: record.parentChatId,
+          parentRoot: record.parentRoot,
+          parentSessionId: record.parentSessionId,
+          supervisorSessionId: record.supervisorSessionId,
+          goalChatId: record.goalChatId,
+          goalTitle: record.goalTitle,
+          taskId: record.taskId,
+          summary: record.summary,
+          attentionKind: record.attentionKind,
+          attentionReason: record.attentionReason,
+          done: record.done,
           createdAt: Date.now(),
         });
       }
@@ -4515,6 +4588,27 @@ async function sendGoalHumanAttention(input: {
     }
   }
   return { sent: false, error: lastError ?? 'no_sender_available' };
+}
+
+async function sendGoalHumanAttention(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  taskId?: string;
+  summary: string;
+  attentionKind: string;
+  attentionReason: string;
+  done?: boolean;
+}): Promise<{ sent: boolean; error?: string }> {
+  const record = retryRecordFromHumanAttention(input);
+  if (!record) return { sent: false, error: 'missing_parent_or_goal_chat' };
+  const result = await sendGoalHumanAttentionRecord(record);
+  if (!result.sent) {
+    upsertGoalNotificationRetry({ ...record, lastError: result.error });
+    logger.warn(`[goal-notification-retry] queued ${record.kind} id=${record.id} goal=${record.goalChatId}: ${result.error}`);
+  } else {
+    removeGoalNotificationRetry(record.id);
+  }
+  return result;
 }
 
 function buildGoalCompletionConfirmCard(input: {
@@ -4580,41 +4674,43 @@ async function sendGoalCompletionConfirmation(input: {
   supervisor?: DaemonSession;
   summary: string;
 }): Promise<{ sent: boolean; error?: string }> {
-  const meta = input.supervisor?.session.goalSupervisor;
-  const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
-  const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
-  if (!parentChatId) return { sent: false, error: 'missing_parent_chat' };
-  if (!goalChatId) return { sent: false, error: 'missing_goal_chat' };
-  const ownerOpenId = goalNotifyOwnerOpenId(input.parent);
-  const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
-  // Keep completion cards on the supervisor/parent identity for now: the
-  // goal_cleanup_confirm card action still closes local daemon sessions only.
-  // Moving it to the panel daemon must land together with cross-daemon cleanup.
-  const candidates = uniqueLarkAppIds(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
+  const record = retryRecordFromCompletion(input);
+  if (!record) return { sent: false, error: 'missing_parent_or_goal_chat' };
+  const result = await sendGoalCompletionConfirmationRecord(record);
+  if (!result.sent) {
+    upsertGoalNotificationRetry({ ...record, lastError: result.error });
+    logger.warn(`[goal-notification-retry] queued ${record.kind} id=${record.id} goal=${record.goalChatId}: ${result.error}`);
+  } else {
+    removeGoalNotificationRetry(record.id);
+  }
+  return result;
+}
+
+async function sendGoalCompletionConfirmationRecord(record: GoalNotificationRetryRecord): Promise<{ sent: boolean; error?: string }> {
   let lastError: string | undefined;
-  for (const larkAppId of candidates) {
-    const goalLink = chatAppLink(goalChatId, getBotBrand(larkAppId));
+  for (const larkAppId of record.candidates) {
+    const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
     const card = buildGoalCompletionConfirmCard({
-      ownerOpenId,
-      goalTitle,
-      goalChatId,
+      ownerOpenId: record.ownerOpenId,
+      goalTitle: record.goalTitle,
+      goalChatId: record.goalChatId,
       goalLink,
-      summary: input.summary,
-      supervisorSessionId: input.supervisor?.session.sessionId,
+      summary: record.summary,
+      supervisorSessionId: record.supervisorSessionId,
     });
     try {
-      const messageId = await sendMessage(larkAppId, parentChatId, card, 'interactive');
+      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive');
       if (messageId) {
         rememberGoalParentNotification({
           messageId,
           larkAppId,
-          parentChatId,
-          parentRoot: meta?.parentRoot,
-          parentSessionId: meta?.parentSessionId,
-          supervisorSessionId: input.supervisor?.session.sessionId,
-          goalChatId,
-          goalTitle,
-          summary: input.summary,
+          parentChatId: record.parentChatId,
+          parentRoot: record.parentRoot,
+          parentSessionId: record.parentSessionId,
+          supervisorSessionId: record.supervisorSessionId,
+          goalChatId: record.goalChatId,
+          goalTitle: record.goalTitle,
+          summary: record.summary,
           done: true,
           createdAt: Date.now(),
         });
@@ -4626,6 +4722,28 @@ async function sendGoalCompletionConfirmation(input: {
     }
   }
   return { sent: false, error: lastError ?? 'no_sender_available' };
+}
+
+async function processGoalNotificationRetries(): Promise<void> {
+  const due = listDueGoalNotificationRetries(currentDaemonLarkAppId);
+  if (due.length === 0) return;
+  for (const record of due) {
+    const result = record.kind === 'human-attention'
+      ? await sendGoalHumanAttentionRecord(record)
+      : await sendGoalCompletionConfirmationRecord(record);
+    if (result.sent) {
+      removeGoalNotificationRetry(record.id);
+      logger.info(`[goal-notification-retry] delivered ${record.kind} id=${record.id} goal=${record.goalChatId}`);
+      continue;
+    }
+    const attempts = record.attempts + 1;
+    markGoalNotificationRetryAttempt(record.id, {
+      attempts,
+      nextAttemptAt: Date.now() + retryBackoffMs(attempts),
+      lastError: result.error,
+    });
+    logger.warn(`[goal-notification-retry] retry failed ${record.kind} id=${record.id} attempts=${attempts}: ${result.error}`);
+  }
 }
 
 function goalParentReplyCandidates(parsed: Pick<LarkMessage, 'parentId' | 'messageId'>): string[] {
@@ -17114,6 +17232,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       workerHealthFacts: buildWorkerHealthFacts,
     });
 
+  const goalNotificationRetryTimer = setInterval(() => {
+    void processGoalNotificationRetries().catch((err: any) => {
+      logger.warn(`[goal-notification-retry] tick failed: ${err?.message ?? err}`);
+    });
+  }, 60_000);
+  goalNotificationRetryTimer.unref?.();
+  setTimeout(() => {
+    void processGoalNotificationRetries().catch((err: any) => {
+      logger.warn(`[goal-notification-retry] startup tick failed: ${err?.message ?? err}`);
+    });
+  }, 15_000).unref?.();
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
