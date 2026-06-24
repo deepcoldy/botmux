@@ -97,6 +97,7 @@ vi.mock('../src/core/dashboard-rows.js', () => ({
 vi.mock('../src/skills/installer.js', () => ({
   ensureSkills: vi.fn(),
   ensureAskSkill: vi.fn(),
+  ensureWhiteboardSkill: vi.fn(),
   removeGlobalBotmuxSkills: vi.fn(),
 }));
 

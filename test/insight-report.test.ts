@@ -1,16 +1,23 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 let resolvedPath = '';
 let resolvedKind: string = 'claude';
+// Per-sessionId override map for multi-session overview tests; falls back to the
+// single resolvedPath when a sessionId has no entry (back-compat for old tests).
+let resolvedPaths: Record<string, string> = {};
 
 vi.mock('../src/services/transcript-resolver.js', () => ({
-  resolveSessionTranscriptPath: vi.fn(() => resolvedPath ? { path: resolvedPath, kind: resolvedKind } : null),
+  resolveSessionTranscriptPath: vi.fn((q?: { sessionId?: string }) => {
+    const p = (q?.sessionId && resolvedPaths[q.sessionId]) || resolvedPath;
+    return p ? { path: p, kind: resolvedKind } : null;
+  }),
 }));
 
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../src/services/insight/report.js';
+import { buildSubagentLanes } from '../src/services/insight/subagent-reader.js';
 
 let dir = '';
 
@@ -18,6 +25,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-insight-report-'));
   resolvedPath = '';
   resolvedKind = 'claude';
+  resolvedPaths = {};
 });
 
 afterEach(() => {
@@ -194,6 +202,111 @@ function writeClaudeLateFailureFixture(): string {
       message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `b${i}`, is_error: true, content: 'failed' }] },
     }));
   }
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
+// One blocking interactive tool (ask-question / plan approval) whose result
+// arrives 119s later — the user was away, not the agent working. Used to prove
+// that wait time is counted as an action but never as work-time or a slow span.
+function writeClaudeInteractiveWaitFixture(tool: string): string {
+  const path = join(dir, 'claude-wait.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'ask me' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'w1', name: tool, input: {} }] } }),
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:02:00.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'answered' }] } }),
+  ];
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
+// turn 0: prompt + narration + a tool_use span. turn 1: prompt + narration, NO
+// tool (a fully tool-less turn). Used to prove agent narration is gated to
+// detail=spans / conversation, and that a tool-less turn still renders.
+function writeClaudeNarrationFixture(): string {
+  const path = join(dir, 'claude-narration.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'fix' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { id: 'm1', role: 'assistant', content: [
+      { type: 'text', text: 'Looking into it. token=sk-abcdef1234567890' },
+      { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/a/b.ts' } },
+    ] } }),
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } }),
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:03.000Z', message: { role: 'user', content: 'and explain' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:04.000Z', message: { id: 'm2', role: 'assistant', content: [
+      { type: 'text', text: 'It does X.' },
+    ] } }),
+  ];
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
+// A session mixing real reads/edits with planning tools (TodoWrite/TodoRead).
+// Planning tools must NOT count as edit/research, or they corrupt the r/w ratio.
+function writeClaudePlanningFixture(): string {
+  const path = join(dir, 'claude-planning.jsonl');
+  const spans = [
+    { name: 'Read', input: { file_path: '/x/a.ts' } },
+    { name: 'Read', input: { file_path: '/x/b.ts' } },
+    { name: 'Edit', input: { file_path: '/x/a.ts' } },
+    { name: 'TodoWrite', input: { todos: [{ content: 'plan', status: 'pending' }] } },
+    { name: 'TodoRead', input: {} },
+  ];
+  const lines: string[] = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'work' } }),
+  ];
+  spans.forEach((s, i) => {
+    lines.push(JSON.stringify({
+      type: 'assistant',
+      timestamp: `2026-06-17T01:00:0${i + 1}.000Z`,
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: `p${i}`, name: s.name, input: s.input }] },
+    }));
+    lines.push(JSON.stringify({
+      type: 'user',
+      timestamp: `2026-06-17T01:00:0${i + 1}.500Z`,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `p${i}`, content: 'ok' }] },
+    }));
+  });
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
+// One genuine tool error + two user-rejected tool uses (the canonical Claude
+// Code rejection string). Only the genuine error must count as a failure.
+function writeClaudeRejectionFixture(): string {
+  const path = join(dir, 'claude-rejection.jsonl');
+  const REJECT = 'The user doesn\'t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was not written to the file).';
+  const cases: Array<{ tool: string; err: string }> = [
+    { tool: 'Bash', err: '<tool_use_error>Exit code 1: command not found</tool_use_error>' }, // genuine
+    { tool: 'Edit', err: REJECT },     // user rejected an edit
+    { tool: 'AskUserQuestion', err: REJECT }, // user dismissed a question
+  ];
+  const lines: string[] = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'go' } }),
+  ];
+  cases.forEach((c, i) => {
+    lines.push(JSON.stringify({ type: 'assistant', timestamp: `2026-06-17T01:00:0${i + 1}.000Z`, message: { role: 'assistant', content: [{ type: 'tool_use', id: `j${i}`, name: c.tool, input: { command: 'x' } }] } }));
+    lines.push(JSON.stringify({ type: 'user', timestamp: `2026-06-17T01:00:0${i + 1}.500Z`, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `j${i}`, is_error: true, content: c.err }] } }));
+  });
+  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+  return path;
+}
+
+// N Read spans + M Edit spans, for testing the pooled overview read/write ratio.
+function writeClaudeRwFixture(name: string, reads: number, edits: number): string {
+  const path = join(dir, `claude-rw-${name}.jsonl`);
+  const lines: string[] = [
+    JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 'work' } }),
+  ];
+  let n = 0;
+  const add = (tool: string, input: unknown) => {
+    n++;
+    const id = `${name}-${n}`;
+    lines.push(JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: tool, input }] } }));
+    lines.push(JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } }));
+  };
+  for (let i = 0; i < reads; i++) add('Read', { file_path: `/x/r${i}.ts` });
+  for (let i = 0; i < edits; i++) add('Edit', { file_path: `/x/e${i}.ts` });
   writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
   return path;
 }
@@ -681,5 +794,220 @@ describe('SafeInsightReport', () => {
     expect(overview.sessions.map(s => s.sessionId)).toEqual(['s2', 's1']);
     expect(JSON.stringify(overview)).not.toContain('sk-secret');
     expect(JSON.stringify(overview)).not.toContain('curl https://x.test');
+  });
+
+  it('gates scrubbed agent narration to detail=spans and omits it from detail=summary', () => {
+    resolvedPath = writeClaudeNarrationFixture();
+
+    const summary = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'summary', now: () => new Date('2026-06-17T02:00:00.000Z') });
+    // narration never reaches the summary report (the /insight card + overview path)
+    expect(JSON.stringify(summary)).not.toContain('Looking into it');
+    expect(JSON.stringify(summary)).not.toContain('It does X');
+
+    const spans = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'spans', now: () => new Date('2026-06-17T02:00:00.000Z') });
+    const t0 = spans.turnTimeline.find(t => t.turnIndex === 0);
+    expect(t0?.agentSay?.text).toContain('Looking into it');
+    // a secret echoed in narration is scrubbed before it reaches the structure
+    expect(JSON.stringify(spans.turnTimeline)).toContain('token=<redacted>');
+    expect(JSON.stringify(spans.turnTimeline)).not.toContain('sk-abcdef1234567890');
+  });
+
+  it('does not resurrect a cap-trimmed span turn as an empty narration turn, but keeps genuinely tool-less turns', () => {
+    // turn 0: a FAILING tool (high cap priority). turn 1: narration + a SUCCESS
+    // tool (low priority → trimmed when maxSpans is small). turn 2: narration
+    // only, no tool (genuinely tool-less).
+    const path = join(dir, 'claude-cap.jsonl');
+    writeFileSync(path, [
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:00.000Z', message: { role: 'user', content: 't0' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:01.000Z', message: { id: 'a0', role: 'assistant', content: [
+        { type: 'tool_use', id: 'f0', name: 'Bash', input: { command: 'false' } },
+      ] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'f0', is_error: true, content: 'boom' }] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:03.000Z', message: { role: 'user', content: 't1' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:04.000Z', message: { id: 'a1', role: 'assistant', content: [
+        { type: 'text', text: 'CAPPED_TURN_NARRATION' },
+        { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: '/x/y.ts' } },
+      ] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:05.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'r1', content: 'ok' }] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-06-17T01:00:06.000Z', message: { role: 'user', content: 't2' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-06-17T01:00:07.000Z', message: { id: 'a2', role: 'assistant', content: [
+        { type: 'text', text: 'TOOLLESS_TURN_NARRATION' },
+      ] } }),
+    ].join('\n') + '\n', 'utf-8');
+    resolvedPath = path;
+
+    const report = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'spans', maxSpans: 1, now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    const turnIndexes = report.turnTimeline.map(t => t.turnIndex);
+    // turn 1 has a real span trimmed by the cap → must NOT become a phantom 0-op
+    // turn, and its narration must not leak past the cap.
+    expect(turnIndexes).not.toContain(1);
+    expect(JSON.stringify(report.turnTimeline)).not.toContain('CAPPED_TURN_NARRATION');
+    // turn 2 is genuinely tool-less → its narration still surfaces under the cap.
+    expect(turnIndexes).toContain(2);
+    const t2 = report.turnTimeline.find(t => t.turnIndex === 2);
+    expect(t2?.agentSay?.text).toContain('TOOLLESS_TURN_NARRATION');
+    expect(t2?.events).toEqual([]);
+  });
+
+  it('renders a tool-less narration turn in the conversation replay (turn with no span)', () => {
+    resolvedPath = writeClaudeNarrationFixture();
+    const convo = buildSafeInsightConversation({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { offset: 0, limit: 50 });
+
+    // turn 1 ran no tool — its narration must still surface as an agent 'say'
+    // message (text, no event). This is the regression the timeline union fixes.
+    const turn1Say = convo.messages.find(m => m.turnIndex === 1 && m.role === 'agent' && !!m.text && !m.event);
+    expect(turn1Say?.text).toContain('It does X');
+    // and the narration on the tool-bearing turn 0 is present too
+    const turn0Say = convo.messages.find(m => m.turnIndex === 0 && m.role === 'agent' && !!m.text && !m.event);
+    expect(turn0Say?.text).toContain('Looking into it');
+  });
+
+  for (const tool of ['AskUserQuestion', 'ExitPlanMode']) {
+    it(`counts ${tool} as an action but never as work-time or a slow span`, () => {
+      resolvedPath = writeClaudeInteractiveWaitFixture(tool);
+      const report = buildSafeInsightReport({
+        cliId: 'claude-code',
+        sessionId: 's1',
+        cwd: dir,
+      }, { detail: 'spans', now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+      // The action is counted...
+      expect(report.agg.totalSpans).toBe(1);
+      expect(report.agg.phase.discuss.count).toBe(1);
+      // ...but the 119s spent waiting for the user is NOT work-time...
+      expect(report.agg.phase.discuss.ms).toBe(0);
+      // ...and never a slow span, even though 119s exceeds the 60s slow threshold.
+      expect(report.agg.slowSpans).toBe(0);
+      expect(report.suggestions.find(s => s.id === 'slow_span')).toBeUndefined();
+      expect(report.diagnostics.find(d => d.id === 'slow_span')).toBeUndefined();
+      expect(report.spans?.[0]?.tags ?? []).not.toContain('slow');
+      // ...so the wait-only turn yields no attention diagnostic at all (its
+      // measured duration is 0 — without the exclusion it would be flagged
+      // turn_has_slow_spans, since 119s exceeds the threshold).
+      expect(report.turnDiagnostics).toEqual([]);
+      // ...and the detail-view timeline metric for that turn also excludes the
+      // wait (buildTurnTimeline falls back to metricsForTimeline when there is
+      // no diagnostic — that path must exclude interactive-wait tools too).
+      expect(report.turnTimeline?.[0]?.metrics.durationMs).toBe(0);
+    });
+  }
+
+  it('does not bucket planning tools (TodoWrite/TodoRead) as edit/research', () => {
+    resolvedPath = writeClaudePlanningFixture();
+    const report = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'summary', now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    expect(report.status).toBe('ok');
+    // 2 Read → research; 1 Edit → edit; TodoWrite + TodoRead → discuss (NOT
+    // edit/research). Without the fix TodoWrite would land in edit and TodoRead
+    // in research, deflating the ratio from 2.0 to 1.5.
+    expect(report.agg.phase.research.count).toBe(2);
+    expect(report.agg.phase.edit.count).toBe(1);
+    expect(report.agg.phase.discuss.count).toBe(2);
+    expect(report.agg.readWriteRatio).toBe(2);
+  });
+
+  it('does not count user-rejected tool uses as failures', () => {
+    resolvedPath = writeClaudeRejectionFixture();
+    const report = buildSafeInsightReport({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: dir,
+    }, { detail: 'spans', now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    expect(report.status).toBe('ok');
+    expect(report.agg.totalSpans).toBe(3);
+    // Only the genuine Bash error counts; the two user-rejections (Edit + AskUserQuestion) do not.
+    expect(report.agg.failedSpans).toBe(1);
+    expect(report.agg.failByTool).toEqual({ Bash: 1 });
+    // The rejected spans are recorded as non-error outcomes.
+    const byTool = Object.fromEntries((report.spans ?? []).map(s => [s.tool, s.status]));
+    expect(byTool.Bash).toBe('error');
+    expect(byTool.Edit).toBe('ok');
+    expect(byTool.AskUserQuestion).toBe('ok');
+  });
+
+  it('pools the cross-session read/write ratio instead of averaging per-session ratios', async () => {
+    // Session A: 4 reads / 1 edit (ratio 4.0); Session B: 1 read / 4 edits (ratio 0.25).
+    // Mean of per-session ratios = 2.13; pooled Σread/Σedit = 5/5 = 1.0. We want pooled.
+    resolvedPaths = {
+      sa: writeClaudeRwFixture('a', 4, 1),
+      sb: writeClaudeRwFixture('b', 1, 4),
+    };
+    const overview = await buildSafeInsightOverview([
+      { cliId: 'claude-code', sessionId: 'sa', cwd: dir, title: 'a', lastMessageAt: 20 },
+      { cliId: 'claude-code', sessionId: 'sb', cwd: dir, title: 'b', lastMessageAt: 10 },
+    ], { limit: 10, now: () => new Date('2026-06-17T02:00:00.000Z') });
+
+    expect(overview.agg.phase.research.count).toBe(5);
+    expect(overview.agg.phase.edit.count).toBe(5);
+    expect(overview.agg.readWriteRatio).toBe(1);
+  });
+});
+
+describe('buildSubagentLanes', () => {
+  const MAX_SUBAGENTS = 40;
+  function writeSubagentFiles(sessionId: string, n: number): string {
+    const subdir = join(dir, sessionId, 'subagents');
+    mkdirSync(subdir, { recursive: true });
+    for (let i = 0; i < n; i++) {
+      writeFileSync(join(subdir, `agent-${i}.jsonl`), '{}\n', 'utf-8');
+      writeFileSync(join(subdir, `agent-${i}.meta.json`), JSON.stringify({ agentType: 'Explore', description: `task ${i}` }), 'utf-8');
+    }
+    return join(dir, `${sessionId}.jsonl`);
+  }
+
+  it('parses at most MAX_SUBAGENTS transcripts even when the dir holds far more', () => {
+    const mainPath = writeSubagentFiles('many', 50);
+    let calls = 0;
+    // The cap is applied to the candidate set BEFORE parsing, so a session with
+    // hundreds of sub-agent files can't trigger hundreds of full parses.
+    const lanes = buildSubagentLanes(mainPath, p => { calls++; expect(p).toContain('subagents'); return { spans: [] }; });
+    expect(calls).toBe(MAX_SUBAGENTS);
+    expect(lanes.length).toBe(MAX_SUBAGENTS);
+  });
+
+  it('returns [] (and never parses) when there is no subagents dir', () => {
+    const lanes = buildSubagentLanes(join(dir, 'nope.jsonl'), () => { throw new Error('should not parse'); });
+    expect(lanes).toEqual([]);
+  });
+
+  it('rolls up phase/reads/edits/runs/failures/duration and safe-projects the meta', () => {
+    const mainPath = writeSubagentFiles('one', 1);
+    const lanes = buildSubagentLanes(mainPath, () => ({ spans: [
+      { phase: 'research', tool: 'Read', status: 'ok', durationMs: 10 },
+      { phase: 'edit', tool: 'Edit', status: 'error', durationMs: 20 },
+      { phase: 'run', tool: 'Bash', status: 'ok' },
+      // Interactive-wait tool: counted as an action but its wall-clock is excluded.
+      { phase: 'discuss', tool: 'AskUserQuestion', status: 'ok', durationMs: 99999 },
+    ] }));
+    expect(lanes.length).toBe(1);
+    expect(lanes[0]!.reads).toBe(1);
+    expect(lanes[0]!.edits).toBe(1);
+    expect(lanes[0]!.runs).toBe(1);
+    expect(lanes[0]!.failures).toBe(1);
+    expect(lanes[0]!.durationMs).toBe(30);
+    expect(lanes[0]!.agentType).toBe('Explore');
+    expect(lanes[0]!.task?.text).toContain('task');
   });
 });

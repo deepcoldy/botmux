@@ -30,7 +30,7 @@ function sanitizeModelSlug(raw: string | undefined): string | undefined {
 
 function aiSlugConfigured(): boolean {
   const c = config.worktreeSlugAI;
-  return !!(c.enabled && c.baseUrl && c.apiKey && c.model);
+  return !!(c?.enabled && c.baseUrl && c.apiKey && c.model);
 }
 
 export function localWorktreeSlugFromContext(title?: string, firstPrompt?: string): string | undefined {
@@ -45,6 +45,7 @@ export async function worktreeSlugFromContextAI(title?: string, firstPrompt?: st
   if (!text) return fallback;
 
   const c = config.worktreeSlugAI;
+  if (!c) return fallback;
   try {
     const url = `${c.baseUrl.replace(/\/+$/, '')}/chat/completions`;
     const resp = await fetch(url, {

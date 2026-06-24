@@ -26,6 +26,14 @@ export interface Session {
   kanbanColumn?: string;
   /** 看板列内手动排序位置（拖拽时取相邻卡片中点，允许小数）。 */
   kanbanPosition?: number;
+  /** Dashboard「创建会话」入待办池：会话已建（群已拉、bot 已邀请）但 CLI 还没起，
+   *  内容暂存在 queuedPrompt 里，停在看板「待办池」列。被激活（拖到进行中 / 点
+   *  「开始」/ 群里来第一条消息）时才 forkWorker 把 queuedPrompt 当首轮发给 CLI。
+   *  与 pendingRepo（等选 repo）不同——queued 会持久化，daemon 重启后仍是停起态。*/
+  queued?: boolean;
+  /** queued 会话被激活时要作为首轮发给 CLI 的原始内容（用户在弹框里写的任务）。
+   *  仅 queued===true 时有意义；激活后清空。持久化以扛 daemon 重启。 */
+  queuedPrompt?: string;
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
@@ -273,6 +281,10 @@ export type DaemonToWorker =
   | { type: 'close' }
   | { type: 'suspend' }
   | { type: 'restart' }
+  // Crash loop: daemon gave up auto-restarting and asks the worker to park a
+  // diagnostic shell (bmx-diag-<sid>) preserving the last output. Deferred from
+  // onExit so transient auto-restarted exits don't park-then-tear-down.
+  | { type: 'park_diagnostic' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
   | { type: 'tui_text_input'; keys: string[]; text: string }
   // CoCo AskUserQuestion 作答：daemon 在 ask 结算后下发，worker 等原生 picker 渲染后
@@ -294,7 +306,7 @@ export type DaemonToWorker =
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string; turnId?: string }
   | { type: 'cli_session_id'; cliSessionId: string }
-  | { type: 'claude_exit'; code: number | null; signal: string | null }
+  | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean }
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string }
   | { type: 'error'; message: string }

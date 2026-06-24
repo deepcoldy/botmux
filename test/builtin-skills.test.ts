@@ -4,7 +4,7 @@
  * Run: pnpm vitest run test/builtin-skills.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES } from '../src/skills/definitions.js';
+import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from '../src/skills/definitions.js';
 
 describe('built-in botmux-send skill', () => {
   it('teaches safe multiline sends across Unix and Windows shells', () => {
@@ -126,16 +126,22 @@ describe('built-in botmux-handoff skill', () => {
 });
 
 describe('built-in botmux-whiteboard skill', () => {
-  it('is registered and teaches disabled/default-safe usage', () => {
-    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-whiteboard');
-    expect(skill).toBeDefined();
-    expect(skill!.content).toContain('botmux whiteboard status');
-    expect(skill!.content).toContain('默认关闭');
-    expect(skill!.content).toContain('botmux whiteboard update');
-    expect(skill!.content).not.toContain('botmux whiteboard post');
-    expect(skill!.content).toContain('write --yes');
-    expect(skill!.content).toContain('不要写');
-    expect(skill!.content).toContain('botmux send');
+  it('is NOT in BUILTIN_SKILLS — installed conditionally on the whiteboard toggle', () => {
+    // The whiteboard feature is off by default, so its skill must not be written
+    // unconditionally. It is materialised only when enabled, via
+    // ensureWhiteboardSkill (see ensure-whiteboard-skill.test.ts).
+    expect(BUILTIN_SKILLS.find(s => s.name === WHITEBOARD_SKILL_NAME)).toBeUndefined();
+    expect(WHITEBOARD_SKILL_NAME).toBe('botmux-whiteboard');
+  });
+
+  it('teaches disabled/default-safe usage', () => {
+    expect(WHITEBOARD_SKILL).toContain('botmux whiteboard status');
+    expect(WHITEBOARD_SKILL).toContain('默认关闭');
+    expect(WHITEBOARD_SKILL).toContain('botmux whiteboard update');
+    expect(WHITEBOARD_SKILL).not.toContain('botmux whiteboard post');
+    expect(WHITEBOARD_SKILL).toContain('write --yes');
+    expect(WHITEBOARD_SKILL).toContain('不要写');
+    expect(WHITEBOARD_SKILL).toContain('botmux send');
   });
 });
 

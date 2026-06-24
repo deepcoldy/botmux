@@ -2,7 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import {
-  readFileSync, existsSync, chmodSync, mkdirSync, statSync, createReadStream,
+  readFileSync, existsSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -14,7 +14,7 @@ import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  loadPersistedToken, persistToken,
+  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -38,9 +38,8 @@ import {
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocale } from './i18n/types.js';
 import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
 import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
@@ -49,6 +48,29 @@ import { spawnDetachedRestart, npmGlobalUpdateLockTarget } from './core/maintena
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
+import {
+  applySettingsWrite,
+  defaultSettingsWriteApplierDeps,
+} from './dashboard/settings-write-applier.js';
+import {
+  addBotsToGroup,
+  bindOncall,
+  disbandGroup,
+  leaveGroup,
+  unbindOncall,
+  type GroupsActionDeps,
+  type HandlerResult as GroupsHandlerResult,
+} from './dashboard/groups-action-helpers.js';
+import { defaultWorkflowsActionDeps } from './dashboard/workflows-action-helpers.js';
+import {
+  listRuns as listRunsImpl,
+  readRunSnapshot as readRunSnapshotImpl,
+  scrubSnapshotForUnauthed as scrubSnapshotImpl,
+  isValidRunId as isValidRunIdImpl,
+  TERMINAL_RUN_STATUSES as TERMINAL_RUN_STATUSES_IMPL,
+  type RunSnapshotDTO,
+} from './workflows/ops-projection.js';
+import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
@@ -69,6 +91,9 @@ import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.j
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
+import { readPlatformBinding } from './platform/binding.js';
+import { startPlatformTunnelClient } from './platform/tunnel-client.js';
+import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -83,13 +108,24 @@ const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
 
 function loadOrCreateSecret(): string {
-  if (existsSync(SECRET_PATH)) return readFileSync(SECRET_PATH, 'utf8').trim();
-  const s = randomBytes(32).toString('base64url');
-  mkdirSync(dirname(SECRET_PATH), { recursive: true });
-  atomicWriteFileSync(SECRET_PATH, s, { mode: 0o600 });
-  chmodSync(SECRET_PATH, 0o600);
-  logger.info(`[dashboard] Generated dashboard secret at ${SECRET_PATH}`);
-  return s;
+  let existing: string | null;
+  try {
+    existing = loadDashboardSecret(SECRET_PATH);
+  } catch (e) {
+    logger.error(`[dashboard] Failed to read dashboard secret at ${SECRET_PATH}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  if (existing) return existing;
+
+  const existed = existsSync(SECRET_PATH);
+  try {
+    const secret = loadOrCreateDashboardSecret(SECRET_PATH);
+    logger.info(`[dashboard] ${existed ? 'Regenerated empty' : 'Generated'} dashboard secret at ${SECRET_PATH}`);
+    return secret;
+  } catch (e) {
+    logger.error(`[dashboard] Failed to create dashboard secret at ${SECRET_PATH}: ${(e as Error).message}`);
+    process.exit(1);
+  }
 }
 
 // The active dashboard token is persisted to disk so a previously-issued
@@ -170,6 +206,72 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     whiteboard: { enabled: global.whiteboard?.enabled === true },
   };
 }
+
+// Single shared deps object for `applySettingsWrite` — both the browser
+// `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
+// route call through this so error codes / merge semantics stay identical.
+async function reloadLocaleOnAllDaemons(): Promise<void> {
+  await Promise.all(registry.list().map(d =>
+    fetch(`http://127.0.0.1:${d.ipcPort}/api/locale/reload`, { method: 'POST' }).catch(() => undefined),
+  ));
+}
+const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
+
+/** Helper to render a {status, body} HandlerResult through `res`. */
+function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
+  const headers = { 'content-type': 'application/json', ...(result.headers ?? {}) };
+  res.writeHead(result.status, headers);
+  res.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body));
+}
+
+// Shared deps for groups-action-helpers — both the browser
+// `/api/groups/*` routes and (PR2 C6) the HMAC-gated `/__daemon/groups/*`
+// routes use these helpers so response shapes / cascade-close semantics
+// stay identical.
+const groupsActionDeps: GroupsActionDeps = {
+  registryList: () => registry.list(),
+  registryGetByAppId: (id) => registry.getByAppId(id),
+  proxyToDaemon,
+  closeSessionsMatching,
+};
+
+// ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
+// HMAC + loopback + ts ±60s + nonce TTL, signed-request envelope = full
+// (ts, nonce, method, pathWithQuery, sha256(body)). Reuses `.dashboard-secret`
+// for the HMAC key — the same secret `/__cli/rotate` already uses — but the
+// signing material is wider so a `/__cli/rotate` signature cannot be replayed
+// here and vice versa (different protocols, same secret, no cross-replay).
+//
+// SECRET fail-closed: `loadOrCreateSecret()` returns a 32-byte base64url
+// string and never empty; we still guard below at server-startup time.
+if (!SECRET || SECRET.length === 0) {
+  logger.error('[dashboard] SECRET is empty — refusing to mount /__daemon/* dispatcher');
+  process.exit(1);
+}
+
+const daemonInternalApi = createDaemonInternalApi({
+  secret: SECRET,
+  getSessions: () => aggregator.getSessions(),
+  getSchedules: () => aggregator.getSchedules(),
+  resolveDashboardSettings,
+  buildGroupsMatrix,
+  settingsApplierDeps: settingsWriteApplierDeps,
+  groupsActionDeps,
+  workflowsActionDeps: defaultWorkflowsActionDeps<RunSnapshotDTO>({
+    runsDir: getRunsDir(),
+    proxyToDaemon,
+    listRuns: listRunsImpl,
+    readRunSnapshot: readRunSnapshotImpl,
+    scrubSnapshotForUnauthed: scrubSnapshotImpl,
+    TERMINAL_RUN_STATUSES: TERMINAL_RUN_STATUSES_IMPL,
+    isValidRunId: isValidRunIdImpl,
+  }),
+  proxyToDaemon,
+  ownerOf: (sid) => aggregator.ownerOf(sid),
+  scheduleOwnerOf: (id) => aggregator.scheduleOwnerOf(id),
+  scheduleExists: (id) => aggregator.scheduleExists(id),
+  sessionExists: (sessionId) => aggregator.sessionExists(sessionId),
+});
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -517,6 +619,71 @@ async function createLifecycleGroupForWebhook(
 }
 
 /**
+ * Build the per-(chat × bot) coverage matrix shared by `GET /api/groups`
+ * (browser) and `GET /__daemon/groups-matrix` (Route B). Pure aggregation,
+ * always returns the raw (unscrubbed) view — the browser route applies its
+ * `redactGroupsForPublic` scrub on top when the caller is unauthed.
+ */
+async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
+  const out = new Map<string, any>();
+  const cliIds = configuredCliIds();
+  const onlineBots = [...registry.list()]
+    .map(b => withConfiguredCliId(b, cliIds))
+    .sort((a, b) => a.botIndex - b.botIndex);
+  await Promise.all(onlineBots.map(async d => {
+    try {
+      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
+      if (!r.ok) return;
+      const j = await r.json() as { chats?: any[] };
+      for (const c of j.chats ?? []) {
+        const { oncallChat, firstSeenAt, hasRole, observedBotNames, ...chatBase } = c;
+        const cur = out.get(c.chatId) ?? {
+          ...chatBase,
+          memberBots: [] as any[],
+          _firstSeenAt: null as number | null,
+          observedBotNames: [] as string[],
+        };
+        if (Array.isArray(observedBotNames) && observedBotNames.length > 0) {
+          cur.observedBotNames = [...new Set([...(cur.observedBotNames ?? []), ...observedBotNames])];
+        }
+        cur.memberBots.push({
+          larkAppId: d.larkAppId,
+          botName: d.botName,
+          cliId: d.cliId,
+          inChat: true,
+          oncallChat: oncallChat ?? null,
+          hasRole: hasRole ?? false,
+        });
+        if (typeof firstSeenAt === 'number') {
+          cur._firstSeenAt = cur._firstSeenAt === null
+            ? firstSeenAt
+            : Math.min(cur._firstSeenAt, firstSeenAt);
+        }
+        out.set(c.chatId, cur);
+      }
+    } catch { /* skip offline daemons silently — best-effort */ }
+  }));
+  for (const c of out.values()) {
+    const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
+    for (const b of onlineBots) {
+      if (!present.has(b.larkAppId)) {
+        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
+      }
+    }
+  }
+  const chats = [...out.values()]
+    .sort((a, b) => {
+      const ta = a._firstSeenAt ?? 0;
+      const tb = b._firstSeenAt ?? 0;
+      if (tb !== ta) return tb - ta;
+      return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
+    })
+    .map(({ _firstSeenAt, ...rest }) => rest);
+  const bots = onlineBots.map(botSummaryPayload);
+  return { chats, bots };
+}
+
+/**
  * Close every active session matching `pred` by routing to its owning daemon.
  * Used after disband (close all sessions in chat) and leave (close only the
  * leaving bot's sessions in chat) so the UI doesn't end up with zombie workers
@@ -748,6 +915,17 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Route B: daemon internal API (`/__daemon/*`) — HMAC + loopback,
+    // mounted BEFORE the browser cookie/token gate because this protocol is
+    // entirely self-contained (the daemon caller has the shared secret and
+    // the signing-envelope already binds method/path/body to the timestamp).
+    // Letting the auth gate touch these paths would be wrong: there is no
+    // cookie or token to set/check; the gate would either 401 the daemon
+    // (false negative) or grant cross-protocol access (false positive).
+    if (await daemonInternalApi.handle(req, res, url)) {
+      return;
+    }
+
     // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
     // token, invalidating any previously-issued link.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
@@ -860,6 +1038,54 @@ const server = createServer(async (req, res) => {
       });
       return jsonRes(res, 200, { sessions });
     }
+    if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
+      let body: { olderThanHours?: unknown; sessionIds?: unknown };
+      try {
+        body = await readJsonBody(req) as { olderThanHours?: unknown; sessionIds?: unknown };
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
+      if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
+
+      // WYSIWYG: the UI scopes cleanup to the rows currently visible under the
+      // page filters and sends their sessionIds, so the closed set matches the
+      // confirmed count. We still hand the scoped rows to cleanupIdleSessions,
+      // which re-validates each is a genuine idle candidate — a stale/forged id
+      // can never close a non-idle session. Omitting sessionIds (e.g. an older
+      // client) falls back to a deployment-wide sweep. Cap the id set so a giant
+      // body can't blow up the Set build.
+      const idScope = Array.isArray(body?.sessionIds)
+        ? new Set((body.sessionIds as unknown[]).slice(0, 10000).map(String))
+        : null;
+      const rows = aggregator.getSessions();
+      const scoped = idScope ? rows.filter(s => idScope.has(s.sessionId)) : rows;
+
+      const result = await cleanupIdleSessions(scoped, olderThanHours, async s => {
+        try {
+          const upstream = await proxyToDaemon(
+            s.larkAppId as string,
+            `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
+            { method: 'POST' },
+          );
+          const text = await upstream.text();
+          let parsed: any = null;
+          try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+          // The daemon close route always replies 200 {ok:true}; treat anything
+          // else (incl. an unparseable/missing body) as a failure rather than a
+          // silent success.
+          const ok = upstream.ok && parsed?.ok === true;
+          return {
+            sessionId: s.sessionId,
+            ok,
+            error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
+          };
+        } catch (e: any) {
+          return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };
+        }
+      });
+      return jsonRes(res, 200, result);
+    }
     if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
       const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
       // Per-daemon timeout + isolate failures: an upstream insight parse can be
@@ -907,66 +1133,9 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const body = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
-      const patch: DashboardGlobalConfig = {};
-      if ('publicReadOnly' in body) {
-        if (typeof body.publicReadOnly !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_publicReadOnly' });
-        patch.publicReadOnly = body.publicReadOnly;
-      }
-      if ('openTerminalInFeishu' in body) {
-        if (typeof body.openTerminalInFeishu !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_openTerminalInFeishu' });
-        patch.openTerminalInFeishu = body.openTerminalInFeishu;
-      }
-      let touched = false;
-      if (Object.keys(patch).length > 0) { mergeDashboardConfig(patch); touched = true; }
-      if ('repoPickerMode' in body) {
-        const v = body.repoPickerMode;
-        if (v !== 'all' && v !== 'repos') return jsonRes(res, 400, { ok: false, error: 'invalid_repoPickerMode' });
-        mergeGlobalConfig({ repoPickerMode: v });
-        touched = true;
-      }
-      if ('whiteboard' in body) {
-        const raw = body.whiteboard;
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return jsonRes(res, 400, { ok: false, error: 'invalid_whiteboard' });
-        const wb = raw as Record<string, unknown>;
-        if (typeof wb.enabled !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_whiteboard_enabled' });
-        mergeGlobalConfig({ whiteboard: { enabled: wb.enabled } });
-        touched = true;
-      }
-      if ('maintenance' in body) {
-        const r = parseMaintenancePatch(body.maintenance);
-        if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.error });
-        // Auto-update is npm-global only; refuse enabling it on a source checkout.
-        if (r.patch.autoUpdate?.enabled && isLocalDevInstall()) {
-          return jsonRes(res, 400, { ok: false, error: 'local_dev_no_autoupdate' });
-        }
-        // Auto-restart only applies an auto-update — it's meaningless without it.
-        // Refuse enabling auto-restart unless auto-update is (or is being) on.
-        if (r.patch.autoRestart?.enabled) {
-          const autoUpdateOn = r.patch.autoUpdate?.enabled
-            ?? readGlobalConfig().maintenance?.autoUpdate?.enabled
-            ?? false;
-          if (!autoUpdateOn) return jsonRes(res, 400, { ok: false, error: 'autoupdate_required' });
-        }
-        mergeMaintenanceConfig(r.patch);
-        touched = true;
-      }
-      if ('lang' in body) {
-        // Global UI locale — single source of truth shared with `botmux lang`
-        // and the Feishu cards. Persist to ~/.botmux/config.json, then fan out
-        // to every online daemon over the same IPC bus the per-bot config
-        // writes use, so running cards switch language live (no restart).
-        const v = body.lang;
-        if (v === null) setGlobalLocale(null);
-        else if (isLocale(v)) setGlobalLocale(v);
-        else return jsonRes(res, 400, { ok: false, error: 'invalid_lang' });
-        await Promise.all(registry.list().map(d =>
-          fetch(`http://127.0.0.1:${d.ipcPort}/api/locale/reload`, { method: 'POST' }).catch(() => undefined),
-        ));
-        touched = true;
-      }
-      if (!touched) return jsonRes(res, 400, { ok: false, error: 'empty_patch' });
-      return jsonRes(res, 200, { ok: true, settings: resolveDashboardSettings() });
+      const result = await applySettingsWrite(parsed, settingsWriteApplierDeps);
+      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.error });
+      return jsonRes(res, 200, { ok: true, settings: result.settings });
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────
@@ -1288,7 +1457,7 @@ const server = createServer(async (req, res) => {
     }
 
     let m: RegExpMatchArray | null;
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -1441,74 +1610,14 @@ const server = createServer(async (req, res) => {
     // ─── Groups (Phase B) ────────────────────────────────────────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/groups') {
-      // Fan out: each online daemon returns the chats its bot is in.
-      // Merge by chatId; populate memberBots with inChat flags for every configured bot.
-      const out = new Map<string, any>();
-      // Sort by botIndex so the matrix columns + the create-group bot picker
-      // both match the order in bots.json (fs.readdir order is unstable).
-      const cliIds = configuredCliIds();
-      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
-      await Promise.all(onlineBots.map(async d => {
-        try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
-          if (!r.ok) return;
-          const j = await r.json() as { chats?: any[] };
-          for (const c of j.chats ?? []) {
-            // Strip per-bot fields from chat-level so the merged record stays
-            // bot-agnostic. oncallChat lives inside memberBots; firstSeenAt is
-            // accumulated as the earliest observation across all bots.
-            const { oncallChat, firstSeenAt, hasRole, observedBotNames, ...chatBase } = c;
-            const cur = out.get(c.chatId) ?? { ...chatBase, memberBots: [] as any[], _firstSeenAt: null as number | null, observedBotNames: [] as string[] };
-            // /introduce 记录按观察者（bot）分文件——跨 daemon 取并集（按名字去重）
-            if (Array.isArray(observedBotNames) && observedBotNames.length) {
-              cur.observedBotNames = [...new Set([...(cur.observedBotNames ?? []), ...observedBotNames])];
-            }
-            cur.memberBots.push({
-              larkAppId: d.larkAppId,
-              botName: d.botName,
-              cliId: d.cliId,
-              inChat: true,
-              oncallChat: oncallChat ?? null,
-              hasRole: hasRole ?? false,
-            });
-            if (typeof firstSeenAt === 'number') {
-              cur._firstSeenAt = cur._firstSeenAt === null
-                ? firstSeenAt
-                : Math.min(cur._firstSeenAt, firstSeenAt);
-            }
-            out.set(c.chatId, cur);
-          }
-        } catch { /* skip offline daemons silently — best-effort */ }
-      }));
-      // Fill in inChat:false slots for bots NOT returned for a given chat (matrix view)
-      for (const c of out.values()) {
-        const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
-        for (const b of onlineBots) {
-          if (!present.has(b.larkAppId)) {
-            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
-          }
-        }
-      }
-      // Sort newest-first by client-side firstSeenAt (Lark exposes no chat
-      // create_time, so daemon stamps timestamps the first time it lists each
-      // chat). Tie-break by name asc so chats backfilled in the same listChats
-      // pass — typically every chat on first deploy — get a stable order.
-      const sorted = [...out.values()]
-        .sort((a, b) => {
-          const ta = a._firstSeenAt ?? 0;
-          const tb = b._firstSeenAt ?? 0;
-          if (tb !== ta) return tb - ta;
-          return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
-        })
-        .map(({ _firstSeenAt, ...rest }) => rest);
-      // Public-read carve-out: oncall bindings carry workingDir (repo/customer
-      // paths). The read-only board only needs chat/bot names; the oncall
-      // editor that consumes oncallChat is authed-only. Strip for anon so the
-      // bound dirs don't leak via /api/groups (mirrors the /api/schedules
-      // prompt strip + keeps /api/bots oncall removal honest).
+      // Fan out via the shared `buildGroupsMatrix` helper so the browser
+      // route and the Route B `/__daemon/groups-matrix` endpoint return the
+      // same matrix shape. Public-read carve-out: oncall bindings carry
+      // workingDir (repo/customer paths) so we scrub when unauthed.
+      const matrix = await buildGroupsMatrix();
       return jsonRes(res, 200, {
-        chats: authed ? sorted : redactGroupsForPublic(sorted),
-        bots: onlineBots.map(botSummaryPayload),
+        chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
+        bots: matrix.bots,
       });
     }
 
@@ -1682,45 +1791,19 @@ const server = createServer(async (req, res) => {
     let m2: RegExpMatchArray | null;
     if (req.method === 'POST' && (m2 = url.pathname.match(/^\/api\/groups\/([^/]+)\/add-bots$/))) {
       const chatId = decodeURIComponent(m2[1]);
-      // Read body once; we'll forward it to the proxy daemon
-      let raw: string;
-      try {
-        const chunks: Buffer[] = [];
-        for await (const c of req) chunks.push(c as Buffer);
-        raw = Buffer.concat(chunks).toString('utf8') || '{}';
-        JSON.parse(raw); // validate is JSON
-      } catch {
-        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
-      }
-      // Find a daemon whose bot is already in this chat
-      let proxy: { larkAppId: string; ipcPort: number } | undefined;
-      for (const d of registry.list()) {
-        try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups/${encodeURIComponent(chatId)}/membership`);
-          if (!r.ok) continue;
-          const j = await r.json() as { inChat?: boolean };
-          if (j.inChat) { proxy = d; break; }
-        } catch { /* skip */ }
-      }
-      if (!proxy) return jsonRes(res, 200, { ok: false, error: 'no_proxy_bot' });
-      const upstream = await fetch(
-        `http://127.0.0.1:${proxy.ipcPort}/api/groups/${encodeURIComponent(chatId)}/add-bots`,
-        { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw },
-      );
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const result = await addBotsToGroup(chatId, raw, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
     // Disband a chat. Body: `{ larkAppId }` — the bot whose daemon should
-    // perform the delete. Disband only succeeds when that bot is currently
-    // the chat owner (or creator with operate_as_owner scope, which botmux
-    // doesn't request by default), so the frontend is responsible for picking
-    // a viable bot. The route just proxies and surfaces Lark's error verbatim.
+    // perform the delete. See `dashboard/groups-action-helpers.ts:disbandGroup`.
     let mDisband: RegExpMatchArray | null;
     if (req.method === 'POST' && (mDisband = url.pathname.match(/^\/api\/groups\/([^/]+)\/disband$/))) {
       const chatId = decodeURIComponent(mDisband[1]);
-      let parsed: { larkAppId?: unknown };
+      let parsed: unknown;
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -1728,34 +1811,17 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const appId = typeof parsed.larkAppId === 'string' ? parsed.larkAppId : '';
-      if (!appId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
-      const upstream = await proxyToDaemon(
-        appId, `/api/groups/${encodeURIComponent(chatId)}/disband`,
-        { method: 'POST' },
-      );
-      const upstreamText = await upstream.text();
-      let upstreamJson: any = null;
-      try { upstreamJson = JSON.parse(upstreamText); } catch { /* tolerate */ }
-      // On successful disband, the chat is gone for everyone — every bot's
-      // session in this chat becomes a zombie (worker still alive, can't post).
-      // Close them all so the UI / Sessions list don't keep them as active.
-      let closedSessions: any[] = [];
-      if (upstreamJson?.ok) {
-        closedSessions = await closeSessionsMatching(s => s.chatId === chatId);
-      }
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ...(upstreamJson ?? {}), closedSessions }));
-      return;
+      const result = await disbandGroup(chatId, parsed, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
-    // Make selected bots leave a chat. Body: `{ larkAppIds: string[] }`.  Each
-    // bot is removed via its own daemon (Lark allows self-removal under any
-    // role). Per-bot results returned so the UI can show partial successes.
+    // Make selected bots leave a chat. Body: `{ larkAppIds: string[] }`. See
+    // `dashboard/groups-action-helpers.ts:leaveGroup` for membership probe +
+    // cascade-close semantics.
     let mLeave: RegExpMatchArray | null;
     if (req.method === 'POST' && (mLeave = url.pathname.match(/^\/api\/groups\/([^/]+)\/leave$/))) {
       const chatId = decodeURIComponent(mLeave[1]);
-      let parsed: { larkAppIds?: unknown };
+      let parsed: unknown;
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -1763,53 +1829,13 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const ids = Array.isArray(parsed.larkAppIds)
-        ? (parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-      if (ids.length === 0) return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
-      // Re-check membership on the daemon side before issuing leave — UI cache
-      // can be stale, and Lark's bot-self-remove returns a confusing error if
-      // the bot isn't actually in the chat. Skipping such bots up-front keeps
-      // the per-bot result useful (`not_in_chat`) instead of a vague API error.
-      const result = await Promise.all(ids.map(async appId => {
-        const d = registry.getByAppId(appId);
-        if (!d) return { larkAppId: appId, ok: false, error: 'daemon_offline' };
-        try {
-          const memRes = await fetch(
-            `http://127.0.0.1:${d.ipcPort}/api/groups/${encodeURIComponent(chatId)}/membership`,
-          );
-          const memJson = await memRes.json() as { inChat?: boolean };
-          if (!memJson.inChat) return { larkAppId: appId, ok: false, error: 'not_in_chat' };
-        } catch (e: any) {
-          return { larkAppId: appId, ok: false, error: `membership_check_failed: ${e?.message ?? e}` };
-        }
-        const upstream = await proxyToDaemon(
-          appId, `/api/groups/${encodeURIComponent(chatId)}/leave`,
-          { method: 'POST' },
-        );
-        const text = await upstream.text();
-        let body: any = null;
-        try { body = JSON.parse(text); } catch { /* tolerate */ }
-        // On successful leave, the leaving bot can no longer post into the
-        // chat — its sessions there are stranded. Close only THIS bot's
-        // sessions for THIS chat (other bots may still be in the chat with
-        // their own active sessions).
-        const closedSessions = body?.ok
-          ? await closeSessionsMatching(s => s.chatId === chatId && s.larkAppId === appId)
-          : [];
-        return {
-          larkAppId: appId,
-          ok: !!body?.ok,
-          error: body?.ok ? undefined : (body?.error ?? `http_${upstream.status}`),
-          closedSessions,
-        };
-      }));
-      return jsonRes(res, 200, { result });
+      const result = await leaveGroup(chatId, parsed, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
     // ─── Oncall bindings (per chat × bot) ────────────────────────────────────
-    // PUT /api/groups/:chatId/oncall/:larkAppId    body: {workingDir}
-    // DELETE /api/groups/:chatId/oncall/:larkAppId
+    // External: PUT/DELETE /api/groups/:chatId/oncall/:larkAppId
+    // Internal: PUT/DELETE /api/oncall/:chatId (on the named bot's daemon).
     let mOncall: RegExpMatchArray | null;
     if ((mOncall = url.pathname.match(/^\/api\/groups\/([^/]+)\/oncall\/([^/]+)$/))) {
       const chatId = decodeURIComponent(mOncall[1]);
@@ -1817,23 +1843,13 @@ const server = createServer(async (req, res) => {
       if (req.method === 'PUT') {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
-        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-        const upstream = await proxyToDaemon(
-          appId, `/api/oncall/${encodeURIComponent(chatId)}`,
-          { method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw },
-        );
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
+        const raw = Buffer.concat(chunks).toString('utf8');
+        const result = await bindOncall(chatId, appId, raw, groupsActionDeps);
+        return writeHandlerResult(res, result);
       }
       if (req.method === 'DELETE') {
-        const upstream = await proxyToDaemon(
-          appId, `/api/oncall/${encodeURIComponent(chatId)}`,
-          { method: 'DELETE' },
-        );
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
+        const result = await unbindOncall(chatId, appId, groupsActionDeps);
+        return writeHandlerResult(res, result);
       }
     }
 
@@ -2003,7 +2019,8 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
-    // any subset of `{ restrictGrantCommands?: boolean, messageQuotaDefaultLimit?: number|null }`.
+    // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
+    // messageQuotaDefaultLimit?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
       const appId = decodeURIComponent(mBotGrantPrefs[1]);
@@ -2131,6 +2148,128 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Dashboard「创建会话」：建飞书群 + 拉选中的 bot，然后按协作模式给各 bot 拉起/暂存
+    // 一条 chat-scope 会话。一起开工=每个被选 bot 各起一条；lead 分配=只起 lead，由它
+    // 在群里 @ 拉起 sub bot。in_progress=立即开跑；backlog=入待办池（parked，等激活）。
+    if (req.method === 'POST' && url.pathname === '/api/sessions/create') {
+      let parsed: {
+        content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
+        leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown;
+      };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const content = typeof parsed.content === 'string' ? parsed.content.replace(/\s+$/u, '') : '';
+      if (!content.trim()) return jsonRes(res, 400, { ok: false, error: 'empty_content' });
+      const selectedIds = Array.isArray(parsed.larkAppIds)
+        ? Array.from(new Set((parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')))
+        : [];
+      if (selectedIds.length === 0) return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
+      const mode = parsed.mode === 'lead' ? 'lead' : parsed.mode === 'all' ? 'all' : null;
+      if (!mode) return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+      const column = parsed.column === 'backlog' ? 'backlog' : parsed.column === 'in_progress' ? 'in_progress' : null;
+      if (!column) return jsonRes(res, 400, { ok: false, error: 'bad_column' });
+      const bindWorkingDir = typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
+        ? parsed.bindWorkingDir.trim() : undefined;
+      const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim().slice(0, 60) : undefined;
+
+      // 解析 creator：lead 模式 = lead bot；一起开工 = pickCreatorForGroup 在选中里挑一个在线的。
+      let creatorLarkAppId: string;
+      if (mode === 'lead') {
+        const leadLarkAppId = typeof parsed.leadLarkAppId === 'string' ? parsed.leadLarkAppId : '';
+        if (!leadLarkAppId || !selectedIds.includes(leadLarkAppId)) {
+          return jsonRes(res, 400, { ok: false, error: 'bad_lead' });
+        }
+        if (!registry.getByAppId(leadLarkAppId)) return jsonRes(res, 503, { ok: false, error: 'lead_offline' });
+        creatorLarkAppId = leadLarkAppId;
+      } else {
+        const pick = pickCreatorForGroup(selectedIds, (id) => {
+          const d = registry.getByAppId(id);
+          return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
+        });
+        if (!pick) return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
+        creatorLarkAppId = pick.creatorLarkAppId;
+      }
+
+      // creator 作用域里的操作者 open_id（首个 ou_ allowedUser）——用于邀请进群 + 转群主 + @通知。
+      // 同时取 on_（union_id，租户内跨 app 稳定）做兜底邀请：lead 模式强制 creator=lead，
+      // 万一 lead 的 allowlist 没有 ou_ 条目，open_id 解析不到、操作者就进不了群——union_id
+      // 不受 app 作用域影响，仍能把人拉进来（createGroupWithBots 走 ownerUnionIds 通道）。
+      const creatorDesc = registry.getByAppId(creatorLarkAppId)!;
+      const allowed = creatorDesc.resolvedAllowedUsers ?? [];
+      const userOpenId = allowed.find(u => u.startsWith('ou_'));
+      const ownerUnionIds = allowed.filter(u => u.startsWith('on_'));
+
+      // 建群（拉所有选中 bot + 邀请操作者 + 转群主 + @通知 + 可选绑 oncall 工作目录）。
+      let groupResp: any = null;
+      try {
+        const groupUpstream = await proxyToDaemon(creatorLarkAppId, '/api/groups/create', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            larkAppIds: selectedIds,
+            userOpenIds: userOpenId ? [userOpenId] : [],
+            ownerUnionIds,
+            transferOwnerTo: userOpenId,
+            notifyOwnerOpenId: userOpenId,
+            bindWorkingDir,
+          }),
+        });
+        groupResp = await groupUpstream.json().catch(() => null);
+        if (!groupUpstream.ok || !groupResp?.ok || typeof groupResp.chatId !== 'string') {
+          return jsonRes(res, 502, { ok: false, error: groupResp?.error ?? `group_create_http_${groupUpstream.status}` });
+        }
+      } catch {
+        return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
+      }
+      const chatId: string = groupResp.chatId;
+      const invalidBotIds: string[] = Array.isArray(groupResp.invalidBotIds) ? groupResp.invalidBotIds : [];
+
+      // spawn 目标：lead 模式只有 lead；一起开工是所有成功入群的选中 bot。
+      const joinedIds = selectedIds.filter(id => !invalidBotIds.includes(id) && !!registry.getByAppId(id));
+      const targets = mode === 'lead'
+        ? (joinedIds.includes(creatorLarkAppId) ? [creatorLarkAppId] : [])
+        : joinedIds;
+      if (targets.length === 0) {
+        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target' });
+      }
+
+      const bots = liveBots();
+      const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
+      const spawned: string[] = [];
+      const failed: Array<{ larkAppId: string; error: string }> = [];
+      await Promise.all(targets.map(async (appId) => {
+        const role = mode === 'lead' ? 'lead' : (targets.length > 1 ? 'collab' : 'solo');
+        // lead 的 coworker = 所有 sub（除自己）；collab 的 coworker = 其它并列 bot（除自己）。
+        const coworkerIds = (mode === 'lead' ? selectedIds : targets).filter(id => id !== appId);
+        const coworkers = coworkerIds.map(id => ({ name: nameOf(id) }));
+        try {
+          const up = await proxyToDaemon(appId, '/api/sessions/spawn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              chatId, content, column, role, coworkers,
+              postBanner: appId === creatorLarkAppId,
+            }),
+          });
+          const b = await up.json().catch(() => null);
+          if (up.ok && b?.ok) spawned.push(appId);
+          else failed.push({ larkAppId: appId, error: b?.error ?? `http_${up.status}` });
+        } catch (e: any) {
+          failed.push({ larkAppId: appId, error: e?.message ?? String(e) });
+        }
+      }));
+
+      return jsonRes(res, 200, {
+        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed,
+      });
+    }
+
     // Public SSE — relays aggregator's listener events
     if (req.method === 'GET' && url.pathname === '/events') {
       res.writeHead(200, {
@@ -2186,6 +2325,7 @@ listenWithProbe({
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  startPlatformTunnelIfBound();
 }).catch((err) => {
   logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
   process.exit(1);
@@ -2202,11 +2342,40 @@ const federationSync = setInterval(() => {
 }, 2 * 60 * 1000);
 federationSync.unref();
 
+// 中心化平台隧道（已绑定才启动；每台机器一个，跑在 dashboard 进程里）
+let platformTunnel: { stop(): void } | null = null;
+function readBotmuxVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dirname(__dirname), 'package.json'), 'utf8'));
+    return pkg.version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+function startPlatformTunnelIfBound(): void {
+  try {
+    const binding = readPlatformBinding();
+    if (!binding) return;
+    const version = readBotmuxVersion();
+    platformTunnel = startPlatformTunnelClient({
+      binding,
+      getDashboardPort: () => boundDashboardPort,
+      getDashboardToken: () => activeToken,
+      getVersion: () => version,
+      log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
+    });
+    logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);
+  } catch (e) {
+    logger.warn(`[platform-tunnel] 启动失败: ${(e as Error).message}`);
+  }
+}
+
 // Graceful shutdown
 function shutdown(): void {
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();
+  platformTunnel?.stop();
   server.close(() => process.exit(0));
   // Hard-exit fallback after 5s
   setTimeout(() => process.exit(0), 5_000).unref();

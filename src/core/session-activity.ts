@@ -51,6 +51,13 @@ export function clearAgentAttention(ds: DaemonSession): boolean {
   return true;
 }
 
+export function announceSessionRow(ds: DaemonSession): void {
+  dashboardEventBus.publish({
+    type: 'session.spawned',
+    body: { session: composeRowFromActive(ds) },
+  });
+}
+
 /** Announce a repo-selection-pending session to dashboard SSE subscribers.
  *
  *  `session.spawned` is normally published when the worker process spawns —
@@ -62,8 +69,5 @@ export function clearAgentAttention(ds: DaemonSession): boolean {
  *  the non-pending branch is announced by the real spawn moments later. */
 export function announcePendingRepoSession(ds: DaemonSession): void {
   if (!ds.pendingRepo) return;
-  dashboardEventBus.publish({
-    type: 'session.spawned',
-    body: { session: composeRowFromActive(ds) },
-  });
+  announceSessionRow(ds);
 }

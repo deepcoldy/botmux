@@ -3,6 +3,12 @@ import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
+import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
+
+// Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
+// pipe (log streaming detaches, God daemon restart) would otherwise emit an
+// unhandled 'error' and crash the daemon, which has no uncaughtException trap.
+installStdioEpipeGuard();
 
 // Legacy: load .env for global settings (WEB_HOST, WEB_EXTERNAL_HOST, etc.)
 // Bot config now lives in bots.json; this is kept for backward compatibility.

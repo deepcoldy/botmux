@@ -21,7 +21,7 @@ import type {
   TurnPromptPreview,
   InsightConversationMessage,
 } from '../../services/insight/types.js';
-import { botDisplayName, escapeHtml, loadNameMaps, relTime, stripMentionPrefix, t } from './ui.js';
+import { botDisplayName, escapeHtml, loadNameMaps, relTime, t } from './ui.js';
 import MarkdownIt from 'markdown-it';
 
 type InsightFilter = 'all' | 'review' | 'failed' | 'slow';
@@ -61,7 +61,12 @@ function safeStatus(report: SafeInsightReport | null, error?: string): string {
 }
 
 function sessionTitle(s: Record<string, any>): string {
-  return stripMentionPrefix(s.title ?? s.firstUserMessage ?? s.rootMessageId ?? s.sessionId);
+  // Strip the leading @mention(s), then fall back to the id when nothing
+  // readable remains — e.g. a title of just "@Gpt" or a blank/whitespace one.
+  // (stripMentionPrefix returns the raw string when stripping empties it, so we
+  // inline the strip here to detect the truly-empty case and fall back.)
+  const stripped = String(s.title ?? '').replace(/^(?:@\S+\s*)+/, '').trim();
+  return stripped || String(s.sessionId ?? '');
 }
 
 function severityLabel(sev: InsightSeverity): string {
@@ -148,11 +153,15 @@ function toRecord(s: SafeInsightOverviewSession): InsightRecord {
   };
 }
 
-function filterRecords(records: InsightRecord[], filter: InsightFilter, q: string, cliSel: Set<string> = new Set()): InsightRecord[] {
+type ScopeOpts = { project?: string; sinceMs?: number; analyzableOnly?: boolean };
+function filterRecords(records: InsightRecord[], filter: InsightFilter, q: string, cliSel: Set<string> = new Set(), scope: ScopeOpts = {}): InsightRecord[] {
   const query = q.trim().toLowerCase();
   return records.filter(rec => {
     const s = rec.session;
     const r = rec.report;
+    if (scope.analyzableOnly && r?.status !== 'ok') return false;
+    if (scope.project && projectOf(rec) !== scope.project) return false;
+    if (scope.sinceMs && Number(s.lastMessageAt ?? s.spawnedAt ?? 0) < scope.sinceMs) return false;
     if (cliSel.size && !cliSel.has(cliIdOf(rec))) return false;
     if (filter === 'review' && !reportNeedsReview(r)) return false;
     if (filter === 'failed' && !(r?.status === 'ok' && r.agg.failedSpans > 0)) return false;
@@ -189,16 +198,6 @@ function renderCliChips(records: InsightRecord[], active: Set<string>): string {
     `<button type="button" class="spanchip${on ? ' on' : ''}" data-clifilter="${escapeHtml(key)}">${escapeHtml(label)} <b>${n}</b></button>`;
   return [chip('all', t('common.all'), records.length, active.size === 0),
     ...counts.map(c => chip(c.id, c.id, c.count, active.has(c.id)))].join('');
-}
-
-function sortRecords(records: InsightRecord[]): InsightRecord[] {
-  return [...records].sort((a, b) => {
-    const ar = a.report;
-    const br = b.report;
-    const aScore = (ar?.status === 'ok' ? ar.agg.failedSpans * 6 + ar.agg.slowSpans * 3 + ar.suggestions.filter(s => s.severity === 'bad').length * 5 : 0);
-    const bScore = (br?.status === 'ok' ? br.agg.failedSpans * 6 + br.agg.slowSpans * 3 + br.suggestions.filter(s => s.severity === 'bad').length * 5 : 0);
-    return bScore - aScore || Number(b.session.lastMessageAt ?? 0) - Number(a.session.lastMessageAt ?? 0);
-  });
 }
 
 function renderMetric(label: string, value: string, sub = ''): string {
@@ -238,8 +237,6 @@ function aggregateRecords(records: InsightRecord[]): DerivedOverview {
     subagentCostShare: null,
   };
   let analyzed = 0;
-  let rwSum = 0;
-  let rwN = 0;
   const suggMap = new Map<string, SafeInsightOverviewSuggestion>();
   for (const rec of records) {
     const r = rec.report;
@@ -260,17 +257,18 @@ function aggregateRecords(records: InsightRecord[]): DerivedOverview {
         agg.phase[ph].ms += pv.ms;
       }
     }
-    if (a.readWriteRatio !== null && Number.isFinite(a.readWriteRatio)) {
-      rwSum += a.readWriteRatio;
-      rwN += 1;
-    }
     for (const s of r.suggestions ?? []) {
       const e = suggMap.get(s.id);
       if (e) e.count += 1;
       else suggMap.set(s.id, { id: s.id, title: s.title, severity: s.severity, count: 1, evidence: s.evidence ?? [], action: s.action });
     }
   }
-  agg.readWriteRatio = rwN ? Number((rwSum / rwN).toFixed(2)) : null;
+  // Pooled read:write (Σreads / Σwrites), consistent with the pooled totals on the
+  // same metric row (spans/failed/slow). A mean of per-session ratios would let a
+  // tiny 2-read/1-write session skew the headline as much as a 300/100 one.
+  agg.readWriteRatio = agg.phase.edit.count > 0
+    ? Number((agg.phase.research.count / agg.phase.edit.count).toFixed(2))
+    : null;
   const topFailedTools = Object.entries(agg.failByTool)
     .map(([tool, count]) => ({ tool, count }))
     .sort((x, y) => y.count - x.count)
@@ -280,6 +278,12 @@ function aggregateRecords(records: InsightRecord[]): DerivedOverview {
 
 // Overview metrics + recommendations for the CURRENTLY VISIBLE (filtered) records,
 // so the summary tracks the active filter rather than staying global.
+// Cross-tool measurement caveat (Codex reads via shell aren't counted as 'read', etc.) —
+// shown under the overview & distribution so ratios/distributions aren't misread.
+function disclosureNote(): string {
+  return `<p class="insight-disclosure">⚖︎ ${escapeHtml(t('insights.disclosure'))}</p>`;
+}
+
 function renderOverview(d: DerivedOverview): string {
   const a = d.agg;
   const rw = a.readWriteRatio === null ? '-' : a.readWriteRatio.toFixed(1);
@@ -315,43 +319,446 @@ function renderOverview(d: DerivedOverview): string {
           }).join('') : `<p class="mut">${escapeHtml(t('insights.noFailures'))}</p>`}
         </div>
       </section>
-    </div>`;
+    </div>
+    ${disclosureNote()}`;
 }
 
-function renderPhaseMix(report: SafeInsightReport): string {
-  const entries = Object.entries(report.agg.phase ?? {}).filter(([, v]) => v.count > 0 || v.ms > 0);
+function phaseMixBar(phase: Record<string, { count: number; ms: number }> | undefined): string {
+  const entries = Object.entries(phase ?? {}).filter(([, v]) => v.count > 0 || v.ms > 0);
   if (!entries.length) return '';
-  return `<div class="mph">${entries.map(([phase, v]) => {
+  return `<div class="mph">${entries.map(([ph, v]) => {
     const weight = Math.max(1, v.ms || v.count);
-    return `<i class="${phaseClass(phase)}" style="flex:${weight}" title="${escapeHtml(`${phaseLabel(phase)} · ${v.count} · ${fmtMs(v.ms)}`)}"></i>`;
+    return `<i class="${phaseClass(ph)}" style="flex:${weight}" title="${escapeHtml(`${phaseLabel(ph)} · ${v.count} · ${fmtMs(v.ms)}`)}"></i>`;
   }).join('')}</div>`;
 }
 
-function renderSessionRows(records: InsightRecord[], selectedId: string | null): string {
+function renderPhaseMix(report: SafeInsightReport): string {
+  return phaseMixBar(report.agg.phase);
+}
+
+// Delegated sub-agents (Claude Task/Agent) as swim-lanes: each shows its type,
+// task, what it did (phase mix) and how long it ran. Renders nothing when none.
+function renderSubagents(report: SafeInsightReport): string {
+  const lanes = report.subagents ?? [];
+  if (!lanes.length) return '';
+  const totMs = lanes.reduce((s, l) => s + l.durationMs, 0);
+  const rows = lanes.map(l => `<div class="sublane${l.failures ? ' bad' : ''}">
+      <div class="sublane-head">
+        <span class="sublane-type">${escapeHtml(l.agentType)}</span>
+        <span class="sublane-task">${escapeHtml(l.task?.text ?? '')}${l.task?.truncated ? '…' : ''}</span>
+      </div>
+      ${phaseMixBar(l.phase)}
+      <div class="sublane-stats">
+        <span>${fmtInt(l.spans)} ${escapeHtml(t('insights.spansShort'))}</span>
+        <span>${escapeHtml(fmtMs(l.durationMs))}</span>
+        ${l.failures ? `<span class="bad">${fmtInt(l.failures)} ${escapeHtml(t('insights.failedShort'))}</span>` : ''}
+      </div>
+    </div>`).join('');
+  return `<section class="block subagent-block">
+    <h3>${escapeHtml(t('insights.subagents'))} <span class="mut">· ${lanes.length} · ${escapeHtml(fmtMs(totMs))}</span></h3>
+    <p class="mut ins-hint">${escapeHtml(t('insights.subagentsHint'))}</p>
+    <div class="sublanes">${rows}</div>
+  </section>`;
+}
+
+// ── Top-level tabs + global filter dimensions (project / time) ──────────────
+type InsightTab = 'overview' | 'sessions' | 'flow' | 'dist' | 'hot';
+const INSIGHT_TABS: Array<{ key: InsightTab; label: string }> = [
+  { key: 'overview', label: 'insights.tabOverview' },
+  { key: 'sessions', label: 'insights.tabSessions' },
+  { key: 'flow', label: 'insights.tabFlow' },
+  { key: 'dist', label: 'insights.tabDist' },
+  { key: 'hot', label: 'insights.tabHot' },
+];
+function renderTabBar(active: InsightTab): string {
+  return `<div class="insight-tabs" role="tablist">${INSIGHT_TABS.map(tb =>
+    `<button type="button" class="itab${tb.key === active ? ' on' : ''}" data-itab="${tb.key}" role="tab" aria-selected="${tb.key === active}">${escapeHtml(t(tb.label))}</button>`,
+  ).join('')}</div>`;
+}
+
+function projectOf(rec: InsightRecord): string {
+  const wd = String(rec.session.workingDir ?? '').replace(/\/+$/, '');
+  if (!wd) return '';
+  return wd.split('/').pop() || wd;
+}
+function projectOptions(records: InsightRecord[]): Array<{ id: string; count: number }> {
+  const m = new Map<string, number>();
+  for (const rec of records) { const p = projectOf(rec); if (p) m.set(p, (m.get(p) ?? 0) + 1); }
+  return [...m.entries()].map(([id, count]) => ({ id, count })).sort((a, b) => b.count - a.count || a.id.localeCompare(b.id));
+}
+const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> = [
+  { key: 'all', label: 'insights.timeAll', days: 0 },
+  { key: '1d', label: 'insights.time1d', days: 1 },
+  { key: '7d', label: 'insights.time7d', days: 7 },
+  { key: '30d', label: 'insights.time30d', days: 30 },
+];
+
+function agentMsOf(r: SafeInsightReport): number {
+  return INSIGHT_PHASES.reduce((sum, ph) => sum + (r.agg.phase?.[ph]?.ms ?? 0), 0);
+}
+function okReports(records: InsightRecord[]): SafeInsightReport[] {
+  return records.map(r => r.report).filter((r): r is SafeInsightReport => !!r && r.status === 'ok');
+}
+function median(values: number[]): number {
+  if (!values.length) return 0;
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+}
+
+// One histogram card. bins is an ordered list of {label, test}; each session value
+// falls into the first matching bin. Reuses the .hbars bar styling.
+function renderHistogram(title: string, values: number[], bins: Array<{ label: string; test: (v: number) => boolean }>, fmtMedian: (n: number) => string = fmtInt, sortKey?: SessSort): string {
+  const counts = bins.map(b => ({ label: b.label, count: values.filter(b.test).length }));
+  const max = Math.max(1, ...counts.map(c => c.count));
+  const total = Math.max(1, values.length);
+  const rows = counts.map(c => {
+    const pct = Math.max(c.count ? 4 : 0, Math.round((c.count / max) * 100));
+    const share = Math.round((c.count / total) * 100);
+    return `<div class="hbrow"><div class="hblabel">${escapeHtml(c.label)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(c.count)}<small>${share}%</small></div></div>`;
+  }).join('');
+  const jump = sortKey ? `<button type="button" class="ihist-jump" data-distsort="${sortKey}">${escapeHtml(t('insights.viewSessions'))} ›</button>` : '';
+  return `<section class="block ihist">
+    <div class="ihist-head"><h3>${escapeHtml(title)}</h3><span class="mut">${escapeHtml(t('insights.distMedian', { v: fmtMedian(median(values)) }))}</span>${jump}</div>
+    <div class="hbars">${rows}</div>
+  </section>`;
+}
+
+// Sessions-per-day over the last 4 weeks (from each record's lastMessageAt) — a quick
+// "how busy lately" trend. Pure client-side, no new engine data.
+function renderTrend(records: InsightRecord[]): string {
+  const DAYS = 28;
+  const dayMs = 86400000;
+  const now = Date.now();
+  const counts = new Array(DAYS).fill(0);
+  for (const rec of records) {
+    const ts = Number(rec.session.lastMessageAt ?? 0);
+    if (!ts) continue;
+    const age = Math.floor((now - ts) / dayMs);
+    if (age >= 0 && age < DAYS) counts[DAYS - 1 - age]++;
+  }
+  const total = counts.reduce((a, b) => a + b, 0);
+  if (!total) return '';
+  const max = Math.max(1, ...counts);
+  // Native title tooltip (date · count). The old data-tip was never wired to a
+  // tooltip host outside the detail body, so it surfaced nothing on hover.
+  const bars = counts.map((c, j) => {
+    const d = new Date(now - (DAYS - 1 - j) * dayMs);
+    const label = `${d.getMonth() + 1}-${d.getDate()} · ${c}`;
+    return `<i class="trendbar" style="height:${c ? Math.max(8, Math.round((c / max) * 100)) : 2}%" title="${escapeHtml(label)}"></i>`;
+  }).join('');
+  return `<section class="block trend-block">
+    <div class="ihist-head"><h3>${escapeHtml(t('insights.distTrend'))}</h3><span class="mut">${escapeHtml(t('insights.distTrendSub'))} · ${total}</span></div>
+    <div class="trend">${bars}</div>
+  </section>`;
+}
+
+function renderDistribution(records: InsightRecord[]): string {
+  const reports = okReports(records);
+  if (!reports.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
+  const churn = reports.map(r => (r.hot?.files ?? []).reduce((s, f) => s + (f.added ?? 0) + (f.removed ?? 0), 0));
+  const spans = reports.map(r => r.agg.totalSpans);
+  const failed = reports.map(r => r.agg.failedSpans);
+  const slow = reports.map(r => r.agg.slowSpans);
+  const agentMin = reports.map(r => agentMsOf(r) / 60000);
+  const rw = reports.map(r => r.agg.readWriteRatio).filter((v): v is number => v !== null && Number.isFinite(v));
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.distHint'))}</p>
+  <div class="ihist-grid">
+    ${renderTrend(records)}
+    ${renderHistogram(t('insights.distSpans'), spans, [
+      { label: '0–10', test: v => v <= 10 },
+      { label: '11–50', test: v => v > 10 && v <= 50 },
+      { label: '51–200', test: v => v > 50 && v <= 200 },
+      { label: '201–500', test: v => v > 200 && v <= 500 },
+      { label: '500+', test: v => v > 500 },
+    ], fmtInt, 'spans')}
+    ${renderHistogram(t('insights.distFailed'), failed, [
+      { label: '0', test: v => v === 0 },
+      { label: '1–2', test: v => v >= 1 && v <= 2 },
+      { label: '3–5', test: v => v >= 3 && v <= 5 },
+      { label: '6–10', test: v => v >= 6 && v <= 10 },
+      { label: '10+', test: v => v > 10 },
+    ], fmtInt, 'fails')}
+    ${renderHistogram(t('insights.distSlow'), slow, [
+      { label: '0', test: v => v === 0 },
+      { label: '1–2', test: v => v >= 1 && v <= 2 },
+      { label: '3–5', test: v => v >= 3 && v <= 5 },
+      { label: '5+', test: v => v > 5 },
+    ], fmtInt, 'slow')}
+    ${renderHistogram(t('insights.distAgentTime'), agentMin, [
+      { label: '<1m', test: v => v < 1 },
+      { label: '1–5m', test: v => v >= 1 && v < 5 },
+      { label: '5–30m', test: v => v >= 5 && v < 30 },
+      { label: '30m–2h', test: v => v >= 30 && v < 120 },
+      { label: '2h+', test: v => v >= 120 },
+    ], n => `${Math.round(n)}m`, 'agent')}
+    ${rw.length ? renderHistogram(t('insights.distRw'), rw, [
+      { label: '0', test: v => v === 0 },
+      { label: '0–1', test: v => v > 0 && v < 1 },
+      { label: '1–3', test: v => v >= 1 && v < 3 },
+      { label: '3+', test: v => v >= 3 },
+    ], n => n.toFixed(1)) : ''}
+    ${renderHistogram(t('insights.distChurn'), churn, [
+      { label: '0', test: v => v === 0 },
+      { label: '1–100', test: v => v > 0 && v <= 100 },
+      { label: '100–1k', test: v => v > 100 && v <= 1000 },
+      { label: '1k–10k', test: v => v > 1000 && v <= 10000 },
+      { label: '10k+', test: v => v > 10000 },
+    ])}
+  </div>
+  ${disclosureNote()}`;
+}
+
+const FLOW_PHASES = ['research', 'edit', 'run', 'delegate', 'discuss'] as const;
+
+// "行为流": where the agent's actions & wall-time land across activity phases,
+// plus each session's phase rhythm. Built from agg.phase (present in summary mode),
+// so it works at the overview level without the (detail-only) turn timeline.
+function renderFlow(records: InsightRecord[]): string {
+  const ok = records.filter(r => r.report && r.report.status === 'ok' && r.report.agg);
+  if (!ok.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
+  const tot: Record<string, { count: number; ms: number }> = {};
+  for (const p of FLOW_PHASES) tot[p] = { count: 0, ms: 0 };
+  for (const rec of ok) for (const p of FLOW_PHASES) {
+    const v = rec.report!.agg.phase?.[p];
+    if (v) { tot[p].count += v.count; tot[p].ms += v.ms; }
+  }
+  const totCount = FLOW_PHASES.reduce((s, p) => s + tot[p].count, 0) || 1;
+  const totMs = FLOW_PHASES.reduce((s, p) => s + tot[p].ms, 0) || 1;
+
+  const nodes = FLOW_PHASES.map((p, i) => {
+    const v = tot[p];
+    const cPct = Math.round((v.count / totCount) * 100);
+    const tPct = Math.round((v.ms / totMs) * 100);
+    const arrow = i < FLOW_PHASES.length - 1 ? '<span class="flow-arrow">→</span>' : '';
+    return `<div class="flow-node"><i class="flow-dot ${phaseClass(p)}"></i>
+      <strong>${escapeHtml(phaseLabel(p))}</strong>
+      <span class="flow-n">${fmtInt(v.count)}<em> · ${cPct}%</em></span>
+      <span class="flow-t">${escapeHtml(fmtMs(v.ms))}<em> · ${tPct}%</em></span></div>${arrow}`;
+  }).join('');
+
+  const bars = FLOW_PHASES.map(p => {
+    const v = tot[p];
+    const cPct = (v.count / totCount) * 100;
+    const tPct = (v.ms / totMs) * 100;
+    return `<div class="flow-brow">
+      <span class="flow-blabel"><i class="${phaseClass(p)}"></i>${escapeHtml(phaseLabel(p))}</span>
+      <span class="flow-btrack"><span class="flow-bfill ${phaseClass(p)}" style="width:${Math.max(2, cPct).toFixed(1)}%"></span><em>${Math.round(cPct)}%</em></span>
+      <span class="flow-btrack"><span class="flow-bfill ${phaseClass(p)}" style="width:${Math.max(2, tPct).toFixed(1)}%"></span><em>${Math.round(tPct)}%</em></span>
+    </div>`;
+  }).join('');
+
+  const rhythm = [...ok]
+    .sort((a, b) => agentMsOf(b.report!) - agentMsOf(a.report!))
+    .slice(0, 40)
+    .map(rec => `<button type="button" class="flow-sess" data-session-id="${escapeHtml(String(rec.session.sessionId))}">
+      <span class="flow-stitle">${escapeHtml(sessionTitle(rec.session))}</span>
+      ${renderPhaseMix(rec.report!)}
+      <span class="flow-stime">${escapeHtml(fmtMs(agentMsOf(rec.report!)))}</span></button>`)
+    .join('');
+
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.flowHint'))}</p>
+    <section class="block flow-pipe-block">
+      <h3>${escapeHtml(t('insights.flowPipeline'))}</h3>
+      <p class="mut flow-sub">${escapeHtml(t('insights.flowPipeSub'))}</p>
+      <div class="flow-pipe">${nodes}</div>
+    </section>
+    <div class="insights-overview-grid">
+      <section class="block">
+        <h3>${escapeHtml(t('insights.flowShares'))}</h3>
+        <div class="flow-bhead"><span></span><span>${escapeHtml(t('insights.flowActShare'))}</span><span>${escapeHtml(t('insights.flowTimeShare'))}</span></div>
+        <div class="flow-bars">${bars}</div>
+      </section>
+      <section class="block">
+        <h3>${escapeHtml(t('insights.flowRhythm'))}</h3>
+        <div class="flow-rhythm">${rhythm}</div>
+        <div class="rl-legend">${FLOW_PHASES.map(p => `<span class="rl-item"><i class="${phaseClass(p)}"></i>${escapeHtml(phaseLabel(p))}</span>`).join('')}</div>
+      </section>
+    </div>
+    ${disclosureNote()}`;
+}
+
+type HotAgg = { key: string; label: string; sessions: Array<{ id: string; title: string }>; reads: number; edits: number; runs: number; fails: number; count: number };
+
+function renderHotspots(records: InsightRecord[], openHot: Set<string>): string {
+  const reports = records.filter(r => !!r.report && r.report.status === 'ok');
+  if (!reports.length) return `<div class="insight-empty">${escapeHtml(t('insights.distEmpty'))}</div>`;
+  // Cross-session recurrence from each session's compact report.hot, tracking which
+  // sessions contributed so each row can drill down to them.
+  const fileAgg = new Map<string, HotAgg>();
+  const cmdAgg = new Map<string, HotAgg>();
+  const errAgg = new Map<string, HotAgg>();
+  const bump = (m: Map<string, HotAgg>, key: string, label: string, sid: string, title: string): HotAgg => {
+    let h = m.get(key);
+    if (!h) { h = { key, label, sessions: [], reads: 0, edits: 0, runs: 0, fails: 0, count: 0 }; m.set(key, h); }
+    if (!h.sessions.some(s => s.id === sid)) h.sessions.push({ id: sid, title });
+    return h;
+  };
+  for (const rec of reports) {
+    const sid = String(rec.session.sessionId);
+    const title = sessionTitle(rec.session);
+    const hot = rec.report!.hot;
+    for (const f of hot?.files ?? []) { const h = bump(fileAgg, `file:${f.path}`, f.path, sid, title); h.reads += f.reads; h.edits += f.edits; }
+    for (const c of hot?.cmds ?? []) { const h = bump(cmdAgg, `cmd:${c.cmd}`, c.cmd, sid, title); h.runs += c.runs; h.fails += c.fails; }
+    for (const e of hot?.errs ?? []) { const h = bump(errAgg, `err:${e.tool} ${e.result}`, `${e.tool} · ${resultLabel(e.result)}`, sid, title); h.count += e.count; }
+  }
+  const recur = (a: HotAgg, b: HotAgg) => b.sessions.length - a.sessions.length;
+  const files = [...fileAgg.values()].sort((a, b) => recur(a, b) || (b.edits + b.reads) - (a.edits + a.reads)).slice(0, 12);
+  const cmds = [...cmdAgg.values()].sort((a, b) => recur(a, b) || b.fails - a.fails || b.runs - a.runs).slice(0, 12);
+  const errs = [...errAgg.values()].sort((a, b) => recur(a, b) || b.count - a.count).slice(0, 10);
+
+  const block = (title: string, rows: HotAgg[], meta: (h: HotAgg) => string) => `
+    <section class="block">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="hotlist">${rows.length ? rows.map(h => {
+        const open = openHot.has(h.key);
+        const sess = open ? `<div class="hot-sess">${h.sessions.map(s =>
+          `<button type="button" class="hot-sesslink" data-session-id="${escapeHtml(s.id)}">${escapeHtml(s.title || s.id)}</button>`).join('')}</div>` : '';
+        return `<div class="hotitem${open ? ' open' : ''}">
+          <button type="button" class="hotrow" data-hotkey="${escapeHtml(h.key)}" aria-expanded="${open}">
+            <span class="hotlabel" title="${escapeHtml(h.label)}">${escapeHtml(h.label)}</span>
+            <span class="hotmeta">${meta(h)}</span>
+            <span class="hotses">${h.sessions.length} ${escapeHtml(t('insights.hotSessionsCol'))}</span>
+          </button>${sess}
+        </div>`;
+      }).join('') : `<p class="mut">-</p>`}</div>
+    </section>`;
+
+  // Projects (kept, with drill-down) + slowest sessions.
+  const projMap = new Map<string, { sessions: number; fails: number }>();
+  for (const rec of reports) { const p = projectOf(rec); if (!p) continue; const e = projMap.get(p) ?? { sessions: 0, fails: 0 }; e.sessions += 1; e.fails += rec.report!.agg.failedSpans; projMap.set(p, e); }
+  const projects = [...projMap.entries()].map(([id, v]) => ({ id, ...v })).sort((a, b) => b.fails - a.fails || b.sessions - a.sessions).slice(0, 10);
+  const projMax = Math.max(1, ...projects.map(x => x.sessions));
+  const slowSessions = [...reports].filter(r => r.report!.agg.slowSpans > 0).sort((a, b) => b.report!.agg.slowSpans - a.report!.agg.slowSpans).slice(0, 8);
+
+  return `<p class="mut ins-hint">${escapeHtml(t('insights.hotHint'))}</p>
+  <div class="hot-grid">
+    ${block(t('insights.hotFiles'), files, h => `${escapeHtml(t('insights.readsShort'))}${h.reads} · ${escapeHtml(t('insights.editsShort'))}${h.edits}`)}
+    ${block(t('insights.hotCommands'), cmds, h => `${h.runs}×${h.fails ? ` · <span class="bad">${h.fails} ${escapeHtml(t('insights.hotFailsCol'))}</span>` : ''}`)}
+    ${block(t('insights.hotErrors'), errs, h => `${h.count}×`)}
+    <section class="block">
+      <h3>${escapeHtml(t('insights.hotProjects'))}</h3>
+      <div class="hbars">${projects.length ? projects.map(x => {
+        const pct = Math.max(4, Math.round((x.sessions / projMax) * 100));
+        return `<button type="button" class="hbrow hbrow-click" data-hotproject="${escapeHtml(x.id)}"><div class="hblabel">${escapeHtml(x.id)}</div><div class="hbtrack"><div class="hbfill" style="width:${pct}%"></div></div><div class="hbval">${fmtInt(x.sessions)}<small>${x.fails} ${escapeHtml(t('insights.hotFailsCol'))}</small></div></button>`;
+      }).join('') : `<p class="mut">-</p>`}</div>
+    </section>
+    <section class="block hot-sessions">
+      <h3>${escapeHtml(t('insights.hotSlowSessions'))}</h3>
+      <div class="slist">${slowSessions.length ? slowSessions.map(rec => {
+        const a = rec.report!.agg;
+        return `<button type="button" class="srow" data-session-id="${escapeHtml(String(rec.session.sessionId))}">
+          <div class="srmain"><strong>${escapeHtml(sessionTitle(rec.session))}</strong>
+          <small>${escapeHtml(botDisplayName(rec.session))} · ${escapeHtml(String(rec.session.cliId ?? '-'))}</small></div>
+          <div class="srstats"><b>${escapeHtml(t('insights.hotSlowCol'))}<em>${fmtInt(a.slowSpans)}</em></b><b>span<em>${fmtInt(a.totalSpans)}</em></b></div>
+        </button>`;
+      }).join('') : `<p class="mut">-</p>`}</div>
+    </section>
+  </div>`;
+}
+
+// ── Sessions tab: sort controls + full-width rich rows (mirrors ASI 会话) ────
+type SessSort = 'recent' | 'review' | 'spans' | 'fails' | 'slow' | 'agent';
+const SESS_SORTS: Array<{ key: SessSort; label: string }> = [
+  { key: 'recent', label: 'insights.sortRecent' },
+  { key: 'review', label: 'insights.sortReview' },
+  { key: 'spans', label: 'insights.sortSpans' },
+  { key: 'fails', label: 'insights.sortFails' },
+  { key: 'slow', label: 'insights.sortSlow' },
+  { key: 'agent', label: 'insights.sortAgent' },
+];
+function renderSortBar(active: SessSort, layout: 'card' | 'table'): string {
+  const sorts = `<span class="sesssort-label mut">${escapeHtml(t('insights.sortLabel'))}</span>` + SESS_SORTS.map(s =>
+    `<button type="button" class="spanchip${s.key === active ? ' on' : ''}" data-sesssort="${s.key}">${escapeHtml(t(s.label))}</button>`).join('');
+  const layouts = `<span class="sesssort-sep"></span>` + ([['card', 'insights.layoutCard'], ['table', 'insights.layoutTable']] as const).map(([k, lbl]) =>
+    `<button type="button" class="spanchip${layout === k ? ' on' : ''}" data-sesslayout="${k}">${escapeHtml(t(lbl))}</button>`).join('');
+  return sorts + layouts;
+}
+function reviewScore(r: SafeInsightReport | null): number {
+  return r?.status === 'ok' ? r.agg.failedSpans * 6 + r.agg.slowSpans * 3 + r.suggestions.filter(s => s.severity === 'bad').length * 5 : 0;
+}
+function sortRecordsBy(records: InsightRecord[], key: SessSort): InsightRecord[] {
+  const recency = (rec: InsightRecord) => Number(rec.session.lastMessageAt ?? 0);
+  const val = (rec: InsightRecord): number => {
+    const r = rec.report; const a = r?.status === 'ok' ? r.agg : null;
+    switch (key) {
+      case 'spans': return a?.totalSpans ?? -1;
+      case 'fails': return a?.failedSpans ?? -1;
+      case 'slow': return a?.slowSpans ?? -1;
+      case 'agent': return r?.status === 'ok' ? agentMsOf(r) : -1;
+      case 'review': return reviewScore(r);
+      default: return 0;
+    }
+  };
+  return [...records].sort((a, b) => key === 'recent' ? recency(b) - recency(a) : (val(b) - val(a)) || recency(b) - recency(a));
+}
+
+function renderSessionRows(records: InsightRecord[], selectedId: string | null, wide = false): string {
   if (!records.length) return `<div class="insight-empty">${escapeHtml(t('insights.empty'))}</div>`;
   const stat = (label: string, val: string, bad = false) =>
     `<b${bad ? ' class="bad"' : ''}>${escapeHtml(label)}<em>${escapeHtml(val)}</em></b>`;
-  return `<div class="slist">${records.map(rec => {
+  return `<div class="slist${wide ? ' wide' : ''}">${records.map(rec => {
     const s = rec.session;
     const r = rec.report;
     const ok = r?.status === 'ok';
     const agg = r?.agg;
     const on = s.sessionId === selectedId ? ' on' : '';
     const review = reportNeedsReview(r) ? ' review' : '';
-    return `<button type="button" class="srow${on}${review}" data-session-id="${escapeHtml(s.sessionId)}">
+    const reads = agg?.phase?.research?.count ?? 0;
+    const edits = agg?.phase?.edit?.count ?? 0;
+    return `<button type="button" class="srow${on}${review}" data-session-id="${escapeHtml(String(s.sessionId))}">
       <div class="srmain">
         <strong>${escapeHtml(sessionTitle(s))}</strong>
-        <small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))} · ${escapeHtml(relTime(s.lastMessageAt ?? s.spawnedAt ?? 0))}</small>
+        <small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))}${s.workingDir ? ` · ${escapeHtml(projectOf(rec))}` : ''} · ${escapeHtml(relTime(s.lastMessageAt ?? s.spawnedAt ?? 0))}</small>
         ${ok ? renderPhaseMix(r!) : ''}
       </div>
       ${ok ? `<div class="srstats">
         ${stat(t('insights.spansShort'), fmtInt(agg!.totalSpans))}
         ${stat(t('insights.failedShort'), fmtInt(agg!.failedSpans), agg!.failedSpans > 0)}
         ${stat(t('insights.slowShort'), fmtInt(agg!.slowSpans))}
+        ${wide ? stat(t('insights.readsShort'), fmtInt(reads)) + stat(t('insights.editsShort'), fmtInt(edits)) + stat(t('insights.durShort'), fmtMs(agentMsOf(r!))) : ''}
         ${stat(t('insights.rwShort'), agg!.readWriteRatio !== null ? agg!.readWriteRatio.toFixed(1) : '-')}
       </div>` : `<div class="srmsg">${escapeHtml(safeStatus(r, rec.error))}</div>`}
     </button>`;
   }).join('')}</div>`;
+}
+
+// Dense table layout for the session list (ASI 表格视图) — sticky header, tabular
+// columns; row click drills into the same full-width detail.
+function renderSessionTable(records: InsightRecord[], selectedId: string | null): string {
+  if (!records.length) return `<div class="insight-empty">${escapeHtml(t('insights.empty'))}</div>`;
+  const head = `<div class="strow sthead">
+    <span class="stc-title">${escapeHtml(t('insights.colTitle'))}</span>
+    <span class="stc-proj">${escapeHtml(t('insights.colProject'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.spansShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.failedShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.slowShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.rwShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.durShort'))}</span>
+    <span class="stc-num">${escapeHtml(t('insights.colTime'))}</span>
+  </div>`;
+  const rows = records.map(rec => {
+    const s = rec.session;
+    const r = rec.report;
+    const ok = r?.status === 'ok';
+    const agg = r?.agg;
+    const on = s.sessionId === selectedId ? ' on' : '';
+    const review = reportNeedsReview(r) ? ' review' : '';
+    const mid = ok
+      ? `<span class="stc-num">${fmtInt(agg!.totalSpans)}</span>
+         <span class="stc-num${agg!.failedSpans ? ' bad' : ''}">${fmtInt(agg!.failedSpans)}</span>
+         <span class="stc-num">${fmtInt(agg!.slowSpans)}</span>
+         <span class="stc-num">${agg!.readWriteRatio !== null ? agg!.readWriteRatio.toFixed(1) : '-'}</span>
+         <span class="stc-num">${escapeHtml(fmtMs(agentMsOf(r!)))}</span>`
+      : `<span class="stc-msg">${escapeHtml(safeStatus(r, rec.error))}</span>`;
+    return `<button type="button" class="strow${on}${review}${ok ? '' : ' nostat'}" data-session-id="${escapeHtml(String(s.sessionId))}">
+      <span class="stc-title"><strong>${escapeHtml(sessionTitle(s))}</strong><small>${escapeHtml(botDisplayName(s))} · ${escapeHtml(String(s.cliId ?? '-'))}</small></span>
+      <span class="stc-proj">${escapeHtml(s.workingDir ? projectOf(rec) : '-')}</span>
+      ${mid}
+      <span class="stc-num stc-time">${escapeHtml(relTime(s.lastMessageAt ?? s.spawnedAt ?? 0))}</span>
+    </button>`;
+  }).join('');
+  return `<div class="stable">${head}${rows}</div>`;
 }
 
 // ── Diagnosis-driven detail view ────────────────────────────────────────────
@@ -872,11 +1279,18 @@ function renderConvoOpRow(m: InsightConversationMessage, open: boolean): string 
 }
 
 function renderConvoOps(unit: { turnIndex: number; msgs: InsightConversationMessage[] }, openOps: Set<string>, recByTurn: Map<number, string[]>): string {
+  // An agent turn carries narration ('say': text, no event) + operations (event).
+  const sayMsgs = unit.msgs.filter(m => m.text && !m.event);
+  const opMsgs = unit.msgs.filter(m => m.event);
   const worst = unit.msgs.some(m => m.severity === 'bad') ? ' sev-bad' : unit.msgs.some(m => m.severity === 'warn') ? ' sev-warn' : '';
-  const rows = unit.msgs.map(m => renderConvoOpRow(m, openOps.has(m.id))).join('');
+  // m.text already carries a trailing '…' when truncated (safeScrubAndTruncate),
+  // so don't append another — that double-ellipsis'd the bubble.
+  const say = sayMsgs.map(m => `<div class="cbub-say"><div class="md-body">${renderPromptMarkdown(m.text!)}</div></div>`).join('');
+  const rows = opMsgs.map(m => renderConvoOpRow(m, openOps.has(m.id))).join('');
   return `<div class="cbub cbub-left role-agent cbub-ops${worst}">
-    <div class="cbub-head"><span class="tp-label tp-src tp-src-system">🤖 ${escapeHtml(t('insights.replayAgent'))}</span><span class="cbub-turn">#${escapeHtml(String(unit.turnIndex))}</span><span class="cbub-opcount">${escapeHtml(t('insights.replayOps', { count: unit.msgs.length }))}</span>${convoRecBadges(unit.turnIndex, recByTurn)}</div>
-    <div class="cbub-ops-list">${rows}</div>
+    <div class="cbub-head"><span class="tp-label tp-src tp-src-system">🤖 ${escapeHtml(t('insights.replayAgent'))}</span><span class="cbub-turn">#${escapeHtml(String(unit.turnIndex))}</span>${opMsgs.length ? `<span class="cbub-opcount">${escapeHtml(t('insights.replayOps', { count: opMsgs.length }))}</span>` : ''}${convoRecBadges(unit.turnIndex, recByTurn)}</div>
+    ${say ? `<div class="cbub-saywrap">${say}</div>` : ''}
+    ${rows ? `<div class="cbub-ops-list">${rows}</div>` : ''}
   </div>`;
 }
 
@@ -1085,6 +1499,7 @@ function renderDetailBody(report: SafeInsightReport, view: DetailView): string {
     </section>
     ${renderTurnRail(report, focus, recByTurn)}
     ${renderWorkGantt(report)}
+    ${renderSubagents(report)}
     ${renderContextCurve(report)}
     <div class="detailtabs">
       <div class="detailtabbar" role="tablist" aria-label="${escapeHtml(t('insights.detailTabs'))}">
@@ -1107,13 +1522,36 @@ async function fetchDetail(sessionId: string): Promise<SafeInsightReport | null>
   return d.report as SafeInsightReport;
 }
 
+// URL state (deep-link + refresh-stable): the insights view state lives in the hash
+// query after #/insights (e.g. #/insights?tab=dist&project=botmux&sess=<id>). Written
+// via history.replaceState (no router re-run), read back on (re)mount.
+function parseInsightsHash(): Record<string, string> {
+  const h = typeof location !== 'undefined' ? (location.hash || '') : '';
+  const qi = h.indexOf('?');
+  if (qi < 0) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of new URLSearchParams(h.slice(qi + 1))) out[k] = v;
+  return out;
+}
+function buildInsightsHash(p: Record<string, string>): string {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(p)) if (v) sp.set(k, v);
+  const q = sp.toString();
+  return '#/insights' + (q ? `?${q}` : '');
+}
+const INSIGHT_FILTERS: InsightFilter[] = ['all', 'review', 'failed', 'slow'];
+const INSIGHT_TAB_KEYS: InsightTab[] = ['overview', 'sessions', 'flow', 'dist', 'hot'];
+const SESS_SORT_KEYS: SessSort[] = ['recent', 'review', 'spans', 'fails', 'slow', 'agent'];
+
 export function renderInsightsPage(root: HTMLElement): () => void {
+  const hp = parseInsightsHash();
   let overviewData: SafeInsightOverview | null = null;
   let records: InsightRecord[] = [];
-  let filter: InsightFilter = 'all';
-  const cliFilter = new Set<string>();
-  let q = '';
+  let filter: InsightFilter = INSIGHT_FILTERS.includes(hp.filter as InsightFilter) ? hp.filter as InsightFilter : 'all';
+  const cliFilter = new Set<string>((hp.cli ?? '').split(',').filter(Boolean));
+  let q = hp.q ?? '';
   let selectedId: string | null = null;
+  let initialSess: string | null = hp.sess ?? null;
   let activeRec: string | null = null;
   let detailReport: SafeInsightReport | null = null;
   let detailTab: 'spans' | 'ledger' | 'convo' = 'spans';
@@ -1131,6 +1569,16 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   let modalPrompt: TurnPromptPreview | null = null;
   let modalReq = 0;
   let disposed = false;
+  let tab: InsightTab = INSIGHT_TAB_KEYS.includes(hp.tab as InsightTab) ? hp.tab as InsightTab : 'overview';
+  let project = hp.project ?? '';
+  let timeWin = hp.time ?? 'all';
+  let showNoise = hp.noise === '1';
+  let sessSort: SessSort = SESS_SORT_KEYS.includes(hp.sort as SessSort) ? hp.sort as SessSort : 'recent';
+  let sessLayout: 'card' | 'table' = hp.layout === 'table' ? 'table' : 'card';
+  const openHot = new Set<string>();
+  let paletteOpen = false;
+  let paletteQ = '';
+  let paletteIdx = 0;
 
   root.innerHTML = `
     <section class="page insights-page">
@@ -1140,10 +1588,17 @@ export function renderInsightsPage(root: HTMLElement): () => void {
           <h1>${escapeHtml(t('insights.title'))}</h1>
           <p>${escapeHtml(t('insights.subtitle'))}</p>
         </div>
-        <button type="button" id="insight-refresh" class="primary">${escapeHtml(t('insights.refresh'))}</button>
+        <div class="insight-head-acts">
+          <button type="button" id="insight-palette-open" class="ins-clear">${escapeHtml(t('insights.paletteOpen'))}</button>
+          <button type="button" id="insight-refresh" class="primary">${escapeHtml(t('insights.refresh'))}</button>
+        </div>
       </div>
       <form id="insight-filters" class="filters insights-filters">
         <input type="search" name="q" placeholder="${escapeHtml(t('insights.search'))}">
+        <select id="insight-project" class="ins-select" aria-label="${escapeHtml(t('insights.projectAll'))}"></select>
+        <select id="insight-time" class="ins-select" aria-label="${escapeHtml(t('insights.timeAll'))}">
+          ${TIME_WINDOWS.map(w => `<option value="${w.key}">${escapeHtml(t(w.label))}</option>`).join('')}
+        </select>
         <div class="segmented" role="group" aria-label="${escapeHtml(t('insights.filter'))}">
           <button type="button" data-filter="all">${escapeHtml(t('insights.filterAll'))}</button>
           <button type="button" data-filter="review">${escapeHtml(t('insights.filterReview'))}</button>
@@ -1151,17 +1606,30 @@ export function renderInsightsPage(root: HTMLElement): () => void {
           <button type="button" data-filter="slow">${escapeHtml(t('insights.filterSlow'))}</button>
         </div>
         <div id="insight-cli-filter" class="spanfilter cli-filter" role="group" aria-label="${escapeHtml(t('insights.filter'))}"></div>
+        <label class="ins-toggle"><input type="checkbox" id="insight-noise"> ${escapeHtml(t('insights.showAll'))}</label>
+        <button type="button" id="insight-clear" class="ins-clear">${escapeHtml(t('insights.clear'))}</button>
       </form>
+      <div id="insight-tabbar">${renderTabBar(tab)}</div>
       <div id="insight-status" class="insight-page-status"></div>
-      <div id="insight-overview"></div>
-      <div class="insight-workbench">
-        <section class="insight-list-panel">
-          <div class="insight-list-head"><h3>${escapeHtml(t('insights.sessions'))}</h3><span id="insight-list-subtitle"></span></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="overview"><div id="insight-overview"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="sessions" hidden>
+        <div id="insight-list-view">
+          <div class="insight-list-head">
+            <span id="insight-list-subtitle"></span>
+            <div class="sesssort" id="insight-sort"></div>
+          </div>
           <div id="insight-list"></div>
-        </section>
-        <div id="insight-detail">${renderDetailShell(undefined)}</div>
+        </div>
+        <div id="insight-detail-view" hidden>
+          <button type="button" id="insight-back" class="ins-back">← ${escapeHtml(t('insights.backToList'))}</button>
+          <div id="insight-detail">${renderDetailShell(undefined)}</div>
+        </div>
       </div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="flow" hidden><div id="insight-flow"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="dist" hidden><div id="insight-dist"></div></div>
+      <div class="insight-panel" role="tabpanel" data-tabpanel="hot" hidden><div id="insight-hot"></div></div>
       <div id="insight-modal" class="insight-modal" hidden></div>
+      <div id="insight-palette" class="insight-palette" hidden></div>
       <div id="insight-tip" class="ins-tip" role="tooltip" hidden></div>
     </section>`;
 
@@ -1171,32 +1639,176 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   const listSubtitle = root.querySelector<HTMLElement>('#insight-list-subtitle')!;
   const detail = root.querySelector<HTMLElement>('#insight-detail')!;
   const search = root.querySelector<HTMLInputElement>('input[name=q]')!;
+  search.value = q;
   const refreshBtn = root.querySelector<HTMLButtonElement>('#insight-refresh')!;
   const filterButtons = [...root.querySelectorAll<HTMLButtonElement>('[data-filter]')];
   const cliFilterEl = root.querySelector<HTMLElement>('#insight-cli-filter')!;
+  const flowEl = root.querySelector<HTMLElement>('#insight-flow')!;
+  const distEl = root.querySelector<HTMLElement>('#insight-dist')!;
+  const hotEl = root.querySelector<HTMLElement>('#insight-hot')!;
+  const projectSel = root.querySelector<HTMLSelectElement>('#insight-project')!;
+  const timeSel = root.querySelector<HTMLSelectElement>('#insight-time')!;
+  const noiseToggle = root.querySelector<HTMLInputElement>('#insight-noise')!;
+  const clearBtn = root.querySelector<HTMLButtonElement>('#insight-clear')!;
+  const tabbar = root.querySelector<HTMLElement>('#insight-tabbar')!;
+  const panels = [...root.querySelectorAll<HTMLElement>('.insight-panel')];
+  const paletteEl = root.querySelector<HTMLElement>('#insight-palette')!;
+  const paletteOpenBtn = root.querySelector<HTMLButtonElement>('#insight-palette-open')!;
+  const listView = root.querySelector<HTMLElement>('#insight-list-view')!;
+  const detailView = root.querySelector<HTMLElement>('#insight-detail-view')!;
+  const backBtn = root.querySelector<HTMLButtonElement>('#insight-back')!;
+  const sortBar = root.querySelector<HTMLElement>('#insight-sort')!;
+
+  // Sessions tab is list ⇆ full-width detail (not a cramped side panel): selecting
+  // a session swaps to the detail view; 返回 clears it back to the list.
+  function showSessionsView(): void {
+    const detailMode = selectedId !== null;
+    listView.hidden = detailMode;
+    detailView.hidden = !detailMode;
+  }
+
+  function scopeOpts(): ScopeOpts {
+    const w = TIME_WINDOWS.find(x => x.key === timeWin);
+    const sinceMs = w && w.days > 0 ? Date.now() - w.days * 86400000 : undefined;
+    return { project: project || undefined, sinceMs, analyzableOnly: !showNoise };
+  }
+
+  // Mirror current view state into the URL hash (deep-link + refresh-stable) without
+  // triggering the router (replaceState fires no hashchange).
+  function syncHash(): void {
+    const p: Record<string, string> = {};
+    if (tab !== 'overview') p.tab = tab;
+    if (filter !== 'all') p.filter = filter;
+    if (q.trim()) p.q = q.trim();
+    if (project) p.project = project;
+    if (timeWin !== 'all') p.time = timeWin;
+    if (cliFilter.size) p.cli = [...cliFilter].join(',');
+    if (sessSort !== 'recent') p.sort = sessSort;
+    if (sessLayout !== 'card') p.layout = sessLayout;
+    if (showNoise) p.noise = '1';
+    if (selectedId) p.sess = selectedId;
+    try { history.replaceState(null, '', buildInsightsHash(p)); } catch { /* ignore */ }
+  }
+
+  // ⌘K command palette: jump to a tab or search/open a session.
+  type PaletteItem = { type: 'tab' | 'session'; key: string; label: string; sub: string };
+  function paletteItems(): PaletteItem[] {
+    const ql = paletteQ.trim().toLowerCase();
+    const tabs: PaletteItem[] = INSIGHT_TABS
+      .map(tb => ({ type: 'tab' as const, key: tb.key, label: t(tb.label), sub: t('insights.paletteTabs') }))
+      .filter(it => !ql || it.label.toLowerCase().includes(ql));
+    const sess: PaletteItem[] = records
+      .filter(r => { const s = r.session; return !ql || `${sessionTitle(s)} ${botDisplayName(s)} ${s.cliId ?? ''}`.toLowerCase().includes(ql); })
+      .slice(0, 20)
+      .map(r => ({ type: 'session' as const, key: String(r.session.sessionId), label: sessionTitle(r.session), sub: `${botDisplayName(r.session)} · ${r.session.cliId ?? '-'}` }));
+    return [...tabs, ...sess];
+  }
+  function choosePalette(type: string, key: string): void {
+    closePalette();
+    if (type === 'tab') { tab = key as InsightTab; selectedId = null; paint(); }
+    else { tab = 'sessions'; showTab(); void selectSession(key); }
+  }
+  // Re-render ONLY the results list (not the <input>), so typing never rebuilds
+  // or re-focuses the input — that would reset the caret and break IME (CJK)
+  // composition on every keystroke.
+  function paintPaletteList(): void {
+    const list = paletteEl.querySelector<HTMLElement>('.palette-list');
+    if (!list) return;
+    const items = paletteItems();
+    if (paletteIdx >= items.length) paletteIdx = Math.max(0, items.length - 1);
+    list.innerHTML = items.length ? items.map((it, i) =>
+      `<button type="button" class="palette-item${i === paletteIdx ? ' on' : ''}" data-pal-type="${it.type}" data-pal-key="${escapeHtml(it.key)}" data-pal-i="${i}">
+        <span class="pal-label">${escapeHtml(it.label)}</span><span class="pal-sub">${escapeHtml(it.sub)}</span>
+      </button>`).join('') : `<p class="mut palette-empty">${escapeHtml(t('insights.paletteEmpty'))}</p>`;
+    list.querySelectorAll<HTMLButtonElement>('.palette-item').forEach(btn =>
+      btn.addEventListener('click', () => choosePalette(btn.dataset.palType ?? 'tab', btn.dataset.palKey ?? '')));
+    list.querySelector<HTMLElement>('.palette-item.on')?.scrollIntoView({ block: 'nearest' });
+  }
+  function paintPalette(): void {
+    if (!paletteOpen) { paletteEl.hidden = true; paletteEl.innerHTML = ''; document.body.classList.remove('insight-modal-open'); return; }
+    paletteEl.hidden = false;
+    document.body.classList.add('insight-modal-open');
+    // Build the shell once per open. The <input> stays stable across keystrokes;
+    // only paintPaletteList() touches the DOM on input/arrow navigation.
+    paletteEl.innerHTML = `<div class="modal-backdrop" data-pal-close></div>
+      <div class="palette-panel" role="dialog" aria-modal="true">
+        <input type="search" class="palette-input" placeholder="${escapeHtml(t('insights.palettePlaceholder'))}" value="${escapeHtml(paletteQ)}">
+        <div class="palette-list"></div>
+      </div>`;
+    const input = paletteEl.querySelector<HTMLInputElement>('.palette-input');
+    if (input) { input.focus(); input.oninput = () => { paletteQ = input.value; paletteIdx = 0; paintPaletteList(); }; }
+    paletteEl.querySelectorAll<HTMLElement>('[data-pal-close]').forEach(el => el.addEventListener('click', closePalette));
+    paintPaletteList();
+  }
+  function openPalette(): void { paletteOpen = true; paletteQ = ''; paletteIdx = 0; paintPalette(); }
+  function closePalette(): void { paletteOpen = false; paintPalette(); }
+
+  // Project <select> options reflect the severity+search+time scoped set (project
+  // pick itself NOT applied), so the dropdown always shows reachable projects.
+  function paintProjectOptions(): void {
+    const base = filterRecords(records, filter, q, cliFilter, { ...scopeOpts(), project: undefined });
+    const opts = projectOptions(base);
+    const cur = project;
+    projectSel.innerHTML = `<option value="">${escapeHtml(t('insights.projectAll'))}</option>` +
+      opts.map(o => `<option value="${escapeHtml(o.id)}"${o.id === cur ? ' selected' : ''}>${escapeHtml(o.id)} (${o.count})</option>`).join('');
+    if (cur && !opts.some(o => o.id === cur)) { project = ''; projectSel.value = ''; }
+  }
+
+  function showTab(): void {
+    for (const p of panels) p.hidden = p.dataset.tabpanel !== tab;
+    for (const b of tabbar.querySelectorAll<HTMLButtonElement>('[data-itab]')) {
+      const on = b.dataset.itab === tab;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-selected', String(on));
+    }
+  }
+
+  function wireSessionButtons(host: HTMLElement, jumpToSessions = false): void {
+    for (const btn of host.querySelectorAll<HTMLButtonElement>('[data-session-id]')) {
+      btn.onclick = () => {
+        if (jumpToSessions && tab !== 'sessions') { tab = 'sessions'; showTab(); paint(); }
+        void selectSession(btn.dataset.sessionId ?? '');
+      };
+    }
+  }
 
   function currentRows(): InsightRecord[] {
-    return sortRecords(filterRecords(records, filter, q, cliFilter));
+    return sortRecordsBy(filterRecords(records, filter, q, cliFilter, scopeOpts()), sessSort);
   }
 
   function paint(): void {
     if (disposed) return;
-    // Faceted CLI chips reflect the severity+search set; drop stale CLI picks that
-    // the other filters have emptied out so the list never gets stuck on nothing.
-    const cliBase = filterRecords(records, filter, q);
+    // Faceted CLI chips reflect the severity+search+scope set (CLI pick itself NOT
+    // applied); drop stale CLI picks the other filters emptied out so the list
+    // never gets stuck on nothing.
+    const cliBase = filterRecords(records, filter, q, new Set(), scopeOpts());
     const present = new Set(cliBase.map(cliIdOf));
     for (const id of [...cliFilter]) if (!present.has(id)) cliFilter.delete(id);
     cliFilterEl.innerHTML = renderCliChips(cliBase, cliFilter);
+    paintProjectOptions();
+    noiseToggle.checked = showNoise;
+    timeSel.value = timeWin;
     const rows = currentRows();
     filterButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.filter === filter));
     overviewEl.innerHTML = overviewData ? renderOverview(aggregateRecords(rows)) : '';
     listSubtitle.textContent = t('insights.listCount', { shown: rows.length, total: records.length });
-    list.innerHTML = renderSessionRows(rows, selectedId);
+    sortBar.innerHTML = renderSortBar(sessSort, sessLayout);
+    // When the analyzable-only default empties the list, point at the toggle so
+    // the user isn't stranded on a blank page wondering where their sessions went.
+    list.innerHTML = (!rows.length && !showNoise)
+      ? `<div class="insight-empty">${escapeHtml(t('insights.empty'))}<br><span class="mut">${escapeHtml(t('insights.emptyAnalyzableHint'))}</span></div>`
+      : sessLayout === 'table' ? renderSessionTable(rows, selectedId) : renderSessionRows(rows, selectedId, true);
     const selected = rows.find(r => r.session.sessionId === selectedId) ?? records.find(r => r.session.sessionId === selectedId);
     if (!selectedId || !selected) detail.innerHTML = renderDetailShell(undefined);
-    for (const btn of list.querySelectorAll<HTMLButtonElement>('[data-session-id]')) {
-      btn.onclick = () => void selectSession(btn.dataset.sessionId ?? '');
-    }
+    wireSessionButtons(list);
+    showSessionsView();
+    flowEl.innerHTML = overviewData ? renderFlow(rows) : '';
+    wireSessionButtons(flowEl, true);
+    distEl.innerHTML = overviewData ? renderDistribution(rows) : '';
+    hotEl.innerHTML = overviewData ? renderHotspots(rows, openHot) : '';
+    wireSessionButtons(hotEl, true);
+    showTab();
+    syncHash();
   }
 
   // Re-render the detail body in place (no refetch) after a focus/filter change.
@@ -1406,6 +2018,8 @@ export function renderInsightsPage(root: HTMLElement): () => void {
 
   async function selectSession(sessionId: string): Promise<void> {
     selectedId = sessionId;
+    showSessionsView();
+    syncHash();
     activeRec = null;
     detailTab = 'spans';
     spanFilter = 'all';
@@ -1463,10 +2077,65 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (selectedId && !records.some(r => r.session.sessionId === selectedId)) selectedId = null;
     paint();
     refreshBtn.disabled = false;
+    // Restore a deep-linked session (load its detail) once records are in.
+    const want = initialSess;
+    initialSess = null;
+    if (want && !selectedId && records.some(r => r.session.sessionId === want)) void selectSession(want);
   }
 
   search.oninput = () => { q = search.value; paint(); };
   refreshBtn.onclick = () => void refresh();
+  tabbar.addEventListener('click', e => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-itab]');
+    if (!btn) return;
+    tab = (btn.dataset.itab as InsightTab) || 'overview';
+    paint();
+  });
+  backBtn.addEventListener('click', () => { selectedId = null; showSessionsView(); paint(); });
+  sortBar.addEventListener('click', e => {
+    const lay = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-sesslayout]');
+    if (lay) { sessLayout = lay.dataset.sesslayout === 'table' ? 'table' : 'card'; paint(); return; }
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-sesssort]');
+    if (!btn) return;
+    sessSort = (btn.dataset.sesssort as SessSort) || 'recent';
+    paint();
+  });
+  // 分布直方图 → 跳到会话 tab 按该指标排序。
+  distEl.addEventListener('click', e => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-distsort]');
+    if (!btn) return;
+    sessSort = (btn.dataset.distsort as SessSort) || 'recent';
+    tab = 'sessions';
+    selectedId = null;
+    paint();
+  });
+  // 项目热点 → 设项目筛选并跳到会话 tab（最慢会话行的 data-session-id 由 wireSessionButtons 处理）。
+  hotEl.addEventListener('click', e => {
+    const target = e.target as HTMLElement;
+    // Expand/collapse a recurrence row → reveal its contributing sessions in place.
+    const hk = target.closest<HTMLButtonElement>('[data-hotkey]');
+    if (hk) {
+      const k = hk.dataset.hotkey || '';
+      if (openHot.has(k)) openHot.delete(k); else openHot.add(k);
+      hotEl.innerHTML = renderHotspots(currentRows(), openHot);
+      wireSessionButtons(hotEl, true);
+      return;
+    }
+    const proj = target.closest<HTMLButtonElement>('[data-hotproject]');
+    if (!proj) return;
+    project = proj.dataset.hotproject || '';
+    tab = 'sessions';
+    selectedId = null;
+    paint();
+  });
+  projectSel.addEventListener('change', () => { project = projectSel.value; paint(); });
+  timeSel.addEventListener('change', () => { timeWin = timeSel.value; paint(); });
+  noiseToggle.addEventListener('change', () => { showNoise = noiseToggle.checked; paint(); });
+  clearBtn.addEventListener('click', () => {
+    q = ''; search.value = ''; filter = 'all'; cliFilter.clear();
+    project = ''; timeWin = 'all'; showNoise = false;
+    paint();
+  });
   for (const btn of filterButtons) {
     btn.onclick = () => {
       filter = (btn.dataset.filter as InsightFilter) || 'all';
@@ -1483,8 +2152,29 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     paint();
   });
 
-  // Esc closes the full-text prompt modal.
-  const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && modalTurn !== null) closeModal(); };
+  paletteOpenBtn.addEventListener('click', openPalette);
+
+  // ⌘K opens the palette; Esc closes palette/modal; arrows + Enter drive the palette.
+  const onKey = (e: KeyboardEvent) => {
+    if ((e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      if (paletteOpen) closePalette(); else openPalette();
+      return;
+    }
+    if (paletteOpen) {
+      // While an IME (CJK) composition is active, Enter/Arrow confirm or move the
+      // candidate list — don't hijack them to select/close the palette. keyCode 229
+      // is the legacy "composition in progress" signal for browsers without isComposing.
+      if (e.isComposing || e.keyCode === 229) return;
+      const items = paletteItems();
+      if (e.key === 'Escape') { e.preventDefault(); closePalette(); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); paletteIdx = Math.min(items.length - 1, paletteIdx + 1); paintPaletteList(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); paletteIdx = Math.max(0, paletteIdx - 1); paintPaletteList(); }
+      else if (e.key === 'Enter') { e.preventDefault(); const it = items[paletteIdx]; if (it) choosePalette(it.type, it.key); }
+      return;
+    }
+    if (e.key === 'Escape' && modalTurn !== null) closeModal();
+  };
   document.addEventListener('keydown', onKey);
 
   void loadNameMaps().then(() => { if (!disposed) paint(); });

@@ -79,7 +79,14 @@ export function isThrottled(larkAppId: string, chatId: string, target: string): 
   const k = key(larkAppId, chatId, target);
   const e = table.get(k);
   if (!e) return false;
-  if (e.state === 'pending') return true;
+  if (e.state === 'pending') {
+    // 废弃 pending（owner 一直没处置，或发卡失败残留）过 stale 窗口 → 本 key 即时回收，
+    // 让同一发送方能重新申请。否则只有「别的 target 触发全表 prune」或 daemon 重启才会清，
+    // 单一发送方反复 @ 会被永久静默压死、owner 永远看不到卡片。与下面 denied 的回收同构。
+    if (Date.now() - e.ts < STALE_PENDING_MS) return true;
+    table.delete(k);
+    return false;
+  }
   // 冷却已过的 denied 不再节流，且无任何用途 → 顺手删除，避免「每个被拒用户」永久占位。
   if (Date.now() - e.ts < DENY_COOLDOWN_MS) return true;
   table.delete(k);

@@ -29,11 +29,12 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
-import { resumeSession } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession } from './session-manager.js';
+import { parseSpawnRequest } from './session-create.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -71,7 +72,8 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
-import type { ScheduledTask, ParsedSchedule, Session } from '../types.js';
+import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
+import type { DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 
@@ -194,6 +196,61 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => 
   jsonRes(res, 200, r);
 });
 
+/** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
+ *  mirroring the /resume route — so a Feishu-side observer sees why the CLI just
+ *  restarted under them (the IM `/restart` command and the card button notify
+ *  too; the dashboard was the lone silent path). `fresh` = the worker was gone
+ *  and we re-forked it (revive) rather than doing an in-place CLI restart.
+ *  Best-effort and fire-and-forget; never blocks the HTTP response. */
+function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
+  if (!ds.larkAppId) return;
+  const loc = localeForBot(ds.larkAppId);
+  const cliName = getCliDisplayName(ds.session.cliId ?? 'claude-code');
+  const text = fresh
+    ? t('card.action.restarted_fresh', { cliName }, loc)
+    : t('cmd.restart.in_progress', { cliName }, loc);
+  const notice = JSON.stringify({ text });
+  if (ds.scope === 'chat' && ds.chatId) {
+    getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
+      .then((mode) => mode === 'topic' && ds.session.rootMessageId
+        ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+        : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
+      .catch(err => logger.debug(`[restart] failed to post chat-scope restart notice: ${err}`));
+  } else if (ds.session.rootMessageId) {
+    replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+      .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
+  }
+}
+
+ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Adopt/observed sessions: botmux never owned the CLI — restarting would kill
+  // the user's real tmux/zellij pane. Hard-reject (the worker self-guards too).
+  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
+    return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
+  }
+  const cliId = ds.session.cliId ?? 'unknown';
+  if (ds.worker && !ds.worker.killed) {
+    // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
+    try {
+      ds.worker.send({ type: 'restart' } as DaemonToWorker);
+    } catch (err) {
+      return jsonRes(res, 502, { ok: false, error: String(err) });
+    }
+    postRestartNotice(ds, false);
+    return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: false });
+  }
+  // Worker is gone but the session is still active — idle-suspended (over the
+  // per-bot cap), lazy-restored after a daemon restart, or crash-loop-stopped.
+  // Revive it the same way the Feishu card restart does (forkWorker), so the
+  // dashboard isn't a dead-end: a 409 here would leave NO working control to
+  // bring the CLI back (the resume button only shows for closed sessions).
+  forkWorker(ds, '', ds.hasHistory);
+  postRestartNotice(ds, true);
+  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
+});
+
 /** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
  *  store 持有同一对象，改字段后 updateSession 即落盘。 */
 function findSessionRecord(sessionId: string): Session | undefined {
@@ -210,17 +267,68 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
   if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  if (column) session.kanbanColumn = column;
+  // 待办池(queued)会话被拖到「进行中」= 激活：把暂存内容当首轮发给 CLI 开跑。
+  // activateQueuedSession 内部会清 queued + 把列设成 in_progress + forkWorker。
+  const activeDs = findActiveBySessionId(params.sessionId);
+  if (column === 'in_progress' && activeDs?.session.queued) {
+    await activateQueuedSession(activeDs);
+  } else if (column) {
+    session.kanbanColumn = column;
+  }
   if (position !== null) session.kanbanPosition = position;
   sessionStore.updateSession(session);
   dashboardEventBus.publish({
     type: 'session.update',
     body: {
       sessionId: params.sessionId,
-      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition },
+      // queued 一并下发：激活后 session.queued 已为 false，前端浅合并若不带这个字段
+      // 会残留 queued=true（卡片仍显示「开始」、再点 409）。!!session.queued 始终反映现态。
+      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition, queued: !!session.queued },
     },
   });
   jsonRes(res, 200, { ok: true });
+});
+
+// 待办池会话「开始」：把 parked 会话激活（发首轮、起 CLI），与拖到「进行中」同义。
+ipcRoute('POST', '/api/sessions/:sessionId/start', async (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (!ds.session.queued) return jsonRes(res, 409, { ok: false, error: 'not_queued' });
+  const r = await activateQueuedSession(ds);
+  if (!r.ok) return jsonRes(res, 500, r);
+  sessionStore.updateSession(ds.session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { kanbanColumn: ds.session.kanbanColumn, queued: false } },
+  });
+  jsonRes(res, 200, { ok: true });
+});
+
+// Dashboard「创建会话」spawn：在新建的群里为本 daemon 的 bot 拉起/暂存一条 chat-scope
+// 会话。aggregator 建完群后按模式(一起开工/lead 分配)对每个目标 bot 的 daemon 调一次。
+ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const parsed = parseSpawnRequest(body);
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+  const postBanner = !!(body as any).postBanner;
+  const r = await spawnDashboardSession(activeSessions, undefined, {
+    larkAppId: cachedLarkAppId,
+    chatId: parsed.value.chatId,
+    content: parsed.value.content,
+    column: parsed.value.column,
+    role: parsed.value.role,
+    coworkers: parsed.value.coworkers,
+    title: parsed.value.title,
+    postBanner,
+    ownerOpenId: parsed.value.ownerOpenId,
+    ownerUnionId: parsed.value.ownerUnionId,
+  });
+  if (!r.ok) return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
+  jsonRes(res, 200, r);
 });
 
 // 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，
@@ -479,7 +587,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/sandbox-land/:action', (_req, res, pa
  * CLI command (via this HTTP route). The CLI route also drops a notice into
  * the original Lark thread so users see why the session is alive again.
  */
-ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
   const sessionId = params.sessionId;
   const reg = getActiveSessionsRegistry();
   if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
@@ -490,6 +598,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) =>
   }
 
   const ds = result.ds;
+  // `?wake=1` is an opt-in operational hook (no UI/CLI caller wires it today —
+  // it's meant for direct `curl` recovery): instead of the default lazy
+  // cold-resume on the next inbound message, fork the worker immediately so the
+  // session is usable right away. Off by default keeps every existing caller's
+  // behaviour unchanged.
+  const wake = new URL(req.url ?? '/', 'http://localhost').searchParams.get('wake') === '1';
   // Tell the dashboard the row flipped back to active (mirror of session.update
   // emitted by closeSession). Use `null` for closedAt — `undefined` would be
   // dropped by JSON.stringify on the SSE wire and the aggregator's spread
@@ -522,9 +636,19 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) =>
     }
   }
 
+  // Report the EFFECTIVE action, not the raw request flag: only fork when wake
+  // was asked AND there's no live worker to clobber. (resumeSession always hands
+  // back a worker:null ds today, so this matches `wake` in practice — but
+  // reporting the action keeps the response honest if the guard ever broadens.)
+  const woke = wake && (!ds.worker || ds.worker.killed);
+  if (woke) {
+    forkWorker(ds, '', true);
+  }
+
   jsonRes(res, 200, {
     ok: true,
     sessionId,
+    wake: woke,
     title: ds.session.title,
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
@@ -1103,6 +1227,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
+    autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     p2pMode,
     maxLiveWorkers,
@@ -1155,6 +1280,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
 // Per-bot 授权偏好。Body 任意子集：
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
+//   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
 //   • messageQuotaDefaultLimit: number|null — 默认消息额度（null = 关闭，正整数 = 启用）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -1165,10 +1291,11 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
   }
-  const body = raw as { restrictGrantCommands?: unknown; messageQuotaDefaultLimit?: unknown };
+  const body = raw as { restrictGrantCommands?: unknown; autoGrantRequestCards?: unknown; messageQuotaDefaultLimit?: unknown };
 
-  const patch: { restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null } = {};
+  const patch: { restrictGrantCommands?: boolean; autoGrantRequestCards?: boolean; messageQuotaDefaultLimit?: number | null } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
+  if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   // null（含 JSON null）= 关闭默认额度；number = 设定（store 内再校验正整数）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
@@ -1508,9 +1635,31 @@ ipcRoute('GET', '/api/events', (_req, res) => {
   // Initial flush so the client sees the connection alive immediately.
   res.write('retry: 5000\n\n');
 
+  // Subscribe BEFORE snapshotting so no event published in the gap is missed.
   const off = dashboardEventBus.subscribe(ev => {
     res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev.body)}\n\n`);
   });
+
+  // Replay the current active sessions as `session.spawned` right after
+  // subscribing. `DashboardEventBus` has no buffer/replay, and the daemon
+  // publishes its discovery descriptor BEFORE restoreActiveSessions() runs
+  // (daemon.ts) — so a dashboard that hydrates (GET /api/sessions) during the
+  // descriptor→restore window gets an EMPTY snapshot, and any restore-time
+  // `announceSessionRow()` that fires before THIS subscription is established is
+  // dropped. Without this replay the aggregator would then have neither a
+  // snapshot row nor a spawned row, and later session.update/close patches would
+  // be discarded as unknown-row. Replaying here makes SSE attach deterministic:
+  // a row registered before subscribe arrives via this snapshot; one registered
+  // after arrives via the live subscription above. Idempotent — both the
+  // aggregator and the browser store upsert by sessionId, so any row also
+  // delivered live just refreshes the same entry.
+  try {
+    for (const ds of listActiveSessions()) {
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds) })}\n\n`);
+    }
+  } catch (err) {
+    logger.warn(`[dashboard-ipc] /api/events snapshot replay failed: ${err}`);
+  }
 
   const hb = setInterval(() => {
     res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);

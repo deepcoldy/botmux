@@ -13,7 +13,7 @@
  * Run: pnpm vitest run test/input-gate.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { shouldWriteNow } from '../src/utils/input-gate.js';
+import { shouldReleaseFirstPromptTimeout, shouldWriteNow } from '../src/utils/input-gate.js';
 
 const base = {
   isPromptReady: false,
@@ -43,5 +43,43 @@ describe('shouldWriteNow', () => {
 
   it('queues when the CLI is busy and does not support type-ahead', () => {
     expect(shouldWriteNow({ ...base, supportsTypeAhead: false, awaitingFirstPrompt: false })).toBe(false);
+  });
+});
+
+describe('shouldReleaseFirstPromptTimeout', () => {
+  it('keeps legacy CLIs on the 15s first-prompt timeout fallback', () => {
+    expect(shouldReleaseFirstPromptTimeout({
+      deferFirstPromptTimeoutUntilReady: false,
+      hasReadyPattern: true,
+      elapsedMs: 15_000,
+      hardTimeoutMs: 90_000,
+    })).toBe(true);
+  });
+
+  it('defers first-prompt release before the hard timeout for ready-gated CLIs', () => {
+    expect(shouldReleaseFirstPromptTimeout({
+      deferFirstPromptTimeoutUntilReady: true,
+      hasReadyPattern: true,
+      elapsedMs: 15_000,
+      hardTimeoutMs: 90_000,
+    })).toBe(false);
+  });
+
+  it('forces first-prompt release at the hard timeout for ready-gated CLIs', () => {
+    expect(shouldReleaseFirstPromptTimeout({
+      deferFirstPromptTimeoutUntilReady: true,
+      hasReadyPattern: true,
+      elapsedMs: 90_000,
+      hardTimeoutMs: 90_000,
+    })).toBe(true);
+  });
+
+  it('does not defer when there is no readyPattern to wait for', () => {
+    expect(shouldReleaseFirstPromptTimeout({
+      deferFirstPromptTimeoutUntilReady: true,
+      hasReadyPattern: false,
+      elapsedMs: 15_000,
+      hardTimeoutMs: 90_000,
+    })).toBe(true);
   });
 });

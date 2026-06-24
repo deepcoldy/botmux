@@ -89,6 +89,27 @@ export function generateToken(): string {
 }
 
 /**
+ * Load a dashboard HMAC secret from disk. Empty / whitespace-only files are
+ * treated as missing so callers never sign requests with an empty key.
+ */
+export function loadDashboardSecret(secretPath: string): string | null {
+  if (!existsSync(secretPath)) return null;
+  const secret = readFileSync(secretPath, 'utf8').trim();
+  return secret.length > 0 ? secret : null;
+}
+
+/** Load the dashboard HMAC secret, creating a fresh 0600 secret when absent. */
+export function loadOrCreateDashboardSecret(secretPath: string): string {
+  const existing = loadDashboardSecret(secretPath);
+  if (existing) return existing;
+  const secret = randomBytes(32).toString('base64url');
+  mkdirSync(dirname(secretPath), { recursive: true });
+  atomicWriteFileSync(secretPath, secret, { mode: 0o600 });
+  chmodSync(secretPath, 0o600);
+  return secret;
+}
+
+/**
  * Load the persisted active dashboard token from `tokenPath`, or `null` when
  * the file is absent / empty / unreadable.
  *

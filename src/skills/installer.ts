@@ -3,7 +3,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
-import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, ASK_SKILL, ASK_SKILL_NAME } from './definitions.js';
+import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, ASK_SKILL, ASK_SKILL_NAME, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from './definitions.js';
 
 // This module only manages botmux-owned bridge/ask skills. User-defined skills
 // live in src/core/skills/* and services/skill-registry-store.ts so their
@@ -109,6 +109,40 @@ export function ensureAskSkill(cliId: string, skillsDir: string | undefined, ins
     }
   } catch (err: any) {
     logger.warn(`[skills] ensureAskSkill(${install}) failed for ${cliId}: ${err.message}`);
+  }
+}
+
+/**
+ * 条件管理 `botmux-whiteboard` skill —— 跟随白板能力开关（与 {@link ensureAskSkill}
+ * 同构）。白板默认关闭，是可选增强，所以它的 skill 不进 `BUILTIN_SKILLS`（那会被
+ * 无条件安装），而是按开关动态写入 / 删除：
+ *
+ * - `install=true`（白板已开启）：写入 SKILL.md，让 agent 看得到并能用
+ *   `botmux whiteboard read/update`。
+ * - `install=false`（白板关闭）：删除该 skill 目录，避免给 agent 暴露一个当前
+ *   用不了（CLI 读写会被拒）的能力；也清理旧版本无条件装下的残留。
+ *
+ * 由 worker-pool 的 `ensureCliSkills` 在每次 spawn 时按 `whiteboardEnabled()`
+ * 调用（不走一次性缓存），所以运行时切换开关下一个会话即生效，无需重启 daemon。
+ * 幂等：install 时内容相同则跳过；remove 时不存在则跳过。
+ */
+export function ensureWhiteboardSkill(cliId: string, skillsDir: string | undefined, install: boolean): void {
+  if (!skillsDir) return;
+  const skillDir = join(expandHome(skillsDir), WHITEBOARD_SKILL_NAME);
+  const skillFile = join(skillDir, 'SKILL.md');
+  try {
+    if (install) {
+      if (existsSync(skillFile) && readFileSync(skillFile, 'utf-8') === WHITEBOARD_SKILL) return;
+      mkdirSync(skillDir, { recursive: true });
+      atomicWriteFileSync(skillFile, WHITEBOARD_SKILL);
+      logger.info(`[skills] Installed ${WHITEBOARD_SKILL_NAME} (whiteboard enabled) for ${cliId} → ${skillFile}`);
+    } else {
+      if (!existsSync(skillDir)) return;
+      rmSync(skillDir, { recursive: true, force: true });
+      logger.info(`[skills] Removed ${WHITEBOARD_SKILL_NAME} (whiteboard disabled) for ${cliId}`);
+    }
+  } catch (err: any) {
+    logger.warn(`[skills] ensureWhiteboardSkill(${install}) failed for ${cliId}: ${err.message}`);
   }
 }
 

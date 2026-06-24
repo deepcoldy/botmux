@@ -140,11 +140,13 @@ vi.mock('../src/core/session-discovery.js', () => ({
 }));
 
 vi.mock('../src/core/session-activity.js', () => ({
+  announceSessionRow: vi.fn(),
   markSessionActivity: vi.fn(),
 }));
 
 import { restoreActiveSessions } from '../src/core/session-manager.js';
 import { forkWorker, closeSession } from '../src/core/worker-pool.js';
+import { announceSessionRow } from '../src/core/session-activity.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -157,6 +159,7 @@ beforeEach(() => {
   server.state = 'running';
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
+  vi.mocked(announceSessionRow).mockClear();
 });
 
 afterEach(() => {
@@ -182,6 +185,10 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     await restoreActiveSessions(map);
 
+    expect(announceSessionRow).toHaveBeenCalledTimes(1);
+    expect(announceSessionRow).toHaveBeenCalledWith(expect.objectContaining({
+      session: expect.objectContaining({ sessionId: s.sessionId }),
+    }));
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect([...map.values()].some(v => v.session.sessionId === s.sessionId)).toBe(false);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
@@ -201,6 +208,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     await restoreActiveSessions(map);
 
+    expect(announceSessionRow).toHaveBeenCalledTimes(1);
     expect(closeSession).not.toHaveBeenCalled();
     const ds = map.get(sessionKey('om_reboot', 'app_test'));
     expect(ds).toBeDefined();              // active record retained…
@@ -220,6 +228,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     await restoreActiveSessions(map);
 
+    expect(announceSessionRow).toHaveBeenCalledTimes(3);
     expect(closeSession).not.toHaveBeenCalled();
     for (const s of [a, b, c]) {
       expect(map.get(sessionKey(s.rootMessageId, 'app_test'))).toBeDefined();

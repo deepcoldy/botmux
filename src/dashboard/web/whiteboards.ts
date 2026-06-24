@@ -58,7 +58,7 @@ function groupedRows(rows: WhiteboardRow[], names: GroupNameMap): Array<{ chatId
 }
 
 function itemStyle(active: boolean): string {
-  return `display:block;text-decoration:none;color:inherit;border:1px solid ${active ? 'rgba(14,165,233,.75)' : 'var(--border)'};border-radius:14px;padding:13px 14px;margin:10px 0 10px 18px;background:${active ? 'linear-gradient(135deg, rgba(14,165,233,.16), rgba(59,130,246,.08))' : 'var(--surface-2,#fff)'};box-shadow:${active ? '0 10px 24px rgba(14,165,233,.13)' : '0 4px 14px rgba(15,23,42,.04)'}`;
+  return `display:block;text-decoration:none;color:inherit;border:1px solid ${active ? 'rgba(14,165,233,.75)' : 'var(--border)'};border-radius:14px;padding:13px 14px;margin:10px 0 10px 18px;background:${active ? 'linear-gradient(135deg, rgba(14,165,233,.16), rgba(59,130,246,.08))' : 'var(--surface-raised)'};box-shadow:${active ? '0 10px 24px rgba(14,165,233,.13)' : '0 4px 14px rgba(15,23,42,.04)'}`;
 }
 
 function boardItem(r: WhiteboardRow, selectedId?: string): string {
@@ -95,7 +95,7 @@ function deleteModalHtml(selected: SelectedBoard): string {
 }
 
 function metaCard(label: string, value: string): string {
-  return `<div style="border:1px solid var(--border);border-radius:12px;padding:10px 12px;background:var(--surface-2,#fff);min-width:0">
+  return `<div style="border:1px solid var(--border);border-radius:12px;padding:10px 12px;background:var(--surface-raised);min-width:0">
     <div style="font-size:11px;color:var(--muted);margin-bottom:5px">${escapeHtml(label)}</div>
     <div style="font-size:13px;word-break:break-all">${escapeHtml(value || '-')}</div>
   </div>`;
@@ -123,7 +123,7 @@ function detailHtml(selected: SelectedBoard | undefined, groupNames: GroupNameMa
       <summary style="cursor:pointer">管理信息 / 文件路径</summary>
       <code style="display:block;margin-top:8px;white-space:pre-wrap;word-break:break-all">${escapeHtml(selectedRow?.path ?? '')}</code>
     </details>
-    <section style="border:1px solid var(--border);border-radius:14px;background:var(--surface-2,#fff);overflow:hidden">
+    <section style="border:1px solid var(--border);border-radius:14px;background:var(--surface-raised);overflow:hidden">
       <div style="padding:12px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
         <strong>当前状态 board.md</strong><span style="color:var(--muted);font-size:12px">read / update</span>
       </div>

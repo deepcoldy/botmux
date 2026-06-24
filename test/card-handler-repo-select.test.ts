@@ -37,6 +37,15 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn(),
 }));
 
+vi.mock('../src/services/bot-config-store.js', () => ({
+  findConfigField: vi.fn((key: string) => key === 'worktreeMultiPicker'
+    ? { key, configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false }
+    : undefined),
+  applyConfigField: vi.fn(async () => ({ ok: true, newText: 'on' })),
+  coerceConfigValue: vi.fn(),
+  getConfigCardData: vi.fn(),
+}));
+
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
@@ -92,6 +101,8 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
+  removeRepoWorktree: vi.fn(async () => {}),
+  dirSuffixForBranch: (branch: string) => branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch',
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -114,7 +125,10 @@ import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-hand
 import { forkWorker, killWorker, deliverEphemeralOrReply } from '../src/core/worker-pool.js';
 import { getAvailableBots } from '../src/core/session-manager.js';
 import { createSession, closeSession } from '../src/services/session-store.js';
-import { createRepoWorktree } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree } from '../src/services/git-worktree.js';
+import { applyConfigField } from '../src/services/bot-config-store.js';
+import { deleteMessage } from '../src/im/lark/client.js';
+import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -159,10 +173,10 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
   } as unknown as DaemonSession;
 }
 
-function makeDeps(ds: DaemonSession) {
+function makeDeps(ds: DaemonSession, projects = PROJECTS) {
   const activeSessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
   const sessionReply = vi.fn(async () => 'om_reply');
-  const deps: CardHandlerDeps = { activeSessions, sessionReply, lastRepoScan: new Map([[CHAT_ID, PROJECTS]]) };
+  const deps: CardHandlerDeps = { activeSessions, sessionReply, lastRepoScan: new Map([[CHAT_ID, projects]]) };
   return { deps, sessionReply };
 }
 
@@ -180,6 +194,20 @@ function makeManualEvent(path: string, operator = OWNER) {
     action: {
       value: { action: 'repo_manual_submit', root_id: ROOT_ID },
       form_value: { repo_manual_path: path },
+    },
+    context: { open_message_id: 'om_card' },
+  };
+}
+
+function makeWorktreeSubmitEvent(branch = '', paths?: string[], operator = OWNER) {
+  return {
+    operator: { open_id: operator },
+    action: {
+      value: { action: 'repo_worktree_submit', root_id: ROOT_ID },
+      form_value: {
+        repo_worktree_branch: branch,
+        ...(paths ? { repo_worktree_paths: paths } : {}),
+      },
     },
     context: { open_message_id: 'om_card' },
   };
@@ -436,6 +464,217 @@ describe('repo select card — worktree open', () => {
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(true); // still recoverable — card stays
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('fetch blew up');
+  });
+
+  it('multi-select creates all selected repos under one parent path and opens that parent', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(createRepoWorktree)
+      .mockResolvedValueOnce({ path: '/repos/feat-multi/alpha', branch: 'feat/multi', baseRef: 'origin/master' })
+      .mockResolvedValueOnce({ path: '/repos/feat-multi/beta', branch: 'feat/multi', baseRef: 'origin/master' });
+
+    const res = await handleCardAction(makeWorktreeSubmitEvent('feat/multi', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
+    expect(res?.toast?.content).toContain('正在创建');
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(createRepoWorktree).toHaveBeenCalledTimes(2);
+    expect(createRepoWorktree).toHaveBeenNthCalledWith(1, '/repos/alpha', {
+      branch: 'feat/multi',
+      slug: undefined,
+      worktreePath: '/repos/feat-multi/alpha',
+    });
+    expect(createRepoWorktree).toHaveBeenNthCalledWith(2, '/repos/beta', {
+      branch: 'feat/multi',
+      slug: undefined,
+      worktreePath: '/repos/feat-multi/beta',
+    });
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.workingDir).toBe('/repos/feat-multi');
+    expect(ds.session.workingDir).toBe('/repos/feat-multi');
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('worktree 已创建');
+  });
+
+  it('reads official form multi-select values from action.form_value and creates all selected repos', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(createRepoWorktree)
+      .mockResolvedValueOnce({ path: '/repos/feat-selected/alpha', branch: 'feat/selected', baseRef: 'origin/master' })
+      .mockResolvedValueOnce({ path: '/repos/feat-selected/beta', branch: 'feat/selected', baseRef: 'origin/master' });
+
+    await handleCardAction(makeWorktreeSubmitEvent('feat/selected', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(createRepoWorktree).toHaveBeenCalledTimes(2);
+    expect(createRepoWorktree).toHaveBeenNthCalledWith(1, '/repos/alpha', {
+      branch: 'feat/selected',
+      slug: undefined,
+      worktreePath: '/repos/feat-selected/alpha',
+    });
+    expect(createRepoWorktree).toHaveBeenNthCalledWith(2, '/repos/beta', {
+      branch: 'feat/selected',
+      slug: undefined,
+      worktreePath: '/repos/feat-selected/beta',
+    });
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.workingDir).toBe('/repos/feat-selected');
+  });
+
+  it('multi-select without explicit branch uses the default slug parent and child naming', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(createRepoWorktree)
+      .mockResolvedValueOnce({ path: '/repos/repo-test/alpha', branch: 'repo-test', baseRef: 'origin/master' })
+      .mockResolvedValueOnce({ path: '/repos/repo-test/beta', branch: 'repo-test', baseRef: 'origin/master' });
+
+    const res = await handleCardAction(makeWorktreeSubmitEvent('', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
+    expect(res?.toast?.content).toContain('正在创建');
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(createRepoWorktree).toHaveBeenCalledTimes(2);
+    expect(createRepoWorktree).toHaveBeenNthCalledWith(1, '/repos/alpha', {
+      branch: undefined,
+      slug: 'repo-test',
+      worktreePath: '/repos/repo-test/alpha',
+    });
+    expect(createRepoWorktree).toHaveBeenNthCalledWith(2, '/repos/beta', {
+      branch: undefined,
+      slug: 'repo-test',
+      worktreePath: '/repos/repo-test/beta',
+    });
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.workingDir).toBe('/repos/repo-test');
+  });
+
+  it('rejects empty repo_worktree_paths from the official form value', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+
+    const res = await handleCardAction(makeWorktreeSubmitEvent('feat/empty', []), deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('至少选择一个仓库');
+    expect(createRepoWorktree).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).not.toBe(true);
+  });
+
+  it('rejects missing repo_worktree_paths and does not fall back to standalone multi-select options', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    const event = {
+      operator: { open_id: OWNER },
+      action: {
+        value: { action: 'repo_worktree_submit', root_id: ROOT_ID },
+        form_value: { repo_worktree_branch: 'feat/missing' },
+        options: ['/repos/alpha', '/repos/beta'],
+      },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('至少选择一个仓库');
+    expect(createRepoWorktree).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).not.toBe(true);
+  });
+
+  it('rejects multi-select repos that map to the same child directory before creating worktrees', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const duplicateProjects: ProjectInfo[] = [
+      { name: 'same', path: '/repos/team-a/same', type: 'repo', branch: 'master' },
+      { name: 'same', path: '/repos/team-b/same', type: 'repo', branch: 'main' },
+    ];
+    const { deps } = makeDeps(ds, duplicateProjects);
+
+    const res = await handleCardAction(makeWorktreeSubmitEvent('feat/collision', ['/repos/team-a/same', '/repos/team-b/same']), deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('相同 worktree 子目录');
+    expect(res?.toast?.content).toContain('same');
+    expect(createRepoWorktree).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).not.toBe(true);
+  });
+
+  it('single selection from the new form keeps the existing single-repo path convention and passes branch', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(createRepoWorktree).mockResolvedValue({ path: '/repos/alpha-feat-one', branch: 'feat/one', baseRef: 'origin/master' });
+
+    await handleCardAction(makeWorktreeSubmitEvent('feat/one', ['/repos/alpha']), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(createRepoWorktree).toHaveBeenCalledWith('/repos/alpha', {
+      branch: 'feat/one',
+      slug: undefined,
+      worktreePath: undefined,
+    });
+    expect(ds.workingDir).toBe('/repos/alpha-feat-one');
+  });
+
+  it('worktree_toggle_mode flips the persisted picker mode and re-sends a fresh repo card', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_old_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('info');
+    // persisted the flipped mode (config undefined → true)
+    expect(vi.mocked(applyConfigField)).toHaveBeenCalledWith('app_test', expect.objectContaining({ configKey: 'worktreeMultiPicker' }), true);
+    // withdrew the old card and posted a fresh interactive repo card
+    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_old_card');
+    const interactiveCall = sessionReply.mock.calls.find(c => c[2] === 'interactive');
+    expect(interactiveCall).toBeDefined();
+    expect(createRepoWorktree).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).not.toBe(true);
+  });
+
+  it('worktree_toggle_mode requires canOperate — a non-operator (even the pending-session owner) cannot flip bot config', async () => {
+    // It writes bot-level worktreeMultiPicker (bots.json), so it must NOT ride
+    // the pendingRepoOwnerException that lets talk-only users start their own session.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_old_card' });
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValueOnce(false); // non-operator
+    const event = {
+      operator: { open_id: OWNER }, // session owner, but NOT an operator
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast).toBeUndefined();                // sensitive gate blocks silently (logs only)
+    expect(vi.mocked(applyConfigField)).not.toHaveBeenCalled(); // no bot-config write
+    expect(vi.mocked(deleteMessage)).not.toHaveBeenCalled();
+  });
+
+  it('rolls back already-created worktrees when a later repo in the batch fails', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(createRepoWorktree)
+      .mockResolvedValueOnce({ path: '/repos/feat-multi/alpha', branch: 'feat/multi', baseRef: 'origin/master' })
+      .mockRejectedValueOnce(new Error('boom on beta'));
+
+    await handleCardAction(makeWorktreeSubmitEvent('feat/multi', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(createRepoWorktree).toHaveBeenCalledTimes(2);
+    // the first repo's worktree (already on disk) is rolled back, not leaked
+    expect(removeRepoWorktree).toHaveBeenCalledTimes(1);
+    expect(removeRepoWorktree).toHaveBeenCalledWith('/repos/alpha', '/repos/feat-multi/alpha');
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true); // still recoverable — card stays
+    const replies = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(replies).toContain('回滚');
+    expect(replies).toContain('boom on beta');
   });
 });
 

@@ -16,6 +16,7 @@ import { createRepoWorktree } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
+import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
@@ -86,7 +87,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/skills']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -1585,7 +1586,7 @@ export async function handleCommand(
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
-        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId, loc);
+        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId, loc, ds ? getBot(ds.larkAppId).config.worktreeMultiPicker : undefined);
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) {
           ds.repoCardMessageId = repoCardMsgId;
@@ -1627,6 +1628,14 @@ export async function handleCommand(
         const chatId = ds?.chatId!;
         await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${logTag}] Schedule command handled`);
+        break;
+      }
+
+      case '/dashboard': {
+        const dashboardArgs = message.content.replace(/^\/dashboard\s*/, '');
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleDashboardCommand(message, dashboardArgs, rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Dashboard command handled (sub=${dashboardArgs.trim().split(/\s+/)[0] || 'overview'})`);
         break;
       }
 

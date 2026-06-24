@@ -4,6 +4,7 @@ import { tmuxKeyToBytes } from './zellij-backend.js';
 import { normaliseCaptureLineEndings } from './tmux-pipe-backend.js';
 import { zellijEnv } from '../../setup/ensure-zellij.js';
 import { logger } from '../../utils/logger.js';
+import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
 /**
  * ZellijObserveBackend — the zellij analogue of TmuxPipeBackend, for /adopt.
@@ -43,6 +44,10 @@ export class ZellijObserveBackend implements ObserveBackend {
   private exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  /** Debounce transient pane-probe failures so one busy `zellij action
+   *  list-panes` doesn't tear down a pane that's still alive. See recordPaneProbe.
+   *  (pid-death stays decisive — a pure syscall can't false-fail under load.) */
+  private readonly livenessGate = new LivenessGate(ADOPT_LIVENESS_MAX_FAILURES);
   private lastSnapshot = '';
   private exited = false;
   /** # of live web-terminal `zellij attach` clients currently connected. While
@@ -83,20 +88,47 @@ export class ZellijObserveBackend implements ObserveBackend {
 
   private checkLiveness(): void {
     if (this.exited) return;
+    // (b) The adopted CLI pid is a pure process.kill(pid,0) syscall — ESRCH
+    // (gone) or EPERM (alive), never a transient/busy-server failure. So
+    // pid-death is DECISIVE: tear down at once. Essential for user-typed CLIs,
+    // where the pane drops back to a still-"alive" shell on exit and a pane-only
+    // check would route subsequent Lark input INTO that shell.
+    if (!this.isCliPidAlive()) { this.handlePaneExit(); return; }
     // While a live web-attach client is connected, skip the list-panes `action`
     // (it makes the zellij server repaint every attached client → flicker). The
-    // pid syscall covers CLI exit; the attach PTY's own exit covers pane/session
-    // death, and full pane liveness resumes the moment the client detaches.
-    if (this.liveAttachCount > 0) {
-      if (!this.isCliPidAlive()) this.handlePaneExit();
+    // attach PTY's own exit covers pane/session death and the pid check above
+    // covers CLI exit — nothing flaky left to probe. The partial pane-failure
+    // streak was already discarded the moment the client attached (see
+    // setLiveAttach), and nothing increments the gate while attached, so there's
+    // nothing to reset here.
+    if (this.liveAttachCount > 0) return;
+    // (a) The list-panes pane probe IS the flaky signal (busy server) — debounce.
+    this.recordPaneProbe(this.isPaneAlive());
+  }
+
+  /**
+   * Debounce the (flaky) pane probe — mirror of TmuxPipeBackend.recordPaneProbe.
+   * Tearing down on the FIRST failed probe produced the spurious
+   * "⏏ /adopt的 CLI 会话已断开" — a busy zellij server momentarily fails list-panes
+   * while the pane is still alive. Only after ADOPT_LIVENESS_MAX_FAILURES
+   * consecutive failures, AND a final re-probe that still fails, do we detach.
+   * Any success resets the counter. (pid-death is handled decisively above.)
+   */
+  private recordPaneProbe(alive: boolean): void {
+    if (this.exited) return;
+    if (!this.livenessGate.record(alive)) {
+      if (!alive) {
+        logger.debug(`[zellij-observe] pane probe failed (${this.livenessGate.consecutiveFailures}/${ADOPT_LIVENESS_MAX_FAILURES}); retrying before teardown`);
+      }
       return;
     }
-    // Two exit signals: (a) the pane vanished, (b) the adopted CLI pid is gone.
-    // (b) is essential for user-typed CLIs: when the CLI exits, the pane drops
-    // back to a shell and stays "alive", so a pane-only check would keep the
-    // worker running and route subsequent Lark input INTO the user's shell.
-    // Mirrors the pid guard the restore path already uses.
-    if (!this.isPaneAlive() || !this.isCliPidAlive()) this.handlePaneExit();
+    // Threshold reached — one final authoritative re-probe before tearing down.
+    if (this.isPaneAlive()) {
+      this.livenessGate.reset();
+      logger.debug('[zellij-observe] pane recovered on final check; staying attached');
+      return;
+    }
+    this.handlePaneExit();
   }
 
   /**
@@ -114,6 +146,11 @@ export class ZellijObserveBackend implements ObserveBackend {
     this.liveAttachCount = Math.max(0, this.liveAttachCount + (active ? 1 : -1));
     if (this.exited) return;
     if (this.liveAttachCount > 0) {
+      // Pane probing pauses while attached → discard any partial pane-failure
+      // streak NOW, at the attach transition, not on the next liveness tick. A
+      // brief attach that opens and closes BETWEEN ticks would otherwise leave a
+      // stale streak that trips the moment the client detaches.
+      this.livenessGate.reset();
       if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
     } else if (!this.pollTimer) {
       this.pollTimer = setInterval(() => this.poll(), POLL_MS);

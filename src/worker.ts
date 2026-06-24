@@ -19,7 +19,9 @@ import { isAbsolute, join } from 'node:path';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
-import { shouldWriteNow } from './utils/input-gate.js';
+import { shouldReleaseFirstPromptTimeout, shouldWriteNow } from './utils/input-gate.js';
+import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
+import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
@@ -128,6 +130,17 @@ let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
+/** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
+let crashDiagnosticTmuxParked = false;
+/** True once the daemon told us to stop & park a crash diagnostic (crash loop):
+ *  the next user message retries the CLI. Distinct from the flag above because
+ *  retry must still fire even if the tmux park itself failed (no hang). */
+let crashDiagnosticStopped = false;
+/** Exit code/signal of the just-exited CLI, stashed so a deferred park
+ *  (park_diagnostic IPC) can stamp the captured log even though the park no
+ *  longer happens inline in onExit. */
+let lastCliExitCode: number | null = null;
+let lastCliExitSignal: string | null = null;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
  *  web-terminal updates flow through the shared scrollback fan-out instead
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
@@ -185,6 +198,14 @@ let readySignalTimer: ReturnType<typeof setTimeout> | null = null;
  *  back. The real signal lands within ~ms of the input box rendering, so this is
  *  pure insurance against a missing/failed hook — generous but bounded. */
 const READY_SIGNAL_TIMEOUT_MS = 45_000;
+/** Soft fallback for CLIs that never emit an idle/ready signal during startup.
+ *  Legacy adapters release queued first input here. Adapters that opt into
+ *  deferFirstPromptTimeoutUntilReady wait for the real readyPattern until the
+ *  hard cap below. */
+const FIRST_PROMPT_TIMEOUT_MS = 15_000;
+/** Hard cap for startup screens that outlive the soft fallback. Prevents a
+ *  changed/missing readyPattern from trapping the first queued input forever. */
+const FIRST_PROMPT_HARD_TIMEOUT_MS = 90_000;
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
@@ -2202,6 +2223,8 @@ const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
 const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
 const WORKFLOW_OUTPUT_END_MARKER = '</WORKFLOW_OUTPUT>';
+const CRASH_DIAGNOSTIC_RAW_MAX = 200_000; // enough scrollback for the web terminal without huge temp files
+const CRASH_LOG_TAIL_MAX = 2_500; // bounded Feishu text payload
 let workflowTranscript = '';
 let workflowFinalOutputSent = false;
 /** Tracks whether the CLI is currently in the alt screen buffer. Updated by
@@ -2213,6 +2236,88 @@ let workflowFinalOutputSent = false;
 let altBufferActive = false;
 const ALT_ENTER_RE = /\x1b\[\?(1049|1047|47)h/g;
 const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
+
+function recentTerminalLogTail(): string | undefined {
+  const plain = stripAnsiForLog(tailChars(scrollback, CRASH_DIAGNOSTIC_RAW_MAX));
+  if (!plain) return undefined;
+  return tailChars(plain, CRASH_LOG_TAIL_MAX);
+}
+
+function crashDiagnosticPath(): string | undefined {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir || !sessionId) return undefined;
+  return join(dataDir, 'crash-diagnostics', `${sessionId}.ansi`);
+}
+
+function destroyCrashDiagnosticTerminal(reason: string): void {
+  // Leaving the stopped-awaiting-retry state regardless of whether a tmux shell
+  // was actually parked (park may have failed); the next retry/close/suspend
+  // funnels through here.
+  crashDiagnosticStopped = false;
+  if (!crashDiagnosticTmuxParked || !sessionId) return;
+  try {
+    TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(sessionId));
+    log(`Crash diagnostic tmux session destroyed (${reason})`);
+  } catch (err: any) {
+    log(`Crash diagnostic tmux cleanup failed (${reason}): ${err?.message ?? err}`);
+  }
+  // Best-effort: drop the captured .ansi file too so a long-lived daemon does
+  // not accumulate one ~200 KB file per crashed session forever.
+  const path = crashDiagnosticPath();
+  if (path) { try { unlinkSync(path); } catch { /* already gone — benign */ } }
+  crashDiagnosticTmuxParked = false;
+}
+
+function parkCrashDiagnosticTerminal(code: number | null, signal: string | null): boolean {
+  if (lastInitConfig?.adoptMode || effectiveBackendType !== 'tmux' || !sessionId) return false;
+  const path = crashDiagnosticPath();
+  if (!path) return false;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const rawTail = tailChars(scrollback, CRASH_DIAGNOSTIC_RAW_MAX);
+    const header =
+      `[botmux] ${cliName()} exited (code: ${code ?? 'null'}, signal: ${signal ?? 'null'}).\n` +
+      `[botmux] Captured at ${new Date().toISOString()}.\n\n`;
+    writeFileSync(path, header + rawTail);
+  } catch (err: any) {
+    log(`Crash diagnostic log write failed: ${err?.message ?? err}`);
+    return false;
+  }
+
+  // Park under a DISTINCT name (`bmx-diag-<sid>`), never the live CLI's
+  // `bmx-<sid>` backing-session name. The whole persistent-backend machinery
+  // (restore probe, hasSession reattach, idle-sweep cold-resume, `botmux
+  // resume`) keys off `bmx-<sid>` to mean "the live CLI". Reusing that name for
+  // a bare diagnostic shell makes restore/cold-resume reattach the shell as if
+  // it were the CLI and type the user's next message into raw bash. With a
+  // distinct name, `bmx-<sid>` is correctly absent after the crash, so every
+  // one of those paths sees "no live CLI" and does the right thing; the web
+  // terminal is pointed at the diagnostic name explicitly (see the WS attach).
+  const ok = TmuxBackend.parkDiagnosticSession(TmuxBackend.diagnosticSessionName(sessionId), {
+    cwd: lastInitConfig?.workingDir ?? process.cwd(),
+    cols: renderCols || PTY_COLS,
+    rows: renderRows || PTY_ROWS,
+    contentPath: path,
+  });
+  if (!ok) {
+    // tmux spawn failed after the .ansi was written — drop the orphan file.
+    try { unlinkSync(path); } catch { /* benign */ }
+    return false;
+  }
+  crashDiagnosticTmuxParked = true;
+  isTmuxMode = true;
+  isPipeMode = false;
+  isZellijMode = false;
+  // The CLI is gone; stop the screen-update + analyzer loops so a stale
+  // `status='working'` tick can't un-freeze the daemon's frozen crash card.
+  // The web terminal is served by per-client tmux-attach PTYs, not these loops,
+  // so the diagnostic shell stays visible. flushPending's retry path restarts
+  // both when the next message respawns the CLI.
+  stopScreenUpdates();
+  stopScreenAnalyzer();
+  log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
+  return true;
+}
 
 // ─── Screen Analyzer (AI-based TUI prompt detection) ────────────────────────
 
@@ -4410,6 +4515,16 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   backend.onData(onPtyData);
   backend.onExit((code, signal) => {
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
+    const logTail = recentTerminalLogTail();
+    // Don't park a diagnostic shell here: most exits are immediately
+    // auto-restarted by the daemon, so an inline park would just be torn down
+    // again (a wasted tmux session + .ansi write on every restart). Instead
+    // report whether we COULD park; the daemon asks us to (park_diagnostic) only
+    // when it actually gives up restarting (crash loop). Stash the exit reason
+    // for that deferred park.
+    lastCliExitCode = code;
+    lastCliExitSignal = signal;
+    const canParkDiagnostic = !lastInitConfig?.adoptMode && effectiveBackendType === 'tmux' && !!sessionId;
     // Inputs written but not yet consumed (no idle since the write) die with
     // the CLI — codex crashing mid-submit never records them, and the fresh
     // respawn comes up empty. Stash them so the next spawnCli re-queues and
@@ -4420,7 +4535,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
     backend = null;
     isPromptReady = false;
-    send({ type: 'claude_exit', code, signal });
+    send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic });
   });
 
   if (isPipeMode && backend && 'isReattach' in backend && backend.isReattach) {
@@ -4429,31 +4544,49 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
   }
 
-  // Fallback: if the CLI takes too long to show its prompt (e.g. slow
-  // plugin init, or a spinner blocks the idle detector), unblock screen
-  // updates AND deliver any queued prompts so the first user message
-  // isn't stranded until the second message arrives. markNewTurn() sets a
-  // clean baseline at the current cursor position so only content written
-  // *after* this point appears in the card.
-  setTimeout(() => {
-    if (awaitingFirstPrompt) {
-      awaitingFirstPrompt = false;
-      renderer?.markNewTurn();
-      log('First prompt timeout — enabling screen updates and flushing queued messages');
-      if (backend && cliAdapter?.busyPattern && probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) {
-        return;
-      }
-      // For type-ahead adapters (Codex/CoCo/TRAE/Claude) the TUI is booted
-      // enough to park input even if the idle detector hasn't fired yet.
-      // Directly invoking markPromptReady() would claim the CLI is idle
-      // while it's still mid-boot, so flushPending() alone is safer — it
-      // respects typeAheadAllowed and drains pendingMessages now.
-      if (cliAdapter?.supportsTypeAhead) flushPending();
+  // Fallback: if the CLI takes too long to show its prompt (e.g. slow plugin
+  // init, or a spinner blocks the idle detector), unblock screen updates AND
+  // deliver any queued prompts so the first user message isn't stranded until
+  // the second message arrives. Some adapters opt into deferring the soft
+  // fallback until readyPattern, but still get a hard cap below.
+  // markNewTurn() sets a clean baseline at the current cursor position so only
+  // content written *after* this point appears in the card.
+  const firstPromptBackend = backend;
+  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
+    if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    if (!shouldReleaseFirstPromptTimeout({
+      deferFirstPromptTimeoutUntilReady: cliAdapter?.deferFirstPromptTimeoutUntilReady === true,
+      hasReadyPattern: !!cliAdapter?.readyPattern,
+      elapsedMs,
+      hardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
+    })) {
+      const hardWaitMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
+      log(`First prompt timeout — ${cliName()} still waiting for readyPattern before flushing queued messages`);
+      const hardTimer = setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_HARD_TIMEOUT_MS, true), hardWaitMs);
+      hardTimer.unref?.();
+      return;
     }
-  }, 15_000);
+
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();
+    log(forced
+      ? `WARN First prompt hard timeout — ${cliName()} readyPattern did not arrive; forcing queued message flush`
+      : 'First prompt timeout — enabling screen updates and flushing queued messages');
+    if (backend && cliAdapter?.busyPattern && probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) {
+      return;
+    }
+    // For type-ahead adapters (Codex/CoCo/Claude/TraeX) the TUI is usually booted
+    // enough to park input even if the idle detector hasn't fired yet. Directly
+    // invoking markPromptReady() would claim the CLI is idle while it's still
+    // mid-boot, so flushPending() alone is safer — it respects typeAheadAllowed
+    // and drains pendingMessages now.
+    if (cliAdapter?.supportsTypeAhead) flushPending();
+  };
+  setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
 }
 
 function killCli(): void {
+  destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
   stopReattachIdleProbe();
@@ -4543,7 +4676,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // byte-for-byte (empty, separators, etc.) are not retransmitted, so
         // the earlier frame "bleeds through" — visible as a second
         // banner/prompt stacked above the new layout when scrolling up.
-        const tmuxTarget = lastInitConfig?.adoptTmuxTarget ?? TmuxBackend.sessionName(sessionId);
+        // While a crash diagnostic shell is parked it lives under bmx-diag-<sid>
+        // (not the live CLI's bmx-<sid>), so attach there to surface the startup
+        // error; otherwise attach the normal backing session.
+        const tmuxTarget = lastInitConfig?.adoptTmuxTarget
+          ?? (crashDiagnosticTmuxParked
+            ? TmuxBackend.diagnosticSessionName(sessionId)
+            : TmuxBackend.sessionName(sessionId));
         let cp: pty.IPty | null = null;
         const pendingInput: string[] = [];
 
@@ -5082,6 +5221,16 @@ process.on('message', async (raw: unknown) => {
       currentBotmuxTurnId = msg.turnId;
       if (msg.docComment && msg.turnId) docCommentTurnIds.add(msg.turnId);
       writeCliPidMarker();
+      if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
+        log('Message received after crash-loop stop; retrying CLI start');
+        destroyCrashDiagnosticTerminal('retry after message');
+        stopScreenAnalyzer();
+        stopScreenUpdates();
+        awaitingFirstPrompt = true;
+        startScreenUpdates();
+        startScreenAnalyzer();
+        spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+      }
       if (lastInitConfig?.adoptMode) {
         // Bridge mode: capture transcript baseline BEFORE writing to the pane,
         // so any assistant uuids appended after this point are attributed to
@@ -5202,6 +5351,17 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'park_diagnostic': {
+      // The daemon gave up auto-restarting (crash loop) and wants the last
+      // terminal output preserved. Park the diagnostic shell now — deferred from
+      // onExit so transient (auto-restarted) exits never pay for it. Mark the
+      // stopped state even if the tmux park fails, so the next message still
+      // retries the CLI (no hang) rather than writing into a dead pane.
+      parkCrashDiagnosticTerminal(lastCliExitCode, lastCliExitSignal);
+      crashDiagnosticStopped = true;
+      break;
+    }
+
     case 'restart': {
       if (lastInitConfig?.adoptMode) {
         log('Restart ignored in adopt mode');
@@ -5315,6 +5475,11 @@ process.on('message', async (raw: unknown) => {
       log('Suspend requested');
       stopScreenshotLoop();
       stopBridgeWatcher();
+      // A parked crash diagnostic shell has backend===null, so the
+      // destroySession/kill below is a no-op and would otherwise leak the
+      // bmx-diag-<sid> session. Tear it down explicitly. (The session then
+      // cold-resumes a FRESH CLI on the next message — bmx-<sid> is absent.)
+      destroyCrashDiagnosticTerminal('suspend');
       // Free the CLI's memory, not just the worker's: destroySession kills the
       // backing tmux/herdr/zellij session AND the CLI process inside it (kill()
       // would only detach the pty viewer and leave the CLI running in the
@@ -5405,14 +5570,23 @@ function teardownSandboxBestEffort(): void {
   try { sandboxCleanup?.(); } catch { /* */ }
   sandboxCleanup = null;
 }
+// Under pm2 the worker's stdout/stderr are pipes; a broken pipe (e.g. log
+// streaming detaches) would otherwise reach the uncaughtException handler below
+// and process.exit(1), killing a live session over a dropped log write. Install
+// the guard before any further stdout writes (log() writes to process.stdout).
+installStdioEpipeGuard();
 process.on('exit', () => { teardownSandboxBestEffort(); });
-process.on('uncaughtException', (err) => {
+process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
+  // A broken pipe on stdout/stderr (or any socket) must not tear down a live
+  // session — the stdio guard handles those it can; this is the backstop.
+  if (isIgnorableStreamError(err)) return;
   try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
   teardownSandboxBestEffort();
   try { cleanup(); } catch { /* */ }
   process.exit(1);
 });
 process.on('unhandledRejection', (reason: any) => {
+  if (isIgnorableStreamError(reason)) return;
   try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
   teardownSandboxBestEffort();
   try { cleanup(); } catch { /* */ }

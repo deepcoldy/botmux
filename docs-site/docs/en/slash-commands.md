@@ -14,6 +14,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
 | `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead) |
+| `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/t <prompt>` `/topic <prompt>` | Force a new topic inside a regular group |
 
 ## 🔀 Passthrough to the Underlying CLI

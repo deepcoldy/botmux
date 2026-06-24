@@ -246,6 +246,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
     // a turn is running is parked and merged into the active turn.
     supportsTypeAhead: true,
+    // TRAE's trust/advisory startup screens can accept stdin before the real
+    // composer exists, so the worker's 15s soft fallback must wait for the
+    // prompt marker. A hard cap in the worker still prevents permanent hangs.
+    deferFirstPromptTimeoutUntilReady: true,
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`

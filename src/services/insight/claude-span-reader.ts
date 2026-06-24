@@ -1,9 +1,13 @@
-import { phaseForTool, normalizeToolName } from './classify.js';
+import { phaseForTool, normalizeToolName, isUserRejectionText } from './classify.js';
 import { intentForToolInput, resultForToolOutput } from './intent.js';
 import { readCompleteJsonlObjects } from './jsonl.js';
 import { safePromptPreview } from './prompt.js';
-import { safeCommandPreview, safeOutputPreview } from './safe-detail.js';
-import type { InsightParseResult, InsightReaderOptions, RawInsightSpan, TurnContextPoint } from './types.js';
+import { safeCommandPreview, safeOutputPreview, safeTextPreview } from './safe-detail.js';
+import type { AgentSay, InsightParseResult, InsightReaderOptions, RawInsightSpan, TurnContextPoint } from './types.js';
+
+// Per-turn agent narration cap. Generous (conversation replay wants the agent's
+// reasoning), still bounded — the scrubber also caps + redacts secrets.
+const AGENT_SAY_MAX = 1500;
 
 function tsMs(value: unknown): number | undefined {
   if (typeof value !== 'string') return undefined;
@@ -152,6 +156,7 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
   let compactions = 0;
   const turnPrompts: InsightParseResult['turnPrompts'] = [];
   const turnContext: TurnContextPoint[] = [];
+  const sayBuf: string[][] = [];
   const seenUsageMessageIds = new Set<string>();
 
   for (const entry of read.entries) {
@@ -176,7 +181,9 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
     }
 
     for (const block of blocks(entry)) {
-      if (block?.type === 'tool_use' && typeof block.id === 'string') {
+      if (entry?.type === 'assistant' && block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        (sayBuf[Math.max(currentTurn, 0)] ??= []).push(block.text);
+      } else if (block?.type === 'tool_use' && typeof block.id === 'string') {
         const tool = normalizeToolName(block.name);
         const span: RawInsightSpan = {
           tool,
@@ -202,8 +209,6 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
       } else if (isToolResultBlock(block)) {
         const span = pending.get(block.tool_use_id);
         if (!span) continue;
-        span.status = block.is_error === true ? 'error' : 'ok';
-        span.outputSummary = summarizeToolOutput(block);
         // tool_result content may be a string OR an array of {type:'text',text}
         // blocks — flatten the array form too, else a successful array result
         // looks empty and mislabels as 'no_output'.
@@ -215,7 +220,12 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
                 .join('\n')
                 .trim() || undefined
             : undefined;
-        span.result = resultForToolOutput(span, output, block.is_error === true);
+        // A user rejecting a proposed tool use lands as is_error but is user
+        // behaviour, not a tool/agent failure — don't let it count as a failure.
+        const errored = block.is_error === true && !isUserRejectionText(output);
+        span.status = errored ? 'error' : 'ok';
+        span.outputSummary = summarizeToolOutput({ is_error: errored, content: block.content });
+        span.result = resultForToolOutput(span, output, errored);
         if (span.phase === 'run') {
           const safeOutput = safeOutputPreview(block.content);
           if (safeOutput) span.evidence = { ...(span.evidence ?? {}), output: safeOutput };
@@ -226,6 +236,13 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
     }
   }
 
+  const turnAgentSay: AgentSay[] = [];
+  sayBuf.forEach((chunks, i) => {
+    if (!chunks?.length) return;
+    const p = safeTextPreview(chunks.join('\n\n'), AGENT_SAY_MAX);
+    if (p) turnAgentSay[i] = { text: p.text, truncated: p.truncated };
+  });
+
   return {
     spans,
     compactions,
@@ -234,5 +251,6 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
     firstEventMs,
     turnPrompts,
     turnContext,
+    turnAgentSay,
   };
 }

@@ -31,6 +31,12 @@ import {
   t,
   ui,
 } from './ui.js';
+import {
+  IDLE_CLEANUP_HOUR_OPTIONS,
+  parseIdleCleanupHours,
+  selectIdleCleanupCandidates,
+  type IdleCleanupHours,
+} from '../session-cleanup.js';
 
 function th(sort: string, label: string): string {
   return `<th data-sort="${sort}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</th>`;
@@ -141,6 +147,7 @@ const ICON = {
   close: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.2 4.2 11.8 11.8"/><path d="M11.8 4.2 4.2 11.8"/></svg>',
   edit: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.7 3.3 12.7 5.3 6.3 11.7 3.7 12.3 4.3 9.7 10.7 3.3z"/></svg>',
   history: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.2 4.8a2 2 0 0 1 2-2h7.6a2 2 0 0 1 2 2v4.6a2 2 0 0 1-2 2H6.6l-2.9 2.4v-2.4h-.5a2 2 0 0 1-2-2z"/><path d="M5.2 6.2h5.6M5.2 8.4h3.6"/></svg>',
+  restart: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.4 6.2a4.8 4.8 0 1 0 1.1 3.1"/><path d="M12.4 2.9v3.3H9.1"/></svg>',
   // 飞书：两片交叠的羽毛向右上展翅（还原 Lark 彩色 logo 的飞鸟造型），单色
   // stroke:currentColor 适配本组线性图标，圆角端点呼应原 logo 的圆润羽尖。
   feishu: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.6 4.4C6.4 4 10.4 5.4 13.4 8.2 9.8 7 6.4 6.6 3.4 7.4"/><path d="M13.4 8.2C9.6 8.7 6 10 2.9 12 5.6 9 8.8 7.6 13.4 8.2"/></svg>',
@@ -214,6 +221,24 @@ export function renderCliFilterGroup(): string {
   </details>`;
 }
 
+export function restartConfirmMessage(s: any): string {
+  const status = String(s.status ?? 'unknown');
+  const cli = String(s.cliId ?? 'unknown');
+  const sep = ui.locale === 'zh' ? '：' : ': ';
+  return [
+    t('sessions.restartConfirmIntro'),
+    '',
+    `${t('sessions.restartConfirmStatus')}${sep}${status}`,
+    `${t('sessions.restartConfirmCli')}${sep}${cli}`,
+    '',
+    t('sessions.restartConfirmQuestion'),
+  ].join('\n');
+}
+
+export function canRestartSession(s: any): boolean {
+  return s.status !== 'closed' && !s.adopt && !s.pendingRepo;
+}
+
 function pageHtml(): string {
   return `<section class="page">
     <div class="page-heading">
@@ -223,6 +248,7 @@ function pageHtml(): string {
         <p>${t('sessions.subtitle')}</p>
       </div>
       <div class="sessions-view-controls">
+        <button type="button" id="create-session-btn" class="primary create-session-btn">＋ ${t('sessions.create.button')}</button>
         <span id="kanban-team-stats" class="kanban-team-stats" hidden></span>
         <select id="kanban-team" class="kanban-team-select" aria-label="${t('sessions.kanban.groupTeam')}" hidden></select>
         <div class="segmented kanban-groupby" id="kanban-groupby" role="group" aria-label="${t('sessions.kanban.groupBy')}" hidden>
@@ -252,6 +278,20 @@ function pageHtml(): string {
       ${renderCliFilterGroup()}
       <label class="filter-toggle"><input type="checkbox" name="active" checked> <span>${t('sessions.activeOnly')}</span></label>
     </form>
+    <div id="idle-cleanup-bar" class="idle-cleanup-bar">
+      <div class="idle-cleanup-summary">
+        <span class="idle-cleanup-dot" aria-hidden="true"></span>
+        <span id="idle-cleanup-count" class="idle-cleanup-count"></span>
+      </div>
+      <div class="idle-cleanup-controls">
+        <span class="idle-cleanup-label">${t('sessions.idleCleanupOlderThan')}</span>
+        <div id="idle-cleanup-threshold" class="idle-cleanup-thresholds" role="group" aria-label="${t('sessions.idleCleanupThreshold')}">
+          ${IDLE_CLEANUP_HOUR_OPTIONS.map(hours => `<button type="button" data-hours="${hours}" aria-pressed="${hours === 24 ? 'true' : 'false'}">${hours === 168 ? '7d' : `${hours}H`}</button>`).join('')}
+        </div>
+        <button type="button" id="idle-cleanup-run" class="contrast idle-cleanup-run">${t('sessions.idleCleanupRun')}</button>
+      </div>
+      <span id="idle-cleanup-status" class="idle-cleanup-status" aria-live="polite"></span>
+    </div>
     <div id="bulk-bar" class="bulk-bar" hidden>
       <span id="bulk-count"></span>
       <button type="button" id="bulk-close" class="contrast">${t('sessions.closeSelected')}</button>
@@ -279,7 +319,187 @@ function pageHtml(): string {
     <dialog id="drawer"></dialog>
     <dialog id="term-modal" class="term-modal"></dialog>
     <dialog id="history-modal" class="history-modal"></dialog>
+    <dialog id="create-session-modal" class="create-session-modal"></dialog>
   </section>`;
+}
+
+// ─── 创建会话 modal ──────────────────────────────────────────────────────────
+
+interface PickerBot { larkAppId: string; botName: string; }
+
+async function fetchPickerBots(): Promise<PickerBot[]> {
+  try {
+    const r = await fetch('/api/groups');
+    if (!r.ok) return [];
+    const data = await r.json();
+    const bots = Array.isArray(data?.bots) ? data.bots : [];
+    return bots
+      .filter((b: any) => b && typeof b.larkAppId === 'string')
+      .map((b: any) => ({ larkAppId: b.larkAppId, botName: typeof b.botName === 'string' && b.botName ? b.botName : b.larkAppId }));
+  } catch { return []; }
+}
+
+function renderCreateSessionForm(bots: PickerBot[]): string {
+  const botRows = bots.map(b => `
+    <label class="cs-bot"><input type="checkbox" name="bot" value="${escapeHtml(b.larkAppId)}"> <span>${escapeHtml(b.botName)}</span></label>`).join('');
+  return `
+    <article class="cs-card">
+      <header><h3>${t('sessions.create.title')}</h3></header>
+      <form id="cs-form">
+        <label class="form-row">
+          <span>${t('sessions.create.content')}</span>
+          <textarea name="content" rows="5" placeholder="${escapeHtml(t('sessions.create.contentPlaceholder'))}" required></textarea>
+        </label>
+        <fieldset class="cs-bots">
+          <legend>${t('sessions.create.bots')}</legend>
+          ${botRows || `<p class="cs-empty">${t('sessions.create.noBots')}</p>`}
+        </fieldset>
+        <fieldset class="cs-mode">
+          <legend>${t('sessions.create.mode')}</legend>
+          <label><input type="radio" name="mode" value="lead" checked> ${t('sessions.create.modeLead')}</label>
+          <label><input type="radio" name="mode" value="all"> ${t('sessions.create.modeAll')}</label>
+          <small>${t('sessions.create.modeHelp')}</small>
+        </fieldset>
+        <div class="cs-lead-row form-row" hidden>
+          <span>${t('sessions.create.lead')}</span>
+          <select name="lead"></select>
+          <small>${t('sessions.create.leadHelp')}</small>
+        </div>
+        <fieldset class="cs-column">
+          <legend>${t('sessions.create.column')}</legend>
+          <label><input type="radio" name="column" value="in_progress" checked> ${t('sessions.create.columnInProgress')}</label>
+          <label><input type="radio" name="column" value="backlog"> ${t('sessions.create.columnBacklog')}</label>
+          <small>${t('sessions.create.columnHelp')}</small>
+        </fieldset>
+        <details class="cs-advanced">
+          <summary>${t('sessions.create.advanced')}</summary>
+          <label class="form-row">
+            <span>${t('sessions.create.groupName')}</span>
+            <input type="text" name="name" maxlength="60" placeholder="${escapeHtml(t('sessions.create.groupNamePlaceholder'))}">
+          </label>
+          <label class="form-row">
+            <span>${t('sessions.create.workingDir')}</span>
+            <input type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/foo">
+            <small>${t('sessions.create.workingDirHelp')}</small>
+          </label>
+        </details>
+        <div class="actions cs-actions">
+          <button type="submit" class="primary">${t('sessions.create.submit')}</button>
+          <button type="button" id="cs-cancel">${t('sessions.create.cancel')}</button>
+        </div>
+      </form>
+    </article>`;
+}
+
+function setupCreateSessionModal(modal: HTMLDialogElement, btn: HTMLButtonElement): void {
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const bots = await fetchPickerBots();
+      if (bots.length === 0) { alert(t('sessions.create.noBots')); return; }
+      modal.innerHTML = renderCreateSessionForm(bots);
+      modal.showModal();
+      wireCreateSessionForm(modal, bots);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+function wireCreateSessionForm(modal: HTMLDialogElement, bots: PickerBot[]): void {
+  const form = modal.querySelector<HTMLFormElement>('#cs-form')!;
+  const leadRow = modal.querySelector<HTMLElement>('.cs-lead-row')!;
+  const leadSelect = modal.querySelector<HTMLSelectElement>('select[name=lead]')!;
+  const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
+
+  const checkedBotIds = (): string[] =>
+    Array.from(form.querySelectorAll<HTMLInputElement>('input[name=bot]:checked')).map(i => i.value);
+  const currentMode = (): string =>
+    (form.querySelector<HTMLInputElement>('input[name=mode]:checked')?.value) ?? 'all';
+
+  // lead 下拉只列「已勾选」的 bot；勾选/模式变化时重建，尽量保留原选中项。
+  function repopulateLead(): void {
+    const ids = checkedBotIds();
+    const prev = leadSelect.value;
+    // 没勾选任何机器人时，空 <select> 会渲染成一个空白小框，看着像 bug——给一个
+    // 禁用的占位项并禁用整个选择器，提示先去上面勾选。
+    if (ids.length === 0) {
+      leadSelect.innerHTML = `<option value="" disabled selected>${escapeHtml(t('sessions.create.leadPickFirst'))}</option>`;
+      leadSelect.disabled = true;
+      return;
+    }
+    leadSelect.disabled = false;
+    leadSelect.innerHTML = ids.map(id => `<option value="${escapeHtml(id)}">${escapeHtml(nameOf(id))}</option>`).join('');
+    if (ids.includes(prev)) leadSelect.value = prev;
+  }
+  function syncMode(): void {
+    if (currentMode() === 'lead') { leadRow.hidden = false; repopulateLead(); }
+    else { leadRow.hidden = true; }
+  }
+
+  form.querySelectorAll<HTMLInputElement>('input[name=mode]').forEach(r => r.addEventListener('change', syncMode));
+  form.querySelectorAll<HTMLInputElement>('input[name=bot]').forEach(c => c.addEventListener('change', () => {
+    if (currentMode() === 'lead') repopulateLead();
+  }));
+  // 按默认模式(Lead 分配)初始化 Lead 行的显隐——一起开工时整行不展示。
+  syncMode();
+  modal.querySelector<HTMLButtonElement>('#cs-cancel')!.onclick = () => modal.close();
+
+  form.onsubmit = async ev => {
+    ev.preventDefault();
+    const fd = new FormData(form);
+    const content = ((fd.get('content') as string) ?? '').trim();
+    const larkAppIds = checkedBotIds();
+    const mode = currentMode();
+    const column = ((fd.get('column') as string) ?? 'in_progress');
+    const name = ((fd.get('name') as string) ?? '').trim();
+    const bindWorkingDir = ((fd.get('bindWorkingDir') as string) ?? '').trim();
+    const leadLarkAppId = ((fd.get('lead') as string) ?? '');
+    if (!content) { alert(t('sessions.create.errContent')); return; }
+    if (larkAppIds.length === 0) { alert(t('sessions.create.errNoBot')); return; }
+    if (mode === 'lead' && (!leadLarkAppId || !larkAppIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
+    const submitBtn = form.querySelector<HTMLButtonElement>('button[type=submit]');
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = t('sessions.create.submitting'); }
+    try {
+      const r = await fetch('/api/sessions/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content, larkAppIds, mode, column,
+          leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
+          name: name || undefined,
+          bindWorkingDir: bindWorkingDir || undefined,
+        }),
+      });
+      const body = await r.json().catch(() => null);
+      if (r.ok && body?.ok) {
+        renderCreateSessionSuccess(modal, body);
+      } else if (r.status !== 401) {
+        alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = t('sessions.create.submit'); }
+      }
+    } catch (e) {
+      alert(`${t('sessions.create.failed')}: ${e}`);
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = t('sessions.create.submit'); }
+    }
+  };
+}
+
+function renderCreateSessionSuccess(modal: HTMLDialogElement, body: any): void {
+  const link = typeof body.shareLink === 'string' && body.shareLink ? body.shareLink : '';
+  const failedN = Array.isArray(body.failed) ? body.failed.length : 0;
+  const spawnedN = Array.isArray(body.spawned) ? body.spawned.length : 0;
+  const colNote = body.column === 'backlog' ? t('sessions.create.doneBacklog') : t('sessions.create.doneInProgress');
+  const failNote = failedN > 0 ? `<p class="cs-warn">${t('sessions.create.partialFail', { n: String(failedN) })}</p>` : '';
+  modal.innerHTML = `
+    <article class="cs-card">
+      <header><h3>${t('sessions.create.doneTitle')}</h3></header>
+      <p>${escapeHtml(colNote)}（${spawnedN}）</p>
+      ${failNote}
+      ${link ? `<p><a href="${escapeHtml(link)}" target="_blank" rel="noopener">${t('sessions.create.openChat')}</a></p>` : ''}
+      <div class="actions"><button type="button" id="cs-done" class="primary">${t('sessions.create.close')}</button></div>
+    </article>`;
+  modal.querySelector<HTMLButtonElement>('#cs-done')!.onclick = () => modal.close();
 }
 
 export function renderSessionsPage(root: HTMLElement) {
@@ -292,6 +512,11 @@ export function renderSessionsPage(root: HTMLElement) {
   const bulkCountSpan = root.querySelector<HTMLElement>('#bulk-count')!;
   const bulkCloseBtn = root.querySelector<HTMLButtonElement>('#bulk-close')!;
   const bulkClearBtn = root.querySelector<HTMLButtonElement>('#bulk-clear')!;
+  const idleCleanupBar = root.querySelector<HTMLElement>('#idle-cleanup-bar')!;
+  const idleCleanupThreshold = root.querySelector<HTMLElement>('#idle-cleanup-threshold')!;
+  const idleCleanupBtn = root.querySelector<HTMLButtonElement>('#idle-cleanup-run')!;
+  const idleCleanupCount = root.querySelector<HTMLElement>('#idle-cleanup-count')!;
+  const idleCleanupStatus = root.querySelector<HTMLElement>('#idle-cleanup-status')!;
   const table = root.querySelector<HTMLTableElement>('#sessions-table')!;
   const board = root.querySelector<HTMLElement>('#sessions-board')!;
   const kanban = root.querySelector<HTMLElement>('#sessions-kanban')!;
@@ -301,6 +526,9 @@ export function renderSessionsPage(root: HTMLElement) {
   const teamSelect = root.querySelector<HTMLSelectElement>('#kanban-team')!;
   const teamStats = root.querySelector<HTMLElement>('#kanban-team-stats')!;
   const viewButtons = root.querySelectorAll<HTMLButtonElement>('.sessions-view-toggle [data-view]');
+  const createSessionBtn = root.querySelector<HTMLButtonElement>('#create-session-btn')!;
+  const createSessionModal = root.querySelector<HTMLDialogElement>('#create-session-modal')!;
+  setupCreateSessionModal(createSessionModal, createSessionBtn);
 
   const selected = new Set<string>();
   let sortKey = 'lastMessageAt';
@@ -347,6 +575,71 @@ export function renderSessionsPage(root: HTMLElement) {
   let kanbanTeamKey: string = (() => {
     try { return window.localStorage.getItem(KANBAN_TEAM_STORAGE_KEY) ?? ''; } catch { return ''; }
   })();
+  let idleCleanupBusy = false;
+  let idleCleanupHours: IdleCleanupHours = 24;
+
+  function selectedIdleCleanupHours(): IdleCleanupHours {
+    return idleCleanupHours;
+  }
+
+  function idleCleanupLabel(hours: IdleCleanupHours): string {
+    return hours === 168 ? '7d' : `${hours}H`;
+  }
+
+  /** Chat IDs that belong to `team` in the kanban "team" view — the same
+   *  whitelist renderKanban uses to narrow the board (team-bound group chats +
+   *  groups where a same-team bot was /introduce'd). Extracted so idle cleanup
+   *  can scope to exactly what the team board shows. */
+  function teamChatIdsFor(team: any): Set<string> {
+    const teamChats = new Set<string>();
+    if (!team) return teamChats;
+    for (const chatId of team.groupChats) teamChats.add(chatId);
+    if (kanbanChatBots) {
+      for (const [chatId, c] of kanbanChatBots) {
+        if (teamChats.has(chatId)) continue;
+        let hasTeamBot = false;
+        for (const id of team.botIds) {
+          if (c.botIds.has(id)) { hasTeamBot = true; break; }
+        }
+        if (!hasTeamBot) continue;
+        for (const n of c.observedNames) {
+          if (team.botNames.has(n)) { teamChats.add(chatId); break; }
+        }
+      }
+    }
+    return teamChats;
+  }
+
+  /** Local rows actually visible in the current view — the basis for idle
+   *  cleanup so "所见即所关" holds everywhere. Table/board and kanban
+   *  (by-status / by-bot) render the full `filtered()` set; only the team
+   *  kanban narrows further to the selected team's chats AND overlays remote
+   *  rows from other deployments (which this dashboard can't close). Mirror the
+   *  team narrowing and never include remote rows. */
+  function currentCleanupVisibleRows(): any[] {
+    const rows = filtered();
+    if (viewMode === 'kanban' && kanbanGroupBy === 'team') {
+      const team = kanbanTeams.find(tm => tm.key === kanbanTeamKey) ?? kanbanTeams[0];
+      const teamChats = teamChatIdsFor(team);
+      return rows.filter(r => teamChats.has(String(r.chatId)));
+    }
+    return rows;
+  }
+
+  function currentIdleCleanupCandidates(): any[] {
+    // Scope to the rows actually visible in the current view (WYSIWYG): the
+    // count, the confirm dialog, and the sessionIds we POST all describe exactly
+    // what the operator sees — never other bots'/teams' sessions off-screen.
+    return selectIdleCleanupCandidates(currentCleanupVisibleRows(), selectedIdleCleanupHours());
+  }
+
+  function paintIdleCleanupThresholds(): void {
+    idleCleanupThreshold.querySelectorAll<HTMLButtonElement>('button[data-hours]').forEach(btn => {
+      const active = parseIdleCleanupHours(btn.dataset.hours) === idleCleanupHours;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+  }
 
   async function loadKanbanTeams(): Promise<void> {
     if (kanbanTeamsLoading || kanbanTeamsLoaded) return;
@@ -615,6 +908,7 @@ export function renderSessionsPage(root: HTMLElement) {
       <div class="session-card-actions">
         ${chatScopeLink(s) ?? cardActBtn('locate', ICON.pin, t('sessions.locate'))}
         ${cardActBtn('details', ICON.details, t('sessions.details'))}
+        ${canRestartSession(s) ? cardActBtn('restart', ICON.restart, t('sessions.restart')) : ''}
         ${terminalControlsHtml(terminal)}
         ${cardActBtn('close', ICON.close, t('sessions.close'), 'danger')}
       </div>
@@ -692,7 +986,8 @@ export function renderSessionsPage(root: HTMLElement) {
           <span class="kanban-card-dot" data-status="${escapeHtml(status)}" title="${escapeHtml(status)}"></span>
           ${remote ? '' : `<button type="button" class="card-act kanban-card-act" data-action="history" title="${escapeHtml(t('sessions.history.title'))}" aria-label="${escapeHtml(t('sessions.history.title'))}">${ICON.history}</button>
           ${s.feishuChatLink ? `<a class="card-act kanban-card-act" href="${escapeHtml(s.feishuChatLink)}" target="_blank" rel="noopener" title="${escapeHtml(t('sessions.kanban.openFeishu'))}" aria-label="${escapeHtml(t('sessions.kanban.openFeishu'))}">${ICON.feishu}</a>` : ''}
-          <button type="button" class="card-act kanban-card-act" data-action="details" title="${escapeHtml(t('sessions.details'))}" aria-label="${escapeHtml(t('sessions.details'))}">${ICON.details}</button>`}
+          <button type="button" class="card-act kanban-card-act" data-action="details" title="${escapeHtml(t('sessions.details'))}" aria-label="${escapeHtml(t('sessions.details'))}">${ICON.details}</button>
+          ${canRestartSession(s) ? `<button type="button" class="card-act kanban-card-act" data-action="restart" title="${escapeHtml(t('sessions.restart'))}" aria-label="${escapeHtml(t('sessions.restart'))}">${ICON.restart}</button>` : ''}`}
         </span>
       </div>
       <p class="kanban-card-title" title="${escapeHtml(String(s.title ?? title))}">${escapeHtml(String(title).slice(0, 140))}</p>
@@ -824,26 +1119,8 @@ export function renderSessionsPage(root: HTMLElement) {
         //   B. 群里 /introduce 过该团队成员机器人的群——介绍记录按名字与团队
         //      roster 匹配；介绍过的若不是本团队成员，不算（防误筛）
         // 命中群里所有 bot 的会话都展示（本质 = 同团队 bot 所在群/话题的会话）。
-        let teamRows: any[] = [];
-        const teamChats = new Set<string>();
-        if (team) {
-          for (const chatId of team.groupChats) teamChats.add(chatId);
-          if (kanbanChatBots) {
-            for (const [chatId, c] of kanbanChatBots) {
-              if (teamChats.has(chatId)) continue;
-              // 自家团队 bot 在场，且群里介绍过同团队的外部机器人
-              let hasTeamBot = false;
-              for (const id of team.botIds) {
-                if (c.botIds.has(id)) { hasTeamBot = true; break; }
-              }
-              if (!hasTeamBot) continue;
-              for (const n of c.observedNames) {
-                if (team.botNames.has(n)) { teamChats.add(chatId); break; }
-              }
-            }
-          }
-          teamRows = rows.filter(r => teamChats.has(String(r.chatId)));
-        }
+        const teamChats = teamChatIdsFor(team);
+        const teamRows = team ? rows.filter(r => teamChats.has(String(r.chatId))) : [];
         // ── hub 团队看板合并（申晗架构：编排存团队 host）──────────────────────
         // 本地行（实时）+ 对方部署上报的裁剪行（host 快照）；共享编排的列/排序
         // 覆盖个人看板字段——团队视图里大家看到同一份摆放。
@@ -1238,6 +1515,17 @@ export function renderSessionsPage(root: HTMLElement) {
     selectAllBox.indeterminate = selectedInView > 0 && selectedInView < selectable.length;
   }
 
+  function syncIdleCleanupUi(): void {
+    const count = currentIdleCleanupCandidates().length;
+    idleCleanupCount.textContent = t('sessions.idleCleanupCount', { count });
+    idleCleanupBtn.disabled = idleCleanupBusy || count === 0;
+    // Keep the bar (and its threshold switcher) visible so the operator can
+    // probe other thresholds, but drop the danger-red dot to neutral when
+    // there's nothing to clean — a red alarm at 0 candidates is misleading.
+    idleCleanupBar.classList.toggle('is-empty', count === 0);
+    paintIdleCleanupThresholds();
+  }
+
   function paintViewToggle(): void {
     viewButtons.forEach(btn => {
       const active = btn.dataset.view === viewMode;
@@ -1292,6 +1580,7 @@ export function renderSessionsPage(root: HTMLElement) {
     paintSortHeaders();
     paintCliFilterCount();
     syncBulkUi(visibleRows);
+    syncIdleCleanupUi();
   }
 
   async function locateSession(s: any, locateBtn?: HTMLButtonElement): Promise<void> {
@@ -1351,6 +1640,37 @@ export function renderSessionsPage(root: HTMLElement) {
       return false;
     } finally {
       if (closeBtn) closeBtn.disabled = false;
+    }
+  }
+
+  // Per-session restart cooldown. The route returns 200 the instant the IPC is
+  // sent — long before the worker's ~500ms+ respawn — so re-enabling the button
+  // immediately let a second restart land inside the respawn window, which trips
+  // the worker's tier-2 crash-loop guard (2 restarts before the CLI reaches its
+  // prompt) and silently drops --resume, losing conversation context. This Set
+  // debounces independently of the button DOM, which the table/board/kanban
+  // rebuild via innerHTML on every SSE update (a DOM-only `disabled` is wiped).
+  const restartCooldownIds = new Set<string>();
+
+  async function restartSession(s: any, restartBtn?: HTMLButtonElement): Promise<boolean> {
+    if (restartCooldownIds.has(s.sessionId)) return false;
+    if (!confirm(restartConfirmMessage(s))) return false;
+    if (restartBtn) restartBtn.disabled = true;
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/restart`, { method: 'POST' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false) {
+        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.error ?? r.status}`);
+        return false;
+      }
+      restartCooldownIds.add(s.sessionId);
+      setTimeout(() => restartCooldownIds.delete(s.sessionId), 5000);
+      return true;
+    } catch (e) {
+      alert(`${t('sessions.restartFailed')}: ${e}`);
+      return false;
+    } finally {
+      if (restartBtn) restartBtn.disabled = false;
     }
   }
 
@@ -1426,6 +1746,8 @@ export function renderSessionsPage(root: HTMLElement) {
         ${chatScopeLink(s) ?? `<button id="locate-btn" type="button">${t('sessions.locate')}</button>`}
         <button id="history-drawer-btn" type="button">${t('sessions.history.title')}</button>
         ${terminalControlsHtml(terminal)}
+        ${canRestartSession(s) ? `<button id="restart-btn" type="button">${t('sessions.restart')}</button>` : ''}
+        ${s.queued && !closed ? `<button id="start-btn" type="button" class="primary">${t('sessions.create.start')}</button>` : ''}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
         <button id="land-btn" type="button">${t('sessions.land')}</button>
@@ -1481,10 +1803,38 @@ export function renderSessionsPage(root: HTMLElement) {
       };
     }
 
+    const restartBtn = drawer.querySelector<HTMLButtonElement>('#restart-btn');
+    if (restartBtn) {
+      restartBtn.onclick = async () => {
+        if (await restartSession(s, restartBtn)) drawer.close();
+      };
+    }
+
     const closeBtn = drawer.querySelector<HTMLButtonElement>('#close-btn');
     if (closeBtn) {
       closeBtn.onclick = async () => {
         if (await closeSession(s, closeBtn)) drawer.close();
+      };
+    }
+
+    // 待办池会话「开始」：激活 parked 会话（发首轮、起 CLI）。
+    const startBtn = drawer.querySelector<HTMLButtonElement>('#start-btn');
+    if (startBtn) {
+      startBtn.onclick = async () => {
+        startBtn.disabled = true;
+        try {
+          const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/start`, { method: 'POST' });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok || body.ok === false) {
+            if (r.status !== 401) alert(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`);
+            startBtn.disabled = false;
+            return;
+          }
+          drawer.close();
+        } catch (e) {
+          alert(`${t('sessions.create.startFailed')}: ${e}`);
+          startBtn.disabled = false;
+        }
       };
     }
 
@@ -1594,6 +1944,7 @@ export function renderSessionsPage(root: HTMLElement) {
       if (action === 'details') openDrawer(s);
       else if (action === 'write-link') void openWriteLink(s, actionButton);
       else if (action === 'locate') void locateSession(s, actionButton);
+      else if (action === 'restart') void restartSession(s, actionButton);
       else if (action === 'close') void closeSession(s, actionButton).then(ok => {
         if (ok) {
           selected.delete(s.sessionId);
@@ -1695,6 +2046,7 @@ export function renderSessionsPage(root: HTMLElement) {
       if (actionButton.dataset.action === 'details') openDrawer(s);
       else if (actionButton.dataset.action === 'rename') startKanbanRename(card, s);
       else if (actionButton.dataset.action === 'history') void openHistoryModal(s);
+      else if (actionButton.dataset.action === 'restart') void restartSession(s, actionButton);
       return;
     }
     if (target.closest('a, button, input, label')) return;
@@ -1915,6 +2267,59 @@ export function renderSessionsPage(root: HTMLElement) {
     selected.clear();
     rerender();
     if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
+  });
+
+  idleCleanupThreshold.addEventListener('click', e => {
+    // Don't let a threshold switch mid-cleanup repaint the count/pill against a
+    // different threshold than the request that's already running.
+    if (idleCleanupBusy) return;
+    const btn = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-hours]');
+    if (!btn) return;
+    const next = parseIdleCleanupHours(btn.dataset.hours);
+    if (!next || next === idleCleanupHours) return;
+    idleCleanupHours = next;
+    idleCleanupStatus.textContent = '';
+    syncIdleCleanupUi();
+  });
+
+  idleCleanupBtn.addEventListener('click', async () => {
+    const hours = selectedIdleCleanupHours();
+    const candidates = currentIdleCleanupCandidates();
+    if (candidates.length === 0) return;
+    const label = idleCleanupLabel(hours);
+    if (!confirm(t('sessions.idleCleanupConfirm', { count: candidates.length, threshold: label }))) return;
+    idleCleanupBusy = true;
+    idleCleanupBtn.disabled = true;
+    idleCleanupStatus.textContent = t('sessions.idleCleanupRunning');
+    try {
+      const r = await fetch('/api/sessions/cleanup-idle', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        // Send the filtered candidate ids so the server closes exactly what the
+        // operator saw and confirmed (it re-validates each is still idle).
+        body: JSON.stringify({ olderThanHours: hours, sessionIds: candidates.map(c => c.sessionId) }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (r.status !== 401) alert(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`);
+        idleCleanupStatus.textContent = '';
+        return;
+      }
+      for (const item of body?.results ?? []) {
+        if (item?.ok && item?.sessionId) selected.delete(String(item.sessionId));
+      }
+      idleCleanupStatus.textContent = t('sessions.idleCleanupDone', {
+        closed: Number(body?.closed ?? 0),
+        failed: Number(body?.failed ?? 0),
+      });
+      rerender();
+    } catch (e) {
+      alert(`${t('sessions.idleCleanupFailed')}: ${e}`);
+      idleCleanupStatus.textContent = '';
+    } finally {
+      idleCleanupBusy = false;
+      syncIdleCleanupUi();
+    }
   });
 
   table.querySelectorAll<HTMLTableCellElement>('th[data-sort]').forEach(header => {

@@ -57,6 +57,7 @@ import { firstPositional } from './cli/arg-utils.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { loadDashboardSecret } from './dashboard/auth.js';
 import { rejectLikelyWindowsStdinMojibake } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
@@ -2617,11 +2618,17 @@ async function cmdTermLink(rest: string[]): Promise<void> {
   }
 
   const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
-  if (!existsSync(SECRET_PATH)) {
-    console.error('❌ 缺少 .dashboard-secret（daemon 未初始化）。先 `botmux restart`。');
+  let secret: string | null;
+  try {
+    secret = loadDashboardSecret(SECRET_PATH);
+  } catch (e) {
+    console.error(`❌ 无法读取 .dashboard-secret：${(e as Error).message}`);
     process.exit(1);
   }
-  const secret = readFileSync(SECRET_PATH, 'utf8').trim();
+  if (!secret) {
+    console.error('❌ 缺少或为空 .dashboard-secret（daemon 未初始化）。先 `botmux restart`。');
+    process.exit(1);
+  }
   const ts = Math.floor(Date.now() / 1000).toString();
   const nonce = randomBytes(8).toString('hex');
   const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
@@ -5554,6 +5561,12 @@ switch (command) {
   case 'status':  cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(); break;
+  case 'bind': {
+    // `botmux bind <code>` — 把本机绑定到中心化平台
+    const { cmdBind } = await import('./platform/bind.js');
+    await cmdBind(process.argv.slice(3));
+    break;
+  }
   case 'list':
   case 'ls':      await cmdList(); break;
   case 'delete':

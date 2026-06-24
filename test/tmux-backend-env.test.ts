@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
+  DIAGNOSTIC_SHELL_SCRIPT,
   resolveUserShell,
   SHELL_WRAPPER_SCRIPT,
 } from '../src/adapters/backend/tmux-backend.js';
@@ -350,6 +351,39 @@ describe('debug keep-shell wrapper end-to-end', () => {
       expect(result.stderr).toContain('[botmux debug]');
       expect(result.stderr).toContain('status 7'); // surfaced fake CLI exit
       expect(result.stdout).toContain('PROBE-RAN');
+    },
+  );
+});
+
+describe('diagnostic shell wrapper', () => {
+  const hasEnvBin = existsSync('/usr/bin/env');
+
+  it('keeps a shell alive after printing the preserved output', () => {
+    expect(DIAGNOSTIC_SHELL_SCRIPT).toContain('cat -- "$2"');
+    expect(DIAGNOSTIC_SHELL_SCRIPT).toContain('Auto-restart is paused');
+    expect(DIAGNOSTIC_SHELL_SCRIPT).toMatch(/exec "\$3" -i$/);
+  });
+
+  it.skipIf(!hasEnvBin)(
+    'prints the diagnostic file and then hands off to the shell',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bmx-diag-'));
+      try {
+        const diag = join(dir, 'diag.ansi');
+        writeFileSync(diag, 'startup failed\nmissing token\n');
+        const probeScript = DIAGNOSTIC_SHELL_SCRIPT.replace('exec "$3" -i', 'echo DIAG-SHELL-READY');
+        const result = spawnSync(
+          '/bin/sh',
+          ['-c', probeScript, '_', dir, diag, '/bin/sh'],
+          { encoding: 'utf-8', env: { HOME: dir, PATH: '/usr/bin:/bin' } },
+        );
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('startup failed');
+        expect(result.stdout).toContain('missing token');
+        expect(result.stdout).toContain('DIAG-SHELL-READY');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     },
   );
 });

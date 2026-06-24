@@ -521,13 +521,20 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       : t('botDefaults.quotaStateOn', { count: quota });
   }
 
-  // 授权（/grant）相关：命令限制开关（auto-save 复选框）+ 默认消息额度（数字输入 + 保存/关闭按钮，
-  // 空＝关闭无限）。两者都通过 PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
+  // 授权（/grant）相关：自动申请卡、命令限制开关 + 默认消息额度。都通过
+  // PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
   function renderGrantSection(b: any): string {
     const restrict = b.restrictGrantCommands === true;
+    const autoCard = b.autoGrantRequestCards !== false;
     const quota: number | null = typeof b.messageQuotaDefaultLimit === 'number' ? b.messageQuotaDefaultLimit : null;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionGrant')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-auto-grant-card" ${autoCard ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.autoGrantCard')}</strong>
+        <small>${t('botDefaults.autoGrantCardHelp')}</small></span>
+      </label>
       <label class="toggle-row">
         <input type="checkbox" data-action="toggle-restrict-grant" ${restrict ? 'checked' : ''}>
         <span class="switch" aria-hidden="true"></span>
@@ -1089,7 +1096,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
-      // ── 授权偏好：命令限制开关 + 默认消息额度 ──────────────────────────
+      // ── 授权偏好：自动申请卡 + 命令限制开关 + 默认消息额度 ──────────────
+      const autoGrantCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-grant-card]');
       const restrictCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-restrict-grant]');
       const quotaInput = card.querySelector<HTMLInputElement>('input[data-input=quotaLimit]');
       const quotaSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-quota]');
@@ -1097,10 +1105,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       const grantStatusEl = card.querySelector<HTMLSpanElement>('[data-grant-status]');
       const quotaStateEl = card.querySelector<HTMLElement>('[data-quota-state]');
 
-      // PUT a partial grant-prefs patch ({ restrictGrantCommands? } and/or
-      // { messageQuotaDefaultLimit: number|null }). Mirrors putCardPref.
+      // PUT a partial grant-prefs patch ({ autoGrantRequestCards? },
+      // { restrictGrantCommands? } and/or { messageQuotaDefaultLimit: number|null }).
+      // Mirrors putCardPref.
       async function putGrantPref(
-        patch: { restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
+        patch: { autoGrantRequestCards?: boolean; restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
         selfEl: HTMLInputElement | HTMLButtonElement,
       ) {
         if (!grantStatusEl) return;
@@ -1120,6 +1129,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             const next: number | null = typeof body.messageQuotaDefaultLimit === 'number' ? body.messageQuotaDefaultLimit : null;
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
+              cached.autoGrantRequestCards = body.autoGrantRequestCards !== false;
               cached.restrictGrantCommands = body.restrictGrantCommands === true;
               cached.messageQuotaDefaultLimit = next;
             }
@@ -1139,6 +1149,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         }
       }
 
+      if (autoGrantCardCb) {
+        autoGrantCardCb.addEventListener('change', () => {
+          putGrantPref({ autoGrantRequestCards: autoGrantCardCb.checked }, autoGrantCardCb);
+        });
+      }
       if (restrictCb) {
         restrictCb.addEventListener('change', () => {
           putGrantPref({ restrictGrantCommands: restrictCb.checked }, restrictCb);

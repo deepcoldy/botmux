@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { cliAuthBind, signCliAuth } from '../dashboard/auth.js';
+import { cliAuthBind, loadDashboardSecret, signCliAuth } from '../dashboard/auth.js';
 
 /**
  * Loopback HMAC client for the dashboard process's `/__cli/*` endpoints, used by
@@ -157,8 +157,13 @@ export async function callDashboard(opts: {
   const fetchImpl = opts.fetchImpl ?? fetch;
 
   const secretPath = join(opts.configDir, '.dashboard-secret');
-  if (!existsSync(secretPath)) return { ok: false, reason: 'no-secret' };
-  const secret = readFileSync(secretPath, 'utf8').trim();
+  let secret: string | null;
+  try {
+    secret = loadDashboardSecret(secretPath);
+  } catch (e) {
+    return { ok: false, reason: 'no-secret', detail: (e as Error).message };
+  }
+  if (!secret) return { ok: false, reason: 'no-secret' };
 
   const portFile = join(opts.configDir, '.dashboard-port');
   const recorded = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')

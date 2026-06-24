@@ -44,6 +44,9 @@ export interface OwnerCandidate { unionId: string; name: string }
  *  without network. */
 interface OwnerResolveDeps {
   configs?: () => BotConfig[];
+  /** Auth-only callers only need union_id membership and should not pay a
+   *  best-effort contact lookup just to decorate direct `on_` candidates. */
+  skipNames?: boolean;
   /** Ensure a usable Lark client exists for cfg. The DASHBOARD process has no bot
    *  registry (it proxies to daemons), so getBotClient() would throw — register
    *  the cfg on demand (it carries the app secret from bots.json). */
@@ -69,6 +72,7 @@ export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps
   const ensureClient = d.ensureClient ?? ((cfg: BotConfig) => { try { getBot(cfg.larkAppId); } catch { registerBot(cfg); } });
   const resolveAllowed = d.resolveAllowed ?? (async (id, a) => (await resolveAllowedUsersWithMap(id, a)).resolved);
   const resolveUnion = d.resolveUnion ?? resolveUserUnionId;
+  const skipNames = d.skipNames === true;
   let configs: BotConfig[] = [];
   try { configs = loadConfigs(); } catch { return []; }
   const byUnion = new Map<string, OwnerCandidate>();
@@ -80,13 +84,15 @@ export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps
     for (const v of allowed) {
       if (!v.startsWith('on_') || byUnion.has(v)) continue;
       let name = '';
-      try {
-        ensureClient(cfg);
-        const res = await (getBot(cfg.larkAppId).client as any).contact.v3.user.get({
-          path: { user_id: v }, params: { user_id_type: 'union_id' },
-        });
-        if (res.code === 0) name = res.data?.user?.name ?? '';
-      } catch { /* best-effort */ }
+      if (!skipNames) {
+        try {
+          ensureClient(cfg);
+          const res = await (getBot(cfg.larkAppId).client as any).contact.v3.user.get({
+            path: { user_id: v }, params: { user_id_type: 'union_id' },
+          });
+          if (res.code === 0) name = res.data?.user?.name ?? '';
+        } catch { /* best-effort */ }
+      }
       byUnion.set(v, { unionId: v, name });
     }
 
