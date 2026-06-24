@@ -37,6 +37,7 @@ export function buildVerifiedDeliveryInstructions(input: {
     '如果你无法完成（缺权限/需求有歧义/客观做不到/反复失败），不要硬撑、也不要只在群里说做不了，用求助：',
     `botmux help --task ${input.taskId} --blocker "具体卡在哪、缺什么" --kind access|ambiguous|impossible|repeated_failure|other`,
     '求助会落账并唤醒监管者来处理；监管者定不了的会升级给人。',
+    '需要人拍板、澄清或补权限时，只用 botmux help 或 @ 你的监管者（L2）；不要直接 @ 群里的人或老板，升级由监管者统一对外处理。',
   ];
   if (input.acceptanceHint?.trim()) {
     lines.push(`验收提示: ${input.acceptanceHint.trim()}`);
