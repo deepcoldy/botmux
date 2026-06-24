@@ -32,6 +32,11 @@ describe('verified delivery narration', () => {
     });
     expect(withMention).toContain('内容：A');
     expect(withMention).not.toContain('@loopy-中控');
+
+    // F5: cleanup card reports the cross-daemon close count.
+    const cleanup = buildGoalNarrationText({ type: 'cleanup', key: 'k4', closed: 3 });
+    expect(cleanup).toContain('🧹 会话已清理 · 关闭 3 个会话');
+    expect(cleanup).toContain('全部 bot');
   });
 
   it('dedupes by narration key', async () => {

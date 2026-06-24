@@ -196,6 +196,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => 
   jsonRes(res, 200, r);
 });
 
+// Close THIS daemon's chat-scope sessions bound to a goal chat. The goal-cleanup
+// card button fans this out to every online daemon, because each bot's workers
+// live in their own daemon process — a card-owner-local loop (the old behavior)
+// left cross-bot workers orphaned. Idempotent: re-running just closes nothing.
+ipcRoute('POST', '/api/goal/:goalChatId/cleanup-local', async (_req, res, params) => {
+  const goalChatId = params.goalChatId;
+  if (!goalChatId) return jsonRes(res, 400, { closed: 0, error: 'missing_goal_chat' });
+  const targets = listActiveSessions().filter(s => s.chatId === goalChatId && s.scope === 'chat');
+  let closed = 0;
+  for (const ds of targets) {
+    try {
+      await closeSession(ds.session.sessionId);
+      closed++;
+    } catch (err) {
+      logger.warn(`[goal-cleanup-local] close ${ds.session.sessionId} failed: ${err}`);
+    }
+  }
+  if (closed > 0) logger.info(`[goal-cleanup-local] closed ${closed} chat-scope sessions for goal=${goalChatId}`);
+  jsonRes(res, 200, { closed });
+});
+
 /** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
  *  mirroring the /resume route — so a Feishu-side observer sees why the CLI just
  *  restarted under them (the IM `/restart` command and the card button notify
