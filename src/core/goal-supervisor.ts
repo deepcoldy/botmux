@@ -119,9 +119,9 @@ function findActiveBySessionId(activeSessions: Map<string, DaemonSession>, sessi
 function findGoalSupervisorByGoal(activeSessions: Map<string, DaemonSession>, larkAppId: string, goalChatId?: string): DaemonSession | undefined {
   if (!goalChatId) return undefined;
   const direct = activeSessions.get(sessionKey(goalChatId, larkAppId));
-  if (direct?.session.goalSupervisor?.goalChatId === goalChatId) return direct;
+  if (direct?.session.goalSupervisor?.goalChatId === goalChatId && direct.worker && !direct.worker.killed) return direct;
   for (const ds of activeSessions.values()) {
-    if (ds.larkAppId === larkAppId && ds.session.goalSupervisor?.goalChatId === goalChatId) return ds;
+    if (ds.larkAppId === larkAppId && ds.session.goalSupervisor?.goalChatId === goalChatId && ds.worker && !ds.worker.killed) return ds;
   }
   return undefined;
 }
