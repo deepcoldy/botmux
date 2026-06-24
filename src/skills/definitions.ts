@@ -1213,6 +1213,7 @@ botmux goal supervise --chat-id "<goalChatId>" \\
 - daemon 在 goal 群**直接创建 L2 的 chat-scope 会话**（绕开 self-message guard，不是你 @ 自己）。
 - \`--parent-*\` + \`--session-id\` 把主群坐标 + 你这条 L1 会话写进 L2 的 prompt；L2 完成时用 \`goal notify-parent\` 据此精准唤起你（daemon-native，不发飞书）。**\`--session-id\` 填 prompt 顶部 \`<session_id>\` 的值**——这样不论你 L1 是话题还是群级会话都能被准确回定位（否则只能靠 chatId/parent-root 兜底，话题会话可能找不准）。
 - 起好 L2 **L1 基本就交棒了**：回主群等完成通知（L1-5）。要派的 subtask 写进 \`--brief\` 交给 L2，或由 L2 按 goal 自行拆派。
+- 🔒 **goal 群对话默认收窄（安全）**：\`goal supervise\` 会把这个 goal 群登记为「授权制」——群里只有**发起人（群主）+ 编排用的自家 bot（L2 / worker，peer 互信）**能和 bot 对话；其他人 @ bot 会被拦下（弹授权卡，需群主显式 grant 才放行）。这样即便日后把第三方拉进 goal 群，也没人能随意占用你的 bot / 烧额度。普通 \`/g\` 群不受影响（仍是开放 oncall）。
 
 > repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。
 > **OnCall 省 \`--repo\` 现按 bot 计**：OnCall 绑定是 per-bot 的——只有**目标子 bot 自己**在该群绑了 OnCall（\`@该bot /oncall bind <仓库路径>\`，多个 bot 一起绑用 \`@bot1 @bot2 /oncall bind <路径>\`）或配了 \`defaultWorkingDir\` 时，dispatch 才可省 \`--repo\`。否则子 bot **不会**跨 bot 继承群目录（除非同话题已有 sibling 在跑可继承），dispatch 仍应显式传 \`--repo\`，不然子 bot 会弹「选仓库」卡。
