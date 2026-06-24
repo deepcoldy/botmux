@@ -267,6 +267,7 @@ import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js'
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
 import { emitGoalNarration } from './verified-delivery/narration.js';
+import { openLedger } from './verified-delivery/ledger.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -274,6 +275,7 @@ import {
   shouldTriggerGoalWatchdogOnSessionBoundary,
   startGoalWatchdog,
   type GoalWatchdogReviveFailureEvent,
+  type GoalWatchdogReassignResult,
   type GoalWatchdogResult,
 } from './core/goal-watchdog.js';
 import type { TaskView } from './verified-delivery/types.js';
@@ -2385,6 +2387,8 @@ type LocalGoalWorkerHealth = {
   title?: string;
 };
 
+const GOAL_WORKER_REASSIGN_COOLDOWN_MS = 15 * 60_000;
+
 function collectLocalGoalWorkerHealth(goalChatId: string, workerLarkAppId?: string): LocalGoalWorkerHealth[] {
   const out: LocalGoalWorkerHealth[] = [];
   for (const ds of activeSessions.values()) {
@@ -2445,9 +2449,11 @@ async function buildWorkerHealthFacts(task: TaskView, goalChatId: string): Promi
   const facts: string[] = [];
   for (const [index, workerOpenId] of workers.entries()) {
     const workerName = names[index] || workerOpenId;
-    const member = roster.find((m) => m.openId === workerOpenId)
-      ?? roster.find((m) => m.displayName === workerName || m.name === workerName);
-    const workerLarkAppId = member?.larkAppId || '';
+    const member = task.workerLarkAppIds?.[index]
+      ? undefined
+      : (roster.find((m) => m.openId === workerOpenId)
+        ?? roster.find((m) => m.displayName === workerName || m.name === workerName));
+    const workerLarkAppId = task.workerLarkAppIds?.[index] || member?.larkAppId || '';
     let health: LocalGoalWorkerHealth | undefined;
     if (workerLarkAppId) {
       const entries = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
@@ -2475,6 +2481,99 @@ async function buildWorkerHealthFacts(task: TaskView, goalChatId: string): Promi
   return facts;
 }
 
+type WorkerReassignCandidate = {
+  index: number;
+  workerOpenId: string;
+  workerName: string;
+  workerLarkAppId: string;
+  workerCliId?: string;
+  health?: LocalGoalWorkerHealth;
+  deadReason: string;
+};
+
+async function resolveWorkerReassignCandidate(task: TaskView, goalChatId: string): Promise<WorkerReassignCandidate | undefined> {
+  const workers = task.workerOpenIds ?? [];
+  for (const [index, workerOpenId] of workers.entries()) {
+    const workerName = task.workerNames?.[index] || workerOpenId;
+    const workerLarkAppId = task.workerLarkAppIds?.[index] || '';
+    const workerCliId = task.workerCliIds?.[index] || undefined;
+    if (!workerLarkAppId) continue;
+    const daemon = findOnlineDaemon(workerLarkAppId);
+    if (!daemon && workerLarkAppId !== currentDaemonLarkAppId) {
+      continue;
+    }
+    const entries = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
+    const health = entries.find((entry) => entry.larkAppId === workerLarkAppId);
+    if (!health) {
+      return { index, workerOpenId, workerName, workerLarkAppId, workerCliId, deadReason: 'session_missing' };
+    }
+    if (health.session === 'suspended') continue;
+    if (health.session === 'closed') {
+      return { index, workerOpenId, workerName, workerLarkAppId, workerCliId, health, deadReason: 'session_closed' };
+    }
+    if (health.workerProcess === 'none' || health.workerProcess === 'killed') {
+      return { index, workerOpenId, workerName, workerLarkAppId, workerCliId, health, deadReason: `worker_${health.workerProcess}` };
+    }
+  }
+  return undefined;
+}
+
+async function reassignDeadGoalWorker(task: TaskView, goalChatId: string, now: number): Promise<GoalWatchdogReassignResult> {
+  if (task.status !== 'dispatched') return { status: 'skipped', reason: `status:${task.status}` };
+  const candidate = await resolveWorkerReassignCandidate(task, goalChatId);
+  if (!candidate) return { status: 'not-dead', reason: 'no_dead_worker' };
+  const epoch = Math.floor(now / GOAL_WORKER_REASSIGN_COOLDOWN_MS);
+  const ledger = openLedger();
+  const brief = [
+    task.title ? `任务：${task.title}` : `任务：${task.taskId}`,
+    `原 worker（${candidate.workerName}）会话状态异常：${candidate.deadReason}。`,
+    '请重新接手该任务；如果需要原上下文，请先查看 goal charter、delivery ledger 和本群历史。完成后仍按 botmux report 协议交付证据。',
+  ].join('\n');
+  const appended = ledger.append({
+    type: 'TaskDispatched',
+    actor: 'orchestrator',
+    taskId: task.taskId,
+    chatId: goalChatId,
+    ts: now,
+    idempotencyKey: `reassign:${task.taskId}:${candidate.workerLarkAppId}:${epoch}`,
+    payload: {
+      taskId: task.taskId,
+      title: task.title,
+      workerTopicRoot: task.workerTopicRoot,
+      workerOpenIds: [candidate.workerOpenId],
+      workerNames: [candidate.workerName],
+      workerLarkAppIds: [candidate.workerLarkAppId],
+      workerCliIds: candidate.workerCliId ? [candidate.workerCliId] : undefined,
+      brief,
+      acceptanceHint: task.acceptanceHint,
+      acceptanceCriteria: task.acceptanceCriteria,
+    },
+  });
+  if (appended.deduped) return { status: 'reassigned', reason: 'deduped' };
+  await sendMessage(
+    currentDaemonLarkAppId,
+    goalChatId,
+    [
+      `<at user_id="${candidate.workerOpenId}"></at> [goal-reassign] ${task.taskId}`,
+      `原会话已确认不可用（${candidate.deadReason}），请重新接手。`,
+      '先查 goal charter / delivery ledger / 群历史，完成后用 botmux report 交证据。',
+    ].join('\n'),
+    'text',
+  );
+  await emitGoalNarrationBestEffort({
+    larkAppId: currentDaemonLarkAppId,
+    goalChatId,
+    event: {
+      type: 'reassigned',
+      key: `narr:reassign:${task.taskId}:${candidate.workerLarkAppId}:${epoch}`,
+      taskId: task.taskId,
+      deadWorker: candidate.workerName || candidate.workerLarkAppId,
+    },
+  });
+  logger.info(`[goal-watchdog] reassigned task=${task.taskId} goal=${goalChatId} worker=${candidate.workerLarkAppId} reason=${candidate.deadReason}`);
+  return { status: 'reassigned', reason: candidate.deadReason };
+}
+
 async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: string): Promise<GoalWatchdogResult[]> {
   if (isGoalPanelApp(currentDaemonLarkAppId)) return [];
   const results = await runGoalWatchdogForGoal({
@@ -2483,15 +2582,17 @@ async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: st
     goalChatId,
     onReviveFailure: handleGoalReviveFailure,
     workerHealthFacts: buildWorkerHealthFacts,
+    reassignDeadWorker: reassignDeadGoalWorker,
   });
   if (shouldRetryGoalWatchdog(results)) scheduleGoalWatchdogRetry(goalChatId, reason);
   const injected = countGoalWatchdogStatus(results, 'injected');
   const reconciled = countGoalWatchdogStatus(results, 'reconciled');
   const revived = countGoalWatchdogStatus(results, 'revived');
+  const reassigned = countGoalWatchdogStatus(results, 'reassigned');
   const busy = countGoalWatchdogStatus(results, 'busy');
   const rateLimited = countGoalWatchdogStatus(results, 'rate-limited');
-  if (injected > 0 || reconciled > 0 || revived > 0 || busy > 0 || rateLimited > 0) {
-    logger.info(`[goal-watchdog] event result goal=${goalChatId} reason=${reason} injected=${injected} reconciled=${reconciled} revived=${revived} busy=${busy} rateLimited=${rateLimited}`);
+  if (injected > 0 || reconciled > 0 || revived > 0 || reassigned > 0 || busy > 0 || rateLimited > 0) {
+    logger.info(`[goal-watchdog] event result goal=${goalChatId} reason=${reason} injected=${injected} reconciled=${reconciled} revived=${revived} reassigned=${reassigned} busy=${busy} rateLimited=${rateLimited}`);
   }
   return results;
 }
@@ -2500,12 +2601,13 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
   goalChatId: string;
   reason: string;
   sourceSessionId?: string;
-}): Promise<{ contacted: number; injected: number; reconciled: number; revived: number; busy: number; rateLimited: number }> {
+}): Promise<{ contacted: number; injected: number; reconciled: number; revived: number; reassigned: number; busy: number; rateLimited: number }> {
   const daemons = listOnlineDaemons();
   let contacted = 0;
   let injected = 0;
   let reconciled = 0;
   let revived = 0;
+  let reassigned = 0;
   let busy = 0;
   let rateLimited = 0;
   await Promise.all(daemons.map(async (daemon) => {
@@ -2525,6 +2627,7 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
       injected += results.filter((r) => r.status === 'injected').length;
       reconciled += results.filter((r) => r.status === 'reconciled').length;
       revived += results.filter((r) => r.status === 'revived').length;
+      reassigned += results.filter((r) => r.status === 'reassigned').length;
       busy += results.filter((r) => r.status === 'busy').length;
       rateLimited += results.filter((r) => r.status === 'rate-limited').length;
     } catch {
@@ -2533,7 +2636,7 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
       clearTimeout(tt);
     }
   }));
-  return { contacted, injected, reconciled, revived, busy, rateLimited };
+  return { contacted, injected, reconciled, revived, reassigned, busy, rateLimited };
 }
 
 /**
@@ -17284,6 +17387,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       activeSessions,
       onReviveFailure: handleGoalReviveFailure,
       workerHealthFacts: buildWorkerHealthFacts,
+      reassignDeadWorker: reassignDeadGoalWorker,
     });
 
   const goalNotificationRetryTimer = setInterval(() => {
