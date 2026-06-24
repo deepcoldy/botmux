@@ -35,6 +35,12 @@ export type GoalNarrationEvent =
       key: string;
       taskId: string;
       detail: string;
+    }
+  | {
+      type: 'cleanup';
+      key: string;
+      /** Total chat-scope sessions closed across all bots/daemons. */
+      closed: number;
     };
 
 export interface EmitGoalNarrationInput {
@@ -99,6 +105,12 @@ export function buildGoalNarrationText(event: GoalNarrationEvent): string {
       `⚠️ 升级给人 · ${event.taskId}`,
       `原因：${cleanLine(event.reason, '未说明')}`,
       '已通过中控通知主群，等人拍板',
+    ].join('\n');
+  }
+  if (event.type === 'cleanup') {
+    return [
+      `🧹 会话已清理 · 关闭 ${event.closed} 个会话`,
+      '本 goal 全部 bot 的会话已收尾（goal 群保留，不退群/不删群）',
     ].join('\n');
   }
   return [
