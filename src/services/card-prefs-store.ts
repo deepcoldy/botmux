@@ -6,6 +6,9 @@
  *
  * Three independent toggles:
  *   • disableStreamingCard      — suppress the live streaming session card
+ *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
+ *                                  lightweight status reactions on the trigger
+ *                                  message (only meaningful while the card is off)
  *   • writableTerminalLinkInCard — embed a directly-usable writable terminal
  *                                  link in the streaming card body
  *   • privateCard               — `/card` sends a private ephemeral snapshot
@@ -21,6 +24,7 @@ import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
   disableStreamingCard: boolean;
+  silentTurnReactions: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
   /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
@@ -43,6 +47,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     const c = getBot(larkAppId).config;
     return {
       disableStreamingCard: c.disableStreamingCard === true,
+      silentTurnReactions: c.silentTurnReactions === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
@@ -56,6 +61,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   } catch {
     return {
       disableStreamingCard: false,
+      silentTurnReactions: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       autoStartOnGroupJoin: false,
@@ -115,6 +121,7 @@ export async function updateBotCardPrefs(
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
+    apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
@@ -127,6 +134,7 @@ export async function updateBotCardPrefs(
       write: true,
       result: {
         disableStreamingCard: entry.disableStreamingCard === true,
+        silentTurnReactions: entry.silentTurnReactions === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
@@ -147,6 +155,9 @@ export async function updateBotCardPrefs(
   // Sync in-memory config so live card builders / routing react without a restart.
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
+  }
+  if (patch.silentTurnReactions !== undefined) {
+    bot.config.silentTurnReactions = patch.silentTurnReactions || undefined;
   }
   if (patch.writableTerminalLinkInCard !== undefined) {
     bot.config.writableTerminalLinkInCard = patch.writableTerminalLinkInCard || undefined;
@@ -178,6 +189,7 @@ export async function updateBotCardPrefs(
   }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +

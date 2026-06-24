@@ -94,6 +94,18 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
+  it('silentTurnReactions is a no-op when the streaming card is on (gate order)', async () => {
+    // Card-on already early-returns before the silent gate, so the flag must not
+    // perturb card-on behavior — same outcome as a plain card-on session.
+    registerWith(false, { silentTurnReactions: true });
+    const ds = makeDs();
+
+    await noteTurnReceived(ds, 'om_a');
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
   it('skips non-message ids (doc-comment id / chat anchor cannot carry a reaction)', async () => {
     registerWith(true);
     const ds = makeDs();

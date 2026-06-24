@@ -105,6 +105,25 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(cfg.regularGroupMentionMode).toBe('never');
   });
 
+  it('silentTurnReactions round-trips through the dashboard card-prefs store', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotCardPrefs('app_default').silentTurnReactions).toBe(false);
+
+    const on = await store.updateBotCardPrefs('app_default', { silentTurnReactions: true });
+    expect(on.ok && on.prefs.silentTurnReactions).toBe(true);
+    expect(readConfig().silentTurnReactions).toBe(true);
+    expect(registry.getBot('app_default').config.silentTurnReactions).toBe(true);
+
+    // Off removes the key (keeps bots.json tidy) and clears in-memory config.
+    const off = await store.updateBotCardPrefs('app_default', { silentTurnReactions: false });
+    expect(off.ok && off.prefs.silentTurnReactions).toBe(false);
+    expect(readConfig().silentTurnReactions).toBeUndefined();
+    expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
+  });
+
   it('removes keys when toggled off / prompt blanked (keeps bots.json tidy)', async () => {
     writeConfig({
       autoStartOnGroupJoin: true,

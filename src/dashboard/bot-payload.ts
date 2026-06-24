@@ -29,6 +29,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     brandLabel: j?.brandLabel ?? null,
     sandbox: j?.sandbox === true,
     disableStreamingCard: j?.disableStreamingCard === true,
+    silentTurnReactions: j?.silentTurnReactions === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
