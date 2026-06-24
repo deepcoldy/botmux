@@ -60,7 +60,7 @@ export function buildReport(input: BuildReportInput, led: LedgerHandle): BuiltRe
     .update([
       input.taskId,
       input.summary,
-      evidence.map((e) => (e.kind === 'path' ? 'p:' + e.path : 'i:' + e.ref)).join(','),
+      evidence.map((e) => (e.kind === 'path' ? 'p:' + e.path : e.kind === 'url' ? 'u:' + e.url : 'i:' + e.ref)).join(','),
     ].join('\n'))
     .digest('hex').slice(0, 8);
   const reportId = input.reportId ?? `${input.taskId}-r${sig}`;

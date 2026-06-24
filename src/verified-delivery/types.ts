@@ -28,7 +28,13 @@ export type Evidence =
   /** Self-contained content the worker pasted (test output / file body / diff).
    *  Stored as an immutable blob; the event carries a ref + small preview so the
    *  ledger line stays small (atomic append). The orchestrator reads the blob. */
-  | { kind: 'inline'; ref: string; name?: string; bytes: number; preview?: string };
+  | { kind: 'inline'; ref: string; name?: string; bytes: number; preview?: string }
+  /** A URL the orchestrator can FETCH to verify (CI log, gist, object store).
+   *  For cross-device/external workers whose filesystem the L2 can't read — the
+   *  verifier fetches it instead of reading a local path. Ingested from delivery
+   *  envelopes (see envelope.ts); fetch-based verification lands with the
+   *  ingestion seam. */
+  | { kind: 'url'; url: string; note?: string };
 
 // ─── acceptance criteria (P1 #7: field-ize the JSON-in-acceptanceHint) ─────────
 // Until P1 #7 the orchestrator's verification intent lived as an opaque JSON
@@ -159,12 +165,26 @@ export interface TaskDispatchedPayload {
   acceptanceCriteria?: AcceptanceCriteria;
 }
 
+/** Provenance for an event that entered the ledger from a goal-group delivery
+ *  envelope (cross-device / external worker P0) rather than a local CLI write.
+ *  Lets the board/audit distinguish "ingested from a group message" and records
+ *  who (verified Lark sender) + which message, for traceability. */
+export interface DeliverySource {
+  via: 'envelope';
+  /** Lark messageId of the envelope message (audit + ingestion idempotency). */
+  messageId?: string;
+  /** Verified Lark sender open_id; authorization was checked at ingestion. */
+  senderOpenId?: string;
+}
+
 export interface TaskReportedPayload {
   taskId: string;
   reportId: string;
   workerOpenId?: string;
   evidence: Evidence[];
   summary: string;
+  /** Set when ingested from a goal-group envelope (remote/external worker). */
+  source?: DeliverySource;
 }
 
 export interface TaskAcceptedPayload {
@@ -196,6 +216,8 @@ export interface TaskHelpRequestedPayload {
   workerOpenId?: string;
   blocker: string;
   kind?: HelpKind;
+  /** Set when ingested from a goal-group envelope (remote/external worker). */
+  source?: DeliverySource;
 }
 
 /** Supervisor → human: "I can't resolve this; a person must decide." Lights the
