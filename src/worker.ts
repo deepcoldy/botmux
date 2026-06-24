@@ -5054,11 +5054,35 @@ if(isTouch&&hasToken){
   }
 }
 
-// Single-finger touch scrolling is handled natively by xterm's own Viewport
-// (handleTouchMove → scrollTop), so no custom handler here — a parallel one
-// would double-drive scrollTop and fight xterm.  overscroll-behavior:none on
-// .xterm-viewport (see <style>) kills the iOS rubber-band; the WebGL/Canvas
-// renderer above is what actually makes scrolling over text smooth.
+// Single-finger touch scrolling: normal-buffer CLIs use xterm's own Viewport
+// (handleTouchMove → scrollTop) natively. Alt-screen CLIs (Claude) have no xterm
+// scrollback, so native touch scroll does nothing — mirror the wheel fix and
+// forward the drag to the CLI as SGR wheel events so it scrolls its own
+// transcript. Only the alternate buffer is intercepted (capture + stopPropagation);
+// the normal buffer falls through to xterm untouched, so no double-drive of
+// scrollTop. overscroll-behavior:none (see <style>) kills the iOS rubber-band.
+if(!${isTmuxMode && !isPipeMode}){
+  var _tTerm=document.getElementById('terminal');
+  var _tLastY=null,_tAccum=0,_tStep=16; // ~px per scrolled line
+  _tTerm.addEventListener('touchstart',function(e){
+    if(e.touches.length===1){_tLastY=e.touches[0].clientY;_tAccum=0;}
+  },{capture:true,passive:true});
+  _tTerm.addEventListener('touchmove',function(e){
+    // Normal buffer / multi-touch / no start → let xterm (or the browser) handle it.
+    if(term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
+    e.preventDefault();e.stopPropagation();
+    var y=e.touches[0].clientY;_tAccum+=y-_tLastY;_tLastY=y;
+    if(!hasToken||!ws_||ws_.readyState!==1)return; // read-only: consume, can't forward
+    var data='';
+    while(Math.abs(_tAccum)>=_tStep){
+      var up=_tAccum>0; // finger drags down → reveal history → wheel-up (64)
+      data+='\\x1b[<'+(up?64:65)+';1;1M';
+      _tAccum+=up?-_tStep:_tStep;
+    }
+    if(data)ws_.send(JSON.stringify({type:'input',data:data}));
+  },{capture:true,passive:false});
+  _tTerm.addEventListener('touchend',function(){_tLastY=null;_tAccum=0;},{capture:true,passive:true});
+}
 </script>
 </body>
 </html>`;
