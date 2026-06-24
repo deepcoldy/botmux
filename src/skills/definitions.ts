@@ -1292,7 +1292,7 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
    - 能自己解 → 给澄清指令 / 补权限 / 带更清楚的 brief 重派（\`dispatch\` 同 taskId 或 \`send --chat-id <goalChatId> --mention <worker>\`）。
    - 自己解不了（要人授权 / 要人拍范围 / 客观做不到）→ \`botmux delivery escalate --task <id> --reason "<卡在哪、需要人做什么>" [--retry-brief ...]\`，把"需要你"推到人面前（actor=监管者，**不假冒 worker 的求助**）。命令不变；daemon 会用信使 bot **「loopy-中控」** 把这条"需要你"代发到主群（不是你自己发，所以能正常唤起 L1 + 人能直接回复它下发指示）。
      **⚠️ task 级升级一律走 \`delivery escalate\`**——它一条命令同时干三件事：写 \`TaskEscalated\` 进账本（看板转「🙋 已升级」）+ 在 **goal 群自动出「⚠️ 升级给人」播报卡**（群里人看得到这事升级了）+ 通知 L1 / 点亮看板。**别拿 \`goal notify-parent --attention\` 去升级单个 task**：那条只把通知推到主群，**不写账本、也不在 goal 群出升级卡** → goal 群里的人完全看不到发生了升级。\`goal notify-parent\` 只用于 goal 级进度 / \`--done\` 收尾，不替代 task 升级。
-4. **产物不存在 + 没动静** → 催 worker；只有 legacy 自由文本 hint（不可机器核验）→ 只催、别臆测 done。
+     **💡 升级给人时带"推荐选项"（人缺上下文，别让他凭空打字决策）**：\`delivery escalate\` 支持 \`--options "k1=方案A,k2=方案B" --recommended k1\`（复用 botmux ask 的选项格式，最多 6 项、\`--recommended\` 标一个推荐）。升级卡会把选项渲染成按钮（推荐项 ⭐+高亮），人点一下就把该方案当决策下发给你；卡片底部仍保留自由输入兜底（选项都不合适时人自己写）。**惯例：只要你能预判方向，就附 2~4 个具体选项 + 标一个推荐**（标签写清"做什么"，理由放进 \`--reason\`），比只甩"需你拍板"友好得多、人决策更快更准；只有真没法预设候选才纯靠自由输入。
 5. **escalated（已升级、等人）** → 别重复 nag，等人处理。
 
 **worker 掉线兜底（别机械催死人；多数情况系统已替你处理）**：daemon 发现某 dispatched 任务的 worker 可能掉线时，会按真实存活状态分流：
