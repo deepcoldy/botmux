@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { basename as pathBasename, dirname, join } from 'node:path';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
@@ -70,6 +71,7 @@ import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
 import { emitGoalNarration } from '../../verified-delivery/narration.js';
+import { getGoalParentNotification, type GoalParentNotificationRecord } from '../../services/goal-parent-notification-store.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
@@ -233,6 +235,86 @@ function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
 
 function isLegacySelfHealAction(actionType?: string): boolean {
   return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
+}
+
+function shortHash(input: string): string {
+  return createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+function goalDecisionText(data: CardActionData): string {
+  const form = data.action?.form_value ?? {};
+  const formValue = form.goal_parent_decision_text;
+  if (typeof formValue === 'string') return formValue.trim();
+  const inputValue = (data.action as any)?.input_value;
+  if (typeof inputValue === 'string') return inputValue.trim();
+  return '';
+}
+
+function goalNotificationRecordFromAction(
+  value: Record<string, string>,
+  cardMessageId: string | undefined,
+  larkAppId: string | undefined,
+): GoalParentNotificationRecord | undefined {
+  const stored = getGoalParentNotification(cardMessageId) ?? getGoalParentNotification(value.parent_message_id);
+  if (stored) return stored;
+  const parentChatId = value.parent_chat_id;
+  const goalChatId = value.goal_chat_id;
+  if (!parentChatId || !goalChatId || !larkAppId) return undefined;
+  return {
+    messageId: cardMessageId ?? value.parent_message_id ?? `card:${goalChatId}`,
+    larkAppId: value.notification_lark_app_id || larkAppId,
+    parentChatId,
+    parentRoot: value.parent_root || undefined,
+    parentSessionId: value.parent_session_id || undefined,
+    supervisorSessionId: value.supervisor_session_id || undefined,
+    goalChatId,
+    goalTitle: value.goal_title || undefined,
+    taskId: value.task_id || undefined,
+    summary: value.summary || value.attention_reason || '',
+    attentionKind: value.attention_kind || undefined,
+    attentionReason: value.attention_reason || undefined,
+    done: false,
+    createdAt: Date.now(),
+  };
+}
+
+async function routeGoalParentCardDecisionAcrossDaemons(
+  record: GoalParentNotificationRecord,
+  input: { cardMessageId?: string; decisionText: string },
+): Promise<{ contacted: number; routed: number; deduped: number }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  let routed = 0;
+  let deduped = 0;
+  const decisionId = `card:${input.cardMessageId ?? record.messageId}:${shortHash(input.decisionText)}`;
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/route-parent-reply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          record,
+          reply: {
+            messageId: decisionId,
+            content: `[中控卡片下发决策]\n${input.decisionText}`,
+          },
+        }),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { routed?: boolean; deduped?: boolean } | null;
+      if (body?.routed && body.deduped) deduped++;
+      else if (body?.routed) routed++;
+    } catch {
+      // Best-effort fan-out; dead peers age out of daemon discovery.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, routed, deduped };
 }
 
 function getSessionByActionValue(
@@ -632,6 +714,29 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+
+  if (value?.action === 'goal_parent_decision') {
+    const decisionText = goalDecisionText(data);
+    if (!decisionText) {
+      return { toast: { type: 'error', content: '请先输入要下发给监管者的决策。' } };
+    }
+    const record = goalNotificationRecordFromAction(value, cardMessageId, larkAppId);
+    if (!record) {
+      return { toast: { type: 'error', content: '缺少 goal 通知上下文，无法下发。' } };
+    }
+    if (larkAppId && !canTalk(larkAppId, record.parentChatId, operatorOpenId)) {
+      logger.info(`[goal-parent-decision] blocked card submit from non-authorized user: ${operatorOpenId ?? '?'} chat=${record.parentChatId}`);
+      return { toast: { type: 'error', content: '你没有权限下发这个 goal 决策。' } };
+    }
+    const result = await routeGoalParentCardDecisionAcrossDaemons(record, { cardMessageId, decisionText });
+    if (result.routed === 0 && result.deduped === 0) {
+      logger.warn(`[goal-parent-decision] no active L2 for goal=${record.goalChatId} card=${cardMessageId ?? '?'} contacted=${result.contacted}`);
+      return { toast: { type: 'error', content: '没有在线监管者，稍后可重试或直接在主群补充说明。' } };
+    }
+    logger.info(`[goal-parent-decision] routed card decision goal=${record.goalChatId} task=${record.taskId ?? '-'} routed=${result.routed} deduped=${result.deduped}`);
+    return { toast: { type: 'success', content: '已把你的决策下发给 goal 监管者。' } };
+  }
+
   // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
   // 不绑 session（sessionId + workingDir 都在 value 里）。owner 强闸门：只有 owner 能把
   // 隔离副本的改动应用回真实磁盘。agent 在沙盒里无感，不参与。

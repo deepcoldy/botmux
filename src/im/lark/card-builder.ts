@@ -216,6 +216,10 @@ function escapeMd(s: string): string {
   return s.replace(/[*_~`\[\]\\<>]/g, c => `\\${c}`);
 }
 
+function truncateCardText(s: string, max = 800): string {
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
 function sidebarUrl(url: string): string {
   const qs = new URLSearchParams({
     mode: 'sidebar-semi',
@@ -2029,5 +2033,123 @@ export function buildLandResultCard(kind: 'applied' | 'discarded' | 'failed', de
     config: { wide_screen_mode: true },
     header: { template: meta.template, title: { tag: 'plain_text', content: t(meta.titleKey, undefined, locale) } },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content: body } }],
+  });
+}
+
+export interface GoalHumanAttentionCardInput {
+  ownerOpenId?: string;
+  goalTitle?: string;
+  goalChatId: string;
+  goalLink?: string;
+  taskId?: string;
+  attentionKind?: string;
+  attentionReason?: string;
+  summary: string;
+  notificationMessageId?: string;
+  notificationLarkAppId?: string;
+  parentChatId: string;
+  parentRoot?: string;
+  parentSessionId?: string;
+  supervisorSessionId?: string;
+}
+
+export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput): string {
+  const kind = input.attentionKind ?? 'blocked';
+  const isHelp = kind === 'help';
+  const header = isHelp
+    ? { template: 'blue', title: '🆘 worker 求助，需支援' }
+    : { template: kind === 'blocked' ? 'orange' : 'red', title: '⚠️ 任务需要你拍板' };
+  const mention = input.ownerOpenId ? `<at id=${input.ownerOpenId}></at> ` : '';
+  const title = input.goalTitle ?? input.goalChatId;
+  const actionValue: Record<string, string> = {
+    action: 'goal_parent_decision',
+    goal_chat_id: input.goalChatId,
+    parent_chat_id: input.parentChatId,
+    parent_message_id: input.notificationMessageId ?? '',
+    notification_lark_app_id: input.notificationLarkAppId ?? '',
+    summary: truncateCardText(input.summary, 1000),
+  };
+  if (input.taskId) actionValue.task_id = input.taskId;
+  if (input.goalTitle) actionValue.goal_title = input.goalTitle;
+  if (input.attentionKind) actionValue.attention_kind = input.attentionKind;
+  if (input.attentionReason) actionValue.attention_reason = input.attentionReason;
+  if (input.parentRoot) actionValue.parent_root = input.parentRoot;
+  if (input.parentSessionId) actionValue.parent_session_id = input.parentSessionId;
+  if (input.supervisorSessionId) actionValue.supervisor_session_id = input.supervisorSessionId;
+
+  const fields = [
+    { is_short: true, text: { tag: 'lark_md', content: `**Goal**\n${escapeMd(title)}` } },
+    { is_short: true, text: { tag: 'lark_md', content: `**类型**\n${escapeMd(kind)}` } },
+    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**taskId**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
+    { is_short: true, text: { tag: 'lark_md', content: `**goalChatId**\n\`${escapeMd(input.goalChatId)}\`` } },
+  ].filter(Boolean);
+
+  const elements: any[] = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: [
+          `${mention}${isHelp ? 'worker 已显式求助，需要你提供支援或决策。' : 'goal 监管者遇到需要人类拍板的事项。'}`,
+          input.goalLink ? `[打开 goal 群](${input.goalLink})` : undefined,
+        ].filter(Boolean).join('\n'),
+      },
+    },
+    { tag: 'div', fields },
+    {
+      tag: 'div',
+      text: { tag: 'lark_md', content: `**原因**\n${escapeMd(truncateCardText(input.attentionReason ?? input.summary, 1000))}` },
+    },
+  ];
+  if (input.summary && input.summary !== input.attentionReason) {
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: `**摘要**\n${escapeMd(truncateCardText(input.summary, 1200))}` },
+    });
+  }
+  elements.push(
+    { tag: 'hr' },
+    {
+      tag: 'action',
+      actions: [
+        input.goalLink ? {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '打开 goal 群' },
+          type: 'default',
+          multi_url: {
+            url: input.goalLink,
+            pc_url: input.goalLink,
+            android_url: input.goalLink,
+            ios_url: input.goalLink,
+          },
+        } : undefined,
+      ].filter(Boolean),
+    },
+    {
+      tag: 'form',
+      name: 'goal_parent_decision_form',
+      elements: [
+        {
+          tag: 'input',
+          name: 'goal_parent_decision_text',
+          placeholder: { tag: 'plain_text', content: '输入要下发给监管者的决策 / 补充信息' },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '下发决策' },
+          type: 'primary',
+          name: 'goal_parent_decision_submit',
+          action_type: 'form_submit',
+          value: actionValue,
+        },
+      ],
+    },
+    { tag: 'note', elements: [{ tag: 'lark_md', content: '也可以直接引用回复这张卡片；两种方式都会转给 goal 监管者。' }] },
+  );
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: header.template, title: { tag: 'plain_text', content: header.title } },
+    elements,
   });
 }
