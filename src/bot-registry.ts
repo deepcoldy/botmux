@@ -305,19 +305,28 @@ export interface BotConfig {
   regularGroupReplyMode?: ChatReplyMode;
   /**
    * Per-bot (bot-global) policy for when an @mention is required to get a reply
-   * in regular Lark groups — a 3-tier ladder:
+   * in regular Lark groups — a 4-tier ladder:
    *   • 'always' (or undefined) — @ required everywhere, including inside the
    *                               bot's own shared topics (the safe default).
    *   • 'topic'                 — @ required to start / at top level, but NOT
    *                               inside the bot's shared topics (non-@ replies
    *                               there continue the session).
-   *   • 'never'                 — @ never required: non-@ messages in groups
-   *                               where the bot has talk access are answered too.
+   *   • 'never'                 — @ never required: every non-@ message in groups
+   *                               where the bot has talk access is answered too,
+   *                               unconditionally. For dedicated / on-call groups.
+   *   • 'ambient'               — like 'never' (non-@ messages answered), EXCEPT
+   *                               when the message @mentions another specific
+   *                               member (person/bot) without @ing this bot —
+   *                               that is a redirect to someone else, so the bot
+   *                               stays quiet (@all is not a redirect). Best for
+   *                               multi-bot / multi-person groups: a default
+   *                               responder that yields when you address someone
+   *                               else.
    * Governs the shared-topic fold-back + the top-level @ gate. `new-topic` /
    * 话题群 topics own their own thread and continue without @ regardless (that
    * is the mode's defining behavior, not affected by this policy).
    */
-  regularGroupMentionMode?: 'always' | 'topic' | 'never';
+  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
   /**
    * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
    *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
@@ -879,9 +888,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
         return mode === 'new-topic' || mode === 'shared' ? mode : undefined;
       })(),
-      // 3-tier @ policy. Only 'topic' | 'never' are meaningful; 'always' (the
-      // default) and anything else normalize to undefined so bots.json stays clean.
-      regularGroupMentionMode: entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never'
+      // 4-tier @ policy. Only 'topic' | 'never' | 'ambient' are meaningful;
+      // 'always' (the default) and anything else normalize to undefined so
+      // bots.json stays clean.
+      regularGroupMentionMode: entry.regularGroupMentionMode === 'topic'
+        || entry.regularGroupMentionMode === 'never'
+        || entry.regularGroupMentionMode === 'ambient'
         ? entry.regularGroupMentionMode
         : undefined,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为

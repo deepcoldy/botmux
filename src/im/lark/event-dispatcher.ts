@@ -770,6 +770,46 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
   return false;
 }
 
+/** Does this message @mention a *specific other member* (a person or bot that
+ *  is NOT this bot)? Used by the 'ambient' mention policy to decide whether to
+ *  back off: under 'ambient' the bot answers un-@ messages, but if the user
+ *  explicitly addresses SOMEONE ELSE it stays quiet (the redirect carve-out).
+ *  `@all` addresses everyone including this bot, so it is NOT an "other member"
+ *  and does NOT trigger backoff. Mirrors isBotMentioned's two shapes:
+ *  message.mentions[] (user text) and inline `at` nodes in post content. */
+export function mentionsAnotherMember(larkAppId: string, message: any): boolean {
+  const botOpenId = getBot(larkAppId).botOpenId;
+
+  // 1. message.mentions array (populated for user-sent text messages)
+  const mentions: any[] = message.mentions ?? [];
+  for (const m of mentions) {
+    const oid: string | undefined = m?.id?.open_id;
+    if (!oid) continue;
+    if (oid === botOpenId) continue; // that's me
+    if (oid === 'all') continue;     // @all → everyone incl. me
+    return true;                     // a specific other member
+  }
+
+  // 2. inline `at` nodes in post content (bot-sent / rich messages)
+  try {
+    const content = JSON.parse(message.content ?? '{}');
+    const inner = content.zh_cn ?? content.en_us ?? content;
+    if (Array.isArray(inner?.content)) {
+      for (const paragraph of inner.content) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const node of paragraph) {
+          if (node.tag !== 'at') continue;
+          const uid: string | undefined = node.user_id;
+          if (!uid || uid === botOpenId || uid === 'all') continue;
+          return true;
+        }
+      }
+    }
+  } catch { /* ignore parse errors */ }
+
+  return false;
+}
+
 // ─── Permission gates ────────────────────────────────────────────────────
 //
 // Two gates:
@@ -1121,11 +1161,17 @@ async function maybeApplySharedTopicSeed(input: {
   if (forceTopicApplied) return undefined;
   if (chatType !== 'group') return undefined;
   if (resolveRegularGroupMode(larkAppId, chatId) !== 'shared') return undefined;
-  // Seeding a shared topic normally needs an @mention. But under the 'never'
-  // mention policy a non-@ message is also answered — and in shared mode it must
-  // still OPEN a topic (reply in a thread reusing the chat session), not fall
-  // back to a flat top-level reply. So allow non-@ seeding only when never.
-  if (!isBotMentioned(larkAppId, message, senderOpenId) && resolveGroupMentionMode(larkAppId) !== 'never') return undefined;
+  // Seeding a shared topic normally needs an @mention. But the 'never' and
+  // 'ambient' mention policies answer non-@ messages too — and in shared mode it
+  // must still OPEN a topic (reply in a thread reusing the chat session), not
+  // fall back to a flat top-level reply. So allow non-@ seeding under 'never'
+  // (unconditional) or 'ambient' — but for 'ambient' NOT when the message
+  // @mentions another specific member (person/bot) without @ing us: that is a
+  // redirect to someone else, so we back off (mentionsAnotherMember).
+  const seedMentionMode = resolveGroupMentionMode(larkAppId);
+  if (!isBotMentioned(larkAppId, message, senderOpenId)
+      && !(seedMentionMode === 'never'
+        || (seedMentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message)))) return undefined;
   const freshMode = routing.scope === 'thread'
     ? await getChatMode(larkAppId, chatId, { forceRefresh: true })
     : (getCachedChatMode(larkAppId, chatId) ?? 'group');
@@ -1593,9 +1639,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // is governed by the bot-global mention policy: 'always' (default) keeps
         // "@ required" so this fold-back is skipped (non-@ thread chatter falls
         // through to the gate below and is ignored — only an explicit @ continues
-        // a shared topic); 'topic' and 'never' enable the seamless no-@ fold-back.
+        // a shared topic); 'topic', 'never' and 'ambient' enable the seamless
+        // no-@ fold-back. Carve-out: under 'ambient', a non-@ reply that @mentions
+        // another specific member (person/bot) is a redirect to someone else →
+        // back off, don't fold it in (mentionsAnotherMember). 'never'
+        // (unconditional) and 'topic' are unaffected.
         if (!explicitlyMentionedThisBot
             && resolveGroupMentionMode(larkAppId) !== 'always'
+            && !(resolveGroupMentionMode(larkAppId) === 'ambient' && mentionsAnotherMember(larkAppId, message))
             && routing.scope === 'thread' && message.root_id && message.thread_id && chatType === 'group') {
           const alias = handlers.resolveReplyThreadAlias?.(message.root_id, chatId, larkAppId) ?? null;
           if (alias) {
@@ -1725,9 +1776,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // folded back to chat-scope.
           //
           // The bot-global mention policy drops the @ requirement:
-          //   • 'never' — entirely: any message from a talk-allowed sender is
-          //     answered (incl. brand-new non-@ top-level → spawns/continues a
-          //     session). Intended for dedicated / on-call groups, not busy chats.
+          //   • 'never' — answer EVERY un-@ message from talk-allowed senders
+          //     (incl. brand-new non-@ top-level → spawns/continues a session),
+          //     unconditionally. Intended for dedicated / on-call groups.
+          //   • 'ambient' — like 'never' (answer un-@ messages), EXCEPT when the
+          //     message @mentions another specific member (person/bot) without
+          //     @ing us — that is a redirect to someone else, so we back off and
+          //     stay quiet (mentionsAnotherMember). @all does not count as a
+          //     redirect. Best for multi-bot / multi-person groups that want a
+          //     default responder which yields the moment you address someone else.
           //   • 'topic' — only inside a topic the bot already owns: a non-@ reply
           //     INSIDE such a thread (new-topic / 话题群 thread the bot owns, or a
           //     shared-topic alias via replyRootId) continues without @, while a
@@ -1738,6 +1795,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const mentionMode = resolveGroupMentionMode(larkAppId);
           const relax = (!!replyRootId && isAllowed)
             || (isAllowed && mentionMode === 'never')
+            || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id)
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {

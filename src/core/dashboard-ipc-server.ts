@@ -1252,7 +1252,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const patch: {
     disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
-    regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never';
+    regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
@@ -1265,7 +1265,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     const m = normalizeChatReplyMode(body.regularGroupReplyMode);
     if (m) patch.regularGroupReplyMode = m;
   }
-  if (body.regularGroupMentionMode === 'always' || body.regularGroupMentionMode === 'topic' || body.regularGroupMentionMode === 'never') {
+  if (body.regularGroupMentionMode === 'always' || body.regularGroupMentionMode === 'topic' || body.regularGroupMentionMode === 'never' || body.regularGroupMentionMode === 'ambient') {
     patch.regularGroupMentionMode = body.regularGroupMentionMode;
   }
   if (body.docSubscribeDefaultMode === 'mention-only' || body.docSubscribeDefaultMode === 'all') {

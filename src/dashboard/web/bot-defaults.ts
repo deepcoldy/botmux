@@ -361,7 +361,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     const p2p: string = b.p2pMode === 'chat' ? 'chat' : 'thread';
     const regular: string = (b.regularGroupReplyMode === 'new-topic' || b.regularGroupReplyMode === 'shared')
       ? b.regularGroupReplyMode : 'chat';
-    const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never')
+    const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never' || b.regularGroupMentionMode === 'ambient')
       ? b.regularGroupMentionMode : 'always';
     const docMode: string = b.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
     const opt = (v: string, label: string) =>
@@ -406,6 +406,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             ${mopt('always', t('botDefaults.mentionModeAlways'))}
             ${mopt('topic', t('botDefaults.mentionModeTopic'))}
             ${mopt('never', t('botDefaults.mentionModeNever'))}
+            ${mopt('ambient', t('botDefaults.mentionModeAmbient'))}
           </select>
         </label>
         <small class="bd-help">${t('botDefaults.mentionModeHelp')}</small>

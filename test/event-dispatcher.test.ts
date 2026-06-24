@@ -100,7 +100,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
 import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
@@ -323,6 +323,67 @@ describe('isBotMentioned', () => {
       mentions: [{ key: '@_bot', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     };
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
+  });
+});
+
+// The 'ambient' mention policy answers un-@ messages but backs off the moment
+// the user @mentions a *different* member (person/bot) — the redirect carve-out.
+// mentionsAnotherMember is that predicate. 'never' ignores it (unconditional).
+describe('mentionsAnotherMember (ambient redirect carve-out)', () => {
+  beforeEach(() => {
+    setupBotState();
+  });
+
+  it('returns true when the message @mentions another member via mentions array', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'Other', id: { open_id: 'ou_other' } }],
+      content: JSON.stringify({ text: '@Other 你看下' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns true when another member is @mentioned via inline at node (post content)', () => {
+    const postContent = JSON.stringify({
+      zh_cn: {
+        content: [[
+          { tag: 'at', user_id: 'ou_other' },
+          { tag: 'text', text: ' 帮我看下' },
+        ]],
+      },
+    });
+    expect(mentionsAnotherMember(MY_APP_ID, { content: postContent, mentions: [] })).toBe(true);
+  });
+
+  it('returns false when only THIS bot is @mentioned', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns false for @all (everyone incl. me — not a redirect to someone else)', () => {
+    const message = {
+      mentions: [{ key: '@_all_', name: 'all', id: { open_id: 'all' } }],
+      content: JSON.stringify({ text: '@all 通知' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns false when no one is @mentioned (plain ambient message)', () => {
+    const message = { mentions: [], content: JSON.stringify({ text: '随便说一句' }) };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns true when both this bot AND another member are @mentioned (still a hand-off signal)', () => {
+    const message = {
+      mentions: [
+        { key: '@_bot', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_other', name: 'Other', id: { open_id: 'ou_other' } },
+      ],
+      content: JSON.stringify({ text: '@BotA @Other' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
   });
 });
 
