@@ -41,9 +41,12 @@ function ds(input: {
   chatId?: string;
   larkAppId?: string;
   status?: DaemonSession['lastScreenStatus'];
+  worker?: 'live' | 'none' | 'killed';
+  suspendedColdResume?: boolean;
 }): DaemonSession {
   const chatId = input.chatId ?? 'oc_goal';
   const larkAppId = input.larkAppId ?? 'cli_main';
+  const workerMode = input.worker ?? 'live';
   return {
     session: {
       sessionId: input.sessionId ?? 's1',
@@ -54,8 +57,9 @@ function ds(input: {
       status: 'active',
       createdAt: new Date(0).toISOString(),
       larkAppId,
+      suspendedColdResume: input.suspendedColdResume,
     },
-    worker: input.status ? ({ killed: false } as any) : null,
+    worker: workerMode === 'none' ? null : ({ killed: workerMode === 'killed' } as any),
     workerPort: null,
     workerToken: null,
     larkAppId,
@@ -66,7 +70,7 @@ function ds(input: {
     cliVersion: 'test',
     lastMessageAt: 0,
     hasHistory: false,
-    lastScreenStatus: input.status,
+    lastScreenStatus: input.status ?? (workerMode === 'live' ? 'idle' : undefined),
   };
 }
 
@@ -542,6 +546,72 @@ describe('goal watchdog', () => {
       pendingTaskIds: ['t1'],
       sessionId: 'l2-new',
       reason: 'revived',
+    }]);
+  });
+
+  it('cold-wakes a suspended L2 supervisor session instead of creating a new one', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({
+      chatId: 'oc_goal',
+      larkAppId: 'cli_main',
+      sessionId: 'l2-suspended',
+      worker: 'none',
+      suspendedColdResume: true,
+    }));
+    const injected: Array<{ sessionId: string; prompt: string }> = [];
+    const reviveCalls: string[] = [];
+
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([task('t-reported-legacy', 'oc_goal', 'reported', undefined, '人工验收')]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      reviveSupervisor: (goalChatId) => {
+        reviveCalls.push(goalChatId);
+        return { ok: true, status: 'revived', sessionId: 'should-not-create' };
+      },
+      inject: (target, prompt) => injected.push({ sessionId: target.session.sessionId, prompt }),
+    });
+
+    expect(reviveCalls).toEqual([]);
+    expect(results).toMatchObject([{ goalChatId: 'oc_goal', status: 'injected', pendingTaskIds: ['t-reported-legacy'], sessionId: 'l2-suspended' }]);
+    expect(injected).toHaveLength(1);
+    expect(injected[0].sessionId).toBe('l2-suspended');
+    expect(injected[0].prompt).toContain('冷唤醒 L2 人工验收');
+  });
+
+  it('revives through the registry when an L2 record remains but its worker is dead', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({
+      chatId: 'oc_goal',
+      larkAppId: 'cli_main',
+      sessionId: 'l2-zombie',
+      worker: 'none',
+      suspendedColdResume: false,
+    }));
+    const calls: string[] = [];
+
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([task('t1', 'oc_goal', 'dispatched')]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      reviveSupervisor: (goalChatId) => {
+        calls.push(goalChatId);
+        return { ok: true, status: 'revived', sessionId: 'l2-new' };
+      },
+      inject: () => { throw new Error('dead non-suspended L2 must not be injected as active'); },
+    });
+
+    expect(calls).toEqual(['oc_goal']);
+    expect(results).toEqual([{
+      goalChatId: 'oc_goal',
+      status: 'revived',
+      pendingTaskIds: ['t1'],
+      sessionId: 'l2-new',
+      reason: 'stale-supervisor:revived',
     }]);
   });
 

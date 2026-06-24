@@ -189,12 +189,18 @@ export function shouldTriggerGoalWatchdogOnSessionBoundary(ds: DaemonSession): b
     && !isGoalSupervisorTitle(ds.session.title);
 }
 
-function isGoalSupervisorSession(ds: DaemonSession, larkAppId: string, goalChatId: string): boolean {
+function isGoalSupervisorSessionRecord(ds: DaemonSession, larkAppId: string, goalChatId: string): boolean {
   return ds.larkAppId === larkAppId
     && ds.chatId === goalChatId
     && ds.scope === 'chat'
     && ds.session.status === 'active'
     && isGoalSupervisorTitle(ds.session.title);
+}
+
+function isLiveGoalSupervisorSession(ds: DaemonSession, larkAppId: string, goalChatId: string): boolean {
+  return isGoalSupervisorSessionRecord(ds, larkAppId, goalChatId)
+    && !!ds.worker
+    && !ds.worker.killed;
 }
 
 function isBusy(ds: DaemonSession): boolean {
@@ -208,11 +214,28 @@ export function findGoalSupervisorSession(
   goalChatId: string,
 ): DaemonSession | undefined {
   const direct = activeSessions.get(sessionKey(goalChatId, larkAppId));
-  if (direct && isGoalSupervisorSession(direct, larkAppId, goalChatId)) return direct;
+  if (direct && isLiveGoalSupervisorSession(direct, larkAppId, goalChatId)) return direct;
   for (const ds of activeSessions.values()) {
-    if (isGoalSupervisorSession(ds, larkAppId, goalChatId)) return ds;
+    if (isLiveGoalSupervisorSession(ds, larkAppId, goalChatId)) return ds;
   }
   return undefined;
+}
+
+function findDormantGoalSupervisorSession(
+  activeSessions: Map<string, DaemonSession>,
+  larkAppId: string,
+  goalChatId: string,
+): DaemonSession | undefined {
+  const direct = activeSessions.get(sessionKey(goalChatId, larkAppId));
+  if (direct && isGoalSupervisorSessionRecord(direct, larkAppId, goalChatId)) return direct;
+  for (const ds of activeSessions.values()) {
+    if (isGoalSupervisorSessionRecord(ds, larkAppId, goalChatId)) return ds;
+  }
+  return undefined;
+}
+
+function canColdWakeGoalSupervisor(ds: DaemonSession): boolean {
+  return ds.session.suspendedColdResume === true;
 }
 
 function latestReportAtByTask(events: LedgerEvent[]): Map<string, number> {
@@ -275,7 +298,45 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
       continue;
     }
-    const ds = findGoalSupervisorSession(deps.activeSessions, deps.larkAppId, goalChatId);
+    const liveDs = findGoalSupervisorSession(deps.activeSessions, deps.larkAppId, goalChatId);
+    const dormantDs = liveDs ? undefined : findDormantGoalSupervisorSession(deps.activeSessions, deps.larkAppId, goalChatId);
+    if (!liveDs && dormantDs && !canColdWakeGoalSupervisor(dormantDs)) {
+      if (deps.reviveSupervisor) {
+        const revive = await deps.reviveSupervisor(goalChatId);
+        if (revive.ok) {
+          results.push({
+            goalChatId,
+            status: 'revived',
+            pendingTaskIds: tasks.map((task) => task.taskId),
+            sessionId: revive.sessionId,
+            reason: `stale-supervisor:${revive.status}`,
+          });
+          continue;
+        }
+        results.push({
+          goalChatId,
+          status: 'revive-skipped',
+          pendingTaskIds: tasks.map((task) => task.taskId),
+          reason: `${revive.errorCode}: ${revive.error}`,
+        });
+        await deps.onReviveFailure?.({
+          goalChatId,
+          errorCode: revive.errorCode,
+          error: revive.error,
+          pendingTaskIds: tasks.map((task) => task.taskId),
+        });
+        continue;
+      }
+      results.push({
+        goalChatId,
+        status: 'no-l2',
+        pendingTaskIds: tasks.map((task) => task.taskId),
+        reason: 'goal supervisor session exists but worker is not live',
+      });
+      continue;
+    }
+    const ds = liveDs ?? dormantDs;
+    const supervisorIsColdWake = !liveDs && !!dormantDs;
     if (!ds) {
       if (deps.reviveSupervisor) {
         const revive = await deps.reviveSupervisor(goalChatId);
@@ -331,7 +392,13 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
         defaultTimeoutMs: deps.defaultTimeoutMs,
       });
       if (reconcile.action === 'no-criteria') {
-        if (task.status === 'reported') continue;
+        if (task.status === 'reported' && !supervisorIsColdWake) continue;
+        if (task.status === 'reported' && supervisorIsColdWake) {
+          inspectionFacts.set(
+            task.taskId,
+            'L2 监管会话处于休眠/冷恢复态；该任务已有 report 但没有结构化 criteria，需冷唤醒 L2 人工验收。',
+          );
+        }
         await appendWorkerHealthFacts(goalChatId, task, inspectionFacts);
         legacyTasks.push(task);
       } else if (reconcile.action === 'unreported-pass') {
