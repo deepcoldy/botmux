@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildGoalHumanAttentionCard } from '../src/im/lark/card-builder.js';
+import { buildGoalHumanAttentionCard, buildGoalHumanAttentionResolvedCard } from '../src/im/lark/card-builder.js';
 
 function findAll(node: any, pred: (n: any) => boolean, out: any[] = []): any[] {
   if (!node || typeof node !== 'object') return out;
@@ -62,5 +62,23 @@ describe('buildGoalHumanAttentionCard', () => {
     }));
     expect(card.header.template).toBe('blue');
     expect(card.header.title.content).toContain('worker 求助');
+  });
+
+  it('renders a locked resolved card after a decision is submitted', () => {
+    const card = JSON.parse(buildGoalHumanAttentionResolvedCard({
+      goalTitle: 'CSV kit',
+      goalChatId: 'oc_goal',
+      goalLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_goal',
+      taskId: 'task-1',
+      summary: 'reviewer 要产品拍板',
+      parentChatId: 'oc_parent',
+      decisionText: '支持方案 A，今晚前给凭证',
+    }));
+
+    expect(card.header.template).toBe('green');
+    expect(JSON.stringify(card)).toContain('支持方案 A');
+    expect(findAll(card, (n) => n?.tag === 'form')).toHaveLength(0);
+    expect(findAll(card, (n) => n?.value?.action === 'goal_parent_decision')).toHaveLength(0);
+    expect(JSON.stringify(card)).toContain('引用回复这张卡片');
   });
 });

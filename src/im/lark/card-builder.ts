@@ -2153,3 +2153,52 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
     elements,
   });
 }
+
+export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCardInput & { decisionText: string }): string {
+  const title = input.goalTitle ?? input.goalChatId;
+  const fields = [
+    { is_short: true, text: { tag: 'lark_md', content: `**Goal**\n${escapeMd(title)}` } },
+    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**taskId**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
+    { is_short: true, text: { tag: 'lark_md', content: `**状态**\n监管者处理中` } },
+  ].filter(Boolean);
+  const elements: any[] = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: [
+          '✅ 人类决策已下发给 goal 监管者。',
+          input.goalLink ? `[打开 goal 群](${input.goalLink})` : undefined,
+        ].filter(Boolean).join('\n'),
+      },
+    },
+    { tag: 'div', fields },
+    {
+      tag: 'div',
+      text: { tag: 'lark_md', content: `**已下发决策**\n${escapeMd(truncateCardText(input.decisionText, 1200))}` },
+    },
+    { tag: 'note', elements: [{ tag: 'lark_md', content: '如需补充，请引用回复这张卡片；卡片内表单已关闭，避免重复下发。' }] },
+  ];
+  if (input.goalLink) {
+    elements.splice(3, 0, {
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '打开 goal 群' },
+        type: 'default',
+        multi_url: {
+          url: input.goalLink,
+          pc_url: input.goalLink,
+          android_url: input.goalLink,
+          ios_url: input.goalLink,
+        },
+      }],
+    });
+  }
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: 'green', title: { tag: 'plain_text', content: '✅ 决策已下发' } },
+    elements,
+  });
+}

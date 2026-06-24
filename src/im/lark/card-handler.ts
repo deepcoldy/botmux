@@ -7,10 +7,10 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { basename as pathBasename, dirname, join } from 'node:path';
 import { config } from '../../config.js';
-import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId, getBotBrand } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard, buildGoalHumanAttentionResolvedCard } from './card-builder.js';
 import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
@@ -72,6 +72,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
 import { emitGoalNarration } from '../../verified-delivery/narration.js';
 import { getGoalParentNotification, type GoalParentNotificationRecord } from '../../services/goal-parent-notification-store.js';
+import { chatAppLink } from './lark-hosts.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
@@ -276,6 +277,25 @@ function goalNotificationRecordFromAction(
     done: false,
     createdAt: Date.now(),
   };
+}
+
+function goalResolvedCard(record: GoalParentNotificationRecord, decisionText: string): string {
+  return buildGoalHumanAttentionResolvedCard({
+    goalTitle: record.goalTitle,
+    goalChatId: record.goalChatId,
+    goalLink: chatAppLink(record.goalChatId, getBotBrand(record.larkAppId)),
+    taskId: record.taskId,
+    attentionKind: record.attentionKind,
+    attentionReason: record.attentionReason,
+    summary: record.summary,
+    notificationMessageId: record.messageId,
+    notificationLarkAppId: record.larkAppId,
+    parentChatId: record.parentChatId,
+    parentRoot: record.parentRoot,
+    parentSessionId: record.parentSessionId,
+    supervisorSessionId: record.supervisorSessionId,
+    decisionText,
+  });
 }
 
 async function routeGoalParentCardDecisionAcrossDaemons(
@@ -734,7 +754,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: '没有在线监管者，稍后可重试或直接在主群补充说明。' } };
     }
     logger.info(`[goal-parent-decision] routed card decision goal=${record.goalChatId} task=${record.taskId ?? '-'} routed=${result.routed} deduped=${result.deduped}`);
-    return { toast: { type: 'success', content: '已把你的决策下发给 goal 监管者。' } };
+    return JSON.parse(goalResolvedCard(record, decisionText));
   }
 
   // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
