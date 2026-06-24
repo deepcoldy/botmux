@@ -16,6 +16,36 @@ export interface DispatchWorkerMeta {
   cliId: string;
 }
 
+export function normalizeDispatchBotsForSender(input: {
+  bots: DispatchBot[];
+  botInfoEntries: DispatchWorkerMetaBotInfo[];
+  senderScopedBotOpenIds?: Record<string, string>;
+}): DispatchBot[] {
+  const senderOpenIdByLabel = new Map<string, string>();
+  for (const [label, openId] of Object.entries(input.senderScopedBotOpenIds ?? {})) {
+    if (typeof openId === 'string' && openId.trim()) senderOpenIdByLabel.set(label.trim().toLowerCase(), openId.trim());
+  }
+  if (senderOpenIdByLabel.size === 0) return input.bots;
+
+  const extraLabelsByCliId = new Map<string, string[]>();
+  for (const entry of input.botInfoEntries) {
+    const cliId = entry.cliId?.trim().toLowerCase();
+    const botName = entry.botName?.trim();
+    if (cliId && botName) extraLabelsByCliId.set(cliId, [...(extraLabelsByCliId.get(cliId) ?? []), botName]);
+  }
+
+  return input.bots.map((bot) => {
+    const labels = [bot.name, bot.openId, ...(extraLabelsByCliId.get(bot.openId.trim().toLowerCase()) ?? [])]
+      .map((label) => label?.trim())
+      .filter((label): label is string => !!label);
+    for (const label of labels) {
+      const scopedOpenId = senderOpenIdByLabel.get(label.toLowerCase());
+      if (scopedOpenId) return { ...bot, openId: scopedOpenId };
+    }
+    return bot;
+  });
+}
+
 export function resolveDispatchWorkerMetas(input: {
   openIds: string[];
   bots: DispatchBot[];

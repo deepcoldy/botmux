@@ -15584,7 +15584,7 @@ async function maybeIngestDeliveryEnvelope(input: {
     return true;
   }
   if (!task.workerOpenIds?.includes(senderOpenId)) {
-    logger.warn(`[delivery-envelope] unauthorized sender=${senderOpenId} task=${envelope.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
+    logger.warn(`[delivery-envelope] unauthorized sender=${senderOpenId} task=${envelope.taskId} goal=${goalChatId} msg=${input.parsed.messageId} allowed=[${(task.workerOpenIds ?? []).join(',')}] app=${input.larkAppId}`);
     return true;
   }
 

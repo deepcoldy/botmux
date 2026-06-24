@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveDispatchWorkerMetas } from '../src/core/dispatch-worker-meta.js';
+import { normalizeDispatchBotsForSender, resolveDispatchWorkerMetas } from '../src/core/dispatch-worker-meta.js';
 
 describe('dispatch worker metadata resolver', () => {
   const botConfigs = [
@@ -54,5 +54,21 @@ describe('dispatch worker metadata resolver', () => {
     });
 
     expect(metas).toEqual([{ larkAppId: '', cliId: '' }]);
+  });
+
+  it('normalizes dispatch bot open_ids to the sender app namespace by display name or cliId', () => {
+    const byName = normalizeDispatchBotsForSender({
+      bots: [{ openId: 'ou_stale', name: 'traex-loopy', role: 'coder' }],
+      botInfoEntries,
+      senderScopedBotOpenIds: { 'traex-loopy': 'ou_traex_seen_by_l2' },
+    });
+    expect(byName).toEqual([{ openId: 'ou_traex_seen_by_l2', name: 'traex-loopy', role: 'coder' }]);
+
+    const byCliId = normalizeDispatchBotsForSender({
+      bots: [{ openId: 'traex', role: 'coder' }],
+      botInfoEntries,
+      senderScopedBotOpenIds: { 'traex-loopy': 'ou_traex_seen_by_l2' },
+    });
+    expect(byCliId).toEqual([{ openId: 'ou_traex_seen_by_l2', role: 'coder' }]);
   });
 });
