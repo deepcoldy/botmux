@@ -32,6 +32,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
+import { AskArgsError, parseAskOptions } from './core/ask-args.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
@@ -124,6 +125,7 @@ import {
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
+import type { GoalDecisionOption } from './services/goal-decision-options.js';
 import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import {
   createWhiteboard,
@@ -5402,6 +5404,37 @@ function withCustomCardMentionFooter(
   return { ok: true, card: cloned };
 }
 
+function parseGoalDecisionOptionsOrExit(args: string[], context: string): GoalDecisionOption[] | undefined {
+  const optionsRaw = argValue(args, '--options');
+  const recommendedRaw = argValue(args, '--recommended', '--selected');
+  if (!optionsRaw) {
+    if (recommendedRaw) {
+      console.error(`${context}: --recommended 只能和 --options 一起使用`);
+      process.exit(1);
+    }
+    return undefined;
+  }
+  let parsed;
+  try {
+    parsed = parseAskOptions(optionsRaw);
+  } catch (err) {
+    if (err instanceof AskArgsError) {
+      console.error(`${context}: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
+  }
+  const recommended = recommendedRaw?.trim();
+  if (recommended && !parsed.some((opt) => opt.key === recommended)) {
+    console.error(`${context}: --recommended 必须匹配 --options 里的 key（收到 ${recommended}）`);
+    process.exit(1);
+  }
+  return parsed.map((opt) => ({
+    ...opt,
+    recommended: recommended ? opt.key === recommended : undefined,
+  }));
+}
+
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
@@ -7459,7 +7492,8 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
         [--retry-brief <text>] [--expected-evidence <text>] [--checked-by <id>] [--no-push]
   升级给人:
     botmux delivery escalate --task <taskId> --reason <text> \\
-        [--retry-brief <text>] [--by <id>] [--session-id <L2会话id>] [--no-notify-parent]
+        [--retry-brief <text>] [--by <id>] [--session-id <L2会话id>] [--no-notify-parent] \\
+        [--options "a=方案A,b=方案B"] [--recommended a]
 
 说明:
   --report 省略时默认使用该任务 latestReportId。
@@ -7542,6 +7576,7 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     }
     const retryBrief = argValue(rest, '--retry-brief')?.trim();
     const by = argValue(rest, '--by')?.trim() || checkedBy;
+    const decisionOptions = parseGoalDecisionOptionsOrExit(rest, 'delivery escalate');
     const result = ledger.append({
       type: 'TaskEscalated',
       actor: 'orchestrator',
@@ -7593,6 +7628,7 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
             summary,
             attentionKind: 'help',
             attentionReason: reason,
+            decisionOptions,
           }),
         });
         const body = await res.json().catch(() => null) as { ok?: boolean; error?: string; attentionRaised?: boolean } | null;
@@ -7746,7 +7782,7 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
       [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
       [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
-  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>] [--task <taskId>] [--attention[=help]] [--done]
+  botmux goal notify-parent (--summary <text> | --summary-file <path>) [--session-id <L2会话id>] [--goal <goal群chatId>] [--task <taskId>] [--attention[=help]] [--done] [--options "a=方案A,b=方案B"] [--recommended a]
   botmux goal charter current --goal <goal群chatId> [--create] [--title <标题>]
   botmux goal charter read --goal <goal群chatId> [--json]
   botmux goal charter update --goal <goal群chatId> --expected-updated-at <ts> <完整内容>
@@ -7853,6 +7889,7 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
   const done = argFlag(rest, '--done') || argFlag(rest, '--complete');
   const summaryFile = argValue(rest, '--summary-file');
   const attention = parseAttentionFlag(rest);
+  const decisionOptions = parseGoalDecisionOptionsOrExit(rest, 'goal notify-parent');
   let summary = argValue(rest, '--summary') ?? '';
   if (summaryFile) {
     if (!existsSync(summaryFile)) { console.error(`文件不存在: ${summaryFile}`); process.exit(1); }
@@ -7898,6 +7935,7 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
         summary: summary.trim(),
         attentionKind: attention.requested ? attention.kind : undefined,
         attentionReason: attention.requested ? summary.trim() : undefined,
+        decisionOptions,
         done,
       }),
     });

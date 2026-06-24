@@ -9,6 +9,7 @@ import { t, type Locale } from '../../i18n/index.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import type { GoalDecisionOption } from '../../services/goal-decision-options.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -2044,6 +2045,7 @@ export interface GoalHumanAttentionCardInput {
   taskId?: string;
   attentionKind?: string;
   attentionReason?: string;
+  decisionOptions?: GoalDecisionOption[];
   summary: string;
   notificationMessageId?: string;
   notificationLarkAppId?: string;
@@ -2107,6 +2109,24 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
       text: { tag: 'lark_md', content: `**摘要**\n${escapeMd(truncateCardText(input.summary, 1200))}` },
     });
   }
+  const optionActions = (input.decisionOptions ?? []).map((opt) => ({
+    tag: 'button',
+    text: { tag: 'plain_text', content: `${opt.recommended ? '⭐ ' : ''}${opt.label}` },
+    type: opt.recommended ? 'primary' : 'default',
+    value: {
+      ...actionValue,
+      action: 'goal_parent_decision_option',
+      decision_key: opt.key,
+      decision_text: opt.label,
+    },
+  }));
+  if (optionActions.length) {
+    elements.push(
+      { tag: 'hr' },
+      { tag: 'div', text: { tag: 'lark_md', content: '**推荐选项**\n点一个选项会直接下发给监管者；复杂情况仍可用下方自由输入。' } },
+      { tag: 'action', actions: optionActions },
+    );
+  }
   elements.push(
     { tag: 'hr' },
     {
@@ -2154,7 +2174,7 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
   });
 }
 
-export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCardInput & { decisionText: string }): string {
+export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCardInput & { decisionText: string; decisionMode?: 'option' | 'free-text' }): string {
   const title = input.goalTitle ?? input.goalChatId;
   const fields = [
     { is_short: true, text: { tag: 'lark_md', content: `**Goal**\n${escapeMd(title)}` } },
@@ -2175,7 +2195,10 @@ export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCar
     { tag: 'div', fields },
     {
       tag: 'div',
-      text: { tag: 'lark_md', content: `**已下发决策**\n${escapeMd(truncateCardText(input.decisionText, 1200))}` },
+      text: {
+        tag: 'lark_md',
+        content: `**${input.decisionMode === 'option' ? '已选' : '已下发决策'}**\n${escapeMd(truncateCardText(input.decisionText, 1200))}`,
+      },
     },
     { tag: 'note', elements: [{ tag: 'lark_md', content: '如需补充，请引用回复这张卡片；卡片内表单已关闭，避免重复下发。' }] },
   ];
