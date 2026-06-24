@@ -51,11 +51,20 @@ export interface GoalWatchdogDeps {
   defaultTimeoutMs?: number;
   reportGraceMs?: number;
   reviveSupervisor?: (goalChatId: string) => Promise<GoalWatchdogReviveResult> | GoalWatchdogReviveResult;
+  onReviveFailure?: (event: GoalWatchdogReviveFailureEvent) => Promise<void> | void;
+  workerHealthFacts?: (task: TaskView, goalChatId: string) => Promise<string[]> | string[];
 }
 
 export type GoalWatchdogReviveResult =
   | { ok: true; status: 'active' | 'revived'; sessionId: string }
   | { ok: false; errorCode: string; error: string };
+
+export interface GoalWatchdogReviveFailureEvent {
+  goalChatId: string;
+  errorCode: string;
+  error: string;
+  pendingTaskIds: string[];
+}
 
 export type GoalWatchdogNotifyKind = 'accepted' | 'rejected';
 
@@ -246,6 +255,20 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
   const goalFilter = deps.goalChatIds ? new Set(deps.goalChatIds) : undefined;
   const results: GoalWatchdogResult[] = [];
 
+  async function appendWorkerHealthFacts(goalChatId: string, task: TaskView, inspectionFacts: Map<string, string>): Promise<void> {
+    if (!deps.workerHealthFacts) return;
+    let facts: string[];
+    try {
+      facts = await deps.workerHealthFacts(task, goalChatId);
+    } catch (err) {
+      facts = [`[worker-health] health lookup failed: ${err instanceof Error ? err.message : String(err)}`];
+    }
+    const clean = facts.map((fact) => fact.trim()).filter(Boolean);
+    if (clean.length === 0) return;
+    const prev = inspectionFacts.get(task.taskId);
+    inspectionFacts.set(task.taskId, [prev, ...clean].filter(Boolean).join('\n'));
+  }
+
   for (const [goalChatId, tasks] of byGoal) {
     if (goalFilter && !goalFilter.has(goalChatId)) continue;
     if (tasks.length === 0) {
@@ -271,6 +294,12 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
           status: 'revive-skipped',
           pendingTaskIds: tasks.map((task) => task.taskId),
           reason: `${revive.errorCode}: ${revive.error}`,
+        });
+        await deps.onReviveFailure?.({
+          goalChatId,
+          errorCode: revive.errorCode,
+          error: revive.error,
+          pendingTaskIds: tasks.map((task) => task.taskId),
         });
         continue;
       }
@@ -303,14 +332,17 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       });
       if (reconcile.action === 'no-criteria') {
         if (task.status === 'reported') continue;
+        await appendWorkerHealthFacts(goalChatId, task, inspectionFacts);
         legacyTasks.push(task);
       } else if (reconcile.action === 'unreported-pass') {
         inspectionFacts.set(
           task.taskId,
           reconcile.inspectionFact ?? '产物已满足结构化验收标准，但 worker 未交付 report；请监管者判断是否代办、催交或重派。',
         );
+        await appendWorkerHealthFacts(goalChatId, task, inspectionFacts);
         legacyTasks.push(task);
       } else if (reconcile.action === 'blocked') {
+        await appendWorkerHealthFacts(goalChatId, task, inspectionFacts);
         legacyTasks.push(task);
       } else if (reconcile.action === 'escalated') {
         continue;
@@ -326,6 +358,7 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
           task.taskId,
           reconcile.inspectionFact ?? '结构化验收未通过；请监管者统揽判断：引导 worker、重派、要求重新 report，或升级给人。',
         );
+        await appendWorkerHealthFacts(goalChatId, task, inspectionFacts);
         legacyTasks.push(task);
       }
     }
@@ -371,6 +404,8 @@ export async function runGoalWatchdogForGoal(input: {
   goalChatId: string;
   now?: number;
   cooldownMs?: number;
+  onReviveFailure?: GoalWatchdogDeps['onReviveFailure'];
+  workerHealthFacts?: GoalWatchdogDeps['workerHealthFacts'];
 }): Promise<GoalWatchdogResult[]> {
   return runGoalWatchdogOnce({
     larkAppId: input.larkAppId,
@@ -379,6 +414,8 @@ export async function runGoalWatchdogForGoal(input: {
     intervalMs: input.cooldownMs ?? DEFAULT_GOAL_WATCHDOG_INTERVAL_MS,
     goalChatIds: [input.goalChatId],
     lastInjectedAt: defaultLastInjectedAt,
+    onReviveFailure: input.onReviveFailure,
+    workerHealthFacts: input.workerHealthFacts,
     reviveSupervisor: async (goalChatId) => {
       const r = await ensureGoalSupervisorFromRegistry(goalChatId, {
         larkAppId: input.larkAppId,
@@ -395,6 +432,8 @@ export function startGoalWatchdog(input: {
   larkAppId: string;
   activeSessions: Map<string, DaemonSession>;
   intervalMs?: number;
+  onReviveFailure?: GoalWatchdogDeps['onReviveFailure'];
+  workerHealthFacts?: GoalWatchdogDeps['workerHealthFacts'];
 }): NodeJS.Timeout | null {
   const disabled = process.env.BOTMUX_GOAL_WATCHDOG === '0' || process.env.BOTMUX_GOAL_WATCHDOG === 'false';
   if (disabled) {
@@ -409,6 +448,8 @@ export function startGoalWatchdog(input: {
         larkAppId: input.larkAppId,
         activeSessions: input.activeSessions,
         intervalMs,
+        onReviveFailure: input.onReviveFailure,
+        workerHealthFacts: input.workerHealthFacts,
         reviveSupervisor: async (goalChatId) => {
           const r = await ensureGoalSupervisorFromRegistry(goalChatId, {
             larkAppId: input.larkAppId,
