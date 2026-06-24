@@ -28,7 +28,7 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, getMessageChatId, listChatBotMembers, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigs,
@@ -58,6 +58,7 @@ import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { getGoalParentNotification, rememberGoalParentNotification, type GoalParentNotificationRecord } from './services/goal-parent-notification-store.js';
+import { getGoalChat } from './services/goal-chat-store.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
@@ -123,7 +124,7 @@ import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
 import { consumeQuota, removeChatGrant, removeGlobalGrant } from './services/grant-store.js';
 import { abortCharge, commitCharge, beginCharge } from './services/quota-dedup.js';
-import { listOnlineDaemons } from './utils/daemon-discovery.js';
+import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import {
   getSessionWorkingDir,
   getProjectScanDir,
@@ -145,7 +146,6 @@ import {
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
-import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -265,8 +265,10 @@ import {
   runGoalWatchdogForGoal,
   shouldTriggerGoalWatchdogOnSessionBoundary,
   startGoalWatchdog,
+  type GoalWatchdogReviveFailureEvent,
   type GoalWatchdogResult,
 } from './core/goal-watchdog.js';
+import type { TaskView } from './verified-delivery/types.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
@@ -2290,12 +2292,189 @@ function scheduleGoalWatchdogRetry(goalChatId: string, reason: string): void {
   logger.info(`[goal-watchdog] scheduled event retry goal=${goalChatId} reason=${reason} delayMs=${DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS}`);
 }
 
+const reviveBudgetAttentionAt = new Map<string, number>();
+const REVIVE_BUDGET_ATTENTION_COOLDOWN_MS = 10 * 60_000;
+
+async function handleGoalReviveFailure(event: GoalWatchdogReviveFailureEvent): Promise<void> {
+  if (event.errorCode !== 'revive_budget_exhausted') return;
+  const now = Date.now();
+  const last = reviveBudgetAttentionAt.get(event.goalChatId) ?? 0;
+  if (last > 0 && now - last < REVIVE_BUDGET_ATTENTION_COOLDOWN_MS) return;
+  reviveBudgetAttentionAt.set(event.goalChatId, now);
+
+  const rec = getGoalChat(event.goalChatId);
+  if (!rec?.parentChatId) {
+    logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId} but parent chat is unknown`);
+    return;
+  }
+
+  const parent = findActiveSessionById(rec.parentSessionId);
+  const ownerOpenId = goalNotifyOwnerOpenId(parent);
+  const candidates = goalParentSenderCandidates(parent?.larkAppId, rec.larkAppId, currentDaemonLarkAppId);
+  const goalLink = chatAppLink(event.goalChatId, getBotBrand(candidates[0] ?? rec.larkAppId ?? currentDaemonLarkAppId));
+  const summary = [
+    `监工连续自动复活失败，已达到预算上限。`,
+    `原因: ${event.error}`,
+    event.pendingTaskIds.length > 0 ? `未完成任务: ${event.pendingTaskIds.join(', ')}` : undefined,
+    '需要人类确认：重启/重建 goal 监管者，或手动收尾该 goal。',
+  ].filter(Boolean).join('\n');
+
+  if (parent) {
+    parent.agentAttention = { kind: 'blocked', reason: `Goal 监工反复崩溃：${rec.title ?? event.goalChatId}`, at: now };
+    publishAttentionPatch(parent);
+    emitSessionLifecycleHook(parent, 'session.requires_attention', {
+      reason: 'goal_supervisor_revive_budget_exhausted',
+      kind: 'blocked',
+      message: parent.agentAttention.reason,
+    });
+  }
+
+  let lastError: string | undefined;
+  for (const larkAppId of candidates) {
+    const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
+    const text = [
+      `${mention}[goal] Goal 监工反复崩溃，需要你处理`,
+      rec.title ? `Goal: ${rec.title}` : undefined,
+      `goalChatId: ${event.goalChatId}`,
+      `打开 goal 群: ${goalLink}`,
+      '',
+      summary,
+    ].filter(Boolean).join('\n');
+    try {
+      const messageId = await sendMessage(larkAppId, rec.parentChatId, text, 'text');
+      if (messageId) {
+        rememberGoalParentNotification({
+          messageId,
+          larkAppId,
+          parentChatId: rec.parentChatId,
+          parentRoot: rec.parentRoot,
+          parentSessionId: rec.parentSessionId,
+          goalChatId: event.goalChatId,
+          goalTitle: rec.title,
+          summary,
+          attentionKind: 'blocked',
+          attentionReason: 'goal_supervisor_revive_budget_exhausted',
+          done: false,
+          createdAt: now,
+        });
+      }
+      logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention sent via ${larkAppId}`);
+      return;
+    } catch (err: any) {
+      lastError = err?.message ?? String(err);
+      logger.warn(`[goal-watchdog] revive budget human attention via ${larkAppId} failed: ${lastError}`);
+    }
+  }
+  logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention failed: ${lastError ?? 'no_sender_available'}`);
+}
+
+type LocalGoalWorkerHealth = {
+  larkAppId: string;
+  sessionId?: string;
+  session: 'live' | 'suspended' | 'closed' | 'missing' | 'unknown';
+  workerProcess: 'live' | 'none' | 'killed' | 'unknown';
+  lastActivityAt?: string;
+  title?: string;
+};
+
+function collectLocalGoalWorkerHealth(goalChatId: string, workerLarkAppId?: string): LocalGoalWorkerHealth[] {
+  const out: LocalGoalWorkerHealth[] = [];
+  for (const ds of activeSessions.values()) {
+    if (workerLarkAppId && ds.larkAppId !== workerLarkAppId) continue;
+    if (ds.chatId !== goalChatId || ds.scope !== 'chat') continue;
+    if (ds.session.goalSupervisor || isGoalPanelApp(ds.larkAppId)) continue;
+    out.push({
+      larkAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      session: ds.session.suspendedColdResume ? 'suspended' : (ds.session.status === 'active' ? 'live' : 'closed'),
+      workerProcess: ds.worker ? (ds.worker.killed ? 'killed' : 'live') : 'none',
+      lastActivityAt: new Date(ds.lastMessageAt).toISOString(),
+      title: ds.session.title,
+    });
+  }
+  return out;
+}
+
+async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string): Promise<LocalGoalWorkerHealth[]> {
+  if (workerLarkAppId === currentDaemonLarkAppId) {
+    return collectLocalGoalWorkerHealth(goalChatId, workerLarkAppId);
+  }
+  const daemon = findOnlineDaemon(workerLarkAppId);
+  if (!daemon) return [];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1_500);
+  try {
+    const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/worker-health-local`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goalChatId, workerLarkAppId }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return [];
+    const body = await res.json().catch(() => null) as { entries?: LocalGoalWorkerHealth[] } | null;
+    return Array.isArray(body?.entries) ? body.entries : [];
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function buildWorkerHealthFacts(task: TaskView, goalChatId: string): Promise<string[]> {
+  const workers = task.workerOpenIds ?? [];
+  const names = task.workerNames ?? [];
+  if (workers.length === 0) {
+    return [`[worker-health]\ntaskId: ${task.taskId}\nworkerOpenId: (none)\nworkerName: (unknown)\nsession: unknown\nworkerProcess: unknown\nfact: 账本没有记录 workerOpenIds，无法确定 worker 会话是否仍存活。\n建议：不要机械催该 worker；请判断恢复原会话、重派、缩 scope 或升级给人。`];
+  }
+
+  let roster: Awaited<ReturnType<typeof listChatBotMembers>> = [];
+  try {
+    roster = await listChatBotMembers(currentDaemonLarkAppId, goalChatId);
+  } catch (err: any) {
+    logger.warn(`[goal-watchdog] listChatBotMembers failed for worker health goal=${goalChatId}: ${err?.message ?? err}`);
+  }
+
+  const facts: string[] = [];
+  for (const [index, workerOpenId] of workers.entries()) {
+    const workerName = names[index] || workerOpenId;
+    const member = roster.find((m) => m.openId === workerOpenId)
+      ?? roster.find((m) => m.displayName === workerName || m.name === workerName);
+    const workerLarkAppId = member?.larkAppId || '';
+    let health: LocalGoalWorkerHealth | undefined;
+    if (workerLarkAppId) {
+      const entries = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
+      health = entries.find((entry) => entry.larkAppId === workerLarkAppId);
+    }
+    const sessionState = health?.session ?? (workerLarkAppId ? 'missing' : 'unknown');
+    const workerProcess = health?.workerProcess ?? (workerLarkAppId ? 'unknown' : 'unknown');
+    const hardFact = workerLarkAppId
+      ? (health
+        ? `已解析到 ${workerName}(${workerLarkAppId}) 的 goal 群 chat-scope 会话，session=${sessionState}，workerProcess=${workerProcess}。`
+        : `已解析到 ${workerName}(${workerLarkAppId})，但该 bot daemon 当前没有这个 goal 群的 chat-scope worker 会话。`)
+      : `无法把账本 workerOpenId 解析到本机配置 bot；可能是外部 bot、未 /introduce，或 open_id 视角不匹配。`;
+    facts.push([
+      '[worker-health]',
+      `taskId: ${task.taskId}`,
+      `workerOpenId: ${workerOpenId}`,
+      `workerName: ${workerName}`,
+      `session: ${sessionState}`,
+      `workerProcess: ${workerProcess}`,
+      health?.lastActivityAt ? `lastActivityAt: ${health.lastActivityAt}` : undefined,
+      `fact: ${hardFact}`,
+      '建议：不要继续机械催该 worker；请判断恢复原会话、重派、缩 scope 或升级给人。',
+    ].filter(Boolean).join('\n'));
+  }
+  return facts;
+}
+
 async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: string): Promise<GoalWatchdogResult[]> {
   if (isGoalPanelApp(currentDaemonLarkAppId)) return [];
   const results = await runGoalWatchdogForGoal({
     larkAppId: currentDaemonLarkAppId,
     activeSessions,
     goalChatId,
+    onReviveFailure: handleGoalReviveFailure,
+    workerHealthFacts: buildWorkerHealthFacts,
   });
   if (shouldRetryGoalWatchdog(results)) scheduleGoalWatchdogRetry(goalChatId, reason);
   const injected = countGoalWatchdogStatus(results, 'injected');
@@ -4666,6 +4845,27 @@ ipcRoute('POST', '/api/goals/:goalChatId/decision', async (req, res, params) => 
     taskId,
     supervisorSessionId: supervisor.session.sessionId,
   });
+});
+
+// Internal: return this daemon's local chat-scope worker sessions for a goal.
+// The goal watchdog owner uses this to give L2 hard worker-health facts across
+// bot daemons without letting the mechanical layer reassign or decide for L2.
+ipcRoute('POST', '/api/goal/worker-health-local', async (req, res) => {
+  let raw: { goalChatId?: unknown; workerLarkAppId?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = typeof raw.goalChatId === 'string' ? raw.goalChatId.trim() : '';
+  const workerLarkAppId = typeof raw.workerLarkAppId === 'string' && raw.workerLarkAppId.trim()
+    ? raw.workerLarkAppId.trim()
+    : undefined;
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
+  if (workerLarkAppId && workerLarkAppId !== currentDaemonLarkAppId) {
+    return jsonRes(res, 200, { ok: true, entries: [] });
+  }
+  return jsonRes(res, 200, { ok: true, entries: collectLocalGoalWorkerHealth(goalChatId, workerLarkAppId) });
 });
 
 // Internal: L2 supervisor notifies its L1 parent without sending a Lark
@@ -16910,6 +17110,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     : startGoalWatchdog({
       larkAppId: cfg.larkAppId,
       activeSessions,
+      onReviveFailure: handleGoalReviveFailure,
+      workerHealthFacts: buildWorkerHealthFacts,
     });
 
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so

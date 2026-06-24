@@ -132,6 +132,35 @@ describe('goal watchdog', () => {
     expect(injected[0].prompt).toContain('acceptanceHint=人工验收: 读取结果文件并确认 PASS');
   });
 
+  it('adds worker health facts to L2 fallback prompts', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+    const injected: Array<{ prompt: string }> = [];
+
+    await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([{ ...task('t-health', 'oc_goal', 'dispatched'), workerOpenIds: ['ou_worker'], workerNames: ['worker-a'] }]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      workerHealthFacts: (t, goalChatId) => [
+        [
+          '[worker-health]',
+          `taskId: ${t.taskId}`,
+          `goalChatId: ${goalChatId}`,
+          'session: missing',
+          'workerProcess: unknown',
+        ].join('\n'),
+      ],
+      inject: (_target, prompt) => injected.push({ prompt }),
+    });
+
+    expect(injected).toHaveLength(1);
+    expect(injected[0].prompt).toContain('[worker-health]');
+    expect(injected[0].prompt).toContain('session: missing');
+    expect(injected[0].prompt).toContain('workerProcess: unknown');
+  });
+
   it('routes blocked help requests to L2 and parks escalated tasks', async () => {
     const activeSessions = new Map<string, DaemonSession>();
     activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
@@ -533,6 +562,34 @@ describe('goal watchdog', () => {
       status: 'revive-skipped',
       pendingTaskIds: ['t1'],
       reason: 'revive_cooldown: last revive was 1000ms ago',
+    }]);
+  });
+
+  it('calls the revive failure hook so budget exhaustion can page a human', async () => {
+    const failures: any[] = [];
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions: new Map(),
+      ledger: ledger([task('t-budget', 'oc_goal', 'dispatched')]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      reviveSupervisor: () => ({ ok: false, errorCode: 'revive_budget_exhausted', error: '3 revive attempts in 10m' }),
+      onReviveFailure: (event) => failures.push(event),
+      inject: () => { throw new Error('revive failure must not inject without L2'); },
+      notify: () => { throw new Error('revive failure must not notify without L2'); },
+    });
+
+    expect(results).toEqual([{
+      goalChatId: 'oc_goal',
+      status: 'revive-skipped',
+      pendingTaskIds: ['t-budget'],
+      reason: 'revive_budget_exhausted: 3 revive attempts in 10m',
+    }]);
+    expect(failures).toEqual([{
+      goalChatId: 'oc_goal',
+      errorCode: 'revive_budget_exhausted',
+      error: '3 revive attempts in 10m',
+      pendingTaskIds: ['t-budget'],
     }]);
   });
 
