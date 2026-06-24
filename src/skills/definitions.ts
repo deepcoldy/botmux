@@ -1260,6 +1260,7 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
 - 能结构化就结构化；实在不可测的活（调研 / 设计）才退回自由文本——那样巡检只能催、不能自动 accept。
 - **默认群级（chat-scope）、不开话题**：worker 被 @ 在它的 goal 群 chat-scope 会话唤起。dispatch 是**你（L2）**发起的，所以 worker 的 report 自然回你这条 L2 会话（同群、不跨群）。
 - \`dispatch\` 已自动把「干完用 \`botmux report --task <id>\` 带证据回报、别在群里口头说完成」的完成协议追加进简报，worker 照做。
+- **worker 的「需人定夺 / 卡住」只走你(L2)**：要人拍板 / 缺权限 / 有歧义，worker 该用 \`botmux help --task <id>\`（落账并唤你）或直接 @ 你，**绝不自己越级 @ 群外的人 / 老板**——越级 @ 会和你随后的正式升级重复、两次打扰人。对外升级由你(L2)统一用 \`delivery escalate\` 做。简报里把这条对 worker 写明（dispatch 追加的协议也会带，但你派多 bot 协作[coder+reviewer]时尤其强调一句）。
 - 工作目录已在建群时 \`--working-dir\` 绑好，dispatch 免传 \`--repo\`；要先拉起 worker 待命用 \`--standby\`。
 - 给 worker 的 brief 只放该 subtask 需要的上下文（含你从 charter 摘录的相关目标 / 约束），别把整份 charter 倒给它。
 - coder 写完先 @ reviewer review，过了再 report。
@@ -1288,6 +1289,7 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 3. **worker 卡住**（账本 \`blocked\`，或群里说卡 / 缺权限 / 有歧义 / 反复失败）：你**主动接手**，不等它自己跑 \`botmux help\`：
    - 能自己解 → 给澄清指令 / 补权限 / 带更清楚的 brief 重派（\`dispatch\` 同 taskId 或 \`send --chat-id <goalChatId> --mention <worker>\`）。
    - 自己解不了（要人授权 / 要人拍范围 / 客观做不到）→ \`botmux delivery escalate --task <id> --reason "<卡在哪、需要人做什么>" [--retry-brief ...]\`，把"需要你"推到人面前（actor=监管者，**不假冒 worker 的求助**）。命令不变；daemon 会用信使 bot **「loopy-中控」** 把这条"需要你"代发到主群（不是你自己发，所以能正常唤起 L1 + 人能直接回复它下发指示）。
+     **⚠️ task 级升级一律走 \`delivery escalate\`**——它一条命令同时干三件事：写 \`TaskEscalated\` 进账本（看板转「🙋 已升级」）+ 在 **goal 群自动出「⚠️ 升级给人」播报卡**（群里人看得到这事升级了）+ 通知 L1 / 点亮看板。**别拿 \`goal notify-parent --attention\` 去升级单个 task**：那条只把通知推到主群，**不写账本、也不在 goal 群出升级卡** → goal 群里的人完全看不到发生了升级。\`goal notify-parent\` 只用于 goal 级进度 / \`--done\` 收尾，不替代 task 升级。
 4. **产物不存在 + 没动静** → 催 worker；只有 legacy 自由文本 hint（不可机器核验）→ 只催、别臆测 done。
 5. **escalated（已升级、等人）** → 别重复 nag，等人处理。
 
