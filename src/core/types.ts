@@ -129,8 +129,9 @@ export interface DaemonSession {
   /** 文档评论入口（/subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
-   *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
-  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string }>;
+   *  命中后标记 delivered=true（不删除），防止同一 turnId 的重复 final_output
+   *  重复发文档评论。cardDelivered 防止重复发飞书卡片。仅内存（轮是瞬时的）。 */
+  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; isWhole?: boolean; delivered?: boolean; cardDelivered?: boolean }>;
   /** Last assistant uuid emitted via the adopt bridge final_output pipeline.
    *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
    *  the worker re-drains the transcript after a noisy idle). */

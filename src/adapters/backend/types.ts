@@ -29,6 +29,20 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /**
+   * Extra env keys to `unset` in the pane's shell wrapper (tmux/zellij only).
+   *
+   * Persistent backends (tmux, zellij) share a backing server whose global env
+   * is inherited by every new pane — even keys deleted from `env` leak through
+   * this vector. `unsetEnvKeys` tells the backend to extend the wrapper script's
+   * `unset` clause with these keys so the pane never sees them.
+   *
+   * Used when a gateway wrapper (e.g. ttadk) must control certain env vars
+   * itself and the daemon's own values would bypass the gateway.
+   *
+   * Ignored by pty/herdr backends (no shared server → `env` is authoritative).
+   */
+  unsetEnvKeys?: string[];
 }
 
 export interface SessionBackend {

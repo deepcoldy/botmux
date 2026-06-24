@@ -991,6 +991,10 @@ export interface DocCommentContext {
   text: string;
   /** 评论发表者 open_id。 */
   authorOpenId?: string;
+  /** 行内评论选中的原文（全文评论无此字段）。 */
+  quote?: string;
+  /** 是否全文评论（true = 针对整篇文档，false = 针对选中文字）。 */
+  isWhole?: boolean;
 }
 
 /**
@@ -1258,7 +1262,17 @@ function handleCommentEventAckSafe(data: any, larkAppId: string, handlers: Event
   const eventKey = `drive.comment_add:${larkAppId}:${eventIdForKey(data) ?? `${parsed.fileToken ?? '?'}:${parsed.replyId ?? parsed.commentId ?? '?'}`}`;
   scheduleAckSafeEvent(eventKey, async () => {
     try {
-      await processCommentEvent(parsed, larkAppId, handlers);
+      // processCommentEvent 涉及多次网络调用（token 刷新、getDocComment、
+      // replyToDocComment），任一环节都可能卡住导致 WS 事件处理阻塞。
+      // 加整体超时兜底，确保评论事件不会永久挂起。
+      const timeout = new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), 30_000));
+      const result = await Promise.race([
+        processCommentEvent(parsed, larkAppId, handlers).then(() => 'done' as const),
+        timeout,
+      ]);
+      if (result === 'timeout') {
+        logger.warn(`[doc-comment] processCommentEvent timed out (30s) file=${parsed.fileToken?.slice(0, 12)} comment=${parsed.commentId?.slice(0, 12)}`);
+      }
     } catch (err) {
       logger.error(`Error handling doc-comment event: ${err}`);
     }
@@ -1286,7 +1300,13 @@ async function processCommentEvent(
 
   // 2) 拉评论 thread 取权威正文 / 作者 / @ 列表（事件 payload 不保证带全），
   //    同时用最新一条回复作为"触发回复"。
-  const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
+  let comment: Awaited<ReturnType<typeof getDocComment>>;
+  try {
+    comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
+  } catch (err) {
+    logger.warn(`[doc-comment] getDocComment failed: ${err instanceof Error ? err.message : err} (file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)})`);
+    return;
+  }
   if (!comment || comment.replies.length === 0) {
     logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
     return;
@@ -1322,6 +1342,8 @@ async function processCommentEvent(
     replyId: trigger.replyId || commentId,
     text,
     authorOpenId: trigger.userId,
+    quote: comment?.quote,
+    isWhole: comment?.isWhole,
   });
 }
 

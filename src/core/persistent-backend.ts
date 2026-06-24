@@ -35,6 +35,11 @@ export function isSuspendableBackendType(
  * forked a worker, where initConfig is unset).
  */
 export function getSessionPersistentBackendType(ds: DaemonSession): PersistentBackendType | undefined {
+  // Adopt sessions observe a user's external tmux/herdr/zellij session — they
+  // don't own a bmx-* backing session, so the persistent-backend probe/reap
+  // logic must not touch them (probing bmx-<sid8> would find nothing and
+  // wrongly close a live adopt session as a "zombie").
+  if (ds.adoptedFrom) return undefined;
   let backendType: BackendType | undefined = ds.initConfig?.backendType;
   if (!backendType) {
     backendType = config.daemon.backendType;

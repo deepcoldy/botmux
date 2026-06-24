@@ -304,6 +304,9 @@ const inflightInputs = new InflightInputTracker();
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
+/** Turn IDs originating from doc-comment events — emitReadyTurns uses
+ *  trailingAssistantText (final answer only) instead of the full join. */
+const docCommentTurnIds = new Set<string>();
 function writeCliPidMarker(): void {
   if (!cliPidMarker || !sessionId) return;
   try {
@@ -1546,7 +1549,11 @@ function emitReadyTurns(): void {
     // material-longer gate, re-posting turns the model already `botmux send`ed.
     // Adopt keeps the full join: transcript drain is that mode's only channel,
     // so interim narration is the user's only window into the turn.
-    const assistantText = adoptMode ? joinAssistantText(matched) : trailingAssistantText(drained.events, turn.assistantUuids);
+    // Doc-comment turns always use trailingAssistantText — the document comment
+    // box shows plain text only, so intermediate steps (tool calls, narration)
+    // would render as noise.
+    const isDocComment = docCommentTurnIds.has(turn.turnId);
+    const assistantText = (adoptMode && !isDocComment) ? joinAssistantText(matched) : trailingAssistantText(drained.events, turn.assistantUuids);
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
@@ -3952,7 +3959,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // merged into childEnv) so the tmux/zellij backends inject it via the per-pane
   // `/usr/bin/env` prefix and never into the shared backing-server global env,
   // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
-  const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  let perBotInjectEnv = sanitizePerBotEnv(cfg.env);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
 
@@ -4060,6 +4067,63 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // keeps the behaviour intentional rather than ambient. (Codex review note.)
   delete (childEnv as Record<string, string>).CJADK_INTERACTIVE;
 
+  // ttadk gateway env routing for persistent backends (tmux/zellij).
+  //
+  // Problem: tmux/zellij panes inherit from the backing SERVER's global env,
+  // not from the client env passed to pty.spawn(). The daemon's ANTHROPIC_*
+  // vars are NOT in the tmux server's global env (it was started before these
+  // vars were set), so panes never see them. Without ANTHROPIC_BASE_URL, the
+  // CLI falls back to api.anthropic.com and uses the user's own Anthropic
+  // account — bypassing ttadk's gateway entirely.
+  //
+  // Fix: for ttadk-wrapped sessions, we move the gateway-needed ANTHROPIC_*
+  // vars (BASE_URL, AUTH_TOKEN, API_KEY, CUSTOM_HEADERS) from childEnv into
+  // injectEnv so the persistent backends inject them via the per-pane
+  // `/usr/bin/env KEY=VAL` prefix. We also delete model-override vars
+  // (ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_*_MODEL) that would conflict with
+  // ttadk's own -m <model> / CLAUDE_CODE_SUBAGENT_MODEL routing, and add
+  // them to unsetEnvKeys so the shell wrapper unsets them from the pane
+  // (in case the tmux server has them from a stale global env).
+  const TTADK_GATEWAY_ANTHROPIC_KEYS = new Set([
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_CUSTOM_HEADERS',
+  ]);
+  const TTADK_REMOVED_ANTHROPIC_KEYS = new Set([
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  ]);
+  let unsetEnvKeys: string[] | undefined;
+  if (ttadkGateway) {
+    unsetEnvKeys = [];
+    const gatewayInject: Record<string, string> = {};
+    for (const key of Object.keys(childEnv)) {
+      if (TTADK_GATEWAY_ANTHROPIC_KEYS.has(key)) {
+        // Move gateway-needed vars from childEnv → injectEnv so persistent
+        // backends inject them via /usr/bin/env in the pane.
+        gatewayInject[key] = childEnv[key]!;
+        delete (childEnv as Record<string, string>)[key];
+      } else if (TTADK_REMOVED_ANTHROPIC_KEYS.has(key)) {
+        // Delete model-override vars and add to tmux unset clause.
+        unsetEnvKeys.push(key);
+        delete (childEnv as Record<string, string>)[key];
+      }
+    }
+    if (Object.keys(gatewayInject).length) {
+      // Merge into perBotInjectEnv (already sanitized). These are appended
+      // AFTER the per-bot keys in the /usr/bin/env prefix so they win over
+      // any same-named leftover in the pane's inherited env.
+      Object.assign(perBotInjectEnv, gatewayInject);
+      log(`ttadk launcher: moved ${Object.keys(gatewayInject).length} ANTHROPIC_* gateway var(s) to injectEnv: ${Object.keys(gatewayInject).join(', ')}`);
+    }
+    if (unsetEnvKeys.length) {
+      log(`ttadk launcher: stripped ${unsetEnvKeys.length} ANTHROPIC_* model-override var(s): ${unsetEnvKeys.join(', ')}`);
+    }
+  }
+
   if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
     if (sandboxOn) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with bwrap)`);
@@ -4096,12 +4160,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
 
+  const finalInjectEnv = Object.keys(perBotInjectEnv).length ? perBotInjectEnv : undefined;
+  if (finalInjectEnv) log(`injectEnv keys: ${Object.keys(finalInjectEnv).join(', ')}`);
   backend.spawn(spawnBin, spawnArgs, {
     cwd: spawnCwd,
     cols: PTY_COLS,
     rows: PTY_ROWS,
     env: childEnv as Record<string, string>,
-    injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+    injectEnv: finalInjectEnv,
+    unsetEnvKeys,
   });
 
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)
@@ -4963,6 +5030,7 @@ process.on('message', async (raw: unknown) => {
       try {
         if (msg.turnId) {
           currentBotmuxTurnId = msg.turnId;
+          if (msg.docComment) docCommentTurnIds.add(msg.turnId);
           writeCliPidMarker();
         }
         let port = 0;
@@ -5012,6 +5080,7 @@ process.on('message', async (raw: unknown) => {
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
       currentBotmuxTurnId = msg.turnId;
+      if (msg.docComment && msg.turnId) docCommentTurnIds.add(msg.turnId);
       writeCliPidMarker();
       if (lastInitConfig?.adoptMode) {
         // Bridge mode: capture transcript baseline BEFORE writing to the pane,
@@ -5068,6 +5137,7 @@ process.on('message', async (raw: unknown) => {
               log(`Codex adopt writeInput error: ${err.message}`);
             }
           } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
+            log(`[adopt] sendText to pane: "${content.substring(0, 80)}"`);
             (backend as any).sendText(content);
             // Beat between text and Enter so the adopted CLI's input layer
             // has time to register the typed chars before submit. Without
@@ -5078,12 +5148,15 @@ process.on('message', async (raw: unknown) => {
             // that fresh-spawn mode goes through and matches the slash-
             // command (raw_input) fix.
             await new Promise(r => setTimeout(r, 200));
+            log('[adopt] sendSpecialKeys Enter');
             (backend as any).sendSpecialKeys('Enter');
           } else {
             backend.write(content + '\r');
           }
           isPromptReady = false;
           idleDetector?.reset();
+        } else {
+          log(`[adopt] backend is null — message dropped: "${content.substring(0, 80)}"`);
         }
       } else {
         // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
