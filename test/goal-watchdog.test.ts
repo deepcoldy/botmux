@@ -491,6 +491,51 @@ describe('goal watchdog', () => {
     }
   });
 
+  it('tries to revive a missing L2 supervisor before falling back to no-l2', async () => {
+    const calls: string[] = [];
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions: new Map(),
+      ledger: ledger([task('t1', 'oc_goal', 'dispatched')]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      reviveSupervisor: (goalChatId) => {
+        calls.push(goalChatId);
+        return { ok: true, status: 'revived', sessionId: 'l2-new' };
+      },
+      inject: () => { throw new Error('freshly revived L2 should take the next watchdog turn'); },
+    });
+
+    expect(calls).toEqual(['oc_goal']);
+    expect(results).toEqual([{
+      goalChatId: 'oc_goal',
+      status: 'revived',
+      pendingTaskIds: ['t1'],
+      sessionId: 'l2-new',
+      reason: 'revived',
+    }]);
+  });
+
+  it('surfaces revive cooldown or budget failures without random daemon injection', async () => {
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions: new Map(),
+      ledger: ledger([task('t1', 'oc_goal', 'dispatched')]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      reviveSupervisor: () => ({ ok: false, errorCode: 'revive_cooldown', error: 'last revive was 1000ms ago' }),
+      inject: () => { throw new Error('revive failure must not inject without L2'); },
+      notify: () => { throw new Error('revive failure must not notify without L2'); },
+    });
+
+    expect(results).toEqual([{
+      goalChatId: 'oc_goal',
+      status: 'revive-skipped',
+      pendingTaskIds: ['t1'],
+      reason: 'revive_cooldown: last revive was 1000ms ago',
+    }]);
+  });
+
   it('hands structured failing tasks to L2 and rate-limits repeated injections', async () => {
     const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-nudge-'));
     try {
