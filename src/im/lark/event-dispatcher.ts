@@ -28,6 +28,7 @@ import { openPending, isThrottled } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
+import { isGoalChat } from '../../services/goal-chat-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
@@ -831,7 +832,7 @@ export function evaluateTalk(larkAppId: string, chatId: string | undefined, send
   // Oncall 群命中：默认不限额；仅当 bot 配了 messageQuota.defaultLimit 时，
   // 才挂 chat:<chatId>:<openId> 这一 quotaKey（与 chatGrant 同键、同计数器，
   // 便于 owner 后续 /grant @x N 续杯/重置）。
-  if (chatId && findOncallChat(larkAppId, chatId)) {
+  if (chatId && findOncallChat(larkAppId, chatId) && !isGoalChat(chatId)) {
     const def = bot.config.messageQuota?.defaultLimit;
     if (typeof def === 'number' && Number.isInteger(def) && def > 0 && senderOpenId) {
       return { allowed: true, reason: 'oncall', quotaKey: chatQuotaKey(chatId, senderOpenId) };
