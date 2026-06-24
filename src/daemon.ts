@@ -29,6 +29,7 @@ import {
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession } from './core/persistent-backend.js';
 import { classifyGoalWorkerHealth, type GoalWorkerProcessState, type GoalWorkerSessionState } from './core/goal-worker-health.js';
+import { countGoalWorkerReassignAttempts, DEFAULT_GOAL_WORKER_REASSIGN_MAX_ATTEMPTS, latestTaskDispatchEvent } from './core/goal-reassign-budget.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, getMessageChatId, listChatBotMembers, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
@@ -2536,6 +2537,65 @@ async function reassignDeadGoalWorker(task: TaskView, goalChatId: string, now: n
   if (!candidate) return { status: 'not-dead', reason: 'no_dead_worker' };
   const epoch = Math.floor(now / GOAL_WORKER_REASSIGN_COOLDOWN_MS);
   const ledger = openLedger();
+  const events = ledger.read();
+  const attempts = countGoalWorkerReassignAttempts(events, task.taskId, now);
+  if (attempts >= DEFAULT_GOAL_WORKER_REASSIGN_MAX_ATTEMPTS) {
+    const latestDispatch = latestTaskDispatchEvent(events, task.taskId);
+    const reason = [
+      `worker ${candidate.workerName}(${candidate.workerLarkAppId}) 反复不可达`,
+      `自动重派 ${attempts} 次仍未接住任务`,
+      `最近原因: ${candidate.deadReason}`,
+    ].join('；');
+    const retryBrief = [
+      `任务 ${task.taskId} 已停止自动重派。`,
+      `请人工判断：恢复 ${candidate.workerName}，换 worker，缩小范围，或取消该任务。`,
+    ].join('\n');
+    const result = ledger.append({
+      type: 'TaskEscalated',
+      actor: 'orchestrator',
+      taskId: task.taskId,
+      chatId: goalChatId,
+      ts: now,
+      idempotencyKey: `reassign-budget-exhausted:${task.taskId}:${latestDispatch?.eventId ?? 'unknown'}`,
+      payload: {
+        taskId: task.taskId,
+        reason,
+        by: 'goal-watchdog',
+        retryBrief,
+      },
+    });
+    if (!result.deduped) {
+      await emitGoalNarrationBestEffort({
+        larkAppId: currentDaemonLarkAppId,
+        goalChatId,
+        event: {
+          type: 'escalated',
+          key: `narr:escalated:${task.taskId}:${result.event.eventId}`,
+          taskId: task.taskId,
+          reason,
+        },
+      });
+      const supervisor = findGoalSupervisorForNotify({ goalChatId });
+      const summary = [
+        `Goal worker 自动重派预算耗尽: ${task.taskId}`,
+        reason,
+        retryBrief,
+        `goal: ${goalChatId}`,
+      ].join('\n');
+      const attention = await sendGoalHumanAttention({
+        supervisor,
+        taskId: task.taskId,
+        summary,
+        attentionKind: 'help',
+        attentionReason: reason,
+      });
+      if (!attention.sent) {
+        logger.warn(`[goal-watchdog] reassign budget human attention failed task=${task.taskId} goal=${goalChatId}: ${attention.error ?? 'unknown'}`);
+      }
+    }
+    logger.warn(`[goal-watchdog] reassign budget exhausted task=${task.taskId} goal=${goalChatId} worker=${candidate.workerLarkAppId} attempts=${attempts}`);
+    return { status: 'skipped', reason: 'reassign_budget_exhausted' };
+  }
   const brief = [
     task.title ? `任务：${task.title}` : `任务：${task.taskId}`,
     `原 worker（${candidate.workerName}）会话状态异常：${candidate.deadReason}。`,
