@@ -45,17 +45,38 @@ export interface EmitGoalNarrationInput {
 
 export interface EmitGoalNarrationDeps {
   sendMessage?: (larkAppId: string, chatId: string, content: string, msgType?: string) => Promise<string>;
+  /** Injectable so tests don't write to the real session data dir. */
+  recordNarration?: (rec: Parameters<typeof recordGoalNarration>[0]) => void;
 }
 
 function cleanLine(text: string | undefined, fallback = ''): string {
   return (text ?? '').replace(/\s+/g, ' ').trim() || fallback;
 }
 
+/**
+ * Human replies routed back from the parent group auto-@ the panel/messenger
+ * bot (and sometimes others); the raw content therefore leads with one or more
+ * "@xxx " tokens. Strip those leading mentions so the narration shows just what
+ * the human actually said, not the routing chrome (e.g. "@loopy-中控 A" → "A").
+ */
+function stripLeadingMentions(text: string | undefined): string {
+  let t = (text ?? '').replace(/\s+/g, ' ').trim();
+  for (;;) {
+    const next = t.replace(/^@\S+\s+/, '');
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+}
+
 export function buildGoalNarrationText(event: GoalNarrationEvent): string {
   if (event.type === 'human-decision') {
+    // Title stays neutral ("回复", not "决策"): a reply in the parent thread may
+    // be a decision, a question, or a correction — the system can't (and
+    // shouldn't) assert it's a decision. L2 reads it and decides what it is.
     return [
-      '👤 人类决策已送达监管者',
-      `决策：${cleanLine(event.decisionText, '(空)')}`,
+      '👤 人类回复已送达监管者',
+      `内容：${cleanLine(stripLeadingMentions(event.decisionText), '(空)')}`,
       `来源：${event.source} → 监管者处理中`,
     ].join('\n');
   }
@@ -100,7 +121,8 @@ export async function emitGoalNarration(input: EmitGoalNarrationInput, deps: Emi
     // event stream as the chat (esp. 「人类决策到达」, which is not a ledger fact).
     // Best-effort: the store swallows its own errors and never throws.
     const taskId = 'taskId' in input.event ? input.event.taskId : undefined;
-    recordGoalNarration({ goalChatId: input.goalChatId, type: input.event.type, taskId, text, ts: Date.now() });
+    const record = deps.recordNarration ?? recordGoalNarration;
+    record({ goalChatId: input.goalChatId, type: input.event.type, taskId, text, ts: Date.now() });
     return { sent: true, messageId };
   } catch (err) {
     sentNarrations.delete(key);
