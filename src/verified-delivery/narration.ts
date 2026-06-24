@@ -41,6 +41,13 @@ export type GoalNarrationEvent =
       key: string;
       /** Total chat-scope sessions closed across all bots/daemons. */
       closed: number;
+    }
+  | {
+      type: 'reassigned';
+      key: string;
+      taskId: string;
+      /** Display name (or id) of the worker confirmed dead, if known. */
+      deadWorker?: string;
     };
 
 export interface EmitGoalNarrationInput {
@@ -111,6 +118,13 @@ export function buildGoalNarrationText(event: GoalNarrationEvent): string {
     return [
       `🧹 会话已清理 · 关闭 ${event.closed} 个会话`,
       '本 goal 全部 bot 的会话已收尾（goal 群保留，不退群/不删群）',
+    ].join('\n');
+  }
+  if (event.type === 'reassigned') {
+    return [
+      `🔄 已自动重派 · ${event.taskId}`,
+      `原 worker${event.deadWorker ? `（${cleanLine(event.deadWorker)}）` : ''}确认掉线，任务已重新派发`,
+      '监管者继续盯，无需重复操作',
     ].join('\n');
   }
   return [
