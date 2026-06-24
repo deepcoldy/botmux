@@ -37,6 +37,11 @@ describe('verified delivery narration', () => {
     const cleanup = buildGoalNarrationText({ type: 'cleanup', key: 'k4', closed: 3 });
     expect(cleanup).toContain('🧹 会话已清理 · 关闭 3 个会话');
     expect(cleanup).toContain('全部 bot');
+
+    // B2: deterministic re-dispatch card names the dead worker + the task.
+    const reassigned = buildGoalNarrationText({ type: 'reassigned', key: 'k5', taskId: 'task-9', deadWorker: 'traex-loopy' });
+    expect(reassigned).toContain('🔄 已自动重派 · task-9');
+    expect(reassigned).toContain('traex-loopy');
   });
 
   it('dedupes by narration key', async () => {
