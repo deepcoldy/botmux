@@ -32,8 +32,8 @@ import type {
 
 /** A compact, display-safe descriptor of one piece of evidence (no blob inlined). */
 export interface BoardEvidence {
-  kind: 'path' | 'inline';
-  /** Path for path-evidence; name/ref for inline-evidence. */
+  kind: 'path' | 'inline' | 'url';
+  /** Path for path-evidence; name/ref for inline-evidence; the URL for url-evidence. */
   label: string;
   /** Short preview for inline-evidence only. */
   preview?: string;
@@ -171,9 +171,11 @@ function collectTimings(events: LedgerEvent[]): Map<string, TaskTiming> {
 }
 
 function toBoardEvidence(ev: Evidence[]): BoardEvidence[] {
-  return ev.map((e) => e.kind === 'path'
-    ? { kind: 'path', label: e.path }
-    : { kind: 'inline', label: e.name ?? e.ref, preview: e.preview, bytes: e.bytes });
+  return ev.map((e) => {
+    if (e.kind === 'path') return { kind: 'path', label: e.path };
+    if (e.kind === 'url') return { kind: 'url', label: e.url, preview: e.note };
+    return { kind: 'inline', label: e.name ?? e.ref, preview: e.preview, bytes: e.bytes };
+  });
 }
 
 function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask {

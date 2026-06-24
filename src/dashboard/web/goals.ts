@@ -16,7 +16,7 @@ interface AcceptanceCheck { type: 'exists' | 'contains'; text?: string }
 interface AcceptanceArtifact { path: string; kind?: string; checks: AcceptanceCheck[] }
 interface AcceptanceCommand { cmd: string; cwd?: string; expectExitCode?: number; timeoutMs?: number }
 interface AcceptanceCriteria { version: number; artifacts?: AcceptanceArtifact[]; commands?: AcceptanceCommand[] }
-interface BoardEvidence { kind: 'path' | 'inline'; label: string; preview?: string; bytes?: number }
+interface BoardEvidence { kind: 'path' | 'inline' | 'url'; label: string; preview?: string; bytes?: number }
 interface BoardAttempt { reportId: string; ts?: number; verdict?: 'accepted' | 'rejected'; reason?: string; summary: string; workerOpenId?: string; verdictVia?: 'reconcile' }
 interface BoardTask {
   taskId: string; title?: string; status: string;
@@ -234,7 +234,11 @@ function trailHtml(t: BoardTask): string {
   if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
   if (t.ranCommands?.length) parts.push(`<div class="gb-kv"><span>跑了命令</span><ul>${t.ranCommands.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul></div>`);
   if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e =>
-    `<li>${e.kind === 'path' ? `<code>${escapeHtml(e.label)}</code>` : `📎 ${escapeHtml(e.label)}${e.preview ? ` <span class="gb-muted">${escapeHtml(e.preview.slice(0, 48))}</span>` : ''}`}</li>`).join('')}</ul></div>`);
+    `<li>${e.kind === 'path'
+      ? `<code>${escapeHtml(e.label)}</code>`
+      : e.kind === 'url'
+        ? `🔗 <a href="${escapeHtml(e.label)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.label)}</a>`
+        : `📎 ${escapeHtml(e.label)}${e.preview ? ` <span class="gb-muted">${escapeHtml(e.preview.slice(0, 48))}</span>` : ''}`}</li>`).join('')}</ul></div>`);
   return parts.join('');
 }
 function attemptsHtml(t: BoardTask): string {
