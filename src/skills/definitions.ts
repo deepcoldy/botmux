@@ -1214,6 +1214,7 @@ botmux goal supervise --chat-id "<goalChatId>" \\
 - \`--parent-*\` + \`--session-id\` 把主群坐标 + 你这条 L1 会话写进 L2 的 prompt；L2 完成时用 \`goal notify-parent\` 据此精准唤起你（daemon-native，不发飞书）。**\`--session-id\` 填 prompt 顶部 \`<session_id>\` 的值**——这样不论你 L1 是话题还是群级会话都能被准确回定位（否则只能靠 chatId/parent-root 兜底，话题会话可能找不准）。
 - 起好 L2 **L1 基本就交棒了**：回主群等完成通知（L1-5）。要派的 subtask 写进 \`--brief\` 交给 L2，或由 L2 按 goal 自行拆派。
 - 🔒 **goal 群对话默认收窄（安全）**：\`goal supervise\` 会把这个 goal 群登记为「授权制」——群里只有**发起人（群主）+ 编排用的自家 bot（L2 / worker，peer 互信）**能和 bot 对话；其他人 @ bot 会被拦下（弹授权卡，需群主显式 grant 才放行）。这样即便日后把第三方拉进 goal 群，也没人能随意占用你的 bot / 烧额度。普通 \`/g\` 群不受影响（仍是开放 oncall）。
+- ♻️ **L2 监工会自愈（不用你操心）**：\`goal supervise\` 把这个 goal 的监工坐标登记下来后，万一 L2 因崩溃/网络挂掉，daemon 的 goal-watchdog 发现"还有未完成任务却没活 L2"时会**自动按登记信息重起 L2**，不用你重新 \`goal supervise\`。带崩溃预算：短时间内反复挂会停止复活、转而**升级给人**（避免无限重启）。被自动复活后 L2 会重新 \`delivery list\` + \`goal charter read\` 重建状态、接着巡检。
 
 > repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。
 > **OnCall 省 \`--repo\` 现按 bot 计**：OnCall 绑定是 per-bot 的——只有**目标子 bot 自己**在该群绑了 OnCall（\`@该bot /oncall bind <仓库路径>\`，多个 bot 一起绑用 \`@bot1 @bot2 /oncall bind <路径>\`）或配了 \`defaultWorkingDir\` 时，dispatch 才可省 \`--repo\`。否则子 bot **不会**跨 bot 继承群目录（除非同话题已有 sibling 在跑可继承），dispatch 仍应显式传 \`--repo\`，不然子 bot 会弹「选仓库」卡。
@@ -1293,6 +1294,11 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
      **⚠️ task 级升级一律走 \`delivery escalate\`**——它一条命令同时干三件事：写 \`TaskEscalated\` 进账本（看板转「🙋 已升级」）+ 在 **goal 群自动出「⚠️ 升级给人」播报卡**（群里人看得到这事升级了）+ 通知 L1 / 点亮看板。**别拿 \`goal notify-parent --attention\` 去升级单个 task**：那条只把通知推到主群，**不写账本、也不在 goal 群出升级卡** → goal 群里的人完全看不到发生了升级。\`goal notify-parent\` 只用于 goal 级进度 / \`--done\` 收尾，不替代 task 升级。
 4. **产物不存在 + 没动静** → 催 worker；只有 legacy 自由文本 hint（不可机器核验）→ 只催、别臆测 done。
 5. **escalated（已升级、等人）** → 别重复 nag，等人处理。
+
+**收到 \`[worker-health]\` 注入时（worker 存活硬事实，别机械催死人）**：daemon 发现某 dispatched 任务的 worker 可能掉线了，会给你注入一段 \`[worker-health]\`（含 \`session: live/suspended/closed/missing\`、\`workerProcess: live/none/killed\`、一句中文硬事实）。**这是要你按真实状态判断、不是继续 @ 一个已经死了的 worker**：
+- **session=closed / workerProcess=killed / missing（worker 真没了）**：原 worker 不可继续 → **带原 brief 重派**（\`dispatch\` 同 taskId 重新拉起它的会话，或换个能干的 worker）；重派仍反复失败 → 缩小任务范围或 \`delivery escalate\` 升级给人。
+- **session=suspended / workerProcess=none 但可恢复（只是休眠、没死）**：一条 \`send --chat-id <goalChatId> --mention <worker>\` 就能把它冷唤醒接着干，**别重派**（重派浪费、还可能丢它已干的进度）。
+- **busy 超时（还在跑但很久没动静）**：先看产物有无进展，给时间或问一句，别急着重派。
 
 巡检后 \`goal charter update\` 刷新；全 accepted → 通知 L1（L2-5）。
 **铁律**：机械层只会自动验收"worker 已 report 且 checks 全过"的确定性交付；其余（没 report、在喊卡、证据可疑）一律交你判断——**完成与否你说了算，但必须基于独立核验的硬证据，绝不是"文件在那儿就算完"**。
