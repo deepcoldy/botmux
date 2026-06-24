@@ -8,6 +8,7 @@ import { buildFollowUpContent, buildNewTopicPrompt, getAvailableBots, rememberLa
 import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { sessionKey, type DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
+import { registerGoalChat } from '../services/goal-chat-store.js';
 
 export interface GoalSuperviseRequest {
   chatId: string;
@@ -233,6 +234,15 @@ export async function startGoalSupervisor(
 
   const bot = getBot(larkAppId);
   const title = req.title.trim() || 'Goal supervisor';
+  try {
+    registerGoalChat(chatId, { title });
+  } catch (err) {
+    return {
+      ok: false,
+      errorCode: 'goal_register_failed',
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
   const anchor = chatId;
   const scope: 'thread' | 'chat' = 'chat';
 

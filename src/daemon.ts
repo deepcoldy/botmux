@@ -4497,6 +4497,16 @@ async function routeGoalParentReplyToLocal(record: GoalParentNotificationRecord,
   goalParentReplyRoutes.set(key, Date.now());
   try {
     await injectGoalSupervisorTurn(supervisor, buildGoalParentReplyPrompt(record, parsed));
+    await emitGoalNarrationBestEffort({
+      larkAppId: supervisor.larkAppId,
+      goalChatId: record.goalChatId,
+      event: {
+        type: 'human-decision',
+        key: `narr:decision:${record.goalChatId}:${parsed.messageId}`,
+        decisionText: parsed.content.trim(),
+        source: '主群回复中控',
+      },
+    });
     return { routed: true, supervisorSessionId: supervisor.session.sessionId };
   } catch (err) {
     goalParentReplyRoutes.delete(key);
@@ -4578,16 +4588,6 @@ async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string,
   }
   try {
     if (routed) {
-      await emitGoalNarrationBestEffort({
-        larkAppId: record.larkAppId,
-        goalChatId: record.goalChatId,
-        event: {
-          type: 'human-decision',
-          key: `narr:decision:${record.goalChatId}:${parsed.messageId}`,
-          decisionText: parsed.content.trim(),
-          source: '主群回复中控',
-        },
-      });
       await sendMessage(
         record.larkAppId,
         record.parentChatId,

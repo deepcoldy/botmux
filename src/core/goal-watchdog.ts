@@ -5,7 +5,7 @@ import { sessionKey, type DaemonSession } from './types.js';
 import { localeForBot } from '../i18n/index.js';
 import { openLedger, type LedgerHandle } from '../verified-delivery/ledger.js';
 import { summarizeAcceptanceCriteria } from '../verified-delivery/acceptance.js';
-import type { TaskView } from '../verified-delivery/types.js';
+import type { LedgerEvent, TaskReportedPayload, TaskView } from '../verified-delivery/types.js';
 import { reconcileTaskByCriteria, type ReconcileResult } from '../verified-delivery/reconcile.js';
 import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -14,6 +14,7 @@ import { emitGoalNarration } from '../verified-delivery/narration.js';
 export const GOAL_WATCHDOG_PROMPT_PREFIX = '[goal-watchdog]';
 export const DEFAULT_GOAL_WATCHDOG_INTERVAL_MS = 5 * 60_000;
 export const DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS = 30_000;
+export const DEFAULT_GOAL_WATCHDOG_REPORT_GRACE_MS = 15_000;
 
 type GoalWatchdogStatus =
   | 'injected'
@@ -21,6 +22,7 @@ type GoalWatchdogStatus =
   | 'no-l2'
   | 'busy'
   | 'rate-limited'
+  | 'grace'
   | 'empty';
 
 export interface GoalWatchdogResult {
@@ -44,6 +46,7 @@ export interface GoalWatchdogDeps {
   checkedBy?: string;
   defaultCwd?: string;
   defaultTimeoutMs?: number;
+  reportGraceMs?: number;
 }
 
 export type GoalWatchdogNotifyKind = 'accepted' | 'rejected';
@@ -195,6 +198,16 @@ export function findGoalSupervisorSession(
   return undefined;
 }
 
+function latestReportAtByTask(events: LedgerEvent[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const event of events) {
+    if (event.type !== 'TaskReported') continue;
+    const payload = event.payload as TaskReportedPayload;
+    out.set(payload.taskId, event.ts);
+  }
+  return out;
+}
+
 export async function injectGoalSupervisorTurn(ds: DaemonSession, prompt: string): Promise<void> {
   const content = buildFollowUpContent(prompt, ds.session.sessionId, {
     isAdoptMode: false,
@@ -216,9 +229,11 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
   const ledger = deps.ledger ?? openLedger();
   const now = deps.now ?? Date.now();
   const intervalMs = deps.intervalMs ?? DEFAULT_GOAL_WATCHDOG_INTERVAL_MS;
+  const reportGraceMs = deps.reportGraceMs ?? DEFAULT_GOAL_WATCHDOG_REPORT_GRACE_MS;
   const lastInjectedAt = deps.lastInjectedAt ?? defaultLastInjectedAt;
   const inject = deps.inject ?? injectGoalSupervisorTurn;
   const notify = deps.notify ?? sendGoalWatchdogNotification;
+  const latestReportAt = latestReportAtByTask(ledger.read());
   const byGoal = pendingGoalTasks(ledger.tasks());
   const goalFilter = deps.goalChatIds ? new Set(deps.goalChatIds) : undefined;
   const results: GoalWatchdogResult[] = [];
@@ -241,9 +256,17 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
     }
     const legacyTasks: TaskView[] = [];
     const inspectionFacts = new Map<string, string>();
+    const graceTaskIds: string[] = [];
     let reconciled = false;
     const last = lastInjectedAt.get(goalChatId) ?? 0;
     for (const task of tasks) {
+      if (task.status === 'reported') {
+        const reportAt = latestReportAt.get(task.taskId);
+        if (reportAt !== undefined && now - reportAt < reportGraceMs) {
+          graceTaskIds.push(task.taskId);
+          continue;
+        }
+      }
       const reconcile = reconcileTaskByCriteria(ledger, task.taskId, {
         checkedBy: deps.checkedBy ?? 'goal-watchdog',
         now,
@@ -282,6 +305,13 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       if (reconciled) {
         lastInjectedAt.set(goalChatId, now);
         results.push({ goalChatId, status: 'reconciled', pendingTaskIds: tasks.map((task) => task.taskId) });
+      } else if (graceTaskIds.length > 0) {
+        results.push({
+          goalChatId,
+          status: 'grace',
+          pendingTaskIds: graceTaskIds,
+          reason: `latest report is younger than ${reportGraceMs}ms`,
+        });
       } else {
         results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
       }
