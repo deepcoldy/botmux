@@ -34,6 +34,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
+import { resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
 import {
   appendVerifiedDeliveryInstructions,
   buildDeliveryListRows,
@@ -7036,6 +7037,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
+  const appId = s.larkAppId!;
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   let botConfigs: ReturnType<typeof loadBotConfigs> = [];
@@ -7050,45 +7052,23 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const botInfoPath = join(resolveDataDir(), 'bots-info.json');
     if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
   } catch { /* best effort */ }
-  const botSpecByOpenId = new Map(bots.map((bot) => [bot.openId, bot]));
-  const botConfigByAppId = new Map(botConfigs.map((cfg) => [cfg.larkAppId, cfg]));
-  const botInfoByAppId = new Map(botInfoEntries.map((entry) => [entry.larkAppId, entry]));
-  const botInfoByName = new Map<string, BotInfoEntry>();
-  for (const cfg of botConfigs) {
-    const info = botInfoByAppId.get(cfg.larkAppId);
-    const name = info?.botName?.trim().toLowerCase();
-    if (name && info && !botInfoByName.has(name)) botInfoByName.set(name, info);
-  }
-  const botConfigsByCliId = new Map<string, typeof botConfigs>();
-  for (const cfg of botConfigs) {
-    const key = cfg.cliId.trim().toLowerCase();
-    botConfigsByCliId.set(key, [...(botConfigsByCliId.get(key) ?? []), cfg]);
-  }
-  function resolveDispatchWorkerMeta(openId: string): { larkAppId: string; cliId: string } {
-    const spec = botSpecByOpenId.get(openId);
-    const labels = [spec?.openId, spec?.name, workerNameByOpenId.get(openId)]
-      .map((label) => label?.trim())
-      .filter((label): label is string => !!label);
-    for (const label of labels) {
-      const byApp = botConfigByAppId.get(label);
-      if (byApp) return { larkAppId: byApp.larkAppId, cliId: byApp.cliId };
-    }
-    for (const label of labels) {
-      const byName = botInfoByName.get(label.toLowerCase());
-      if (byName) return { larkAppId: byName.larkAppId, cliId: byName.cliId };
-    }
-    for (const label of labels) {
-      const matches = botConfigsByCliId.get(label.toLowerCase()) ?? [];
-      if (matches.length === 1) return { larkAppId: matches[0].larkAppId, cliId: matches[0].cliId };
-    }
-    return { larkAppId: '', cliId: '' };
-  }
-  const workerMetas = built.mentionedOpenIds.map(resolveDispatchWorkerMeta);
+  let senderScopedBotOpenIds: Record<string, string> = {};
+  try {
+    const crossRefPath = join(resolveDataDir(), `bot-openids-${appId}.json`);
+    if (existsSync(crossRefPath)) senderScopedBotOpenIds = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
+  } catch { /* best effort */ }
+  const workerMetas = resolveDispatchWorkerMetas({
+    openIds: built.mentionedOpenIds,
+    bots,
+    workerNames,
+    botConfigs,
+    botInfoEntries,
+    senderScopedBotOpenIds,
+  });
   const workerLarkAppIds = workerMetas.map((meta) => meta.larkAppId);
   const workerCliIds = workerMetas.map((meta) => meta.cliId);
   const hasWorkerMeta = workerLarkAppIds.some(Boolean) || workerCliIds.some(Boolean);
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
-  const appId = s.larkAppId!;
   const briefJson = JSON.stringify({ zh_cn: { title: '', content: built.threadContent } });
 
   try {
