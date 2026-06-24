@@ -24,7 +24,6 @@ import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
 import { config } from '../config.js';
-import { getGoalPanelConfig } from '../bot-registry.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -109,11 +108,13 @@ export async function transferGroupOwner(opts: TransferGroupOwnerOpts): Promise<
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
-  const panelLarkAppId = getGoalPanelConfig()?.larkAppId;
-  const invitedBotIds = Array.from(new Set([
-    ...opts.larkAppIds,
-    ...(panelLarkAppId ? [panelLarkAppId] : []),
-  ]));
+  // The goal panel is NOT auto-invited here. This service backs every group
+  // creation path (/g, /relay --create, dashboard create, `botmux create-group`),
+  // so injecting the panel unconditionally dragged the sender-only relay into
+  // ordinary user groups too. The panel's whole job (escalation OUT + human
+  // reply RETURN) happens in the PARENT chat, never the new group, so no path
+  // needs it here. If one ever does, make it an explicit caller opt-in.
+  const invitedBotIds = Array.from(new Set(opts.larkAppIds));
   // Filter creator out of the bot invite list. createChat does this defensively
   // too, but doing it here makes the service contract explicit and keeps
   // invalidBotIds reporting stable across underlying API changes.
@@ -216,8 +217,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
 
   const oncallBindings: CreateGroupResult['oncallBindings'] = [];
   const invalidBots = new Set(r.invalidBotIds);
-  // Sender-only goal panel is invited for relay visibility, but it is not a
-  // worker and should not receive oncall bindings or role bootstrap prompts.
+  // Oncall bindings + role bootstrap go to the bots that actually joined: the
+  // creator (implicit member) plus the requested peers minus Lark-rejected ones.
   const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
     .filter(id => !invalidBots.has(id));
   const bindWorkingDir = opts.bindWorkingDir?.trim();
