@@ -359,7 +359,7 @@ describe('goal watchdog', () => {
         larkAppId: 'cli_main',
         activeSessions,
         ledger: led,
-        now: 10_000,
+        now: 20_000,
         lastInjectedAt: new Map(),
         inject: () => { throw new Error('should not inject L2 for structured report'); },
         notify: (event) => notifications.push(event),
@@ -369,6 +369,68 @@ describe('goal watchdog', () => {
       expect(notifications.map((n) => [n.kind, n.result.reportId])).toEqual([['accepted', 'report-existing']]);
       expect(led.task('task-reported')?.status).toBe('accepted');
       expect(led.task('task-reported')?.reports).toHaveLength(1);
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reconcile a fresh report before the report grace window expires', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'goal-watchdog-report-grace-'));
+    try {
+      const out = join(baseDir, 'not-yet-visible.txt');
+      const led = openLedger({ baseDir });
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-fresh-report',
+        chatId: 'oc_goal',
+        ts: 1_000,
+        idempotencyKey: 'dispatched:task-fresh-report',
+        payload: {
+          taskId: 'task-fresh-report',
+          workerOpenIds: ['ou_worker'],
+          acceptanceCriteria: {
+            version: 1,
+            artifacts: [{ path: out, checks: [{ type: 'exists' }] }],
+          },
+        },
+      });
+      led.append({
+        type: 'TaskReported',
+        actor: 'worker',
+        taskId: 'task-fresh-report',
+        chatId: 'oc_goal',
+        ts: 9_500,
+        idempotencyKey: 'reported:report-fresh',
+        payload: {
+          taskId: 'task-fresh-report',
+          reportId: 'report-fresh',
+          workerOpenId: 'ou_worker',
+          evidence: [{ kind: 'path', path: out }],
+          summary: 'worker reported before file became visible',
+        },
+      });
+      const activeSessions = new Map<string, DaemonSession>();
+      activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+
+      const results = await runGoalWatchdogOnce({
+        larkAppId: 'cli_main',
+        activeSessions,
+        ledger: led,
+        now: 10_000,
+        reportGraceMs: 15_000,
+        lastInjectedAt: new Map(),
+        inject: () => { throw new Error('fresh reports must not trigger L2 fallback'); },
+        notify: () => { throw new Error('fresh reports must not be auto-rejected'); },
+      });
+
+      expect(results).toMatchObject([{
+        goalChatId: 'oc_goal',
+        status: 'grace',
+        pendingTaskIds: ['task-fresh-report'],
+      }]);
+      expect(led.task('task-fresh-report')?.status).toBe('reported');
+      expect(led.task('task-fresh-report')?.reports[0]?.verdict).toBeUndefined();
     } finally {
       rmSync(baseDir, { recursive: true, force: true });
     }
