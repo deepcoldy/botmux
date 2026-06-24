@@ -1295,10 +1295,12 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 4. **产物不存在 + 没动静** → 催 worker；只有 legacy 自由文本 hint（不可机器核验）→ 只催、别臆测 done。
 5. **escalated（已升级、等人）** → 别重复 nag，等人处理。
 
-**收到 \`[worker-health]\` 注入时（worker 存活硬事实，别机械催死人）**：daemon 发现某 dispatched 任务的 worker 可能掉线了，会给你注入一段 \`[worker-health]\`（含 \`session: live/suspended/closed/missing\`、\`workerProcess: live/none/killed\`、一句中文硬事实）。**这是要你按真实状态判断、不是继续 @ 一个已经死了的 worker**：
-- **session=closed / workerProcess=killed / missing（worker 真没了）**：原 worker 不可继续 → **带原 brief 重派**（\`dispatch\` 同 taskId 重新拉起它的会话，或换个能干的 worker）；重派仍反复失败 → 缩小任务范围或 \`delivery escalate\` 升级给人。
-- **session=suspended / workerProcess=none 但可恢复（只是休眠、没死）**：一条 \`send --chat-id <goalChatId> --mention <worker>\` 就能把它冷唤醒接着干，**别重派**（重派浪费、还可能丢它已干的进度）。
-- **busy 超时（还在跑但很久没动静）**：先看产物有无进展，给时间或问一句，别急着重派。
+**worker 掉线兜底（别机械催死人；多数情况系统已替你处理）**：daemon 发现某 dispatched 任务的 worker 可能掉线时，会按真实存活状态分流：
+- **worker 真死透（其 daemon 在线、但 goal 群里它的会话缺失/closed 或进程 killed）→ 系统自动同 bot 重派**：watchdog 确认死透（派活 5min 后才判、不误伤 busy/慢）后**自动**带原 taskId 重派 + @ 原 worker 重新接手 + 在群里发「🔄 已自动重派」卡（幂等：同 task 15min 窗口只重派一次）。**你看到 🔄 卡时别再重派**——系统做了，你只接管监督：查 charter/ledger/群历史确认新会话在推进。**只有**缺重派元数据的老任务系统没自动处理，才由你 \`dispatch\` 同 taskId 兜底。
+- **worker 整个 daemon 离线（重派没地方落）**：系统**不**往黑洞重派 → 注入 \`[worker-health]\` 交你判断：等它回来 / 缩 scope / \`delivery escalate\` 升级给人。
+- **session=suspended / workerProcess=none 但可恢复（只是休眠、没死）**：一条 \`send --chat-id <goalChatId> --mention <worker>\` 冷唤醒接着干，**别重派**（浪费 + 可能丢进度）。
+- **busy 超时（还在跑但很久没动静）**：先看产物进展，给时间或问一句，别急着重派。
+- **同一 task 反复被自动重派**（worker 起来又死）→ 别干等系统死循环，\`delivery escalate\` 升级给人。
 
 巡检后 \`goal charter update\` 刷新；全 accepted → 通知 L1（L2-5）。
 **铁律**：机械层只会自动验收"worker 已 report 且 checks 全过"的确定性交付；其余（没 report、在喊卡、证据可疑）一律交你判断——**完成与否你说了算，但必须基于独立核验的硬证据，绝不是"文件在那儿就算完"**。
