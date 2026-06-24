@@ -121,6 +121,10 @@ export interface TaskView {
    *  dispatch from the `--bot <id:name:role>` label — open_id is per-app scoped so
    *  it can't be resolved to a name cross-app; the name is stored at the source. */
   workerNames?: string[];
+  /** Index-aligned larkAppId / cliId for each worker (B2 deterministic re-dispatch:
+   *  hard-scope the worker's session + re-spawn the same CLI). */
+  workerLarkAppIds?: string[];
+  workerCliIds?: string[];
   acceptanceHint?: string;    // legacy free-text intent (kept for back-compat / display)
   acceptanceCriteria?: AcceptanceCriteria; // P1 #7: structured, validated verify plan (preferred)
   status: TaskStatus;
@@ -141,6 +145,15 @@ export interface TaskDispatchedPayload {
   workerOpenIds?: string[];
   /** Index-aligned display names for workerOpenIds (from `--bot <id:name:role>`). */
   workerNames?: string[];
+  /** Index-aligned larkAppId for each worker (resolved at dispatch). Lets the
+   *  watchdog hard-scope a worker's session for deterministic re-dispatch (B2) —
+   *  open_id alone is per-app and ambiguous cross-daemon. */
+  workerLarkAppIds?: string[];
+  /** Index-aligned cliId for each worker (so re-dispatch can re-spawn the same
+   *  CLI). sessionId is intentionally NOT recorded — the worker session isn't
+   *  spawned until after dispatch; the watchdog resolves it live by goalChatId +
+   *  larkAppId/openId. */
+  workerCliIds?: string[];
   brief?: string;
   acceptanceHint?: string;
   acceptanceCriteria?: AcceptanceCriteria;
