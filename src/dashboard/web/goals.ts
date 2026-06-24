@@ -30,6 +30,11 @@ interface BoardTask {
   escalation?: { reason: string; by?: string; retryBrief?: string };
 }
 interface BoardNarration { goalChatId: string; type: string; taskId?: string; text: string; ts: number }
+interface GoalNotificationRetryRecord {
+  id: string; ownerLarkAppId: string; kind: 'human-attention' | 'completion-confirm'; status?: 'pending' | 'dead';
+  goalChatId: string; goalTitle?: string; taskId?: string; summary: string; attentionKind?: string; attentionReason?: string;
+  attempts: number; nextAttemptAt: number; lastError?: string; deadAt?: number; deadReason?: string; createdAt: number; updatedAt: number;
+}
 interface BoardGoal {
   goalChatId: string; title?: string; hasCharter: boolean;
   charterUpdatedAt?: string; charterContent?: string; lastActivityAt?: number;
@@ -38,6 +43,7 @@ interface BoardGoal {
   narrations?: BoardNarration[];
 }
 interface GoalBoard { goals: BoardGoal[] }
+interface RetryBoard { records: GoalNotificationRetryRecord[] }
 
 const STATUS_LABEL: Record<string, string> = {
   dispatched: '待交付', reported: '已报告', accepted: '已验收', rejected: '已驳回',
@@ -292,6 +298,31 @@ function narrationsHtml(g: BoardGoal): string {
       </li>`).join('')}</ul>
   </div>`;
 }
+
+function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string {
+  const visible = records.filter(r => (r.status === 'dead') || r.attempts > 0 || r.lastError);
+  if (!visible.length) return '';
+  return `<div class="gb-retries">
+    <div class="gb-retries-head">⚠️ 关键通知投递异常 <span>${visible.length} 条</span></div>
+    <div class="gb-retries-list">${visible.map(r => {
+      const dead = r.status === 'dead';
+      const title = r.goalTitle || chatNameForId(r.goalChatId) || shortId(r.goalChatId);
+      const label = r.kind === 'completion-confirm' ? '完成确认卡' : '升级/需要人拍板';
+      const status = dead ? `已停止自动重试 · ${r.deadReason ?? 'dead-letter'}` : `下次重试 ${fmtTs(r.nextAttemptAt)}`;
+      return `<div class="gb-retry ${dead ? 'dead' : ''}" data-retry-id="${escapeHtml(r.id)}">
+        <div class="gb-retry-main">
+          <strong>${dead ? '需人工处理' : '重试中'} · ${label}</strong>
+          <span>${escapeHtml(title)}${r.taskId ? ` · <code>${escapeHtml(r.taskId)}</code>` : ''}</span>
+          <small>${escapeHtml(status)} · attempts=${r.attempts}${r.lastError ? ` · ${escapeHtml(r.lastError)}` : ''}</small>
+        </div>
+        <div class="gb-retry-actions">
+          <button type="button" class="gb-retry-retry">手动重试</button>
+          <button type="button" class="gb-retry-clear">清除</button>
+        </div>
+      </div>`;
+    }).join('')}</div>
+  </div>`;
+}
 function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
   if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
   return `<div class="gb-detail-head">
@@ -319,6 +350,7 @@ function shell(): string {
   <p>每个目标下子任务的交付生命周期：派发 → 报告 → 核验 → 验收。账本是唯一真相。</p></div>
   <div><button type="button" id="gb-refresh" class="gb-refresh-btn">↻ 刷新</button></div>
 </div>
+<div id="gb-retries"></div>
 <div class="gb-layout">
   <aside class="gb-rail" id="gb-rail"></aside>
   <main class="gb-main" id="gb-main"></main>
@@ -332,9 +364,11 @@ export function renderGoalsPage(root: HTMLElement): () => void {
   const railEl = root.querySelector<HTMLElement>('#gb-rail')!;
   const mainEl = root.querySelector<HTMLElement>('#gb-main')!;
   const detailEl = root.querySelector<HTMLElement>('#gb-detail')!;
+  const retriesEl = root.querySelector<HTMLElement>('#gb-retries')!;
   const refreshBtn = root.querySelector<HTMLButtonElement>('#gb-refresh')!;
 
   let board: GoalBoard = { goals: [] };
+  let retries: RetryBoard = { records: [] };
   let selGoal: string | null = null;
   let selTask: string | null = null;
   let disposed = false;
@@ -363,6 +397,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     if (ta && selTask && decideDraft[selTask]) ta.value = decideDraft[selTask];
   }
   function renderAll(): void { renderRail(); renderMain(); renderDetail(); }
+  function renderRetries(): void { retriesEl.innerHTML = notificationRetriesHtml(retries.records); }
 
   async function sendDecision(btn: HTMLButtonElement): Promise<void> {
     const sec = btn.closest<HTMLElement>('.gb-sec-decide');
@@ -431,16 +466,41 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     ta?.closest<HTMLElement>('.gb-sec-decide')?.querySelector<HTMLButtonElement>('.gb-decide-send')?.click();
   });
   refreshBtn.onclick = () => { void load(); };
+  retriesEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button');
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.gb-retry');
+    if (!btn || !row) return;
+    const id = row.dataset.retryId ?? '';
+    const action = btn.classList.contains('gb-retry-retry') ? 'retry' : btn.classList.contains('gb-retry-clear') ? 'clear' : '';
+    if (!id || !action) return;
+    btn.disabled = true;
+    void fetch(`/api/goal-notification-retries/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        lastJson = '';
+        return load();
+      })
+      .catch((err) => {
+        btn.disabled = false;
+        btn.textContent = (err as Error).message;
+      });
+  });
 
   async function load(): Promise<void> {
     try {
-      const res = await fetch('/api/goals');
+      const [res, retryRes] = await Promise.all([
+        fetch('/api/goals'),
+        fetch('/api/goal-notification-retries'),
+      ]);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
+      if (!retryRes.ok) throw new Error(`retry HTTP ${retryRes.status}`);
+      const [text, retryText] = await Promise.all([res.text(), retryRes.text()]);
+      const combinedText = `${text}\n${retryText}`;
       if (disposed) return;
-      if (text === lastJson) return; // unchanged → don't repaint (kills 10s poll flicker)
-      lastJson = text;
+      if (combinedText === lastJson) return; // unchanged → don't repaint (kills 10s poll flicker)
+      lastJson = combinedText;
       board = JSON.parse(text) as GoalBoard;
+      retries = JSON.parse(retryText) as RetryBoard;
       // keep selection if still present; else default to first goal / first task
       if (!goalOf(selGoal)) { selGoal = board.goals[0]?.goalChatId ?? null; selTask = null; }
       const g = goalOf(selGoal);
@@ -448,7 +508,8 @@ export function renderGoalsPage(root: HTMLElement): () => void {
       // don't yank the caret out of the decision box if a poll repaint lands mid-typing
       const typing = (document.activeElement as HTMLElement | null)?.classList.contains('gb-decide-input')
         && detailEl.contains(document.activeElement);
-      if (typing) { renderRail(); renderMain(); } else { renderAll(); }
+      renderRetries();
+      if (typing) { renderRail(); renderMain(); } else { renderAll(); renderRetries(); }
     } catch (e) {
       if (disposed) return;
       railEl.innerHTML = `<p class="gb-empty">加载失败：${escapeHtml((e as Error).message)}</p>`;
