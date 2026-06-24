@@ -10,6 +10,7 @@ export interface GoalNotificationRetryRecord {
   id: string;
   ownerLarkAppId: string;
   kind: GoalNotificationRetryKind;
+  status?: 'pending' | 'dead';
   candidates: string[];
   parentChatId: string;
   parentRoot?: string;
@@ -26,6 +27,8 @@ export interface GoalNotificationRetryRecord {
   attempts: number;
   nextAttemptAt: number;
   lastError?: string;
+  deadAt?: number;
+  deadReason?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -63,6 +66,7 @@ export function upsertGoalNotificationRetry(record: Omit<GoalNotificationRetryRe
   const prev = all[record.id];
   const next: GoalNotificationRetryRecord = {
     ...record,
+    status: record.status ?? (prev?.status === 'dead' ? 'dead' : 'pending'),
     attempts: record.attempts ?? prev?.attempts ?? 0,
     createdAt: record.createdAt ?? prev?.createdAt ?? now,
     updatedAt: record.updatedAt ?? now,
@@ -81,8 +85,13 @@ export function removeGoalNotificationRetry(id: string): void {
 
 export function listDueGoalNotificationRetries(ownerLarkAppId: string, now = Date.now()): GoalNotificationRetryRecord[] {
   return Object.values(loadAll())
-    .filter((r) => r.ownerLarkAppId === ownerLarkAppId && r.nextAttemptAt <= now)
+    .filter((r) => (r.status ?? 'pending') !== 'dead' && r.ownerLarkAppId === ownerLarkAppId && r.nextAttemptAt <= now)
     .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt);
+}
+
+export function listGoalNotificationRetries(): GoalNotificationRetryRecord[] {
+  return Object.values(loadAll())
+    .sort((a, b) => (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0));
 }
 
 export function markGoalNotificationRetryAttempt(id: string, input: { attempts: number; nextAttemptAt: number; lastError?: string }): void {
@@ -91,10 +100,47 @@ export function markGoalNotificationRetryAttempt(id: string, input: { attempts: 
   if (!prev) return;
   all[id] = {
     ...prev,
+    status: 'pending',
     attempts: input.attempts,
     nextAttemptAt: input.nextAttemptAt,
     lastError: input.lastError,
     updatedAt: Date.now(),
   };
   saveAll(all);
+}
+
+export function markGoalNotificationRetryDead(id: string, input: { reason: string; lastError?: string; now?: number }): GoalNotificationRetryRecord | null {
+  const all = loadAll();
+  const prev = all[id];
+  if (!prev) return null;
+  const now = input.now ?? Date.now();
+  const next: GoalNotificationRetryRecord = {
+    ...prev,
+    status: 'dead',
+    deadAt: now,
+    deadReason: input.reason,
+    lastError: input.lastError ?? prev.lastError,
+    updatedAt: now,
+  };
+  all[id] = next;
+  saveAll(all);
+  return next;
+}
+
+export function retryGoalNotification(id: string, now = Date.now()): GoalNotificationRetryRecord | null {
+  const all = loadAll();
+  const prev = all[id];
+  if (!prev) return null;
+  const next: GoalNotificationRetryRecord = {
+    ...prev,
+    status: 'pending',
+    attempts: 0,
+    nextAttemptAt: now,
+    deadAt: undefined,
+    deadReason: undefined,
+    updatedAt: now,
+  };
+  all[id] = next;
+  saveAll(all);
+  return next;
 }

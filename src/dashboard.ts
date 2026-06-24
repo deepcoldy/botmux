@@ -128,6 +128,11 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
+import {
+  listGoalNotificationRetries,
+  removeGoalNotificationRetry,
+  retryGoalNotification,
+} from './services/goal-notification-retry-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
@@ -2684,6 +2689,38 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/goals') {
       return jsonRes(res, 200, buildGoalBoard());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/goal-notification-retries') {
+      return jsonRes(res, 200, { records: listGoalNotificationRetries() });
+    }
+    const mGoalNotificationRetry = url.pathname.match(/^\/api\/goal-notification-retries\/([^/]+)\/(retry|clear)$/);
+    if (req.method === 'POST' && mGoalNotificationRetry) {
+      const id = decodeURIComponent(mGoalNotificationRetry[1]);
+      const action = mGoalNotificationRetry[2];
+      if (action === 'retry') {
+        const record = retryGoalNotification(id);
+        if (!record) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+        const d = registry.getByAppId(record.ownerLarkAppId);
+        let triggered = false;
+        let triggerError: string | undefined;
+        if (d) {
+          try {
+            const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goal-notification-retries/process`, {
+              method: 'POST',
+              signal: AbortSignal.timeout(3_000),
+            });
+            triggered = upstream.ok;
+            if (!upstream.ok) triggerError = `HTTP ${upstream.status}`;
+          } catch (err: any) {
+            triggerError = err?.message ?? String(err);
+          }
+        } else {
+          triggerError = 'owner_daemon_offline';
+        }
+        return jsonRes(res, 200, { ok: true, record, triggered, triggerError });
+      }
+      removeGoalNotificationRetry(id);
+      return jsonRes(res, 200, { ok: true });
     }
     const mGoalDecision = url.pathname.match(/^\/api\/goals\/([^/]+)\/decision$/);
     if (req.method === 'POST' && mGoalDecision) {

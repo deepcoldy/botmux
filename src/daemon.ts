@@ -62,6 +62,7 @@ import { getGoalChat } from './services/goal-chat-store.js';
 import {
   listDueGoalNotificationRetries,
   markGoalNotificationRetryAttempt,
+  markGoalNotificationRetryDead,
   removeGoalNotificationRetry,
   upsertGoalNotificationRetry,
   type GoalNotificationRetryRecord,
@@ -4472,6 +4473,19 @@ function retryBackoffMs(attempts: number): number {
   return Math.min(15 * 60_000, 60_000 * 2 ** Math.max(0, attempts - 1));
 }
 
+const GOAL_NOTIFICATION_RETRY_MAX_ATTEMPTS = 24;
+const GOAL_NOTIFICATION_RETRY_DEAD_AFTER_MS = 24 * 60 * 60_000;
+
+function retryDeadReason(record: GoalNotificationRetryRecord, now = Date.now()): string | null {
+  if (record.attempts >= GOAL_NOTIFICATION_RETRY_MAX_ATTEMPTS) {
+    return `max_attempts_${GOAL_NOTIFICATION_RETRY_MAX_ATTEMPTS}`;
+  }
+  if (now - record.createdAt >= GOAL_NOTIFICATION_RETRY_DEAD_AFTER_MS) {
+    return 'ttl_24h';
+  }
+  return null;
+}
+
 function retryRecordFromHumanAttention(input: {
   parent?: DaemonSession;
   supervisor?: DaemonSession;
@@ -4728,6 +4742,12 @@ async function processGoalNotificationRetries(): Promise<void> {
   const due = listDueGoalNotificationRetries(currentDaemonLarkAppId);
   if (due.length === 0) return;
   for (const record of due) {
+    const preflightDeadReason = retryDeadReason(record);
+    if (preflightDeadReason) {
+      markGoalNotificationRetryDead(record.id, { reason: preflightDeadReason, lastError: record.lastError });
+      logger.error(`[goal-notification-retry] dead-letter ${record.kind} id=${record.id} goal=${record.goalChatId} reason=${preflightDeadReason}; requires human`);
+      continue;
+    }
     const result = record.kind === 'human-attention'
       ? await sendGoalHumanAttentionRecord(record)
       : await sendGoalCompletionConfirmationRecord(record);
@@ -4737,6 +4757,12 @@ async function processGoalNotificationRetries(): Promise<void> {
       continue;
     }
     const attempts = record.attempts + 1;
+    const deadReason = retryDeadReason({ ...record, attempts });
+    if (deadReason) {
+      markGoalNotificationRetryDead(record.id, { reason: deadReason, lastError: result.error });
+      logger.error(`[goal-notification-retry] dead-letter ${record.kind} id=${record.id} goal=${record.goalChatId} attempts=${attempts} reason=${deadReason}; requires human: ${result.error}`);
+      continue;
+    }
     markGoalNotificationRetryAttempt(record.id, {
       attempts,
       nextAttemptAt: Date.now() + retryBackoffMs(attempts),
@@ -4745,6 +4771,16 @@ async function processGoalNotificationRetries(): Promise<void> {
     logger.warn(`[goal-notification-retry] retry failed ${record.kind} id=${record.id} attempts=${attempts}: ${result.error}`);
   }
 }
+
+ipcRoute('POST', '/api/goal-notification-retries/process', async (_req, res) => {
+  try {
+    await processGoalNotificationRetries();
+    return jsonRes(res, 200, { ok: true });
+  } catch (err: any) {
+    logger.warn(`[goal-notification-retry] manual process failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
 
 function goalParentReplyCandidates(parsed: Pick<LarkMessage, 'parentId' | 'messageId'>): string[] {
   // Only explicit quote/reply to the notification should route back to L2.

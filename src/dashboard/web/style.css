@@ -22636,6 +22636,22 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 @media (max-width: 1100px) { .goalboard .gb-layout { grid-template-columns: 220px minmax(0,1fr); } .gb-detail { display: none; } }
 .gb-refresh-btn { font-family: var(--mono); font-size: .8rem; }
 
+.gb-retries { margin: 0 0 12px; border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border-soft)); background: color-mix(in srgb, var(--danger) 6%, var(--surface)); border-radius: var(--radius); overflow: hidden; }
+.gb-retries-head { display: flex; justify-content: space-between; gap: 8px; padding: 9px 12px; font-weight: 700; color: var(--danger); border-bottom: 1px solid color-mix(in srgb, var(--danger) 20%, var(--border-soft)); }
+.gb-retries-head span { font-family: var(--mono); font-size: .76rem; color: var(--muted); }
+.gb-retries-list { display: flex; flex-direction: column; }
+.gb-retry { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 10px 12px; border-top: 1px solid var(--border-soft); }
+.gb-retry:first-child { border-top: none; }
+.gb-retry.dead { background: color-mix(in srgb, var(--danger) 4%, transparent); }
+.gb-retry-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; font-size: .82rem; }
+.gb-retry-main strong { color: var(--fg); }
+.gb-retry-main span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gb-retry-main small { color: var(--faint); font-size: .72rem; }
+.gb-retry-actions { display: flex; gap: 6px; flex: none; }
+.gb-retry-actions button { font: inherit; font-size: .74rem; padding: 5px 10px; border-radius: 7px; border: 1px solid var(--border-soft); background: var(--surface); color: var(--fg); cursor: pointer; }
+.gb-retry-actions button:hover { border-color: var(--accent); color: var(--accent-strong); }
+.gb-retry-actions button:disabled { opacity: .55; cursor: default; }
+
 /* left rail: goals as operational summary rows */
 .gb-rail { display: flex; flex-direction: column; gap: 8px; max-height: calc(100vh - 180px); overflow-y: auto; }
 .gb-goal {

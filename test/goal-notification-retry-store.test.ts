@@ -5,8 +5,11 @@ import { tmpdir } from 'node:os';
 import { config } from '../src/config.js';
 import {
   listDueGoalNotificationRetries,
+  listGoalNotificationRetries,
+  markGoalNotificationRetryDead,
   markGoalNotificationRetryAttempt,
   removeGoalNotificationRetry,
+  retryGoalNotification,
   upsertGoalNotificationRetry,
 } from '../src/services/goal-notification-retry-store.js';
 
@@ -64,5 +67,19 @@ describe('goal notification retry store', () => {
 
     removeGoalNotificationRetry('r1');
     expect(listDueGoalNotificationRetries('cli_a', 10_000)).toEqual([]);
+  });
+
+  it('dead-letters records and allows manual retry', () => {
+    upsertGoalNotificationRetry(record('r-dead'));
+    const dead = markGoalNotificationRetryDead('r-dead', { reason: 'ttl_24h', lastError: 'bot_removed', now: 1_000 });
+
+    expect(dead).toMatchObject({ id: 'r-dead', status: 'dead', deadReason: 'ttl_24h', lastError: 'bot_removed' });
+    expect(listDueGoalNotificationRetries('cli_a', 10_000)).toEqual([]);
+    expect(listGoalNotificationRetries()[0]).toMatchObject({ id: 'r-dead', status: 'dead' });
+
+    const retried = retryGoalNotification('r-dead', 20_000);
+    expect(retried).toMatchObject({ id: 'r-dead', status: 'pending', attempts: 0, nextAttemptAt: 20_000 });
+    expect(retried?.deadAt).toBeUndefined();
+    expect(listDueGoalNotificationRetries('cli_a', 20_000).map((r) => r.id)).toEqual(['r-dead']);
   });
 });
