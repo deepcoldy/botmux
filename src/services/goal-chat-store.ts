@@ -15,12 +15,37 @@ import { logger } from '../utils/logger.js';
 export interface GoalChatRecord {
   chatId: string;
   title?: string;
+  brief?: string;
+  larkAppId?: string;
+  parentChatId?: string;
+  parentRoot?: string;
+  parentSessionId?: string;
+  workingDir?: string;
+  supervisorSessionId?: string;
+  supervisorCreatedAt?: string;
+  lastReviveAt?: string;
+  reviveAttempts?: string[];
   createdAt: string;
   updatedAt: string;
 }
 
 interface GoalChatFile {
   goals: GoalChatRecord[];
+}
+
+export interface RegisterGoalChatInput {
+  title?: string;
+  brief?: string;
+  now?: number;
+  larkAppId?: string;
+  parentChatId?: string;
+  parentRoot?: string;
+  parentSessionId?: string;
+  workingDir?: string;
+  supervisorSessionId?: string;
+  supervisorCreatedAt?: string;
+  lastReviveAt?: string;
+  reviveAttempts?: string[];
 }
 
 let loadedFrom: string | null = null;
@@ -38,8 +63,15 @@ function readFile(path: string): GoalChatFile {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<GoalChatFile>;
     return {
       goals: Array.isArray(parsed.goals)
-        ? parsed.goals.filter((g): g is GoalChatRecord =>
-          !!g && typeof g.chatId === 'string' && typeof g.createdAt === 'string' && typeof g.updatedAt === 'string')
+        ? parsed.goals
+          .filter((g): g is GoalChatRecord =>
+            !!g && typeof g.chatId === 'string' && typeof g.createdAt === 'string' && typeof g.updatedAt === 'string')
+          .map((g) => ({
+            ...g,
+            reviveAttempts: Array.isArray(g.reviveAttempts)
+              ? g.reviveAttempts.filter((v): v is string => typeof v === 'string')
+              : undefined,
+          }))
         : [],
     };
   } catch (err) {
@@ -72,7 +104,7 @@ function writeFile(next: Map<string, GoalChatRecord>): void {
   loadIfNeeded();
 }
 
-export function registerGoalChat(chatId: string, input: { title?: string; now?: number } = {}): GoalChatRecord {
+export function registerGoalChat(chatId: string, input: RegisterGoalChatInput = {}): GoalChatRecord {
   testOverride = false;
   const id = chatId.trim();
   if (!id) throw new Error('goal chatId is required');
@@ -82,6 +114,16 @@ export function registerGoalChat(chatId: string, input: { title?: string; now?: 
   const rec: GoalChatRecord = {
     chatId: id,
     title: input.title?.trim() || prev?.title,
+    brief: input.brief ?? prev?.brief,
+    larkAppId: input.larkAppId ?? prev?.larkAppId,
+    parentChatId: input.parentChatId ?? prev?.parentChatId,
+    parentRoot: input.parentRoot ?? prev?.parentRoot,
+    parentSessionId: input.parentSessionId ?? prev?.parentSessionId,
+    workingDir: input.workingDir ?? prev?.workingDir,
+    supervisorSessionId: input.supervisorSessionId ?? prev?.supervisorSessionId,
+    supervisorCreatedAt: input.supervisorCreatedAt ?? prev?.supervisorCreatedAt,
+    lastReviveAt: input.lastReviveAt ?? prev?.lastReviveAt,
+    reviveAttempts: input.reviveAttempts ?? prev?.reviveAttempts,
     createdAt: prev?.createdAt ?? nowIso,
     updatedAt: nowIso,
   };
@@ -89,6 +131,12 @@ export function registerGoalChat(chatId: string, input: { title?: string; now?: 
   next.set(id, rec);
   writeFile(next);
   return rec;
+}
+
+export function getGoalChat(chatId: string | undefined): GoalChatRecord | undefined {
+  if (!chatId) return undefined;
+  loadIfNeeded();
+  return goalChats.get(chatId);
 }
 
 export function isGoalChat(chatId: string | undefined): boolean {

@@ -8,7 +8,7 @@ import { buildFollowUpContent, buildNewTopicPrompt, getAvailableBots, rememberLa
 import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { sessionKey, type DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
-import { registerGoalChat } from '../services/goal-chat-store.js';
+import { getGoalChat, registerGoalChat } from '../services/goal-chat-store.js';
 
 export interface GoalSuperviseRequest {
   chatId: string;
@@ -67,6 +67,21 @@ export interface GoalSupervisorDeps {
   larkAppId: string;
   activeSessions: Map<string, DaemonSession>;
 }
+
+export const DEFAULT_GOAL_SUPERVISOR_REVIVE_COOLDOWN_MS = 60_000;
+export const DEFAULT_GOAL_SUPERVISOR_REVIVE_WINDOW_MS = 10 * 60_000;
+export const DEFAULT_GOAL_SUPERVISOR_REVIVE_MAX_ATTEMPTS = 3;
+
+export interface EnsureGoalSupervisorOptions {
+  now?: number;
+  cooldownMs?: number;
+  windowMs?: number;
+  maxAttempts?: number;
+}
+
+export type EnsureGoalSupervisorResult =
+  | { ok: true; status: 'active' | 'revived'; goalChatId: string; supervisorSessionId: string }
+  | { ok: false; errorCode: string; error: string; goalChatId: string };
 
 export function buildGoalSupervisorPrompt(req: GoalSuperviseRequest): string {
   const brief = req.brief?.trim();
@@ -235,7 +250,15 @@ export async function startGoalSupervisor(
   const bot = getBot(larkAppId);
   const title = req.title.trim() || 'Goal supervisor';
   try {
-    registerGoalChat(chatId, { title });
+    registerGoalChat(chatId, {
+      title,
+      brief: req.brief,
+      larkAppId,
+      parentChatId,
+      parentRoot: req.parentRoot,
+      parentSessionId: req.parentSessionId,
+      workingDir: wd.workingDir,
+    });
   } catch (err) {
     return {
       ok: false,
@@ -262,6 +285,17 @@ export async function startGoalSupervisor(
     createdAt: new Date(now).toISOString(),
   };
   sessionStore.updateSession(session);
+  registerGoalChat(chatId, {
+    title,
+    brief: req.brief,
+    larkAppId,
+    parentChatId,
+    parentRoot: req.parentRoot,
+    parentSessionId: req.parentSessionId,
+    workingDir: wd.workingDir,
+    supervisorSessionId: session.sessionId,
+    supervisorCreatedAt: session.createdAt,
+  });
 
   messageQueue.ensureQueue(anchor);
 
@@ -306,5 +340,88 @@ export async function startGoalSupervisor(
     goalChatId: chatId,
     supervisorSessionId: session.sessionId,
     parent: { chatId: parentChatId, rootMessageId: req.parentRoot },
+  };
+}
+
+function recentReviveAttempts(attempts: string[] | undefined, now: number, windowMs: number): string[] {
+  return (attempts ?? []).filter((ts) => {
+    const t = Date.parse(ts);
+    return Number.isFinite(t) && now - t < windowMs;
+  });
+}
+
+export async function ensureGoalSupervisorFromRegistry(
+  goalChatId: string,
+  deps: GoalSupervisorDeps,
+  opts: EnsureGoalSupervisorOptions = {},
+): Promise<EnsureGoalSupervisorResult> {
+  const active = findGoalSupervisorByGoal(deps.activeSessions, deps.larkAppId, goalChatId);
+  if (active?.session.goalSupervisor) {
+    return {
+      ok: true,
+      status: 'active',
+      goalChatId,
+      supervisorSessionId: active.session.sessionId,
+    };
+  }
+
+  const rec = getGoalChat(goalChatId);
+  if (!rec) {
+    return { ok: false, goalChatId, errorCode: 'goal_not_registered', error: 'goal chat is not registered' };
+  }
+  if (rec.larkAppId && rec.larkAppId !== deps.larkAppId) {
+    return { ok: false, goalChatId, errorCode: 'not_owner_daemon', error: `goal is owned by ${rec.larkAppId}` };
+  }
+  if (!rec.parentChatId) {
+    return { ok: false, goalChatId, errorCode: 'incomplete_goal_record', error: 'goal registry has no parentChatId' };
+  }
+
+  const now = opts.now ?? Date.now();
+  const cooldownMs = opts.cooldownMs ?? DEFAULT_GOAL_SUPERVISOR_REVIVE_COOLDOWN_MS;
+  const windowMs = opts.windowMs ?? DEFAULT_GOAL_SUPERVISOR_REVIVE_WINDOW_MS;
+  const maxAttempts = opts.maxAttempts ?? DEFAULT_GOAL_SUPERVISOR_REVIVE_MAX_ATTEMPTS;
+  const recent = recentReviveAttempts(rec.reviveAttempts, now, windowMs);
+  const lastRevive = rec.lastReviveAt ? Date.parse(rec.lastReviveAt) : undefined;
+  if (lastRevive !== undefined && Number.isFinite(lastRevive) && now - lastRevive < cooldownMs) {
+    return { ok: false, goalChatId, errorCode: 'revive_cooldown', error: `last revive was ${now - lastRevive}ms ago` };
+  }
+  if (recent.length >= maxAttempts) {
+    return {
+      ok: false,
+      goalChatId,
+      errorCode: 'revive_budget_exhausted',
+      error: `goal supervisor revived ${recent.length} time(s) in ${windowMs}ms`,
+    };
+  }
+
+  const revived = await startGoalSupervisor({
+    chatId: rec.chatId,
+    parentChatId: rec.parentChatId,
+    parentRoot: rec.parentRoot,
+    parentSessionId: rec.parentSessionId,
+    title: rec.title ?? rec.chatId,
+    brief: rec.brief
+      ? `${rec.brief}\n\n[auto-revive] 你是被 goal-watchdog 自动恢复的 L2；先查 goal charter 和 delivery ledger，继续处理未完成任务。`
+      : '[auto-revive] 你是被 goal-watchdog 自动恢复的 L2；先查 goal charter 和 delivery ledger，继续处理未完成任务。',
+    workingDir: rec.workingDir,
+  }, deps);
+
+  if (!revived.ok) {
+    return { ok: false, goalChatId, errorCode: revived.errorCode, error: revived.error };
+  }
+
+  const at = new Date(now).toISOString();
+  registerGoalChat(goalChatId, {
+    lastReviveAt: at,
+    reviveAttempts: [...recent, at],
+    supervisorSessionId: revived.supervisorSessionId,
+    supervisorCreatedAt: at,
+  });
+
+  return {
+    ok: true,
+    status: 'revived',
+    goalChatId,
+    supervisorSessionId: revived.supervisorSessionId,
   };
 }
