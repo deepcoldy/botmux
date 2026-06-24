@@ -54,9 +54,29 @@ describe('applyInlineMentions', () => {
     // name "Owner" must not match inside "@Owner2".
     expect(applyInlineMentions('@Owner2 done', [owner]).text).toBe('@Owner2 done');
     // name "张三" must not match inside "@张三丰"; with both registered, the
-    // longer one wins via backtracking.
+    // longer one wins via backtracking (separator is a letter, lookahead fires).
     const both = applyInlineMentions('@张三丰 报告', [zhang, { open_id: 'ou_zsf', name: '张三丰' }]);
     expect(both.text).toBe('<at id=ou_zsf></at> 报告');
+  });
+
+  it('resolves prefix collision when the separator is NOT a letter/digit (length-desc)', () => {
+    // Codex P2: lookahead alone can't fix `Claude` vs `Claude-Code` — after the
+    // short `Claude` the next char `-` passes the lookahead. Length-desc ordering
+    // makes the longer name win.
+    const bots = [
+      { open_id: 'ou_short', name: 'Claude' },
+      { open_id: 'ou_cli', name: 'Claude-Code' },
+    ];
+    expect(applyInlineMentions('@Claude-Code hi', bots).text).toBe('<at id=ou_cli></at> hi');
+    expect([...applyInlineMentions('@Claude-Code hi', bots).usedIds]).toEqual(['ou_cli']);
+    // Reversed registration order must not change the outcome.
+    const rev = [bots[1], bots[0]];
+    expect(applyInlineMentions('@Claude-Code hi', rev).text).toBe('<at id=ou_cli></at> hi');
+    // The bare short name still resolves to the short id when written alone.
+    expect(applyInlineMentions('@Claude hi', bots).text).toBe('<at id=ou_short></at> hi');
+    // Single-char prefix with a hyphen separator (Codex's `A` / `A-B` repro).
+    const ab = [{ open_id: 'ou_a', name: 'A' }, { open_id: 'ou_ab', name: 'A-B' }];
+    expect(applyInlineMentions('@A-B hi', ab).text).toBe('<at id=ou_ab></at> hi');
   });
 
   it('is case-insensitive against the registered name', () => {

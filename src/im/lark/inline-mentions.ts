@@ -14,9 +14,15 @@
  *     `负责人 @张三` and a CJK-prefixed `看看@张三` are accepted (CJK isn't an
  *     ASCII word char);
  *   - lookahead `(?![\p{L}\p{N}_])` (needs the `u` flag) blocks any Unicode
- *     letter/digit so `@Owner2` won't half-match name "Owner", and on a prefix
- *     collision (`@张三丰` with both `张三` and `张三丰` registered) it forces the
- *     engine to backtrack onto the longer, fully-bounded alternative.
+ *     letter/digit so `@Owner2` won't half-match name "Owner".
+ *
+ * Prefix collisions (one registered name is a string-prefix of another, e.g.
+ * `Claude` / `Claude-Code`) are resolved by trying the LONGER name first — the
+ * alternation is built length-descending, mirroring the `@BotName` matcher's
+ * sorted iteration. The lookahead alone is not enough: it only forces the
+ * longer match when the next char is itself a letter/digit (`@张三丰`); when the
+ * separator is `-`/space/emoji (`@Claude-Code`) the short name's lookahead would
+ * otherwise pass and win, @-ing the wrong target and footer-mismatching.
  *
  * This replaces the previous `@(name)\b` matcher whose `\b` word boundary never
  * matched after a CJK character — pure-Chinese display names (`@张三`) silently
@@ -47,10 +53,14 @@ export function applyInlineMentions(
   const map = new Map<string, string>();
   for (const m of named) map.set(m.name.toLowerCase(), m.open_id);
 
+  // Length-descending so a longer name wins over a shorter one it has as a
+  // prefix (`Claude-Code` before `Claude`); see the prefix-collision note above.
+  const alternation = [...named]
+    .sort((a, b) => b.name.length - a.name.length)
+    .map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|');
   const pattern = new RegExp(
-    `(?<![A-Za-z0-9_])@(${named
-      .map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('|')})(?![\\p{L}\\p{N}_])`,
+    `(?<![A-Za-z0-9_])@(${alternation})(?![\\p{L}\\p{N}_])`,
     'giu',
   );
 
