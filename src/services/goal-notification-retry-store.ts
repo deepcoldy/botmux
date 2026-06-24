@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
+import type { GoalDecisionOption } from './goal-decision-options.js';
 
 export type GoalNotificationRetryKind = 'human-attention' | 'completion-confirm';
 
@@ -22,6 +23,7 @@ export interface GoalNotificationRetryRecord {
   summary: string;
   attentionKind?: string;
   attentionReason?: string;
+  decisionOptions?: GoalDecisionOption[];
   done?: boolean;
   ownerOpenId?: string;
   attempts: number;
