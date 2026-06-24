@@ -68,6 +68,8 @@ import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js'
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
+import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
+import { emitGoalNarration } from '../../verified-delivery/narration.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
@@ -1350,22 +1352,47 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!goalChatId) {
       return { toast: { type: 'error', content: '缺少 goal_chat_id，无法清理。' } };
     }
-    let closed = 0;
-    for (const ds of [...activeSessions.values()]) {
-      if (ds.chatId !== goalChatId || ds.scope !== 'chat') continue;
-      if (larkAppId && ds.larkAppId !== larkAppId) continue;
-      killWorker(ds);
-      sessionStore.closeSession(ds.session.sessionId);
-      activeSessions.delete(sessionKey(sessionAnchorId(ds), ds.larkAppId));
-      closed++;
+    // Fan out to EVERY online daemon (self included): each closes its own
+    // chat-scope sessions bound to this goal. A goal group hosts workers from
+    // several bots, and each bot's sessions live in its own daemon process —
+    // so the old card-owner-local loop left the other bots' workers orphaned
+    // (F5). Mirrors routeGoalParentReplyAcrossDaemons: all peers, concurrent,
+    // per-call timeout, best-effort (a dead peer ages out of the registry).
+    const perDaemon = await Promise.all(listOnlineDaemons().map(async (d) => {
+      const ctrl = new AbortController();
+      const tt = setTimeout(() => ctrl.abort(), 5_000);
+      try {
+        const r = await fetch(
+          `http://127.0.0.1:${d.ipcPort}/api/goal/${encodeURIComponent(goalChatId)}/cleanup-local`,
+          { method: 'POST', signal: ctrl.signal },
+        );
+        const body = await r.json().catch(() => null) as { closed?: number } | null;
+        return typeof body?.closed === 'number' ? body.closed : 0;
+      } catch (err) {
+        logger.warn(`[goal-cleanup] fanout to ${d.larkAppId}@${d.ipcPort} failed: ${err}`);
+        return 0;
+      } finally {
+        clearTimeout(tt);
+      }
+    }));
+    const closed = perDaemon.reduce((a, b) => a + b, 0);
+    logger.info(`[goal-cleanup] ${operatorOpenId ?? '?'} closed ${closed} chat-scope sessions across daemons for goal=${goalChatId}`);
+    // Narrate into the goal group so observers see the cleanup actually fired —
+    // the sessions are gone, but the card is sent by the bot directly (not via a
+    // session), so the goal group still gets a visible 🧹 marker.
+    if (larkAppId) {
+      await emitGoalNarration({
+        larkAppId,
+        goalChatId,
+        event: { type: 'cleanup', key: `narr:cleanup:${goalChatId}:${cardMessageId ?? closed}`, closed },
+      }).catch(err => logger.warn(`[goal-cleanup] narration failed: ${err}`));
     }
-    logger.info(`[goal-cleanup] ${operatorOpenId ?? '?'} closed ${closed} chat-scope sessions for goal=${goalChatId}`);
     return {
       config: { wide_screen_mode: true },
       header: { template: 'green', title: { tag: 'plain_text', content: 'Goal 会话已清理' } },
       elements: [{
         tag: 'div',
-        text: { tag: 'lark_md', content: `已清理 **${closed}** 个 goal 群 chat-scope 会话。\n\nGoal 群保留，不退群、不删群。` },
+        text: { tag: 'lark_md', content: `已清理 **${closed}** 个 goal 群 chat-scope 会话（已覆盖全部 bot/daemon）。\n\nGoal 群保留，不退群、不删群。` },
       }],
     };
   }
