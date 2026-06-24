@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseDeliveryEnvelope } from '../src/verified-delivery/envelope.js';
+import { formatHelpEnvelope, formatReportEnvelope, parseDeliveryEnvelope } from '../src/verified-delivery/envelope.js';
 
 describe('delivery envelope parser', () => {
   it('returns null for non-envelope text (fast path)', () => {
@@ -75,5 +75,31 @@ describe('delivery envelope parser', () => {
 
   it('rejects a help with no blocker', () => {
     expect(parseDeliveryEnvelope('[botmux-help v1]\ntaskId: t')).toBeNull();
+  });
+
+  it('formats a report envelope that parses back', () => {
+    const text = formatReportEnvelope({
+      taskId: 'task-x',
+      reportId: 'r1',
+      summary: 'done\nwith newline',
+      evidence: [
+        { kind: 'inline', name: 'test', text: 'PASS\nall good' },
+        { kind: 'path', path: '/tmp/out.txt' },
+        { kind: 'url', url: 'https://ci.example.com/1' },
+      ],
+    });
+    const env = parseDeliveryEnvelope(text);
+    if (env?.kind !== 'report') throw new Error('expected report');
+    expect(env).toMatchObject({ taskId: 'task-x', reportId: 'r1', summary: 'done with newline' });
+    expect(env.evidence[0]).toEqual({ kind: 'inline', name: 'test', text: 'PASS all good' });
+    expect(env.evidence[1]).toEqual({ kind: 'path', path: '/tmp/out.txt' });
+    expect(env.evidence[2]).toEqual({ kind: 'url', url: 'https://ci.example.com/1' });
+  });
+
+  it('formats a help envelope that parses back', () => {
+    const text = formatHelpEnvelope({ taskId: 'task-h', helpKind: 'access', blocker: '缺权限\n无法继续' });
+    const env = parseDeliveryEnvelope(text);
+    if (env?.kind !== 'help') throw new Error('expected help');
+    expect(env).toEqual({ kind: 'help', taskId: 'task-h', helpKind: 'access', blocker: '缺权限 无法继续' });
   });
 });

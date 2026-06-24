@@ -5445,6 +5445,7 @@ import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { openLedger } from './verified-delivery/ledger.js';
 import { buildReport, parseArtifactText } from './verified-delivery/report.js';
+import { formatHelpEnvelope, formatReportEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
 import { parseAcceptanceCriteria } from './verified-delivery/acceptance.js';
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import {
@@ -7285,6 +7286,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   // Backward-compatible: no --task ⇒ legacy free-form report-back, unchanged.
   const taskId = argValue(rest, '--task');
   let reportedLedger: { reportId: string; deduped: boolean } | undefined;
+  let deliveryEnvelope: string | undefined;
   if (taskId) {
     const artifacts = argValues(rest, '--artifact');
     const inline = parseArtifactText(argValues(rest, '--artifact-text'));
@@ -7308,6 +7310,16 @@ async function cmdReport(rest: string[]): Promise<void> {
       }, led);
       const res = led.append(draft);
       reportedLedger = { reportId, deduped: res.deduped };
+      const envelopeEvidence: EnvelopeEvidence[] = [
+        ...artifacts.map((path): EnvelopeEvidence => ({ kind: 'path', path })),
+        ...inline.map((it): EnvelopeEvidence => ({ kind: 'inline', name: it.name, text: it.content })),
+      ];
+      deliveryEnvelope = formatReportEnvelope({
+        taskId,
+        reportId,
+        summary: content.trim(),
+        evidence: envelopeEvidence,
+      });
     } catch (err: any) {
       console.error(`ledger 写入失败: ${err.message}`);
       process.exit(1);
@@ -7344,7 +7356,8 @@ async function cmdReport(rest: string[]): Promise<void> {
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
-  const paras = buildReportContent({ orchOpenId: tgt.orchOpenId, content });
+  const reportContent = deliveryEnvelope ? `${content.trim()}\n\n${deliveryEnvelope}` : content;
+  const paras = buildReportContent({ orchOpenId: tgt.orchOpenId, content: reportContent });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
 
   try {
@@ -7441,6 +7454,22 @@ async function cmdHelp(rest: string[]): Promise<void> {
   });
 
   const watchdog = await triggerGoalWatchdogFromCli(goalChatId, `help:${taskId}`);
+  let envelopeMessageId: string | undefined;
+  if (s?.larkAppId) {
+    try {
+      const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+      try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+      const { sendMessage } = await import('./im/lark/client.js');
+      envelopeMessageId = await sendMessage(
+        s.larkAppId,
+        goalChatId,
+        formatHelpEnvelope({ taskId, blocker: blockerText, helpKind: kind }),
+        'text',
+      );
+    } catch (err) {
+      console.error(`⚠️ 已写入 help 账本，但 goal 群求助信封发送失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   if (!result.deduped && s?.larkAppId) {
     await emitDeliveryNarrationFromCli({
       larkAppId: s.larkAppId,
@@ -7459,6 +7488,7 @@ async function cmdHelp(rest: string[]): Promise<void> {
     blocked: true,
     deduped: result.deduped,
     goalChatId,
+    envelopeMessageId,
     watchdog,
   }, null, 2));
 }
