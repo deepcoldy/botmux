@@ -27,6 +27,8 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
+import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession } from './core/persistent-backend.js';
+import { classifyGoalWorkerHealth, type GoalWorkerProcessState, type GoalWorkerSessionState } from './core/goal-worker-health.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, getMessageChatId, listChatBotMembers, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
@@ -2381,8 +2383,8 @@ async function handleGoalReviveFailure(event: GoalWatchdogReviveFailureEvent): P
 type LocalGoalWorkerHealth = {
   larkAppId: string;
   sessionId?: string;
-  session: 'live' | 'suspended' | 'closed' | 'missing' | 'unknown';
-  workerProcess: 'live' | 'none' | 'killed' | 'unknown';
+  session: GoalWorkerSessionState;
+  workerProcess: GoalWorkerProcessState;
   lastActivityAt?: string;
   title?: string;
 };
@@ -2395,11 +2397,21 @@ function collectLocalGoalWorkerHealth(goalChatId: string, workerLarkAppId?: stri
     if (workerLarkAppId && ds.larkAppId !== workerLarkAppId) continue;
     if (ds.chatId !== goalChatId || ds.scope !== 'chat') continue;
     if (ds.session.goalSupervisor || isGoalPanelApp(ds.larkAppId)) continue;
+    const backendType = getSessionPersistentBackendType(ds);
+    const persistentProbe = backendType
+      ? probePersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId))
+      : undefined;
+    const health = classifyGoalWorkerHealth({
+      sessionStatus: ds.session.status,
+      suspendedColdResume: ds.session.suspendedColdResume,
+      worker: ds.worker,
+      persistentProbe,
+    });
     out.push({
       larkAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
-      session: ds.session.suspendedColdResume ? 'suspended' : (ds.session.status === 'active' ? 'live' : 'closed'),
-      workerProcess: ds.worker ? (ds.worker.killed ? 'killed' : 'live') : 'none',
+      session: health.session,
+      workerProcess: health.workerProcess,
       lastActivityAt: new Date(ds.lastMessageAt).toISOString(),
       title: ds.session.title,
     });
