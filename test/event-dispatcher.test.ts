@@ -293,6 +293,36 @@ describe('isBotMentioned', () => {
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
   });
 
+  it('detects @mention via REST string-form id (im.message.get shape)', () => {
+    // The message REST API delivers mention.id as a bare string "ou_xxx" with a
+    // sibling id_type, unlike the WS event's { open_id } object. mentionOpenId
+    // must absorb this so a Lark shape convergence can't silently break @-routing.
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('detects string-form id with no id_type (defaults to open_id)', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('does NOT match a string-form id whose id_type is not open_id', () => {
+    // Guard: Lark may return a union_id/user_id string when the app lacks the
+    // open_id scope. Even if its value coincided with our open_id it must not be
+    // compared as one.
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID, id_type: 'union_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
+  });
+
   it('detects @mention in post content at tags (bot-sent messages)', () => {
     // Bot-sent post messages embed @mentions as inline `at` nodes in content,
     // NOT in the message.mentions array

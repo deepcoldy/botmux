@@ -85,6 +85,17 @@ describe('parseGrantTargets (multi)', () => {
     expect(parseGrantTargets({ mentions: [{ id: { open_id: 'ou_bot' }, name: 'Claude' }] }, 'ou_bot')).toEqual([]);
   });
 
+  // REST string-form mention.id ("ou_xxx" + id_type) must parse identically to
+  // the WS object form — grant is security-sensitive, so a shape change must not
+  // mis-identify the target (or fail to exclude the operator bot itself).
+  it('parses REST string-form mention.id, still excluding the bot', () => {
+    const msg = { mentions: [
+      { id: 'ou_bot', id_type: 'open_id', name: 'Claude' },
+      { id: 'ou_a', id_type: 'open_id', name: '张三' },
+    ] };
+    expect(parseGrantTargets(msg, 'ou_bot')).toEqual([{ openId: 'ou_a', name: '张三' }]);
+  });
+
   // post 形态 mentions 为空 → 回退到 inline `at` 节点解析（否则误判成裸 /grant）。
   it('post fallback: parses non-bot at-nodes when mentions empty', () => {
     const postMsg = {

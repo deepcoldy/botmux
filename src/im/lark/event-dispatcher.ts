@@ -15,7 +15,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripLeadingMentions } from './message-parser.js';
+import { stripLeadingMentions, mentionOpenId } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
@@ -592,7 +592,7 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
 export function updateBotOpenIdCrossRef(
   dataDir: string,
   larkAppId: string,
-  mentionsList: Array<{ name?: string; id?: { open_id?: string } }>,
+  mentionsList: Array<{ name?: string; id?: { open_id?: string } | string; id_type?: string }>,
 ): void {
   if (!mentionsList || mentionsList.length === 0) return;
 
@@ -620,7 +620,7 @@ export function updateBotOpenIdCrossRef(
   let changed = false;
   for (const m of mentionsList) {
     const name = m.name;
-    const openId = m.id?.open_id;
+    const openId = mentionOpenId(m);
     if (!name || !openId) continue;
     if (!knownBotNames.has(name.toLowerCase())) continue;
     if (existing[name] === openId) continue;
@@ -694,9 +694,9 @@ export async function tryHandleIntroduceCommand(
   }
 
   const selfOpenId = getBot(larkAppId).botOpenId;
-  const rawMentions: Array<{ name?: string; id?: { open_id?: string } }> = message.mentions ?? [];
+  const rawMentions: Array<{ name?: string; id?: { open_id?: string } | string; id_type?: string }> = message.mentions ?? [];
   const all = rawMentions
-    .map(m => ({ openId: m.id?.open_id ?? '', name: m.name ?? '' }))
+    .map(m => ({ openId: mentionOpenId(m) ?? '', name: m.name ?? '' }))
     .filter(m => m.openId && m.name);
   const hasExternal = all.some(m => m.openId !== selfOpenId);
   if (!hasExternal) {
@@ -735,6 +735,10 @@ export async function tryHandleIntroduceCommand(
 
 // ─── @mention detection ──────────────────────────────────────────────────
 
+/** One-shot guard so the mention-shape early-warning logs at most once per
+ *  process instead of flooding once Lark converges the shapes (see below). */
+let warnedStringMentionShape = false;
+
 /** Check if the bot was @mentioned in this message */
 export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: string | undefined): boolean {
   const botOpenId = getBot(larkAppId).botOpenId;
@@ -746,9 +750,20 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
     return false;
   }
 
-  // 1. Check message.mentions array (populated for user-sent text messages)
+  // 1. Check message.mentions array (populated for user-sent text messages).
+  //    mentionOpenId() tolerates both the WS event object shape and the REST
+  //    string shape, so a Lark mention-shape change can't silently break
+  //    @-detection (which would make the bot ignore every @ with no error).
   const mentions: any[] = message.mentions ?? [];
-  if (mentions.some((m: any) => m.id?.open_id === botOpenId)) {
+  // Early-warning: today's WS events carry mention.id as an object; the REST
+  // API carries a bare string. A string-form id on the event path means Lark
+  // has converged the event onto the REST shape — surface it (once) so a silent
+  // @-routing regression announces itself even though mentionOpenId absorbs it.
+  if (!warnedStringMentionShape && mentions.some((m: any) => typeof m?.id === 'string')) {
+    warnedStringMentionShape = true;
+    logger.warn(`[${larkAppId}] mention.id arrived in string form on the event path — Lark may have converged the WS event onto the REST shape. mentionOpenId() absorbs it, but verify group @-routing. (logged once per process)`);
+  }
+  if (mentions.some((m: any) => mentionOpenId(m) === botOpenId)) {
     return true;
   }
 
@@ -909,7 +924,7 @@ async function maybeSendGrantRequestCard(
   // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
   // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
   // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
-  const mentionName = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name;
+  const mentionName = (message?.mentions ?? []).find((m: any) => mentionOpenId(m) === requesterOpenId)?.name;
   const observedName = mentionName
     ? undefined
     : listObservedBots(config.session.dataDir, larkAppId, chatId).find(b => b.openId === requesterOpenId)?.name;
