@@ -110,6 +110,7 @@ export function resolveDispatchWorkerBotUnionIds(input: {
   bots: DispatchBot[];
   workerNames?: string[];
   workerMetas?: DispatchWorkerMeta[];
+  learnedBotUnionIdsByName?: Record<string, string>;
   federationBots: DispatchWorkerUnionBot[];
   senderScopedBotOpenIds?: Record<string, string>;
 }): string[] {
@@ -118,6 +119,12 @@ export function resolveDispatchWorkerBotUnionIds(input: {
   const nameBySenderScopedOpenId = new Map<string, string>();
   for (const [botName, openId] of Object.entries(input.senderScopedBotOpenIds ?? {})) {
     if (typeof openId === 'string' && openId.trim()) nameBySenderScopedOpenId.set(openId, botName);
+  }
+  const learnedUnionByName = new Map<string, string>();
+  for (const [name, unionId] of Object.entries(input.learnedBotUnionIdsByName ?? {})) {
+    const n = name?.trim().toLowerCase();
+    const u = unionId?.trim();
+    if (n && u) learnedUnionByName.set(n, u);
   }
 
   const byAppId = new Map<string, DispatchWorkerUnionBot>();
@@ -138,16 +145,20 @@ export function resolveDispatchWorkerBotUnionIds(input: {
   }
 
   return input.openIds.map((openId, index) => {
+    const spec = botSpecByOpenId.get(openId);
+    const senderScopedName = nameBySenderScopedOpenId.get(openId);
     const meta = input.workerMetas?.[index];
+    const labels = [senderScopedName, spec?.openId, spec?.name, workerNameByOpenId.get(openId), meta?.cliId, meta?.larkAppId]
+      .map((label) => label?.trim())
+      .filter((label): label is string => !!label);
+    for (const label of labels) {
+      const learned = learnedUnionByName.get(label.toLowerCase());
+      if (learned) return learned;
+    }
     if (meta?.larkAppId) {
       const byMeta = byAppId.get(meta.larkAppId)?.botUnionId?.trim();
       if (byMeta) return byMeta;
     }
-    const spec = botSpecByOpenId.get(openId);
-    const senderScopedName = nameBySenderScopedOpenId.get(openId);
-    const labels = [senderScopedName, spec?.openId, spec?.name, workerNameByOpenId.get(openId), meta?.cliId, meta?.larkAppId]
-      .map((label) => label?.trim())
-      .filter((label): label is string => !!label);
     for (const label of labels) {
       const byApp = byAppId.get(label)?.botUnionId?.trim();
       if (byApp) return byApp;

@@ -94,6 +94,19 @@ describe('dispatch worker metadata resolver', () => {
     })).toEqual(['on_bot_coco']);
   });
 
+  it('prefers locally learned bot union ids by name before federation roster fallback', () => {
+    expect(resolveDispatchWorkerBotUnionIds({
+      openIds: ['ou_seen_by_l2'],
+      bots: [{ openId: 'ou_seen_by_l2', name: 'traex-loopy' }],
+      workerNames: ['traex-loopy'],
+      workerMetas: [{ larkAppId: 'cli_traex', cliId: 'traex' }],
+      learnedBotUnionIdsByName: { 'traex-loopy': 'on_learned_traex' },
+      federationBots: [
+        { larkAppId: 'cli_traex', cliId: 'traex', name: 'traex-loopy', botUnionId: 'on_roster_traex' },
+      ],
+    })).toEqual(['on_learned_traex']);
+  });
+
   it('keeps index-aligned empty worker bot union ids when the federation match is ambiguous or absent', () => {
     expect(resolveDispatchWorkerBotUnionIds({
       openIds: ['codex'],
