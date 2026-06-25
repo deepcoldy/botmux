@@ -15569,6 +15569,7 @@ async function maybeIngestDeliveryEnvelope(input: {
   if (!envelope) return false;
   const goalChatId = input.chatId ?? input.parsed.chatId;
   const senderOpenId = input.parsed.senderId;
+  const senderUnionId = input.parsed.senderUnionId?.trim();
   if (!goalChatId || !senderOpenId) return true;
 
   const supervisor = findGoalSupervisorForNotify({ goalChatId });
@@ -15583,8 +15584,12 @@ async function maybeIngestDeliveryEnvelope(input: {
     logger.warn(`[delivery-envelope] unknown/wrong-goal task=${envelope.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
     return true;
   }
-  if (!task.workerOpenIds?.includes(senderOpenId)) {
-    logger.warn(`[delivery-envelope] unauthorized sender=${senderOpenId} task=${envelope.taskId} goal=${goalChatId} msg=${input.parsed.messageId} allowed=[${(task.workerOpenIds ?? []).join(',')}] app=${input.larkAppId}`);
+  const allowedUnionIds = (task.workerBotUnionIds ?? []).map((id) => id?.trim()).filter(Boolean);
+  const allowedOpenIds = task.workerOpenIds ?? [];
+  const unionAuthorized = !!senderUnionId && allowedUnionIds.includes(senderUnionId);
+  const openIdAuthorized = allowedOpenIds.includes(senderOpenId);
+  if (!unionAuthorized && !openIdAuthorized) {
+    logger.warn(`[delivery-envelope] unauthorized senderOpenId=${senderOpenId} senderUnionId=${senderUnionId ?? ''} task=${envelope.taskId} goal=${goalChatId} msg=${input.parsed.messageId} allowedOpenIds=[${allowedOpenIds.join(',')}] allowedUnionIds=[${allowedUnionIds.join(',')}] app=${input.larkAppId}`);
     return true;
   }
 
