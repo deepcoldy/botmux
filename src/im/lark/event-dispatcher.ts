@@ -18,6 +18,7 @@ import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
+import { recordObservedBotUnionId } from '../../services/observed-bot-union-ids-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
@@ -2099,6 +2100,28 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const isBotSenderType = senderType === 'app' || senderType === 'bot';
         if (isBotSenderType) {
           const senderOpenId = sender.sender_id?.open_id;
+          // Learn this bot's tenant-stable union_id from the event (cross-device
+          // verified-delivery authz anchor — union_id is the only worker id that is
+          // both stable cross-app AND on every inbound event; see
+          // services/observed-bot-union-ids-store + verified-delivery/types.ts). Resolve the
+          // bot's display name from our open_id cross-ref (populated when it was
+          // @mentioned), then record name → union_id for dispatch / federation
+          // roster to consume. Logs the unresolved-name case too — that diagnostic
+          // pinpoints why a bot's union_id wasn't learned (never @mentioned here).
+          const senderUnionId = sender.sender_id?.union_id;
+          if (senderUnionId && senderOpenId) {
+            let resolvedBotName: string | undefined;
+            for (const [n, oid] of readBotOpenIdCrossRef(config.session.dataDir, larkAppId)) {
+              if (oid === senderOpenId) { resolvedBotName = n; break; }
+            }
+            if (resolvedBotName) {
+              if (recordObservedBotUnionId(config.session.dataDir, resolvedBotName, senderUnionId, senderOpenId)) {
+                logger.info(`[bot-union-id] learned ${resolvedBotName} → ${senderUnionId} (app=${larkAppId})`);
+              }
+            } else {
+              logger.info(`[bot-union-id] observed union_id ${senderUnionId} for openId=${senderOpenId} (app=${larkAppId}, name unresolved — not @mentioned here yet, not recorded)`);
+            }
+          }
           const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
           // Self messages: learn our OWN union_id from the echo first (the only
           // reliable source — see bot-union-ids-store; reported to the platform
@@ -2128,7 +2151,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // tenant-stable union_id — we then honour it as a teammate in ANY chat
           // (see team-bots-store). Done BEFORE the @mention gate so even a non-@
           // message in a team group teaches us the teammate. Cheap + idempotent.
-          const senderUnionId = sender.sender_id?.union_id as string | undefined;
           if (senderUnionId && isTeamGroupChat(config.session.dataDir, chatId)) {
             recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
           }
