@@ -16,6 +16,13 @@ export interface DispatchWorkerMeta {
   cliId: string;
 }
 
+export interface DispatchWorkerUnionBot {
+  larkAppId: string;
+  cliId: string;
+  name: string;
+  botUnionId?: string;
+}
+
 export function normalizeDispatchBotsForSender(input: {
   bots: DispatchBot[];
   botInfoEntries: DispatchWorkerMetaBotInfo[];
@@ -96,4 +103,63 @@ export function resolveDispatchWorkerMetas(input: {
   }
 
   return input.openIds.map(resolveOne);
+}
+
+export function resolveDispatchWorkerBotUnionIds(input: {
+  openIds: string[];
+  bots: DispatchBot[];
+  workerNames?: string[];
+  workerMetas?: DispatchWorkerMeta[];
+  federationBots: DispatchWorkerUnionBot[];
+  senderScopedBotOpenIds?: Record<string, string>;
+}): string[] {
+  const botSpecByOpenId = new Map(input.bots.map((bot) => [bot.openId, bot]));
+  const workerNameByOpenId = new Map(input.openIds.map((openId, index) => [openId, input.workerNames?.[index] ?? openId]));
+  const nameBySenderScopedOpenId = new Map<string, string>();
+  for (const [botName, openId] of Object.entries(input.senderScopedBotOpenIds ?? {})) {
+    if (typeof openId === 'string' && openId.trim()) nameBySenderScopedOpenId.set(openId, botName);
+  }
+
+  const byAppId = new Map<string, DispatchWorkerUnionBot>();
+  const byCliId = new Map<string, DispatchWorkerUnionBot[]>();
+  const byName = new Map<string, DispatchWorkerUnionBot[]>();
+  for (const bot of input.federationBots) {
+    if (!bot.botUnionId?.trim()) continue;
+    if (bot.larkAppId) byAppId.set(bot.larkAppId, bot);
+    const cliKey = bot.cliId?.trim().toLowerCase();
+    if (cliKey) byCliId.set(cliKey, [...(byCliId.get(cliKey) ?? []), bot]);
+    const nameKey = bot.name?.trim().toLowerCase();
+    if (nameKey) byName.set(nameKey, [...(byName.get(nameKey) ?? []), bot]);
+  }
+
+  function uniqueUnion(match: DispatchWorkerUnionBot[] | undefined): string {
+    const unionIds = [...new Set((match ?? []).map((bot) => bot.botUnionId?.trim()).filter((id): id is string => !!id))];
+    return unionIds.length === 1 ? unionIds[0] : '';
+  }
+
+  return input.openIds.map((openId, index) => {
+    const meta = input.workerMetas?.[index];
+    if (meta?.larkAppId) {
+      const byMeta = byAppId.get(meta.larkAppId)?.botUnionId?.trim();
+      if (byMeta) return byMeta;
+    }
+    const spec = botSpecByOpenId.get(openId);
+    const senderScopedName = nameBySenderScopedOpenId.get(openId);
+    const labels = [senderScopedName, spec?.openId, spec?.name, workerNameByOpenId.get(openId), meta?.cliId, meta?.larkAppId]
+      .map((label) => label?.trim())
+      .filter((label): label is string => !!label);
+    for (const label of labels) {
+      const byApp = byAppId.get(label)?.botUnionId?.trim();
+      if (byApp) return byApp;
+    }
+    for (const label of labels) {
+      const union = uniqueUnion(byName.get(label.toLowerCase()));
+      if (union) return union;
+    }
+    for (const label of labels) {
+      const union = uniqueUnion(byCliId.get(label.toLowerCase()));
+      if (union) return union;
+    }
+    return '';
+  });
 }

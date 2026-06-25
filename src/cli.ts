@@ -35,7 +35,7 @@ import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { AskArgsError, parseAskOptions } from './core/ask-args.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
-import { normalizeDispatchBotsForSender, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
+import { normalizeDispatchBotsForSender, resolveDispatchWorkerBotUnionIds, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
 import {
   appendVerifiedDeliveryInstructions,
   buildDeliveryListRows,
@@ -7106,6 +7106,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const workerLarkAppIds = workerMetas.map((meta) => meta.larkAppId);
   const workerCliIds = workerMetas.map((meta) => meta.cliId);
   const hasWorkerMeta = workerLarkAppIds.some(Boolean) || workerCliIds.some(Boolean);
+  let workerBotUnionIds: string[] = [];
+  try {
+    const { buildFederatedRoster } = await import('./services/federation-roster.js');
+    const roster = buildFederatedRoster(resolveDataDir());
+    workerBotUnionIds = resolveDispatchWorkerBotUnionIds({
+      openIds: built.mentionedOpenIds,
+      bots,
+      workerNames,
+      workerMetas,
+      federationBots: roster.bots,
+      senderScopedBotOpenIds,
+    });
+  } catch { /* best effort: workers without botUnionId fall back to open_id auth */ }
+  const hasWorkerBotUnionIds = workerBotUnionIds.some(Boolean);
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const briefJson = JSON.stringify({ zh_cn: { title: '', content: built.threadContent } });
 
@@ -7146,6 +7160,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           workerNames,
           workerLarkAppIds: hasWorkerMeta ? workerLarkAppIds : undefined,
           workerCliIds: hasWorkerMeta ? workerCliIds : undefined,
+          workerBotUnionIds: hasWorkerBotUnionIds ? workerBotUnionIds : undefined,
           brief,
           acceptanceHint: acceptanceHint?.trim() || undefined,
           acceptanceCriteria: parsedAcceptance.criteria,

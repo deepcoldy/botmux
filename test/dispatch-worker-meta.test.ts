@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeDispatchBotsForSender, resolveDispatchWorkerMetas } from '../src/core/dispatch-worker-meta.js';
+import { normalizeDispatchBotsForSender, resolveDispatchWorkerBotUnionIds, resolveDispatchWorkerMetas } from '../src/core/dispatch-worker-meta.js';
 
 describe('dispatch worker metadata resolver', () => {
   const botConfigs = [
@@ -70,5 +70,38 @@ describe('dispatch worker metadata resolver', () => {
       senderScopedBotOpenIds: { 'traex-loopy': 'ou_traex_seen_by_l2' },
     });
     expect(byCliId).toEqual([{ openId: 'ou_traex_seen_by_l2', role: 'coder' }]);
+  });
+
+  it('resolves tenant-stable worker bot union ids from federation roster by lark app, name, or cliId', () => {
+    const federationBots = [
+      { larkAppId: 'cli_remote_traex', cliId: 'traex', name: 'traex-loopy(d2)', botUnionId: 'on_bot_traex' },
+      { larkAppId: 'cli_remote_coco', cliId: 'coco', name: 'coco-loopy(d2)', botUnionId: 'on_bot_coco' },
+    ];
+
+    expect(resolveDispatchWorkerBotUnionIds({
+      openIds: ['ou_seen_by_l2'],
+      bots: [{ openId: 'ou_seen_by_l2', name: 'traex-loopy(d2)' }],
+      workerNames: ['traex-loopy(d2)'],
+      workerMetas: [{ larkAppId: 'cli_remote_traex', cliId: 'traex' }],
+      federationBots,
+    })).toEqual(['on_bot_traex']);
+
+    expect(resolveDispatchWorkerBotUnionIds({
+      openIds: ['coco'],
+      bots: [{ openId: 'coco' }],
+      workerNames: ['coco'],
+      federationBots,
+    })).toEqual(['on_bot_coco']);
+  });
+
+  it('keeps index-aligned empty worker bot union ids when the federation match is ambiguous or absent', () => {
+    expect(resolveDispatchWorkerBotUnionIds({
+      openIds: ['codex'],
+      bots: [{ openId: 'codex' }],
+      federationBots: [
+        { larkAppId: 'cli_a', cliId: 'codex', name: 'codex-a', botUnionId: 'on_a' },
+        { larkAppId: 'cli_b', cliId: 'codex', name: 'codex-b', botUnionId: 'on_b' },
+      ],
+    })).toEqual(['']);
   });
 });
