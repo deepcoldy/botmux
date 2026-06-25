@@ -131,6 +131,13 @@ export interface TaskView {
    *  hard-scope the worker's session + re-spawn the same CLI). */
   workerLarkAppIds?: string[];
   workerCliIds?: string[];
+  /** Index-aligned tenant-stable bot union_id for each worker — the authorization
+   *  anchor for cross-device delivery-envelope ingestion. Unlike open_id (per-app
+   *  scoped, has mis-bound twice) it is on every inbound event (sender_id.union_id),
+   *  so a remote worker's report/help envelope can be authorized by
+   *  `senderUnionId ∈ workerBotUnionIds` with no prior observation. Distinct from
+   *  workerLarkAppIds/workerCliIds, which serve local re-dispatch/health. */
+  workerBotUnionIds?: string[];
   acceptanceHint?: string;    // legacy free-text intent (kept for back-compat / display)
   acceptanceCriteria?: AcceptanceCriteria; // P1 #7: structured, validated verify plan (preferred)
   status: TaskStatus;
@@ -160,6 +167,17 @@ export interface TaskDispatchedPayload {
    *  spawned until after dispatch; the watchdog resolves it live by goalChatId +
    *  larkAppId/openId. */
   workerCliIds?: string[];
+  /** Index-aligned tenant-stable bot union_id for each worker. union_id is the
+   *  only worker identifier that is BOTH stable cross-app AND present on every
+   *  inbound message event (sender_id.union_id) — so it is the authorization anchor
+   *  for cross-device / external delivery envelopes: a remote worker's report/help
+   *  can be authorized by `senderUnionId ∈ workerBotUnionIds` without any prior
+   *  observation (open_id is per-app and only learnable after the bot is seen).
+   *  Resolved at dispatch from the federation roster's botUnionId when available;
+   *  left empty when it can't be resolved (those workers fall back to open_id auth).
+   *  Does NOT replace workerLarkAppIds/workerCliIds, which serve local
+   *  re-dispatch/health — different responsibility, kept independently. */
+  workerBotUnionIds?: string[];
   brief?: string;
   acceptanceHint?: string;
   acceptanceCriteria?: AcceptanceCriteria;
