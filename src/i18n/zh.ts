@@ -599,6 +599,7 @@ export const messages: Record<string, string> = {
   'card.action.terminal_not_ready': '⚠️ 终端尚未就绪，请稍后再试。',
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
+  'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',

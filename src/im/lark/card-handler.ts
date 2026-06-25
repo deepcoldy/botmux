@@ -1199,7 +1199,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
 
-    if (actionType === 'close' && ds) {
+    if (actionType === 'close') {
+      if (!ds) {
+        // 会话已不在 activeSessions（已关过 / 卡片过期 / daemon 重启丢失）——点「关闭
+        // 会话」却静默无反应会让人以为按钮坏了，给一条失败 toast（成功路径不弹，已关卡即反馈）。
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
       const botCfg = getBot(ds.larkAppId).config;
       // Build the closed card BEFORE killWorker/closeSession — it reads the
       // live session's identity off `ds`.
@@ -1465,7 +1470,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
     // from pre-screenshot cards and is mapped to toggle_display semantics.
-    if ((actionType === 'toggle_display' || actionType === 'toggle_stream') && ds) {
+    if (actionType === 'toggle_display' || actionType === 'toggle_stream') {
+      if (!ds) {
+        // 同 close：会话已不在线时「显示 / 隐藏输出」静默无反应 → 给失败 toast（成功不弹）。
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
       const clickedNonce: string | undefined = value?.card_nonce;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 

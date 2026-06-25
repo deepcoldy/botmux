@@ -596,6 +596,7 @@ export const messages: Record<string, string> = {
   'card.action.terminal_not_ready': '⚠️ Terminal is not ready yet, please try again shortly.',
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
+  'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
   'card.action.no_output': '(no output yet)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
