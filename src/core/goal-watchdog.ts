@@ -91,7 +91,7 @@ function isPendingForWatchdog(task: TaskView): boolean {
 export function pendingGoalTasks(tasks: TaskView[]): Map<string, TaskView[]> {
   const byGoal = new Map<string, TaskView[]>();
   for (const task of tasks) {
-    if (!task.chatId || !isPendingForWatchdog(task)) continue;
+    if (!task.chatId || !task.taskId?.trim() || !isPendingForWatchdog(task)) continue;
     const arr = byGoal.get(task.chatId) ?? [];
     arr.push(task);
     byGoal.set(task.chatId, arr);
