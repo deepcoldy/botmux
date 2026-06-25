@@ -32,6 +32,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     silentTurnReactions: j?.silentTurnReactions === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
+    botToBotSameDir: j?.botToBotSameDir !== false,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,

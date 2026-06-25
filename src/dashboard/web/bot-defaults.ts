@@ -230,7 +230,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -357,6 +357,22 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <small data-card-pref-moot class="hint-warn-inline" ${disableStreaming ? '' : 'hidden'}>${t('botDefaults.writableLinkMoot')}</small>
         <span class="oncall-status" data-card-pref-status></span>
       </div>
+    </section>`;
+  }
+
+  // bot@bot 同目录拉起 (cross-bot working-dir inheritance). Default ON. Auto-saves
+  // on change via the shared card-prefs PUT.
+  function renderCrossBotSection(b: any): string {
+    const sameDir = b.botToBotSameDir !== false;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionCrossBot')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-cross-bot-samedir" ${sameDir ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.botToBotSameDir')}</strong>
+        <small>${t('botDefaults.botToBotSameDirHelp')}</small></span>
+      </label>
+      <div class="actions"><span class="oncall-status" data-crossbot-status></span></div>
     </section>`;
   }
 
@@ -837,6 +853,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
               cached.silentTurnReactions = body.silentTurnReactions;
               cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
               cached.privateCard = body.privateCard;
+              cached.botToBotSameDir = body.botToBotSameDir;
               cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
               cached.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
               cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
@@ -885,6 +902,13 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (privateCardCb) {
         privateCardCb.addEventListener('change', () => {
           putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
+      const crossBotCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-cross-bot-samedir]');
+      const crossBotStatusEl = card.querySelector<HTMLSpanElement>('[data-crossbot-status]');
+      if (crossBotCb) {
+        crossBotCb.addEventListener('change', () => {
+          putCardPref({ botToBotSameDir: crossBotCb.checked }, crossBotCb, crossBotStatusEl);
         });
       }
 

@@ -1221,6 +1221,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     silentTurnReactions: cardPrefs.silentTurnReactions,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
@@ -1244,6 +1245,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
     disableStreamingCard?: unknown; silentTurnReactions?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
   };
@@ -1252,11 +1254,13 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
   const patch: {
     disableStreamingCard?: boolean; silentTurnReactions?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;

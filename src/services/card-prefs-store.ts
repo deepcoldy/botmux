@@ -27,6 +27,10 @@ export interface BotCardPrefs {
   silentTurnReactions: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
+  /** bot@bot 同目录拉起: when a bot is @-ed into a chat where a sibling bot is
+   *  already working, inherit that sibling's workingDir & skip the repo card.
+   *  Default TRUE (unlike the others) — only an explicit false is persisted. */
+  botToBotSameDir: boolean;
   /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
   autoStartOnGroupJoin: boolean;
   /** 主动开工 — 场景① optional pre-configured first-turn prompt ('' = none). */
@@ -50,6 +54,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: c.silentTurnReactions === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
+      botToBotSameDir: c.botToBotSameDir !== false,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
@@ -64,6 +69,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
+      botToBotSameDir: true,
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
       autoStartOnNewTopic: false,
@@ -90,6 +96,13 @@ export async function updateBotCardPrefs(
     if (val === undefined) return;
     if (val) entry[key] = true;
     else delete entry[key];
+  };
+  // Default-TRUE boolean: persist only an explicit `false`; `true` drops the key
+  // (absent === on), keeping bots.json tidy and the default ON.
+  const applyDefaultTrue = (entry: any, key: keyof BotCardPrefs, val: boolean | undefined) => {
+    if (val === undefined) return;
+    if (val) delete entry[key];
+    else entry[key] = false;
   };
   // String prefs: store verbatim when non-blank, drop the key when blank/absent
   // so bots.json stays tidy (absent === "no prompt").
@@ -124,6 +137,7 @@ export async function updateBotCardPrefs(
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
@@ -137,6 +151,7 @@ export async function updateBotCardPrefs(
         silentTurnReactions: entry.silentTurnReactions === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
+        botToBotSameDir: entry.botToBotSameDir !== false,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
@@ -164,6 +179,10 @@ export async function updateBotCardPrefs(
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
+  }
+  if (patch.botToBotSameDir !== undefined) {
+    // Default true: store false explicitly, clear (→ default on) when true.
+    bot.config.botToBotSameDir = patch.botToBotSameDir === false ? false : undefined;
   }
   if (patch.autoStartOnGroupJoin !== undefined) {
     bot.config.autoStartOnGroupJoin = patch.autoStartOnGroupJoin || undefined;

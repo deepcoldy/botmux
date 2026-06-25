@@ -2043,7 +2043,11 @@ async function resolvePinnedWorkingDir(ctx: {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
   const inheritedFrom = !oncallEntry
-    ? findInheritablePeer({ scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType, selfAppId: ctx.larkAppId })
+    ? findInheritablePeer({
+        scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
+        selfAppId: ctx.larkAppId,
+        botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
+      })
     : null;
   const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
     ? resolveBotDefaultWorkingDir(ctx.larkAppId)

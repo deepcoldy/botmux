@@ -1528,6 +1528,20 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // semantics: this is re-derived on every fork/restore.
   ds.workingDir = cwd;
 
+  // Also persist the effective launch dir onto the SESSION record so a sibling
+  // bot @-ed into the same anchor can inherit it (inherit-peer reads the
+  // persisted session.workingDir cross-process, even across daemons). Without
+  // this, a session running on the bot-default/fallback dir leaves
+  // session.workingDir empty and is invisible to cross-bot same-dir inheritance.
+  // Only FILL IN a missing workingDir (default/fallback-spawned sessions) — never
+  // overwrite an already-pinned value (oncall/repo-card sessions keep their stored
+  // form). And only persist a genuinely-resolved dir, never the homedir()
+  // crash-fallback (cwd !== rawCwd), so a transiently-missing dir can't pin to ~.
+  if (!ds.session.workingDir && cwd === rawCwd) {
+    ds.session.workingDir = cwd;
+    sessionStore.updateSession(ds.session);
+  }
+
   // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
   // historical session. A brand-new session (resume=false) with no recorded

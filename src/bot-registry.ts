@@ -273,6 +273,15 @@ export interface BotConfig {
    */
   privateCard?: boolean;
   /**
+   * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
+   * into a chat/thread where a sibling bot already has an active session, it
+   * reuses that sibling's workingDir and skips its own repo-selection card.
+   * This is independent of /oncall. Default ON (undefined = on); set to false
+   * to make THIS bot always fall through to its own repo card / default dir.
+   * Toggled from the dashboard Bot Defaults tab; persisted via card-prefs-store.
+   */
+  botToBotSameDir?: boolean;
+  /**
    * 主动开工 — 场景①. When true, the bot auto-starts a session when it is added
    * to a new chat that contains at least one of its allowedUsers (see
    * docs/specs/20260529-proactive-auto-start/). Default (undefined) = passive
@@ -873,6 +882,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
+      // Default ON: only an explicit false is meaningful/persisted (undefined = on).
+      botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.
