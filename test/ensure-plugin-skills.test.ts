@@ -74,4 +74,23 @@ describe('removeGlobalBotmuxSkills', () => {
     expect(() => removeGlobalBotmuxSkills(join(dir, 'nope'))).not.toThrow();
     expect(() => removeGlobalBotmuxSkills(undefined)).not.toThrow();
   });
+
+  it('二次扫描：第一次清理后重启竞态又写回的 botmux skill，会被再扫一遍清掉', () => {
+    // 第一道：清理（模拟早期 cleanupGlobalBotmuxSkillsOnce）
+    seed('botmux-send');
+    removeGlobalBotmuxSkills(dir);
+    expect(existsSync(join(dir, 'botmux-send'))).toBe(false);
+
+    // 重启竞态：清理后又被外部老 build / 残留进程写回全局
+    seed('botmux-send');
+    seed('botmux-handoff');
+    seed('my-own-skill');
+    expect(existsSync(join(dir, 'botmux-send'))).toBe(true);
+
+    // 第二道：restore 完成后再扫一遍（本次修复的核心）——botmux 残留清掉、用户 skill 保留
+    removeGlobalBotmuxSkills(dir);
+    expect(existsSync(join(dir, 'botmux-send'))).toBe(false);
+    expect(existsSync(join(dir, 'botmux-handoff'))).toBe(false);
+    expect(existsSync(join(dir, 'my-own-skill'))).toBe(true);
+  });
 });

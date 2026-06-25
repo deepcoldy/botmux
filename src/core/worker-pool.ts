@@ -947,17 +947,33 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
   cleanupLegacyMcpConfig(cliId);
 }
 
+/** The user's global skills dir that botmux must NOT pollute (Claude now injects
+ *  its skills per-session via `--plugin-dir`). Single source of truth for the
+ *  path so the early once-pass and the post-restore re-sweep stay in sync. */
+const GLOBAL_CLAUDE_SKILLS_DIR = '~/.claude/skills';
+
+/** Unconditionally sweep botmux-owned skills out of the user's global
+ *  `~/.claude/skills`. botmux owns the `botmux-` namespace there and injects its
+ *  skills per-session via `--plugin-dir`, so anything matching is a leak that
+ *  would otherwise surface (and mis-fire) in the user's standalone `claude`.
+ *  Idempotent & best-effort — safe to call repeatedly. */
+export function sweepGlobalBotmuxSkills(): void {
+  removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
+}
+
 let globalBotmuxSkillsCleaned = false;
 /** One-time, CLI-independent cleanup of botmux skills that older versions
- *  installed into the global `~/.claude/skills`. Claude now injects skills via
- *  `--plugin-dir`, so any leftover `botmux-*` there leaks into the user's
- *  standalone `claude` regardless of which CLI THIS daemon's bot uses — so the
- *  cleanup must NOT be gated on `adapter.pluginDir` (which only fires for a
- *  Claude bot). Runs at daemon startup via ensureCliEnv. */
+ *  installed into the global `~/.claude/skills`. Runs early at daemon startup
+ *  via ensureCliEnv (CLI-independent: the leak surfaces in standalone `claude`
+ *  no matter which CLI THIS daemon's bot uses, so it must NOT be gated on
+ *  `adapter.pluginDir`). NOTE: this early pass can lose a restart race — an
+ *  outgoing old-build daemon may re-create the dirs a few ms later — so
+ *  {@link sweepGlobalBotmuxSkills} is called again post-restore (see daemon.ts)
+ *  to catch that on the same startup instead of leaving it until next restart. */
 function cleanupGlobalBotmuxSkillsOnce(): void {
   if (globalBotmuxSkillsCleaned) return;
   globalBotmuxSkillsCleaned = true;
-  removeGlobalBotmuxSkills('~/.claude/skills');
+  sweepGlobalBotmuxSkills();
 }
 
 // ─── Claude Code folder-trust pre-acceptance ─────────────────────────────────

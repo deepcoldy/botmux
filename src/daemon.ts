@@ -59,6 +59,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
   ensureCliEnv,
+  sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
@@ -3795,6 +3796,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
+
+  // Second global-skills sweep, AFTER restore has settled. The early
+  // cleanupGlobalBotmuxSkillsOnce() pass (in the startup ensureCliEnv above)
+  // runs before any restart overlap settles, so an outgoing old-build daemon
+  // (pre `--plugin-dir` migration) can re-create ~/.claude/skills/botmux-* a few
+  // ms after we cleaned it — leaving it to leak into the user's standalone
+  // `claude` until the *next* restart. Re-sweeping here, once this daemon's own
+  // spawns and the handoff window are done, catches that leak on the same
+  // startup. Idempotent & best-effort — never blocks startup.
+  try { sweepGlobalBotmuxSkills(); }
+  catch (err) { logger.warn(`[skills] post-restore global sweep failed: ${err instanceof Error ? err.message : String(err)}`); }
 
   // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
   // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
