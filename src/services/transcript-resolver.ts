@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from '../adapters/cli/types.js';
@@ -63,11 +63,24 @@ export function cachedTranscriptPathLookup(
   return path;
 }
 
+/** cwd → the path Claude Code keys its project dir by: the REALPATH (symlinks
+ *  resolved), falling back to a lexical resolve only when the path isn't on disk.
+ *  Claude keys projects by realpath, so a symlinked cwd (e.g. /home/x →
+ *  /data00/home/x) must resolve to the same string the CLI used — a lexical
+ *  resolve() would point at a project key Claude never writes to. */
+function realCwd(cwd: string): string {
+  const expanded = expandHome(cwd);
+  try { return realpathSync(expanded); } catch { return resolve(expanded); }
+}
+
 export function getClaudeSessionJsonlPath(sessionId: string, cwd: string, dataDir: string): string | null {
-  const resolvedCwd = resolve(expandHome(cwd));
   // Claude stores sessions at ~/.claude/projects/<project-key>/<sessionId>.jsonl
-  // where project-key = absolute path with non [A-Za-z0-9-] chars replaced by -
-  const projectKey = resolvedCwd.replace(/[^A-Za-z0-9-]/g, '-');
+  // where project-key = the REALPATH of cwd with non [A-Za-z0-9-] chars → '-'.
+  // Resolve symlinks (realCwd), NOT just resolve(): under a symlinked cwd a
+  // lexical key points at a dir Claude never wrote, so the transcript is never
+  // found and the usage ledger silently writes no delta (claude-code.ts's
+  // realpathCwd already does this for the idle bridge — this path was the laggard).
+  const projectKey = realCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   const jsonlPath = join(dataDir, 'projects', projectKey, `${sessionId}.jsonl`);
   return existsSync(jsonlPath) ? jsonlPath : null;
 }
