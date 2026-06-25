@@ -124,7 +124,7 @@ import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-l
 import { forkAdoptWorker, forkWorker, initWorkerPool } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -295,5 +295,15 @@ describe('forkWorker session.workingDir back-fill (cross-bot inherit enabler)', 
     ds.session.workingDir = undefined;
     forkWorker(ds, 'hi', false);
     expect(ds.session.workingDir).toBeFalsy();   // cwd === homedir() → excluded by guard
+  });
+
+  it('NEVER pins a SYMLINK that resolves to $HOME (realpath-compared)', () => {
+    const homeLink = join(tmp, 'homelink');
+    symlinkSync(homedir(), homeLink);    // a different textual path that realpaths to $HOME
+    initPool(() => homeLink);
+    const ds = makeDs();
+    ds.session.workingDir = undefined;
+    forkWorker(ds, 'hi', false);
+    expect(ds.session.workingDir).toBeFalsy();   // realpath(homeLink) === realpath($HOME) → excluded
   });
 });

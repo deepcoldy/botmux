@@ -1495,6 +1495,15 @@ export async function transferSession(
 
 // ─── Fork worker ────────────────────────────────────────────────────────────
 
+/** True if `p` resolves (via realpath) to the user's home dir. Used to exclude
+ *  $HOME — including a symlinked/aliased home or a different textual form — from
+ *  the session-workingDir back-fill, so a sibling bot never inherits the home dir.
+ *  Falls back to a string compare if realpath can't resolve (e.g. transient race). */
+function resolvesToHome(p: string): boolean {
+  try { return realpathSync(p) === realpathSync(homedir()); }
+  catch { return p === homedir(); }
+}
+
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
@@ -1539,8 +1548,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // (cwd !== rawCwd → a transiently-missing dir can't pin to ~). Also exclude a
   // LEGITIMATELY-resolved homedir: a bot whose workingDir is unset/`~` resolves to
   // $HOME, and pinning that would let a sibling bot inherit $HOME (launch in the home
-  // dir with no repo context) instead of getting its own repo card.
-  if (!ds.session.workingDir && cwd === rawCwd && cwd !== homedir()) {
+  // dir with no repo context) instead of getting its own repo card. Compared via
+  // realpath so a symlinked/aliased $HOME is excluded too, not just the literal string.
+  if (!ds.session.workingDir && cwd === rawCwd && !resolvesToHome(cwd)) {
     ds.session.workingDir = cwd;
     sessionStore.updateSession(ds.session);
   }
