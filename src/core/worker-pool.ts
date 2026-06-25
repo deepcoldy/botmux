@@ -28,6 +28,7 @@ import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { stripMarkdown } from '../utils/markdown.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
@@ -2516,15 +2517,51 @@ function deliverFinalOutput(
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = ds.docCommentTurns?.get(msg.turnId);
       if (docTurn) {
-        // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
-        // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
-        const chunks = chunkCommentText(msg.content);
-        for (let i = 0; i < chunks.length; i++) {
-          await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
+        // 已投递过的 doc-comment 轮次：跳过文档评论（已发），但仍需继续走
+        // 飞书卡片路径——用户期望文档评论 + 飞书会话双通道收到回复。
+        if (!docTurn.delivered) {
+          // botmux send 子进程发完评论后会写 marker（messageId = "doc:<commentId>"），
+          // 抑制此兜底路径重复发评论。漏记 marker 则容忍多一条（不丢回复总比丢好）。
+          let sendAlreadyPosted = false;
+          try {
+            const markerPath = join(config.session.dataDir, 'turn-sends', `${ds.session.sessionId}.jsonl`);
+            if (existsSync(markerPath)) {
+              const lines = readFileSync(markerPath, 'utf-8').split('\n');
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                  const m = JSON.parse(line);
+                  if (m.messageId === `doc:${docTurn.commentId}`) { sendAlreadyPosted = true; break; }
+                } catch { /* skip */ }
+              }
+            }
+          } catch { /* best-effort */ }
+          if (sendAlreadyPosted) {
+            docTurn.delivered = true;
+            logger.info(`[${t}] doc-comment final_output skipped — botmux send already posted (turn ${msg.turnId.substring(0, 8)})`);
+          } else {
+            // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
+            // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
+            const cleaned = stripMarkdown(msg.content.trim()) || '（无回复内容）';
+            const chunks = chunkCommentText(cleaned);
+            for (let i = 0; i < chunks.length; i++) {
+              await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined, { isWhole: docTurn.isWhole });
+            }
+            docTurn.delivered = true;
+            logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+          }
+        } else {
+          logger.info(`[${t}] doc-comment already delivered, skipping doc comment (turn ${msg.turnId.substring(0, 8)})`);
         }
-        ds.docCommentTurns?.delete(msg.turnId);
+        // 继续走飞书卡片路径——文档评论 + 飞书会话双通道投递
+      }
+
+      // For doc-comment turns: skip card if already delivered to prevent
+      // duplicate cards from a second final_output (different lastUuid).
+      const docTurnForCard = ds.docCommentTurns?.get(msg.turnId);
+      if (docTurnForCard?.cardDelivered) {
         ds.lastBridgeEmittedUuid = msg.lastUuid;
-        logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        logger.info(`[${t}] Bridge final_output card skipped — doc-comment card already delivered (turn ${msg.turnId.substring(0, 8)})`);
         return;
       }
 
@@ -2559,6 +2596,9 @@ function deliverFinalOutput(
       // used to swallow the answer; a brand-new message always pings.
       await scopedReply(cardJson, 'interactive', msg.turnId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
+      // Mark card delivered for doc-comment turns to prevent duplicate cards.
+      const docTurnCardMark = ds.docCommentTurns?.get(msg.turnId);
+      if (docTurnCardMark) docTurnCardMark.cardDelivered = true;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (err instanceof MessageWithdrawnError) {
@@ -2591,7 +2631,7 @@ export const __testOnly_finishTurnReactions = finishTurnReactions;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
-export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
+export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean; prompt?: string; turnId?: string }): void {
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
@@ -2669,15 +2709,19 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     from there (cursor-agent never calls `botmux send`).
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
-  if (adopted.source === 'herdr' && adoptedCliId === 'claude-code' && !adopted.sessionId) {
+  // For claude-code adopt with no sessionId, try to resolve by cwd.
+  // tmux discovery may record the wrapper pid (e.g. ttadk) rather than the
+  // real claude process, so readClaudeSessionMeta(pid) can miss the session.
+  // The cwd-based fallback is the same strategy used for herdr adopt below.
+  if (adoptedCliId === 'claude-code' && !adopted.sessionId) {
     const claudeMeta = findUniqueClaudeSessionByCwd(adopted.cwd);
     if (claudeMeta?.sessionId) {
       adopted.sessionId = claudeMeta.sessionId;
       if (ds.session.adoptedFrom) ds.session.adoptedFrom.sessionId = claudeMeta.sessionId;
       sessionStore.updateSession(ds.session);
-      logger.info(`[${t}] Resolved Claude session for adopted herdr target by cwd`);
+      logger.info(`[${t}] Resolved Claude session for adopted ${adopted.source} target by cwd`);
     } else {
-      logger.warn(`[${t}] Cannot resolve unique Claude session for adopted herdr target; final replies may be unavailable`);
+      logger.warn(`[${t}] Cannot resolve unique Claude session for adopted ${adopted.source} target; final replies may be unavailable`);
     }
   }
   const hasCliPid = typeof adopted.originalCliPid === 'number';
@@ -2702,7 +2746,9 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
-    prompt: '',
+    prompt: opts?.prompt ?? '',
+    turnId: opts?.turnId ?? undefined,
+    docComment: !!ds.docCommentTurns?.has(opts?.turnId ?? ''),
     resume: false,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,

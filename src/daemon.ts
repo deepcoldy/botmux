@@ -50,6 +50,7 @@ import {
   initWorkerPool,
   setActiveSessionsRegistry,
   forkWorker,
+  forkAdoptWorker,
   killWorker,
   reapOrphanWorkers,
   scheduleCardPatch,
@@ -126,7 +127,7 @@ import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext } from './im/lark/event-dispatcher.js';
 import { listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription } from './services/doc-subs-store.js';
-import { subscribeDocFile, unsubscribeDocFile } from './im/lark/doc-comment.js';
+import { subscribeDocFile, unsubscribeDocFile, buildDocCommentPrompt } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
@@ -3631,7 +3632,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedPrompt, ds.hasHistory);
+    if (ds.adoptedFrom) {
+      forkAdoptWorker(ds, { prompt: wrappedPrompt, turnId: parsed.messageId });
+    } else {
+      forkWorker(ds, wrappedPrompt, ds.hasHistory);
+    }
   }
 }
 
@@ -3659,7 +3664,14 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
 
   const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
   const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
-  const promptContent = `${tr('daemon.doc_comment_prefix', { author: authorName }, loc)}\n${text}`;
+  const promptContent = buildDocCommentPrompt({
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    question: text,
+    quote: ctx.quote,
+    isWhole: ctx.isWhole,
+    brand: normalizeBrand(getBot(larkAppId).config.brand),
+  });
 
   // 记录本轮回评论的落点。两条路都要覆盖：
   //   • ds.docCommentTurns（内存，按 turnId）→ deliverFinalOutput「兜底」分流用
@@ -3671,8 +3683,9 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     commentId,
     replyToOpenId: ctx.authorOpenId,
     replyToName: sender?.name,
+    isWhole: ctx.isWhole,
   });
-  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId };
+  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, isWhole: ctx.isWhole };
 
   const dsBotCfg = getBot(ds.larkAppId).config;
   const selfBot = getBot(ds.larkAppId);
@@ -3698,7 +3711,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     rememberLastCliInput(ds, promptContent, msgContent);
     sessionStore.updateSession(ds.session); // 先落盘，botmux send 子进程才读得到落点
     await noteTurnReceived(ds, commentId, text, sender, turnId);
-    ds.worker.send({ type: 'message', content: msgContent, turnId } as DaemonToWorker);
+    ds.worker.send({ type: 'message', content: msgContent, turnId, docComment: true } as DaemonToWorker);
     logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
   } else {
     // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
@@ -3725,7 +3738,11 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
     await noteTurnReceived(ds, commentId, text, sender, turnId);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedPrompt, ds.hasHistory);
+    if (ds.adoptedFrom) {
+      forkAdoptWorker(ds, { prompt: wrappedPrompt, turnId });
+    } else {
+      forkWorker(ds, wrappedPrompt, ds.hasHistory);
+    }
   }
 }
 

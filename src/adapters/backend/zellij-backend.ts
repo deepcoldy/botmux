@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, buildShellWrapperScript } from './tmux-backend.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -316,7 +316,7 @@ export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts):
   const shellSpec = resolveUserShell();
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
   const paneArgs = [
-    ...shellSpec.flags, '-c', SHELL_WRAPPER_SCRIPT, '_',
+    ...shellSpec.flags, '-c', buildShellWrapperScript(opts.unsetEnvKeys), '_',
     opts.cwd,
     ...envAssignments,
     bin, ...args,

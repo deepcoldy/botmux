@@ -9,6 +9,7 @@ import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
+import { logger } from '../utils/logger.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
@@ -493,7 +494,13 @@ export function findUniqueClaudeSessionByCwd(cwd: string): { sessionId?: string;
       // Ignore malformed or concurrently rewritten metadata files.
     }
   }
-  if (matches.length !== 1) return undefined;
+  if (matches.length === 0) return undefined;
+  // When multiple sessions share the same cwd (e.g. ttadk wrappers creating
+  // multiple Claude instances), pick the most recently active one so the
+  // adopt bridge has the best chance of finding the right transcript.
+  if (matches.length > 1) {
+    matches.sort((a, b) => (b.updatedAt ?? b.startedAt ?? 0) - (a.updatedAt ?? a.startedAt ?? 0));
+  }
   return matches[0];
 }
 
@@ -659,46 +666,44 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       // 3b. Filter by CLI type if requested
       if (filterCliId && match.cliId !== filterCliId) continue;
 
+      // 3c. If findCliProcess matched a COMM_ARGV_LAUNCHERS wrapper (e.g. node/ttadk
+      // wrapping claude), resolve the real CLI PID underneath it. findCliProcess uses
+      // cliIdFromCommArgv which can match the wrapper by argv; findLaunchedCliPid
+      // does comm-only BFS from the wrapper's children to find the actual CLI binary.
+      let cliPid = match.pid;
+      const matchComm = readComm(match.pid);
+      if (matchComm && COMM_ARGV_LAUNCHERS.has(matchComm)) {
+        const realPid = findLaunchedCliPid(match.pid, match.cliId);
+        if (realPid) cliPid = realPid;
+      }
+
       // 4. Read CLI working directory (Linux: /proc; macOS: lsof)
-      const cwd = readCwd(match.pid);
+      const cwd = readCwd(cliPid);
       if (!cwd) continue;
 
       // 5. Try to read CLI session metadata
       let sessionId: string | undefined;
       let startedAt: number | undefined;
       if (match.cliId === 'claude-code') {
-        const meta = readClaudeSessionMeta(match.pid);
+        const meta = readClaudeSessionMeta(cliPid);
         if (meta) {
           sessionId = meta.sessionId;
           startedAt = meta.startedAt;
         }
       } else if (match.cliId === 'codex') {
-        // Codex has no per-pid state file — bind via the open rollout fd in
-        // /proc. Worker-side has the same probe as a fallback so this is
-        // best-effort: we resolve here so the daemon-side adopt UI shows
-        // an accurate "currently in session X" hint.
-        const rollout = findCodexRolloutByPid(match.pid);
+        const rollout = findCodexRolloutByPid(cliPid);
         if (rollout) sessionId = rollout.cliSessionId;
       } else if (match.cliId === 'coco') {
-        // CoCo: probe /proc/<pid>/fd for an open file under the session dir
-        // (session.log / traces.jsonl). events.jsonl itself is opened-written-
-        // closed per event so it's not reliable on its own. Worker-side
-        // re-probes too, so undefined here is acceptable.
-        const cocoSession = findCocoSessionByPid(match.pid);
+        const cocoSession = findCocoSessionByPid(cliPid);
         if (cocoSession) sessionId = cocoSession.sessionId;
       } else if (match.cliId === 'traex') {
-        // TRAE: same open-rollout-fd probe as Codex, with a TRAE-specific
-        // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
-        // pid as a fallback, so undefined here is acceptable.
-        const rollout = findTraexRolloutByPid(match.pid);
+        const rollout = findTraexRolloutByPid(cliPid);
         if (rollout) sessionId = rollout.cliSessionId;
       }
 
-      // 5b. Fall back to the CLI process's own start time for uptime. Without
-      // this only Claude (which has a session JSON with startedAt) shows a real
-      // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
+      // 5b. Fall back to the CLI process's own start time for uptime.
       if (startedAt === undefined) {
-        startedAt = readProcessStartTime(match.pid);
+        startedAt = readProcessStartTime(cliPid);
       }
 
       // 6. Get pane dimensions
@@ -709,7 +714,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
         source: 'tmux',
         tmuxTarget,
         panePid,
-        cliPid: match.pid,
+        cliPid,
         cliId: match.cliId,
         sessionId,
         cwd,
@@ -733,7 +738,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
  * 'cursor' (see cliIdForComm); without the same filter here, discovery surfaces
  * the session but validation re-identifies nothing and wrongly reports it exited.
  */
-export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number, filterCliId?: CliId): boolean {
+export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid?: number, filterCliId?: CliId): boolean {
   // Verify the tmux pane still exists and get its shell PID
   let panePid: number;
   try {
@@ -747,9 +752,17 @@ export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number,
     return false;
   }
 
-  // Search the process tree for the expected CLI PID
+  // Search the process tree for a matching CLI process. Existence check, not
+  // strict PID equality — the stored PID may be a wrapper (ttadk/aiden) while
+  // BFS now finds the real CLI child (or vice versa), and CLI PID rotation
+  // (/clear, /resume) also produces legitimate PID changes. As long as a
+  // matching CLI process exists in the pane the adopt session is still alive.
   const match = findCliProcess(panePid, 3, filterCliId);
-  return match !== undefined && match.pid === expectedPid;
+  if (!match) return false;
+  if (expectedPid && match.pid !== expectedPid) {
+    logger.info(`[adopt] PID mismatch in ${tmuxTarget}: expected=${expectedPid} found=${match.pid} — accepting (CLI may have rotated or wrapper resolved)`);
+  }
+  return true;
 }
 
 
@@ -768,10 +781,10 @@ export function validateAdoptTarget(target: AdoptableSession | NonNullable<impor
 
 export function validateAdoptTargetState(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): AdoptValidationResult {
   if (target.source === 'herdr') return validateHerdrAdoptTarget(target.herdrSessionName, target.herdrPaneId ?? target.herdrTarget);
+  if (!target.tmuxTarget) return 'missing';
   const pid = 'originalCliPid' in target
     ? target.originalCliPid
     : ('cliPid' in target ? target.cliPid : undefined);
-  if (!target.tmuxTarget || !pid) return 'missing';
   return validateTmuxAdoptTarget(target.tmuxTarget, pid, target.cliId) ? 'alive' : 'missing';
 }
 

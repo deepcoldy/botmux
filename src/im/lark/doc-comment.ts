@@ -87,6 +87,10 @@ export interface DocComment {
   commentId: string;
   /** 评论是否已解决。 */
   isSolved: boolean;
+  /** 是否全文评论（针对整篇文档，vs 行内/锚定评论针对选中文字）。 */
+  isWhole: boolean;
+  /** 行内评论选中的原文（全文评论无此字段）。 */
+  quote?: string;
   /** 该评论 thread 下所有回复（飞书把评论建模成 reply_list）。 */
   replies: Array<{
     replyId: string;
@@ -187,6 +191,10 @@ function buildQuery(params?: DriveCallOpts['params']): string {
   return q ? `?${q}` : '';
 }
 
+/** drive/wiki API 调用的超时（ms）。裸 fetch / SDK request 均无内置超时，
+ *  网络异常时 Promise 会永久 pending → processCommentEvent 整条链路静默卡死。 */
+const DRIVE_API_TIMEOUT_MS = 15_000;
+
 /**
  * 调一个 drive/wiki OpenAPI。优先 user token（裸 fetch），拿不到 token 或遇
  * 401/403 时回退 tenant（SDK client.request 自带 tenant_access_token + GET
@@ -199,12 +207,19 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   // tenant（应用身份）：走 SDK client.request（带 token/缓存/GET 空 body 守卫）。
   const callTenant = async () => {
     const c = getBotClient(larkAppId);
-    return c.request({
-      method: opts.method,
-      url: opts.path,
-      params: opts.params,
-      ...(opts.data !== undefined ? { data: opts.data } : {}),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DRIVE_API_TIMEOUT_MS);
+    try {
+      return await c.request({
+        method: opts.method,
+        url: opts.path,
+        params: opts.params,
+        ...(opts.data !== undefined ? { data: opts.data } : {}),
+        signal: controller.signal,
+      } as any);
+    } finally {
+      clearTimeout(timer);
+    }
   };
   const callUser = async () => {
     const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
@@ -218,12 +233,17 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   if (opts.preferTenant) {
     try {
       const res = await callTenant();
-      if (res?.code === 0) return res;
-      logger.debug(`[doc-comment] tenant call code=${res?.code} (${opts.path})；回退 user 身份`);
+      if (res?.code === 0) {
+        logger.info(`[doc-comment] preferTenant: tenant succeeded (reply_id=${res?.data?.reply_id?.slice(0, 12) ?? '?'})`);
+        return res;
+      }
+      logger.info(`[doc-comment] preferTenant: tenant code=${res?.code} (${opts.path})；回退 user 身份`);
     } catch (err) {
-      logger.debug(`[doc-comment] tenant call threw (${opts.path})；回退 user 身份：${err instanceof Error ? err.message : err}`);
+      logger.info(`[doc-comment] preferTenant: tenant threw (${opts.path})；回退 user 身份：${err instanceof Error ? err.message : err}`);
     }
-    return callUser();
+    const userRes = await callUser();
+    logger.info(`[doc-comment] preferTenant: user fallback replied (reply_id=${userRes?.data?.reply_id?.slice(0, 12) ?? '?'})`);
+    return userRes;
   }
 
   // 默认：优先 user（有 token），401/403 回退 tenant。
@@ -241,14 +261,27 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
 
 async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCallOpts): Promise<any> {
   const url = `${larkHosts(brand).openApi}${opts.path}${buildQuery(opts.params)}`;
-  const res = await fetch(url, {
-    method: opts.method,
-    headers: {
-      Authorization: `Bearer ${userToken}`,
-      ...(opts.data !== undefined ? { 'Content-Type': 'application/json' } : {}),
-    },
-    ...(opts.data !== undefined ? { body: JSON.stringify(opts.data) } : {}),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DRIVE_API_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: opts.method,
+      headers: {
+        Authorization: `Bearer ${userToken}`,
+        ...(opts.data !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(opts.data !== undefined ? { body: JSON.stringify(opts.data) } : {}),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`drive API ${opts.path} 超时 (${DRIVE_API_TIMEOUT_MS}ms)`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.status === 401) {
     throw new UserTokenMissingError('User Token 已失效（HTTP 401）。请在话题中 /login 重新授权。');
   }
@@ -344,9 +377,13 @@ export async function getDocComment(
 
 function normalizeComment(raw: any): DocComment {
   const replies = Array.isArray(raw?.reply_list?.replies) ? raw.reply_list.replies : [];
+  // 飞书 batch_query 响应里 quote 在 raw.extra.quote 或 raw.quote
+  const quoteText = raw?.extra?.quote ?? raw?.quote;
   return {
     commentId: raw?.comment_id ?? '',
     isSolved: raw?.is_solved === true,
+    isWhole: raw?.is_whole === true,
+    quote: typeof quoteText === 'string' ? quoteText : undefined,
     replies: replies.map((r: any) => ({
       replyId: r?.reply_id ?? '',
       userId: r?.user_id,
@@ -373,7 +410,14 @@ export async function replyToDocComment(
   commentId: string,
   text: string,
   mentionOpenId?: string,
+  opts?: { isWhole?: boolean },
 ): Promise<{ replyId?: string; commentId?: string }> {
+  // 全文评论不允许嵌套回复，直接走新建全文评论（跳过注定失败的 probe）。
+  if (opts?.isWhole) {
+    logger.info(`[doc-comment] skip in-thread reply (isWhole=true), posting top-level comment`);
+    const c = await createDocComment(larkAppId, file, text, mentionOpenId);
+    return { replyId: c.replyId, commentId: c.commentId };
+  }
   const elements = buildCommentElements(text, mentionOpenId);
   let res: any;
   try {
@@ -469,4 +513,67 @@ export function chunkCommentText(text: string, max = DOC_COMMENT_MAX_CHARS): str
   }
   if (rest) chunks.push(rest);
   return chunks;
+}
+
+// ─── Prompt 构建 ─────────────────────────────────────────────────────────────────
+
+/**
+ * 为文档评论场景构造结构化 prompt，替代简单前缀。
+ *
+ * 让 AI 知道自己在一个文档评论场景中：提供文档链接、类型、评论范围、
+ * 引用原文、读取指令（让 AI 自己用 lark-cli 读文档正文）、纯文本回复要求。
+ *
+ * 参考 lark-coding-agent-bridge 的 buildCommentPrompt，适配 botmux 的投递方式。
+ */
+export function buildDocCommentPrompt(opts: {
+  fileToken: string;
+  fileType: string;
+  question: string;
+  quote?: string;
+  isWhole?: boolean;
+  brand?: Brand;
+}): string {
+  const { fileToken, fileType, question, quote, isWhole, brand } = opts;
+  const host = larkHosts(brand ?? 'feishu');
+  // 飞书文档链接用的是 openApi 域名去掉 /open-apis 前缀，如 https://open.feishu.cn → https://feishu.cn
+  const webBase = host.openApi.replace(/\/open-apis$/, '');
+  const docUrl = `${webBase}/${fileType}/${fileToken}`;
+  const parts: string[] = [];
+  parts.push('我在飞书云文档里被 @了。文档信息：');
+  parts.push(`- 链接：${docUrl}`);
+  parts.push(`- file_token：${fileToken}`);
+  parts.push(`- 类型：${fileType}`);
+  parts.push(`- 评论范围：${isWhole ? '全文评论（针对整篇）' : '行内评论（针对选中文字）'}`);
+  if (quote) {
+    parts.push('');
+    parts.push(`用户选中的原文：\n> ${quote.replace(/\n/g, '\n> ')}`);
+  }
+  parts.push('');
+  parts.push(`用户的问题：${question}`);
+  parts.push('');
+  parts.push(docReadInstruction(fileToken, fileType));
+  parts.push('');
+  parts.push(
+    '评论回复由 botmux 负责：不要调用云文档评论或回复接口，也不要给评论添加或删除 reaction；最终答案直接用纯文本交给 botmux。',
+  );
+  parts.push('');
+  parts.push(
+    '回复要求：直接用纯文本，不要 markdown（不要 ** __ # - * > ` 之类的标记），不要代码块；不要输出内部思考、内部分析、读取步骤、工具调用过程或工具日志。若用户要求解释依据，只说明用户可见的依据和结论。云文档评论框不渲染 markdown，会原样显示这些符号。',
+  );
+  return parts.join('\n');
+}
+
+/** 按 fileType 给出文档读取命令建议。 */
+function docReadInstruction(fileToken: string, fileType: string): string {
+  if (fileType === 'doc' || fileType === 'docx') {
+    return (
+      '读取文档内容：优先使用当前 docs v2 读取命令：\n' +
+      `  \`lark-cli docs +fetch --api-version v2 --doc ${fileToken} --doc-format markdown\`\n` +
+      '如果本机 lark-cli 不支持上述参数，不要在同一错误上反复重试；使用当前可用的等价读取命令读取同一 file_token。'
+    );
+  }
+  if (fileType === 'sheet') {
+    return '读取表格内容：这是 sheet 类型，不要使用 docs +fetch。请按当前可用的表格读取工具或本机 lark-cli 支持的表格读取命令读取同一 file_token；如果命令参数不兼容，不要在同一错误上反复重试。';
+  }
+  return '读取文件内容：这是 file 类型，不要使用 docs +fetch。请按当前可用的云空间文件工具或本机 lark-cli 支持的文件读取/下载命令处理同一 file_token；如果命令参数不兼容，不要在同一错误上反复重试。';
 }

@@ -21,6 +21,16 @@ import { logger } from '../../utils/logger.js';
 const REDACTED_ENV_UNSET_CLAUSE = `unset ${REDACTED_CHILD_ENV_KEYS.join(' ')}`;
 
 /**
+ * Build the shell `unset` clause for a pane, starting with the always-redacted
+ * keys and appending any session-specific keys (e.g. ANTHROPIC_* for ttadk).
+ * Key names are validated identifiers — no shell-escaping needed.
+ */
+export function buildUnsetClause(extraKeys?: string[]): string {
+  if (!extraKeys?.length) return REDACTED_ENV_UNSET_CLAUSE;
+  return `unset ${[...REDACTED_CHILD_ENV_KEYS, ...extraKeys].join(' ')}`;
+}
+
+/**
  * TmuxBackend — session backend using tmux for process persistence.
  *
  * Architecture: pty-under-tmux.
@@ -269,8 +279,8 @@ export class TmuxBackend implements SessionBackend {
       // through the bot while in this mode — type into the web terminal directly.
       const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
       const script = debugKeepShell
-        ? buildDebugKeepShellScript(shellSpec.shell)
-        : SHELL_WRAPPER_SCRIPT;
+        ? buildDebugKeepShellScript(shellSpec.shell, opts.unsetEnvKeys)
+        : buildShellWrapperScript(opts.unsetEnvKeys);
       if (debugKeepShell) {
         logger.info(
           `[tmux:${this.sessionName}] BOTMUX_DEBUG_KEEP_SHELL=1 — CLI exit will drop ` +
@@ -626,19 +636,24 @@ export function buildBotmuxEnvAssignments(
 }
 
 /**
- * Default wrapper script for `<shell> -c`. Sees argv as:
+ * Build the shell wrapper script for `<shell> -c`. Sees argv as:
  *   $0 = '_' (placeholder), $1 = cwd, $2..N = KEY=VAL... bin args...
  *
  * The `cd` step makes the CLI's cwd survive a wayward `cd` in the user's
  * rcfile. The `unset` step removes bare creds the pane inherited from the tmux
- * server's global env (REDACTED_ENV_UNSET_CLAUSE). The `exec /usr/bin/env` step
- * injects botmux's per-bot/per-session overrides AFTER rcfile load so they
- * can't be shadowed by leftover exports.
+ * server's global env (plus any session-specific keys, e.g. ANTHROPIC_* for
+ * ttadk). The `exec /usr/bin/env` step injects botmux's per-bot/per-session
+ * overrides AFTER rcfile load so they can't be shadowed by leftover exports.
  *
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
-export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && exec /usr/bin/env "$@"`;
+export function buildShellWrapperScript(unsetKeys?: string[]): string {
+  return `cd -- "$1" && shift && ${buildUnsetClause(unsetKeys)} && exec /usr/bin/env "$@"`;
+}
+
+/** Default wrapper script with only the always-redacted keys. */
+export const SHELL_WRAPPER_SCRIPT = buildShellWrapperScript();
 
 export const DIAGNOSTIC_SHELL_SCRIPT = [
   'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
@@ -663,13 +678,13 @@ export const DIAGNOSTIC_SHELL_SCRIPT = [
  * safe for paths containing spaces or quotes. Caller has already verified
  * it via accessSync().
  */
-export function buildDebugKeepShellScript(shellPath: string): string {
+export function buildDebugKeepShellScript(shellPath: string, unsetKeys?: string[]): string {
   const safeShell = shellPath.replace(/'/g, `'\\''`);
   return [
     'cd -- "$1" && shift',
     // Same redaction as SHELL_WRAPPER_SCRIPT — so neither the CLI nor the
     // interactive debug shell that follows sees server/rcfile-inherited creds.
-    REDACTED_ENV_UNSET_CLAUSE,
+    buildUnsetClause(unsetKeys),
     '/usr/bin/env "$@"',
     `printf '\\n[botmux debug] CLI exited (status %d) — interactive shell active. Type exit to close the session.\\n' "$?" >&2`,
     `exec '${safeShell}' -i`,
