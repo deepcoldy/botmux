@@ -5006,16 +5006,32 @@ window.addEventListener('resize',onViewportResize);
   ws.onerror=function(){ws.close()};
 })();
 
-// ── Wheel scroll handling ──
+// ── Wheel / touch scroll handling ──
 // Alt-screen + mouse-mode CLIs (e.g. Claude Code) keep NO scrollback in xterm OR
 // tmux — their whole transcript is redrawn by the app inside the fixed alt-screen
-// grid, so term.scrollLines() reveals nothing. When the browser xterm is in the
-// alternate buffer we instead forward the wheel as SGR mouse-wheel events so the
-// CLI scrolls its own transcript and repaints (verified: Claude scrolls on this).
+// grid, so term.scrollLines() reveals nothing. In the alternate buffer we forward
+// scrolling as SGR mouse-wheel events so the CLI scrolls its own transcript and
+// repaints (works in read-only too: the server only lets wheel sequences through).
 // Normal-buffer CLIs keep xterm's native scrollback scroll. Capture-phase +
-// stopPropagation pre-empts xterm's own mouse handler so the wheel isn't also
-// re-emitted to the CLI. Skipped for pure tmux/zellij ATTACH (gate), where the
-// attach client owns the wheel via tmux/zellij copy-mode.
+// stopPropagation pre-empts xterm's own handler. Skipped for pure tmux/zellij
+// ATTACH (gate), where the attach client owns scrolling via copy-mode.
+//
+// Accumulate intended scroll DISTANCE (px) and emit one wheel tick per STEP px —
+// decoupled from how many wheel/touch events the browser fires per gesture
+// (high-res trackpads fire dozens), so a small gesture stays a small scroll and
+// doesn't compound into a whole screen. px<0 = scroll up (toward history). The
+// per-call cap stops a single huge delta (page tick / fling) from over-firing.
+var _scrollAccum=0;var _SCROLL_STEP=33;
+function _fwdScroll(px){
+  if(!ws_||ws_.readyState!==1)return;
+  _scrollAccum+=px;var data='',n=0;
+  while(Math.abs(_scrollAccum)>=_SCROLL_STEP&&n<6){
+    var up=_scrollAccum<0; // px<0 → wheel-up (history)
+    data+='\\x1b[<'+(up?64:65)+';1;1M';
+    _scrollAccum+=up?_SCROLL_STEP:-_SCROLL_STEP;n++;
+  }
+  if(data)ws_.send(JSON.stringify({type:'input',data:data}));
+}
 if(!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
     if(term.buffer.active.type!=='alternate'){
@@ -5024,14 +5040,10 @@ if(!${isTmuxMode && !isPipeMode}){
       if(!hasToken){e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);}
       return;
     }
-    // Alternate buffer: no local scrollback — forward the wheel so the CLI scrolls.
-    // Allowed in read-only too: the server lets wheel scroll sequences through for
-    // non-authed clients (scrolling the CLI's own view is non-destructive).
     e.preventDefault();e.stopPropagation();
-    if(!ws_||ws_.readyState!==1)return;
-    var btn=e.deltaY<0?64:65; // SGR: 64=wheel-up (history), 65=wheel-down
-    var seq='\\x1b[<'+btn+';1;1M';
-    ws_.send(JSON.stringify({type:'input',data:seq+seq+seq})); // ~3 lines per notch
+    // Normalise deltaMode to px: line→~16px, page→~one screen.
+    var px=e.deltaMode===1?e.deltaY*16:e.deltaMode===2?e.deltaY*term.rows*16:e.deltaY;
+    _fwdScroll(px);
   },{capture:true,passive:false});
 }
 
@@ -5071,25 +5083,19 @@ if(isTouch&&hasToken){
 // scrollTop. overscroll-behavior:none (see <style>) kills the iOS rubber-band.
 if(!${isTmuxMode && !isPipeMode}){
   var _tTerm=document.getElementById('terminal');
-  var _tLastY=null,_tAccum=0,_tStep=16; // ~px per scrolled line
+  var _tLastY=null;
   _tTerm.addEventListener('touchstart',function(e){
-    if(e.touches.length===1){_tLastY=e.touches[0].clientY;_tAccum=0;}
+    if(e.touches.length===1)_tLastY=e.touches[0].clientY;
   },{capture:true,passive:true});
   _tTerm.addEventListener('touchmove',function(e){
     // Normal buffer / multi-touch / no start → let xterm (or the browser) handle it.
     if(term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
-    var y=e.touches[0].clientY;_tAccum+=y-_tLastY;_tLastY=y;
-    if(!ws_||ws_.readyState!==1)return; // read-only allowed (server gates to wheel only)
-    var data='';
-    while(Math.abs(_tAccum)>=_tStep){
-      var up=_tAccum>0; // finger drags down → reveal history → wheel-up (64)
-      data+='\\x1b[<'+(up?64:65)+';1;1M';
-      _tAccum+=up?-_tStep:_tStep;
-    }
-    if(data)ws_.send(JSON.stringify({type:'input',data:data}));
+    var y=e.touches[0].clientY;
+    _fwdScroll(_tLastY-y); // finger drags down (y grows) → px<0 → scroll up (history)
+    _tLastY=y;
   },{capture:true,passive:false});
-  _tTerm.addEventListener('touchend',function(){_tLastY=null;_tAccum=0;},{capture:true,passive:true});
+  _tTerm.addEventListener('touchend',function(){_tLastY=null;},{capture:true,passive:true});
 }
 </script>
 </body>
