@@ -4445,12 +4445,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   let workerBotUnionIds: string[] = [];
   try {
     const { buildFederatedRoster } = await import('./services/federation-roster.js');
+    const { listBotUnionIds } = await import('./services/bot-union-ids-store.js');
     const roster = buildFederatedRoster(resolveDataDir());
     workerBotUnionIds = resolveDispatchWorkerBotUnionIds({
       openIds: built.mentionedOpenIds,
       bots,
       workerNames,
       workerMetas,
+      learnedBotUnionIdsByName: listBotUnionIds(resolveDataDir()),
       federationBots: roster.bots,
       senderScopedBotOpenIds,
     });
