@@ -82,6 +82,7 @@ describe('goal watchdog', () => {
       task('t3', 'oc_a', 'reported'),
       task('t4', 'oc_b', 'accepted'),
       task('t5', undefined, 'dispatched'),
+      task('', 'oc_a', 'dispatched'),
       { ...task('t6', 'oc_a', 'blocked'), help: { blocker: '缺权限', kind: 'access', workerOpenId: 'ou_w' } },
       { ...task('t7', 'oc_a', 'escalated'), escalation: { reason: '需要人拍' } },
     ]);
