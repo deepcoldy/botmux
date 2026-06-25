@@ -119,6 +119,7 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         t.workerNames = p.workerNames ?? t.workerNames;
         t.workerLarkAppIds = p.workerLarkAppIds ?? t.workerLarkAppIds;
         t.workerCliIds = p.workerCliIds ?? t.workerCliIds;
+        t.workerBotUnionIds = p.workerBotUnionIds ?? t.workerBotUnionIds;
         t.acceptanceHint = p.acceptanceHint ?? t.acceptanceHint;
         t.acceptanceCriteria = p.acceptanceCriteria ?? t.acceptanceCriteria;
         // A (re)dispatch re-activates a fresh OR a help-blocked/escalated task —
