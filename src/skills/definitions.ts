@@ -1221,10 +1221,13 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
 - 给 worker 的 brief 只放该 subtask 需要的上下文（含你从 charter 摘录的相关目标 / 约束），别把整份 charter 倒给它。
 - coder 写完先 @ reviewer review，过了再 report。
 
-#### L2-2.5 派给跨设备 / 非-botmux worker（外部 worker，P0）
-本机 botmux worker 不用管这节（照常 \`botmux report\`，享进程探活 + 自动重派）。要把**别人机器上的 botmux bot**、**非-botmux 的 agent**、甚至**人**纳入当 worker 时：
-- **授权 = 把它的飞书 open_id 记进该 task 的 \`workerOpenIds\`**（dispatch 指定 / 你建 task 时带上）。只有"被派了这个活的人"发的交付才会被摄取入账，其它当普通聊天忽略。
-- **它在 goal 群里用「交付信封」交活 / 求助**（纯文本，你的 daemon 自动摄取成 TaskReported / TaskHelpRequested）。把下面格式**抄进给它的 brief**，让它照发：
+#### L2-2.5 a2a：派给跨设备 / 外部 worker（goal 可选用的跨设备交付协议）
+**a2a 不是新编排模式**，而是 goal 在需要时可选用的「跨设备 agent-to-agent 交付协议」——本机 botmux worker、飞书里的**人**、**别人机器上的 botmux bot**、**非-botmux 的 agent** 可以并存当 worker，goal/L2/charter/watchdog/看板一切照旧。本机 botmux worker 不用管这节（照常 \`botmux report\`，享进程探活 + 自动重派）；把**外部 worker** 纳入时才走 a2a：
+
+- **交付/回报方向（worker→你的账本）= 按 union_id 授权，免 /grant**：dispatch 时把 worker 的 \`workerBotUnionIds\`（首选）带上——union_id 租户级稳定、且**每条入站事件都带**，是最可靠的 worker 身份；\`workerOpenIds\`(open_id) 作兜底。只有「被派了这个活的 worker」发的信封才摄取入账，其它当普通聊天忽略。信封摄取在权限门**之前**、用 union_id 自证，所以回报这条**不需要 /grant**。
+- **冷启动**：跨设备 bot 的 union_id 花名册里**不带**，得它在群里先 @ 你一次，你的 daemon 才从那条事件学到（\`[bot-union-id] learned …\`）；学到后 dispatch 才解析得出 \`workerBotUnionIds\`。
+- **派活方向（你→让远端 bot 真接活）= 需要对方给你 /grant**：远端那台得对它的 bot 做一次 \`@该bot /grant @你的bot\`（或把你放进 allowedUsers），否则你的 @ 派活会被对方权限门当「没对话权限」挡掉（跨设备 bot 不是同部署互信 peer，goal 群也不吃 oncall 全开放豁免）。
+- **它在 goal 群用「交付信封」交活 / 求助**（纯文本，daemon 自动摄取成 TaskReported / TaskHelpRequested）。⚠️ 必须**原始文本**，别用会渲染卡片的 \`botmux send\`。把下面格式**抄进给它的 brief**：
   \`\`\`
   [botmux-report v1]
   taskId: <taskId>
@@ -1303,6 +1306,7 @@ botmux goal notify-parent --done --summary "Goal 已完成：各 subtask 产出 
 - **验收必留硬证据（硬规矩，不是建议）**：每次 \`delivery accept\` 必须带 \`--evidence-checked\`（写清具体核验了什么：读了哪个文件的哪段内容 / 跑了什么命令得到什么结果），能跑命令核验的必带 \`--ran-command\`；\`reject\` 必带 \`--reason\`。**禁止空证据、或"看了一下没问题"式 accept**。验不动（产物不存在 / 读不到 / 不可测）就别 accept——去 reject 或催 worker，不要凭印象放行。
 - **兜底通道尤其要硬**：goal-watchdog 唤你主动核验那笔（worker 根本没 report），你的 \`evidenceChecked\` 是这笔交付**唯一**的核验记录、没有 worker report 作旁证——必须**逐条**对着验收 checks 清单写明结果（哪个 check 怎么验、过没过），绝不能因为"文件在那儿"就 accept。
 - **goalId = goal 群 chatId**：\`delivery list --goal <goalId>\` 就是这个项目的全景账本视图。
+- **外部 worker 也进同一本账**：本机 worker 走 \`botmux report\`；跨设备 botmux / 非-botmux agent / 人则走 **a2a**——goal 可选用的「跨设备交付协议」，往 goal 群发文本「交付信封」、按 union_id 授权摄取成同样的账本事件（见 L2-2.5）。a2a 只命名这条跨设备交付链路，不改 goal 编排本身。
 
 ## 注意
 - **没通过用户审批不要建群 / 起 L2 / 派活。**
