@@ -517,6 +517,30 @@ export function findOncallChat(larkAppId: string, chatId: string): OncallChat | 
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
 }
 
+/**
+ * The bot's effective default working dir for a NEW session, as a raw
+ * (possibly `~`-prefixed) path — the caller still expands + validates it.
+ *
+ * Two sources, presented as a mutually-exclusive 3-way choice in the dashboard
+ * ("默认工作目录模式": 关闭 / 仅默认目录 / Oncall 模式) but if both happen to be set
+ * (legacy / chat-command config) `defaultWorkingDir` wins:
+ *   1) `defaultWorkingDir` — pin a dir for new sessions; no permission change.
+ *   2) `defaultOncall.workingDir` when `defaultOncall.enabled` — "Oncall 模式"
+ *      extends its directory to ALL of this bot's sessions (p2p / 话题 / 普通群
+ *      fallback), not just the group auto-bind. The group auto-bind (which also
+ *      opens talk to the whole group) still happens separately upstream; this
+ *      fallback is what makes the bot's OTHER sessions land in the same dir.
+ *
+ * Returns undefined when neither is configured. Reading this NEVER writes state
+ * or binds a chat to oncall, so the resolved session's permission model is
+ * unchanged regardless of which source supplied the path.
+ */
+export function effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined {
+  return cfg.defaultWorkingDir
+    || (cfg.defaultOncall?.enabled ? cfg.defaultOncall.workingDir : undefined)
+    || undefined;
+}
+
 // Cross-bot oncall chat discovery — cached by config-file mtime.
 //
 // /oncall bind is per-bot, and so is consumption: both talk-authorization

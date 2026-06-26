@@ -34,7 +34,7 @@ import {
   type ValidateManifest,
 } from './contract.js';
 import { readJournal } from './journal.js';
-import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
+import { loadBotConfigs, effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
 
 interface V3RunArgs {
   dagPath: string;
@@ -91,7 +91,7 @@ function resolveBotConfig(selector: string | undefined, bots: BotConfig[]): BotC
  *  expands).  CLI `--working-dir` overrides the bot's configured value. */
 function botWorkingDir(bot: BotConfig, override: string | undefined): string {
   return override
-    ?? bot.defaultWorkingDir
+    ?? effectiveDefaultWorkingDir(bot)
     ?? bot.workingDir
     ?? bot.workingDirs?.[0]
     ?? '~';

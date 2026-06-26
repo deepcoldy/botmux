@@ -215,6 +215,64 @@ describe('resolvePinnedWorkingDir', () => {
     expect(result.inheritedFrom).toEqual({ sessionId: peer.sessionId, larkAppId: 'app-peer', workingDir: peerDir });
   });
 
+  it('uses defaultOncall.workingDir as the all-sessions fallback for non-group sessions (Oncall mode covers p2p)', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('self-oncall-repo');
+    // Oncall mode: defaultOncall enabled, defaultWorkingDir cleared (the
+    // dashboard makes them mutually exclusive). A p2p session never auto-binds
+    // oncall (group-only), so the oncall dir must still pin it via layer-4.
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultOncall: { enabled: true, workingDir: oncallDir, since: 1 },
+    });
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_dm',
+      chatId: 'oc_dm',
+      chatType: 'p2p',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.oncallEntry).toBeFalsy();
+    expect(result.inheritedFrom).toBeNull();
+    expect(result.pinnedWorkingDir).toBe(oncallDir);
+  });
+
+  it('does NOT use a DISABLED defaultOncall.workingDir as the fallback', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('self-oncall-repo');
+    // defaultOncall present but disabled → no all-sessions fallback; no
+    // defaultWorkingDir either → nothing pins, caller shows the repo card.
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultOncall: { enabled: false, workingDir: oncallDir, since: 0 },
+    });
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread', anchor: 'om_dm', chatId: 'oc_dm', chatType: 'p2p', larkAppId: 'app-self',
+    });
+
+    expect(result.pinnedWorkingDir).toBeUndefined();
+  });
+
+  it('prefers explicit defaultWorkingDir over defaultOncall.workingDir when both are set', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('self-oncall-repo');
+    const defaultDir = tempDir('self-default-repo');
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultOncall: { enabled: true, workingDir: oncallDir, since: 1 },
+      defaultWorkingDir: defaultDir,
+    });
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread', anchor: 'om_dm', chatId: 'oc_dm', chatType: 'p2p', larkAppId: 'app-self',
+    });
+
+    expect(result.pinnedWorkingDir).toBe(defaultDir);
+  });
+
   it('honors THIS bot\'s own oncall binding above inherit/default', async () => {
     const { botRegistry, daemon } = await loadFreshModules();
     const selfOncallDir = tempDir('self-oncall-repo');

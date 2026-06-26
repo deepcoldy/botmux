@@ -16,7 +16,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
-import { getBot, getAllBots, getOwnerOpenId, findOncallChat } from '../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
@@ -1344,14 +1344,15 @@ export async function executeScheduledTask(
 
 // ─── Dashboard「创建会话」spawn / activate ───────────────────────────────────
 
-/** 解析 dashboard 创建会话的 pinned workingDir：oncall 绑定优先（弹框填了工作目录会
- *  建群时绑 oncall），其次 bot 的 defaultWorkingDir（校验是真目录）。都没有 → undefined，
- *  表示「不钉目录」，交给 forkOrShowRepoCard 弹 /repo 卡片让用户在群里选。与普通新话题
- *  的 resolvePinnedWorkingDir 同口径（少了 sibling 继承那层，新群无 sibling 可继承）。*/
+/** 解析 dashboard 创建会话的 pinned workingDir：本群 oncall 绑定优先（弹框填了工作目录会
+ *  建群时绑 oncall），其次 bot 的 effectiveDefaultWorkingDir（defaultWorkingDir，或 Oncall
+ *  模式下的 defaultOncall 目录；校验是真目录）。都没有 → undefined，表示「不钉目录」，交给
+ *  forkOrShowRepoCard 弹 /repo 卡片让用户在群里选。与普通新话题的 resolvePinnedWorkingDir
+ *  同口径（少了 sibling 继承那层，新群无 sibling 可继承）。*/
 function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): string | undefined {
   const oncall = findOncallChat(larkAppId, chatId)?.workingDir;
   if (oncall) return oncall;
-  const raw = getBot(larkAppId).config.defaultWorkingDir;
+  const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
   const resolved = expandHome(raw);
   try {

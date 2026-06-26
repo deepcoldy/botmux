@@ -11,7 +11,7 @@
  * file is edited.)
  */
 
-import type { BotConfig } from '../../bot-registry.js';
+import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
 import type { BotSnapshot } from './contract.js';
 
 export function resolveBotConfig(selector: string | undefined, bots: BotConfig[]): BotConfig {
@@ -31,7 +31,7 @@ export function resolveBotConfig(selector: string | undefined, bots: BotConfig[]
  *  expands).  An explicit override wins over the bot's configured value. */
 export function botWorkingDir(bot: BotConfig, override?: string): string {
   return override
-    ?? bot.defaultWorkingDir
+    ?? effectiveDefaultWorkingDir(bot)
     ?? bot.workingDir
     ?? bot.workingDirs?.[0]
     ?? '~';

@@ -2,7 +2,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
-import { getBot } from '../bot-registry.js';
+import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { getChatMode, sendMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
@@ -72,7 +72,7 @@ function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; worki
   const bot = getBot(larkAppId);
   const candidate =
     oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir ||
-    bot.config.defaultWorkingDir ||
+    effectiveDefaultWorkingDir(bot.config) ||
     bot.config.workingDir ||
     '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));

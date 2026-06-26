@@ -187,7 +187,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       </article>`;
     }
     const def = b.defaultOncall ?? { enabled: false, workingDir: '', since: 0 };
-    const enabled = !!def.enabled;
+    // 默认工作目录模式（三选一，dashboard 互斥）：oncall > default > off。
+    const wdMode = def.enabled ? 'oncall' : (b.defaultWorkingDir ? 'default' : 'off');
+    // 输入框预填「最可能的目录」：defaultWorkingDir 优先，否则 oncall 目录（disable 后仍保留），
+    // 便于来回切换模式不用重输。
+    const wdDirValue: string = b.defaultWorkingDir || def.workingDir || '';
     const name = b.botName ?? b.larkAppId;
     const cli = displayCliId(b, cliIdOf(b.larkAppId));
     return `<article class="bd-card bd-profile" data-appid="${escapeHtml(b.larkAppId)}">
@@ -207,22 +211,27 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="bd-body bd-grid">
         <section class="bd-tile">
           <section class="bd-section">
-            <h3 class="bd-section-title">${t('botDefaults.sectionOncall')}</h3>
-            <label class="toggle-row">
-              <input type="checkbox" data-action="toggle" ${enabled ? 'checked' : ''}>
-              <span class="switch" aria-hidden="true"></span>
-              <span class="toggle-tx"><strong>${t('botDefaults.defaultOncall')}</strong>
-              <small>${t('botDefaults.defaultOncallHelp')}。${t('botDefaults.warning')}</small></span>
-            </label>
+            <h3 class="bd-section-title">${t('botDefaults.sectionWorkingDir')}</h3>
             <div class="bd-row">
               <label>
-                <span>${t('botDefaults.workingDir')}</span>
+                <span>${t('botDefaults.workingDirMode')}</span>
+                <select data-input="workingDirMode">
+                  <option value="off" ${wdMode === 'off' ? 'selected' : ''}>${escapeHtml(t('botDefaults.workingDirModeOff'))}</option>
+                  <option value="default" ${wdMode === 'default' ? 'selected' : ''}>${escapeHtml(t('botDefaults.workingDirModeDefault'))}</option>
+                  <option value="oncall" ${wdMode === 'oncall' ? 'selected' : ''}>${escapeHtml(t('botDefaults.workingDirModeOncall'))}</option>
+                </select>
+              </label>
+              <small class="bd-help">${t('botDefaults.workingDirModeHelp')}</small>
+            </div>
+            <div class="bd-row" data-wd-dir-row ${wdMode === 'off' ? 'hidden' : ''}>
+              <label>
+                <span>${t('botDefaults.workingDirField')}</span>
                 <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux"
-                  value="${escapeHtml(def.workingDir ?? '')}" ${enabled ? '' : 'disabled'}>
+                  value="${escapeHtml(wdDirValue)}">
               </label>
             </div>
             <div class="actions">
-              <button type="button" class="primary" data-action="save">${t('botDefaults.save')}</button>
+              <button type="button" class="primary" data-action="save-working-dir">${t('botDefaults.save')}</button>
               <span class="oncall-status" data-status></span>
             </div>
             ${renderAutoStartControls(b)}
@@ -708,52 +717,55 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     listEl.querySelectorAll<HTMLElement>('.bd-card').forEach(card => {
       const appId = card.dataset.appid!;
       void ensureProfileRolesLoaded(appId, card);
-      const toggle = card.querySelector<HTMLInputElement>('input[data-action=toggle]');
+      // ── 默认工作目录模式（三选一互斥：off / default / oncall）─────────────────
+      const wdModeSel = card.querySelector<HTMLSelectElement>('select[data-input=workingDirMode]');
       const input = card.querySelector<HTMLInputElement>('input[data-input=workingDir]');
-      const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save]');
+      const wdDirRow = card.querySelector<HTMLElement>('[data-wd-dir-row]');
+      const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-working-dir]');
       const statusEl = card.querySelector<HTMLSpanElement>('[data-status]');
-      if (!toggle || !input || !saveBtn || !statusEl) return; // error card
+      if (!wdModeSel || !input || !saveBtn || !statusEl) return; // error card
 
-      toggle.addEventListener('change', () => {
-        input.disabled = !toggle.checked;
-        if (toggle.checked) input.focus();
+      // 选「关闭」隐藏目录输入框；选其它则显示并聚焦（off 不需要目录）。
+      wdModeSel.addEventListener('change', () => {
+        const off = wdModeSel.value === 'off';
+        if (wdDirRow) wdDirRow.hidden = off;
+        if (!off) input.focus();
       });
 
       saveBtn.addEventListener('click', async () => {
         statusEl.textContent = '';
         statusEl.className = 'oncall-status';
-        const enabled = toggle.checked;
+        const mode = wdModeSel.value;
         const workingDir = input.value.trim();
-        if (enabled && !workingDir) {
+        if (mode !== 'off' && !workingDir) {
           statusEl.textContent = t('botDefaults.required');
           statusEl.classList.add('hint-warn-inline');
           return;
         }
         saveBtn.disabled = true;
         try {
-          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/default-oncall`, {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/working-dir-mode`, {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ enabled, workingDir }),
+            body: JSON.stringify({ mode, workingDir }),
           });
           const body = await r.json().catch(() => ({}));
           if (r.ok && body.ok) {
             const resolvedNote = body.resolvedPath ? ` → ${body.resolvedPath}` : '';
-            statusEl.textContent = enabled
-              ? `✓ 已开启${resolvedNote}（未绑定的群下次开话题自动 oncall）`
-              : '✓ 已关闭（已绑定的群不动）';
+            statusEl.textContent = `✓ ${t('botDefaults.workingDirSaved')}${resolvedNote}`;
             statusEl.classList.add('hint-ok');
             // Patch in-cache snapshot so the next manual Refresh / filter
-            // rerender shows the new since/workingDir. We deliberately don't
-            // call rerender() here — that would rebuild the card and wipe the
-            // success toast the user just saw.
+            // rerender reflects the new mode. We deliberately don't call
+            // rerender() here — that would rebuild the card and wipe the toast.
             const cached = cache.bots.find((b: any) => b.larkAppId === appId);
-            if (cached && body.defaultOncall) cached.defaultOncall = body.defaultOncall;
-            // Update the visible "上次启用时间" line in-place so the user
-            // sees the timestamp jump without losing the toast.
+            if (cached) {
+              if (body.defaultOncall) cached.defaultOncall = body.defaultOncall;
+              cached.defaultWorkingDir = body.defaultWorkingDir ?? null;
+            }
+            // Oncall 模式 re-stamps `since` → reflect it in the meta line.
             const metaEl = card.querySelector<HTMLElement>('[data-oncall-since]');
             if (metaEl && body.defaultOncall?.since != null) {
-              metaEl.textContent = `上次启用时间：${fmtSince(body.defaultOncall.since)}`;
+              metaEl.textContent = `${t('botDefaults.lastEnabled')}: ${fmtSince(body.defaultOncall.since)}`;
             }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;

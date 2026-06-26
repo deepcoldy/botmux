@@ -16,7 +16,7 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -2211,26 +2211,29 @@ async function maybeAutoBindDefaultOncall(
 }
 
 /**
- * Resolve this bot's `defaultWorkingDir` for a new-topic spawn, if any.
- * Unlike `defaultOncall`, this is a pure runtime fallback: no state is
- * written to bots.json and the chat is NOT bound to oncall (so the
- * permission model stays unchanged). `/cd <path>` can still switch the
+ * Resolve this bot's effective default working dir for a new-session spawn, if
+ * any (see {@link effectiveDefaultWorkingDir}): `defaultWorkingDir`, or — when
+ * "Oncall 模式" is on — `defaultOncall.workingDir` as the all-sessions fallback.
+ *
+ * Either way this is a pure runtime fallback: no state is written to bots.json
+ * and the chat is NOT bound to oncall here (the group auto-bind, which opens
+ * talk, happens separately upstream at layer 2), so the permission model for
+ * the resolved session stays unchanged. `/cd <path>` can still switch the
  * working dir mid-session; the next new topic falls back to this default.
  *
- * Returns the expanded path when the configured field points to a real
- * directory; logs and returns undefined when the path is missing/invalid
- * so the caller falls through to the repo-select card instead of
- * spawning into a bad cwd.
+ * Returns the expanded path when the chosen source points at a real directory;
+ * logs and returns undefined when the path is missing/invalid so the caller
+ * falls through to the repo-select card instead of spawning into a bad cwd.
  */
 function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
-  const raw = getBot(larkAppId).config.defaultWorkingDir;
+  const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
   const resolved = expandHome(raw);
   try {
     if (statSync(resolved).isDirectory()) return resolved;
   } catch { /* not a dir */ }
   logger.warn(
-    `[${larkAppId}] defaultWorkingDir invalid (${resolved}); ` +
+    `[${larkAppId}] default working dir invalid (${resolved}); ` +
     `falling back to repo-select card`,
   );
   return undefined;

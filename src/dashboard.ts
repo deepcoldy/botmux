@@ -2007,6 +2007,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/working-dir-mode — proxy to that bot's daemon. Body
+    // `{ mode: 'off'|'default'|'oncall', workingDir }` — sets the 3-way
+    // mutually-exclusive default-dir mode (defaultWorkingDir vs defaultOncall).
+    let mBotWdMode: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotWdMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/working-dir-mode$/))) {
+      const appId = decodeURIComponent(mBotWdMode[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-working-dir-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/skills — proxy to that bot's daemon. Body accepts
     // `{ action:'attach'|'detach', name }` or `{ action:'set', policy|null }`.
     let mBotSkills: RegExpMatchArray | null;

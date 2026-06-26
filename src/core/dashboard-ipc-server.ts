@@ -1210,10 +1210,19 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const e = getBot(cachedLarkAppId).config.env;
     if (e && typeof e === 'object' && Object.keys(e).length) env = JSON.stringify(e, null, 2);
   } catch { /* none */ }
+  // defaultWorkingDir — the "仅默认目录" mode source. Mutually exclusive with
+  // defaultOncall in the dashboard 3-way selector; the frontend derives the
+  // current mode from (defaultOncall.enabled ? oncall : defaultWorkingDir ? default : off).
+  let defaultWorkingDir: string | null = null;
+  try {
+    const d = getBot(cachedLarkAppId).config.defaultWorkingDir;
+    if (typeof d === 'string' && d.trim()) defaultWorkingDir = d;
+  } catch { /* none */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
+    defaultWorkingDir,
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
@@ -1547,6 +1556,65 @@ ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {
   const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled, workingDir });
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true, defaultOncall: r.defaultOncall, resolvedPath: resolvedPath || undefined });
+});
+
+// Per-bot「默认工作目录模式」三选一（dashboard 单选；两个底层字段互斥）：
+//   • off     → 清 defaultWorkingDir + 关 defaultOncall（新会话弹「选仓库」卡）
+//   • default → 写 defaultWorkingDir + 关 defaultOncall（钉目录、跳过选仓库、不改权限）
+//   • oncall  → 开 defaultOncall(+dir) + 清 defaultWorkingDir（新群自动绑+开放对话；
+//               该目录经 resolveBotDefaultWorkingDir 的 layer-4 兜底覆盖该 bot 所有会话）
+// defaultWorkingDir 走 applyConfigField（与 /botconfig 同写盘+内存热更新），defaultOncall
+// 走 oncallStore。先关/清「未选中」的字段、再写「选中」的：万一中途失败，最多落到「都没设」
+// （安全，回退到选仓库卡），绝不会两个同时残留。next-session 生效（运行中会话需 /restart）。
+ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { mode?: unknown; workingDir?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown; workingDir?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const mode = body.mode;
+  if (mode !== 'off' && mode !== 'default' && mode !== 'oncall') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  const workingDir = typeof body.workingDir === 'string' ? body.workingDir.trim() : '';
+
+  const spec = findConfigField('defaultWorkingDir');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  // 非「关闭」模式必须给一个真实存在的目录。
+  let resolvedPath = '';
+  if (mode !== 'off') {
+    if (!workingDir) return jsonRes(res, 400, { ok: false, error: 'workingDir_required' });
+    const v = validateWorkingDir(workingDir);
+    if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error });
+    resolvedPath = v.resolvedPath;
+  }
+
+  if (mode === 'oncall') {
+    // 先清 defaultWorkingDir，再开 defaultOncall。
+    const c = await applyConfigField(cachedLarkAppId, spec, null);
+    if (!c.ok) return jsonRes(res, 400, { ok: false, error: c.reason });
+    const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled: true, workingDir });
+    if (!r.ok) return jsonRes(res, 400, r);
+    return jsonRes(res, 200, {
+      ok: true, mode, defaultWorkingDir: null, defaultOncall: r.defaultOncall,
+      resolvedPath: resolvedPath || undefined,
+    });
+  }
+
+  // off / default：都先关 defaultOncall（disable 保留旧 workingDir 便于来回切换），
+  // 再设/清 defaultWorkingDir。
+  const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled: false, workingDir: '' });
+  if (!r.ok) return jsonRes(res, 400, r);
+  const value = mode === 'default' ? workingDir : null;
+  const c = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!c.ok) return jsonRes(res, 400, { ok: false, error: c.reason });
+  return jsonRes(res, 200, {
+    ok: true, mode,
+    defaultWorkingDir: mode === 'default' ? workingDir : null,
+    defaultOncall: r.defaultOncall,
+    resolvedPath: resolvedPath || undefined,
+  });
 });
 
 // Create a brand-new chat with this bot as creator/owner and `larkAppIds` as

@@ -25,6 +25,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
   return {
     ...base,
     defaultOncall: j?.defaultOncall,
+    defaultWorkingDir: typeof j?.defaultWorkingDir === 'string' ? j.defaultWorkingDir : null,
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     brandLabel: j?.brandLabel ?? null,
     sandbox: j?.sandbox === true,
