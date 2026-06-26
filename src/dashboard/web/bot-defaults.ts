@@ -8,6 +8,20 @@ import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js
 
 let cache: { bots: any[] } = { bots: [] };
 let loadError: string | null = null;
+type CliOption = {
+  id: string;
+  label: string;
+  gateway?: 'ttadk';
+  acceptsModel?: boolean;
+};
+let cliOptions: CliOption[] = [
+  { id: 'claude-code', label: 'Claude' },
+  { id: 'codex', label: 'Codex' },
+  { id: 'traex', label: 'traex' },
+];
+let cliOptionsLoaded = false;
+let ttadkModelDefault = 'glm-5.1';
+let ttadkModelSuggestions: string[] = [];
 // master-detail：左侧员工名册选中谁，右侧就渲染谁的档案
 let selectedAppId: string | null = null;
 
@@ -38,6 +52,79 @@ function cliIdOf(appId: string): string {
     if (!best || Number(s.lastMessageAt ?? 0) > Number(best.lastMessageAt ?? 0)) best = s;
   }
   return best?.cliId ?? '';
+}
+
+async function loadCliOptions(): Promise<void> {
+  if (cliOptionsLoaded) return;
+  cliOptionsLoaded = true;
+  try {
+    const r = await fetch('/api/cli-options');
+    const body = await r.json().catch(() => ({}));
+    if (r.ok && Array.isArray(body?.options)) {
+      cliOptions = body.options.filter((o: any): o is CliOption =>
+        o && typeof o.id === 'string' && typeof o.label === 'string',
+      );
+      if (typeof body.ttadkModelDefault === 'string' && body.ttadkModelDefault.trim()) {
+        ttadkModelDefault = body.ttadkModelDefault.trim();
+      }
+      if (Array.isArray(body.ttadkModelSuggestions)) {
+        ttadkModelSuggestions = body.ttadkModelSuggestions.filter((s: unknown): s is string => typeof s === 'string');
+      }
+    }
+  } catch {
+    // Keep the static fallback; saving still works for plain claude-code.
+  }
+}
+
+function agentSelectionKey(bot: any, sessionFallback: string): string {
+  const explicit = typeof bot?.agentSelectionKey === 'string' && bot.agentSelectionKey ? bot.agentSelectionKey : '';
+  if (explicit) return explicit;
+  const cli = displayCliId(bot, sessionFallback);
+  return cli || 'claude-code';
+}
+
+function selectedCliOption(key: string): CliOption | undefined {
+  return cliOptions.find(o => o.id === key);
+}
+
+function modelSuggestionsForOption(opt: CliOption | undefined): string[] {
+  if (opt?.gateway === 'ttadk' && opt.acceptsModel !== false) return ttadkModelSuggestions;
+  return [];
+}
+
+export function renderBotAgentSection(b: any, sessionFallback: string): string {
+  const key = agentSelectionKey(b, sessionFallback);
+  const optHtml = cliOptions
+    .map(o => `<option value="${escapeHtml(o.id)}" ${o.id === key ? 'selected' : ''}>${escapeHtml(o.label)}（${escapeHtml(o.id)}）</option>`)
+    .join('');
+  const model = typeof b?.model === 'string' ? b.model : '';
+  const suggestions = modelSuggestionsForOption(selectedCliOption(key));
+  const disabled = selectedCliOption(key)?.gateway === 'ttadk' && selectedCliOption(key)?.acceptsModel === false;
+  return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionAgent')}</h3>
+      <div class="bd-row">
+        <label>
+          <span>${t('botDefaults.agentCli')}</span>
+          <select data-input="agentCliId">${optHtml}</select>
+        </label>
+      </div>
+      <div class="bd-row">
+        <label>
+          <span>${t('botDefaults.agentModel')}</span>
+          <input type="text" data-input="agentModel" list="agent-model-suggestions-${escapeHtml(b.larkAppId)}"
+            placeholder="${escapeHtml(t('botDefaults.agentModelPlaceholder'))}"
+            value="${escapeHtml(model)}" ${disabled ? 'disabled' : ''}>
+          <datalist id="agent-model-suggestions-${escapeHtml(b.larkAppId)}">
+            ${suggestions.map(m => `<option value="${escapeHtml(m)}"></option>`).join('')}
+          </datalist>
+        </label>
+        <small class="bd-help">${t('botDefaults.agentHelp')}</small>
+        <div class="actions">
+          <button type="button" class="primary" data-action="save-agent">${t('botDefaults.agentSave')}</button>
+          <span class="oncall-status" data-agent-status></span>
+        </div>
+      </div>
+    </section>`;
 }
 
 function pageHtml(): string {
@@ -106,7 +193,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     refreshBtn.disabled = true;
     try {
       botProfileRoleCache.clear();
-      await loadBots();
+      await Promise.all([loadBots(), loadCliOptions()]);
       rerender();
     } finally { refreshBtn.disabled = false; }
   };
@@ -123,7 +210,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
   // /api/bots 要逐 daemon 探活，慢——先亮 loading 占住右侧详情区。
   listEl.innerHTML = loadingHtml();
-  await loadBots();
+  await Promise.all([loadBots(), loadCliOptions()]);
 
   function rerender() {
     const f = new FormData(form);
@@ -210,6 +297,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       </header>
       <div class="bd-body bd-grid">
         <section class="bd-tile">
+          ${renderBotAgentSection(b, cli)}
           <section class="bd-section">
             <h3 class="bd-section-title">${t('botDefaults.sectionWorkingDir')}</h3>
             <div class="bd-row">
@@ -724,6 +812,78 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-working-dir]');
       const statusEl = card.querySelector<HTMLSpanElement>('[data-status]');
       if (!wdModeSel || !input || !saveBtn || !statusEl) return; // error card
+
+      // ── Agent CLI / model (next-session) ─────────────────────────────────
+      const agentCliSel = card.querySelector<HTMLSelectElement>('select[data-input=agentCliId]');
+      const agentModelInput = card.querySelector<HTMLInputElement>('input[data-input=agentModel]');
+      const agentSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-agent]');
+      const agentStatusEl = card.querySelector<HTMLSpanElement>('[data-agent-status]');
+
+      function syncAgentModelField(): void {
+        if (!agentCliSel || !agentModelInput) return;
+        const list = card.querySelector<HTMLDataListElement>(`#agent-model-suggestions-${CSS.escape(appId)}`);
+        const opt = selectedCliOption(agentCliSel.value);
+        const isTtadk = opt?.gateway === 'ttadk';
+        const acceptsModel = isTtadk && opt.acceptsModel !== false;
+        if (isTtadk && !acceptsModel) {
+          if (list) list.innerHTML = '';
+          agentModelInput.value = '';
+          agentModelInput.disabled = true;
+          agentModelInput.placeholder = t('botOnboarding.modelTtadkCocoPlaceholder');
+          return;
+        }
+        agentModelInput.disabled = false;
+        if (acceptsModel) {
+          if (list) list.innerHTML = ttadkModelSuggestions.map(m => `<option value="${escapeHtml(m)}"></option>`).join('');
+          agentModelInput.placeholder = t('botOnboarding.modelTtadkPlaceholder').replace('{model}', ttadkModelDefault);
+          if (!agentModelInput.value.trim()) agentModelInput.value = ttadkModelDefault;
+        } else {
+          if (list) list.innerHTML = '';
+          agentModelInput.placeholder = t('botDefaults.agentModelPlaceholder');
+          if (agentModelInput.value.trim() === ttadkModelDefault) agentModelInput.value = '';
+        }
+      }
+
+      if (agentCliSel && agentModelInput && agentSaveBtn && agentStatusEl) {
+        agentCliSel.addEventListener('change', syncAgentModelField);
+        agentSaveBtn.addEventListener('click', async () => {
+          agentStatusEl.textContent = '';
+          agentStatusEl.className = 'oncall-status';
+          agentSaveBtn.disabled = true;
+          agentCliSel.disabled = true;
+          agentModelInput.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/agent`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ cliId: agentCliSel.value, model: agentModelInput.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              agentStatusEl.textContent = `✓ ${t('botDefaults.agentSaved')}`;
+              agentStatusEl.classList.add('hint-ok');
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) {
+                cached.cliId = body.cliId;
+                cached.wrapperCli = body.wrapperCli ?? null;
+                cached.model = body.model ?? '';
+                cached.agentSelectionKey = body.selectionKey ?? agentCliSel.value;
+              }
+            } else {
+              agentStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              agentStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            agentStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            agentStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            agentSaveBtn.disabled = false;
+            agentCliSel.disabled = false;
+            agentModelInput.disabled = false;
+            syncAgentModelField();
+          }
+        });
+      }
 
       // 选「关闭」隐藏目录输入框；选其它则显示并聚焦（off 不需要目录）。
       wdModeSel.addEventListener('change', () => {

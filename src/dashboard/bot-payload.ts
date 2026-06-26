@@ -3,6 +3,8 @@ export interface DashboardBotDescriptor {
   botName?: string | null;
   botAvatarUrl?: string;
   cliId?: string;
+  wrapperCli?: string;
+  model?: string;
 }
 
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
@@ -19,6 +21,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     larkAppId: bot.larkAppId,
     botName: bot.botName,
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
+    ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
+    ...(bot.model ? { model: bot.model } : {}),
     online: true,
   };
   if (error) return { ...base, error };
