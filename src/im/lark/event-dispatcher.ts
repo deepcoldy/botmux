@@ -790,15 +790,16 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
  *  back off: under 'ambient' the bot answers un-@ messages, but if the user
  *  explicitly addresses SOMEONE ELSE it stays quiet (the redirect carve-out).
  *  `@all` addresses everyone including this bot, so it is NOT an "other member"
- *  and does NOT trigger backoff. Mirrors isBotMentioned's two shapes:
- *  message.mentions[] (user text) and inline `at` nodes in post content. */
+ *  and does NOT trigger backoff. Reads open_ids via mentionOpenId() so it
+ *  tolerates mention.id's object/string forms (matching isBotMentioned — see
+ *  #309), and also scans inline `at` nodes in post content. */
 export function mentionsAnotherMember(larkAppId: string, message: any): boolean {
   const botOpenId = getBot(larkAppId).botOpenId;
 
   // 1. message.mentions array (populated for user-sent text messages)
   const mentions: any[] = message.mentions ?? [];
   for (const m of mentions) {
-    const oid: string | undefined = m?.id?.open_id;
+    const oid = mentionOpenId(m);
     if (!oid) continue;
     if (oid === botOpenId) continue; // that's me
     if (oid === 'all') continue;     // @all → everyone incl. me

@@ -126,7 +126,7 @@ function setupBotState(opts?: {
   configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
-  regularGroupMentionMode?: 'always' | 'topic' | 'never';
+  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
   chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
@@ -414,6 +414,26 @@ describe('mentionsAnotherMember (ambient redirect carve-out)', () => {
       content: JSON.stringify({ text: '@BotA @Other' }),
     };
     expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  // Regression for #309: the event can deliver mention.id as a bare string (the
+  // REST shape) instead of { open_id }. mentionOpenId() normalizes both, so a
+  // string-form @ to another member must still register as a redirect — the
+  // pre-#309 raw `m.id?.open_id` read returned undefined here and never yielded.
+  it('returns true when another member is @mentioned via the string-form mention.id (#309 shape)', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'Other', id: 'ou_other' }],
+      content: JSON.stringify({ text: '@Other 你看下' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns false when only THIS bot is @mentioned via the string-form mention.id (#309 shape)', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
   });
 });
 
@@ -1744,6 +1764,75 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-never',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('mention mode ambient: a non-@ top-level message with no redirect is answered, like never', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no at-mention at all, top level' }),
+      messageId: 'msg-ambient-toplevel',
+      chatId: 'chat-ambient',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('mention mode ambient: a non-@ message that @mentions ANOTHER member is NOT answered (redirect carve-out)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 }); // multi-person, not 1v1
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Other 你来处理' }),
+      messageId: 'msg-ambient-redirect',
+      chatId: 'chat-ambient-redirect',
+      chatType: 'group',
+      mentions: [{ key: '@_other', name: 'Other', id: { open_id: 'ou_other' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // The message addresses someone else (not this bot) → ambient yields → silent.
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('mention mode ambient: an @all message is still answered (not a redirect to a specific member)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@all 大家注意' }),
+      messageId: 'msg-ambient-all',
+      chatId: 'chat-ambient-all',
+      chatType: 'group',
+      mentions: [{ key: '@_all_', name: 'all', id: { open_id: 'all' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient-all',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
