@@ -235,4 +235,66 @@ describe('default-oncall store persistence', () => {
     expect(chatIds).toEqual(ids.slice().sort());
     expect((persisted.defaultOncallAutoboundChats ?? []).slice().sort()).toEqual(ids.slice().sort());
   });
+
+  // ── setWorkingDirMode: dashboard 三态互斥写盘 (PR #311 Codex review) ──────────
+  it('setWorkingDirMode oncall enables defaultOncall AND clears defaultWorkingDir in one write', async () => {
+    writeConfig({ defaultWorkingDir: '/prev-default' }); // start in "default" mode
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    vi.setSystemTime(30_000);
+    const r = await store.setWorkingDirMode('app_default', 'oncall', '/repos/oncall');
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.defaultOncall).toEqual({ enabled: true, workingDir: '/repos/oncall', since: 30_000 });
+      expect(r.defaultWorkingDir).toBeNull();
+    }
+    const persisted = readConfig();
+    expect(persisted.defaultOncall).toEqual({ enabled: true, workingDir: '/repos/oncall', since: 30_000 });
+    expect(persisted.defaultWorkingDir).toBeUndefined(); // cleared — never enabled-oncall + defaultWorkingDir together
+    const cfg = registry.getBot('app_default').config;
+    expect(cfg.defaultOncall?.enabled).toBe(true);
+    expect(cfg.defaultWorkingDir).toBeUndefined();
+  });
+
+  it('setWorkingDirMode default sets defaultWorkingDir AND disables defaultOncall (keeps prior oncall dir)', async () => {
+    writeConfig({ defaultOncall: { enabled: true, workingDir: '/repos/oncall', since: 5_000 } }); // start oncall
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.setWorkingDirMode('app_default', 'default', '/repos/dwd');
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.defaultWorkingDir).toBe('/repos/dwd');
+      expect(r.defaultOncall.enabled).toBe(false);
+      expect(r.defaultOncall.workingDir).toBe('/repos/oncall'); // prior dir kept for round-trip
+    }
+    const persisted = readConfig();
+    expect(persisted.defaultWorkingDir).toBe('/repos/dwd');
+    expect(persisted.defaultOncall.enabled).toBe(false); // disabled — the active state is mutually exclusive
+  });
+
+  it('setWorkingDirMode off clears defaultWorkingDir AND disables defaultOncall (cleans up a both-set state)', async () => {
+    // Seed the very inconsistent state the race could once produce: enabled
+    // defaultOncall + defaultWorkingDir both present. `off` must clean both.
+    writeConfig({
+      defaultWorkingDir: '/repos/dwd',
+      defaultOncall: { enabled: true, workingDir: '/repos/oncall', since: 5_000 },
+    });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.setWorkingDirMode('app_default', 'off', '');
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.defaultWorkingDir).toBeNull();
+      expect(r.defaultOncall.enabled).toBe(false);
+    }
+    const persisted = readConfig();
+    expect(persisted.defaultWorkingDir).toBeUndefined();
+    expect(persisted.defaultOncall.enabled).toBe(false);
+  });
 });

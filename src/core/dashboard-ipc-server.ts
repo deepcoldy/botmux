@@ -1563,9 +1563,11 @@ ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {
 //   • default → 写 defaultWorkingDir + 关 defaultOncall（钉目录、跳过选仓库、不改权限）
 //   • oncall  → 开 defaultOncall(+dir) + 清 defaultWorkingDir（新群自动绑+开放对话；
 //               该目录经 resolveBotDefaultWorkingDir 的 layer-4 兜底覆盖该 bot 所有会话）
-// defaultWorkingDir 走 applyConfigField（与 /botconfig 同写盘+内存热更新），defaultOncall
-// 走 oncallStore。先关/清「未选中」的字段、再写「选中」的：万一中途失败，最多落到「都没设」
-// （安全，回退到选仓库卡），绝不会两个同时残留。next-session 生效（运行中会话需 /restart）。
+// 两字段在 oncallStore.setWorkingDirMode 的**同一个 rmwBotEntry 锁内**一次性原子写盘 +
+// 同步内存：否则两个并发请求分别加锁写各自字段会交错，最终留下 defaultOncall.enabled 与
+// defaultWorkingDir 同时存在的不一致态（GET/前端按 enabled 显示 oncall，但 runtime 的
+// effectiveDefaultWorkingDir 优先用 defaultWorkingDir → UI 与实际目录背离；PR #311 Codex 评审）。
+// next-session 生效（运行中会话需 /restart）。
 ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { mode?: unknown; workingDir?: unknown };
@@ -1578,9 +1580,6 @@ ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
   }
   const workingDir = typeof body.workingDir === 'string' ? body.workingDir.trim() : '';
 
-  const spec = findConfigField('defaultWorkingDir');
-  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
-
   // 非「关闭」模式必须给一个真实存在的目录。
   let resolvedPath = '';
   if (mode !== 'off') {
@@ -1590,28 +1589,11 @@ ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
     resolvedPath = v.resolvedPath;
   }
 
-  if (mode === 'oncall') {
-    // 先清 defaultWorkingDir，再开 defaultOncall。
-    const c = await applyConfigField(cachedLarkAppId, spec, null);
-    if (!c.ok) return jsonRes(res, 400, { ok: false, error: c.reason });
-    const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled: true, workingDir });
-    if (!r.ok) return jsonRes(res, 400, r);
-    return jsonRes(res, 200, {
-      ok: true, mode, defaultWorkingDir: null, defaultOncall: r.defaultOncall,
-      resolvedPath: resolvedPath || undefined,
-    });
-  }
-
-  // off / default：都先关 defaultOncall（disable 保留旧 workingDir 便于来回切换），
-  // 再设/清 defaultWorkingDir。
-  const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled: false, workingDir: '' });
+  const r = await oncallStore.setWorkingDirMode(cachedLarkAppId, mode, workingDir);
   if (!r.ok) return jsonRes(res, 400, r);
-  const value = mode === 'default' ? workingDir : null;
-  const c = await applyConfigField(cachedLarkAppId, spec, value);
-  if (!c.ok) return jsonRes(res, 400, { ok: false, error: c.reason });
   return jsonRes(res, 200, {
     ok: true, mode,
-    defaultWorkingDir: mode === 'default' ? workingDir : null,
+    defaultWorkingDir: r.defaultWorkingDir,
     defaultOncall: r.defaultOncall,
     resolvedPath: resolvedPath || undefined,
   });
