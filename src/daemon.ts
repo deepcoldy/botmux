@@ -16,7 +16,7 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -59,6 +59,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
   ensureCliEnv,
+  sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
@@ -89,7 +90,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
-import { beginReplyTargetTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { handleCardAction } from './im/lark/card-handler.js';
@@ -97,10 +98,25 @@ import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import {
   executeWorkflowCommand,
   parseWorkflowCommand,
+  parseWorkflowGrillTrigger,
+  buildWorkflowGrillPrompt,
   resolveBotSnapshot,
+  WORKFLOW_USAGE,
+  WORKFLOW_V2_RENAME_NOTICE,
   type WorkflowCommandResult,
 } from './im/lark/workflow-slash-command.js';
 import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
+import { createV3GateRunner, requestV3Retry, requestV3LoopGrant } from './workflows/v3/daemon-run.js';
+import { buildV3GateCard } from './im/lark/v3-gate-card.js';
+import { buildV3BlockedCard } from './im/lark/v3-blocked-card.js';
+import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
+import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
+import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js';
+import { readRunChatBinding as readV3RunChatBinding, defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.js';
+
+/** This daemon process's bot larkAppId (set in startDaemon).  Used to scope v3
+ *  humanGate cold-attach + start to runs this bot owns (codex blocker #1). */
+let selfV3LarkAppId: string | undefined;
 import {
   buildWorkflowStartingCard,
   buildWorkflowProgressCard,
@@ -341,6 +357,12 @@ function streamingCardDisabledFor(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
+function silentTurnReactionsFor(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.silentTurnReactions === true;
+  } catch { return false; }
+}
+
 function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
   const paths = [
     join(config.session.dataDir, `sessions-${larkAppId}.json`),
@@ -366,13 +388,14 @@ export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: stri
   // This call site is the per-message acceptance point, so it also drives the
   // two-phase turn reaction. It's auto-enabled exactly for card-off sessions
   // (streaming card disabled): those have no live status card, so the ✋→✅ on
-  // the user's message is the only lightweight progress signal. When the
-  // streaming card is on it already shows status, so we stay silent.
+  // the user's message is the only lightweight progress signal. Bots can opt
+  // out via silentTurnReactions for low-noise observer scenarios.
   // React 冲! on the triggering message the instant it's accepted. Binding to the
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
   if (!streamingCardDisabledFor(ds)) return;
+  if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
   if (!triggerMessageId.startsWith('om_')) return;
   if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
@@ -428,7 +451,18 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
     if (ds?.scope === 'chat') {
       const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
       if (fresh) syncReplyTargetState(ds, fresh);
-      const target = resolveSessionReplyTarget(ds, turnId);
+      // Resolve through fallbackTurnId so daemon-side sends that carry no turn of
+      // their own (the repo-select card, skip/switch confirmations, crash notices)
+      // still anchor into the current shared fold-back topic instead of leaking to
+      // the chat top level. Callers that DO pass an explicit turnId are unchanged —
+      // fallbackTurnId returns it verbatim, so the stale-turn hijack guard stays
+      // authoritative. Baking the fallback in HERE (the single chat-scope send
+      // chokepoint) means no individual send site can re-introduce the leak by
+      // forgetting to thread — the recurring failure mode behind this and the
+      // earlier e619250d fix. Guarded by test/session-reply-thread-anchor.test.ts
+      // (drives the real sessionReply) and test/reply-target-fallback.test.ts
+      // (the resolveSessionReplyTarget × fallbackTurnId composition it relies on).
+      const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
       if (target.mode === 'thread') return replyMessage(appId, target.rootMessageId, content, msgType, true, undefined, hookContext);
       if (ds.session.rootMessageId) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
@@ -444,6 +478,13 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   // Thread-scope (or unknown / legacy): reply in thread.
   return replyMessage(appId, anchor, content, msgType, true, undefined, hookContext);
 }
+
+// Test seams: drive the real sessionReply (the chat-scope thread/top-level
+// chokepoint) against a seeded session, so the shared fold-back leak is guarded
+// at the function that actually routes — not just the resolveSessionReplyTarget
+// composition it relies on. See test/reply-target-fallback.test.ts.
+export const __testOnly_sessionReply = sessionReply;
+export const __testOnly_activeSessions = activeSessions;
 
 async function revokeQuotaGrant(
   larkAppId: string,
@@ -1342,6 +1383,13 @@ async function handleWorkflowCommandIfAny(
   larkAppId: string,
   initiator: string | undefined,
 ): Promise<boolean> {
+  // 旧 `/workflow run|cancel` 软降级：在执行前**先**发改名提示，让迁移指引第一时间
+  // 到达用户（codex review：先发优于后发）。从原始 content 判定而非 parse 结果，
+  // 这样连 `/workflow run`（缺 id）这类 invalid legacy 也能收到提示（codex review）。
+  // 仅匹配 legacy 的 run|cancel（executeWorkflowCommand 必然 handle），不误伤 /template。
+  if (/^\/workflow\s+(run|cancel)\b/.test(content.trim())) {
+    await sessionReply(anchor, WORKFLOW_V2_RENAME_NOTICE, 'text', larkAppId);
+  }
   // Captured by the `onRunCreated` closure so the trailing text reply can be
   // suppressed when the run-level progress card already landed.  Codex
   // round 1 medium: "single self-updating tile" promise breaks if we also
@@ -1556,6 +1604,92 @@ function fireSessionlessCommandDetached(
 }
 
 // Dependencies passed to card-handler
+// v3 humanGate run-controller: drives daemon-side v3 runs, posts/​re-posts
+// approval cards to the run's bound topic, and re-arms pending gates on startup
+// (cold-attach).  postCard / notifyTerminal use the daemon's Lark sender; the
+// run logic + in-flight guard live in createV3GateRunner.
+const v3GateRunner = createV3GateRunner({
+  postCard: async (binding, gate, runId) => {
+    const card = buildV3GateCard({
+      runId,
+      waitId: gate.waitId,
+      nodeId: gate.nodeId,
+      prompt: gate.prompt,
+      options: gate.options,
+      approveOptions: gate.approveOptions,
+      approvers: gate.approvers,
+    });
+    // codex blocker #3: never silently skip — a missing rootMessageId would
+    // leave the run stuck at awaitingGate forever.  Reply in-thread when we have
+    // an anchor; otherwise post to the chat directly.
+    if (binding.rootMessageId) {
+      await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
+    } else {
+      await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+    }
+  },
+  postBlockedCard: async (binding, info, runId) => {
+    const card = buildV3BlockedCard({
+      runId,
+      nodeId: info.nodeId,
+      attemptId: info.attemptId,
+      errorClass: info.errorClass,
+      errorCode: info.errorCode,
+      message: info.message,
+      // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）。
+      ...(info.ask ? { ask: info.ask } : {}),
+    });
+    if (binding.rootMessageId) {
+      await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
+    } else {
+      await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+    }
+  },
+  postLoopGrantCard: async (binding, info, runId) => {
+    const card = buildV3LoopGrantCard({
+      runId,
+      loopId: info.loopId,
+      iteration: info.iteration,
+      maxIterations: info.maxIterations,
+      granted: info.granted,
+      detail: info.detail,
+    });
+    if (binding.rootMessageId) {
+      await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
+    } else {
+      await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+    }
+  },
+  postRevisitGrantCard: async (binding, info, runId) => {
+    const card = buildV3RevisitGrantCard({
+      runId,
+      sourceNodeId: info.sourceNodeId,
+      toNodeId: info.toNodeId,
+      tier: info.tier,
+      attemptId: info.attemptId,
+      detail: info.detail,
+    });
+    if (binding.rootMessageId) {
+      await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
+    } else {
+      await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+    }
+  },
+  notifyTerminal: async (binding, runId, outcome) => {
+    if (!binding?.rootMessageId) return;
+    const msg = outcome.runStatus === 'succeeded'
+      ? `✅ v3 workflow \`${runId}\` 跑完了`
+      : outcome.runStatus === 'blocked'
+        // Fallback only — the blocked path normally posts a retry/grant card instead.
+        ? `⏸️ v3 workflow \`${runId}\` 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''}，可 \`botmux workflow retry ${runId}\` 重试（loop 耗尽则 \`botmux workflow grant ${runId}\` 追加一轮）`
+        : `❌ v3 workflow \`${runId}\` 失败${outcome.failedNodeId ? `（节点 ${outcome.failedNodeId}）` : ''}`;
+    await sessionReply(binding.rootMessageId, msg, 'text', binding.larkAppId).catch(() => {});
+  },
+  onError: (runId, err) => {
+    logger.warn(`[v3:${runId}] drive failed: ${err instanceof Error ? err.message : String(err)}`);
+  },
+});
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
@@ -1564,6 +1698,28 @@ const cardDeps: CardHandlerDeps = {
     driveWorkflowRun(runId).catch((err) => {
       logger.warn(`[workflow:${runId}] re-entry after approval failed: ${err instanceof Error ? err.message : String(err)}`);
     });
+  },
+  v3GateDeps: {
+    driveRun: (runId) => v3GateRunner.driveDetached(runId),
+    // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
+    // 非 grill 出生的旧卡）→ **拒**（codex follow-up：合法卡一定有 binding，缺失即可疑）.
+    canResolve: (binding, operatorOpenId) =>
+      binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
+  },
+  v3BlockedDeps: {
+    driveRun: (runId) => v3GateRunner.driveDetached(runId),
+    canResolve: (binding, operatorOpenId) =>
+      binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
+  },
+  v3LoopGrantDeps: {
+    driveRun: (runId) => v3GateRunner.driveDetached(runId),
+    canResolve: (binding, operatorOpenId) =>
+      binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
+  },
+  v3RevisitGrantDeps: {
+    driveRun: (runId) => v3GateRunner.driveDetached(runId),
+    canResolve: (binding, operatorOpenId) =>
+      binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
   },
 };
 
@@ -1601,6 +1757,93 @@ for (const [path, resolution] of [
     return jsonRes(res, 200, result);
   });
 }
+
+// v3 humanGate: start a daemon-driven run (grill `approve-dag` 后的主入口).  Same
+// 127.0.0.1 ipcRoute posture as the v0.2 approve/reject mutations (dashboard
+// proxies authed external calls).  Fire-and-forget: the runner drives the run +
+// posts gate cards; the caller polls /api/v3/runs/:id for status.
+ipcRoute('POST', '/api/v3/runs/:runId/start', async (_req, res, params) => {
+  const runId = params.runId;
+  if (!isValidV3RunId(runId)) return jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
+  // Owner check (codex blocker #1): only the daemon owning this run's bot may
+  // start it — otherwise the wrong daemon drives + posts cards with its client.
+  const binding = readV3RunChatBinding(join(v3DefaultBaseDir(), runId));
+  if (!binding) return jsonRes(res, 404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (selfV3LarkAppId && binding.larkAppId !== selfV3LarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+  }
+  v3GateRunner.driveDetached(runId);
+  return jsonRes(res, 202, { ok: true, runId });
+});
+
+// v3 blocked retry: append the retry intent + re-drive.  Same owner posture as
+// /start.  Body: { nodeId? } (defaults to the run's blockedNodeId).
+ipcRoute('POST', '/api/v3/runs/:runId/retry', async (req, res, params) => {
+  const runId = params.runId;
+  if (!isValidV3RunId(runId)) return jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
+  const binding = readV3RunChatBinding(join(v3DefaultBaseDir(), runId));
+  if (!binding) return jsonRes(res, 404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (selfV3LarkAppId && binding.larkAppId !== selfV3LarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+  }
+  let body: { nodeId?: unknown } = {};
+  try {
+    body = await readJsonBody<{ nodeId?: unknown }>(req);
+  } catch {
+    /* empty body is fine — retry the blockedNodeId */
+  }
+  const nodeId = typeof body.nodeId === 'string' && body.nodeId ? body.nodeId : undefined;
+  let outcome;
+  try {
+    outcome = requestV3Retry(v3DefaultBaseDir(), runId, { nodeId });
+  } catch (err) {
+    return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+  if (outcome.kind === 'stale-run') {
+    return jsonRes(res, 409, {
+      ok: false,
+      error:
+        outcome.reason === 'missing' ? 'unknown_run'
+        : outcome.reason === 'loop-node' ? 'loop_node_use_grant'
+        : 'not_blocked',
+    });
+  }
+  // requested / already-requested → make sure the run is moving.
+  v3GateRunner.driveDetached(runId);
+  return jsonRes(res, 202, { ok: true, runId, ...outcome });
+});
+
+// v3 loop grant: append one extra iteration for an exhausted loop + re-drive.
+// Same owner posture as /retry.  Body: { loopId? } (defaults to the run's
+// blocked loop).
+ipcRoute('POST', '/api/v3/runs/:runId/grant', async (req, res, params) => {
+  const runId = params.runId;
+  if (!isValidV3RunId(runId)) return jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
+  const binding = readV3RunChatBinding(join(v3DefaultBaseDir(), runId));
+  if (!binding) return jsonRes(res, 404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (selfV3LarkAppId && binding.larkAppId !== selfV3LarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+  }
+  let body: { loopId?: unknown } = {};
+  try {
+    body = await readJsonBody<{ loopId?: unknown }>(req);
+  } catch {
+    /* empty body is fine — grant the blocked loop */
+  }
+  const loopId = typeof body.loopId === 'string' && body.loopId ? body.loopId : undefined;
+  let outcome;
+  try {
+    outcome = requestV3LoopGrant(v3DefaultBaseDir(), runId, { loopId, by: 'cli' });
+  } catch (err) {
+    return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+  if (outcome.kind === 'stale-run') {
+    return jsonRes(res, 409, { ok: false, error: outcome.reason === 'missing' ? 'unknown_run' : 'not_exhausted' });
+  }
+  // granted / already-granted → make sure the run is moving.
+  v3GateRunner.driveDetached(runId);
+  return jsonRes(res, 202, { ok: true, runId, ...outcome });
+});
 
 function attemptResumeStatus(error: { error: string }): number {
   switch (error.error) {
@@ -1729,7 +1972,7 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
     }
   }
   // Convert JSON-channel params (decoded values) into the shared RawParamInput
-  // map.  String-channel coercion stays on the IM `/workflow run` path.
+  // map.  String-channel coercion stays on the IM `/template run` path.
   const rawParams: Record<string, RawParamInput> = {};
   for (const [k, v] of Object.entries((body.params as Record<string, unknown> | undefined) ?? {})) {
     rawParams[k] = { kind: 'json', value: v };
@@ -1952,7 +2195,7 @@ function parseTriggerChatBinding(
  * Default-oncall is a uniform forward-only policy: whenever the toggle is
  * on, ANY chat the bot is currently in — old or newly added, doesn't matter —
  * gets auto-bound to the configured workingDir on its next observed topic,
- * unless it's already bound (`findOncallChatForAnyBot` upstream) or the user
+ * unless it's already bound (`findOncallChat`, per-bot, upstream) or the user
  * has opted out via tombstone.
  *
  * Thin wrapper around the shared `ensureDefaultOncallBound` in oncall-store,
@@ -1968,26 +2211,29 @@ async function maybeAutoBindDefaultOncall(
 }
 
 /**
- * Resolve this bot's `defaultWorkingDir` for a new-topic spawn, if any.
- * Unlike `defaultOncall`, this is a pure runtime fallback: no state is
- * written to bots.json and the chat is NOT bound to oncall (so the
- * permission model stays unchanged). `/cd <path>` can still switch the
+ * Resolve this bot's effective default working dir for a new-session spawn, if
+ * any (see {@link effectiveDefaultWorkingDir}): `defaultWorkingDir`, or — when
+ * "Oncall 模式" is on — `defaultOncall.workingDir` as the all-sessions fallback.
+ *
+ * Either way this is a pure runtime fallback: no state is written to bots.json
+ * and the chat is NOT bound to oncall here (the group auto-bind, which opens
+ * talk, happens separately upstream at layer 2), so the permission model for
+ * the resolved session stays unchanged. `/cd <path>` can still switch the
  * working dir mid-session; the next new topic falls back to this default.
  *
- * Returns the expanded path when the configured field points to a real
- * directory; logs and returns undefined when the path is missing/invalid
- * so the caller falls through to the repo-select card instead of
- * spawning into a bad cwd.
+ * Returns the expanded path when the chosen source points at a real directory;
+ * logs and returns undefined when the path is missing/invalid so the caller
+ * falls through to the repo-select card instead of spawning into a bad cwd.
  */
 function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
-  const raw = getBot(larkAppId).config.defaultWorkingDir;
+  const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
   const resolved = expandHome(raw);
   try {
     if (statSync(resolved).isDirectory()) return resolved;
   } catch { /* not a dir */ }
   logger.warn(
-    `[${larkAppId}] defaultWorkingDir invalid (${resolved}); ` +
+    `[${larkAppId}] default working dir invalid (${resolved}); ` +
     `falling back to repo-select card`,
   );
   return undefined;
@@ -1995,7 +2241,8 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
 
 /**
  * Resolve the pinned working dir for a brand-new topic via the layered lookup:
- *   1) an existing oncall binding (this bot or a sibling)
+ *   1) this bot's OWN oncall binding (per-bot: another bot's binding never pins
+ *      this bot — cross-bot dir alignment is handled by layer 3 inherit-peer)
  *   2) this bot's defaultOncall — auto-binds a brand-new chat when the flag is on
  *      (this WRITES state, so it must run identically on every spawn path)
  *   3) a sibling session's workingDir (cross-bot / chat-scope inheritance)
@@ -2011,12 +2258,16 @@ async function resolvePinnedWorkingDir(ctx: {
   chatType: 'group' | 'p2p';
   larkAppId: string;
 }) {
-  let oncallEntry = findOncallChatForAnyBot(ctx.chatId);
+  let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
   const inheritedFrom = !oncallEntry
-    ? findInheritablePeer({ scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType, selfAppId: ctx.larkAppId })
+    ? findInheritablePeer({
+        scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
+        selfAppId: ctx.larkAppId,
+        botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
+      })
     : null;
   const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
     ? resolveBotDefaultWorkingDir(ctx.larkAppId)
@@ -2231,13 +2482,31 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     content,
   });
 
-  if (parseWorkflowCommand(cmdContent)) {
+  // v3 即兴 grill：`/workflow [new] <目标>`。daemon 不拷问——把目标包成触发
+  // botmux-workflow skill 的 prompt（改写 content，promptContent 随后从 content
+  // 构造），fall-through 到正常 session 创建，让本话题 agent 接管整条链路。
+  // run|cancel 不在此命中（归 v2 legacy，由下面 handleWorkflowCommandIfAny 处理）。
+  const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
+  if (newTopicGrill) {
     if (await replyGrantRestrictionIfNeeded(larkAppId, chatId, senderOpenId, anchor, '/workflow')) {
       return;
     }
-  }
-  if (await handleWorkflowCommandIfAny(cmdContent, anchor, chatId, larkAppId, senderOpenId)) {
-    return;
+    if (newTopicGrill.kind === 'usage') {
+      await sessionReply(anchor, WORKFLOW_USAGE, 'text', larkAppId);
+      return;
+    }
+    content = buildWorkflowGrillPrompt(newTopicGrill.goal);
+    // 保留原 cmdContent（"/workflow new …"）供 title/日志；/workflow 非注册命令，
+    // 下面的 parseSlashCommandInvocation 会让它落到正常 spawn 路径。
+  } else {
+    if (parseWorkflowCommand(cmdContent)) {
+      if (await replyGrantRestrictionIfNeeded(larkAppId, chatId, senderOpenId, anchor, '/template')) {
+        return;
+      }
+    }
+    if (await handleWorkflowCommandIfAny(cmdContent, anchor, chatId, larkAppId, senderOpenId)) {
+      return;
+    }
   }
 
   // Intercept daemon commands in new topics (no session needed for some commands)
@@ -2771,7 +3040,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
 
-  const promptContent = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix + parsed.content;
+  // `let` (not const): the v3 grill gate below may replace this with a
+  // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
+  let promptContent = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix + parsed.content;
   const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
   emitHookEvent('thread.reply', {
     larkAppId,
@@ -2854,19 +3125,35 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
   }
 
-  if (parseWorkflowCommand(cmdContent)) {
+  // v3 即兴 grill（thread 内）：`/workflow [new] <目标>` → 把目标包成触发
+  // botmux-workflow skill 的 prompt 覆盖 promptContent，fall-through 到下面正常
+  // 转发逻辑，让现有/新建的 agent 接管。run|cancel 归 v2 legacy（走 else）。
+  const threadGrill = parseWorkflowGrillTrigger(cmdContent);
+  if (threadGrill) {
     if (await replyGrantRestrictionIfNeeded(larkAppId, threadChatId, threadSenderOpenId, anchor, '/workflow')) {
       return;
     }
-  }
-  if (await handleWorkflowCommandIfAny(
-    cmdContent,
-    anchor,
-    threadChatId,
-    larkAppId,
-    threadSenderOpenId,
-  )) {
-    return;
+    if (threadGrill.kind === 'usage') {
+      await sessionReply(anchor, WORKFLOW_USAGE, 'text', larkAppId);
+      return;
+    }
+    promptContent = buildWorkflowGrillPrompt(threadGrill.goal);
+    // fall through to normal forwarding with the rewritten promptContent
+  } else {
+    if (parseWorkflowCommand(cmdContent)) {
+      if (await replyGrantRestrictionIfNeeded(larkAppId, threadChatId, threadSenderOpenId, anchor, '/template')) {
+        return;
+      }
+    }
+    if (await handleWorkflowCommandIfAny(
+      cmdContent,
+      anchor,
+      threadChatId,
+      larkAppId,
+      threadSenderOpenId,
+    )) {
+      return;
+    }
   }
 
   // Intercept daemon commands
@@ -2995,10 +3282,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
   // settle 掉 ask（替代选项语义），不再当作新一轮指令喂给 CLI。此时发起 ask 的 CLI
   // 正阻塞等结果，回什么都得先等 ask 结束，故无副作用。仅拦截纯文字（slash 命令 /
-  // 回调 URL / workflow 已在上方各自 return，可用来中止）。答复权限 = canTalk，由
+  // 回调 URL 已在上方 return，可用来中止）。答复权限 = canTalk，由
   // broker 在 submitCustomReply 内按注入的 canTalkChecker 判定：非授权人返回
   // 'unauthorized'，这里 fall through 到正常路由。卡片由 broker.onSettle 自动 PATCH。
-  if (threadSenderOpenId && threadChatId) {
+  // `!threadGrill`：grill goal 分支只改写 promptContent 后 fall-through（不 return），
+  // cmdContent 仍是字面量 `/workflow new <目标>`；若不排除，待回答 ask 会把它当答案吞掉，
+  // grill 永远不启动。grill 必须穿过拦截器走正常转发。
+  if (threadSenderOpenId && threadChatId && !threadGrill) {
     const askReplyText = cmdContent.trim();
     if (askReplyText) {
       const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: threadChatId, anchor });
@@ -3587,6 +3877,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // also needs its own copy for SessionRow.botName.
   setBotName(cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
+  selfV3LarkAppId = cfg.larkAppId; // scope v3 humanGate cold-attach / start to this bot
 
   // Bind dashboard IPC HTTP server BEFORE publishing the registry descriptor.
   // Otherwise the dashboard process can race-fetch the IPC port from the
@@ -3770,6 +4061,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
 
+  // Second global-skills sweep, AFTER restore has settled. The early
+  // cleanupGlobalBotmuxSkillsOnce() pass (in the startup ensureCliEnv above)
+  // runs before any restart overlap settles, so an outgoing old-build daemon
+  // (pre `--plugin-dir` migration) can re-create ~/.claude/skills/botmux-* a few
+  // ms after we cleaned it — leaving it to leak into the user's standalone
+  // `claude` until the *next* restart. Re-sweeping here, once this daemon's own
+  // spawns and the handoff window are done, catches that leak on the same
+  // startup. Idempotent & best-effort — never blocks startup.
+  try { sweepGlobalBotmuxSkills(); }
+  catch (err) { logger.warn(`[skills] post-restore global sweep failed: ${err instanceof Error ? err.message : String(err)}`); }
+
   // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
   // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
   await restoreDocSubscriptions(activeSessions);
@@ -3813,6 +4115,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   sandboxReconcileTimer.unref?.();
 
   await attachColdWorkflowRuns(cfg.larkAppId);
+
+  // v3 humanGate cold-attach: re-post pending gate cards + resume healed gates
+  // for runs OWNED BY THIS BOT (codex blocker #1 — owner filter, mirrors
+  // attachColdWorkflowRuns(cfg.larkAppId)).  Best-effort; never blocks startup.
+  await v3GateRunner.coldAttach(cfg.larkAppId).catch((err) => {
+    logger.warn(`[v3] cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
+  });
 
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot

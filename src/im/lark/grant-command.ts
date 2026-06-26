@@ -6,7 +6,7 @@
  */
 import { getOwnerOpenId, getBotOpenId, getBot } from '../../bot-registry.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
-import { stripLeadingMentions } from './message-parser.js';
+import { stripLeadingMentions, mentionOpenId } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPendingMulti } from './grant-pending.js';
 import { revokeGrant, addAllowedChatGroup, removeAllowedChatGroup } from '../../services/grant-store.js';
@@ -42,7 +42,7 @@ export function parseGrantTargets(message: any, botOpenId: string | undefined): 
   const seen = new Set<string>();
   const out: Array<{ openId: string; name: string }> = [];
   for (const x of (message?.mentions ?? [])) {
-    const oid = x?.id?.open_id;
+    const oid = mentionOpenId(x);
     if (!oid || oid === botOpenId || seen.has(oid)) continue;
     seen.add(oid);
     out.push({ openId: oid, name: x.name ?? oid });
@@ -60,7 +60,7 @@ function parseTextTargetsAfterCommand(
   const seen = new Set<string>();
   const out: Array<{ openId: string; name: string }> = [];
   for (const m of mentions) {
-    const oid = m?.id?.open_id;
+    const oid = mentionOpenId(m);
     if (!oid || oid === botOpenId || seen.has(oid)) continue;
     const key = m?.key;
     if (cmdIdx >= 0 && typeof key === 'string' && key.length > 0) {
@@ -155,7 +155,7 @@ export function isGrantTargetOnly(message: any, botOpenId: string | undefined): 
   try { content = JSON.parse(message?.content ?? '{}'); } catch { return false; }
 
   if (typeof content?.text === 'string') {
-    const key = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === botOpenId)?.key;
+    const key = (message?.mentions ?? []).find((m: any) => mentionOpenId(m) === botOpenId)?.key;
     if (!key) return false;
     const cmdIdx = content.text.search(/\/(?:grant|revoke)\b/i);
     const keyMatch = new RegExp(`${escapeRe(key)}(?!\\d)`).exec(content.text);

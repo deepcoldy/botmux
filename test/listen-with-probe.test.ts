@@ -10,7 +10,7 @@
  * Run: pnpm vitest run test/listen-with-probe.test.ts
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { createServer, type Server } from 'node:http';
+import { createServer, get, type Server } from 'node:http';
 import { listenWithProbe } from '../src/utils/listen-with-probe.js';
 
 const open: Server[] = [];
@@ -62,5 +62,58 @@ describe('listenWithProbe', () => {
       .catch(e => { err = e; });
     expect(err).not.toBeNull();
     expect(err!.code).toBe('EADDRINUSE');
+  });
+
+  it('releases a successfully-bound port that fails post-bind verification and steps up', async () => {
+    // A wildcard bind can succeed at the OS level yet be shadowed on loopback
+    // (someone else holds 127.0.0.1:port and wins loopback routing). verifyBound
+    // runs AFTER listen; returning false must close that binding and re-probe.
+    const tmp = mk();
+    const start = await rawListen(tmp, 0);
+    await new Promise<void>(r => tmp.close(() => r()));
+    open.splice(open.indexOf(tmp), 1);
+
+    const verified: number[] = [];
+    const logs: string[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '0.0.0.0',
+      // Reject the first port we land on, accept the next.
+      verifyBound: (p) => { verified.push(p); return verified.length > 1; },
+      log: m => logs.push(m),
+    });
+    expect(verified[0]).toBe(start);   // it really bound `start` before rejecting
+    expect(bound).toBe(start + 1);     // then released it and stepped up
+    expect(logs.join('\n')).toContain(`${start}`);
+  });
+
+  it('skips a loopback-shadowed wildcard port and binds where loopback reaches us', async () => {
+    // Realistic end-to-end: a "shadow" owns 127.0.0.1:sport and does NOT speak
+    // our self-check. Our server binds wildcard + verifies via a loopback nonce
+    // call. It must NOT settle on the shadowed port, and the port it DOES settle
+    // on must be one where a loopback request reaches us.
+    const NONCE = 'real-server-nonce-ok';
+    const shadow = createServer((_q, r) => { r.writeHead(404); r.end('not-us'); });
+    open.push(shadow);
+    const sport = await rawListen(shadow, 0);   // shadow holds 127.0.0.1:sport
+
+    const real = createServer((q, r) => {
+      if (q.url === '/__selfcheck') { r.writeHead(200); r.end(NONCE); return; }
+      r.writeHead(200); r.end('ok');
+    });
+    open.push(real);
+    const selfCheck = (p: number) => new Promise<boolean>((resolve) => {
+      const req = get({ host: '127.0.0.1', port: p, path: '/__selfcheck', agent: false }, (res) => {
+        let b = ''; res.setEncoding('utf8'); res.on('data', c => { b += c; });
+        res.on('end', () => resolve(res.statusCode === 200 && b === NONCE));
+      });
+      req.setTimeout(1500, () => { req.destroy(); resolve(false); });
+      req.on('error', () => resolve(false));
+    });
+
+    const bound = await listenWithProbe({ server: real, port: sport, host: '0.0.0.0', verifyBound: selfCheck });
+    expect(bound).not.toBe(sport);                 // did not settle on the shadowed port
+    expect(await selfCheck(bound)).toBe(true);     // loopback to the bound port reaches US
   });
 });

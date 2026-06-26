@@ -2,8 +2,9 @@ import * as sessionStore from '../services/session-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
-import { getBot } from '../bot-registry.js';
-import { getChatMode, sendMessage } from '../im/lark/client.js';
+import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getChatMode, sendMessage, type ChatMode } from '../im/lark/client.js';
+import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpContent, buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
@@ -56,11 +57,22 @@ export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string
   return lines.join('\n');
 }
 
+/** Whether a webhook external-event turn for this chat should open its own topic
+ *  + session (thread-scope) instead of folding into the group's one chat-scope
+ *  session. Mirrors the inbound @mention routing (event-dispatcher's
+ *  `regularGroupRouting`): a 话题群 always sessions per-topic, and a 普通群 only when
+ *  its reply mode is `new-topic`. The other 普通群 modes (chat / shared / chat-topic)
+ *  keep a top-level external event flat in the group chat-scope session, exactly
+ *  as they route a top-level @mention. Exported for unit tests. */
+export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode: ChatReplyMode): boolean {
+  return chatMode === 'topic' || regularGroupMode === 'new-topic';
+}
+
 function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string } | { ok: false; error: string } {
   const bot = getBot(larkAppId);
   const candidate =
     oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir ||
-    bot.config.defaultWorkingDir ||
+    effectiveDefaultWorkingDir(bot.config) ||
     bot.config.workingDir ||
     '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));
@@ -106,7 +118,16 @@ export async function triggerSessionTurn(
     return { ok: false, errorCode: 'bot_not_in_chat', error: `bot ${larkAppId} is not in chat ${chatId}` };
   }
 
-  if (!ds && !req.target.sessionId) {
+  // Mirror the inbound @ routing: a 普通群 in `new-topic` mode forks a fresh
+  // session per top-level event, so an external event must NOT fold into the
+  // group's chat-scope session. resolveRegularGroupMode is the same single source
+  // of truth event-dispatcher's regularGroupRouting reads — webhook delivery was
+  // the one path that ignored it. (A 话题群 keys its sessions by anchor message id,
+  // so its chat-scope key is never populated; the reuse lookup is already a no-op
+  // there and the scope branch below routes it per-topic via externalEventOpensOwnTopic
+  // regardless.) chat / shared / chat-topic keep folding, as they do for a top-level @.
+  const regularGroupMode = resolveRegularGroupMode(larkAppId, chatId);
+  if (!ds && !req.target.sessionId && regularGroupMode !== 'new-topic') {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
 
@@ -152,7 +173,7 @@ export async function triggerSessionTurn(
   const chatMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
   let scope: 'thread' | 'chat' = 'chat';
   let anchor = chatId;
-  if (chatMode === 'topic') {
+  if (externalEventOpensOwnTopic(chatMode, regularGroupMode)) {
     anchor = await sendMessage(larkAppId, chatId, t('trigger.external_event', { source: req.envelope.sourceName }, localeForBot(larkAppId)));
     scope = 'thread';
   }

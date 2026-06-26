@@ -58,8 +58,12 @@ export function workflowApprovalCardNonce(
   return `wf:${runId}:${activityId}:${attemptId}`;
 }
 
+// v2 (v0.2) workflow runs live at the legacy detail route now that the main
+// `#/workflows` URL belongs to the v3 runs page. v2 runs are not in the v3 runs
+// directory, so pointing these cards at `#/workflows/<id>` would 404 against
+// `/api/v3/runs/<id>`; `#/legacy-workflow/<id>` renders the v2 detail page.
 export function workflowRunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/workflows/${encodeURIComponent(runId)}`;
+  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/legacy-workflow/${encodeURIComponent(runId)}`;
 }
 
 export function getWorkflowApprovalCardContext(

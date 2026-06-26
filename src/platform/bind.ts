@@ -2,8 +2,10 @@
 // <blob> 是平台网页生成的自包含凭证（内含平台地址 + 绑定 token），
 // 因此本仓库源码里不出现任何平台域名。
 import { randomBytes } from 'node:crypto';
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
+import { join } from 'node:path';
 import { readPlatformBinding, writePlatformBinding } from './binding.js';
+import { callDashboard } from '../cli/dashboard-endpoint.js';
 
 /** 解码平台生成的 bind blob：base64url(JSON{u:平台地址, t:绑定token})。 */
 function decodeBindBlob(blob: string): { platformUrl: string; token: string } | null {
@@ -87,5 +89,18 @@ export async function cmdBind(args: string[]): Promise<void> {
 
   console.log(`✓ 已绑定到平台 ${platformUrl}`);
   console.log(`  机器名: ${name}`);
-  console.log('  运行 `botmux dashboard` 后，平台即可看到并打开这台机器的 dashboard。');
+
+  // 事件驱动：写完绑定后直接「捅一下」正在运行的 daemon（走其本地 /__cli HMAC 接口，
+  // 复用端口自发现），立即重连平台，无需重启、不轮询。没 daemon 在跑则跳过——下次启动自然读到绑定。
+  const poke = await callDashboard({
+    configDir: join(homedir(), '.botmux'),
+    defaultPort: 7891,
+    envPort: process.env.BOTMUX_DASHBOARD_PORT,
+    path: '/__cli/reload-binding',
+  });
+  if (poke.ok) {
+    console.log('  已通知运行中的 botmux 连接平台 ✓（无需重启）');
+  } else {
+    console.log('  未发现运行中的 botmux —— 启动它即可连接平台并在网页打开本机 dashboard。');
+  }
 }

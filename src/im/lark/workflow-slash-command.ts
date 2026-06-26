@@ -20,6 +20,13 @@ import type { BotSnapshot } from '../../workflows/events/payloads.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from '../../workflows/runtime.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 
+// v3 即兴 grill 引擎占用 /workflow 主语义。
+export const WORKFLOW_USAGE =
+  '用法：/workflow new <目标>（或直接 /workflow <目标>）——我会先拷问澄清需求，再自动编排成流程跑完。\n跑已存好的模板用 /template run <id>。';
+// 旧 /workflow run|cancel 软降级：仍能跑，但提示已改名（迁移期友好，不直接断老用户）。
+export const WORKFLOW_V2_RENAME_NOTICE =
+  '⚠️ /workflow run|cancel 已改名为 /template run|cancel（/workflow 现用于即兴 workflow）。本次仍照旧执行，请尽快改用 /template。';
+// v2「跑已存模板」引擎命令（/template run|cancel）出错时回显的用法（i18n，已随 C 方案改名）。
 function workflowUsage(locale?: Locale): string {
   return t('card.wf.usage', undefined, locale);
 }
@@ -29,6 +36,12 @@ export type WorkflowCommand =
   | { kind: 'run'; workflowId: string; rawParams: Record<string, string> }
   | { kind: 'cancel'; runId: string }
   | { kind: 'invalid'; error: string; usage: string };
+
+/** v3 grill 触发结果（仅 `/workflow` 命名空间，不含 run/cancel 那套 v2 子命令）。
+ *  `goal` = 用户描述的模糊目标，daemon 会转成触发 botmux-workflow skill 的 prompt。 */
+export type WorkflowGrillTrigger =
+  | { kind: 'goal'; goal: string }
+  | { kind: 'usage' };
 
 export type WorkflowRunCreatedInfo = {
   runId: string;
@@ -96,13 +109,62 @@ export type ExecuteWorkflowCommandInput = {
   initiator: string;
 };
 
+/**
+ * Parse the v3 grill trigger on the `/workflow` namespace.
+ *
+ *  - `/workflow new <目标>` / 裸 `/workflow <目标>` → `{ kind:'goal', goal }`
+ *  - `/workflow`（无目标）→ `{ kind:'usage' }`
+ *  - `/workflow run|cancel …` → `null`（那是 v2 模板的 legacy 入口，交给
+ *    `parseWorkflowCommand` 处理；这里刻意不吞）
+ *  - 非 `/workflow` → `null`
+ *
+ * 注意 word-boundary：`/workflowfoo` 不匹配（避免误吞别的命令）。
+ */
+export function parseWorkflowGrillTrigger(content: string): WorkflowGrillTrigger | null {
+  const trimmed = content.trim();
+  const m = /^\/workflow(?:\s+([\s\S]*))?$/.exec(trimmed);
+  if (!m) return null;
+  const tail = (m[1] ?? '').trim();
+  if (!tail) return { kind: 'usage' };
+  const firstTok = tail.split(/\s+/)[0];
+  // run/cancel 归 v2（legacy），不当作 grill 目标。
+  if (firstTok === 'run' || firstTok === 'cancel') return null;
+  // 显式 `new` 前缀可选：剥掉后剩下的就是目标；否则整段 tail 即目标。
+  const goal = firstTok === 'new' ? tail.slice(firstTok.length).trim() : tail;
+  if (!goal) return { kind: 'usage' };
+  return { kind: 'goal', goal };
+}
+
+/**
+ * 把用户 `/workflow new <目标>` 的目标包成一条触发 `botmux-workflow` skill 的
+ * prompt。daemon 用它改写消息内容后 fall-through 到正常 session 创建，让本话题
+ * 的 agent 接管整条 grill→编排→执行链路（daemon 自己不会拷问）。
+ */
+export function buildWorkflowGrillPrompt(goal: string): string {
+  return [
+    '[/workflow new] 用户通过 `/workflow new` 显式发起了一个即兴 workflow。',
+    '请使用 `botmux-workflow` skill 处理下面这个目标：直接进入 grill（用户已显式发起，"确认意图"那步可省略），',
+    '在当前飞书话题里一问一答澄清需求，然后自动编排成 DAG 流程并跑完。',
+    '',
+    `目标：${goal}`,
+  ].join('\n');
+}
+
 export function parseWorkflowCommand(content: string, locale?: Locale): WorkflowCommand | null {
   const trimmed = content.trim();
-  if (!trimmed.startsWith('/workflow')) return null;
-
   const parts = trimmed.split(/\s+/);
-  if (parts[0] !== '/workflow') return null;
+  const cmd = parts[0];
+  // v2 模板主入口 = /template；/workflow 仅保留 run|cancel 作 legacy 软降级
+  // （其余 /workflow 子命令是 v3 grill，由 parseWorkflowGrillTrigger 处理）。
+  const isTemplate = cmd === '/template';
+  const isLegacyWorkflow = cmd === '/workflow';
+  if (!isTemplate && !isLegacyWorkflow) return null;
   const sub = parts[1];
+  // /workflow 仅 run|cancel 作 legacy（其余 /workflow 子命令是 v3 grill）。legacy 与
+  // /template 解析结果相同——legacy 的「改名提示」由 daemon 从原始 content 判定，
+  // 这里不需要再带标记（单一检测来源，避免双重机制）。
+  if (isLegacyWorkflow && sub !== 'run' && sub !== 'cancel') return null;
+
   if (sub === 'cancel') {
     const runId = parts[2];
     if (!runId) return invalid(t('wf.err.missing_run_id', undefined, locale), locale);
@@ -156,13 +218,13 @@ export async function executeWorkflowCommand(
       return {
         handled: true,
         ok: false,
-        error: '/workflow cancel requires daemon runtime context',
+        error: '/template cancel requires daemon runtime context',
         usage: workflowUsage(locale),
       };
     }
     const result = await deps.cancelWorkflowRunFn(
       command.runId,
-      'cancelled via /workflow cancel',
+      'cancelled via /template cancel',
       { expectedChatId: input.chatId, by: input.initiator },
     );
     if (!result.ok) {

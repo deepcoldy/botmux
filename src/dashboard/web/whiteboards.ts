@@ -162,7 +162,15 @@ function pageHtml(enabled: boolean, rows: WhiteboardRow[], groupNames: GroupName
 }
 
 export async function renderWhiteboardsPage(root: HTMLElement): Promise<void> {
-  root.innerHTML = '<p class="empty">Loading whiteboards…</p>';
+  // 同步渲染一个稳定的宿主容器，三次 fetch 落地后只往这个「捕获到的子节点」里
+  // 写，绝不回写共享的 #root。这与其它异步页（overview/settings/skills）一致：
+  // 若用户在 fetch 期间切走，路由会用下一个页面替换 #root，本 host 随之脱离文档
+  // 树，迟到的写入落在已脱离的节点上（不可见），不会把白板的最终渲染状态盖到当前
+  // 页面上。快速「白板→他页→白板」也安全：每次渲染各自捕获一个 host，只有最新
+  // 那次的 host 仍挂在文档里，旧渲染只会写进自己那个已脱离的 host。
+  root.innerHTML = '<div data-whiteboards-host><p class="empty">Loading whiteboards…</p></div>';
+  const host = root.querySelector<HTMLElement>('[data-whiteboards-host]');
+  if (!host) return;
   const selectedId = decodeURIComponent((location.hash.match(/^#\/whiteboards\/([^/]+)/)?.[1] ?? '').trim());
   try {
     const [whiteboardsRes, groupsRes] = await Promise.all([
@@ -174,11 +182,11 @@ export async function renderWhiteboardsPage(root: HTMLElement): Promise<void> {
     const groupNames = await loadGroupNames(groupsRes);
     const rows: WhiteboardRow[] = Array.isArray(body.whiteboards) ? body.whiteboards : [];
     const selected = selectedId ? await loadSelectedBoard(selectedId, rows) : undefined;
-    root.innerHTML = pageHtml(body.enabled === true, rows, groupNames, selected);
-    wireBoardSelection(root, rows, groupNames);
-    wireDelete(root, selectedId);
+    host.innerHTML = pageHtml(body.enabled === true, rows, groupNames, selected);
+    wireBoardSelection(host, rows, groupNames);
+    wireDelete(host, selectedId);
   } catch (err: any) {
-    root.innerHTML = `<section class="page"><p class="hint-warn">加载白板失败：${escapeHtml(err?.message ?? String(err))}</p></section>`;
+    host.innerHTML = `<section class="page"><p class="hint-warn">加载白板失败：${escapeHtml(err?.message ?? String(err))}</p></section>`;
   }
 }
 

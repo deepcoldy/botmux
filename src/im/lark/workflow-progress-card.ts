@@ -60,7 +60,7 @@ const DEFAULT_MAX_INLINE_ROWS = 6;
 /**
  * Build the initial "starting" card body (no events past `runCreated`).
  *
- * Called once at IM-side `/workflow run` time so the user sees the tile
+ * Called once at IM-side `/template run` time so the user sees the tile
  * BEFORE the first `attemptCreated` lands — otherwise there's a multi-
  * second hole between "I sent the command" and "card shows up".
  */

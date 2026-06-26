@@ -29,6 +29,11 @@ export interface InheritOptions {
   chatId: string;
   chatType: 'group' | 'p2p';
   selfAppId: string;
+  /** Per-bot gate on the RECEIVING (self) bot: when false, this bot never
+   *  inherits a sibling bot's workingDir — it falls through to its own repo
+   *  card / default instead. Default true (undefined = on). Surfaced in the
+   *  dashboard as "bot@bot 同目录拉起". */
+  botToBotSameDir?: boolean;
 }
 
 export interface InheritedPeer {
@@ -51,6 +56,8 @@ function isValidPeerWorkingDir(workingDir: string): boolean {
 
 export function findInheritablePeer(opts: InheritOptions): InheritedPeer | null {
   const { scope, anchor, chatId, selfAppId } = opts;
+  // Receiving bot opted out of cross-bot same-dir inheritance → never inherit.
+  if (opts.botToBotSameDir === false) return null;
   const sameAnchorPeers = scope === 'thread'
     ? sessionStore.findActiveSessionsByRoot(anchor)
     : sessionStore.findActiveChatScopeSessionsByChat(chatId);

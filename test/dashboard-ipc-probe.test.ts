@@ -1,6 +1,6 @@
 /**
  * Regression: two botmux daemons on one machine that resolve the same IPC port
- * (e.g. both default to BOTMUX_DAEMON_IPC_BASE_PORT 7892 + idx 0) must NOT take
+ * (e.g. both default to BOTMUX_DAEMON_IPC_BASE_PORT 7950 + idx 0) must NOT take
  * each other down. Before the fix, startIpcServer did a single fixed-port
  * server.listen + server.once('error', reject); the daemon awaits it unguarded
  * (daemon.ts), so an EADDRINUSE rejected -> the WHOLE daemon crashed at startup.

@@ -102,7 +102,17 @@ export const config = {
     host: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
     port: Number(process.env.BOTMUX_DASHBOARD_PORT) || 7891,
     get externalHost() { return getDashboardExternalHost(); },
-    ipcBasePort: Number(process.env.BOTMUX_DAEMON_IPC_BASE_PORT) || 7892,
+    // Daemon IPC servers bind 127.0.0.1 at ipcBasePort + botIndex. This base MUST
+    // stay clear of the dashboard's wildcard probe-fallback range [port, port +
+    // listenWithProbe maxProbe (20)] = [7891, 7911]. When they overlapped (old
+    // default 7892, adjacent to 7891), a restart race let the dashboard bind
+    // 0.0.0.0:7892 while an IPC server held 127.0.0.1:7892 — on macOS both
+    // coexist, loopback routes to the IPC server, and the dashboard was 404 on the
+    // port it wrote to ~/.botmux/.dashboard-port. 7950 leaves a clean gap below
+    // the web-terminal proxy base (8800). The port is advertised per-daemon via
+    // the daemon descriptor (daemon.ts → desc.ipcPort), so nothing assumes it.
+    // Guarded by test/dashboard-ipc-port-range.test.ts.
+    ipcBasePort: Number(process.env.BOTMUX_DAEMON_IPC_BASE_PORT) || 7950,
     /** Public read-only mode (default ON): GET/HEAD surfaces — sessions,
      *  schedules, SSE — are reachable WITHOUT a token, so a stale dashboard
      *  link degrades to read-only browsing instead of a dead "link expired"

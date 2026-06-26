@@ -13,6 +13,13 @@ const APP = 'app-union-resolve-test';
 function stubClient(userGet: any, batchGetId?: any) {
   const st = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', botName: 'B' } as any);
   (st as any).client = {
+    // PR #310 routes contact.v3.user.get through the generic no-body c.request()
+    // (larkGet). Emulate that endpoint here and delegate to the same userGet stub
+    // so the assertions on path.user_id / params.user_id_type still hold.
+    request: async ({ url, params }: any) => {
+      const user_id = decodeURIComponent(String(url).split('/').pop());
+      return userGet({ path: { user_id }, params });
+    },
     contact: { v3: { user: {
       get: userGet,
       batchGetId: batchGetId ?? (async () => ({ code: 0, data: { user_list: [] } })),

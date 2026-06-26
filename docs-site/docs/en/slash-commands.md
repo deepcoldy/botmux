@@ -104,6 +104,16 @@ See [One-Click Session Group](/en/group) for details.
 
 `/subscribe-lark-doc <doc link>`: subscribe a Feishu doc — its comments feed into this session and the bot replies back into the comment thread · `/subscribe-lark-doc list` to view subscriptions · `/subscribe-lark-doc off` to unsubscribe. See [Feishu Doc Comment Entry](/en/doc-comment) for details.
 
+## 🔧 Workflow (orchestration, experimental)
+
+| Command | Description |
+|------|------|
+| `/workflow <goal>` (= `/workflow new <goal>`) | Start an **ad-hoc workflow**: the bot interrogates the requirement → auto-orchestrates a DAG → runs it concurrently after you confirm, with approval cards on risk nodes at execution time |
+| `/template run <id> [key=value ...]` | Run a saved workflow template (the old `/workflow run` was renamed to this) |
+| `/template cancel <runId>` | Cancel a template run (the old `/workflow cancel` was renamed to this) |
+
+See [Workflow](/en/workflow) for details.
+
 ## 👥 Multi-Bot Collaboration
 
 `@botA @botB /t <prompt>` (each opens a new topic) · `@botA @botB /introduce` (register each other's open_id)

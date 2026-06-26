@@ -18,6 +18,7 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { logger } from '../../utils/logger.js';
 import { UserTokenMissingError } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
+import type { CommentTriggerMode } from '../../services/doc-subs-store.js';
 
 /**
  * bot 回复的隐形哨兵：追加在 bot 发表的评论末尾（零宽字符，用户不可见）。
@@ -44,6 +45,33 @@ export function isBotAuthoredReply(id: string | undefined): boolean {
 }
 export function hasBotSentinel(text: string | undefined): boolean {
   return !!text && text.includes(BOT_REPLY_SENTINEL);
+}
+
+/**
+ * 触发范围闸：给定订阅的 `commentTriggerMode` + 触发评论正文 @ 到的 open_id 列表
+ * + 本 bot 自己的 open_id，判定这条评论是否应触发会话。
+ *
+ *   • 'all'          —— 该文档所有新评论都触发。
+ *   • 'mention-only' —— 仅当评论正文真的 @ 了「本 bot」才触发。
+ *
+ * ⚠️ 这里是用户报的 bug 的根因所在：mention-only **绝不能**用飞书评论事件里的
+ *   `is_mentioned` 字段判定。实测该字段含义是「这条评论里存在任意 @」——@ 了
+ *   别人（同事）时它同样为 true。早先用 `is_mentioned === true || …` 短路放行，
+ *   导致「只 @ 同事、没 @bot」的评论也被误触发，mention-only 形同虚设
+ *   （现象：「只有 @ 别人时才被触发」）。唯一可靠依据是拉到的评论正文
+ *   @person(open_id) 列表里是否含本 bot 自己的 open_id。
+ *
+ * `selfBotOpenId` 缺失（daemon 启动期 open_id 尚未探到）时一律判否：mention-only
+ *   宁可漏触发也不误触发。调用方应在此之前 `await ensureBotOpenId` 关掉该启动
+ *   竞态，避免把合法的 @bot 评论误丢（事件已被 ACK，飞书不会重投）。
+ */
+export function commentTriggerAllowed(
+  mode: CommentTriggerMode,
+  triggerMentions: string[],
+  selfBotOpenId: string | undefined,
+): boolean {
+  if (mode === 'all') return true;
+  return !!selfBotOpenId && triggerMentions.includes(selfBotOpenId);
 }
 
 /** 飞书云文档评论里富文本元素的最小子集（够 bot 发纯文本 + @人）。 */

@@ -513,7 +513,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/dashboard'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/insight', '/dashboard'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -1029,16 +1029,49 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('Claude'); // CLI display name
     });
 
-    it('renders the passthrough list straight from PASSTHROUGH_COMMANDS (no drift)', async () => {
+    it('renders the current bot effective passthrough list', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const b = defaultGetBot(id);
+        (b.config as any).customPassthroughCommands = ['/status', '/b@d', '/GOAL', '/export', '/goal'];
+        return b;
+      }) as any);
+      try {
+        const ds = makeDaemonSession();
+        const deps = makeDeps(ds);
+
+        await handleCommand('/help', ROOT_ID, makeLarkMessage('/help'), deps, LARK_APP_ID);
+
+        const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        const passthroughLine = replyContent.split('\n').find(line => line.startsWith('/compact ')) ?? '';
+        expect(passthroughLine).toBe([...resolvePassthroughCommands(LARK_APP_ID)].join(' '));
+        expect(passthroughLine).toContain('/goal');
+        expect(passthroughLine).toContain('/export');
+        expect(passthroughLine).not.toContain('/status');
+      } finally {
+        vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+      }
+    });
+
+    it('lists every fixed Feishu-executable slash command', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
 
       await handleCommand('/help', ROOT_ID, makeLarkMessage('/help'), deps, LARK_APP_ID);
 
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      // /help renders [...PASSTHROUGH_COMMANDS].join(' '); guard against anyone
-      // re-hardcoding a stale list that drifts from the set.
-      expect(replyContent).toContain([...PASSTHROUGH_COMMANDS].join(' '));
+      const fixedFeishuCommands = [
+        ...DAEMON_COMMANDS,
+        '/grant',
+        '/revoke',
+        '/introduce',
+        '/reply-mode',
+        '/workflow',
+        '/t',
+        '/topic',
+      ];
+      for (const cmd of fixedFeishuCommands) {
+        expect(replyContent, `Expected /help to mention ${cmd}`).toContain(cmd);
+      }
     });
 
     it('should return help text when no session exists', async () => {

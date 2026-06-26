@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { emitHookEventMock, forkMock, execSyncMock } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
@@ -123,6 +123,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 import { forkAdoptWorker, forkWorker, initWorkerPool } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { join } from 'node:path';
 
 function makeFakeWorker() {
   const worker = new EventEmitter() as any;
@@ -245,5 +249,61 @@ describe('session.start lifecycle integration', () => {
       'app_test',
       undefined,
     );
+  });
+});
+
+// PR #307: forkWorker back-fills the effective launch dir onto session.workingDir so
+// a sibling bot can inherit it (cross-bot same-dir, decoupled from oncall). The guards
+// are the correctness boundary — keep them covered.
+describe('forkWorker session.workingDir back-fill (cross-bot inherit enabler)', () => {
+  let tmp = '';
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'botmux-backfill-')); });
+  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  function initPool(getSessionWorkingDir: () => string) {
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir, getActiveCount: () => 1, closeSession: vi.fn() });
+  }
+
+  it('fills an EMPTY session.workingDir with the resolved effective dir + persists it', () => {
+    initPool(() => tmp);                 // resolves to an existing, non-home dir
+    const ds = makeDs();
+    ds.session.workingDir = undefined;   // default/fallback session — nothing pinned
+    forkWorker(ds, 'hi', false);
+    expect(ds.session.workingDir).toBe(tmp);
+    expect(vi.mocked(sessionStore.updateSession)).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('NEVER overwrites an already-pinned session.workingDir', () => {
+    initPool(() => tmp);                 // a different dir than the pin
+    const ds = makeDs();
+    ds.session.workingDir = '/pinned-repo';   // oncall/repo-card pinned
+    forkWorker(ds, 'hi', false);
+    expect(ds.session.workingDir).toBe('/pinned-repo');
+  });
+
+  it('NEVER pins the homedir crash-fallback when the resolved dir is missing', () => {
+    initPool(() => join(tmp, 'gone'));   // does not exist → forkWorker falls back to homedir()
+    const ds = makeDs();
+    ds.session.workingDir = undefined;
+    forkWorker(ds, 'hi', false);
+    expect(ds.session.workingDir).toBeFalsy();   // cwd(homedir) !== rawCwd(missing) → not persisted
+  });
+
+  it('NEVER pins a legitimately-resolved $HOME (a sibling must not inherit the home dir)', () => {
+    initPool(() => homedir());           // bot workingDir unset/~ → resolves to $HOME
+    const ds = makeDs();
+    ds.session.workingDir = undefined;
+    forkWorker(ds, 'hi', false);
+    expect(ds.session.workingDir).toBeFalsy();   // cwd === homedir() → excluded by guard
+  });
+
+  it('NEVER pins a SYMLINK that resolves to $HOME (realpath-compared)', () => {
+    const homeLink = join(tmp, 'homelink');
+    symlinkSync(homedir(), homeLink);    // a different textual path that realpaths to $HOME
+    initPool(() => homeLink);
+    const ds = makeDs();
+    ds.session.workingDir = undefined;
+    forkWorker(ds, 'hi', false);
+    expect(ds.session.workingDir).toBeFalsy();   // realpath(homeLink) === realpath($HOME) → excluded
   });
 });

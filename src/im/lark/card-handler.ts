@@ -22,6 +22,30 @@ import {
   isWorkflowApprovalAction,
   type WorkflowApprovalHandlerDeps,
 } from './workflow-card-handler.js';
+import {
+  handleV3GateAction,
+  isV3GateAction,
+  type V3GateCardHandlerDeps,
+} from './v3-gate-card-handler.js';
+import type { V3GateActionValue } from './v3-gate-card.js';
+import {
+  handleV3BlockedAction,
+  isV3BlockedAction,
+  type V3BlockedCardHandlerDeps,
+} from './v3-blocked-card-handler.js';
+import type { V3BlockedActionValue, V3AskAnswerActionValue } from './v3-blocked-card.js';
+import {
+  handleV3LoopGrantAction,
+  isV3LoopGrantAction,
+  type V3LoopGrantCardHandlerDeps,
+} from './v3-loop-grant-card-handler.js';
+import type { V3LoopGrantActionValue } from './v3-loop-grant-card.js';
+import {
+  handleV3RevisitGrantAction,
+  isV3RevisitGrantAction,
+  type V3RevisitGrantCardHandlerDeps,
+} from './v3-revisit-grant-card-handler.js';
+import type { V3RevisitGrantActionValue } from './v3-revisit-grant-card.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
@@ -51,6 +75,14 @@ export interface CardHandlerDeps {
   lastRepoScan: Map<string, ProjectInfo[]>;
   workflowApprovalDeps?: WorkflowApprovalHandlerDeps;
   workflowApprovalResolved?: (runId: string) => void | Promise<void>;
+  /** v3 humanGate 审批卡点击处理（driveRun 由 daemon 接的 v3 gate runner 提供）. */
+  v3GateDeps?: V3GateCardHandlerDeps;
+  /** v3 blocked 重试卡点击处理（同一个 runner 的 driveRun）. */
+  v3BlockedDeps?: V3BlockedCardHandlerDeps;
+  /** v3 loop 追加一轮卡点击处理（同一个 runner 的 driveRun）. */
+  v3LoopGrantDeps?: V3LoopGrantCardHandlerDeps;
+  /** v3 回溯预算准许卡点击处理（同一个 runner 的 driveRun）. */
+  v3RevisitGrantDeps?: V3RevisitGrantCardHandlerDeps;
 }
 
 /**
@@ -1044,6 +1076,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
+  // v3 humanGate 审批卡（独立 namespace，不混 v0.2 wait path）。**在通用 sensitive
+  // 权限门之前**处理（codex medium）：v3 卡 value 没有 root_id/session_id，通用门只能
+  // 用 chatId=undefined 做粗判，可能误拦；v3 自己的 `canResolve(binding, operator)`
+  // 才有 run binding 的 chatId，是权威权限门。
+  if (isV3GateAction(value?.action)) {
+    if (!deps.v3GateDeps) return;
+    return await handleV3GateAction(value as unknown as V3GateActionValue, operatorOpenId, deps.v3GateDeps);
+  }
+  if (isV3BlockedAction(value?.action)) {
+    if (!deps.v3BlockedDeps) return;
+    return await handleV3BlockedAction(
+      value as unknown as V3BlockedActionValue | V3AskAnswerActionValue,
+      operatorOpenId,
+      deps.v3BlockedDeps,
+      action?.form_value,
+    );
+  }
+  if (isV3RevisitGrantAction(value?.action)) {
+    if (!deps.v3RevisitGrantDeps) return;
+    return await handleV3RevisitGrantAction(value as unknown as V3RevisitGrantActionValue, operatorOpenId, deps.v3RevisitGrantDeps);
+  }
+  if (isV3LoopGrantAction(value?.action)) {
+    if (!deps.v3LoopGrantDeps) return;
+    return await handleV3LoopGrantAction(value as unknown as V3LoopGrantActionValue, operatorOpenId, deps.v3LoopGrantDeps);
+  }
+
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
@@ -1076,6 +1134,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
         logger.info(`Card action "${value.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
+        // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
+        // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
+        // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
+        if (value.action === 'get_write_link') {
+          return { toast: { type: 'warning', content: t('card.action.write_link_no_permission', undefined, localeForBot(effectiveAppId)) } };
+        }
         return;
       }
     } else {
@@ -1089,6 +1153,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         || bots.some(b => (b.config.globalGrants?.length ?? 0) > 0);
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
+        // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
+        if (value.action === 'get_write_link') {
+          return { toast: { type: 'warning', content: t('card.action.write_link_no_permission', undefined, localeForBot(larkAppId)) } };
+        }
         return;
       }
     }
@@ -1189,7 +1257,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
 
-    if (actionType === 'close' && ds) {
+    if (actionType === 'close') {
+      if (!ds) {
+        // 会话已不在 activeSessions（已关过 / 卡片过期 / daemon 重启丢失）——点「关闭
+        // 会话」却静默无反应会让人以为按钮坏了，给一条失败 toast（成功路径不弹，已关卡即反馈）。
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
       const botCfg = getBot(ds.larkAppId).config;
       // Build the closed card BEFORE killWorker/closeSession — it reads the
       // live session's identity off `ds`.
@@ -1439,6 +1512,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
         void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+        // 乐观回执：投递是异步的（话题群要先 ephemeral 失败再 DM，两次往返 await 容易
+        // 超过 2500ms 的 ACK 窗口而被丢弃），点完立即弹 toast，让用户知道链接已私密发出。
+        return { toast: { type: 'success', content: t('card.action.write_link_sent', undefined, locDs) } };
       } else {
         // 普通群发「仅自己可见」私密卡；话题群 / 单聊不支持 ephemeral，回退为同样内容的
         // 卡片回复（而非纯文本），三种场景都渲染成卡片，行为不变。
@@ -1452,7 +1528,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
     // from pre-screenshot cards and is mapped to toggle_display semantics.
-    if ((actionType === 'toggle_display' || actionType === 'toggle_stream') && ds) {
+    if (actionType === 'toggle_display' || actionType === 'toggle_stream') {
+      if (!ds) {
+        // 同 close：会话已不在线时「显示 / 隐藏输出」静默无反应 → 给失败 toast（成功不弹）。
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
       const clickedNonce: string | undefined = value?.card_nonce;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 

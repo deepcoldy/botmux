@@ -187,7 +187,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       </article>`;
     }
     const def = b.defaultOncall ?? { enabled: false, workingDir: '', since: 0 };
-    const enabled = !!def.enabled;
+    // 默认工作目录模式（三选一，dashboard 互斥）：oncall > default > off。
+    const wdMode = def.enabled ? 'oncall' : (b.defaultWorkingDir ? 'default' : 'off');
+    // 输入框预填「最可能的目录」：defaultWorkingDir 优先，否则 oncall 目录（disable 后仍保留），
+    // 便于来回切换模式不用重输。
+    const wdDirValue: string = b.defaultWorkingDir || def.workingDir || '';
     const name = b.botName ?? b.larkAppId;
     const cli = displayCliId(b, cliIdOf(b.larkAppId));
     return `<article class="bd-card bd-profile" data-appid="${escapeHtml(b.larkAppId)}">
@@ -207,22 +211,27 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="bd-body bd-grid">
         <section class="bd-tile">
           <section class="bd-section">
-            <h3 class="bd-section-title">${t('botDefaults.sectionOncall')}</h3>
-            <label class="toggle-row">
-              <input type="checkbox" data-action="toggle" ${enabled ? 'checked' : ''}>
-              <span class="switch" aria-hidden="true"></span>
-              <span class="toggle-tx"><strong>${t('botDefaults.defaultOncall')}</strong>
-              <small>${t('botDefaults.defaultOncallHelp')}。${t('botDefaults.warning')}</small></span>
-            </label>
+            <h3 class="bd-section-title">${t('botDefaults.sectionWorkingDir')}</h3>
             <div class="bd-row">
               <label>
-                <span>${t('botDefaults.workingDir')}</span>
+                <span>${t('botDefaults.workingDirMode')}</span>
+                <select data-input="workingDirMode">
+                  <option value="off" ${wdMode === 'off' ? 'selected' : ''}>${escapeHtml(t('botDefaults.workingDirModeOff'))}</option>
+                  <option value="default" ${wdMode === 'default' ? 'selected' : ''}>${escapeHtml(t('botDefaults.workingDirModeDefault'))}</option>
+                  <option value="oncall" ${wdMode === 'oncall' ? 'selected' : ''}>${escapeHtml(t('botDefaults.workingDirModeOncall'))}</option>
+                </select>
+              </label>
+              <small class="bd-help">${t('botDefaults.workingDirModeHelp')}</small>
+            </div>
+            <div class="bd-row" data-wd-dir-row ${wdMode === 'off' ? 'hidden' : ''}>
+              <label>
+                <span>${t('botDefaults.workingDirField')}</span>
                 <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux"
-                  value="${escapeHtml(def.workingDir ?? '')}" ${enabled ? '' : 'disabled'}>
+                  value="${escapeHtml(wdDirValue)}">
               </label>
             </div>
             <div class="actions">
-              <button type="button" class="primary" data-action="save">${t('botDefaults.save')}</button>
+              <button type="button" class="primary" data-action="save-working-dir">${t('botDefaults.save')}</button>
               <span class="oncall-status" data-status></span>
             </div>
             ${renderAutoStartControls(b)}
@@ -230,7 +239,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderLaunchShellSection(b)}${renderEnvSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -317,11 +326,14 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </section>`;
   }
 
-  // Two per-bot card-behaviour toggles. Both auto-save on change (no explicit
-  // save button — each checkbox PUTs immediately). The writable-link toggle is
-  // moot while the streaming card is disabled, so we disable it in that state.
+  // Per-bot card-behaviour toggles. Each auto-saves on change (no explicit save
+  // button — each checkbox PUTs immediately). Two are gated on the streaming-card
+  // state: the writable-link toggle is moot WHILE the card is disabled; the
+  // status-reactions toggle only matters WHILE the card is disabled (the ✋→✅
+  // reactions only appear in card-off sessions), so it's editable only then.
   function renderCardBehaviorSection(b: any): string {
     const disableStreaming = b.disableStreamingCard === true;
+    const silentReactions = b.silentTurnReactions === true;
     const writableLink = b.writableTerminalLinkInCard === true;
     const privateCard = b.privateCard === true;
     return `<section class="bd-section">
@@ -331,6 +343,12 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <span class="switch" aria-hidden="true"></span>
         <span class="toggle-tx"><strong>${t('botDefaults.disableStreaming')}</strong>
         <small>${t('botDefaults.disableStreamingHelp')}</small></span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-silent-reactions" ${silentReactions ? 'checked' : ''} ${disableStreaming ? '' : 'disabled'}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.silentTurnReactions')}</strong>
+        <small>${t('botDefaults.silentTurnReactionsHelp')}</small></span>
       </label>
       <label class="toggle-row">
         <input type="checkbox" data-action="toggle-writable-link" ${writableLink ? 'checked' : ''} ${disableStreaming ? 'disabled' : ''}>
@@ -351,15 +369,31 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </section>`;
   }
 
+  // bot@bot 同目录拉起 (cross-bot working-dir inheritance). Default ON. Auto-saves
+  // on change via the shared card-prefs PUT.
+  function renderCrossBotSection(b: any): string {
+    const sameDir = b.botToBotSameDir !== false;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionCrossBot')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-cross-bot-samedir" ${sameDir ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.botToBotSameDir')}</strong>
+        <small>${t('botDefaults.botToBotSameDirHelp')}</small></span>
+      </label>
+      <div class="actions"><span class="oncall-status" data-crossbot-status></span></div>
+    </section>`;
+  }
+
   // 会话模式：私聊（p2pMode）+ 普通群（regularGroupReplyMode）两个默认会话方式
   // 放在同一板块，各自一个下拉、一改即保存。
   //   • p2pMode             → PUT /api/bots/:appId/p2p-mode（走 applyConfigField，与 /botconfig 同路径）
   //   • 普通群默认模式 mode  → PUT /api/bots/:appId/card-prefs 的 regularGroupReplyMode
-  //                           （chat | new-topic | shared，默认 chat）
+  //                           （chat | chat-topic | new-topic | shared，默认 chat）
   // per-chat 的 /reply-mode 可覆盖此 per-bot 默认。
   function renderSessionModeSection(b: any): string {
     const p2p: string = b.p2pMode === 'chat' ? 'chat' : 'thread';
-    const regular: string = (b.regularGroupReplyMode === 'new-topic' || b.regularGroupReplyMode === 'shared')
+    const regular: string = (b.regularGroupReplyMode === 'new-topic' || b.regularGroupReplyMode === 'shared' || b.regularGroupReplyMode === 'chat-topic')
       ? b.regularGroupReplyMode : 'chat';
     const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never' || b.regularGroupMentionMode === 'ambient')
       ? b.regularGroupMentionMode : 'always';
@@ -390,6 +424,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           <span>${t('botDefaults.regularGroupMode')}</span>
           <select data-input="regularGroupMode">
             ${opt('chat', t('botDefaults.regularGroupModeChat'))}
+            ${opt('chat-topic', t('botDefaults.regularGroupModeChatTopic'))}
             ${opt('new-topic', t('botDefaults.regularGroupModeNewTopic'))}
             ${opt('shared', t('botDefaults.regularGroupModeShared'))}
           </select>
@@ -475,6 +510,25 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="actions">
         <button type="button" class="primary" data-action="save-startup-commands">${t('botDefaults.startupCommandsSave')}</button>
         <span class="oncall-status" data-startup-commands-status></span>
+      </div>
+    </div>`;
+  }
+
+  // 启动 shell launchShell：启动 CLI 用的 shell（zsh|bash|sh 或绝对路径），覆盖 $SHELL。
+  // 用于登录 $SHELL（如 bash）的 rc 文件里 `exec zsh` 跳转、导致 CLI 起不来的场景。
+  // next-session 生效。PUT /api/bot-launch-shell 落 bots.json。
+  function renderLaunchShellSection(b: any): string {
+    const val: string = typeof b.launchShell === 'string' ? b.launchShell : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionLaunchShell')}</h4>
+      <p class="bd-section-note">${t('botDefaults.launchShellHelp')}</p>
+      <input type="text" data-input="launchShell"
+        placeholder="${escapeHtml(t('botDefaults.launchShellPlaceholder'))}"
+        value="${escapeHtml(val)}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-launch-shell">${t('botDefaults.launchShellSave')}</button>
+        <span class="oncall-status" data-launch-shell-status></span>
       </div>
     </div>`;
   }
@@ -683,52 +737,55 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     listEl.querySelectorAll<HTMLElement>('.bd-card').forEach(card => {
       const appId = card.dataset.appid!;
       void ensureProfileRolesLoaded(appId, card);
-      const toggle = card.querySelector<HTMLInputElement>('input[data-action=toggle]');
+      // ── 默认工作目录模式（三选一互斥：off / default / oncall）─────────────────
+      const wdModeSel = card.querySelector<HTMLSelectElement>('select[data-input=workingDirMode]');
       const input = card.querySelector<HTMLInputElement>('input[data-input=workingDir]');
-      const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save]');
+      const wdDirRow = card.querySelector<HTMLElement>('[data-wd-dir-row]');
+      const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-working-dir]');
       const statusEl = card.querySelector<HTMLSpanElement>('[data-status]');
-      if (!toggle || !input || !saveBtn || !statusEl) return; // error card
+      if (!wdModeSel || !input || !saveBtn || !statusEl) return; // error card
 
-      toggle.addEventListener('change', () => {
-        input.disabled = !toggle.checked;
-        if (toggle.checked) input.focus();
+      // 选「关闭」隐藏目录输入框；选其它则显示并聚焦（off 不需要目录）。
+      wdModeSel.addEventListener('change', () => {
+        const off = wdModeSel.value === 'off';
+        if (wdDirRow) wdDirRow.hidden = off;
+        if (!off) input.focus();
       });
 
       saveBtn.addEventListener('click', async () => {
         statusEl.textContent = '';
         statusEl.className = 'oncall-status';
-        const enabled = toggle.checked;
+        const mode = wdModeSel.value;
         const workingDir = input.value.trim();
-        if (enabled && !workingDir) {
+        if (mode !== 'off' && !workingDir) {
           statusEl.textContent = t('botDefaults.required');
           statusEl.classList.add('hint-warn-inline');
           return;
         }
         saveBtn.disabled = true;
         try {
-          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/default-oncall`, {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/working-dir-mode`, {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ enabled, workingDir }),
+            body: JSON.stringify({ mode, workingDir }),
           });
           const body = await r.json().catch(() => ({}));
           if (r.ok && body.ok) {
             const resolvedNote = body.resolvedPath ? ` → ${body.resolvedPath}` : '';
-            statusEl.textContent = enabled
-              ? `✓ 已开启${resolvedNote}（未绑定的群下次开话题自动 oncall）`
-              : '✓ 已关闭（已绑定的群不动）';
+            statusEl.textContent = `✓ ${t('botDefaults.workingDirSaved')}${resolvedNote}`;
             statusEl.classList.add('hint-ok');
             // Patch in-cache snapshot so the next manual Refresh / filter
-            // rerender shows the new since/workingDir. We deliberately don't
-            // call rerender() here — that would rebuild the card and wipe the
-            // success toast the user just saw.
+            // rerender reflects the new mode. We deliberately don't call
+            // rerender() here — that would rebuild the card and wipe the toast.
             const cached = cache.bots.find((b: any) => b.larkAppId === appId);
-            if (cached && body.defaultOncall) cached.defaultOncall = body.defaultOncall;
-            // Update the visible "上次启用时间" line in-place so the user
-            // sees the timestamp jump without losing the toast.
+            if (cached) {
+              if (body.defaultOncall) cached.defaultOncall = body.defaultOncall;
+              cached.defaultWorkingDir = body.defaultWorkingDir ?? null;
+            }
+            // Oncall 模式 re-stamps `since` → reflect it in the meta line.
             const metaEl = card.querySelector<HTMLElement>('[data-oncall-since]');
             if (metaEl && body.defaultOncall?.since != null) {
-              metaEl.textContent = `上次启用时间：${fmtSince(body.defaultOncall.since)}`;
+              metaEl.textContent = `${t('botDefaults.lastEnabled')}: ${fmtSince(body.defaultOncall.since)}`;
             }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
@@ -793,6 +850,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
       // ── Card behaviour toggles (auto-save on change) ──────────────────────
       const disableStreamingCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-disable-streaming]');
+      const silentReactionsCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-silent-reactions]');
       const writableLinkCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-writable-link]');
       const privateCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-private-card]');
       const cardPrefStatusEl = card.querySelector<HTMLSpanElement>('[data-card-pref-status]');
@@ -824,8 +882,10 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
               cached.disableStreamingCard = body.disableStreamingCard;
+              cached.silentTurnReactions = body.silentTurnReactions;
               cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
               cached.privateCard = body.privateCard;
+              cached.botToBotSameDir = body.botToBotSameDir;
               cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
               cached.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
               cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
@@ -843,6 +903,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         } finally {
           // The writable-link checkbox stays disabled while streaming is off.
           if (selfEl === writableLinkCb) selfEl.disabled = !!disableStreamingCb?.checked;
+          // The status-reactions checkbox is only editable while streaming is off.
+          else if (selfEl === silentReactionsCb) selfEl.disabled = !disableStreamingCb?.checked;
           else selfEl.disabled = false;
         }
       }
@@ -852,8 +914,16 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           const off = disableStreamingCb.checked;
           // Streaming off → the writable-link toggle has nothing to attach to.
           if (writableLinkCb) writableLinkCb.disabled = off;
+          // Status reactions only exist in card-off sessions, so this toggle is
+          // editable only while streaming is off.
+          if (silentReactionsCb) silentReactionsCb.disabled = !off;
           if (cardPrefMootEl) cardPrefMootEl.hidden = !off;
           putCardPref({ disableStreamingCard: off }, disableStreamingCb);
+        });
+      }
+      if (silentReactionsCb) {
+        silentReactionsCb.addEventListener('change', () => {
+          putCardPref({ silentTurnReactions: silentReactionsCb.checked }, silentReactionsCb);
         });
       }
       if (writableLinkCb) {
@@ -864,6 +934,13 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (privateCardCb) {
         privateCardCb.addEventListener('change', () => {
           putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
+      const crossBotCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-cross-bot-samedir]');
+      const crossBotStatusEl = card.querySelector<HTMLSpanElement>('[data-crossbot-status]');
+      if (crossBotCb) {
+        crossBotCb.addEventListener('change', () => {
+          putCardPref({ botToBotSameDir: crossBotCb.checked }, crossBotCb, crossBotStatusEl);
         });
       }
 
@@ -1280,6 +1357,43 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             startupStatusEl.classList.add('hint-warn-inline');
           } finally {
             startupSaveBtn.disabled = false;
+          }
+        });
+      }
+
+      // ── 启动 shell launchShell（shell 名或绝对路径；空＝清除→回 $SHELL） ──────
+      const launchShellEl = card.querySelector<HTMLInputElement>('input[data-input=launchShell]');
+      const launchShellSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-launch-shell]');
+      const launchShellStatusEl = card.querySelector<HTMLSpanElement>('[data-launch-shell-status]');
+      if (launchShellEl && launchShellSaveBtn) {
+        launchShellSaveBtn.addEventListener('click', async () => {
+          if (!launchShellStatusEl) return;
+          launchShellStatusEl.textContent = '';
+          launchShellStatusEl.className = 'oncall-status';
+          launchShellSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/launch-shell`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ launchShell: launchShellEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              launchShellStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              launchShellStatusEl.classList.add('hint-ok');
+              const next: string = typeof body.launchShell === 'string' ? body.launchShell : '';
+              launchShellEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.launchShell = next;
+            } else {
+              launchShellStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              launchShellStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            launchShellStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            launchShellStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            launchShellSaveBtn.disabled = false;
           }
         });
       }

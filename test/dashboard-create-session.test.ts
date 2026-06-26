@@ -65,7 +65,12 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getOwnerOpenId: vi.fn(() => 'ou_owner'),
+  // oncall pin is per-bot now (resolveDashboardSpawnWorkingDir → findOncallChat).
+  findOncallChat: vi.fn(() => undefined),
   findOncallChatForAnyBot: vi.fn(() => undefined),
+  // Mirror the real helper: defaultWorkingDir, else enabled defaultOncall dir.
+  effectiveDefaultWorkingDir: vi.fn((cfg: any) =>
+    cfg?.defaultWorkingDir || (cfg?.defaultOncall?.enabled ? cfg.defaultOncall.workingDir : undefined) || undefined),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({ dashboardEventBus: { publish: vi.fn() } }));

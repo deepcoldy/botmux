@@ -10,8 +10,8 @@ import { renderRoleProfilesPage, renderRolesPage } from './roles.js';
 import { renderTeamFederationPage, renderTeamManagePage } from './team-federation.js';
 import { renderConnectorsPage } from './connectors.js';
 import { renderSettingsPage } from './settings.js';
+import { renderV3RunsPage } from './v3.js';
 import { renderWorkflowsPage } from './workflows.js';
-import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { renderOfficePage } from './office.js';
 import { renderWhiteboardsPage } from './whiteboards.js';
 import { renderInsightsPage } from './insights.js';
@@ -260,16 +260,25 @@ function route() {
     highlightNav(hash);
     return;
   }
-  // Catalog is a sub-route under Workflows now (`#/workflows/catalog[/<id>]`)
-  // so the top nav has a single "Workflows (beta)" entry.  Legacy
-  // `#/workflows-catalog[*]` URLs are kept working for any external links
-  // that may have been pasted before the move.
-  if (
-    hash.startsWith('#/workflows/catalog') ||
-    hash.startsWith('#/workflows-catalog')
-  ) {
-    pageDispose = renderWorkflowCatalogPage(root);
-  } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  // The "工作流" nav now points at the v3 runs page (#/workflows). The v2 (v0.2)
+  // engine is kept (backend + Feishu cards), so its run-detail page survives at
+  // the dedicated #/legacy-workflow route (where v2 cards now link). Legacy URL
+  // upkeep so old bookmarks/pasted links don't 404:
+  //   - `#/v3[/<id>]`                                 → `#/workflows[/<id>]` (v3 promoted)
+  //   - `#/workflows/catalog`, `#/workflows-catalog`  → `#/workflows` (v2 catalog gone)
+  if (hash.startsWith('#/legacy-workflow')) {
+    pageDispose = renderWorkflowsPage(root);
+  } else if (hash.startsWith('#/v3')) {
+    window.location.replace(`#/workflows${hash.slice('#/v3'.length)}`);
+    return;
+  } else if (/^#\/workflows(?:\/|-)catalog(?:[/?].*)?$/.test(hash)) {
+    // Bounded match (NOT startsWith): a v3 runId can begin with "catalog"
+    // (goal slug → `catalog-all-open-prs-…`), and `#/workflows/catalog-…`
+    // must open that run's detail, not bounce to the list.
+    window.location.replace('#/workflows');
+    return;
+  }
+  else if (hash.startsWith('#/workflows')) pageDispose = renderV3RunsPage(root);
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/settings')) void renderSettingsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);

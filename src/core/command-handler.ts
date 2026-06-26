@@ -2676,12 +2676,15 @@ export async function handleCommand(
       }
 
       case '/help': {
-        const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
+        const helpAppId = ds?.larkAppId ?? larkAppId;
+        const botCfg = ds ? getBot(ds.larkAppId).config : (helpAppId ? getBot(helpAppId).config : getAllBots()[0]?.config);
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
+        const passthroughCommands = [...resolvePassthroughCommands(helpAppId)];
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
           t('help.restart', { cliName }, loc),
+          t('help.topic', undefined, loc),
           t('help.cd', { cliName }, loc),
           t('help.repo_list', undefined, loc),
           t('help.repo_n', undefined, loc),
@@ -2690,11 +2693,14 @@ export async function handleCommand(
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
+          t('help.dashboard', undefined, loc),
+          t('help.insight', undefined, loc),
+          t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
-          // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移
-          [...PASSTHROUGH_COMMANDS].join(' '),
+          // 展示当前 bot 实际生效的透传集合：固定白名单 + adapter 默认 + 有效自定义项。
+          passthroughCommands.join(' '),
           '',
           t('help.heading_schedule', undefined, loc),
           t('help.schedule_create', undefined, loc),
@@ -2710,9 +2716,26 @@ export async function handleCommand(
           t('help.adopt_pane', undefined, loc),
           t('help.detach', undefined, loc),
           '',
+          t('help.heading_collab', undefined, loc),
+          t('help.introduce', undefined, loc),
+          t('help.relay', undefined, loc),
+          t('help.relay_create', undefined, loc),
+          '',
           t('help.heading_login', undefined, loc),
           t('help.login', undefined, loc),
           t('help.login_status', undefined, loc),
+          t('help.pair', undefined, loc),
+          '',
+          t('help.heading_workflow', undefined, loc),
+          t('help.workflow_run', undefined, loc),
+          t('help.workflow_cancel', undefined, loc),
+          '',
+          t('help.heading_role', undefined, loc),
+          t('help.role_show', undefined, loc),
+          t('help.role_set', undefined, loc),
+          t('help.role_team', undefined, loc),
+          t('help.role_cap', undefined, loc),
+          t('help.role_profile', undefined, loc),
           '',
           t('help.heading_oncall', undefined, loc),
           t('help.oncall_bind', undefined, loc),
@@ -2726,6 +2749,8 @@ export async function handleCommand(
           t('help.heading_config', undefined, loc),
           t('help.config_get', undefined, loc),
           t('help.config_set', undefined, loc),
+          t('help.skills', undefined, loc),
+          t('help.reply_mode', undefined, loc),
           '',
           t('help.heading_group', undefined, loc),
           t('help.group', undefined, loc),

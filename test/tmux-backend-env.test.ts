@@ -27,6 +27,7 @@ import {
   buildDebugKeepShellScript,
   DIAGNOSTIC_SHELL_SCRIPT,
   resolveUserShell,
+  resolveShellOverride,
   SHELL_WRAPPER_SCRIPT,
 } from '../src/adapters/backend/tmux-backend.js';
 
@@ -274,6 +275,65 @@ describe('resolveUserShell()', () => {
     const spec = resolveUserShell({ SHELL: bogus });
     expect(spec.shell).not.toBe(bogus);
     expect(['/bin/zsh', '/bin/bash', '/bin/sh']).toContain(spec.shell);
+  });
+
+  it('launchShell override (absolute path) wins over $SHELL', () => {
+    // The escape hatch for a login $SHELL whose rcfile exec-trampolines into
+    // another shell: pinning launchShell launches the CLI under it directly.
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const bash = join(tmpDir, 'bash');
+    const zsh = join(tmpDir, 'zsh');
+    writeFileSync(bash, '#!/bin/sh\nexec "$@"\n'); chmodSync(bash, 0o755);
+    writeFileSync(zsh, '#!/bin/sh\nexec "$@"\n'); chmodSync(zsh, 0o755);
+    const spec = resolveUserShell({ SHELL: bash }, zsh);
+    expect(spec.shell).toBe(zsh);
+    expect(spec.flags).toEqual(['-l', '-i']);  // zsh-flavoured, not bash's ['-i']
+  });
+
+  it('falls back to $SHELL when the launchShell override is not found/executable', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const bash = join(tmpDir, 'bash');
+    writeFileSync(bash, '#!/bin/sh\nexec "$@"\n'); chmodSync(bash, 0o755);
+    const spec = resolveUserShell({ SHELL: bash }, '/no/such/zsh');
+    expect(spec.shell).toBe(bash);
+    expect(spec.flags).toEqual(['-i']);
+  });
+});
+
+describe('resolveShellOverride()', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) { rmSync(tmpDir, { recursive: true, force: true }); tmpDir = undefined; }
+  });
+
+  it('resolves an absolute path and classifies its flags', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const zsh = join(tmpDir, 'zsh');
+    writeFileSync(zsh, '#!/bin/sh\nexec "$@"\n'); chmodSync(zsh, 0o755);
+    const spec = resolveShellOverride(zsh);
+    expect(spec?.shell).toBe(zsh);
+    expect(spec?.flags).toEqual(['-l', '-i']);
+  });
+
+  it('resolves a bare name from the conventional locations (or null if absent)', () => {
+    // bash/sh exist on essentially every CI image; assert the spec is sane when found.
+    const spec = resolveShellOverride('sh');
+    if (spec) {
+      expect(spec.shell.endsWith('/sh')).toBe(true);
+      expect(spec.flags).toEqual([]);
+    }
+  });
+
+  it('returns null for a non-existent override and for a blank string', () => {
+    expect(resolveShellOverride('/no/such/shell-xyz')).toBeNull();
+    expect(resolveShellOverride('   ')).toBeNull();
+  });
+
+  it('returns null (ignored) for an unsupported shell like fish', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const fish = join(tmpDir, 'fish');
+    writeFileSync(fish, '#!/bin/sh\nexec "$@"\n'); chmodSync(fish, 0o755);
+    expect(resolveShellOverride(fish)).toBeNull();
   });
 });
 

@@ -25,16 +25,19 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
   return {
     ...base,
     defaultOncall: j?.defaultOncall,
+    defaultWorkingDir: typeof j?.defaultWorkingDir === 'string' ? j.defaultWorkingDir : null,
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     brandLabel: j?.brandLabel ?? null,
     sandbox: j?.sandbox === true,
     disableStreamingCard: j?.disableStreamingCard === true,
+    silentTurnReactions: j?.silentTurnReactions === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
+    botToBotSameDir: j?.botToBotSameDir !== false,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
-    regularGroupReplyMode: (j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared')
+    regularGroupReplyMode: (j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared' || j?.regularGroupReplyMode === 'chat-topic')
       ? j.regularGroupReplyMode
       : 'chat',
     regularGroupMentionMode: (j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never' || j?.regularGroupMentionMode === 'ambient')

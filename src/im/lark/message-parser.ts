@@ -27,10 +27,48 @@ interface RawEventData {
     mentions?: Array<{
       key: string;       // e.g. "@_user_1"
       name: string;      // display name
-      id?: { open_id?: string; user_id?: string; union_id?: string };
+      // Two shapes exist in the wild. The WS event (im.message.receive_v1)
+      // delivers an OBJECT: { open_id, union_id, user_id }. The REST API
+      // (im.message.get / list) delivers a bare STRING ("ou_xxx") plus a
+      // sibling `id_type`. Always read the open_id via mentionOpenId() so both
+      // forms are handled — see its doc-comment for why this matters.
+      id?: { open_id?: string; user_id?: string; union_id?: string } | string;
+      id_type?: string;  // present only in the REST string form, e.g. "open_id"
       tenant_key?: string;
     }>;
   };
+}
+
+/**
+ * Extract a mention's open_id, tolerating BOTH Lark shapes for `mention.id`:
+ *
+ *   - WebSocket event (im.message.receive_v1): `id` is an OBJECT
+ *       { open_id, union_id, user_id }            ← what botmux has always seen
+ *   - Message REST API (im.message.get / list):  `id` is a bare STRING "ou_xxx"
+ *       with a sibling `id_type` ("open_id" | "union_id" | "user_id")
+ *
+ * The two diverged in production: the API already ships the flat-string form
+ * while the event still ships the object form. If Lark ever converges the event
+ * onto the string form, every `m.id.open_id` read across botmux would silently
+ * become `undefined` and @-detection (isBotMentioned) would fail closed with no
+ * log. Reading through this helper keeps every caller robust regardless of
+ * which shape arrives.
+ *
+ * For the string form we return the value only when it actually IS an open_id
+ * (id_type === 'open_id', or absent — mentions are open_id-keyed by default). A
+ * string carrying a non-open_id id_type (union_id / user_id, which Lark may
+ * return when the app lacks the open_id scope) yields `undefined` rather than
+ * being mis-compared against a botOpenId.
+ */
+export function mentionOpenId(m: { id?: { open_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+  const id = m?.id;
+  if (id == null) return undefined;
+  if (typeof id === 'object') return id.open_id || undefined;
+  if (typeof id === 'string') {
+    if (m?.id_type && m.id_type !== 'open_id') return undefined;
+    return id || undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -271,7 +309,7 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
       ? message.mentions.map(m => ({
           key: m.key,
           name: m.name,
-          openId: m.id?.open_id,
+          openId: mentionOpenId(m),
         }))
       : undefined;
 

@@ -37,6 +37,7 @@ export interface ResolvedDashboardSettingsView {
   openTerminalInFeishu: boolean;
   maintenance: MaintenanceConfig;
   localDevInstall: boolean;
+  remoteAccess?: boolean;
 }
 
 export type ParseMaintenanceResult =
@@ -99,6 +100,7 @@ export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
   | 'invalid_repoPickerMode'
+  | 'invalid_remoteAccess'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
@@ -155,6 +157,14 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_repoPickerMode' };
     }
     deps.mergeGlobalConfig({ repoPickerMode: v });
+    touched = true;
+  }
+
+  if ('remoteAccess' in obj) {
+    if (typeof obj.remoteAccess !== 'boolean') {
+      return { ok: false, error: 'invalid_remoteAccess' };
+    }
+    deps.mergeGlobalConfig({ remoteAccess: obj.remoteAccess });
     touched = true;
   }
 

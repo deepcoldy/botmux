@@ -259,7 +259,7 @@ export class TmuxBackend implements SessionBackend {
       //     session env (visible to the shell), which means the user's rcfile
       //     could `unset` or `export` over it before the CLI sees it. env(1)
       //     injection happens after rcfile load and is authoritative.
-      const shellSpec = resolveUserShell();
+      const shellSpec = resolveUserShell(process.env, opts.launchShell);
       const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
       // Debug knob — when on, the wrapper does NOT `exec` the CLI; it runs the
       // CLI as a child and then drops into an interactive `$shell -i` so the
@@ -739,8 +739,45 @@ function isExecutable(path: string): boolean {
 }
 
 /**
+ * Resolve a per-bot `launchShell` override (BotConfig.launchShell) to an
+ * absolute, executable, classifiable shell path. Accepts either an absolute
+ * path (`/usr/bin/zsh`) or a bare name (`zsh`) — the latter is searched in the
+ * conventional shell locations. Returns null when the override can't be honored
+ * (not found / not executable / unsupported syntax like fish), so the caller
+ * falls back to the normal `$SHELL` resolution with a warning.
+ *
+ * The override is the escape hatch for users whose login `$SHELL` (e.g. bash)
+ * has an rcfile that `exec`-trampolines into another shell: pinning
+ * `launchShell: zsh` makes botmux launch the CLI under zsh directly, sidestepping
+ * the bash `.bashrc` `exec zsh` entirely. (Caveat surfaced in docs: PATH/nvm/pnpm
+ * must then live in the pinned shell's rcfiles, not the bypassed one.)
+ */
+export function resolveShellOverride(override: string): ShellSpec | null {
+  const raw = override.trim();
+  if (!raw) return null;
+  const candidates = raw.includes('/')
+    ? [raw]
+    : [`/bin/${raw}`, `/usr/bin/${raw}`, `/usr/local/bin/${raw}`, `/opt/homebrew/bin/${raw}`];
+  for (const candidate of candidates) {
+    if (!isExecutable(candidate)) continue;
+    const kind = classifyShell(candidate);
+    if (!kind) {
+      logger.warn(
+        `[tmux-backend] launchShell=${override} resolved to ${candidate} which is not bash/zsh/sh; ` +
+        `ignoring override (our POSIX wrapper would break under it).`,
+      );
+      return null;
+    }
+    return specForKind(candidate, kind);
+  }
+  logger.warn(`[tmux-backend] launchShell=${override} not found/executable; ignoring override.`);
+  return null;
+}
+
+/**
  * Pick a shell to wrap the CLI launch in, returning the binary path plus the
- * exact argv flags needed for its rcfiles to load. Tries `$SHELL` first, then
+ * exact argv flags needed for its rcfiles to load. A per-bot `launchShell`
+ * override wins when it resolves; otherwise tries `$SHELL` first, then
  * `/bin/zsh` → `/bin/bash` → `/bin/sh`.
  *
  * If `$SHELL` is fish/nu/csh/etc., emits a warning and falls back to a POSIX
@@ -754,7 +791,12 @@ function isExecutable(path: string): boolean {
  * than good. If `/bin/sh` is also missing, tmux's own spawn will fail with
  * a clear message.
  */
-export function resolveUserShell(env: NodeJS.ProcessEnv = process.env): ShellSpec {
+export function resolveUserShell(env: NodeJS.ProcessEnv = process.env, override?: string): ShellSpec {
+  if (override) {
+    const spec = resolveShellOverride(override);
+    if (spec) return spec;
+    // override unusable (not found / unsupported) → fall through to $SHELL.
+  }
   const userShell = env.SHELL;
   if (userShell && isExecutable(userShell)) {
     const kind = classifyShell(userShell);

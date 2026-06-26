@@ -322,7 +322,7 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 ### Workflow
 
 1. Send a message in a Lark topic group to create a new thread; or in a regular group send `/t <prompt>` to force-open a new topic
-2. The bot shows a repo selection card — pick a project or click "Start directly" (chats bound via `/oncall bind` skip this step)
+2. The bot shows a repo selection card — pick a project or click "Start directly" (a bot bound via `/oncall bind` skips this step; binding is per-bot)
 3. The CLI spawns in the selected directory
 4. A live streaming card appears in the thread, showing real-time terminal output with markdown rendering
 5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state

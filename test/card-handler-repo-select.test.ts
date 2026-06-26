@@ -122,7 +122,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker, deliverEphemeralOrReply } from '../src/core/worker-pool.js';
+import { forkWorker, killWorker, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
 import { getAvailableBots } from '../src/core/session-manager.js';
 import { createSession, closeSession } from '../src/services/session-store.js';
 import { createRepoWorktree, removeRepoWorktree } from '../src/services/git-worktree.js';
@@ -654,6 +654,25 @@ describe('repo select card — worktree open', () => {
     expect(res?.toast).toBeUndefined();                // sensitive gate blocks silently (logs only)
     expect(vi.mocked(applyConfigField)).not.toHaveBeenCalled(); // no bot-config write
     expect(vi.mocked(deleteMessage)).not.toHaveBeenCalled();
+  });
+
+  it('get_write_link 破例：非 operator 点击得到「无操作权限」toast，而非像其它敏感动作那样静默', async () => {
+    // 与上面的 worktree_toggle_mode 对照：敏感门控默认静默 block（仅日志），但
+    //「获取操作链接」是用户主动点的取权动作，静默会让人以为按钮坏了 —— 破例给提示。
+    const ds = makeDs({ worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValueOnce(false); // non-operator
+    const event = {
+      operator: { open_id: 'ou_stranger' },
+      action: { value: { action: 'get_write_link', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('warning');
+    expect(res?.toast?.content).toContain('没有操作权限');
+    expect(vi.mocked(deliverWriteLinkCard)).not.toHaveBeenCalled(); // 门控就拦下，未投递
   });
 
   it('rolls back already-created worktrees when a later repo in the batch fails', async () => {

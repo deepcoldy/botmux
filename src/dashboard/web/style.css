@@ -3121,6 +3121,17 @@ input.row-select,
 .wf-terminal-frame { display: block; width: 100%; height: 460px; border: 0; border-top: 1px solid var(--border); background: #0d1117; }
 .wf-error-msg { display: block; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 
+/* v3 per-node terminal panel (live iframe / replay) */
+.v3-terminal-panel { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: #0d1117; }
+.v3-terminal-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 12px; }
+.v3-terminal-head .muted { margin-left: 0; }
+.v3-terminal-head .btn-link { margin-left: auto; }
+.v3-terminal-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); }
+.v3-terminal-dot.live { background: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,0.25); }
+.v3-terminal-dot.replay { background: #f9ab00; }
+.v3-terminal-dot.closed { background: #188038; }
+.v3-terminal-empty { padding: 1.5rem 0.75rem; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
+
 /* Workflow catalog */
 .catalog-head, .catalog-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.8rem; margin-bottom: 0.8rem; }
 .catalog-head h2, .catalog-detail-head h2 { margin: 0 0 0.15rem; font-size: 18px; line-height: 1.25; }
@@ -6919,6 +6930,218 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
   .skin-intro { display: none; }
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   v3 runs page — "flight recorder" visual language (v3.ts).
+   Status hues derive from theme tokens so light/dark/skins all inherit;
+   gateWaiting gets its own violet (approval ≠ blocked).  All motion is
+   CSS-only and disabled under prefers-reduced-motion.
+   (`.v3-terminal-*` above is the codex-owned terminal slot — untouched.)
+   ════════════════════════════════════════════════════════════════════════ */
+:root {
+  --v3r-pending: var(--faint);
+  --v3r-running: var(--accent);
+  --v3r-done: var(--success);
+  --v3r-blocked: var(--warning);
+  --v3r-failed: var(--danger);
+  --v3r-gate: #7c5cd6;
+  /* edge-activation: 分支未选中的中性终态 — 比 pending 更"收起"，绝不能像
+     失败（它是 by-design 的非事件） */
+  --v3r-skipped: var(--faint);
+}
+:root[data-theme="dark"] { --v3r-gate: #a78bfa; }
+
+.v3r-title { display: inline-block; margin-left: .5rem; font-family: var(--mono); font-size: 1.18rem; letter-spacing: -0.01em; }
+.v3r-runid { font-family: var(--mono); font-size: 12.5px; }
+
+/* status pill — shared by list rows, panel header, run badge */
+.v3r-pill {
+  display: inline-flex; align-items: center; gap: .38em;
+  padding: .14em .62em; border-radius: 999px;
+  font-size: 12px; font-weight: 600; line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  background: color-mix(in srgb, var(--ns, var(--muted)) 14%, transparent);
+  color: var(--ns, var(--muted));
+  border: 1px solid color-mix(in srgb, var(--ns, var(--muted)) 32%, transparent);
+}
+.v3r-pill .dot, .v3r-inst .dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--ns, var(--muted));
+}
+.st-pending     { --ns: var(--v3r-pending); }
+.st-running     { --ns: var(--v3r-running); }
+.st-gateWaiting { --ns: var(--v3r-gate); }
+.st-done        { --ns: var(--v3r-done); }
+.st-skipped     { --ns: var(--v3r-skipped); }
+.st-cancelled   { --ns: var(--v3r-skipped); }
+.st-blocked     { --ns: var(--v3r-blocked); }
+.st-failed      { --ns: var(--v3r-failed); }
+/* skipped 整体降透明度 + 虚线盒 — 一眼读出"这条路没走"，与 pending 区分 */
+.v3r-node.st-skipped, .v3r-node.st-cancelled { opacity: .55; }
+.v3r-node.st-skipped .v3r-box, .v3r-node.st-cancelled .v3r-box { stroke-dasharray: 4 3; }
+.rs-running   { --ns: var(--v3r-running); }
+.rs-succeeded { --ns: var(--v3r-done); }
+.rs-blocked   { --ns: var(--v3r-blocked); }
+.rs-failed    { --ns: var(--v3r-failed); }
+
+.v3r-wrap { display: flex; flex-direction: column; gap: 1rem; align-items: stretch; }
+.v3r-graph-card {
+  border: 1px solid var(--border); border-radius: 10px;
+  background:
+    radial-gradient(circle, color-mix(in srgb, var(--fg) 7%, transparent) 1px, transparent 1px) 0 0 / 22px 22px,
+    var(--surface);
+}
+.v3r-graph { max-height: 48vh; overflow: auto; }
+.v3r-legend {
+  display: flex; flex-wrap: wrap; gap: .9rem; align-items: center;
+  padding: .45rem .9rem; border-top: 1px solid var(--border-soft);
+  font-size: 11.5px; color: var(--muted);
+}
+.v3r-legend .lg { display: inline-flex; align-items: center; gap: .35em; }
+.v3r-legend .lg::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ns, var(--muted));
+}
+.v3r-legend .lg-loop::before { content: none; }
+.v3r-legend .lg-loop { font-family: var(--mono); }
+
+/* ── graph nodes (SVG) ── */
+.v3r-node { cursor: pointer; }
+.v3r-node .v3r-box {
+  fill: color-mix(in srgb, var(--ns) 9%, var(--surface-raised));
+  stroke: color-mix(in srgb, var(--ns) 52%, var(--border));
+  stroke-width: 1.2;
+  transition: fill .2s ease, stroke .2s ease;
+}
+.v3r-node:hover .v3r-box { fill: color-mix(in srgb, var(--ns) 16%, var(--surface-raised)); }
+.v3r-node.sel .v3r-box { stroke: var(--accent-strong); stroke-width: 2; }
+.v3r-node .v3r-bar { fill: var(--ns); }
+.v3r-node .v3r-nid {
+  fill: var(--fg); font-family: var(--mono); font-size: 12px; font-weight: 600;
+}
+.v3r-node .v3r-nstatus {
+  fill: var(--ns); font-size: 10.5px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.v3r-node.st-running .v3r-box { animation: v3r-breathe 2.2s ease-in-out infinite; }
+
+/* loop capsule: dashed outer frame = composite-container affordance */
+.v3r-loopnode .v3r-cap {
+  fill: none; stroke: color-mix(in srgb, var(--ns) 45%, var(--border));
+  stroke-width: 1.2; stroke-dasharray: 5 4;
+}
+.v3r-loopnode.sel .v3r-cap { stroke: var(--accent-strong); stroke-dasharray: none; }
+.v3r-spin {
+  fill: var(--ns); font-size: 13px; font-weight: 700;
+  transform-box: fill-box; transform-origin: center;
+}
+.st-running .v3r-spin { animation: v3r-spin 2.4s linear infinite; }
+.v3r-dot.done { fill: var(--ns); }
+.v3r-dot.cur  { fill: var(--ns); stroke: color-mix(in srgb, var(--ns) 40%, transparent); stroke-width: 3; }
+.v3r-dot.cur.live { animation: v3r-breathe 1.4s ease-in-out infinite; }
+.v3r-dot.todo { fill: none; stroke: var(--faint); stroke-width: 1.2; }
+.v3r-dot.grant { stroke: var(--accent-strong); stroke-width: 1.6; }
+.v3r-dot.grant.done, .v3r-dot.grant.cur { fill: var(--accent-strong); }
+.v3r-dots-verdict { font-size: 11px; font-weight: 700; }
+.v3r-dots-verdict.ok { fill: var(--v3r-done); }
+.v3r-dots-verdict.warn { fill: var(--v3r-blocked); }
+
+/* edges: quiet by default, marching-ants into live nodes */
+.v3r-edge { fill: none; stroke: color-mix(in srgb, var(--fg) 26%, transparent); stroke-width: 1.5; }
+.v3r-edge.live {
+  stroke: var(--v3r-running); stroke-width: 1.8;
+  stroke-dasharray: 6 5; animation: v3r-flow 0.9s linear infinite;
+}
+
+/* ── node panel ── */
+.v3r-panel {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 1rem; background: var(--surface);
+}
+.v3r-panel-head { display: flex; align-items: center; gap: .6rem; margin-bottom: .55rem; }
+.v3r-loop-mark { font-size: 17px; font-weight: 700; color: var(--accent); }
+.v3r-nodeid { font-family: var(--mono); font-size: 15px; font-weight: 700; letter-spacing: -0.01em; }
+.v3r-crumb { margin: .2rem 0 .55rem; font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: .45em; }
+.v3r-crumb .sep { color: var(--faint); }
+.v3r-goal {
+  margin: .45rem 0; padding: .5rem .7rem; font-size: 12.5px; color: var(--muted);
+  border-left: 3px solid var(--border); background: var(--surface-muted);
+  border-radius: 0 6px 6px 0; white-space: pre-wrap;
+}
+.v3r-deps { margin: .4rem 0; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: .4em; flex-wrap: wrap; }
+.v3r-dep {
+  font-family: var(--mono); font-size: 11.5px; padding: .1em .5em;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--surface-muted);
+}
+.v3r-err { margin: .4rem 0; font-size: 12.5px; color: var(--v3r-blocked); }
+.v3r-term-slot { margin-top: .75rem; }
+
+/* ── loop iteration timeline ── */
+.v3r-loop-sec { margin-top: .65rem; }
+.v3r-loop-meter {
+  display: flex; align-items: center; gap: .7rem; margin-bottom: .55rem;
+  font-size: 13px; color: var(--muted);
+}
+.v3r-loop-meter .num { font-variant-numeric: tabular-nums; }
+.v3r-loop-meter .num b { font-family: var(--mono); font-size: 15px; color: var(--fg); }
+.v3r-granted-tag {
+  font-size: 11px; font-weight: 700; padding: .1em .5em; border-radius: 999px;
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.v3r-rounds {
+  display: flex; flex-direction: column; gap: .45rem;
+  max-height: 380px; overflow-y: auto; padding: .15rem;
+}
+.v3r-round {
+  border: 1px solid var(--border); border-radius: 9px;
+  padding: .45rem .6rem; background: var(--surface-muted);
+}
+.v3r-round.cur { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
+.v3r-round.vd-exit { border-color: color-mix(in srgb, var(--v3r-done) 50%, var(--border)); }
+.v3r-round.vd-exhausted { border-color: color-mix(in srgb, var(--v3r-blocked) 55%, var(--border)); }
+.v3r-round-head { display: flex; align-items: center; gap: .45em; margin-bottom: .15rem; }
+.v3r-round-head .rn { font-family: var(--mono); font-size: 12.5px; font-weight: 700; color: var(--fg); }
+.v3r-verdict { font-size: 11px; font-weight: 700; white-space: nowrap; }
+.v3r-verdict.vd-exit { color: var(--v3r-done); }
+.v3r-verdict.vd-continue { color: var(--muted); }
+.v3r-verdict.vd-exhausted { color: var(--v3r-blocked); }
+.v3r-verdict.vd-live { color: var(--v3r-running); animation: v3r-blink 1.6s ease-in-out infinite; }
+/* round mini-dag: body instances drawn like real graph nodes (template gives
+   the shape; undispatched slots are dashed ghosts) */
+.v3r-mini-svg { display: block; }
+.v3r-mini .v3r-nid { font-size: 11px; }
+.v3r-mini .v3r-mini-dot { fill: var(--ns); }
+.v3r-mini.st-running .v3r-mini-dot { animation: v3r-breathe 1.4s ease-in-out infinite; }
+.v3r-mini.sel .v3r-box { stroke: var(--accent-strong); stroke-width: 2; }
+.v3r-mini.ghost .v3r-box { stroke-dasharray: 3 3; fill: transparent; }
+.v3r-mini.ghost .v3r-nid, .v3r-mini.ghost .v3r-mini-dot { opacity: .55; }
+/* the strip naming which instance's terminal is mounted below the timeline */
+.v3r-inst-strip {
+  display: flex; align-items: center; gap: .55rem; flex-wrap: wrap;
+  margin-top: .7rem; padding: .45rem .65rem;
+  border: 1px solid var(--border-soft); border-radius: 8px 8px 0 0; border-bottom: none;
+  background: var(--surface-muted); font-size: 12px; color: var(--muted);
+}
+.v3r-inst-strip .lbl { font-weight: 700; color: var(--faint); letter-spacing: .04em; }
+.v3r-nodeid.sm { font-size: 12.5px; }
+#v3-inst-strip:not(:empty) + .v3r-term-slot { margin-top: 0; }
+.v3r-cta {
+  margin-top: .55rem; padding: .5rem .7rem; font-size: 12.5px;
+  color: var(--v3r-blocked); border-radius: 8px;
+  background: color-mix(in srgb, var(--v3r-blocked) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--v3r-blocked) 35%, transparent);
+}
+.v3r-cta code { font-family: var(--mono); }
+
+@keyframes v3r-spin { to { transform: rotate(360deg); } }
+@keyframes v3r-flow { to { stroke-dashoffset: -11; } }
+@keyframes v3r-breathe { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+@keyframes v3r-blink { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) {
+  .st-running .v3r-spin, .v3r-edge.live, .v3r-node.st-running .v3r-box,
+  .v3r-dot.cur.live, .v3r-verdict.vd-live { animation: none; }
+}
 /* ── Insight workbench (owner-only #/insights page) ───────────────────────────
    Visual layer ported from the reference app (agent-session-insights, html.ts
    STYLE) so this page reads as that read-only "工作台", not generic dashboard

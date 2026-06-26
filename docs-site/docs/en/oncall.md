@@ -14,7 +14,7 @@ The fastest way — just send a line in the group:
 /oncall bind ~/projects/your-service
 ```
 
-This anchors the current group to that directory, and the initiator automatically becomes the owner. Good for when you just spun up a group and want to use it immediately.
+This anchors **this bot** to that directory in the current group, and the initiator automatically becomes the owner. Binding is **per-bot** — it only affects this bot; bind several at once with `@bot1 @bot2 /oncall bind <path>`. Good for when you just spun up a group and want to use it immediately.
 
 ### Option 2: Enable per group (Dashboard)
 
@@ -43,7 +43,7 @@ From then on, **all of the bot's unbound groups** automatically bind to this dir
 
 | Command | Description |
 |------|------|
-| `/oncall bind <path>` | Bind the current group to a project directory; the initiator automatically becomes the owner |
+| `/oncall bind <path>` | Bind this bot to a project directory in the current group (multi-bot: `@bot1 @bot2 /oncall bind`); the initiator automatically becomes the owner |
 | `/oncall unbind` | Unbind (owner only) |
 | `/oncall status` | View the current binding |
 

@@ -175,6 +175,57 @@ describe('findInheritablePeer — layer 2 removed (普通群 new thread no longe
   });
 });
 
+describe('findInheritablePeer — botToBotSameDir gate (per-bot, default on)', () => {
+  it('returns null when botToBotSameDir=false even with a valid same-anchor peer', () => {
+    const workingDir = tempDir('repo-gate');
+    mockFindByRoot.mockReturnValue([
+      makePeer({ sessionId: 'peer-1', rootMessageId: 'om_root', workingDir, larkAppId: 'app-other' }),
+    ]);
+    const result = findInheritablePeer({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      selfAppId: 'app-self',
+      botToBotSameDir: false,
+    });
+    expect(result).toBeNull();
+    // Short-circuits before even scanning sessions.
+    expect(mockFindByRoot).not.toHaveBeenCalled();
+  });
+
+  it('inherits when botToBotSameDir=true (explicit on)', () => {
+    const workingDir = tempDir('repo-gate-on');
+    mockFindByRoot.mockReturnValue([
+      makePeer({ sessionId: 'peer-1', rootMessageId: 'om_root', workingDir, larkAppId: 'app-other' }),
+    ]);
+    const result = findInheritablePeer({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      selfAppId: 'app-self',
+      botToBotSameDir: true,
+    });
+    expect(result).toEqual({ sessionId: 'peer-1', larkAppId: 'app-other', workingDir });
+  });
+
+  it('inherits when botToBotSameDir is omitted (undefined = default on)', () => {
+    const workingDir = tempDir('repo-gate-default');
+    mockFindByRoot.mockReturnValue([
+      makePeer({ sessionId: 'peer-1', rootMessageId: 'om_root', workingDir, larkAppId: 'app-other' }),
+    ]);
+    const result = findInheritablePeer({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      selfAppId: 'app-self',
+    });
+    expect(result).toEqual({ sessionId: 'peer-1', larkAppId: 'app-other', workingDir });
+  });
+});
+
 describe('findInheritablePeer — guards', () => {
   it('returns null when no peer has a workingDir set', () => {
     mockFindByRoot.mockReturnValue([

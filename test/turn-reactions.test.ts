@@ -45,13 +45,14 @@ function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
 
 // Reactions are auto-on for card-off sessions, so the gate is driven by
 // disableStreamingCard (streaming card on → no reactions; off → reactions).
-function registerWith(reactionsOn: boolean) {
+function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean } = {}) {
   registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
     cliId: 'claude-code',
     allowedUsers: ['ou_o'],
     disableStreamingCard: reactionsOn || undefined,
+    silentTurnReactions: opts.silentTurnReactions || undefined,
   });
 }
 
@@ -83,6 +84,28 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a', 'om_b']);
   });
 
+  it('silentTurnReactions suppresses receipt reactions in card-off sessions', async () => {
+    registerWith(true, { silentTurnReactions: true });
+    const ds = makeDs();
+
+    await noteTurnReceived(ds, 'om_a');
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
+  it('silentTurnReactions is a no-op when the streaming card is on (gate order)', async () => {
+    // Card-on already early-returns before the silent gate, so the flag must not
+    // perturb card-on behavior — same outcome as a plain card-on session.
+    registerWith(false, { silentTurnReactions: true });
+    const ds = makeDs();
+
+    await noteTurnReceived(ds, 'om_a');
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
   it('skips non-message ids (doc-comment id / chat anchor cannot carry a reaction)', async () => {
     registerWith(true);
     const ds = makeDs();
@@ -109,6 +132,23 @@ describe('two-phase turn reactions', () => {
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it('silentTurnReactions clears pending received reactions without adding DONE', async () => {
+    registerWith(true, { silentTurnReactions: true });
+    const ds = makeDs({
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a' },
+        { messageId: 'om_b', reactionId: 'rid_om_b' },
+      ],
+    });
+
+    await finishTurnReactions(ds);
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions).toEqual([]);
   });
 

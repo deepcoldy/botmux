@@ -17,16 +17,19 @@ import { cliAuthBind, loadDashboardSecret, signCliAuth } from '../dashboard/auth
  *    misleading `Rotation failed: no-active-token` when the real problem is that
  *    `.dashboard-port` points at the wrong service.
  *
- * 2. **`.dashboard-port` can go stale.** The dashboard and the daemon IPC server
- *    both `listenWithProbe` upward from adjacent base ports (7891 vs 7892) with
- *    heavily overlapping probe ranges, so across restarts the recorded dashboard
- *    port can end up owned by an IPC server. When the recorded port answers as
- *    the *wrong service*, we rediscover the real dashboard by HMAC-probing the
- *    probe range (only the genuine dashboard can validate the signature) and
+ * 2. **`.dashboard-port` can go stale.** The dashboard (wildcard) and the daemon
+ *    IPC servers (loopback) both `listenWithProbe` upward. Their base ports are
+ *    now kept disjoint (config.dashboard.port 7891 + probe span vs ipcBasePort
+ *    7950 — see config.ts, guarded by dashboard-ipc-port-range.test.ts), so a
+ *    recorded dashboard port should no longer end up owned by an IPC server. The
+ *    HMAC self-heal below stays as defense-in-depth: when the recorded port
+ *    answers as the *wrong service* (e.g. a foreign squatter pushed the dashboard
+ *    onto an unexpected port), we rediscover the real dashboard by HMAC-probing
+ *    the probe range (only the genuine dashboard can validate the signature) and
  *    self-heal `.dashboard-port`.
  */
 
-export type DashboardEndpoint = '/__cli/rotate' | '/__cli/current';
+export type DashboardEndpoint = '/__cli/rotate' | '/__cli/current' | '/__cli/reload-binding';
 
 export type DashboardFailReason =
   | 'no-secret'
@@ -122,6 +125,8 @@ export async function requestDashboardAt(opts: {
   if (!res.ok) {
     return { ok: false, reason: 'http-error', detail: `${res.status} ${await res.text().catch(() => '')}` };
   }
+  // reload-binding 不返回 url，200 即成功（仅用于「捅一下 daemon 重连」）
+  if (path === '/__cli/reload-binding') return { ok: true, url: '' };
   const body = await res.json().catch(() => ({})) as { url?: string };
   if (!body.url) return { ok: false, reason: 'http-error', detail: 'malformed response (no url)' };
   return { ok: true, url: body.url };

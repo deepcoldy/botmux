@@ -31,6 +31,7 @@ import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
+import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
@@ -147,6 +148,21 @@ describe('claude-code buildArgs', () => {
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toContain('EnterPlanMode');
     expect(args[idx + 1]).toContain('ExitPlanMode');
+    expect(args[idx + 1]).not.toContain('AskUserQuestion');
+  });
+
+  it('disallows native AskUserQuestion in v3 goal-mode', () => {
+    const previous = process.env[GOAL_ENV.V3_MARKER];
+    process.env[GOAL_ENV.V3_MARKER] = '1';
+    try {
+      const args = adapter.buildArgs({ sessionId: 's', resume: false });
+      const idx = args.indexOf('--disallowed-tools');
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(args[idx + 1].split(',')).toEqual(['EnterPlanMode', 'ExitPlanMode', 'AskUserQuestion']);
+    } finally {
+      if (previous === undefined) delete process.env[GOAL_ENV.V3_MARKER];
+      else process.env[GOAL_ENV.V3_MARKER] = previous;
+    }
   });
 
   it('passes inline --settings that skips the dangerous-mode prompt', () => {

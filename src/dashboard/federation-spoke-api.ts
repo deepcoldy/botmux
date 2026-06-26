@@ -243,6 +243,43 @@ export async function syncAllMemberships(
   return { synced, failed };
 }
 
+/** Persist a resolved owner as THIS deployment's identity, claim its unassigned
+ *  bots (no-steal: only bots without a manual owner), then push the new identity
+ *  to every joined hub. Shared verbatim by the interactive bind paths (/pair
+ *  consume, dashboard auto-bind) and the headless startup auto-bind, so the three
+ *  never drift apart. */
+export async function bindDeploymentOwnerAndClaim(
+  dataDir: string,
+  owner: { unionId?: string; name?: string },
+  opts: { fetcher?: Fetcher; live?: LiveBot[] } = {},
+): Promise<{ synced: number; failed: number }> {
+  setDeploymentOwner(dataDir, owner);
+  for (const b of buildTeamRoster(dataDir, undefined, undefined, opts.live).bots) {
+    setBotOwner(dataDir, b.larkAppId, { unionId: owner.unionId, name: owner.name }, { override: false });
+  }
+  return syncAllMemberships(dataDir, opts.fetcher ?? fetch, opts.live).catch(() => ({ synced: 0, failed: 0 }));
+}
+
+/** Headless single-candidate auto-bind, for a standalone (non-team) deployment so
+ *  the owner identity gets set WITHOUT a manual dashboard click — the left-rail
+ *  avatar then shows, 拉群 can pull the operator in, and bots are claimed. Resolves
+ *  the owner from the bots' OWN allowedUsers (no /pair, immune to the dataDir-split
+ *  that /pair has). Only acts when there is exactly ONE candidate (unambiguous); a
+ *  multi-person deployment still needs the dashboard picker. Idempotent: a no-op
+ *  once bound (cheap local read, no network). */
+export async function autoBindOwnerIfUnambiguous(
+  dataDir: string,
+  opts: { fetcher?: Fetcher; live?: LiveBot[]; ownerCandidates?: () => Promise<OwnerCandidate[]> } = {},
+): Promise<{ status: 'already_bound' | 'bound' | 'need_choice' | 'no_candidates'; owner?: OwnerCandidate; candidates?: OwnerCandidate[] }> {
+  if (getDeploymentIdentity(dataDir).ownerUnionId) return { status: 'already_bound' };
+  const candidates = await (opts.ownerCandidates ?? resolveOwnerCandidatesFromAllowedUsers)();
+  if (candidates.length === 0) return { status: 'no_candidates' };
+  if (candidates.length > 1) return { status: 'need_choice', candidates };
+  const owner = candidates[0];
+  await bindDeploymentOwnerAndClaim(dataDir, owner, opts);
+  return { status: 'bound', owner };
+}
+
 export interface FederationSpokeDeps {
   dataDir?: string;
   fetcher?: Fetcher;
@@ -368,15 +405,10 @@ export async function handleFederationSpokeApi(
     const c = consumePairing(dataDir, String(body?.pairingId ?? ''), String(body?.browserToken ?? ''));
     if (!c.ok) { jsonRes(res, 409, { ok: false, error: c.reason }); return true; }
     const owner = { unionId: c.claimedBy.unionId, name: c.claimedBy.name };
-    setDeploymentOwner(dataDir, owner);
-    // Own THIS deployment's bots (no-steal: only unassigned; keep manual owners).
-    for (const b of buildTeamRoster(dataDir, undefined, undefined, live).bots) {
-      setBotOwner(dataDir, b.larkAppId, { unionId: owner.unionId, name: owner.name }, { override: false });
-    }
-    // Push the new owner identity to every joined hub NOW (best-effort) so a 拉群
-    // immediately after binding can derive the operator — don't wait for the
-    // 2-min periodic sync, otherwise #3 (operator not invited) reproduces.
-    const sync = await syncAllMemberships(dataDir, fetcher, live).catch(() => ({ synced: 0, failed: 0 }));
+    // Bind + claim bots + push to hubs NOW (best-effort) so a 拉群 immediately after
+    // binding can derive the operator — don't wait for the 2-min periodic sync,
+    // otherwise #3 (operator not invited) reproduces.
+    const sync = await bindDeploymentOwnerAndClaim(dataDir, owner, { fetcher, live });
     jsonRes(res, 200, { ok: true, owner, hubsSynced: sync.synced, hubsFailed: sync.failed });
     return true;
   }
@@ -394,11 +426,7 @@ export async function handleFederationSpokeApi(
     const chosen = want ? candidates.find(c => c.unionId === want) : (candidates.length === 1 ? candidates[0] : undefined);
     if (!chosen) { jsonRes(res, 200, { ok: true, needChoice: true, candidates }); return true; }
     const owner = { unionId: chosen.unionId, name: chosen.name };
-    setDeploymentOwner(dataDir, owner);
-    for (const b of buildTeamRoster(dataDir, undefined, undefined, live).bots) {
-      setBotOwner(dataDir, b.larkAppId, { unionId: owner.unionId, name: owner.name }, { override: false });
-    }
-    const sync = await syncAllMemberships(dataDir, fetcher, live).catch(() => ({ synced: 0, failed: 0 }));
+    const sync = await bindDeploymentOwnerAndClaim(dataDir, owner, { fetcher, live });
     jsonRes(res, 200, { ok: true, owner, hubsSynced: sync.synced, hubsFailed: sync.failed });
     return true;
   }

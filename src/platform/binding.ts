@@ -41,6 +41,22 @@ export function writePlatformBinding(b: PlatformBinding): void {
   atomicWriteFileSync(PLATFORM_BINDING_PATH, JSON.stringify(b, null, 2), { mode: 0o600 });
 }
 
+/**
+ * 绑定平台后，本机对外可达的「机器子域」基址 `https://m-<machineId>.<平台域名>`，
+ * 平台会把该子域经隧道反代回本机 dashboard。域名从 binding.platformUrl 运行时推导
+ * （公开仓库不写死平台域名）；前缀 `m-` 是平台约定。未绑定返回 null。
+ */
+export function platformMachineBaseUrl(): string | null {
+  const b = readPlatformBinding();
+  if (!b) return null;
+  try {
+    const u = new URL(b.platformUrl);
+    return `${u.protocol}//m-${b.machineId}.${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
 /** 更新本机平台团队列表并落盘（读最新 binding 防覆盖其它字段）。返回更新后的列表。 */
 export function setPlatformTeams(teams: PlatformTeam[]): PlatformTeam[] {
   const b = readPlatformBinding();

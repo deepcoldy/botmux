@@ -1,7 +1,11 @@
-// Dashboard workflow Run List / Detail pages.
+// Legacy (v0.2) workflow Run List / Detail pages — kept reachable only at the
+// `#/legacy-workflow[/<runId>]` route so the v2 engine's Feishu progress /
+// approval cards + daemon "Workflow started: Web:" links still open a working
+// detail page. The main "工作流" nav now points at the v3 runs page (#/workflows);
+// this page is intentionally out of the top nav.
 //
 // Polls /api/workflows/runs every 5s while visible.  Each row links to
-// #/workflows/<runId> — the Run Detail page (B path) hooks into the
+// #/legacy-workflow/<runId> — the Run Detail page (B path) hooks into the
 // same hash route.
 import { t } from './ui.js';
 
@@ -183,8 +187,8 @@ function pageHtml(): string {
   ];
   return `
 <nav class="wf-subnav">
-  <a href="#/workflows" class="active" data-i18n="workflow.subnav.runs">${escapeHtml(t('workflow.subnav.runs'))}</a>
-  <a href="#/workflows/catalog" data-i18n="workflow.subnav.catalog">${escapeHtml(t('workflow.subnav.catalog'))}</a>
+  <a href="#/legacy-workflow" class="active" data-i18n="workflow.subnav.runs">${escapeHtml(t('workflow.subnav.runs'))}</a>
+  <a href="#/workflows" data-i18n="workflow.subnav.v3">${escapeHtml(t('workflow.subnav.v3'))}</a>
 </nav>
 <form id="wf-filters" class="filters">
   <input type="search" name="q" placeholder="${escapeHtml(t('workflow.searchPlaceholder'))}" />
@@ -236,7 +240,7 @@ function statusLabel(status: string): string {
 }
 
 export function renderWorkflowsPage(root: HTMLElement): () => void {
-  const detailMatch = location.hash.match(/^#\/workflows\/([^?#]+)(?:\?([^#]*))?$/);
+  const detailMatch = location.hash.match(/^#\/legacy-workflow\/([^?#]+)(?:\?([^#]*))?$/);
   if (detailMatch) {
     const params = new URLSearchParams(detailMatch[2] ?? '');
     return renderWorkflowDetailPage(root, decodeURIComponent(detailMatch[1]!), {
@@ -292,7 +296,7 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
         const chatCell = chatBits.length > 0 ? chatBits.join('<br/>') : '—';
         const errorSummary = renderRunErrorSummary(r);
         return `<tr data-runid="${escapeHtml(r.runId)}">
-          <td><a href="#/workflows/${encodeURIComponent(r.runId)}"><code>${escapeHtml(r.runId)}</code></a></td>
+          <td><a href="#/legacy-workflow/${encodeURIComponent(r.runId)}"><code>${escapeHtml(r.runId)}</code></a></td>
           <td>${escapeHtml(r.workflowId)}</td>
           <td>${statusBadge(r.status)}${
             r.failedNodeId ? ` <span class="muted">(${escapeHtml(r.failedNodeId)})</span>` : ''
@@ -395,7 +399,7 @@ function renderWorkflowDetailPage(
 ): () => void {
   root.innerHTML = `
     <div class="wf-detail-head">
-      <a class="btn-link" href="#/workflows">${escapeHtml(t('workflow.detail.back'))}</a>
+      <a class="btn-link" href="#/legacy-workflow">${escapeHtml(t('workflow.detail.back'))}</a>
       <div>
         <h2><code>${escapeHtml(runId)}</code></h2>
         <div id="wf-detail-subtitle" class="muted">${escapeHtml(t('workflow.detail.loading'))}</div>
@@ -1637,7 +1641,7 @@ function terminalLogDownloadUrl(
 }
 
 function currentRunIdFromHash(): string | null {
-  const m = window.location.hash.match(/^#\/workflows\/([^/?#]+)/);
+  const m = window.location.hash.match(/^#\/legacy-workflow\/([^/?#]+)/);
   if (!m) return null;
   try {
     return decodeURIComponent(m[1]);

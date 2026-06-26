@@ -5,6 +5,7 @@ import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
@@ -525,7 +526,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (Object.keys(inlineSettings).length > 0) {
         args.push('--settings', JSON.stringify(inlineSettings));
       }
-      args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
+      const disallowedTools = ['EnterPlanMode', 'ExitPlanMode'];
+      if (process.env[GOAL_ENV.V3_MARKER] === '1') {
+        disallowedTools.push('AskUserQuestion');
+      }
+      args.push('--disallowed-tools', disallowedTools.join(','));
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.

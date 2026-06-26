@@ -10,6 +10,7 @@ interface DashboardSettings {
   maintenance: MaintenanceCfg;
   localDevInstall: boolean;
   whiteboard: { enabled: boolean };
+  remoteAccess: boolean;
 }
 
 let settings: DashboardSettings | null = null;
@@ -17,6 +18,9 @@ let loadError: string | null = null;
 // 只读访客（无有效 token 进来的 public-read 连接）看得到设置值但不能改——
 // 开关直接禁用并给提示，而不是点了 401 再回滚。
 let canWrite = true;
+// 本机是否已绑定中心化平台。仅当 bound 时才显示「远程访问」开关
+// （未绑定时中心化 URL 无意义）。
+let bound = false;
 
 function parseSettings(s: any): DashboardSettings {
   return {
@@ -26,6 +30,7 @@ function parseSettings(s: any): DashboardSettings {
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
     localDevInstall: s?.localDevInstall === true,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
+    remoteAccess: s?.remoteAccess === true,
   };
 }
 
@@ -97,6 +102,12 @@ function renderSettingsBody(): string {
           <span class="toggle-tx"><strong>${t('settings.publicReadOnly')}</strong>
           <small>${t('settings.publicReadOnlyHelp')}</small></span>
         </label>
+        ${bound ? `<label class="toggle-row">
+          <input type="checkbox" data-setting="remoteAccess" ${settings.remoteAccess ? 'checked' : ''} ${dis}>
+          <span class="switch" aria-hidden="true"></span>
+          <span class="toggle-tx"><strong>${t('settings.remoteAccess')}</strong>
+          <small>${t('settings.remoteAccessHelp')}</small></span>
+        </label>` : ''}
       </section>
       <section class="bd-section">
         <h3 class="bd-section-title">${t('settings.sectionCards')}</h3>
@@ -377,6 +388,7 @@ async function fetchSettings(): Promise<void> {
     }
     settings = parseSettings(body.settings);
     canWrite = body.authed === true;
+    bound = body.bound === true;
     loadError = null;
   } catch (e: any) {
     settings = null;
@@ -424,7 +436,7 @@ export async function renderSettingsPage(root: HTMLElement): Promise<void> {
     // Flat boolean settings.
     bodyEl.querySelectorAll<HTMLInputElement>('input[data-setting]').forEach(input => {
       input.addEventListener('change', () => {
-        const key = input.dataset.setting as 'publicReadOnly' | 'openTerminalInFeishu';
+        const key = input.dataset.setting as 'publicReadOnly' | 'openTerminalInFeishu' | 'remoteAccess';
         const before = !input.checked;
         void putSettings({ [key]: input.checked }, () => { input.checked = before; }, input);
       });

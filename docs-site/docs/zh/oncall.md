@@ -14,7 +14,7 @@
 /oncall bind ~/projects/your-service
 ```
 
-把当前群锚定到该目录，发起人自动成为 owner。适合临时拉个群就想立刻用。
+把**当前 bot** 在本群锚定到该目录，发起人自动成为 owner。绑定**按 bot 计**——只影响这个 bot；多个 bot 一起绑用 `@bot1 @bot2 /oncall bind <path>`。适合临时拉个群就想立刻用。
 
 ### 方式二：按群开启（Dashboard）
 
@@ -43,7 +43,7 @@
 
 | 命令 | 说明 |
 |------|------|
-| `/oncall bind <path>` | 绑定当前群到某项目目录，发起人自动成为 owner |
+| `/oncall bind <path>` | 把当前 bot 在本群绑到某项目目录，发起人自动成为 owner（多 bot：`@bot1 @bot2 /oncall bind`） |
 | `/oncall unbind` | 解绑（仅 owner） |
 | `/oncall status` | 查看当前绑定 |
 

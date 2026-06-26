@@ -7,6 +7,7 @@ import {
   markBotAuthoredReply,
   isBotAuthoredReply,
   hasBotSentinel,
+  commentTriggerAllowed,
   BOT_REPLY_SENTINEL,
 } from '../src/im/lark/doc-comment.js';
 
@@ -68,5 +69,38 @@ describe('bot-authored reply tracking (self-loop guard)', () => {
     expect(hasBotSentinel(`some reply${BOT_REPLY_SENTINEL}`)).toBe(true);
     expect(hasBotSentinel('a normal user comment')).toBe(false);
     expect(hasBotSentinel(undefined)).toBe(false);
+  });
+});
+
+describe('commentTriggerAllowed (mention-only trigger gate)', () => {
+  const SELF = 'ou_selfbot';
+
+  it("'all' mode triggers on any comment, regardless of mentions", () => {
+    expect(commentTriggerAllowed('all', [], SELF)).toBe(true);
+    expect(commentTriggerAllowed('all', ['ou_someone_else'], SELF)).toBe(true);
+    // even when the bot's own open_id isn't known yet
+    expect(commentTriggerAllowed('all', [], undefined)).toBe(true);
+  });
+
+  it("'mention-only' triggers when the comment @s this bot", () => {
+    expect(commentTriggerAllowed('mention-only', [SELF], SELF)).toBe(true);
+    expect(commentTriggerAllowed('mention-only', ['ou_other', SELF], SELF)).toBe(true);
+  });
+
+  it("'mention-only' does NOT trigger when the comment only @s other people (the reported bug)", () => {
+    // 用户报的现象：评论只 @ 同事、没 @bot，却被触发。根因是早先信了事件级
+    // is_mentioned（=「有任意 @」）。这里证明仅按正文 @person 列表判定后不再误触发。
+    expect(commentTriggerAllowed('mention-only', ['ou_qiaoxiang'], SELF)).toBe(false);
+    expect(commentTriggerAllowed('mention-only', ['ou_a', 'ou_b'], SELF)).toBe(false);
+  });
+
+  it("'mention-only' does NOT trigger when the comment @s nobody", () => {
+    expect(commentTriggerAllowed('mention-only', [], SELF)).toBe(false);
+  });
+
+  it("'mention-only' drops conservatively when the bot's own open_id is unknown", () => {
+    // 启动期 open_id 尚未探到：宁可漏触发也不误触发（调用方会先 await ensureBotOpenId）。
+    expect(commentTriggerAllowed('mention-only', [SELF], undefined)).toBe(false);
+    expect(commentTriggerAllowed('mention-only', [SELF], '')).toBe(false);
   });
 });

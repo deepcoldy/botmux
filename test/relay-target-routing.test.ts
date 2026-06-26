@@ -96,6 +96,22 @@ describe('resolveRelayTargetRouting', () => {
     expect(r).toEqual({ scope: 'chat', anchor: 'oc_chat' });
   });
 
+  it('普通群 chat-topic mode top-level → chat-scope anchored at chatId (flat like chat)', () => {
+    resolveRegularGroupModeMock.mockReturnValue('chat-topic');
+    const r = resolveRelayTargetRouting({ ...base, chatMode: 'group', message: { messageId: 'om_m' } });
+    expect(r).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+  });
+
+  it('普通群 chat-topic mode in a native topic → thread-scope at rootId (per-topic session)', () => {
+    resolveRegularGroupModeMock.mockReturnValue('chat-topic');
+    const r = resolveRelayTargetRouting({
+      ...base,
+      chatMode: 'group',
+      message: { messageId: 'om_m', rootId: 'om_root', threadId: 'omt_1' },
+    });
+    expect(r).toEqual({ scope: 'thread', anchor: 'om_root' });
+  });
+
   it('real-thread takes precedence over flat regular-group mode', () => {
     resolveRegularGroupModeMock.mockReturnValue('chat');
     const r = resolveRelayTargetRouting({

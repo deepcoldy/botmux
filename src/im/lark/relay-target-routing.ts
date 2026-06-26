@@ -23,7 +23,9 @@
  *      message in decideRouting)
  *   4. 话题群 top-level       → thread-scope, anchor = message.messageId (seeds 话题)
  *   5. 普通群 new-topic/shared → thread-scope, anchor = message.messageId (seeds 话题)
- *   6. 普通群 flat (chat)     → chat-scope, anchor = chatId (top-level, unchanged)
+ *   6. 普通群 flat (chat / chat-topic) → chat-scope, anchor = chatId (top-level,
+ *      unchanged). chat-topic only diverges from chat for replies INSIDE a native
+ *      topic — those carry root_id+thread_id and are already caught by rule 2.
  */
 import { resolveRegularGroupMode } from '../../services/chat-reply-mode-store.js';
 import { getBot } from '../../bot-registry.js';
@@ -69,7 +71,10 @@ export function resolveRelayTargetRouting(input: {
   }
 
   // 普通群: mode decides. new-topic + shared both land in a fresh 话题 seeded
-  // on the /relay message; flat 'chat' stays top-level chat-scope.
+  // on the /relay message; flat 'chat' stays top-level chat-scope. 'chat-topic'
+  // is flat at top level too (its per-topic divergence only applies to replies
+  // inside a native topic, already handled by the real-thread branch above), so
+  // a top-level /relay lands chat-scope just like plain 'chat'.
   const rg = resolveRegularGroupMode(larkAppId, chatId);
   if (rg === 'new-topic' || rg === 'shared') {
     return { scope: 'thread', anchor: message.messageId };

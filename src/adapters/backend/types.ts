@@ -29,6 +29,14 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /**
+   * Per-bot shell override (BotConfig.launchShell). When set, the persistent
+   * backends (tmux/zellij) launch the CLI under this shell instead of `$SHELL`
+   * — the escape hatch for a login `$SHELL` whose rcfile `exec`-trampolines into
+   * another shell. Bare name (`zsh`) or absolute path; see resolveUserShell.
+   * Ignored by the pty backend (no shell wrapper).
+   */
+  launchShell?: string;
 }
 
 export interface SessionBackend {

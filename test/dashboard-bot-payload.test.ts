@@ -34,6 +34,16 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('passes through defaultWorkingDir (string) and normalizes missing to null', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { defaultWorkingDir: '/root/iserver/botmux' })).toMatchObject({
+      defaultWorkingDir: '/root/iserver/botmux',
+    });
+    // Missing / non-string → null (the "off" or "oncall" modes carry no defaultWorkingDir).
+    expect(botDefaultsPayload(daemon, {}).defaultWorkingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { defaultWorkingDir: 123 }).defaultWorkingDir).toBeNull();
+  });
+
   it('defaults auto grant request cards on and preserves explicit off', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({

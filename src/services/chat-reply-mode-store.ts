@@ -1,14 +1,20 @@
 /**
  * Per-chat reply mode for regular groups, layered over the per-bot default.
  *
- * Three modes (tri-state) — unifies #116 + #131 into one knob so a chat resolves
+ * Four modes — unifies #116 + #131 into one knob so a chat resolves
  * to EXACTLY ONE mode and the two thread-reply mechanisms can never compete:
- *   • chat        — flat chat-scope replies in the group (default).
+ *   • chat        — flat chat-scope replies in the group (default). A native
+ *                    Lark topic the user opens here folds back into this one
+ *                    chat-scope session too (see maybeFoldMentionedRegularGroupThreadToChat).
  *   • topic/shared — 话题展示但复用同一个 session: reuse the bot's existing
  *                    chat-scope session/worker/cwd, but route this turn's reply
  *                    into the trigger message's thread (#131).
  *   • new-topic    — explicit fork mode: each top-level @mention opens a fresh
  *                    thread-scope session under the trigger (its own worker/cwd/context).
+ *   • chat-topic   — hybrid: top-level @mentions stay flat in the one chat-scope
+ *                    session (like `chat`), BUT a native Lark topic the user opens
+ *                    runs its own independent thread-scope session (NOT folded).
+ *                    "顶层平铺连续会话；群内原生话题各自独立会话".
  *
  * Resolution: per-chat override (`chatReplyModes[chatId]`) wins; otherwise fall
  * back to the per-bot default (`regularGroupReplyMode`, default 'chat'). The
@@ -25,14 +31,18 @@ export function normalizeChatReplyMode(raw: string | undefined): ChatReplyMode |
   const v = raw?.trim().toLowerCase();
   if (!v || v === 'status') return undefined;
   if (v === 'chat') return 'chat';
+  if (v === 'chat-topic' || v === 'chattopic' || v === 'chat_topic') return 'chat-topic';
   if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
   if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
   return undefined;
 }
 
 /** Short command-word label for status / confirmation messages. */
-export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'new-topic' {
-  return mode === 'shared' ? 'topic' : mode === 'new-topic' ? 'new-topic' : 'chat';
+export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'new-topic' | 'chat-topic' {
+  if (mode === 'shared') return 'topic';
+  if (mode === 'new-topic') return 'new-topic';
+  if (mode === 'chat-topic') return 'chat-topic';
+  return 'chat';
 }
 
 /** Per-bot default regular-group mode (`regularGroupReplyMode`, default 'chat'). */

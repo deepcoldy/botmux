@@ -1210,16 +1210,27 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const e = getBot(cachedLarkAppId).config.env;
     if (e && typeof e === 'object' && Object.keys(e).length) env = JSON.stringify(e, null, 2);
   } catch { /* none */ }
+  // defaultWorkingDir — the "仅默认目录" mode source. Mutually exclusive with
+  // defaultOncall in the dashboard 3-way selector; the frontend derives the
+  // current mode from (defaultOncall.enabled ? oncall : defaultWorkingDir ? default : off).
+  let defaultWorkingDir: string | null = null;
+  try {
+    const d = getBot(cachedLarkAppId).config.defaultWorkingDir;
+    if (typeof d === 'string' && d.trim()) defaultWorkingDir = d;
+  } catch { /* none */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
+    defaultWorkingDir,
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
+    silentTurnReactions: cardPrefs.silentTurnReactions,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
@@ -1232,6 +1243,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     p2pMode,
     maxLiveWorkers,
     startupCommands,
+    launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
@@ -1242,7 +1254,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
-    disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    disableStreamingCard?: unknown; silentTurnReactions?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
   };
@@ -1250,12 +1263,15 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const patch: {
-    disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    disableStreamingCard?: boolean; silentTurnReactions?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
+  if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
@@ -1364,6 +1380,31 @@ ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
+// 空字符串＝清除（回 $SHELL）。走 applyConfigField（与 /config launchShell 同一写盘
+// + 内存热更新路径），next-session 生效（下个会话起用新 shell 启动 CLI）。
+ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { launchShell?: unknown };
+  try { body = await readJsonBody<{ launchShell?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('launchShell');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.launchShell === 'string' ? body.launchShell : '';
+  let value: string | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回 $SHELL
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
 });
 
 // Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如
@@ -1541,6 +1582,47 @@ ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {
   const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled, workingDir });
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true, defaultOncall: r.defaultOncall, resolvedPath: resolvedPath || undefined });
+});
+
+// Per-bot「默认工作目录模式」三选一（dashboard 单选；两个底层字段互斥）：
+//   • off     → 清 defaultWorkingDir + 关 defaultOncall（新会话弹「选仓库」卡）
+//   • default → 写 defaultWorkingDir + 关 defaultOncall（钉目录、跳过选仓库、不改权限）
+//   • oncall  → 开 defaultOncall(+dir) + 清 defaultWorkingDir（新群自动绑+开放对话；
+//               该目录经 resolveBotDefaultWorkingDir 的 layer-4 兜底覆盖该 bot 所有会话）
+// 两字段在 oncallStore.setWorkingDirMode 的**同一个 rmwBotEntry 锁内**一次性原子写盘 +
+// 同步内存：否则两个并发请求分别加锁写各自字段会交错，最终留下 defaultOncall.enabled 与
+// defaultWorkingDir 同时存在的不一致态（GET/前端按 enabled 显示 oncall，但 runtime 的
+// effectiveDefaultWorkingDir 优先用 defaultWorkingDir → UI 与实际目录背离；PR #311 Codex 评审）。
+// next-session 生效（运行中会话需 /restart）。
+ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { mode?: unknown; workingDir?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown; workingDir?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const mode = body.mode;
+  if (mode !== 'off' && mode !== 'default' && mode !== 'oncall') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  const workingDir = typeof body.workingDir === 'string' ? body.workingDir.trim() : '';
+
+  // 非「关闭」模式必须给一个真实存在的目录。
+  let resolvedPath = '';
+  if (mode !== 'off') {
+    if (!workingDir) return jsonRes(res, 400, { ok: false, error: 'workingDir_required' });
+    const v = validateWorkingDir(workingDir);
+    if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error });
+    resolvedPath = v.resolvedPath;
+  }
+
+  const r = await oncallStore.setWorkingDirMode(cachedLarkAppId, mode, workingDir);
+  if (!r.ok) return jsonRes(res, 400, r);
+  return jsonRes(res, 200, {
+    ok: true, mode,
+    defaultWorkingDir: r.defaultWorkingDir,
+    defaultOncall: r.defaultOncall,
+    resolvedPath: resolvedPath || undefined,
+  });
 });
 
 // Create a brand-new chat with this bot as creator/owner and `larkAppIds` as

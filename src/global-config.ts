@@ -53,6 +53,12 @@ export interface GlobalConfig {
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;
+  /** 远程访问. When true (and this machine is bound to the central platform),
+   *  session web-terminal links, Feishu card terminal buttons, and connector
+   *  webhook URLs use the central-platform machine subdomain instead of local
+   *  host:port URLs. Off by default — only local links are emitted. Gated in
+   *  buildTerminalUrl / publicWebhookUrl via isRemoteAccessEnabled(). */
+  remoteAccess?: boolean;
 }
 
 export interface GlobalSkillConfig {
@@ -266,8 +272,16 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;
+  if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
   readCache = { path, value: out, at: Date.now() };
   return out;
+}
+
+/** 远程访问 enabled? Reads the (short-TTL cached) global config — cheap enough to
+ *  call per link. False unless explicitly enabled. Gates whether central-platform
+ *  URLs are emitted (see buildTerminalUrl / publicWebhookUrl). */
+export function isRemoteAccessEnabled(): boolean {
+  return readGlobalConfig().remoteAccess === true;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

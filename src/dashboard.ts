@@ -1,6 +1,7 @@
 // src/dashboard.ts
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createServer as createTcpServer } from 'node:net';
+import { createServer, get as httpGet, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer, connect as netConnect } from 'node:net';
+import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
@@ -21,12 +22,14 @@ import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { planGroupCreator } from './dashboard/team-group.js';
 import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
+import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
+import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
-import { handleFederationSpokeApi, syncAllMemberships, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
+import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import {
@@ -92,7 +95,7 @@ import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
-import { startPlatformTunnelClient } from './platform/tunnel-client.js';
+import { startPlatformTunnelClient, type PlatformBotInfo } from './platform/tunnel-client.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
@@ -163,6 +166,37 @@ function dashboardPortAvailable(port: number): Promise<boolean> {
   return tcpPortAvailable('127.0.0.1', port);
 }
 
+// Per-process random marker served at /__selfcheck. Lets verifyDashboardBinding
+// confirm a loopback request to our just-bound wildcard port reaches THIS
+// process and not a shadow holding 127.0.0.1:port. The value is meaningless to
+// anyone else, so exposing it is safe.
+const DASHBOARD_SELF_NONCE = randomBytes(16).toString('hex');
+
+/**
+ * Post-bind loopback identity check handed to listenWithProbe (verifyBound).
+ * dashboardPortAvailable is a PRE-bind gate, but on macOS a loopback occupant
+ * can appear in the race window between that check and the wildcard listen, and
+ * a 0.0.0.0 bind succeeds anyway while loopback routing favours the occupant —
+ * so the dashboard would advertise a port it doesn't actually own on loopback.
+ * This runs AFTER listen: dial 127.0.0.1:port/__selfcheck and require OUR nonce
+ * back. A shadow answers with its own body/404 → reject → listenWithProbe steps
+ * up. Number-independent: it works no matter which port or who is shadowing.
+ * Loopback-host binds can't be shadowed, so they short-circuit to true.
+ */
+function verifyDashboardBinding(port: number): Promise<boolean> {
+  if (!isWildcardBindHost(config.dashboard.host)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const req = httpGet({ host: '127.0.0.1', port, path: '/__selfcheck', agent: false }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { body += c; if (body.length > 128) req.destroy(); });
+      res.on('end', () => resolve(res.statusCode === 200 && body === DASHBOARD_SELF_NONCE));
+    });
+    req.setTimeout(2000, () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
+
 /** Sign a loopback request to a daemon's write-link route. The daemon verifies
  *  with the same .dashboard-secret, so only a caller that can read the secret —
  *  the dashboard — can mint write tokens; a bare local process that only knows
@@ -192,6 +226,9 @@ interface ResolvedDashboardSettings {
   localDevInstall: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
+  /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
+   *  of local host:port. Off by default; only meaningful when bound. */
+  remoteAccess: boolean;
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
@@ -204,6 +241,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
+    remoteAccess: global.remoteAccess === true,
   };
 }
 
@@ -888,6 +926,15 @@ async function dashboardSkillReferences(skillName: string): Promise<SkillReferen
   };
 }
 
+/** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
+ *  the first path segment after `/s/` (stops at the next `/`; query/hash are
+ *  already stripped by URL.pathname). undefined when there's no segment. */
+function parseTerminalSessionId(pathname: string): string | undefined {
+  if (!pathname.startsWith('/s/')) return undefined;
+  const seg = pathname.slice(3).split('/')[0];
+  return seg || undefined;
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -895,6 +942,46 @@ const server = createServer(async (req, res) => {
     // Health probe (no auth) — for pm2
     if (url.pathname === '/__health') {
       return jsonRes(res, 200, { ok: true });
+    }
+
+    // Loopback self-identification (no auth): echoes this process's nonce so the
+    // post-bind shadow check (listen-with-probe verifyBound) can distinguish our
+    // server from a process shadowing 127.0.0.1:port. Returns only the nonce.
+    if (url.pathname === '/__selfcheck') {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      return res.end(DASHBOARD_SELF_NONCE);
+    }
+
+    // Web terminal reverse-proxy: `/s/<sessionId>/*` → the owning bot daemon's
+    // terminal proxy. The central platform only tunnels the dashboard port, so
+    // terminal links served under the machine subdomain
+    // (`https://m-<id>.<host>/s/<sessionId>`) land here. The dashboard is the
+    // aggregator process (it fronts many bot daemons, each with its own terminal
+    // proxy on proxyBasePort+idx), so we resolve the session's owning daemon's
+    // proxy port from the aggregator rows and forward there, streaming the
+    // response straight back. Mounted before the dashboard auth gate because the
+    // terminal proxy / worker enforces its own write gate (read-only without
+    // token / platform role).
+    if (url.pathname === '/s' || url.pathname.startsWith('/s/')) {
+      const sessionId = parseTerminalSessionId(url.pathname);
+      const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
+      if (!tport) {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        return res.end('session terminal not available');
+      }
+      const upstream = httpRequest(
+        { host: '127.0.0.1', port: tport, method: req.method, path: req.url, headers: req.headers },
+        (up) => {
+          res.writeHead(up.statusCode ?? 502, up.headers);
+          up.pipe(res);
+        },
+      );
+      upstream.on('error', () => {
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('terminal proxy error');
+      });
+      req.pipe(upstream);
+      return;
     }
 
     if (await handleWebhookRoute(req, res, url, {
@@ -949,6 +1036,21 @@ const server = createServer(async (req, res) => {
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
       return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
+    }
+
+    // CLI 通知绑定变化（HMAC + loopback）——`botmux bind` 写完绑定后捅一下，立即重连平台，
+    // 无需重启 daemon，也不依赖 fs.watch。
+    if (req.method === 'POST' && url.pathname === '/__cli/reload-binding') {
+      const gate = verifyCliRequest(req, url.pathname);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      try {
+        platformTunnel?.stop();
+      } catch {
+        /* ignore */
+      }
+      platformTunnel = null;
+      startPlatformTunnelIfBound();
+      return jsonRes(res, 200, { ok: true });
     }
 
     const presentedToken = authedToken(req, url);
@@ -1124,7 +1226,14 @@ const server = createServer(async (req, res) => {
       // `lang` is the global UI locale (single source of truth shared with
       // `botmux lang` and the Feishu cards) — the web UI reads it as its
       // authoritative initial language when set.
-      return jsonRes(res, 200, { settings: dashboardSettings, lang: readGlobalConfig().lang ?? null, authed });
+      // `bound` reflects central-platform binding; the Settings UI only shows the
+      // 远程访问 toggle when bound (the central URLs are meaningless otherwise).
+      return jsonRes(res, 200, {
+        settings: dashboardSettings,
+        lang: readGlobalConfig().lang ?? null,
+        authed,
+        bound: readPlatformBinding() !== null,
+      });
     }
     if (req.method === 'PUT' && url.pathname === '/api/settings') {
       let parsed: unknown;
@@ -1607,6 +1716,12 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // v3 workflow runs (read-only DAG + per-node terminal projection).  Reads
+    // the v3 run dirs directly; no daemon proxy (v3 runs are plain files).
+    if (await handleV3RunsApi(req, res, url, { runsDir: v3RunsDir() }, authed)) {
+      return;
+    }
+
     // ─── Groups (Phase B) ────────────────────────────────────────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/groups') {
@@ -1892,6 +2007,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/working-dir-mode — proxy to that bot's daemon. Body
+    // `{ mode: 'off'|'default'|'oncall', workingDir }` — sets the 3-way
+    // mutually-exclusive default-dir mode (defaultWorkingDir vs defaultOncall).
+    let mBotWdMode: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotWdMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/working-dir-mode$/))) {
+      const appId = decodeURIComponent(mBotWdMode[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-working-dir-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/skills — proxy to that bot's daemon. Body accepts
     // `{ action:'attach'|'detach', name }` or `{ action:'set', policy|null }`.
     let mBotSkills: RegExpMatchArray | null;
@@ -1937,6 +2071,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-startup-commands`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/launch-shell — proxy to that bot's daemon. Body
+    // `{ launchShell: string }` (shell name or absolute path; '' = clear → $SHELL).
+    let mBotLaunchShell: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotLaunchShell = url.pathname.match(/^\/api\/bots\/([^/]+)\/launch-shell$/))) {
+      const appId = decodeURIComponent(mBotLaunchShell[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-launch-shell`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -2063,7 +2215,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown };
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -2098,6 +2250,11 @@ const server = createServer(async (req, res) => {
       }
       const creator = registry.getByAppId(pick.creatorLarkAppId)!;
       const merged = new Set<string>([...explicit, ...pick.userOpenIds]);
+      // 跨 app 邀请通道：按 union_id 加人（open_id 是 app 作用域的，union_id 稳定，
+      // 由 creator daemon 解析成本 app 的 open_id 再加）。平台「拉群」即走这条。
+      const ownerUnionIds = Array.isArray(parsed.ownerUnionIds)
+        ? (parsed.ownerUnionIds as unknown[]).filter((x): x is string => typeof x === 'string')
+        : [];
       // Auto-invite/transfer/notify target: prefer the explicit open_id passed
       // by the caller (rare API consumer use), else the creator bot's first
       // resolved allowlist entry.
@@ -2107,6 +2264,7 @@ const server = createServer(async (req, res) => {
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
         larkAppIds: selectedIds,
         userOpenIds: [...merged],
+        ownerUnionIds,
         // Auto-transfer ownership to the auto-invited operator. Scope-safe
         // because the open_id was sourced from the creator bot's own allowlist.
         transferOwnerTo: autoInvited ?? undefined,
@@ -2309,6 +2467,48 @@ const server = createServer(async (req, res) => {
   }
 });
 
+// Web terminal WebSocket reverse-proxy: bridge `/s/*` upgrade requests through to
+// the local terminal proxy (which in turn bridges to the session worker). Raw
+// socket-to-socket bridge: dial 127.0.0.1:<terminalProxyPort>, replay the upgrade
+// request line + headers verbatim, then pipe both directions. Mirrors how
+// terminal-proxy.ts bridges to the worker. Non-`/s/*` upgrades are dropped (the
+// dashboard SPA uses SSE, not WebSocket).
+server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+  try {
+    const rawUrl = req.url ?? '/';
+    if (!(rawUrl === '/s' || rawUrl.startsWith('/s/') || rawUrl.startsWith('/s?'))) {
+      return clientSocket.destroy();
+    }
+    // Strip query/hash before extracting the sessionId path segment.
+    const pathname = rawUrl.split(/[?#]/)[0];
+    const sessionId = parseTerminalSessionId(pathname);
+    const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
+    if (!tport) return clientSocket.destroy();
+
+    const upstream = netConnect(tport, '127.0.0.1', () => {
+      // rawHeaders is a flat [k, v, k, v, ...] list — preserves casing/duplicates.
+      const lines = [`${req.method} ${req.url} HTTP/1.1`];
+      const rh = req.rawHeaders;
+      for (let i = 0; i + 1 < rh.length; i += 2) lines.push(`${rh[i]}: ${rh[i + 1]}`);
+      lines.push('', '');
+      upstream.write(lines.join('\r\n'));
+      if (head?.length) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    const cleanup = () => {
+      try { upstream.destroy(); } catch { /* ignore */ }
+      try { clientSocket.destroy(); } catch { /* ignore */ }
+    };
+    upstream.on('error', cleanup);
+    clientSocket.on('error', cleanup);
+    upstream.on('close', () => clientSocket.destroy());
+    clientSocket.on('close', () => upstream.destroy());
+  } catch {
+    try { clientSocket.destroy(); } catch { /* ignore */ }
+  }
+});
+
 // Probe upward on EADDRINUSE rather than crashing with an unhandled 'error':
 // a second botmux instance on this host (or a stray process) holding the
 // configured port would otherwise tear the dashboard process down on bind.
@@ -2318,6 +2518,7 @@ listenWithProbe({
   port: config.dashboard.port,
   host: config.dashboard.host,
   portAvailable: dashboardPortAvailable,
+  verifyBound: verifyDashboardBinding,
   log: (m) => logger.warn(`[dashboard] ${m}`),
 }).then((port) => {
   boundDashboardPort = port;
@@ -2342,16 +2543,84 @@ const federationSync = setInterval(() => {
 }, 2 * 60 * 1000);
 federationSync.unref();
 
+// 单候选自动绑定：standalone（未入团队）部署不必手动点面板「绑定」——用各机器人自己的
+// 凭证从 allowedUsers 解析出唯一负责人就自动认领，左上角飞书头像 / 拉群把发起人拉进群 /
+// 机器人归属随即生效。多候选（部署里配了多个人）仍保留手动选择。幂等：绑定后即刻 no-op。
+// 启动时按 0/5/15/60s 退避重试几次以覆盖 boot 时网络/凭证尚未就绪，之后交给手动按钮，
+// 不挂进永久心跳（避免对真·多候选/无 allowedUsers 的部署每 2 分钟空打飞书）。
+async function tryAutoBindOwner(): Promise<'done' | 'retry'> {
+  try {
+    const r = await autoBindOwnerIfUnambiguous(config.session.dataDir, { fetcher: fetch, live: liveBots() });
+    if (r.status === 'bound') { logger.info(`[identity] 已自动绑定本部署负责人：${r.owner?.name || r.owner?.unionId}（头像/拉群/归属即时生效）`); return 'done'; }
+    if (r.status === 'already_bound') return 'done';
+    if (r.status === 'need_choice') { logger.info(`[identity] 检测到 ${r.candidates?.length ?? 0} 个候选负责人，请到面板「团队」手动选择绑定`); return 'done'; }
+    return 'retry'; // no_candidates：可能是网络/凭证未就绪的瞬时失败，退避后重试
+  } catch (e) {
+    logger.debug(`[identity] 自动绑定尝试失败（将退避重试）：${(e as Error).message}`);
+    return 'retry';
+  }
+}
+void (async () => {
+  for (const delayMs of [0, 5_000, 15_000, 60_000]) {
+    if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+    if ((await tryAutoBindOwner()) === 'done') return;
+  }
+})();
+
 // 中心化平台隧道（已绑定才启动；每台机器一个，跑在 dashboard 进程里）
 let platformTunnel: { stop(): void } | null = null;
 function readBotmuxVersion(): string {
+  // 与本地 dashboard「版本与更新」卡同源：源码 checkout 的 package.json 是占位的 0.0.0，
+  // resolveCurrentVersion() 会用 git describe 推出真实版本（如 2.91.1），npm 安装则用 package.json。
   try {
-    const pkg = JSON.parse(readFileSync(join(dirname(__dirname), 'package.json'), 'utf8'));
-    return pkg.version || 'unknown';
+    return resolveCurrentVersion();
   } catch {
     return 'unknown';
   }
 }
+/** 读本机 bots-info.json，转成上报给平台的 bot 概要（人→机器→bot + 拉群用）。 */
+function readPlatformBotsInfo(): PlatformBotInfo[] {
+  try {
+    const fp = join(config.session.dataDir, 'bots-info.json');
+    if (!existsSync(fp)) return [];
+    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{
+      larkAppId?: string;
+      botOpenId?: string | null;
+      botName?: string | null;
+      botAvatarUrl?: string | null;
+      cliId?: string;
+    }>;
+    if (!Array.isArray(entries)) return [];
+    // Merge per-bot team-visibility config (showInTeam) from bots.json by
+    // larkAppId so the platform team page can hide bots. Default: showInTeam =
+    // true (shown). bots.json may be unreadable from the dashboard process →
+    // fall back to the default.
+    const cfgByAppId = new Map<string, { showInTeam?: boolean }>();
+    try {
+      for (const cfg of loadBotConfigs()) {
+        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam });
+      }
+    } catch {
+      /* defaults below */
+    }
+    return entries
+      .map((e) => {
+        const cfg = cfgByAppId.get(e.larkAppId || '');
+        return {
+          appId: e.larkAppId || '',
+          openId: e.botOpenId ?? null,
+          name: e.botName || e.larkAppId || 'bot',
+          avatar: e.botAvatarUrl || undefined,
+          cli: e.cliId,
+          showInTeam: cfg?.showInTeam !== false, // default true
+        };
+      })
+      .filter((b) => b.appId);
+  } catch {
+    return [];
+  }
+}
+
 function startPlatformTunnelIfBound(): void {
   try {
     const binding = readPlatformBinding();
@@ -2362,6 +2631,7 @@ function startPlatformTunnelIfBound(): void {
       getDashboardPort: () => boundDashboardPort,
       getDashboardToken: () => activeToken,
       getVersion: () => version,
+      getBots: () => readPlatformBotsInfo(),
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     });
     logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);

@@ -80,6 +80,7 @@ describe('bot-config store', () => {
     expect(keys).toContain('model');
     expect(keys).not.toContain('repoPickerMode');
     expect(keys).toContain('skills');
+    expect(keys).toContain('silentTurnReactions');
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -143,6 +144,19 @@ describe('bot-config store', () => {
     expect(plain.skills).toBeUndefined();
     expect(skilled.skills).toEqual({ include: ['skill:deploy-runbook'] });
     expect(advancedOnly.skills).toBeUndefined();
+  });
+
+  it('parses silentTurnReactions from bots.json only when true', async () => {
+    const { registry } = await freshModules();
+    const [on, off, invalid] = registry.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'silent-on', larkAppSecret: 's', cliId: 'codex', silentTurnReactions: true },
+      { larkAppId: 'silent-off', larkAppSecret: 's', cliId: 'codex', silentTurnReactions: false },
+      { larkAppId: 'silent-invalid', larkAppSecret: 's', cliId: 'codex', silentTurnReactions: 'true' },
+    ]));
+
+    expect(on.silentTurnReactions).toBe(true);
+    expect(off.silentTurnReactions).toBeUndefined();
+    expect(invalid.silentTurnReactions).toBeUndefined();
   });
 
   it('sets and unsets JSON skills policy through /config store', async () => {
@@ -227,6 +241,19 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+  });
+
+  it('silentTurnReactions writes true / deletes key on false (keeps bots.json tidy)', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('silentTurnReactions')!;
+
+    await store.applyConfigField('app_default', spec, true);
+    expect(readConfig().silentTurnReactions).toBe(true);
+    expect(registry.getBot('app_default').config.silentTurnReactions).toBe(true);
+
+    await store.applyConfigField('app_default', spec, false);
+    expect(readConfig().silentTurnReactions).toBeUndefined();
+    expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
   });
 
   it('number field (maxLiveWorkers) round-trips and clears on null', async () => {

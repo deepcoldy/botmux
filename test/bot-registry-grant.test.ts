@@ -2,12 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
 
 describe('bot-registry grant additions', () => {
-  it('parseBotConfigsFromText preserves & filters chatReplyModes (tri-state)', () => {
+  it('parseBotConfigsFromText preserves & filters chatReplyModes (four-state incl. chat-topic)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'rm1', larkAppSecret: 's',
-      chatReplyModes: { oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_5: 'topic_alias', oc_6: 'topic', oc_3: 'bad', '': 'shared' },
+      chatReplyModes: { oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_5: 'topic_alias', oc_6: 'topic', oc_7: 'chat-topic', oc_3: 'bad', '': 'shared' },
     }]));
-    expect(cfgs[0].chatReplyModes).toEqual({ oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_5: 'shared', oc_6: 'shared' });
+    expect(cfgs[0].chatReplyModes).toEqual({ oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_5: 'shared', oc_6: 'shared', oc_7: 'chat-topic' });
   });
 
   it('parseBotConfigsFromText leaves chatReplyModes undefined when absent/all-invalid', () => {
@@ -114,11 +114,15 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ag4', larkAppSecret: 's', autoGrantRequestCards: 'false' }]))[0].autoGrantRequestCards).toBeUndefined();
   });
 
-  it('parses regularGroupReplyMode: keeps new-topic|shared, drops chat/invalid/absent to undefined', () => {
+  it('parses regularGroupReplyMode: keeps chat-topic|new-topic|shared, drops chat/invalid/absent to undefined', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyMode: 'new-topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1b', larkAppSecret: 's', regularGroupReplyMode: 'shared' }]))[0].regularGroupReplyMode).toBe('shared');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1c', larkAppSecret: 's', regularGroupReplyMode: 'topic_alias' }]))[0].regularGroupReplyMode).toBe('shared');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1d', larkAppSecret: 's', regularGroupReplyMode: 'topic' }]))[0].regularGroupReplyMode).toBe('shared');
+    // chat-topic must SURVIVE the load round-trip — regression for the blocker
+    // where the per-bot default loader dropped it back to 'chat' on restart.
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1e', larkAppSecret: 's', regularGroupReplyMode: 'chat-topic' }]))[0].regularGroupReplyMode).toBe('chat-topic');
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1f', larkAppSecret: 's', regularGroupReplyMode: 'chat_topic' }]))[0].regularGroupReplyMode).toBe('chat-topic');
     // 'chat' is the default → normalized to undefined so bots.json stays clean.
     for (const bad of ['chat', 'bad', true, 1, undefined]) {
       const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg2', larkAppSecret: 's', regularGroupReplyMode: bad }]));

@@ -31,8 +31,43 @@ vi.mock('node:os', () => ({
 
 import { execSync } from 'node:child_process';
 import { readFileSync, readlinkSync, existsSync, readdirSync } from 'node:fs';
-import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
+import { discoverAdoptableSessions, validateAdoptTarget, isBareShellComm, bareShellLaunchKind } from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
+
+describe('isBareShellComm()', () => {
+  it('classifies interactive shells as bare shells', () => {
+    for (const sh of ['sh', 'bash', 'zsh', 'dash', 'ash', 'ksh', 'fish', 'tcsh', 'csh']) {
+      expect(isBareShellComm(sh)).toBe(true);
+    }
+  });
+  it('tolerates the leading-dot login-shell form (e.g. -zsh → .zsh on some ps)', () => {
+    expect(isBareShellComm('.zsh')).toBe(true);
+  });
+  it('does NOT classify agent CLIs or launchers as bare shells', () => {
+    for (const comm of ['codex', 'claude', 'node', 'python', 'relay', 'seed', 'coco']) {
+      expect(isBareShellComm(comm)).toBe(false);
+    }
+  });
+  it('returns false for undefined/empty', () => {
+    expect(isBareShellComm(undefined)).toBe(false);
+    expect(isBareShellComm('')).toBe(false);
+  });
+});
+
+describe('bareShellLaunchKind()', () => {
+  it('reports trampoline when leaf shell differs from the launch shell', () => {
+    // The exact user case: $SHELL=bash, .bashrc `exec zsh` → leaf is zsh.
+    expect(bareShellLaunchKind('zsh', 'bash')).toBe('trampoline');
+    expect(bareShellLaunchKind('bash', 'zsh')).toBe('trampoline');
+  });
+  it('reports stuck when leaf matches the launch shell (slow/erroring rc, or CLI not on PATH)', () => {
+    expect(bareShellLaunchKind('bash', 'bash')).toBe('stuck');
+    expect(bareShellLaunchKind('zsh', 'zsh')).toBe('stuck');
+  });
+  it('reports stuck (no confident trampoline claim) when the launch shell is unknown', () => {
+    expect(bareShellLaunchKind('zsh', '')).toBe('stuck');
+  });
+});
 
 const mockExecSync = vi.mocked(execSync);
 const mockReadFileSync = vi.mocked(readFileSync);

@@ -813,10 +813,7 @@ export async function resolveAllowedUsersWithMap(
     // into this bot's allowedUsers and owner checks silently lock everyone out.
     for (const oid of openIds) {
       try {
-        const res = await (c as any).contact.v3.user.get({
-          path: { user_id: oid },
-          params: { user_id_type: 'open_id' },
-        });
+        const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(oid)}`, { user_id_type: 'open_id' });
         if (res?.code === 99992361) {
           logger.warn(`allowedUsers open_id ${oid} belongs to another app for ${larkAppId}; use email or union_id (on_) instead.`);
         } else if (res?.code && res.code !== 0) {
@@ -830,10 +827,7 @@ export async function resolveAllowedUsersWithMap(
     // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
     for (const uid of unionIds) {
       try {
-        const res = await (c as any).contact.v3.user.get({
-          path: { user_id: uid },
-          params: { user_id_type: 'union_id' },
-        });
+        const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(uid)}`, { user_id_type: 'union_id' });
         const oid = res?.data?.user?.open_id as string | undefined;
         if (res.code === 0 && oid) {
           map.set(uid, oid);
@@ -902,10 +896,7 @@ export async function resolveUserUnionId(larkAppId: string, openId: string): Pro
   if (!openId) return {};
   try {
     const c = getBotClient(larkAppId);
-    const res = await (c as any).contact.v3.user.get({
-      path: { user_id: openId },
-      params: { user_id_type: 'open_id' },
-    });
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, { user_id_type: 'open_id' });
     if (res.code === 0 && res.data?.user) {
       return { unionId: res.data.user.union_id ?? undefined, name: res.data.user.name ?? undefined };
     }

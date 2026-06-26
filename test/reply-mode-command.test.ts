@@ -106,6 +106,12 @@ describe('tryHandleReplyModeCommand — DM (p2p) session mode', () => {
     expect(lastReply()).toBe('cmd.reply_mode.dm_shared_unsupported');
   });
 
+  it('DM `/reply-mode chat-topic` → rejected (group-only, like shared), no silent no-op', async () => {
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode chat-topic', 'p2p'), USER, true);
+    expect(mockApplyConfigField).not.toHaveBeenCalled();
+    expect(lastReply()).toBe('cmd.reply_mode.dm_shared_unsupported');
+  });
+
   it('DM `/reply-mode` status (canTalk) → dm_status, no write, no @ required', async () => {
     mockIsBotMentioned.mockReturnValue(false); // DMs need no @mention
     mockGetBot.mockReturnValue({ config: { larkAppId: APP, p2pMode: 'chat' }, botOpenId: 'ou_bot' });
@@ -152,6 +158,13 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode new-topic', 'group'), USER, true);
     expect(handled).toBe(true);
     expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'new-topic');
+    expect(lastReply()).toBe('cmd.reply_mode.updated');
+  });
+
+  it('group `/reply-mode chat-topic` sets the hybrid flat-top/per-native-topic mode', async () => {
+    const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode chat-topic', 'group'), USER, true);
+    expect(handled).toBe(true);
+    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'chat-topic');
     expect(lastReply()).toBe('cmd.reply_mode.updated');
   });
 

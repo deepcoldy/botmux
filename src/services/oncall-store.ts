@@ -179,6 +179,66 @@ export async function updateBotDefaultOncall(
 }
 
 /**
+ * Atomically set the per-bot「默认工作目录模式」(dashboard 三选一). The two underlying
+ * fields — `defaultWorkingDir` and `defaultOncall` — are mutually exclusive, so BOTH
+ * are written inside a SINGLE `rmwBotEntry` lock. Doing them as two separate locked
+ * writes (applyConfigField + updateBotDefaultOncall) lets two concurrent saves for
+ * different modes interleave and leave `defaultOncall.enabled` AND `defaultWorkingDir`
+ * both set — an inconsistent state where the UI shows oncall (derived from
+ * `defaultOncall.enabled`) but runtime pins `defaultWorkingDir` (see
+ * `effectiveDefaultWorkingDir`). PR #311 Codex review.
+ *
+ *   • 'off'     → clear defaultWorkingDir; disable defaultOncall (keep its prior dir
+ *                 so a later toggle back to oncall round-trips without retyping).
+ *   • 'default' → set defaultWorkingDir=dir; disable defaultOncall (keep prior dir).
+ *   • 'oncall'  → enable defaultOncall(dir) + re-stamp `since`; clear defaultWorkingDir.
+ *
+ * Caller validates `workingDir` (dir existence) first; it is ignored for 'off'.
+ */
+export async function setWorkingDirMode(
+  larkAppId: string,
+  mode: 'off' | 'default' | 'oncall',
+  workingDir: string,
+): Promise<
+  | { ok: true; defaultOncall: BotDefaultOncall; defaultWorkingDir: string | null }
+  | { ok: false; reason: string }
+> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const dir = (workingDir ?? '').trim();
+  let nextOncall: BotDefaultOncall | null = null;
+  let nextWorkingDir: string | null = null;
+
+  const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+    const prior: BotDefaultOncall | undefined = entry.defaultOncall;
+    if (mode === 'oncall') {
+      nextOncall = { enabled: true, workingDir: dir, since: Date.now() };
+      nextWorkingDir = null;
+    } else {
+      // off / default → disable defaultOncall, keep its prior workingDir for round-trip.
+      nextOncall = { enabled: false, workingDir: prior?.workingDir ?? '', since: prior?.since ?? 0 };
+      nextWorkingDir = mode === 'default' ? dir : null;
+    }
+    entry.defaultOncall = nextOncall;
+    if (nextWorkingDir === null) delete entry.defaultWorkingDir;
+    else entry.defaultWorkingDir = nextWorkingDir;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  // Sync in-memory config (runtime reads bot.config directly — no restart needed).
+  bot.config.defaultOncall = nextOncall!;
+  bot.config.defaultWorkingDir = nextWorkingDir ?? undefined;
+  logger.info(
+    `[oncall:${larkAppId}] working-dir mode=${mode} ` +
+    `(defaultWorkingDir=${nextWorkingDir ?? '∅'}, oncall.enabled=${nextOncall!.enabled}, ` +
+    `oncall.dir=${nextOncall!.workingDir || '∅'})`,
+  );
+  return { ok: true, defaultOncall: nextOncall!, defaultWorkingDir: nextWorkingDir };
+}
+
+/**
  * Auto-bind a chat as part of the defaultOncall flow. Atomically:
  *   1. RE-CHECK tombstone + existing binding against the freshest on-disk
  *      snapshot. The daemon's fast-path tombstone check is informational —

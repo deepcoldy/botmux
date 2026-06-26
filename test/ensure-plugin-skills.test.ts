@@ -27,6 +27,13 @@ describe('ensurePluginSkills', () => {
     }
   });
 
+  it('botmux-goal-ask 文案和 GoalInputs answer 结构一致', () => {
+    const skill = BUILTIN_SKILLS.find((s) => s.name === 'botmux-goal-ask');
+    expect(skill?.content).toContain('"from": "human"');
+    expect(skill?.content).toContain('"name": "answer"');
+    expect(skill?.content).not.toContain('from: "human/answer"');
+  });
+
   it('幂等：重复调用不报错且内容稳定', () => {
     ensurePluginSkills('claude-code', dir);
     const sample = join(dir, 'skills', BUILTIN_SKILLS[0].name, 'SKILL.md');
@@ -73,5 +80,24 @@ describe('removeGlobalBotmuxSkills', () => {
   it('目录不存在 / undefined：no-op，不报错', () => {
     expect(() => removeGlobalBotmuxSkills(join(dir, 'nope'))).not.toThrow();
     expect(() => removeGlobalBotmuxSkills(undefined)).not.toThrow();
+  });
+
+  it('二次扫描：第一次清理后重启竞态又写回的 botmux skill，会被再扫一遍清掉', () => {
+    // 第一道：清理（模拟早期 cleanupGlobalBotmuxSkillsOnce）
+    seed('botmux-send');
+    removeGlobalBotmuxSkills(dir);
+    expect(existsSync(join(dir, 'botmux-send'))).toBe(false);
+
+    // 重启竞态：清理后又被外部老 build / 残留进程写回全局
+    seed('botmux-send');
+    seed('botmux-handoff');
+    seed('my-own-skill');
+    expect(existsSync(join(dir, 'botmux-send'))).toBe(true);
+
+    // 第二道：restore 完成后再扫一遍（本次修复的核心）——botmux 残留清掉、用户 skill 保留
+    removeGlobalBotmuxSkills(dir);
+    expect(existsSync(join(dir, 'botmux-send'))).toBe(false);
+    expect(existsSync(join(dir, 'botmux-handoff'))).toBe(false);
+    expect(existsSync(join(dir, 'my-own-skill'))).toBe(true);
   });
 });

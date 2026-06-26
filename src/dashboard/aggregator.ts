@@ -67,6 +67,14 @@ export class Aggregator {
     return this.sessions.get(sessionId)?.larkAppId;
   }
 
+  /** sessionId → owning bot daemon's terminal reverse-proxy port. Used by the
+   *  dashboard `/s/*` bridge to route a terminal request to the right daemon's
+   *  proxy (each bot daemon runs its own terminal proxy on proxyBasePort+idx).
+   *  undefined when the session is unknown or its daemon's proxy isn't up. */
+  terminalProxyPortOf(sessionId: string): number | undefined {
+    return this.sessions.get(sessionId)?.proxyPort as number | undefined;
+  }
+
   /** Whether a session row with this id exists at all in the aggregator,
    *  regardless of `larkAppId` presence. Mirrors `scheduleExists`; lets
    *  the Route B write gate tell apart "legacy row with no owner" from

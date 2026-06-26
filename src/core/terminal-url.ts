@@ -1,4 +1,6 @@
 import { config } from '../config.js';
+import { platformMachineBaseUrl } from '../platform/binding.js';
+import { isRemoteAccessEnabled } from '../global-config.js';
 
 /**
  * Builds the public URL for a session's web terminal. When the per-daemon
@@ -63,6 +65,18 @@ export function resetTerminalProxy(): void {
 }
 
 export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
+  // When 远程访问 is enabled AND this daemon is bound to the central platform AND
+  // the local terminal proxy is up, route terminal links through the machine
+  // subdomain (`https://m-<machineId>.<platformHost>/s/<sessionId>`). The platform
+  // reverse-proxies that subdomain to this daemon's dashboard, which in turn
+  // proxies `/s/*` to the local terminal proxy — so terminals are reachable
+  // centrally with no `:port`. Write access there is gated by the platform login
+  // (not a URL token), so we deliberately omit `?token=`. When 远程访问 is off the
+  // platform base is null and we fall through to the local URL behavior.
+  if (proxyReady) {
+    const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
+    if (platformBase) return `${platformBase}/s/${ds.session.sessionId}`;
+  }
   const base = proxyReady
     ? `http://${config.web.externalHost}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
     : `http://${config.web.externalHost}:${ds.workerPort ?? ds.session.webPort}`;

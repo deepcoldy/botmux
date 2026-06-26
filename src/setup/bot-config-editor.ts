@@ -135,6 +135,13 @@ export interface BotConfigEditInput {
   workingDir?: string;
   allowedUsers?: string;
   allowedChatGroups?: string;
+  /**
+   * 平台团队页是否展示这个 bot（默认 ON）。三态字符串：
+   *   - undefined → 不动
+   *   - 'true' / 'false' → 设置（'true' 落盘为删字段=默认 ON；'false' 落盘 false）
+   *   - '' / '-' → 清空（回到默认 ON）
+   */
+  showInTeam?: string;
 }
 
 /**
@@ -258,6 +265,37 @@ function applyOptionalString(
   out[key] = s;
 }
 
+/**
+ * Apply a tri-state boolean edit to a bot config object.
+ *   - raw === undefined → leave untouched
+ *   - '' / '-'          → delete the key (revert to default)
+ *   - 'true' / 'false' (case-insensitive, also 1/0/yes/no/on/off) → set bool
+ *
+ * `persistDefault` is the value that equals "default" — when the parsed bool
+ * equals it, the key is deleted instead of stored, mirroring how the bot-registry
+ * parser keeps bots.json clean (default ON fields store only `false`, default OFF
+ * fields store only `true`). Unparseable values throw.
+ */
+function applyOptionalBoolean(
+  out: Record<string, any>,
+  key: string,
+  raw: string | undefined,
+  persistDefault: boolean,
+): void {
+  if (raw === undefined) return;
+  const s = raw.trim().toLowerCase();
+  if (!s || s === '-') {
+    delete out[key];
+    return;
+  }
+  let value: boolean;
+  if (s === 'true' || s === '1' || s === 'yes' || s === 'on') value = true;
+  else if (s === 'false' || s === '0' || s === 'no' || s === 'off') value = false;
+  else throw new Error(`${key} 必须是 true / false（或留空 / - 恢复默认）: ${raw}`);
+  if (value === persistDefault) delete out[key];
+  else out[key] = value;
+}
+
 export function parseBotSelection(
   input: string,
   bots: Array<{ larkAppId?: string; name?: unknown }>,
@@ -372,6 +410,9 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
       out.allowedChatGroups = allowedChatGroups.split(',').map(s => s.trim()).filter(Boolean);
     }
   }
+
+  // 平台团队展示默认 ON → 只把显式 false 落盘。
+  applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
 
   return normalizeBotConfig(out) as T;
 }

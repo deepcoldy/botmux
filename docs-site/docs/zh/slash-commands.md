@@ -104,6 +104,16 @@
 
 `/subscribe-lark-doc <文档链接>`：订阅一篇飞书文档，文档评论喂进本会话、机器人回复发回评论讨论串 · `/subscribe-lark-doc list` 查看已订阅 · `/subscribe-lark-doc off` 退订。详见 [飞书文档评论入口](/doc-comment)。
 
+## 🔧 Workflow（流程编排，实验性）
+
+| 命令 | 说明 |
+|------|------|
+| `/workflow <目标>`（= `/workflow new <目标>`） | 发起**即兴 workflow**：bot 拷问澄清需求 → 自动编排成 DAG → 你确认后并发跑完，风险节点执行期弹审批卡 |
+| `/template run <id> [key=value ...]` | 跑一个已存好的 workflow 模板（旧 `/workflow run` 已改名为此） |
+| `/template cancel <runId>` | 取消一个模板 run（旧 `/workflow cancel` 已改名为此） |
+
+详见 [Workflow](/workflow)。
+
 ## 👥 多机器人协作
 
 `@botA @botB /t <prompt>`（各自开新话题）· `@botA @botB /introduce`（互相登记 open_id）

@@ -15,10 +15,10 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripLeadingMentions } from './message-parser.js';
+import { stripLeadingMentions, mentionOpenId } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
@@ -592,7 +592,7 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
 export function updateBotOpenIdCrossRef(
   dataDir: string,
   larkAppId: string,
-  mentionsList: Array<{ name?: string; id?: { open_id?: string } }>,
+  mentionsList: Array<{ name?: string; id?: { open_id?: string } | string; id_type?: string }>,
 ): void {
   if (!mentionsList || mentionsList.length === 0) return;
 
@@ -620,7 +620,7 @@ export function updateBotOpenIdCrossRef(
   let changed = false;
   for (const m of mentionsList) {
     const name = m.name;
-    const openId = m.id?.open_id;
+    const openId = mentionOpenId(m);
     if (!name || !openId) continue;
     if (!knownBotNames.has(name.toLowerCase())) continue;
     if (existing[name] === openId) continue;
@@ -694,9 +694,9 @@ export async function tryHandleIntroduceCommand(
   }
 
   const selfOpenId = getBot(larkAppId).botOpenId;
-  const rawMentions: Array<{ name?: string; id?: { open_id?: string } }> = message.mentions ?? [];
+  const rawMentions: Array<{ name?: string; id?: { open_id?: string } | string; id_type?: string }> = message.mentions ?? [];
   const all = rawMentions
-    .map(m => ({ openId: m.id?.open_id ?? '', name: m.name ?? '' }))
+    .map(m => ({ openId: mentionOpenId(m) ?? '', name: m.name ?? '' }))
     .filter(m => m.openId && m.name);
   const hasExternal = all.some(m => m.openId !== selfOpenId);
   if (!hasExternal) {
@@ -735,6 +735,10 @@ export async function tryHandleIntroduceCommand(
 
 // ─── @mention detection ──────────────────────────────────────────────────
 
+/** One-shot guard so the mention-shape early-warning logs at most once per
+ *  process instead of flooding once Lark converges the shapes (see below). */
+let warnedStringMentionShape = false;
+
 /** Check if the bot was @mentioned in this message */
 export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: string | undefined): boolean {
   const botOpenId = getBot(larkAppId).botOpenId;
@@ -746,9 +750,20 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
     return false;
   }
 
-  // 1. Check message.mentions array (populated for user-sent text messages)
+  // 1. Check message.mentions array (populated for user-sent text messages).
+  //    mentionOpenId() tolerates both the WS event object shape and the REST
+  //    string shape, so a Lark mention-shape change can't silently break
+  //    @-detection (which would make the bot ignore every @ with no error).
   const mentions: any[] = message.mentions ?? [];
-  if (mentions.some((m: any) => m.id?.open_id === botOpenId)) {
+  // Early-warning: today's WS events carry mention.id as an object; the REST
+  // API carries a bare string. A string-form id on the event path means Lark
+  // has converged the event onto the REST shape — surface it (once) so a silent
+  // @-routing regression announces itself even though mentionOpenId absorbs it.
+  if (!warnedStringMentionShape && mentions.some((m: any) => typeof m?.id === 'string')) {
+    warnedStringMentionShape = true;
+    logger.warn(`[${larkAppId}] mention.id arrived in string form on the event path — Lark may have converged the WS event onto the REST shape. mentionOpenId() absorbs it, but verify group @-routing. (logged once per process)`);
+  }
+  if (mentions.some((m: any) => mentionOpenId(m) === botOpenId)) {
     return true;
   }
 
@@ -949,7 +964,7 @@ async function maybeSendGrantRequestCard(
   // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
   // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
   // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
-  const mentionName = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name;
+  const mentionName = (message?.mentions ?? []).find((m: any) => mentionOpenId(m) === requesterOpenId)?.name;
   const observedName = mentionName
     ? undefined
     : listObservedBots(config.session.dataDir, larkAppId, chatId).find(b => b.openId === requesterOpenId)?.name;
@@ -1211,9 +1226,12 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   // would otherwise fork a brand-new thread-scope session every time another
   // human/bot @mentions us inside that topic. Keep the visible reply in the
   // same topic (replyRootId=rootId), but route the turn through the group
-  // chat-scope session. `new-topic` is the only mode that intentionally keeps
-  // per-topic independent sessions.
-  if (resolveRegularGroupMode(larkAppId, chatId) === 'new-topic') return undefined;
+  // chat-scope session. `new-topic` and `chat-topic` are the modes that
+  // intentionally keep per-topic independent sessions — they must NOT fold:
+  // new-topic forks every top-level @ too, while chat-topic keeps top level
+  // flat but lets each native Lark topic run its own session.
+  const mode = resolveRegularGroupMode(larkAppId, chatId);
+  if (mode === 'new-topic' || mode === 'chat-topic') return undefined;
   const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
   if (freshMode !== 'group') return undefined;
   routing.scope = 'chat';
@@ -1251,10 +1269,12 @@ type RoutingDecision = {
 };
 
 function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
-  // tri-state: only `new-topic` forks a fresh thread-scope session. `shared`
-  // stays chat-scope here (the topic fold happens post-routing, see
-  // maybeApplySharedTopicSeed); `chat` is the flat default. resolveRegularGroupMode
-  // is the single decision point so new-topic and shared never both fire.
+  // Only `new-topic` forks a fresh thread-scope session for a TOP-LEVEL @.
+  // `shared` stays chat-scope here (the topic fold happens post-routing, see
+  // maybeApplySharedTopicSeed); `chat` is the flat default; `chat-topic` is also
+  // flat at top level (it only diverges for native topics, where the fold is
+  // skipped — see maybeFoldMentionedRegularGroupThreadToChat). resolveRegularGroupMode
+  // is the single decision point so the modes never both fire.
   if (resolveRegularGroupMode(larkAppId, chatId) === 'new-topic') {
     return { scope: 'thread', anchor: messageId, source: 'regular-group-thread' };
   }
@@ -1364,6 +1384,12 @@ async function processCommentEvent(
     return;
   }
 
+  // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
+  // 在该窗口内到达，下面 mention-only 闸 / 自触发过滤会拿到 undefined 的 botOpenId
+  // → 合法的 @bot 评论被误丢（事件已被 ACK，飞书不会重投，@ 永久丢失）。await
+  // 去重后的探针把 open_id 补齐；探针失败则降级（心跳会重试）。
+  await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+
   // 2) 拉评论 thread 取权威正文 / 作者 / @ 列表（事件 payload 不保证带全），
   //    同时用最新一条回复作为"触发回复"。
   const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
@@ -1381,14 +1407,13 @@ async function processCommentEvent(
   const selfBotOpenId = getBot(larkAppId).botOpenId;
   if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
 
-  // 4) 触发范围：mention-only 要求评论 @ 到本 bot。优先用事件自带的 is_mentioned
-  //    （飞书已判好），拿不到再回退按评论正文里的 @person 列表比对 bot open_id。
-  if (sub.commentTriggerMode === 'mention-only') {
-    const mentioned = parsed.isMentioned === true || (!!selfBotOpenId && trigger.mentions.includes(selfBotOpenId));
-    if (!mentioned) {
-      logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)})`);
-      return;
-    }
+  // 4) 触发范围闸（mention-only 仅当评论真的 @ 了本 bot 才触发）。
+  //    ⚠️ 必须以拉到的评论正文 @person(open_id) 列表为准，不能信事件自带的
+  //    `is_mentioned`——它表示「评论里存在任意 @」，@ 别人时也是 true，曾导致
+  //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
+  if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
+    logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
+    return;
   }
 
   const text = trigger.text.trim();

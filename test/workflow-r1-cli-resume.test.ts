@@ -73,7 +73,7 @@ const resumeSpawnStub: WorkerSpawnFn = async (input) => ({
   errorMessage:
     `subagent '${input.botName}' (node=${input.nodeId}, activity=${input.activityId}) ` +
     `is not resumable via 'botmux workflow resume' — CLI does not spawn workers. ` +
-    `Use IM /workflow run for full execution, or restart the run.`,
+    `Use IM /template run for full execution, or restart the run.`,
 });
 
 // Helper to write effectAttempted state matching what dispatchWork would

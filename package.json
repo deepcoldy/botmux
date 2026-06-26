@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "build": "tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js",
-    "dashboard:bundle": "esbuild src/dashboard/web/app.ts --bundle --outfile=dist/dashboard-web/app.js --platform=browser --format=iife --minify && cp src/dashboard/web/index.html dist/dashboard-web/index.html && cp src/dashboard/web/style.css dist/dashboard-web/style.css && cp src/dashboard/web/terminal-replay.html dist/dashboard-web/terminal-replay.html && rm -rf dist/dashboard-web/skins && cp -r src/dashboard/web/skins dist/dashboard-web/skins && rm -rf dist/dashboard-web/game && { [ ! -d src/dashboard/web/game ] || cp -r src/dashboard/web/game dist/dashboard-web/game; }",
+    "dashboard:bundle": "esbuild src/dashboard/web/app.ts --bundle --outfile=dist/dashboard-web/app.js --platform=browser --format=iife --minify && cp src/dashboard/web/index.html dist/dashboard-web/index.html && cp src/dashboard/web/style.css dist/dashboard-web/style.css && cp src/dashboard/web/favicon.png dist/dashboard-web/favicon.png && cp src/dashboard/web/apple-touch-icon.png dist/dashboard-web/apple-touch-icon.png && cp src/dashboard/web/terminal-replay.html dist/dashboard-web/terminal-replay.html && rm -rf dist/dashboard-web/skins && cp -r src/dashboard/web/skins dist/dashboard-web/skins && rm -rf dist/dashboard-web/game && { [ ! -d src/dashboard/web/game ] || cp -r src/dashboard/web/game dist/dashboard-web/game; }",
     "daemon": "tsx src/index-daemon.ts",
     "daemon:start": "node dist/cli.js start",
     "daemon:stop": "node dist/cli.js stop",

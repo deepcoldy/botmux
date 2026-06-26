@@ -832,9 +832,12 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+      const res = await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
       await flush();
 
+      // 有权限点击：同步立即回执 success toast（投递是异步 fire-and-forget，不等它完成）。
+      expect(res?.toast?.type).toBe('success');
+      expect(res?.toast?.content).toContain('已私密发送');
       // 普通群 → 仅点击者可见的 ephemeral 私密卡，不发 DM。
       expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
         APP_ID, ds.chatId, 'ou_user', expect.stringContaining('"type":"session"'),
@@ -856,9 +859,11 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+      const res = await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
       await flush();
 
+      // 有权限：同样同步回执 success toast（不区分投递通道）。
+      expect(res?.toast?.type).toBe('success');
       // 单聊 → 跳过注定失败的 ephemeral，直接私聊 DM（DM 落在同一个 1:1 会话里）。
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(fakeLark.dms).toHaveLength(1);
@@ -945,14 +950,24 @@ describe('Card integration: full event flow', () => {
       expect(fakeLark.patches).toHaveLength(0);
     });
 
-    it('action on non-existent session should be a no-op', async () => {
+    it('close / toggle on a non-existent session return a failure toast; restart stays a silent no-op', async () => {
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeToggleEvent('om_nonexistent', NONCE_CURRENT), deps, APP_ID);
-      await handleCardAction(makeRestartEvent('om_nonexistent'), deps, APP_ID);
-      await handleCardAction(makeCloseEvent('om_nonexistent'), deps, APP_ID);
+      // 会话已不在线：close /「显示输出」给失败 toast（消除「按钮坏了」的错觉）。
+      const toggleRes = await handleCardAction(makeToggleEvent('om_nonexistent', NONCE_CURRENT), deps, APP_ID);
+      expect(toggleRes?.toast?.type).toBe('warning');
+      expect(toggleRes?.toast?.content).toContain('不在线');
 
+      const closeRes = await handleCardAction(makeCloseEvent('om_nonexistent'), deps, APP_ID);
+      expect(closeRes?.toast?.type).toBe('warning');
+      expect(closeRes?.toast?.content).toContain('不在线');
+
+      // restart 未纳入本次失败 toast 范围，维持既有「静默 no-op」。
+      const restartRes = await handleCardAction(makeRestartEvent('om_nonexistent'), deps, APP_ID);
+      expect(restartRes?.toast).toBeUndefined();
+
+      // 三者都不应产生卡片 PATCH。
       expect(fakeLark.patches).toHaveLength(0);
     });
 

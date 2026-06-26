@@ -125,11 +125,11 @@ function setupBotState(opts?: {
   /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
   configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
-  regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared';
+  regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
-  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared'>;
+  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
   p2pMode?: 'thread' | 'chat';
 }) {
   mockGetBot.mockReturnValue({
@@ -291,6 +291,36 @@ describe('isBotMentioned', () => {
       content: JSON.stringify({ text: '@BotA hello' }),
     };
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('detects @mention via REST string-form id (im.message.get shape)', () => {
+    // The message REST API delivers mention.id as a bare string "ou_xxx" with a
+    // sibling id_type, unlike the WS event's { open_id } object. mentionOpenId
+    // must absorb this so a Lark shape convergence can't silently break @-routing.
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('detects string-form id with no id_type (defaults to open_id)', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('does NOT match a string-form id whose id_type is not open_id', () => {
+    // Guard: Lark may return a union_id/user_id string when the app lacks the
+    // open_id scope. Even if its value coincided with our open_id it must not be
+    // compared as one.
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID, id_type: 'union_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
   });
 
   it('detects @mention in post content at tags (bot-sent messages)', () => {
@@ -1549,6 +1579,99 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('chat-topic mode: a fresh @ inside a native regular-group topic spawns an independent thread session (NOT folded to chat-scope)', async () => {
+    // Direct contrast to the chat/shared fold test above: SAME setup (bot owns
+    // the group chat-scope anchor, @mentioned inside a native Lark topic), but in
+    // chat-topic mode the turn must NOT fold into the group session. With no
+    // session owned at the topic root yet, it spawns a fresh thread-scope session
+    // (handleNewTopic, anchor=rootId) — "话题里开新会话".
+    setupBotState({ regularGroupReplyMode: 'chat-topic', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA independent topic context please' }),
+      rootId: 'chat-topic-native-root',
+      threadId: 'omt_chat_topic_thread', // real Lark thread
+      messageId: 'msg-mentioned-in-chat-topic-mode',
+      chatId: 'chat-chat-topic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    // Bot owns the group chat-scope anchor — must NOT pull the topic into it.
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-chat-topic');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'chat-topic-native-root',
+      larkAppId: MY_APP_ID,
+    }));
+    // Crucially NOT routed into the group chat-scope session (the fold path).
+    expect(handlers.handleThreadReply).not.toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-chat-topic',
+    }));
+  });
+
+  it('chat-topic mode: a follow-up @ in a native topic the bot already owns continues that per-topic session (thread-scope, not folded)', async () => {
+    // Once a per-topic session exists, further @s continue it in thread-scope —
+    // never folded back to the group chat-scope session.
+    setupBotState({ regularGroupReplyMode: 'chat-topic', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-chat-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA keep going in this topic' }),
+      rootId: 'owned-chat-topic-root',
+      threadId: 'owned-chat-topic-root',
+      messageId: 'msg-followup-in-chat-topic',
+      chatId: 'chat-chat-topic-2',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'owned-chat-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('chat-topic mode: a TOP-LEVEL @ still routes flat through the group chat-scope session', async () => {
+    // The hybrid: only native topics diverge. A plain top-level @ behaves exactly
+    // like `chat` — flat chat-scope anchored on chatId, no topic seeding. No
+    // session owned yet → handleNewTopic at chat-scope.
+    setupBotState({ regularGroupReplyMode: 'chat-topic', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA top-level question' }),
+      messageId: 'msg-chat-topic-top-level',
+      chatId: 'chat-chat-topic-flat',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockReturnValue(false);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-chat-topic-flat',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('shared follow-up thread reply folds back to chat session when mention mode is topic (no-@ inside topics)', async () => {

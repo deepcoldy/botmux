@@ -56,7 +56,9 @@ export async function tryHandleReplyModeCommand(
       await reply(t('cmd.reply_mode.dm_usage', undefined, loc));
       return true;
     }
-    if (mode === 'shared') {
+    // shared / chat-topic are regular-group-only (they hinge on native topics
+    // inside a group); a 1:1 DM has none, so reject instead of silently no-oping.
+    if (mode === 'shared' || mode === 'chat-topic') {
       await reply(t('cmd.reply_mode.dm_shared_unsupported', undefined, loc));
       return true;
     }
