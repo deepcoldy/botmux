@@ -58,7 +58,7 @@ import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments }
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
-import { rejectLikelyWindowsStdinMojibake } from './cli/stdin-encoding.js';
+import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
@@ -2986,7 +2986,7 @@ function readStdinUtf8(): string {
   // a TTY as "no stdin input" so the caller's empty-content guard surfaces a
   // real error instead of an indefinite hang.
   if (process.stdin.isTTY) return '';
-  try { return readFileSync(0, 'utf-8'); } catch { return ''; }
+  try { return decodeStdinBytes(readFileSync(0)); } catch { return ''; }
 }
 
 function currentWhiteboardContext(args: string[]): { session?: SessionData; larkAppId?: string; chatId?: string; workingDir?: string; sessionId?: string } {
@@ -3538,10 +3538,16 @@ function readStdin(): Promise<string> {
     if (process.stdin.isTTY) { resolve(''); return; }
     const chunks: Buffer[] = [];
     process.stdin.on('data', (c) => chunks.push(c));
-    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+    process.stdin.on('end', () => {
+      const raw = Buffer.concat(chunks);
+      resolve(decodeStdinBytes(raw));
+    });
     process.stdin.on('error', () => resolve(''));
   });
 }
+
+// decodeStdinBytes lives in ./cli/stdin-encoding.ts (imported above) so it
+// can be unit-tested with an explicit platform argument.
 
 /** Collect all values for a repeatable flag: --flag v1 --flag v2 */
 function argValues(args: string[], ...flags: string[]): string[] {
