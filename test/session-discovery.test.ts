@@ -31,7 +31,7 @@ vi.mock('node:os', () => ({
 
 import { execSync } from 'node:child_process';
 import { readFileSync, readlinkSync, existsSync, readdirSync } from 'node:fs';
-import { discoverAdoptableSessions, validateAdoptTarget, isBareShellComm } from '../src/core/session-discovery.js';
+import { discoverAdoptableSessions, validateAdoptTarget, isBareShellComm, bareShellLaunchKind } from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 
 describe('isBareShellComm()', () => {
@@ -51,6 +51,21 @@ describe('isBareShellComm()', () => {
   it('returns false for undefined/empty', () => {
     expect(isBareShellComm(undefined)).toBe(false);
     expect(isBareShellComm('')).toBe(false);
+  });
+});
+
+describe('bareShellLaunchKind()', () => {
+  it('reports trampoline when leaf shell differs from the launch shell', () => {
+    // The exact user case: $SHELL=bash, .bashrc `exec zsh` → leaf is zsh.
+    expect(bareShellLaunchKind('zsh', 'bash')).toBe('trampoline');
+    expect(bareShellLaunchKind('bash', 'zsh')).toBe('trampoline');
+  });
+  it('reports stuck when leaf matches the launch shell (slow/erroring rc, or CLI not on PATH)', () => {
+    expect(bareShellLaunchKind('bash', 'bash')).toBe('stuck');
+    expect(bareShellLaunchKind('zsh', 'zsh')).toBe('stuck');
+  });
+  it('reports stuck (no confident trampoline claim) when the launch shell is unknown', () => {
+    expect(bareShellLaunchKind('zsh', '')).toBe('stuck');
   });
 });
 

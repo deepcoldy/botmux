@@ -65,7 +65,7 @@ import {
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
-import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm } from './core/session-discovery.js';
+import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
@@ -212,6 +212,12 @@ let hasRunStartupCommands = false;
  *  would just produce `zsh: parse error`) and the user gets one diagnostic
  *  instead. Reset per spawn in spawnCli. */
 let bareShellLaunchBlocked = false;
+/** Per-spawn one-shot: has the bare-shell launch check already run for this
+ *  spawn? Gates detectBareShellLaunch() to the FIRST flush only (the
+ *  "about to type the first prompt" moment), independent of the startup-commands
+ *  one-shot so it also covers a reattach onto a pane that degraded to a bare
+ *  shell. Reset per spawn in spawnCli. */
+let bareShellChecked = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
  *  hook fires a true-ready signal, so a cjadk-style startup selector's ❯ (which
  *  falsely matches readyPattern) can't eat the first message. Recreated + armed
@@ -3223,7 +3229,7 @@ function detectBareShellLaunch(): boolean {
   // mismatch is the unmistakable signature of an rcfile `exec`-trampoline.
   const launchShell = (lastInitConfig?.launchShell || process.env.SHELL || '').trim();
   const expectedShell = launchShell ? basename(launchShell) : '';
-  const trampolined = !!expectedShell && comm !== expectedShell;
+  const trampolined = bareShellLaunchKind(comm!, expectedShell) === 'trampoline';
   bareShellLaunchBlocked = true;
   log(`Bare-shell launch detected: pane leaf comm=${comm}, expected launch shell=${expectedShell || '?'}, ` +
     `cli=${lastInitConfig?.cliId}; suppressing first-prompt write (${trampolined ? 'rc trampoline' : 'CLI did not start'})`);
@@ -3308,14 +3314,20 @@ async function flushPending(): Promise<void> {
   }
 
   try {
-    // Launch-failure guard, BEFORE startup commands or any user prompt: if the
-    // pane leaf is a bare shell (the CLI never launched — e.g. a user rcfile that
-    // `exec`-trampolines into another shell), don't type anything into it (it
-    // would just be `zsh: parse error`); surface one diagnostic and bail. Must
-    // precede runStartupCommands so a bot with startupCommands doesn't get them
-    // typed into the bare shell first.
-    if (!hasRunStartupCommands && detectBareShellLaunch()) {
-      return;  // finally{} releases the mutex; pendingMessages stay queued, untouched
+    // Launch-failure guard, run ONCE per spawn on the first flush, BEFORE startup
+    // commands or any user prompt: if the pane leaf is a bare shell (the CLI never
+    // launched — e.g. a user rcfile that `exec`-trampolines into another shell, or
+    // a reattached persistent pane that has dropped back to a shell), don't type
+    // anything into it (it would just be `zsh: parse error`); surface one
+    // diagnostic and bail. Gated by its own one-shot (NOT hasRunStartupCommands)
+    // so it also covers reattach, where startup commands are intentionally
+    // skipped. Must precede runStartupCommands so a bot with startupCommands
+    // doesn't get them typed into the bare shell first.
+    if (!bareShellChecked) {
+      bareShellChecked = true;
+      if (detectBareShellLaunch()) {
+        return;  // finally{} releases the mutex; pendingMessages stay queued, untouched
+      }
     }
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
@@ -3962,10 +3974,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // arm it. spawnCli is synchronous up to backend spawn, so this lands before
   // any flushPending consumes the flag.
   hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
-  // Re-arm the bare-shell launch detector for each fresh spawn. A reattach to a
-  // live pane is a known-good running CLI, so skip detection there (same gate as
-  // startup commands) — only fresh spawns can land in a trampolined bare shell.
+  // Re-arm the bare-shell launch detector for this spawn (fresh OR reattach). It
+  // runs once on the first flush and only fires when the pane leaf is actually a
+  // bare shell, so a healthy reattach (leaf = the live CLI) self-excludes while a
+  // reattach onto a pane that has degraded to a bare shell still gets the
+  // diagnostic instead of having the prompt typed into it.
   bareShellLaunchBlocked = false;
+  bareShellChecked = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false

@@ -93,6 +93,16 @@ export function isBareShellComm(comm: string | undefined): boolean {
   return BARE_SHELL_COMMS.has(comm.startsWith('.') ? comm.slice(1) : comm);
 }
 
+/** Classify a confirmed bare-shell launch for diagnostics: 'trampoline' when the
+ *  observed leaf shell differs from the shell botmux launched with — the
+ *  signature of an rcfile that `exec`-trampolines into another shell (e.g.
+ *  `$SHELL`=bash but the pane leaf is zsh). Otherwise 'stuck' (slow/erroring rc,
+ *  or the CLI binary not on PATH). `expectedShell` may be '' when the launch
+ *  shell is unknown, which yields 'stuck' (no confident trampoline claim). */
+export function bareShellLaunchKind(leafComm: string, expectedShell: string): 'trampoline' | 'stuck' {
+  return expectedShell && leafComm !== expectedShell ? 'trampoline' : 'stuck';
+}
+
 export function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
   const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
   const direct = CLI_COMM_MAP[comm] ?? CLI_COMM_MAP[normalizedComm];
