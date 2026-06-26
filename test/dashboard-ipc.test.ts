@@ -1,7 +1,7 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -10,7 +10,7 @@ import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
-import { registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeTeamRoleFile } from '../src/core/role-resolver.js';
@@ -82,6 +82,7 @@ afterEach(async () => {
   // Reset module-level larkAppId between tests so groups endpoints don't
   // leak state across describes.
   setLarkAppId('');
+  __testOnly_resetBotRegistry();
   setIpcAuthSecret(null);
 });
 
@@ -583,6 +584,52 @@ describe('PUT /api/bot-skills', () => {
   });
 });
 
+describe('PUT /api/bot-agent', () => {
+  it('updates cli selection and model through bots.json and live config', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        cliId: 'codex',
+        wrapperCli: 'ttadk codex',
+        model: 'kimi-k2.5',
+        selectionKey: 'ttadk-x-codex',
+      });
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored).toMatchObject({
+        cliId: 'codex',
+        wrapperCli: 'ttadk codex',
+        model: 'kimi-k2.5',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('GET /api/groups (Phase B)', () => {
   it('returns 503 when larkAppId not set', async () => {
     setLarkAppId('');
@@ -756,6 +803,13 @@ describe('POST /api/groups/create', () => {
       invalidBotIds: [],
       invalidUserIds: [],
     });
+    const addBotSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([
+      { id: 'cli_X', ok: true },
+    ]);
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({
+      ok: true,
+      shareLink: 'https://example.test/chat',
+    });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
       method: 'POST',
@@ -774,6 +828,8 @@ describe('POST /api/groups/create', () => {
     expect(spy).toHaveBeenCalledWith('cli_X', 'oc_new', process.cwd());
     spy.mockRestore();
     createSpy.mockRestore();
+    addBotSpy.mockRestore();
+    linkSpy.mockRestore();
   });
 
   it('rejects missing bindWorkingDir before creating the group', async () => {
