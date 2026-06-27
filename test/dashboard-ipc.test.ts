@@ -756,6 +756,9 @@ describe('POST /api/groups/create', () => {
       invalidBotIds: [],
       invalidUserIds: [],
     });
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([
+      { id: 'cli_X', ok: true },
+    ]);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
       method: 'POST',
@@ -770,8 +773,15 @@ describe('POST /api/groups/create', () => {
       { larkAppId: 'test-app', ok: true, created: true },
       { larkAppId: 'cli_X', ok: true, created: true },
     ]);
+    expect(createSpy).toHaveBeenCalledWith('test-app', {
+      name: undefined,
+      botIds: [],
+      userIds: [],
+    });
+    expect(addSpy).toHaveBeenCalledWith('test-app', 'oc_new', ['cli_X']);
     expect(spy).toHaveBeenCalledWith('test-app', 'oc_new', process.cwd());
     expect(spy).toHaveBeenCalledWith('cli_X', 'oc_new', process.cwd());
+    addSpy.mockRestore();
     spy.mockRestore();
     createSpy.mockRestore();
   });
@@ -783,6 +793,12 @@ describe('POST /api/groups/create', () => {
       invalidBotIds: [],
       invalidUserIds: [],
     });
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([]);
+    const bindSpy = vi.spyOn(oncallStore, 'bindOncall').mockResolvedValue({
+      ok: true,
+      entry: { chatId: 'oc_should_not_bind', workingDir: process.cwd() },
+      created: true,
+    });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
       method: 'POST',
@@ -791,6 +807,10 @@ describe('POST /api/groups/create', () => {
     });
     expect(res.status).toBe(400);
     expect(createSpy).not.toHaveBeenCalled();
+    expect(addSpy).not.toHaveBeenCalled();
+    expect(bindSpy).not.toHaveBeenCalled();
+    bindSpy.mockRestore();
+    addSpy.mockRestore();
     createSpy.mockRestore();
   });
 });
