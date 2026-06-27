@@ -9,6 +9,10 @@ const SPINNER_RE = /[·✢✳✶✻✽⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏■⬝]/;
 const QUIESCENCE_MS = 2_000;
 /** Spinner guard — don't declare idle if spinner seen within this window */
 const SPINNER_GUARD_MS = 3_000;
+/** Short grace window after readyPattern fires (ms) — covers a transient
+ *  redraw of the input box, but is NOT reset by arbitrary TUI status-bar
+ *  churn the way QUIESCENCE_MS is. Matches completionPattern's 500ms. */
+const READY_GRACE_MS = 500;
 
 export class IdleDetector {
   private outputTail = '';
@@ -77,6 +81,28 @@ export class IdleDetector {
     // When readyPattern is set, suppress quiescence until the input prompt appears.
     if (this.readyPattern && !this.readySeen) return;
 
+    // Once the input prompt is visible, the CLI is visually "ready" — don't
+    // make the user wait QUIESCENCE_MS (2s) on top of the spawn time. A short
+    // grace window (READY_GRACE_MS, 500ms) covers a transient redraw of the
+    // input box. The grace timer is NOT reset by arbitrary TUI status-bar
+    // churn (every ~1ms in Hermes/Codex TUIs): once the prompt is up, idle
+    // is the only sensible state from a user-input perspective. Spinner chars
+    // in the post-ready output are already excluded by the `!readySeen` guard
+    // at the top of feed() (status-bar ·· is not a real spinner) — we do not
+    // re-check them here.
+    if (this.readyPattern && this.readySeen && !this.completionPattern) {
+      // Only arm the grace timer once. If it's already armed, leave it
+      // running — TUI status-bar redraws every ~1ms in Hermes/Codex would
+      // otherwise clear+reset the timer indefinitely, recreating the
+      // original 13s detection delay.
+      if (this.quiescenceTimer) return;
+      this.quiescenceTimer = setTimeout(() => {
+        this.quiescenceTimer = null;
+        if (!this.isIdle) this.markIdle();
+      }, READY_GRACE_MS);
+      return;
+    }
+
     this.clearTimer();
     this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), QUIESCENCE_MS);
   }
@@ -135,6 +161,6 @@ export class IdleDetector {
   private stripAnsi(str: string): string {
     return str
       .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
-      .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[\??[0-9;]*[hlmsuJ]/g, '');
   }
 }
