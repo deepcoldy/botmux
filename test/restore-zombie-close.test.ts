@@ -172,6 +172,11 @@ function makeActivePersistentSession(rootMessageId: string) {
   s.workingDir = '/tmp/proj';
   s.cliId = 'claude-code';
   s.scope = 'thread';
+  // Real tmux sessions now carry their backend stamped at spawn time
+  // (Session.backendType); getSessionPersistentBackendType reads it back rather
+  // than re-deriving from the daemon default. Stamp it so this fixture models a
+  // genuine tmux-backed session.
+  s.backendType = 'tmux';
   sessionStore.updateSession(s);
   return s; // left active
 }

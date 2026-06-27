@@ -1,6 +1,5 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
-import { probeTmuxFunctional } from './setup/ensure-tmux.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
@@ -26,15 +25,19 @@ export function getDashboardExternalHost(): string {
 }
 
 /**
- * Pick the session backend. tmux is preferred (enables /adopt + per-client
- * Web terminal attach) but only if it can actually start a server. The old
- * check was `tmux -V`, which passes on machines where tmux is installed but
- * broken (perms / config / linkage) and leaves the worker spamming "error
- * connecting to /tmp/tmux-UID/default" forever. The functional probe filters
- * those out so we silently fall back to PTY.
+ * Default session backend: always tmux (PTY 退役).
+ *
+ * PTY is no longer an automatic fallback. It used to be picked here whenever
+ * the tmux functional probe failed, which meant hosts with a broken/missing
+ * tmux silently ran on PTY — and then hit PTY's whole problem set (no survival
+ * across daemon restart, scrollback-relay quirks, …) without the user ever
+ * knowing they'd been downgraded. Now the default is tmux unconditionally; if
+ * tmux isn't functional the worker hard-gates the session with an actionable
+ * card (see decideBackendGate). PTY remains reachable only via an explicit
+ * BACKEND_TYPE=pty (or per-bot backendType:'pty') opt-in.
  */
 function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
-  return probeTmuxFunctional().ok ? 'tmux' : 'pty';
+  return 'tmux';
 }
 
 // Computed once: the packaged fallback data dir. The effective dir is read

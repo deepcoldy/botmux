@@ -124,6 +124,18 @@ export interface Session {
   /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
   cliId?: import('./adapters/cli/types.js').CliId;
   /**
+   * Session backend resolved AT SPAWN TIME (tmux/herdr/zellij/pty). Stamped on
+   * fork so restore can resolve the backend authoritatively from the session
+   * itself instead of re-deriving it from the live daemon default — which
+   * changed when PTY stopped being an automatic fallback (default is now always
+   * tmux). Without this, a session that was created under the old probe-based
+   * default (e.g. implicit PTY on a tmux-less host) would, after upgrade +
+   * restart, be misread as tmux and zombie-closed because no `bmx-<sid>` pane
+   * exists. Undefined on sessions persisted before this field existed → treated
+   * conservatively (see getSessionPersistentBackendType).
+   */
+  backendType?: BackendType;
+  /**
    * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
    * sandbox status is frozen here at creation so a restore/restart never

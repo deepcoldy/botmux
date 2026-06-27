@@ -77,10 +77,10 @@ import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-back
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
-import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
+import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
 import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
-import { tmuxEnv } from './setup/ensure-tmux.js';
+import { tmuxEnv, probeTmuxFunctional } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -3883,28 +3883,57 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   }
 
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
-  // backendType=tmux trust-but-verify: an explicit per-bot config (or
-  // BACKEND_TYPE=tmux env override) bypasses config.ts's auto-detect, so
-  // the worker re-probes here. Existing botmux tmux sessions are more
-  // authoritative than the disposable "can we create a new server?" probe:
-  // abandoning one after a transient probe failure would spawn a duplicate CLI
-  // under raw PTY and make later submits invisible to the real Codex history.
+  // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
+  // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
+  // worker re-probes the requested persistent backend here. A requested
+  // tmux/herdr/zellij backend that isn't functional NO LONGER silently
+  // degrades to raw PTY — that silent fallback was the root of the "secretly
+  // running on PTY, then hitting all of PTY's problems" bug class. Instead we
+  // refuse to spawn and post an actionable card (user_notify) telling the user
+  // to install the backend, or to explicitly opt into PTY with BACKEND_TYPE=pty.
+  //
+  // Existing botmux sessions stay authoritative over the disposable "can we
+  // create a new server?" probe: a live session reattaches regardless of a
+  // transient probe failure (PR#249), so it's exempt from the gate.
   let effectiveBackend = cfg.backendType;
-  if (effectiveBackend === 'tmux') {
-    const existingSessionName = TmuxBackend.sessionName(cfg.sessionId);
-    const hasExistingSession = TmuxBackend.hasSession(existingSessionName);
-    if (!hasExistingSession && !TmuxBackend.isAvailable()) {
-      log('tmux backend requested but functional probe failed and no existing session is available — falling back to PTY backend');
-      effectiveBackend = 'pty';
+  {
+    let available = true;
+    let reason = '';
+    let hasExistingSession = false;
+    if (effectiveBackend === 'tmux') {
+      hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
+      if (!hasExistingSession) {
+        const probe = probeTmuxFunctional();
+        available = probe.ok;
+        if (!probe.ok) reason = probe.reason;
+      }
+    } else if (effectiveBackend === 'zellij') {
+      // Like tmux, zellij's probe is a disposable background session, so a
+      // live named session is more authoritative than a transient probe
+      // failure (PR#249 semantics) — check it first so we reattach, not gate.
+      hasExistingSession = ZellijBackend.hasSession(ZellijBackend.sessionName(cfg.sessionId));
+      if (!hasExistingSession) {
+        available = ZellijBackend.isAvailable();
+        reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
+      }
+    } else if (effectiveBackend === 'herdr') {
+      // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
+      // (not a disposable session probe), so it has no PR#249 false-negative
+      // risk and needs no existing-session exemption.
+      available = HerdrBackend.isAvailable();
+      reason = 'herdr 功能性探针失败';
     }
-  }
-  if (effectiveBackend === 'herdr' && !HerdrBackend.isAvailable()) {
-    log('herdr backend requested but probe failed — falling back to PTY backend');
-    effectiveBackend = 'pty';
-  }
-  if (effectiveBackend === 'zellij' && !ZellijBackend.isAvailable()) {
-    log('zellij backend requested but functional probe failed (need zellij >= 0.44) — falling back to PTY backend');
-    effectiveBackend = 'pty';
+    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
+    if (decision.action === 'gate') {
+      const detail = reason || decision.reason;
+      log(`${effectiveBackend} backend unavailable and silent PTY fallback is disabled (set BACKEND_TYPE=pty to opt in): ${detail}`);
+      // user_notify is delivered to the Lark thread by the daemon (type:'error'
+      // is log-only); send it BEFORE throwing so the card lands. The throw is
+      // caught by the init handler, which sends type:'error' and exits — the
+      // IPC channel flushes these small messages before exit.
+      send({ type: 'user_notify', message: backendGateUserMessage(effectiveBackend, detail), turnId: cfg.turnId });
+      throw new Error(`${effectiveBackend} backend unavailable; refusing silent PTY fallback (set BACKEND_TYPE=pty to opt in): ${detail}`);
+    }
   }
   effectiveBackendType = effectiveBackend;
   const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend });

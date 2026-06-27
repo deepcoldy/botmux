@@ -96,16 +96,21 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).not.toContain('pendingMessages.length > 0');
   });
 
-  it('checks for an existing tmux session before falling back to pty', () => {
+  it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const guardStart = source.indexOf('let effectiveBackend = cfg.backendType;');
-    const guardEnd = source.indexOf("if (effectiveBackend === 'herdr'", guardStart);
+    const guardEnd = source.indexOf('effectiveBackendType = effectiveBackend;', guardStart);
     const guard = source.slice(guardStart, guardEnd);
 
     expect(guardStart).toBeGreaterThan(-1);
     expect(guardEnd).toBeGreaterThan(guardStart);
-    expect(guard).toContain('const hasExistingSession = TmuxBackend.hasSession(existingSessionName);');
-    expect(guard).toContain('!hasExistingSession && !TmuxBackend.isAvailable()');
-    expect(guard.indexOf('TmuxBackend.hasSession')).toBeLessThan(guard.indexOf('TmuxBackend.isAvailable'));
+    // A live tmux session is checked before probing so it can reattach (PR#249).
+    expect(guard).toContain('TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId))');
+    expect(guard.indexOf('TmuxBackend.hasSession')).toBeLessThan(guard.indexOf('probeTmuxFunctional'));
+    // The decision is made by the pure gate helper, and a gate posts an
+    // actionable card + throws — it must NOT silently downgrade to pty.
+    expect(guard).toContain('decideBackendGate(');
+    expect(guard).toContain("send({ type: 'user_notify'");
+    expect(guard).not.toContain("effectiveBackend = 'pty'");
   });
 });

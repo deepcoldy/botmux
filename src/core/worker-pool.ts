@@ -1729,6 +1729,18 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     sessionStore.updateSession(ds.session);
   }
 
+  // Stamp the resolved backend on the persisted session. Since PTY退役, the
+  // worker no longer silently downgrades an unavailable backend (it hard-gates
+  // instead), so the requested backend here IS the effective one for any
+  // session that actually runs. Restore reads this back (see
+  // getSessionPersistentBackendType) so an upgraded daemon doesn't re-derive a
+  // session's backend from the now-always-tmux default and misclassify a legacy
+  // PTY session as a tmux zombie.
+  if (ds.session.backendType !== initMsg.backendType) {
+    ds.session.backendType = initMsg.backendType;
+    sessionStore.updateSession(ds.session);
+  }
+
   // Use shared handler for IPC messages and exit
   setupWorkerHandlers(ds, worker);
 
