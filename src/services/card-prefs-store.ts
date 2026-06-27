@@ -39,8 +39,8 @@ export interface BotCardPrefs {
   autoStartOnNewTopic: boolean;
   /** Per-bot DEFAULT regular-group session mode (chat | chat-topic | new-topic | shared). */
   regularGroupReplyMode: ChatReplyMode;
-  /** Per-bot 3-tier @-requirement policy for regular groups (default 'always'). */
-  regularGroupMentionMode: 'always' | 'topic' | 'never';
+  /** Per-bot 4-tier @-requirement policy for regular groups (default 'always'). */
+  regularGroupMentionMode: 'always' | 'topic' | 'never' | 'ambient';
   /** 文档订阅新订阅默认评论触发范围（default 'mention-only'）。 */
   docSubscribeDefaultMode: 'mention-only' | 'all';
 }
@@ -59,7 +59,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
       regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat',
-      regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never'
+      regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never' || c.regularGroupMentionMode === 'ambient'
         ? c.regularGroupMentionMode : 'always',
       docSubscribeDefaultMode: c.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     };
@@ -118,11 +118,11 @@ export async function updateBotCardPrefs(
     if (val === 'new-topic' || val === 'shared' || val === 'chat-topic') entry[key] = val;
     else delete entry[key];
   };
-  // 3-tier @ policy: store only the non-default tiers; 'always' (default) drops
+  // 4-tier @ policy: store only the non-default tiers; 'always' (default) drops
   // the key so bots.json stays tidy (absent === 'always').
-  const applyMention = (entry: any, key: keyof BotCardPrefs, val: 'always' | 'topic' | 'never' | undefined) => {
+  const applyMention = (entry: any, key: keyof BotCardPrefs, val: 'always' | 'topic' | 'never' | 'ambient' | undefined) => {
     if (val === undefined) return;
-    if (val === 'topic' || val === 'never') entry[key] = val;
+    if (val === 'topic' || val === 'never' || val === 'ambient') entry[key] = val;
     else delete entry[key];
   };
   // 文档订阅默认触发范围：只存 'all'；'mention-only'（默认）删键保持 bots.json 干净。
@@ -158,7 +158,7 @@ export async function updateBotCardPrefs(
         regularGroupReplyMode: (entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared' || entry.regularGroupReplyMode === 'chat-topic')
           ? entry.regularGroupReplyMode
           : 'chat',
-        regularGroupMentionMode: (entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never')
+        regularGroupMentionMode: (entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never' || entry.regularGroupMentionMode === 'ambient')
           ? entry.regularGroupMentionMode
           : 'always',
         docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
@@ -199,7 +199,7 @@ export async function updateBotCardPrefs(
       : undefined;
   }
   if (patch.regularGroupMentionMode !== undefined) {
-    bot.config.regularGroupMentionMode = (patch.regularGroupMentionMode === 'topic' || patch.regularGroupMentionMode === 'never')
+    bot.config.regularGroupMentionMode = (patch.regularGroupMentionMode === 'topic' || patch.regularGroupMentionMode === 'never' || patch.regularGroupMentionMode === 'ambient')
       ? patch.regularGroupMentionMode
       : undefined;
   }

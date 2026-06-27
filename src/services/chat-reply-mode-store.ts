@@ -54,18 +54,20 @@ function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
   }
 }
 
-export type GroupMentionMode = 'always' | 'topic' | 'never';
+export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
 
 /**
  * Per-bot (bot-global) @-requirement policy for regular groups, default 'always'.
- *   • always — @ required everywhere (incl. inside shared topics).
- *   • topic  — @ required at top level, but non-@ continues inside shared topics.
- *   • never  — non-@ messages are answered too (where the bot has talk access).
+ *   • always  — @ required everywhere (incl. inside shared topics).
+ *   • topic   — @ required at top level, but non-@ continues inside shared topics.
+ *   • never   — non-@ messages are always answered (where the bot has talk access).
+ *   • ambient — like never, but stays quiet when the message @mentions another
+ *               specific member (person/bot) without @ing this bot (redirect).
  */
 export function resolveGroupMentionMode(larkAppId: string): GroupMentionMode {
   try {
     const m = getBot(larkAppId).config.regularGroupMentionMode;
-    return m === 'topic' || m === 'never' ? m : 'always';
+    return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
   } catch {
     return 'always';
   }

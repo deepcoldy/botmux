@@ -40,7 +40,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     regularGroupReplyMode: (j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared' || j?.regularGroupReplyMode === 'chat-topic')
       ? j.regularGroupReplyMode
       : 'chat',
-    regularGroupMentionMode: (j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never')
+    regularGroupMentionMode: (j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never' || j?.regularGroupMentionMode === 'ambient')
       ? j.regularGroupMentionMode
       : 'always',
     restrictGrantCommands: j?.restrictGrantCommands === true,
