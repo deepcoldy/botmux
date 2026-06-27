@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   allExpectedInChat,
   renderBotCheckboxes,
+  renderAddBotsResultSummary,
   renderRoleProfileBootstrapSummary,
   suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
@@ -85,6 +86,34 @@ describe('renderRoleProfileBootstrapSummary — create-group profile feedback', 
     expect(html).toContain('&lt;profile&gt;');
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     expect(html).toContain('hint-warn');
+  });
+});
+
+describe('renderAddBotsResultSummary — add-bots inline feedback', () => {
+  it('summarizes a clean add-bots result as success', () => {
+    const html = renderAddBotsResultSummary([
+      { id: 'cli_a', ok: true },
+      { id: 'cli_b', ok: true },
+    ]);
+
+    expect(html).toContain('hint-ok');
+    expect(html).toContain('成功 2/2');
+    expect(html).toContain('<code>cli_a</code>: OK');
+    expect(html).toContain('<code>cli_b</code>: OK');
+  });
+
+  it('summarizes partial failures and escapes ids/errors', () => {
+    const html = renderAddBotsResultSummary([
+      { id: 'cli_ok', ok: true },
+      { id: '<bad>', ok: false, error: '<script>alert(1)</script>' },
+    ]);
+
+    expect(html).toContain('hint-warn');
+    expect(html).toContain('成功 1/2，失败 1');
+    expect(html).toContain('&lt;bad&gt;');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).not.toContain('<bad>');
+    expect(html).not.toContain('<script>');
   });
 });
 

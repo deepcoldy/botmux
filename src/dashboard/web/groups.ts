@@ -26,6 +26,11 @@ type SaveProfileEntry = {
   content: string;
   status: SaveProfileEntryStatus;
 };
+type GroupAddBotResult = {
+  id?: unknown;
+  ok?: unknown;
+  error?: unknown;
+};
 
 function isValidProfileId(profileId: string): boolean {
   return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
@@ -187,6 +192,26 @@ export function renderRoleProfileBootstrapSummary(
   return `<p class="hint-ok">${escapeHtml(t('groups.roleProfileBootstrapDone', { name: cleanProfileId }))}</p>`;
 }
 
+export function renderAddBotsResultSummary(result: GroupAddBotResult[]): string {
+  const rows = Array.isArray(result) ? result : [];
+  if (!rows.length) {
+    return `<p class="hint-warn">没有返回添加结果。</p>`;
+  }
+  const okCount = rows.filter(x => !!x?.ok).length;
+  const failed = rows.length - okCount;
+  const cls = failed ? 'hint-warn' : 'hint-ok';
+  const items = rows.map(x => {
+    const id = String(x?.id ?? '?');
+    return x?.ok
+      ? `<li><code>${escapeHtml(id)}</code>: OK</li>`
+      : `<li><code>${escapeHtml(id)}</code>: failed (${escapeHtml(String(x?.error ?? 'unknown'))})</li>`;
+  }).join('');
+  return `<div class="${cls}">
+    <strong>添加结果：成功 ${okCount}/${rows.length}${failed ? `，失败 ${failed}` : ''}</strong>
+    <ul>${items}</ul>
+  </div>`;
+}
+
 export async function renderGroupsPage(root: HTMLElement) {
   root.innerHTML = pageHtml();
   const head = root.querySelector<HTMLElement>('#g-head')!;
@@ -230,6 +255,20 @@ export async function renderGroupsPage(root: HTMLElement) {
     }
   }
 
+  function setDialogStatus(el: HTMLElement, html: string): void {
+    el.innerHTML = html;
+  }
+
+  function renderDialogError(title: string, reason: unknown): string {
+    return `<p class="hint-warn"><strong>${escapeHtml(title)}</strong><br><small>${escapeHtml(String(reason ?? 'unknown'))}</small></p>`;
+  }
+
+  function restoreSubmit(btn: HTMLButtonElement | null | undefined, label: string): void {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+
   async function openCreateModal() {
     const allBots = cache.bots;
     if (allBots.length === 0) {
@@ -268,6 +307,7 @@ export async function renderGroupsPage(root: HTMLElement) {
             <legend>${t('groups.botPicker')}</legend>
             ${renderBotCheckboxes(allBots)}
           </fieldset>
+          <div data-create-status aria-live="polite"></div>
           <div class="actions">
             <button type="submit" class="primary">${t('groups.createSubmit')}</button>
             <button type="button" id="g-create-cancel">${t('groups.cancel')}</button>
@@ -285,9 +325,14 @@ export async function renderGroupsPage(root: HTMLElement) {
       const bindWorkingDir = ((fd.get('bindWorkingDir') as string) ?? '').trim();
       const roleProfileId = ((fd.get('roleProfileId') as string) ?? '').trim();
       const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
+      const statusEl = drawer.querySelector<HTMLElement>('[data-create-status]')!;
+      if (ids.length === 0) {
+        setDialogStatus(statusEl, renderDialogError('请选择 bot', '至少选择一个 bot 后再创建群聊。'));
+        return;
+      }
       const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
       if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Creating...'; }
+      setDialogStatus(statusEl, '');
       try {
         const r = await fetch('/api/groups/create', {
           method: 'POST',
@@ -325,12 +370,12 @@ export async function renderGroupsPage(root: HTMLElement) {
           void refreshRoleProfileContext();
           void refreshUntilSeen(respBody.chatId, expectedBotIds).catch(() => { /* tolerate */ });
         } else {
-          alert(`Failed: ${respBody.error ?? r.status}`);
-          drawer.close();
+          setDialogStatus(statusEl, renderDialogError('创建失败', respBody.error ?? `HTTP ${r.status}`));
+          restoreSubmit(submitBtn, t('groups.createSubmit'));
         }
       } catch (e) {
-        alert('Network error: ' + e);
-        drawer.close();
+        setDialogStatus(statusEl, renderDialogError('网络错误', e));
+        restoreSubmit(submitBtn, t('groups.createSubmit'));
       }
     };
 
@@ -561,6 +606,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         <p>${t('groups.createHelp')}</p>
         <form id="g-addform">
           ${renderBotCheckboxes(cache.bots, inChatSet)}
+          <div data-add-status aria-live="polite"></div>
           <div class="actions">
             <button type="submit" class="primary">${t('groups.addBots')}</button>
             <button type="button" id="g-cancel">${t('groups.cancel')}</button>
@@ -575,7 +621,14 @@ export async function renderGroupsPage(root: HTMLElement) {
       ev.preventDefault();
       const fd = new FormData(ev.target as HTMLFormElement);
       const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
+      const statusEl = drawer.querySelector<HTMLElement>('[data-add-status]')!;
+      if (ids.length === 0) {
+        setDialogStatus(statusEl, renderDialogError('请选择 bot', '至少选择一个 bot 后再添加。'));
+        return;
+      }
+      const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Adding...'; }
+      setDialogStatus(statusEl, '');
       try {
         const r = await fetch(`/api/groups/${encodeURIComponent(chatId)}/add-bots`, {
           method: 'POST',
@@ -584,22 +637,27 @@ export async function renderGroupsPage(root: HTMLElement) {
         });
         const respBody = await r.json();
         if (respBody.error === 'no_proxy_bot') {
-          alert('No bot is currently in this chat — add one manually in Feishu first, then retry.');
+          setDialogStatus(statusEl, renderDialogError(
+            '无法添加 bot',
+            '当前群里没有可代理操作的 bot。请先在飞书里手动拉入一个 bot，然后重试。',
+          ));
         } else if (respBody.result) {
-          const lines = respBody.result.map((x: any) =>
-            `${x.id}: ${x.ok ? 'OK' : `failed (${x.error ?? 'unknown'})`}`
-          ).join('\n');
-          alert(lines);
-          // Refresh after change
-          await loadGroups();
-          rerender();
+          const resultHtml = renderAddBotsResultSummary(respBody.result);
+          setDialogStatus(statusEl, resultHtml);
+          try {
+            await loadGroups();
+            rerender();
+            void refreshRoleProfileContext();
+          } catch (e) {
+            setDialogStatus(statusEl, `${resultHtml}${renderDialogError('刷新失败', `添加结果已返回，但刷新群组列表失败：${e}`)}`);
+          }
         } else {
-          alert(`Unexpected response: ${JSON.stringify(respBody)}`);
+          setDialogStatus(statusEl, renderDialogError('响应异常', JSON.stringify(respBody)));
         }
       } catch (e) {
-        alert('Network error: ' + e);
+        setDialogStatus(statusEl, renderDialogError('网络错误', e));
       } finally {
-        drawer.close();
+        restoreSubmit(submitBtn, t('groups.addBots'));
       }
     };
   });
