@@ -20,12 +20,14 @@ const mockTransferChatOwner = vi.fn();
 const mockGetChatOwner = vi.fn();
 const mockGetChatShareLink = vi.fn();
 const mockAddUsersByUnionId = vi.fn();
+const mockAddBotToChat = vi.fn();
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: (...args: any[]) => mockCreateChat(...args),
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
   getChatOwner: (...args: any[]) => mockGetChatOwner(...args),
   getChatShareLink: (...args: any[]) => mockGetChatShareLink(...args),
   addUsersToChatByUnionId: (...args: any[]) => mockAddUsersByUnionId(...args),
+  addBotToChat: (...args: any[]) => mockAddBotToChat(...args),
 }));
 
 const SHARE_LINK = 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=tok';
@@ -69,12 +71,16 @@ describe('createGroupWithBots', () => {
     mockListChatBotMembers.mockReset();
     mockBindOncall.mockReset();
     mockAddUsersByUnionId.mockReset();
+    mockAddBotToChat.mockReset();
     mockReadRoleProfileEntry.mockReset();
     mockWriteRoleFile.mockReset();
     // Default: share-link fetch succeeds. group-creator always calls this after
     // createChat; individual tests override to exercise the fallback path.
     mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => ({ id, ok: true })),
+    );
   });
 
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {
@@ -157,7 +163,8 @@ describe('createGroupWithBots', () => {
     expect(mockCreateChat).toHaveBeenCalledTimes(1);
     const args = mockCreateChat.mock.calls[0];
     expect(args[0]).toBe(CREATOR);
-    expect(args[1].botIds).toEqual([OTHER_BOT]);  // creator filtered out
+    expect(args[1].botIds).toEqual([]);  // bots are added after createChat
+    expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_x', [OTHER_BOT]);
   });
 
   it('skips transfer when invitee was rejected by Lark', async () => {
@@ -259,9 +266,14 @@ describe('createGroupWithBots', () => {
   it('binds the newly created chat for joined bots when bindWorkingDir is provided', async () => {
     mockCreateChat.mockResolvedValue({
       chatId: 'oc_bound',
-      invalidBotIds: ['cli_rejected_bot'],
+      invalidBotIds: [],
       invalidUserIds: [],
     });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => id === 'cli_rejected_bot'
+        ? { id, ok: false, error: 'invalid_id' }
+        : { id, ok: true }),
+    );
     mockBindOncall.mockResolvedValue({ ok: true, created: true });
 
     const result = await createGroupWithBots({
@@ -313,9 +325,14 @@ describe('createGroupWithBots', () => {
   it('reports invalidBotIds/invalidUserIds passthrough from createChat', async () => {
     mockCreateChat.mockResolvedValue({
       chatId: 'oc_x',
-      invalidBotIds: ['cli_zombie'],
+      invalidBotIds: [],
       invalidUserIds: ['ou_banned'],
     });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => id === 'cli_zombie'
+        ? { id, ok: false, error: 'invalid_id' }
+        : { id, ok: true }),
+    );
     const result = await createGroupWithBots({
       creatorLarkAppId: CREATOR,
       larkAppIds: [CREATOR, 'cli_zombie'],
