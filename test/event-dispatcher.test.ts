@@ -1893,6 +1893,179 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
+
+  // ── ambient tier — end-to-end gating across the three no-@ decision points ──
+  // mentionsAnotherMember is unit-tested above; these drive the FULL dispatch
+  // path to prove the redirect carve-out is wired into every gate that drops the
+  // @ requirement: the top-level gate, shared-topic seeding, and alias fold-back.
+  // Each gate gets a positive (ambient answers) + the carve-out (@ someone else
+  // → yields). @all is never a redirect, so it still answers.
+
+  it('ambient: a non-@ top-level message from an allowed user is answered (like never)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no @ at all — ambient default responder answers' }),
+      messageId: 'msg-ambient-toplevel',
+      chatId: 'chat-ambient',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a top-level message that @mentions ANOTHER member (not this bot) is ignored — yields the turn', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Someone 你来看看这个' }),
+      messageId: 'msg-ambient-redirect',
+      chatId: 'chat-ambient-redirect',
+      chatType: 'group',
+      mentions: [{ key: '@_other', name: 'Someone', id: { open_id: 'ou_someone_else' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // The redirect carve-out: @ing someone else hands the turn away → stay quiet.
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a top-level @all message is still answered (@all is not a redirect to someone else)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@all 大家注意' }),
+      messageId: 'msg-ambient-atall',
+      chatId: 'chat-ambient-atall',
+      chatType: 'group',
+      mentions: [{ key: '@_all', name: 'all', id: { open_id: 'all' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient-atall',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('shared + ambient: a non-@ top-level message OPENS a topic (seeds replyRootId), like never', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'shared', regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReturnValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no @ but should open a shared topic' }),
+      messageId: 'msg-shared-ambient-seed',
+      chatId: 'chat-shared-ambient',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-shared-ambient',
+      replyRootId: 'msg-shared-ambient-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('shared + ambient: a non-@ top-level message that @mentions another member does NOT seed a topic (yields)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'shared', regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReturnValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Someone 这个交给你' }),
+      messageId: 'msg-shared-ambient-redirect',
+      chatId: 'chat-shared-ambient-redirect',
+      chatType: 'group',
+      mentions: [{ key: '@_other', name: 'Someone', id: { open_id: 'ou_someone_else' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // Seeding gate backs off → no topic opened, and the top-level gate also yields.
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a non-@ follow-up inside a shared-topic alias thread folds back into the chat session (like topic/never)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-ambient-alias', sessionId: 'sess-chat' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-ambient-alias');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up in alias topic, no @' }),
+      rootId: 'msg-ambient-alias-1',
+      messageId: 'msg-ambient-alias-2',
+      chatId: 'chat-ambient-alias',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient-alias',
+      replyRootId: 'msg-ambient-alias-1',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a follow-up inside a shared-topic alias thread that @mentions another member does NOT fold back (yields)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-ambient-alias', sessionId: 'sess-chat' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-ambient-alias');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Someone 你接着看' }),
+      rootId: 'msg-ambient-alias-1',
+      messageId: 'msg-ambient-alias-redirect',
+      chatId: 'chat-ambient-alias',
+      chatType: 'group',
+      mentions: [{ key: '@_other', name: 'Someone', id: { open_id: 'ou_someone_else' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // The fold-back is skipped (redirect) → the alias resolver is never consulted
+    // and the message is not pulled into the shared chat session.
+    expect(handlers.resolveReplyThreadAlias).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
 });
 
 describe('im.message.receive_v1 — regular group thread replies preference', () => {
