@@ -914,6 +914,56 @@ describe('GET /api/goals', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('returns the operator attention board with ledger-derived risk', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-goals-attention-ipc-'));
+    const prevEnv = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    process.env.SESSION_DATA_DIR = dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const now = Date.now();
+      const led = openLedger();
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-risk',
+        chatId: 'oc_goal',
+        ts: now - 10_000,
+        idempotencyKey: 'dispatched:task-risk',
+        payload: { taskId: 'task-risk', title: 'Risk task' },
+      });
+      for (let i = 1; i <= 3; i++) {
+        led.append({
+          type: 'TaskDispatched',
+          actor: 'orchestrator',
+          taskId: 'task-risk',
+          chatId: 'oc_goal',
+          ts: now - 5_000 + i,
+          idempotencyKey: `reassign:task-risk:${i}`,
+          payload: { taskId: 'task-risk', title: 'Risk task' },
+        });
+      }
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/goals/attention`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.systemRisk).toHaveLength(1);
+      expect(body.systemRisk[0]).toMatchObject({
+        taskId: 'task-risk',
+        source: 'ledger',
+        disposition: { bucket: 'systemRisk', reason: 'reassign_budget_exhausted' },
+      });
+      expect(body.counts.systemRisk).toBe(1);
+      expect(body.perGoal[0].tasks[0]).toMatchObject({ taskId: 'task-risk', status: 'dispatched' });
+    } finally {
+      if (prevEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevEnv;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('SSE /api/events', () => {

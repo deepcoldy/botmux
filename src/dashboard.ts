@@ -128,6 +128,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
+import { buildGoalAttentionBoardWithContext, withGoalAttentionLiveRisks } from './core/goal-attention.js';
 import {
   listGoalNotificationRetries,
   removeGoalNotificationRetry,
@@ -1545,6 +1546,24 @@ function fetchDaemonUrl(input: string | URL | Request, init?: RequestInit): Prom
   return fetchDaemonIpc(port, `${url.pathname}${url.search}`, init);
 }
 
+async function collectGoalAttentionLiveRisks(chatId?: string): Promise<any[]> {
+  const qs = chatId ? `?chatId=${encodeURIComponent(chatId)}` : '';
+  const chunks = await Promise.all(registry.list().map(async d => {
+    try {
+      const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goals/attention/live${qs}`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(2_000),
+      });
+      if (!upstream.ok) return [];
+      const body = await upstream.json().catch(() => null) as { systemRisk?: any[] } | null;
+      return Array.isArray(body?.systemRisk) ? body.systemRisk : [];
+    } catch {
+      return [];
+    }
+  }));
+  return chunks.flat();
+}
+
 /** Create a Feishu group from the team UI: pick a creator daemon among the
  *  selected bots, proxy to its /api/groups/create, invite the requesting user.
  *  Surfaces invalidBotIds/invalidUserIds so the UI never implies a non-added
@@ -2715,6 +2734,12 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/goals') {
       return jsonRes(res, 200, buildGoalBoard());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/goals/attention') {
+      const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+      const board = buildGoalAttentionBoardWithContext({ chatId });
+      const liveRisks = await collectGoalAttentionLiveRisks(chatId);
+      return jsonRes(res, 200, withGoalAttentionLiveRisks(board, liveRisks));
     }
     if (req.method === 'GET' && url.pathname === '/api/goal-notification-retries') {
       return jsonRes(res, 200, { records: listGoalNotificationRetries() });

@@ -5,6 +5,7 @@ import { sessionKey, type DaemonSession } from './types.js';
 import { localeForBot } from '../i18n/index.js';
 import { openLedger, type LedgerHandle } from '../verified-delivery/ledger.js';
 import { summarizeAcceptanceCriteria } from '../verified-delivery/acceptance.js';
+import { classifyTaskDisposition } from '../verified-delivery/attention.js';
 import type { LedgerEvent, TaskDispatchedPayload, TaskReportedPayload, TaskView } from '../verified-delivery/types.js';
 import { reconcileTaskByCriteria, type ReconcileResult } from '../verified-delivery/reconcile.js';
 import { sendMessage } from '../im/lark/client.js';
@@ -101,6 +102,7 @@ export function pendingGoalTasks(tasks: TaskView[]): Map<string, TaskView[]> {
 
 export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[], inspectionFacts: Map<string, string> = new Map()): string {
   const rows = tasks.map((task) => {
+    const disposition = classifyTaskDisposition(task);
     const hint = task.acceptanceHint?.trim() && !task.acceptanceCriteria
       ? ` acceptanceHint=${task.acceptanceHint.trim()}`
       : '';
@@ -112,7 +114,7 @@ export function buildGoalWatchdogPrompt(goalChatId: string, tasks: TaskView[], i
       : '';
     const fact = inspectionFacts.get(task.taskId);
     const factLine = fact ? `\n    inspectionFact: ${fact}` : '';
-    return `- ${task.taskId} status=${task.status}${hint}${help}${checks}${factLine}`;
+    return `- ${task.taskId} status=${task.status} bucket=${disposition.bucket} reason=${disposition.reason} next=${disposition.next}${hint}${help}${checks}${factLine}`;
   }).join('\n');
   return [
     `${GOAL_WATCHDOG_PROMPT_PREFIX} 你是本 goal 的统揽监管者。请先查 charter、账本和最近群消息，再为每个非终态任务给出并执行下一步：验收/accept/reject/催/重派/升级。聊天只是触发器，证据和账本才是真相；blocked 任务先处理 worker 求助，定不了再升级给人。`,

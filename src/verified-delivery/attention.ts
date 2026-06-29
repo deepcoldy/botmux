@@ -126,6 +126,13 @@ export interface AttentionTask {
   title?: string;
   workerNames?: string[];
   disposition: TaskDisposition;
+  /** Risk provenance. Omitted in the pure board; IPC enrichment stamps it. */
+  source?: 'ledger' | 'live';
+  /** Live-health detail fields are only present when source='live'. */
+  liveKind?: string;
+  liveDetail?: string;
+  sessionId?: string;
+  larkAppId?: string;
   /** Most recent delivery activity for this task (unix ms; for ordering/age). */
   lastActivityAt?: number;
   recentEvidence?: AttentionEvidence;
