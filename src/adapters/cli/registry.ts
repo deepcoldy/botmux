@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { accessSync, constants, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { locateExecutable } from '../../utils/executable.js';
 import type { CliAdapter, CliId } from './types.js';
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createSeedAdapter } from './seed.js';
@@ -82,14 +83,7 @@ export function resolveCommand(cmd: string): string {
  * silent crash-loop. Cheap and shell-free (no rc side effects).
  */
 export function locateOnPath(cmd: string): string | null {
-  if (isAbsolute(cmd)) {
-    try { accessSync(cmd, constants.X_OK); return cmd; } catch { return null; }
-  }
-  for (const dir of (process.env.PATH ?? '').split(':').filter(Boolean)) {
-    const candidate = join(dir, cmd);
-    try { accessSync(candidate, constants.X_OK); return candidate; } catch { /* next dir */ }
-  }
-  return null;
+  return locateExecutable(cmd);
 }
 
 const adapterCache = new Map<string, CliAdapter>();

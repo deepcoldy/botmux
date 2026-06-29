@@ -20,6 +20,40 @@ botmux 通过适配器桥接不同 CLI，`bots.json` 里用 `cliId` 选择。一
 
 > 还有社区贡献的 MTR、ttadk、Mira 等接入方式。`model` 字段只对支持模型参数的适配器生效，其它会忽略。
 
+## Mir CLI 与 MCP Bridge
+
+`botmux setup` 里选择 **Mira -> Mir CLI（本地 mircli）** 后，机器人配置会使用 `cliId: "mir"`。这个适配器通过本机 `mircli -p --lean` 执行，因此需要运行 botmux daemon 的同一系统用户已经完成 Mir CLI 登录和初始化。
+
+BotMux 不需要额外的 DevBox 专属配置；在 DevBox、本地 macOS 或其它 Linux 机器上规则相同：
+
+- `mircli` 能被 botmux 找到，或在机器人配置里用 `cliPathOverride` 指向 `mircli` 的绝对路径。
+- `~/.mira/config.json` 里已有 `device_id`。首次使用 Mir CLI 时通常通过 `mircli mcp --device-id <id>` 或 Mir CLI 自身初始化流程写入。
+- `miramcp` 已安装在 Mir CLI 的标准位置（例如 `~/.local/bin/miramcp`、`~/.local/bin/mira_cli`），或通过 `MIRAMCP_BIN` 指向可执行文件。
+
+当 `cliId: "mir"` 会话启动并收到消息时，BotMux 会在调用 `mircli` 前 best-effort 拉起 MCP Bridge：
+
+```bash
+miramcp run --device-id <device_id>
+```
+
+它会先检查 `~/.mira/miramcp/miramcp.pid` 和本机 `9801` 端口，已在运行就不会重复启动。要确认状态，可以在运行 botmux daemon 的同一用户下执行：
+
+```bash
+mircli mcp status
+```
+
+如果你想禁用这个自动拉起行为，可以任选一种方式：
+
+```json
+{"auto_start_bridge": false}
+```
+
+或只对 BotMux 进程禁用：
+
+```bash
+MIRCLI_AUTO_START_MIRAMCP=0 botmux start
+```
+
 ## 套 wrapper / 网关接入
 
 很多场景下你不是直接跑原生 CLI，而是套一层网关 / 路由（内网代理 + SSO、模型路由等），比如 `ccr`、`ttadk`、`aiden x claude`、`aiden x codex`。这时**不需要新适配器**：`cliId` 仍填底层真实 CLI（`claude-code` / `codex` …），只把启动入口换成一个 **wrapper 脚本**，用 `cliPathOverride` 指过去（`botmux setup` 编辑机器人时的「CLI 可执行文件路径覆盖」就是填它）。
