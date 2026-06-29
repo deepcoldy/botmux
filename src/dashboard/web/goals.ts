@@ -56,7 +56,9 @@ interface RetryBoard { records: GoalNotificationRetryRecord[] }
 interface AttnDisposition { bucket: string; reason: string; next: string }
 interface AttnEvidence { checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; latestSummary?: string }
 interface AttnTask {
-  goalChatId: string; goalTitle?: string; taskId: string; title?: string;
+  // taskId is normally always set, but the wire format omits it for malformed
+  // tasks (an escalation materialized without one) — keep it optional and guard.
+  goalChatId: string; goalTitle?: string; taskId?: string; title?: string;
   workerNames?: string[]; disposition: AttnDisposition; lastActivityAt?: number;
   recentEvidence?: AttnEvidence;
   // present only on live-probe systemRisk rows (IPC enrichment, not a ledger fact):
@@ -197,9 +199,9 @@ function taskRow(t: BoardTask, selected: boolean): string {
   const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
     : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
   const primary = t.title
-    ? `<span class="gb-task-title">${escapeHtml(t.title)}</span><span class="gb-led-id gb-led-id-sm">${escapeHtml(shortId(t.taskId))}</span>`
-    : `<span class="gb-led-id">${escapeHtml(shortId(t.taskId))}</span>`;
-  return `<tr class="gb-trow${selected ? ' sel' : ''}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId)}">
+    ? `<span class="gb-task-title">${escapeHtml(t.title)}</span><span class="gb-led-id gb-led-id-sm">${escapeHtml(shortId(t.taskId || ''))}</span>`
+    : `<span class="gb-led-id">${escapeHtml(shortId(t.taskId || ''))}</span>`;
+  return `<tr class="gb-trow${selected ? ' sel' : ''}" data-task="${escapeHtml(t.taskId || '')}" title="${escapeHtml(t.taskId || '')}">
     <td class="gb-task-id">${primary}${accTag}</td>
     ${STAGES.map(s => stageCell(t, s.key)).join('')}
     <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${provTag}${helpTag}${verdictTag}</td>
@@ -384,7 +386,7 @@ function attnRow(t: AttnTask): string {
   const task = t.taskId
     ? `<span class="attn-task">${escapeHtml(t.title || shortId(t.taskId))}</span>`
     : '<span class="attn-task attn-task-none">—</span>';
-  return `<button type="button" class="attn-row attn-${escapeHtml(t.disposition.bucket)}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId || t.goalChatId)}">
+  return `<button type="button" class="attn-row attn-${escapeHtml(t.disposition.bucket)}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(t.taskId || t.goalChatId)}">
     <span class="attn-next">${escapeHtml(t.disposition.next)}</span>
     ${task}<span class="attn-goal">${goal}</span>${who}${src}${ev}
     <span class="attn-age">${t.lastActivityAt ? fmtTs(t.lastActivityAt) : ''}</span>
