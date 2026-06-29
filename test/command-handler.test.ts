@@ -46,6 +46,7 @@ vi.mock('../src/config.js', () => ({
 
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
+  isRemoteAccessEnabled: vi.fn(() => false),
   // repoPickerScanOptions is the shared helper command-handler depends on;
   // default to legacy (include worktrees), overridden per-test.
   repoPickerScanOptions: vi.fn(() => ({ includeWorktrees: true })),

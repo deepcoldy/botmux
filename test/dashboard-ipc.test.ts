@@ -807,6 +807,13 @@ describe('POST /api/groups/create', () => {
       invalidBotIds: [],
       invalidUserIds: [],
     });
+    const addBotSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([
+      { id: 'cli_X', ok: true },
+    ]);
+    const shareLinkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({
+      ok: true,
+      shareLink: 'https://example.test/join/oc_new',
+    });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
       method: 'POST',
@@ -823,8 +830,11 @@ describe('POST /api/groups/create', () => {
     ]);
     expect(spy).toHaveBeenCalledWith('test-app', 'oc_new', process.cwd());
     expect(spy).toHaveBeenCalledWith('cli_X', 'oc_new', process.cwd());
+    expect(addBotSpy).toHaveBeenCalledWith('test-app', 'oc_new', ['cli_X']);
     spy.mockRestore();
     createSpy.mockRestore();
+    addBotSpy.mockRestore();
+    shareLinkSpy.mockRestore();
   });
 
   it('rejects missing bindWorkingDir before creating the group', async () => {
