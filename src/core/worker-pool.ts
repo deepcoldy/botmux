@@ -65,6 +65,8 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Turn boundary signal used by goal watchdog to inspect unreported tasks. */
+  onSessionIdleOrExit?: (ds: DaemonSession, reason: 'idle' | 'limited' | 'exit') => void;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -2046,6 +2048,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
+            callbacks?.onSessionIdleOrExit?.(ds, ds.lastScreenStatus === 'limited' ? 'limited' : 'idle');
           }
         }
 
@@ -2446,6 +2449,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         code,
       });
     }
+    callbacks?.onSessionIdleOrExit?.(ds, 'exit');
   });
 }
 

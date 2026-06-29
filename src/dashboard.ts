@@ -96,6 +96,12 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo } from './platform/tunnel-client.js';
+import { buildGoalBoard } from './verified-delivery/goal-board.js';
+import {
+  listGoalNotificationRetries,
+  removeGoalNotificationRetry,
+  retryGoalNotification,
+} from './services/goal-notification-retry-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
@@ -553,11 +559,11 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string }>(bo
   return bot.cliId ? bot : { ...bot, cliId: ids.get(bot.larkAppId) };
 }
 
-function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+function liveBots(): { larkAppId: string; botName: string; botOpenId?: string; cliId?: string }[] {
   const ids = configuredCliIds();
   return registry.list().map(d => {
     const b = withConfiguredCliId(d, ids);
-    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+    return { larkAppId: b.larkAppId, botName: b.botName, botOpenId: b.botOpenId, cliId: b.cliId };
   });
 }
 
@@ -1445,6 +1451,82 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
       return jsonRes(res, 200, { enabled: whiteboardEnabled(), whiteboards: listWhiteboards() });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/goals') {
+      return jsonRes(res, 200, buildGoalBoard());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/goal-notification-retries') {
+      return jsonRes(res, 200, { records: listGoalNotificationRetries() });
+    }
+    const mGoalNotificationRetry = url.pathname.match(/^\/api\/goal-notification-retries\/([^/]+)\/(retry|clear)$/);
+    if (req.method === 'POST' && mGoalNotificationRetry) {
+      const id = decodeURIComponent(mGoalNotificationRetry[1]);
+      const action = mGoalNotificationRetry[2];
+      if (action === 'retry') {
+        const record = retryGoalNotification(id);
+        if (!record) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+        const d = registry.getByAppId(record.ownerLarkAppId);
+        let triggered = false;
+        let triggerError: string | undefined;
+        if (d) {
+          try {
+            const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goal-notification-retries/process`, {
+              method: 'POST',
+              signal: AbortSignal.timeout(3_000),
+            });
+            triggered = upstream.ok;
+            if (!upstream.ok) triggerError = `HTTP ${upstream.status}`;
+          } catch (err: any) {
+            triggerError = err?.message ?? String(err);
+          }
+        } else {
+          triggerError = 'owner_daemon_offline';
+        }
+        return jsonRes(res, 200, { ok: true, record, triggered, triggerError });
+      }
+      removeGoalNotificationRetry(id);
+      return jsonRes(res, 200, { ok: true });
+    }
+    const mGoalDecision = url.pathname.match(/^\/api\/goals\/([^/]+)\/decision$/);
+    if (req.method === 'POST' && mGoalDecision) {
+      const goalChatId = decodeURIComponent(mGoalDecision[1]);
+      let parsed: any;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const text = typeof parsed?.text === 'string' ? parsed.text.trim() : '';
+      const taskId = typeof parsed?.taskId === 'string' && parsed.taskId.trim() ? parsed.taskId.trim() : undefined;
+      if (!text) return jsonRes(res, 400, { ok: false, error: 'missing_text' });
+      const body = JSON.stringify({ taskId, text });
+      let contacted = 0;
+      let lastError: any = null;
+      for (const d of registry.list()) {
+        try {
+          const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goals/${encodeURIComponent(goalChatId)}/decision`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body,
+            signal: AbortSignal.timeout(3_000),
+          });
+          contacted++;
+          const txt = await upstream.text();
+          let json: any = null;
+          try { json = txt ? JSON.parse(txt) : null; } catch { /* keep null */ }
+          if (upstream.ok && json?.ok) return jsonRes(res, 200, json);
+          if (json?.error !== 'no_supervisor') lastError = json ?? { status: upstream.status, body: txt };
+        } catch (err: any) {
+          lastError = { error: err?.message ?? String(err) };
+        }
+      }
+      return jsonRes(res, 404, {
+        ok: false,
+        error: 'no_supervisor',
+        goalChatId,
+        contacted,
+        lastError,
+      });
     }
     const mWhiteboard = url.pathname.match(/^\/api\/whiteboards\/([^/]+)$/);
     if (req.method === 'GET' && mWhiteboard) {

@@ -1,0 +1,528 @@
+// Goal board (P1 #6) — a grid-first delivery observation console (claude×codex
+// design). Three zones: a left rail of goals (operational summary rows), a center
+// task grid where each row is a subtask and the columns are the delivery lifecycle
+// (派发→报告→核验→验收), and a right detail panel that shows the selected task's
+// verification trail. Data: GET /api/goals (buildGoalBoard read-model). Self-
+// contained fetch + 10s poll; the returned dispose clears the timer.
+//
+// Aesthetic: borrows the v3 "flight recorder" language — mono-LED task ids, status
+// LEDs, staged reveal — but stays inside the dashboard's CSS variables + themes.
+// No DAG: subtasks are flat (no deps); the lifecycle pipeline IS the progress
+// model. The "核验" stage lights amber while a report awaits verification — exactly
+// the gap the goal-watchdog fills, made visible.
+import { escapeHtml, relTime, loadNameMaps, botNameForOpenId, botNameForAppId, chatNameForId } from './ui.js';
+
+interface AcceptanceCheck { type: 'exists' | 'contains'; text?: string }
+interface AcceptanceArtifact { path: string; kind?: string; checks: AcceptanceCheck[] }
+interface AcceptanceCommand { cmd: string; cwd?: string; expectExitCode?: number; timeoutMs?: number }
+interface AcceptanceCriteria { version: number; artifacts?: AcceptanceArtifact[]; commands?: AcceptanceCommand[] }
+interface BoardEvidence { kind: 'path' | 'inline' | 'url'; label: string; preview?: string; bytes?: number }
+interface BoardAttempt { reportId: string; ts?: number; verdict?: 'accepted' | 'rejected'; reason?: string; summary: string; workerOpenId?: string; verdictVia?: 'reconcile' }
+interface BoardTask {
+  taskId: string; title?: string; status: string;
+  workerOpenIds?: string[]; workerNames?: string[]; latestReportId?: string; reportCount: number;
+  acceptanceCriteria?: AcceptanceCriteria; acceptanceHint?: string;
+  latestVerdict?: 'accepted' | 'rejected'; rejectReason?: string; autoReconciled?: boolean;
+  dispatchedAt?: number; latestReportedAt?: number; latestVerdictAt?: number; acceptedAt?: number; rejectedAt?: number;
+  checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; evidence?: BoardEvidence[];
+  attempts: BoardAttempt[];
+  help?: { blocker: string; kind?: string; workerOpenId?: string };
+  escalation?: { reason: string; by?: string; retryBrief?: string };
+}
+interface BoardNarration { goalChatId: string; type: string; taskId?: string; text: string; ts: number }
+interface GoalNotificationRetryRecord {
+  id: string; ownerLarkAppId: string; kind: 'human-attention' | 'completion-confirm'; status?: 'pending' | 'dead';
+  goalChatId: string; goalTitle?: string; taskId?: string; summary: string; attentionKind?: string; attentionReason?: string;
+  attempts: number; nextAttemptAt: number; lastError?: string; deadAt?: number; deadReason?: string; createdAt: number; updatedAt: number;
+}
+interface BoardGoal {
+  goalChatId: string; title?: string; hasCharter: boolean;
+  charterUpdatedAt?: string; charterContent?: string; lastActivityAt?: number;
+  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; total: number };
+  tasks: BoardTask[];
+  narrations?: BoardNarration[];
+}
+interface GoalBoard { goals: BoardGoal[] }
+interface RetryBoard { records: GoalNotificationRetryRecord[] }
+
+const STATUS_LABEL: Record<string, string> = {
+  dispatched: '待交付', reported: '已报告', accepted: '已验收', rejected: '已驳回',
+  blocked: '求助中', escalated: '已升级人工',
+};
+const HELP_KIND_LABEL: Record<string, string> = {
+  access: '缺权限', ambiguous: '需求歧义', impossible: '做不到', repeated_failure: '反复失败', other: '其它',
+};
+
+// ── lifecycle stages ────────────────────────────────────────────────────────
+type StageState = 'done' | 'active' | 'fail' | 'pending';
+const STAGES: Array<{ key: string; label: string }> = [
+  { key: 'dispatch', label: '派发' },
+  { key: 'report', label: '报告' },
+  { key: 'check', label: '核验' },
+  { key: 'verdict', label: '验收' },
+];
+function stageState(t: BoardTask, key: string): StageState {
+  const reported = t.reportCount > 0;
+  const verdict = t.latestVerdict;
+  switch (key) {
+    case 'dispatch': return 'done';
+    case 'report': return reported ? 'done' : 'pending';
+    case 'check': return verdict ? 'done' : reported ? 'active' : 'pending';
+    case 'verdict':
+      if (verdict === 'accepted') return 'done';
+      if (verdict === 'rejected') return 'fail';
+      return 'pending';
+    default: return 'pending';
+  }
+}
+
+// ── formatters ──────────────────────────────────────────────────────────────
+function shortId(s: string): string { return s.length > 12 ? s.slice(0, 6) + '…' + s.slice(-4) : s; }
+/** Charters default to a "Goal charter: <id>" title — strip that noise for display. */
+function cleanTitle(s: string): string { return s.replace(/^Goal charter:\s*/, '').trim() || s; }
+/** A goal's human name: custom charter title → real Feishu group name → short id. */
+function goalName(g: BoardGoal): string {
+  const custom = g.title && !/^Goal charter:/.test(g.title) ? cleanTitle(g.title) : '';
+  return custom || chatNameForId(g.goalChatId) || shortId(g.goalChatId);
+}
+/** Resolve an actor field (checkedBy/worker) to a friendly agent name. checkedBy
+ *  may be an open_id, a larkAppId (cli_…), or already a plain label (e.g.
+ *  "goal-watchdog" / "claude-loopy-L2"): try the registry by open_id then by
+ *  app_id, else show the label as-is, else short id. */
+function botName(v?: string): string {
+  if (!v) return '—';
+  return botNameForOpenId(v) || botNameForAppId(v)
+    || (v.startsWith('ou_') || v.startsWith('cli_') ? shortId(v) : v);
+}
+/** A 'supervisor 代办' accept: the worker never filed a genuine report, so L2
+ *  bridged the gap — filed a self-report + accept after independent verification.
+ *  The orchestrate skill marks the report/accept with this prefix; we surface it
+ *  so the board never reads as if the worker delivered it themselves. */
+const SUPERVISOR_BRIDGE_MARK = 'supervisor 代办';
+function supervisorBridged(t: BoardTask): boolean {
+  if (t.status !== 'accepted' || t.autoReconciled) return false;
+  const acc = t.attempts.find((a) => a.verdict === 'accepted') ?? t.attempts[t.attempts.length - 1];
+  return !!acc?.summary?.includes(SUPERVISOR_BRIDGE_MARK);
+}
+function fmtDur(ms?: number): string {
+  if (ms === undefined || ms < 0) return '';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${(m / 60).toFixed(1)}h`;
+}
+function fmtTs(ms?: number): string {
+  if (ms === undefined) return '—';
+  return relTime(ms);
+}
+function rejectCount(t: BoardTask): number { return t.attempts.filter(a => a.verdict === 'rejected').length; }
+
+// ── left rail: goals as operational summary rows ──────────────────────────────
+function goalRow(g: BoardGoal, selected: boolean): string {
+  const c = g.counts;
+  const pct = c.total ? Math.round((c.accepted / c.total) * 100) : 0;
+  const segs = (['accepted', 'reported', 'dispatched', 'blocked', 'escalated', 'rejected'] as const)
+    .map(k => c[k] ? `<span class="gb-seg gb-seg-${k}" style="flex:${c[k]}"></span>` : '')
+    .join('');
+  const badges = [
+    c.escalated > 0 ? `<span class="gb-mini gb-mini-esc">${c.escalated} 待你拍</span>` : '',
+    c.blocked > 0 ? `<span class="gb-mini gb-mini-blk">${c.blocked} 求助</span>` : '',
+    c.dispatched + c.reported > 0 ? `<span class="gb-mini gb-mini-active">${c.dispatched + c.reported} 在跑</span>` : '',
+    c.rejected > 0 ? `<span class="gb-mini gb-mini-rej">${c.rejected} 驳回</span>` : '',
+  ].join('');
+  const name = escapeHtml(goalName(g));
+  return `<button class="gb-goal${selected ? ' sel' : ''}" data-goal="${escapeHtml(g.goalChatId)}">
+    <div class="gb-goal-top">
+      <span class="gb-goal-name" title="${escapeHtml(g.goalChatId)}">${name}</span>
+      <span class="gb-goal-frac">${c.accepted}/${c.total}</span>
+    </div>
+    <div class="gb-bar" title="${pct}% 已验收">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
+    <div class="gb-goal-foot">
+      <span class="gb-badges">${badges || '<span class="gb-mini gb-mini-quiet">无在跑</span>'}</span>
+      <span class="gb-goal-time">${g.lastActivityAt ? fmtTs(g.lastActivityAt) : (g.hasCharter ? '仅 charter' : '')}</span>
+    </div>
+  </button>`;
+}
+
+// ── center: task grid (rows=task, columns=lifecycle stages) ───────────────────
+function stageCell(t: BoardTask, key: string): string {
+  const st = stageState(t, key);
+  let glyph = '';
+  if (st === 'done') glyph = key === 'verdict' ? '✓' : '●';
+  else if (st === 'fail') glyph = '✗';
+  else if (st === 'active') glyph = '◌';
+  else glyph = '○';
+  const rc = key === 'verdict' && st === 'fail' && rejectCount(t) > 1 ? `<sub>×${rejectCount(t)}</sub>` : '';
+  return `<td class="gb-cell gb-st-${st}"><span class="gb-led">${glyph}</span>${rc}</td>`;
+}
+function taskRow(t: BoardTask, selected: boolean): string {
+  const verdictTag = t.status === 'rejected' && t.rejectReason
+    ? `<span class="gb-reason">${escapeHtml(t.rejectReason)}</span>` : '';
+  const provTag = t.status !== 'accepted' ? ''
+    : t.autoReconciled
+      ? '<span class="gb-via gb-via-auto" title="goal-watchdog 机器对账：worker 已交付，自动跑结构化验收检查后裁定">🤖 自动对账</span>'
+      : supervisorBridged(t)
+        ? '<span class="gb-via gb-via-bridge" title="worker 未自报，监管者独立核验后代办交付+验收">🤝 监管者代办</span>'
+        : '<span class="gb-via gb-via-agent" title="监管 agent 自主核验后裁定">🧠 自主验收</span>';
+  const helpTag = t.status === 'blocked' && t.help
+    ? `<span class="gb-via gb-via-blocked" title="${escapeHtml(t.help.blocker)}">🚧 ${escapeHtml(HELP_KIND_LABEL[t.help.kind ?? 'other'] ?? '求助')}</span>`
+    : t.status === 'escalated' && t.escalation
+      ? `<span class="gb-via gb-via-escalated" title="${escapeHtml(t.escalation.reason)}">🙋 等人拍板</span>`
+      : '';
+  const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
+    : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
+  const primary = t.title
+    ? `<span class="gb-task-title">${escapeHtml(t.title)}</span><span class="gb-led-id gb-led-id-sm">${escapeHtml(shortId(t.taskId))}</span>`
+    : `<span class="gb-led-id">${escapeHtml(shortId(t.taskId))}</span>`;
+  return `<tr class="gb-trow${selected ? ' sel' : ''}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId)}">
+    <td class="gb-task-id">${primary}${accTag}</td>
+    ${STAGES.map(s => stageCell(t, s.key)).join('')}
+    <td class="gb-task-status"><span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>${provTag}${helpTag}${verdictTag}</td>
+  </tr>`;
+}
+function gridHtml(g: BoardGoal, selTask: string | null): string {
+  if (!g.tasks.length) return '<p class="gb-empty">该目标下暂无子任务</p>';
+  return `<table class="gb-grid">
+    <thead><tr><th class="gb-task-id">子任务</th>${STAGES.map(s => `<th class="gb-cell">${s.label}</th>`).join('')}<th class="gb-task-status">状态</th></tr></thead>
+    <tbody>${g.tasks.map(t => taskRow(t, t.taskId === selTask)).join('')}</tbody>
+  </table>`;
+}
+
+// ── right: detail panel for the selected task ─────────────────────────────────
+function acceptanceHtml(t: BoardTask): string {
+  if (t.acceptanceCriteria) {
+    const c = t.acceptanceCriteria;
+    const items: string[] = [];
+    for (const a of c.artifacts ?? []) {
+      const checks = (a.checks ?? []).map(ck => ck.type === 'exists' ? '存在' : `含"${escapeHtml(ck.text ?? '')}"`).join(' + ');
+      items.push(`<li><code>${escapeHtml(a.path)}</code> — ${checks}</li>`);
+    }
+    for (const cmd of c.commands ?? []) {
+      items.push(`<li><code>${escapeHtml(cmd.cmd)}</code>${cmd.cwd ? ` @${escapeHtml(cmd.cwd)}` : ''} → exit ${cmd.expectExitCode ?? 0}</li>`);
+    }
+    return `<ul class="gb-checklist">${items.join('') || '<li class="gb-muted">—</li>'}</ul>`;
+  }
+  if (t.acceptanceHint) return `<p class="gb-hint-legacy">${escapeHtml(t.acceptanceHint)}</p>`;
+  return '<p class="gb-muted">无验收标准（不可机器核验）</p>';
+}
+function timelineHtml(t: BoardTask): string {
+  const steps: Array<[string, number | undefined]> = [
+    ['派发', t.dispatchedAt], ['报告', t.latestReportedAt],
+    [t.latestVerdict === 'rejected' ? '驳回' : '验收', t.latestVerdictAt],
+  ];
+  const dispatched = t.dispatchedAt;
+  return `<div class="gb-timeline">${steps.filter(([, ts]) => ts !== undefined).map(([label, ts]) => {
+    const delta = (dispatched !== undefined && ts !== undefined && ts > dispatched) ? `+${fmtDur(ts - dispatched)}` : '';
+    return `<div class="gb-tl-step"><span class="gb-tl-dot"></span><span class="gb-tl-label">${label}</span>
+      <span class="gb-tl-time">${fmtTs(ts)}</span>${delta ? `<span class="gb-tl-delta">${delta}</span>` : ''}</div>`;
+  }).join('')}</div>`;
+}
+function trailHtml(t: BoardTask): string {
+  if (!t.checkedBy && !t.evidenceChecked?.length && !t.ranCommands?.length && !t.evidence?.length) {
+    return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">worker 尚未报告</p>';
+  }
+  const parts: string[] = [];
+  if (t.checkedBy) {
+    const prov = t.autoReconciled
+      ? ' <span class="gb-via gb-via-auto" title="goal-watchdog 机器对账，worker 已交付，确定性裁定">🤖 自动对账</span>'
+      : supervisorBridged(t)
+        ? ' <span class="gb-via gb-via-bridge" title="worker 未自报，监管者独立核验后代办交付+验收">🤝 监管者代办</span>'
+        : ' <span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠 自主验收</span>';
+    parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}${prov}</div>`);
+  }
+  if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
+  if (t.ranCommands?.length) parts.push(`<div class="gb-kv"><span>跑了命令</span><ul>${t.ranCommands.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul></div>`);
+  if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e =>
+    `<li>${e.kind === 'path'
+      ? `<code>${escapeHtml(e.label)}</code>`
+      : e.kind === 'url'
+        ? `🔗 <a href="${escapeHtml(e.label)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.label)}</a>`
+        : `📎 ${escapeHtml(e.label)}${e.preview ? ` <span class="gb-muted">${escapeHtml(e.preview.slice(0, 48))}</span>` : ''}`}</li>`).join('')}</ul></div>`);
+  return parts.join('');
+}
+function attemptsHtml(t: BoardTask): string {
+  if (!t.attempts.length) return '<p class="gb-muted">无报告</p>';
+  return `<ol class="gb-attempts">${t.attempts.map((a, i) => {
+    const v = a.verdict === 'accepted' ? '<span class="gb-pill gb-pill-accepted">已验收</span>'
+      : a.verdict === 'rejected' ? '<span class="gb-pill gb-pill-rejected">已驳回</span>'
+        : '<span class="gb-pill gb-pill-reported">待核验</span>';
+    const via = a.verdictVia === 'reconcile' ? '<span class="gb-via gb-via-auto" title="机器对账">🤖</span>'
+      : a.verdict ? '<span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠</span>' : '';
+    return `<li><div class="gb-att-head"><span class="gb-att-n">#${i + 1}</span>${v}${via}<span class="gb-att-time">${fmtTs(a.ts)}</span></div>
+      <div class="gb-att-sum">${escapeHtml(a.summary)}</div>
+      ${a.reason ? `<div class="gb-att-reason">原因：${escapeHtml(a.reason)}</div>` : ''}</li>`;
+  }).join('')}</ol>`;
+}
+function helpHtml(t: BoardTask): string {
+  const parts: string[] = [];
+  if (t.help) {
+    const kind = t.help.kind ? `<span class="gb-help-kind">${escapeHtml(HELP_KIND_LABEL[t.help.kind] ?? t.help.kind)}</span> ` : '';
+    const who = t.help.workerOpenId ? ` <span class="gb-muted">— ${escapeHtml(botName(t.help.workerOpenId))}</span>` : '';
+    parts.push(`<div class="gb-kv"><span>🚧 worker 求助</span><div>${kind}${escapeHtml(t.help.blocker)}${who}</div></div>`);
+  }
+  if (t.escalation) {
+    const by = t.escalation.by ? ` <span class="gb-muted">— ${escapeHtml(botName(t.escalation.by))}</span>` : '';
+    const brief = t.escalation.retryBrief ? `<div class="gb-att-reason">待你拍：${escapeHtml(t.escalation.retryBrief)}</div>` : '';
+    parts.push(`<div class="gb-kv"><span>🙋 升级人工</span><div>${escapeHtml(t.escalation.reason)}${by}${brief}</div></div>`);
+  }
+  return parts.join('');
+}
+/** Human-in-the-loop decision box — the dashboard counterpart of replying in the
+ *  Feishu goal group. The human types an instruction / supplied info and it is
+ *  injected into the goal's L2 supervisor turn (POST /api/goals/:goalChatId/
+ *  decision), which then guides the worker / 代办 / 重派 / closes the escalation.
+ *  Shown for the states that actually need a human call (升级人工 / worker 求助);
+ *  the ledger stays the truth — this only feeds L2 a decision, never writes a verdict. */
+function decisionHtml(t: BoardTask, goalChatId: string): string {
+  if (!(t.escalation || t.status === 'blocked')) return '';
+  const cue = t.escalation ? '这条已升级到你，拍个方向给监管者' : 'worker 在求助，给监管者一个处置指示';
+  return `<div class="gb-sec gb-sec-decide" data-goal="${escapeHtml(goalChatId)}" data-task="${escapeHtml(t.taskId)}">
+    <h3>下发决策 → 监管者</h3>
+    <p class="gb-decide-hint">${cue}。它会去引导 worker / 代办 / 重派 / 关闭升级；账本仍是唯一真相。</p>
+    <textarea class="gb-decide-input" rows="3" placeholder="例如：权限我已开通让 worker 重试；或：改用方案 B 重派；或：这条放弃，标记不做…"></textarea>
+    <div class="gb-decide-row">
+      <button type="button" class="gb-decide-send">下发给监管者</button>
+      <span class="gb-decide-status" aria-live="polite"></span>
+    </div>
+  </div>`;
+}
+// Event stream — the same clean human-readable narration the goal chat shows
+// (人类决策到达 / 监管者关键动作). Mirrors chat ⇄ dashboard so a human watching
+// the board follows the loop without reading L2's terminal cards. n.text already
+// carries the emoji + body; we just lay it out with a relative timestamp.
+function narrationsHtml(g: BoardGoal): string {
+  const ns = g.narrations ?? [];
+  if (!ns.length) return '';
+  return `<div class="gb-narr">
+    <div class="gb-narr-head">📣 事件流 <span class="gb-narr-sub">人类决策 / 监管动作 · 与群内一致</span></div>
+    <ul class="gb-narr-list">${ns.map(n => `<li class="gb-narr-item gb-narr-${escapeHtml(n.type)}">
+        <span class="gb-narr-text">${escapeHtml(n.text).replace(/\n/g, '<br>')}</span>
+        <time class="gb-narr-ts" title="${n.ts ? escapeHtml(new Date(n.ts).toLocaleString()) : ''}">${n.ts ? relTime(n.ts) : ''}</time>
+      </li>`).join('')}</ul>
+  </div>`;
+}
+
+function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string {
+  const visible = records.filter(r => (r.status === 'dead') || r.attempts > 0 || r.lastError);
+  if (!visible.length) return '';
+  return `<div class="gb-retries">
+    <div class="gb-retries-head">⚠️ 关键通知投递异常 <span>${visible.length} 条</span></div>
+    <div class="gb-retries-list">${visible.map(r => {
+      const dead = r.status === 'dead';
+      const title = r.goalTitle || chatNameForId(r.goalChatId) || shortId(r.goalChatId);
+      const label = r.kind === 'completion-confirm' ? '完成确认卡' : '升级/需要人拍板';
+      const status = dead ? `已停止自动重试 · ${r.deadReason ?? 'dead-letter'}` : `下次重试 ${fmtTs(r.nextAttemptAt)}`;
+      return `<div class="gb-retry ${dead ? 'dead' : ''}" data-retry-id="${escapeHtml(r.id)}">
+        <div class="gb-retry-main">
+          <strong>${dead ? '需人工处理' : '重试中'} · ${label}</strong>
+          <span>${escapeHtml(title)}${r.taskId ? ` · <code>${escapeHtml(r.taskId)}</code>` : ''}</span>
+          <small>${escapeHtml(status)} · attempts=${r.attempts}${r.lastError ? ` · ${escapeHtml(r.lastError)}` : ''}</small>
+        </div>
+        <div class="gb-retry-actions">
+          <button type="button" class="gb-retry-retry">手动重试</button>
+          <button type="button" class="gb-retry-clear">清除</button>
+        </div>
+      </div>`;
+    }).join('')}</div>
+  </div>`;
+}
+function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
+  if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
+  return `<div class="gb-detail-head">
+      <div class="gb-led-id gb-led-id-lg">${escapeHtml(t.taskId)}</div>
+      <span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>
+    </div>
+    ${t.title ? `<p class="gb-detail-title">${escapeHtml(t.title)}</p>` : ''}
+    ${t.workerOpenIds?.length ? `<p class="gb-detail-worker">执行 worker：${t.workerOpenIds.map((w, i) => {
+      const nm = t.workerNames?.[i]?.trim();
+      return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
+    }).join('、')}</p>` : ''}
+    ${(t.help || t.escalation) ? `<div class="gb-sec gb-sec-help"><h3>求助 / 升级</h3>${helpHtml(t)}</div>` : ''}
+    ${goalChatId ? decisionHtml(t, goalChatId) : ''}
+    <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
+    <div class="gb-sec"><h3>验收标准</h3>${acceptanceHtml(t)}</div>
+    <div class="gb-sec"><h3>验收痕迹</h3>${trailHtml(t)}</div>
+    <div class="gb-sec"><h3>报告历史 (${t.attempts.length})</h3>${attemptsHtml(t)}</div>`;
+}
+
+// ── page shell + wiring ───────────────────────────────────────────────────────
+function shell(): string {
+  return `<section class="page goalboard">
+<div class="page-heading">
+  <div><p class="eyebrow">可信交付</p><h1>目标看板</h1>
+  <p>每个目标下子任务的交付生命周期：派发 → 报告 → 核验 → 验收。账本是唯一真相。</p></div>
+  <div><button type="button" id="gb-refresh" class="gb-refresh-btn">↻ 刷新</button></div>
+</div>
+<div id="gb-retries"></div>
+<div class="gb-layout">
+  <aside class="gb-rail" id="gb-rail"></aside>
+  <main class="gb-main" id="gb-main"></main>
+  <aside class="gb-detail" id="gb-detail"></aside>
+</div>
+</section>`;
+}
+
+export function renderGoalsPage(root: HTMLElement): () => void {
+  root.innerHTML = shell();
+  const railEl = root.querySelector<HTMLElement>('#gb-rail')!;
+  const mainEl = root.querySelector<HTMLElement>('#gb-main')!;
+  const detailEl = root.querySelector<HTMLElement>('#gb-detail')!;
+  const retriesEl = root.querySelector<HTMLElement>('#gb-retries')!;
+  const refreshBtn = root.querySelector<HTMLButtonElement>('#gb-refresh')!;
+
+  let board: GoalBoard = { goals: [] };
+  let retries: RetryBoard = { records: [] };
+  let selGoal: string | null = null;
+  let selTask: string | null = null;
+  let disposed = false;
+  let lastJson = ''; // skip re-render when a poll returns identical data (no flicker)
+
+  const goalOf = (id: string | null) => board.goals.find(g => g.goalChatId === id) ?? null;
+
+  function renderRail(): void {
+    railEl.innerHTML = board.goals.length
+      ? board.goals.map(g => goalRow(g, g.goalChatId === selGoal)).join('')
+      : '<p class="gb-empty">还没有任何目标 / 交付任务</p>';
+  }
+  function renderMain(): void {
+    const g = goalOf(selGoal);
+    if (!g) { mainEl.innerHTML = '<div class="gb-main-empty"><p>选择左侧一个目标查看子任务</p></div>'; return; }
+    mainEl.innerHTML = `<div class="gb-main-head">
+        <span class="gb-main-title" title="${escapeHtml(g.goalChatId)}">${escapeHtml(goalName(g))}</span>
+        <span class="gb-main-counts">已验收 ${g.counts.accepted} · 共 ${g.counts.total}${g.counts.rejected ? ` · 驳回 ${g.counts.rejected}` : ''}</span>
+      </div>${gridHtml(g, selTask)}${narrationsHtml(g)}`;
+  }
+  const decideDraft: Record<string, string> = {}; // preserve an in-progress decision across poll repaints
+  function renderDetail(): void {
+    const g = goalOf(selGoal);
+    detailEl.innerHTML = detailHtml(g?.tasks.find(t => t.taskId === selTask) ?? null, selGoal);
+    const ta = detailEl.querySelector<HTMLTextAreaElement>('.gb-decide-input');
+    if (ta && selTask && decideDraft[selTask]) ta.value = decideDraft[selTask];
+  }
+  function renderAll(): void { renderRail(); renderMain(); renderDetail(); }
+  function renderRetries(): void { retriesEl.innerHTML = notificationRetriesHtml(retries.records); }
+
+  async function sendDecision(btn: HTMLButtonElement): Promise<void> {
+    const sec = btn.closest<HTMLElement>('.gb-sec-decide');
+    if (!sec) return;
+    const goal = sec.dataset.goal ?? '';
+    const task = sec.dataset.task ?? '';
+    const ta = sec.querySelector<HTMLTextAreaElement>('.gb-decide-input');
+    const statusEl = sec.querySelector<HTMLElement>('.gb-decide-status');
+    const setStatus = (msg: string, cls = '') => { if (statusEl) { statusEl.textContent = msg; statusEl.className = `gb-decide-status${cls ? ' ' + cls : ''}`; } };
+    const text = (ta?.value ?? '').trim();
+    if (!text) { setStatus('先写点指示再下发'); return; }
+    btn.disabled = true;
+    setStatus('下发中…');
+    try {
+      const res = await fetch(`/api/goals/${encodeURIComponent(goal)}/decision`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ taskId: task, text }),
+      });
+      if (!res.ok) {
+        let code = '';
+        try { code = (await res.json())?.error ?? ''; } catch { /* non-json */ }
+        throw new Error(
+          code === 'no_supervisor' ? '该 goal 当前没有在线监管者(L2)，无法下发（会话可能已关）'
+          : code === 'missing_text' ? '指示不能为空'
+          : `下发失败：${code || 'HTTP ' + res.status}`,
+        );
+      }
+      if (ta) ta.value = '';
+      delete decideDraft[task];
+      setStatus('✓ 已下发给监管者', 'gb-decide-ok');
+    } catch (err) {
+      setStatus((err as Error).message, 'gb-decide-err');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // delegation on the persistent containers (only their innerHTML is replaced)
+  railEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>('.gb-goal');
+    if (!btn) return;
+    selGoal = btn.dataset.goal ?? null;
+    const g = goalOf(selGoal);
+    selTask = g?.tasks[0]?.taskId ?? null; // auto-select first task
+    renderAll();
+  });
+  mainEl.addEventListener('click', (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.gb-trow');
+    if (!row) return;
+    selTask = row.dataset.task ?? null;
+    renderMain(); renderDetail();
+  });
+  // decision box (escalated / 求助 tasks): persist the draft, send on click or Ctrl/⌘+Enter
+  detailEl.addEventListener('input', (e) => {
+    const ta = (e.target as HTMLElement).closest<HTMLTextAreaElement>('.gb-decide-input');
+    if (ta && selTask) decideDraft[selTask] = ta.value;
+  });
+  detailEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.gb-decide-send');
+    if (btn) void sendDecision(btn);
+  });
+  detailEl.addEventListener('keydown', (e) => {
+    const ke = e as KeyboardEvent;
+    if (!(ke.ctrlKey || ke.metaKey) || ke.key !== 'Enter') return;
+    const ta = (ke.target as HTMLElement).closest<HTMLElement>('.gb-decide-input');
+    ta?.closest<HTMLElement>('.gb-sec-decide')?.querySelector<HTMLButtonElement>('.gb-decide-send')?.click();
+  });
+  refreshBtn.onclick = () => { void load(); };
+  retriesEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button');
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.gb-retry');
+    if (!btn || !row) return;
+    const id = row.dataset.retryId ?? '';
+    const action = btn.classList.contains('gb-retry-retry') ? 'retry' : btn.classList.contains('gb-retry-clear') ? 'clear' : '';
+    if (!id || !action) return;
+    btn.disabled = true;
+    void fetch(`/api/goal-notification-retries/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        lastJson = '';
+        return load();
+      })
+      .catch((err) => {
+        btn.disabled = false;
+        btn.textContent = (err as Error).message;
+      });
+  });
+
+  async function load(): Promise<void> {
+    try {
+      const [res, retryRes] = await Promise.all([
+        fetch('/api/goals'),
+        fetch('/api/goal-notification-retries'),
+      ]);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!retryRes.ok) throw new Error(`retry HTTP ${retryRes.status}`);
+      const [text, retryText] = await Promise.all([res.text(), retryRes.text()]);
+      const combinedText = `${text}\n${retryText}`;
+      if (disposed) return;
+      if (combinedText === lastJson) return; // unchanged → don't repaint (kills 10s poll flicker)
+      lastJson = combinedText;
+      board = JSON.parse(text) as GoalBoard;
+      retries = JSON.parse(retryText) as RetryBoard;
+      // keep selection if still present; else default to first goal / first task
+      if (!goalOf(selGoal)) { selGoal = board.goals[0]?.goalChatId ?? null; selTask = null; }
+      const g = goalOf(selGoal);
+      if (g && !g.tasks.some(t => t.taskId === selTask)) selTask = g.tasks[0]?.taskId ?? null;
+      // don't yank the caret out of the decision box if a poll repaint lands mid-typing
+      const typing = (document.activeElement as HTMLElement | null)?.classList.contains('gb-decide-input')
+        && detailEl.contains(document.activeElement);
+      renderRetries();
+      if (typing) { renderRail(); renderMain(); } else { renderAll(); renderRetries(); }
+    } catch (e) {
+      if (disposed) return;
+      railEl.innerHTML = `<p class="gb-empty">加载失败：${escapeHtml((e as Error).message)}</p>`;
+    }
+  }
+
+  // resolve open_ids / chatIds → real names, then repaint (memoized globally)
+  void loadNameMaps().then(() => { if (!disposed) renderAll(); });
+  void load();
+  const timer = window.setInterval(() => { void load(); }, 10_000);
+  return () => { disposed = true; window.clearInterval(timer); };
+}

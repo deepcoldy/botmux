@@ -20,12 +20,14 @@ const mockTransferChatOwner = vi.fn();
 const mockGetChatOwner = vi.fn();
 const mockGetChatShareLink = vi.fn();
 const mockAddUsersByUnionId = vi.fn();
+const mockAddBotToChat = vi.fn();
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: (...args: any[]) => mockCreateChat(...args),
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
   getChatOwner: (...args: any[]) => mockGetChatOwner(...args),
   getChatShareLink: (...args: any[]) => mockGetChatShareLink(...args),
   addUsersToChatByUnionId: (...args: any[]) => mockAddUsersByUnionId(...args),
+  addBotToChat: (...args: any[]) => mockAddBotToChat(...args),
 }));
 
 const SHARE_LINK = 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=tok';
@@ -69,12 +71,17 @@ describe('createGroupWithBots', () => {
     mockListChatBotMembers.mockReset();
     mockBindOncall.mockReset();
     mockAddUsersByUnionId.mockReset();
+    mockAddBotToChat.mockReset();
     mockReadRoleProfileEntry.mockReset();
     mockWriteRoleFile.mockReset();
     // Default: share-link fetch succeeds. group-creator always calls this after
     // createChat; individual tests override to exercise the fallback path.
     mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
+    // Default: every batched bot joins OK. Bots are added via addBotToChat (each
+    // batch ≤5) since createChat is called with botIds:[]; tests that exercise
+    // rejected bots override per-id (return { ok:false }).
+    mockAddBotToChat.mockImplementation((_appId: string, _chatId: string, ids: string[]) => ids.map((id) => ({ ok: true, id })));
   });
 
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {
@@ -148,7 +155,7 @@ describe('createGroupWithBots', () => {
     expect(result.shareLinkError).toBe('unsupported chat type (code: 232001)');
   });
 
-  it('filters creator out of bot_id_list before calling createChat', async () => {
+  it('creates the chat with no bots, then adds peers (creator filtered + deduped) via addBotToChat', async () => {
     mockCreateChat.mockResolvedValue({ chatId: 'oc_x', invalidBotIds: [], invalidUserIds: [] });
     await createGroupWithBots({
       creatorLarkAppId: CREATOR,
@@ -157,7 +164,11 @@ describe('createGroupWithBots', () => {
     expect(mockCreateChat).toHaveBeenCalledTimes(1);
     const args = mockCreateChat.mock.calls[0];
     expect(args[0]).toBe(CREATOR);
-    expect(args[1].botIds).toEqual([OTHER_BOT]);  // creator filtered out
+    // 飞书 bot_id_list 上限 5 → 建群不带 bot，所有 bot 一律走 addBotToChat 增量加。
+    expect(args[1].botIds).toEqual([]);
+    // creator filtered out + deduped → only OTHER_BOT added (one batch).
+    expect(mockAddBotToChat).toHaveBeenCalledTimes(1);
+    expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_x', [OTHER_BOT]);
   });
 
   it('skips transfer when invitee was rejected by Lark', async () => {

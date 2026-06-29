@@ -11,9 +11,11 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { registerBot, getBot } from '../src/bot-registry.js';
 import { canTalk, canOperate, evaluateTalk, grantCommandRestriction } from '../src/im/lark/event-dispatcher.js';
+import { _resetGoalChatStoreForTest } from '../src/services/goal-chat-store.js';
 
 describe('grant gates', () => {
   beforeEach(() => {
+    _resetGoalChatStoreForTest();
     const bot = registerBot({ larkAppId: 'g1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] });
     bot.resolvedAllowedUsers = ['ou_owner'];
     bot.config.allowedChatGroups = ['oc_team'];
@@ -50,6 +52,26 @@ describe('grant gates', () => {
     bot.config.oncallChats = [{ chatId: 'oc_oncall_quota', workingDir: '/tmp' }];
     bot.config.chatGrants = { oc_oncall_quota: ['ou_guest'] };
     expect(evaluateTalk('g1', 'oc_oncall_quota', 'ou_guest')).toEqual({ allowed: true, reason: 'oncall' });
+  });
+
+  it('goal chats do not inherit the oncall all-member talk shortcut', () => {
+    const bot = getBot('g1');
+    bot.config.oncallChats = [{ chatId: 'oc_goal', workingDir: '/tmp' }];
+    bot.config.chatGrants = { oc_goal: ['ou_guest'] };
+    _resetGoalChatStoreForTest([{
+      chatId: 'oc_goal',
+      title: 'Goal',
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    }]);
+
+    expect(evaluateTalk('g1', 'oc_goal', 'ou_stranger')).toEqual({ allowed: false, reason: 'none' });
+    expect(evaluateTalk('g1', 'oc_goal', 'ou_guest')).toEqual({
+      allowed: true,
+      reason: 'chatGrant',
+      quotaKey: 'chat:oc_goal:ou_guest',
+    });
+    expect(evaluateTalk('g1', 'oc_goal', 'ou_owner')).toEqual({ allowed: true, reason: 'allowedUser' });
   });
 
   it('scopes oncall talk access to the bot that owns the binding', () => {
