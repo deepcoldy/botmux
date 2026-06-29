@@ -81,6 +81,103 @@ describe('verified-delivery ledger', () => {
     }))).toThrow(/at least one evidence/);
   });
 
+  it('refuses taskId mismatches and malformed core fields at the append seam', () => {
+    const led = openLedger({ baseDir });
+    expect(() => led.append(draft({
+      type: 'TaskDispatched',
+      taskId: 'task-a',
+      idempotencyKey: 'dispatched:task-a',
+      payload: { taskId: 'task-b' },
+    }))).toThrow(/payload\.taskId must match/);
+    expect(() => led.append(draft({
+      type: 'TaskDispatched',
+      taskId: '',
+      idempotencyKey: 'dispatched:empty',
+      payload: { taskId: '' },
+    }))).toThrow(/taskId must be non-empty/);
+  });
+
+  it('refuses misaligned worker metadata and malformed acceptanceCriteria', () => {
+    const led = openLedger({ baseDir });
+    expect(() => led.append(draft({
+      type: 'TaskDispatched',
+      taskId: 'task-meta',
+      idempotencyKey: 'dispatched:task-meta',
+      payload: { taskId: 'task-meta', workerOpenIds: ['ou_a', 'ou_b'], workerLarkAppIds: ['cli_a'] },
+    }))).toThrow(/workerLarkAppIds must be index-aligned/);
+    expect(() => led.append(draft({
+      type: 'TaskDispatched',
+      taskId: 'task-criteria',
+      idempotencyKey: 'dispatched:task-criteria',
+      payload: { taskId: 'task-criteria', acceptanceCriteria: { version: 1, artifacts: [{ path: '', checks: [] }] } },
+    }))).toThrow(/acceptanceCriteria invalid/);
+  });
+
+  it('refuses malformed evidence, help kind, and empty verdict/escalation fields', () => {
+    const led = openLedger({ baseDir });
+    expect(() => led.append(draft({
+      type: 'TaskReported',
+      actor: 'worker',
+      taskId: 'task-ev',
+      idempotencyKey: 'reported:bad-path',
+      payload: { taskId: 'task-ev', reportId: 'r1', summary: 'bad', evidence: [{ kind: 'path', path: '' }] },
+    }))).toThrow(/evidence\[0\]\.path/);
+    expect(() => led.append(draft({
+      type: 'TaskReported',
+      actor: 'worker',
+      taskId: 'task-ev',
+      idempotencyKey: 'reported:bad-url',
+      payload: { taskId: 'task-ev', reportId: 'r2', summary: 'bad', evidence: [{ kind: 'url', url: 'ftp://example.test/a' }] },
+    }))).toThrow(/http or https/);
+    expect(() => led.append(draft({
+      type: 'TaskHelpRequested',
+      actor: 'worker',
+      taskId: 'task-help',
+      idempotencyKey: 'help:bad-kind',
+      payload: { taskId: 'task-help', blocker: 'blocked', kind: 'mystery' as never },
+    }))).toThrow(/kind is invalid/);
+    expect(() => led.append(draft({
+      type: 'TaskAccepted',
+      taskId: 'task-acc',
+      idempotencyKey: 'accepted:empty-report',
+      payload: { taskId: 'task-acc', reportId: '' },
+    }))).toThrow(/TaskAccepted\.reportId/);
+    expect(() => led.append(draft({
+      type: 'TaskEscalated',
+      taskId: 'task-esc',
+      idempotencyKey: 'escalated:empty',
+      payload: { taskId: 'task-esc', reason: '' },
+    }))).toThrow(/TaskEscalated\.reason/);
+  });
+
+  it('keeps deferred invariants backward-compatible for now', () => {
+    const led = openLedger({ baseDir });
+    expect(() => led.append(draft({
+      type: 'TaskReported',
+      taskId: 'task-legacy-report',
+      idempotencyKey: 'reported:legacy-actor',
+      payload: { taskId: 'task-legacy-report', reportId: 'r1', summary: 'legacy actor', evidence: [{ kind: 'path', path: '/tmp/a' }] },
+    }))).not.toThrow();
+    expect(() => led.append(draft({
+      type: 'TaskHelpRequested',
+      taskId: 'task-legacy-help',
+      idempotencyKey: 'help:legacy-actor',
+      payload: { taskId: 'task-legacy-help', blocker: 'legacy actor' },
+    }))).not.toThrow();
+    expect(() => led.append(draft({
+      type: 'TaskAccepted',
+      taskId: 'task-legacy-accept',
+      idempotencyKey: 'accepted:legacy-light',
+      payload: { taskId: 'task-legacy-accept', reportId: 'r1' },
+    }))).not.toThrow();
+    expect(() => led.append(draft({
+      type: 'TaskRejected',
+      taskId: 'task-legacy-reject',
+      idempotencyKey: 'rejected:legacy-free-text',
+      payload: { taskId: 'task-legacy-reject', reportId: 'r1', reason: 'missing report.md' },
+    }))).not.toThrow();
+  });
+
   it('idempotent append: same key twice is a no-op', () => {
     const led = openLedger({ baseDir });
     const a = led.append(draft({ type: 'TaskDispatched', taskId: 'task-3', idempotencyKey: 'dispatched:task-3', payload: { taskId: 'task-3' } }));

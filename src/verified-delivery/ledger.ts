@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 import type { Evidence, LedgerEvent, LedgerEventDraft, TaskView, TaskReportView } from './types.js';
+import { validateLedgerEventDraft } from './invariants.js';
 
 export interface LedgerHandle {
   /** Append an event; same idempotencyKey twice ⇒ second is a no-op. */
@@ -79,13 +80,9 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
   }
 
   function append(draft: LedgerEventDraft): { event: LedgerEvent; deduped: boolean } {
-    // Contract invariant enforced at the seam: a report with no evidence is not
-    // verifiable, so the ledger refuses it — don't rely on the report CLI alone.
-    if (draft.type === 'TaskReported') {
-      const ev = (draft.payload as import('./types.js').TaskReportedPayload).evidence;
-      if (!Array.isArray(ev) || ev.length === 0) {
-        throw new Error('TaskReported requires at least one evidence item (path or inline)');
-      }
+    const invariant = validateLedgerEventDraft(draft);
+    if (invariant.errors.length > 0) {
+      throw new Error(`verified-delivery ledger invariant violation: ${invariant.errors.join('; ')}`);
     }
     return withLock(() => {
       const existing = read();
