@@ -38,7 +38,7 @@
 
 ## daemon 重启会丢上下文吗？
 
-装了 **tmux** 就不会——CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。没装 tmux 则走 pty 模式，重启会重载。
+使用 **tmux 或 Herdr 持久后端** 就不会——CLI 进程常驻后端 session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。未启用持久后端则走 pty 模式，重启会重载。
 
 ## 会话不关会一直跑吗？有自动回收吗？
 

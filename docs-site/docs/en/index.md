@@ -25,14 +25,14 @@ Compared to approaches like OpenClaw that are "rebuilt on top of an Agent SDK":
 | Multiple CLIs | One-click switching among 6+ | Bound to a single SDK |
 | Web Terminal | Fully interactive terminal, synced across three surfaces | Usually read-only output |
 | Multi-bot collaboration | Multiple bots in one group with @mention routing, process isolation | Usually a single bot |
-| Direct terminal access | `tmux attach` into the process, identical to local | Cannot operate the underlying terminal |
+| Direct terminal access | Attach to a tmux / Herdr persistent session and operate the process directly, identical to local | Cannot operate the underlying terminal |
 
 ## Highlights
 
 - **Streaming cards** — One live-updating Lark card per conversation turn, with terminal output rendered as Markdown
 - **Interactive Web Terminal** — Not just viewing: operate the CLI directly in the browser; mobile has a floating shortcut toolbar
 - **Multi-bot collaboration** — Put multiple bots with different CLIs in one group, @ whoever you want to work, and have Claude Code and Codex review code together
-- **Persistent tmux sessions** — Restarting the daemon doesn't interrupt CLI processes
+- **Persistent backends** — tmux is enabled by default, Herdr can be configured explicitly, and restarting the daemon doesn't interrupt CLI processes
 - **Session adopt** — Adopt a CLI running in a local tmux into Lark with one click, and continue on another device
 - **Scheduled tasks** — Configure recurring tasks in natural language; they resume in the original topic when due
 - **On-Call Mode** — Anchor a group to a project so anyone in the on-call group can @ for instant answers

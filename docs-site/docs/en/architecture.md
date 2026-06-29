@@ -13,7 +13,7 @@ Lark long-connection events
    └────┬─────┘
         │ spawns one per topic
         ▼
-   ┌──────────┐   Launches the CLI via an adapter, on a PTY / tmux backend
+   ┌──────────┐   Launches the CLI via an adapter, on a PTY / tmux / Herdr backend
    │  worker  │   Reads terminal output → renders cards; receives Lark messages → writes to CLI
    └────┬─────┘
         │
@@ -34,7 +34,7 @@ Lark long-connection events
 | `server.ts` | Web Terminal HTTP service (xterm.js) |
 | `bot-registry.ts` | Multi-bot config loading + state management |
 | `adapters/cli/` | CLI adapters (argument building, input writing, Skill directory), one file per CLI |
-| `adapters/backend/` | Session backends: `PtyBackend`, `TmuxPipeBackend` |
+| `adapters/backend/` | Session backends: `PtyBackend`, `TmuxPipeBackend`, `HerdrBackend` |
 | `im/lark/` | Lark: event routing, card building/handling, API client, message parsing |
 | `core/` | `worker-pool`, `command-handler`, `session-manager`, `cost-calculator`, `scheduler` |
 | `skills/` | Out-of-the-box Skills (`botmux-send` / `botmux-schedule` / `botmux-bots` / `botmux-history` / `botmux-quoted`) |
@@ -48,4 +48,4 @@ Lark long-connection events
 4. The worker continuously reads PTY output, converts it to Markdown via terminal-renderer, and updates the streaming card.
 5. The CLI proactively sends messages to the topic via injected Skills / commands like `botmux send`.
 
-Key point: **the worker and the CLI are decoupled through the backend (PTY or tmux)**. With the tmux backend, when the daemon/worker restarts the CLI process stays alive inside tmux, and the next message automatically re-attaches — no need to reload context with `--resume`. See [Persistent tmux sessions](/en/tmux) for details.
+Key point: **the worker and the CLI are decoupled through the backend (PTY / tmux / Herdr)**. With a persistent backend, when the daemon/worker restarts the CLI process stays alive inside the backend session, and the next message automatically re-attaches — no need to reload context with `--resume`. See [Persistent backends](/en/persistent-backends) for details.

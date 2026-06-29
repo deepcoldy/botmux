@@ -11,10 +11,10 @@
 | `botmux logs [--lines N]` | 查看日志 |
 | `botmux status` | 查看 daemon 状态 |
 | `botmux upgrade` | 升级到最新版本 |
-| `botmux list` (别名 `ls`) | 列出所有活跃会话 |
+| `botmux list` (别名 `ls`) | 列出所有活跃会话；交互式选择后连接该 bot 的持久后端（tmux / Herdr） |
 | `botmux delete <id>` (别名 `del`/`rm`) | 关闭指定会话，支持 ID 前缀匹配 |
 | `botmux delete all` | 关闭所有活跃会话 |
-| `botmux delete stopped` | 清理进程已退出的僵尸会话 |
+| `botmux delete stopped` | 清理进程已退出且持久后端确认不存在的僵尸会话 |
 | `botmux dashboard` | 输出一次 Web Dashboard URL（每次刷 token） |
 
 ## 开机自启

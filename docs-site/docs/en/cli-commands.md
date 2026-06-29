@@ -11,10 +11,10 @@ Manage the daemon and sessions from the terminal.
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |
-| `botmux list` (alias `ls`) | List all active sessions |
+| `botmux list` (alias `ls`) | List all active sessions; in interactive mode, attach to the bot's persistent backend (tmux / Herdr) |
 | `botmux delete <id>` (aliases `del`/`rm`) | Close the specified session, with ID prefix matching |
 | `botmux delete all` | Close all active sessions |
-| `botmux delete stopped` | Clean up zombie sessions whose processes have exited |
+| `botmux delete stopped` | Clean up zombie sessions whose processes have exited and whose persistent backend is confirmed missing |
 | `botmux dashboard` | Print a Web Dashboard URL once (refreshes the token each time) |
 
 ## Auto-Start on Boot

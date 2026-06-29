@@ -29,3 +29,5 @@ BACKEND_TYPE=pty botmux start
 ```
 
 Once you attach, what you see is a terminal exactly identical to your local development — and this is the key difference between botmux and "read-only output" approaches.
+
+For other backends, see [Persistent Backends](/en/persistent-backends).

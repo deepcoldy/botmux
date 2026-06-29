@@ -38,7 +38,7 @@ First run `@botA @botB /introduce` to register each other's open_id; afterwards,
 
 ## Does restarting the daemon lose context?
 
-With **tmux** installed, no — the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. Without tmux, it runs in pty mode, and a restart reloads everything.
+With a **tmux or Herdr persistent backend**, no — the CLI process stays resident in the backend session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. Without a persistent backend, it runs in pty mode, and a restart reloads everything.
 
 ## Does a session keep running if I don't close it? Is there automatic reclamation?
 

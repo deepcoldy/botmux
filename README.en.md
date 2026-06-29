@@ -56,7 +56,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
-| Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
+| Terminal Access | Attach to a tmux / Herdr persistent session and operate the CLI process directly, same as local dev experience | No direct terminal access |
 | Installation | `npm install -g botmux`, 5-min Lark setup | Easy to install, but more configuration needed |
 
 ---
@@ -227,19 +227,21 @@ When a sub-bot finishes, it reports progress/completion back with `botmux report
 - Sub-bots must already be in the group and @-mentionable (i.e. have the `im:message.group_at_msg.include_bot` permission).
 - A single topic can hold multiple bots, and they @-mention each other to collaborate within the topic (e.g. the coder @-mentions the reviewer once the code is done).
 
-### Tmux Persistence
+### Persistent Backends
 
-When tmux is installed, botmux automatically uses it. CLI processes persist inside tmux sessions — all features work unchanged.
+When tmux is installed, botmux uses it by default. You can also set `backendType: "herdr"` in a bot config to use Herdr explicitly. CLI processes persist inside the backing session — all features work unchanged.
 
-**Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
+**Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux / Herdr session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
 
 ```bash
-# Interactive session picker — select and attach to tmux (see § CLI Commands)
+# Interactive session picker — select and attach to the configured persistent backend
 botmux list
 
 # Or manually attach (session name = bmx-<first 8 chars of session ID>)
 tmux attach -t bmx-<first-8-chars-of-session-id>
-# Ctrl+B, D to detach — CLI keeps running
+# With backendType=herdr:
+herdr session attach bmx-<first-8-chars-of-session-id>
+# Use the backend's detach action to leave the view; the CLI keeps running
 
 # Force pure pty mode (disable tmux)
 BACKEND_TYPE=pty botmux start
@@ -247,10 +249,10 @@ BACKEND_TYPE=pty botmux start
 
 **Lifecycle:**
 
-| Event | tmux session | CLI process |
+| Event | Persistent session | CLI process |
 |-------|-------------|-------------|
 | `botmux restart` | Survives | Survives (re-attaches on next message) |
-| `/close` or close button | Destroyed | Terminated (SIGHUP) |
+| `/close` or close button | Destroyed | Terminated |
 | CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
 
 ### Session Adopt

@@ -29,3 +29,5 @@ BACKEND_TYPE=pty botmux start
 ```
 
 attach 进去后你看到的就是和本地开发完全一致的终端——这也是 botmux 相比"只读输出"方案的关键区别。
+
+其他会话后端见 [持久会话后端](/persistent-backends)。
