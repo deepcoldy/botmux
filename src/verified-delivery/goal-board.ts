@@ -60,6 +60,10 @@ export interface GoalBoardTask {
   workerOpenIds?: string[];
   /** Display names index-aligned with workerOpenIds (captured at dispatch). */
   workerNames?: string[];
+  /** Index-aligned worker identity metadata for local health/reassign + a2a auth. */
+  workerLarkAppIds?: string[];
+  workerCliIds?: string[];
+  workerBotUnionIds?: string[];
   latestReportId?: string;
   reportCount: number;
   /** Structured verify plan (preferred); undefined for legacy tasks. */
@@ -186,6 +190,9 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
     status: t.status,
     workerOpenIds: t.workerOpenIds,
     workerNames: t.workerNames,
+    workerLarkAppIds: t.workerLarkAppIds,
+    workerCliIds: t.workerCliIds,
+    workerBotUnionIds: t.workerBotUnionIds,
     latestReportId: t.latestReportId,
     reportCount: t.reports.length,
     attempts: t.reports.map((r) => {

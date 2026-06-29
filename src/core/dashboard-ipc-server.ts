@@ -92,6 +92,11 @@ import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 import { buildGoalBoard } from '../verified-delivery/goal-board.js';
+import {
+  buildGoalAttentionBoardWithContext,
+  buildLocalGoalAttentionLiveRisks,
+  withGoalAttentionLiveRisks,
+} from './goal-attention.js';
 
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
@@ -1287,6 +1292,30 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 
 ipcRoute('GET', '/api/goals', (_req, res) => {
   jsonRes(res, 200, buildGoalBoard());
+});
+
+ipcRoute('GET', '/api/goals/attention', (req, res) => {
+  const url = new URL(req.url ?? '/api/goals/attention', 'http://127.0.0.1');
+  const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+  const board = buildGoalAttentionBoardWithContext({ chatId });
+  const liveRisks = buildLocalGoalAttentionLiveRisks({
+    board,
+    activeSessions: getActiveSessionsRegistry(),
+    larkAppId: cachedLarkAppId,
+  });
+  jsonRes(res, 200, withGoalAttentionLiveRisks(board, liveRisks));
+});
+
+ipcRoute('GET', '/api/goals/attention/live', (req, res) => {
+  const url = new URL(req.url ?? '/api/goals/attention/live', 'http://127.0.0.1');
+  const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+  const board = buildGoalAttentionBoardWithContext({ chatId });
+  const liveRisks = buildLocalGoalAttentionLiveRisks({
+    board,
+    activeSessions: getActiveSessionsRegistry(),
+    larkAppId: cachedLarkAppId,
+  });
+  jsonRes(res, 200, { systemRisk: liveRisks });
 });
 
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
