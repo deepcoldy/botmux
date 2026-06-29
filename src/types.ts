@@ -121,8 +121,14 @@ export interface Session {
    * session probes 'missing'. Cleared once a live worker is re-established.
    */
   suspendedColdResume?: boolean;
-  /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
+  /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */
   cliId?: import('./adapters/cli/types.js').CliId;
+  /** Optional CLI binary override frozen with `cliId`; used when no wrapper launcher is set. */
+  cliPathOverride?: string;
+  /** Optional wrapper launcher frozen at creation, e.g. `ttadk codex` or `aiden x claude`. */
+  wrapperCli?: string;
+  /** Optional model frozen at creation so historical sessions resume with their original model. */
+  model?: string;
   /**
    * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's

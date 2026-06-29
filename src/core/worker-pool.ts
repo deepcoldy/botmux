@@ -190,6 +190,39 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
 }
 
+function sessionAgentConfig(
+  ds: DaemonSession,
+  botCfg: { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string },
+  resume: boolean,
+): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } {
+  if (!resume) {
+    let changed = false;
+    if (!ds.session.cliId) {
+      ds.session.cliId = botCfg.cliId;
+      changed = true;
+    }
+    if (ds.session.cliPathOverride === undefined && botCfg.cliPathOverride !== undefined) {
+      ds.session.cliPathOverride = botCfg.cliPathOverride;
+      changed = true;
+    }
+    if (ds.session.wrapperCli === undefined && botCfg.wrapperCli !== undefined) {
+      ds.session.wrapperCli = botCfg.wrapperCli;
+      changed = true;
+    }
+    if (ds.session.model === undefined && botCfg.model !== undefined) {
+      ds.session.model = botCfg.model;
+      changed = true;
+    }
+    if (changed) sessionStore.updateSession(ds.session);
+  }
+  return {
+    cliId: ds.session.cliId ?? botCfg.cliId,
+    cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    wrapperCli: ds.session.wrapperCli,
+    model: ds.session.model,
+  };
+}
+
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
   let crossRef: Record<string, string> = {};
@@ -1595,13 +1628,14 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
   if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
 
-  ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);
+  const agentCfg = sessionAgentConfig(ds, botCfg, resume);
+  ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
   // Seed CLI (Claude Code fork) has the same dialog — drive both off the
   // adapter's claude-family fields, writing to each variant's own .claude.json
   // (`~/.claude.json` for claude, `.claude-runtime/.claude.json` for seed).
-  const familyAdapter = createCliAdapterSync(botCfg.cliId, botCfg.cliPathOverride);
+  const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
   let skillPluginDir: string | undefined;
@@ -1609,7 +1643,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   if (!resume && prompt.trim().length > 0) {
     const preparedSkills = prepareSessionSkillPrompt({
       sessionId: ds.session.sessionId,
-      cliId: botCfg.cliId,
+      cliId: agentCfg.cliId,
       workingDir: cwd,
       prompt,
       botPolicy: botCfg.skills,
@@ -1683,11 +1717,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     chatId: ds.chatId,
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
-    cliId: botCfg.cliId,
-    cliPathOverride: botCfg.cliPathOverride,
-    wrapperCli: botCfg.wrapperCli,
+    cliId: agentCfg.cliId,
+    cliPathOverride: agentCfg.cliPathOverride,
+    wrapperCli: agentCfg.wrapperCli,
     launchShell: botCfg.launchShell,
-    model: botCfg.model,
+    model: agentCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
@@ -1724,8 +1758,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // even after the session is closed. Do this before installing worker handlers:
   // a fast worker can emit `ready` immediately after init, and card rendering
   // must see the session-level CLI identity rather than the bot default.
-  if (ds.session.cliId !== botCfg.cliId) {
-    ds.session.cliId = botCfg.cliId;
+  if (ds.session.cliId !== agentCfg.cliId) {
+    ds.session.cliId = agentCfg.cliId;
     sessionStore.updateSession(ds.session);
   }
 

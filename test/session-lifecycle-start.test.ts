@@ -46,7 +46,13 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'codex' },
+    config: {
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      wrapperCli: 'ttadk codex',
+      model: 'glm-5.1',
+    },
     resolvedAllowedUsers: [],
     botOpenId: 'ou_bot',
     botName: 'TestBot',
@@ -103,6 +109,12 @@ vi.mock('../src/skills/installer.js', () => ({
 
 vi.mock('../src/adapters/cli/claude-code.js', () => ({
   claudeJsonlPathForSession: vi.fn(),
+  createClaudeCodeAdapter: vi.fn(() => ({
+    id: 'claude-code',
+    resolvedBin: 'claude',
+    skillsDir: '/tmp/claude-skills',
+    buildArgs: vi.fn(() => []),
+  })),
 }));
 
 vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
@@ -249,6 +261,61 @@ describe('session.start lifecycle integration', () => {
       'app_test',
       undefined,
     );
+  });
+});
+
+describe('forkWorker session agent config freeze', () => {
+  it('records cli wrapper and model on fresh sessions before spawning', () => {
+    const ds = makeDs();
+
+    forkWorker(ds, 'hello', false);
+
+    expect(ds.session.cliId).toBe('codex');
+    expect(ds.session.wrapperCli).toBe('ttadk codex');
+    expect(ds.session.model).toBe('glm-5.1');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      wrapperCli: 'ttadk codex',
+      model: 'glm-5.1',
+    }));
+  });
+
+  it('fills wrapper and model on fresh sessions that already stamped cliId', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;
+
+    forkWorker(ds, 'hello', false);
+
+    expect(ds.session.cliId).toBe('codex');
+    expect(ds.session.wrapperCli).toBe('ttadk codex');
+    expect(ds.session.model).toBe('glm-5.1');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      wrapperCli: 'ttadk codex',
+      model: 'glm-5.1',
+    }));
+  });
+
+  it('resumes with the session recorded cli wrapper and model even after bot config changes', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code' as any;
+    ds.session.wrapperCli = 'aiden x claude';
+    ds.session.model = 'opus';
+
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'claude-code',
+      wrapperCli: 'aiden x claude',
+      model: 'opus',
+      resume: true,
+    }));
   });
 });
 
