@@ -45,6 +45,30 @@ interface BoardGoal {
 interface GoalBoard { goals: BoardGoal[] }
 interface RetryBoard { records: GoalNotificationRetryRecord[] }
 
+// ── Operator View attention band — cross-goal "what needs me now" rollup ──────
+// Consumed from GET /api/goals/attention (verified-delivery/attention.ts
+// buildGoalAttentionBoard + daemon IPC live-health enrichment). The browser hits
+// ONLY this endpoint. Live-probe risk (supervisor/worker liveness) is appended
+// into systemRisk and tagged source:'live'; ledger/store-derived risk is
+// source:'ledger' — so the band renders one list yet distinguishes provenance
+// ("现场探测，可能瞬时" vs "账本事实"). perGoal carries the existing GoalBoard for
+// the unchanged drill-down below.
+interface AttnDisposition { bucket: string; reason: string; next: string }
+interface AttnEvidence { checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; latestSummary?: string }
+interface AttnTask {
+  goalChatId: string; goalTitle?: string; taskId: string; title?: string;
+  workerNames?: string[]; disposition: AttnDisposition; lastActivityAt?: number;
+  recentEvidence?: AttnEvidence;
+  // present only on live-probe systemRisk rows (IPC enrichment, not a ledger fact):
+  source?: 'ledger' | 'live'; liveKind?: string; liveDetail?: string; sessionId?: string; larkAppId?: string;
+}
+interface AttentionBoard {
+  needsHuman: AttnTask[]; blocked: AttnTask[]; systemRisk: AttnTask[];
+  inProgress: AttnTask[]; readyToVerify: AttnTask[]; recentlyCompleted: AttnTask[];
+  counts: { needsHuman: number; blocked: number; systemRisk: number; inProgress: number; readyToVerify: number; completed: number };
+  perGoal: BoardGoal[];
+}
+
 const STATUS_LABEL: Record<string, string> = {
   dispatched: '待交付', reported: '已报告', accepted: '已验收', rejected: '已驳回',
   blocked: '求助中', escalated: '已升级人工',
@@ -346,6 +370,46 @@ function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
     <div class="gb-sec"><h3>报告历史 (${t.attempts.length})</h3>${attemptsHtml(t)}</div>`;
 }
 
+// ── Operator View attention band (cross-goal first screen) ────────────────────
+function attnRow(t: AttnTask): string {
+  const goal = escapeHtml(t.goalTitle ? cleanTitle(t.goalTitle) : (chatNameForId(t.goalChatId) || shortId(t.goalChatId)));
+  const who = t.workerNames?.length ? `<span class="attn-who">${escapeHtml(t.workerNames.join('、'))}</span>` : '';
+  const src = t.disposition.bucket === 'systemRisk'
+    ? (t.source === 'live'
+        ? `<span class="attn-src attn-src-live" title="${escapeHtml(t.liveDetail ?? '现场探测，可能瞬时')}">🔴 实时</span>`
+        : '<span class="attn-src attn-src-ledger" title="账本/存储派生，稳态事实">📒 账本</span>')
+    : '';
+  const sum = t.recentEvidence?.latestSummary;
+  const ev = sum ? `<span class="attn-ev" title="${escapeHtml(sum)}">${escapeHtml(sum.length > 56 ? sum.slice(0, 56) + '…' : sum)}</span>` : '';
+  const task = t.taskId
+    ? `<span class="attn-task">${escapeHtml(t.title || shortId(t.taskId))}</span>`
+    : '<span class="attn-task attn-task-none">—</span>';
+  return `<button type="button" class="attn-row attn-${escapeHtml(t.disposition.bucket)}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId)}" title="${escapeHtml(t.taskId || t.goalChatId)}">
+    <span class="attn-next">${escapeHtml(t.disposition.next)}</span>
+    ${task}<span class="attn-goal">${goal}</span>${who}${src}${ev}
+    <span class="attn-age">${t.lastActivityAt ? fmtTs(t.lastActivityAt) : ''}</span>
+  </button>`;
+}
+function attnSection(label: string, rows: AttnTask[]): string {
+  if (!rows.length) return '';
+  return `<div class="attn-sec"><div class="attn-sec-head">${label} <span class="attn-sec-n">${rows.length}</span></div>${rows.map(attnRow).join('')}</div>`;
+}
+function attentionBandHtml(a: AttentionBoard): string {
+  const c = a.counts;
+  const urgent = c.needsHuman + c.blocked + c.systemRisk + c.readyToVerify;
+  if (!urgent && !c.inProgress && !c.completed) return '<div class="attn-band attn-quiet">✅ 暂无需要你处理的事</div>';
+  const summary = `拍板 ${c.needsHuman} · 卡住 ${c.blocked} · 风险 ${c.systemRisk} · 待验收 ${c.readyToVerify} · 进行中 ${c.inProgress}`;
+  // priority order (codex): 需要你拍板 → 卡住/风险 → 待验收 → (进行中/最近完成 折叠)
+  const top = attnSection('🙋 需要你拍板', a.needsHuman)
+    + attnSection('🚧 卡住 / 风险', [...a.blocked, ...a.systemRisk])
+    + attnSection('🔍 待验收', a.readyToVerify);
+  return `<div class="attn-band">
+    <div class="attn-band-head"><span class="attn-band-title">需要你处理</span><span class="attn-summary">${summary}</span></div>
+    ${top || '<div class="attn-quiet-inline">✅ 没有需要你拍板 / 卡住 / 待验收的事</div>'}
+    ${(c.inProgress || c.completed) ? `<details class="attn-more"><summary>进行中 ${c.inProgress} · 最近完成 ${c.completed}</summary>${attnSection('⏳ 进行中', a.inProgress)}${attnSection('✅ 最近完成', a.recentlyCompleted)}</details>` : ''}
+  </div>`;
+}
+
 // ── page shell + wiring ───────────────────────────────────────────────────────
 function shell(): string {
   return `<section class="page goalboard">
@@ -354,6 +418,7 @@ function shell(): string {
   <p>每个目标下子任务的交付生命周期：派发 → 报告 → 核验 → 验收。账本是唯一真相。</p></div>
   <div><button type="button" id="gb-refresh" class="gb-refresh-btn">↻ 刷新</button></div>
 </div>
+<div id="gb-attn"></div>
 <div id="gb-retries"></div>
 <div class="gb-layout">
   <aside class="gb-rail" id="gb-rail"></aside>
@@ -369,10 +434,12 @@ export function renderGoalsPage(root: HTMLElement): () => void {
   const mainEl = root.querySelector<HTMLElement>('#gb-main')!;
   const detailEl = root.querySelector<HTMLElement>('#gb-detail')!;
   const retriesEl = root.querySelector<HTMLElement>('#gb-retries')!;
+  const gbAttnEl = root.querySelector<HTMLElement>('#gb-attn')!;
   const refreshBtn = root.querySelector<HTMLButtonElement>('#gb-refresh')!;
 
   let board: GoalBoard = { goals: [] };
   let retries: RetryBoard = { records: [] };
+  let attn: AttentionBoard | null = null;
   let selGoal: string | null = null;
   let selTask: string | null = null;
   let disposed = false;
@@ -400,7 +467,8 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     const ta = detailEl.querySelector<HTMLTextAreaElement>('.gb-decide-input');
     if (ta && selTask && decideDraft[selTask]) ta.value = decideDraft[selTask];
   }
-  function renderAll(): void { renderRail(); renderMain(); renderDetail(); }
+  function renderAttn(): void { gbAttnEl.innerHTML = attn ? attentionBandHtml(attn) : ''; }
+  function renderAll(): void { renderAttn(); renderRail(); renderMain(); renderDetail(); }
   function renderRetries(): void { retriesEl.innerHTML = notificationRetriesHtml(retries.records); }
 
   async function sendDecision(btn: HTMLButtonElement): Promise<void> {
@@ -438,6 +506,21 @@ export function renderGoalsPage(root: HTMLElement): () => void {
       btn.disabled = false;
     }
   }
+
+  // attention band: clicking a row drills into that goal+task, reusing the grid
+  // and detail panel below (needsHuman/blocked rows land on the existing decision box).
+  gbAttnEl.addEventListener('click', (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.attn-row');
+    if (!row) return;
+    const goal = row.dataset.goal || null;
+    if (!goal || !goalOf(goal)) return; // a live-only row with no board goal: nothing to drill into
+    selGoal = goal;
+    const g = goalOf(selGoal);
+    const task = row.dataset.task || '';
+    selTask = (task && g?.tasks.some(t => t.taskId === task)) ? task : (g?.tasks[0]?.taskId ?? null);
+    renderAll();
+    detailEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
 
   // delegation on the persistent containers (only their innerHTML is replaced)
   railEl.addEventListener('click', (e) => {
@@ -493,7 +576,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
   async function load(): Promise<void> {
     try {
       const [res, retryRes] = await Promise.all([
-        fetch('/api/goals'),
+        fetch('/api/goals/attention'),
         fetch('/api/goal-notification-retries'),
       ]);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -503,7 +586,8 @@ export function renderGoalsPage(root: HTMLElement): () => void {
       if (disposed) return;
       if (combinedText === lastJson) return; // unchanged → don't repaint (kills 10s poll flicker)
       lastJson = combinedText;
-      board = JSON.parse(text) as GoalBoard;
+      attn = JSON.parse(text) as AttentionBoard;
+      board = { goals: attn.perGoal ?? [] }; // perGoal feeds the existing drill-down (browser hits only /api/goals/attention)
       retries = JSON.parse(retryText) as RetryBoard;
       // keep selection if still present; else default to first goal / first task
       if (!goalOf(selGoal)) { selGoal = board.goals[0]?.goalChatId ?? null; selTask = null; }
@@ -512,8 +596,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
       // don't yank the caret out of the decision box if a poll repaint lands mid-typing
       const typing = (document.activeElement as HTMLElement | null)?.classList.contains('gb-decide-input')
         && detailEl.contains(document.activeElement);
-      renderRetries();
-      if (typing) { renderRail(); renderMain(); } else { renderAll(); renderRetries(); }
+      if (typing) { renderAttn(); renderRail(); renderMain(); renderRetries(); } else { renderAll(); renderRetries(); }
     } catch (e) {
       if (disposed) return;
       railEl.innerHTML = `<p class="gb-empty">加载失败：${escapeHtml((e as Error).message)}</p>`;
