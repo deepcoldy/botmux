@@ -1237,6 +1237,13 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: 'bm-cp' })).toBeNull();
   });
 
+  it('kimi emits `kimi --resume <cliSessionId>` when known, null otherwise', () => {
+    const a = createKimiAdapter('/usr/bin/kimi');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi', cliSessionId: 'kimi-sess-1' }))
+      .toBe('kimi --resume kimi-sess-1');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi' })).toBeNull();
+  });
+
 });
 
 describe('kimi buildArgs', () => {
@@ -1266,10 +1273,17 @@ describe('kimi buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
 
-  it('ignores resume parameter (MVP does not support precise resume)', () => {
+  it('resumes latest session when no resumeSessionId is available', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true });
+    expect(args).toContain('--continue');
     expect(args).not.toContain('--resume');
-    expect(args).not.toContain('sess-1');
+  });
+
+  it('resumes the provided cli session id when available', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true, resumeSessionId: 'kimi-session-123' });
+    expect(args).toContain('--resume');
+    expect(args[args.indexOf('--resume') + 1]).toBe('kimi-session-123');
+    expect(args).not.toContain('--continue');
   });
 
   it('surfaces curated model choices for setup', () => {

@@ -12,7 +12,7 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.kimi-code/credentials', '~/.kimi-code/oauth'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ model, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, model, disableCliBypass }) {
       const args: string[] = [];
       if (!disableCliBypass) {
         args.push('--yolo');
@@ -20,7 +20,14 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
-      return args;
+      if (!resume) return args;
+      if (resumeSessionId) return [...args, '--resume', resumeSessionId];
+      return [...args, '--continue'];
+    },
+
+    buildResumeCommand({ cliSessionId }) {
+      if (!cliSessionId) return null;
+      return `kimi --resume ${cliSessionId}`;
     },
 
     async writeInput(pty: PtyHandle, content: string) {
