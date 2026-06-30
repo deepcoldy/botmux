@@ -53,7 +53,11 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
   function connect(): void {
     if (stopped) return;
     const url = `${base}/tunnel/control?token=${tokenQ}`;
-    const sock = new WebSocket(url);
+    // 关掉 permessage-deflate：隧道是裸字节桥，承载的 HTTP 自己会 gzip，WS 层再压一遍既没收益、
+    // 又会在经过中心化网关(TLB)时因压缩扩展协商被改写而触发 "Invalid WebSocket frame: RSV1 must
+    // be clear"，整条数据流当场挂掉 → dashboard 的 CSS/JS 半路断供、页面掉样式。不 offer 扩展，
+    // 中间任何一跳都不会给这条连接开压缩。
+    const sock = new WebSocket(url, { perMessageDeflate: false });
     ws = sock;
 
     sock.on('open', () => {
@@ -160,7 +164,8 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
 
   function openDataStream(streamId: string): void {
     const url = `${base}/tunnel/data?token=${tokenQ}&stream=${encodeURIComponent(streamId)}`;
-    const data = new WebSocket(url);
+    // 同上：数据流必须关 permessage-deflate，否则大文件(CSS/JS)帧经网关压缩协商错位 → RSV1 报错断流。
+    const data = new WebSocket(url, { perMessageDeflate: false });
     const dialTimer = setTimeout(() => {
       try {
         data.terminate();
