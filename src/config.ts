@@ -46,6 +46,24 @@ function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
 // wrong directory. Mirrors the web/dashboard externalHost getters below.
 const packagedDataDir = new URL('../data', import.meta.url).pathname;
 
+export interface ChatBotDiscoveryConfig {
+  listBotsApiEnabled: boolean;
+  listBotsApiTimeoutMs: number;
+}
+
+/**
+ * Experimental current-chat bot discovery via Lark `/members/bots`.
+ *
+ * The endpoint is useful but not public API, so it must stay explicitly opt-in
+ * and every caller must keep the legacy discovery path as fallback.
+ */
+export function resolveChatBotDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): ChatBotDiscoveryConfig {
+  return {
+    listBotsApiEnabled: (env.BOTMUX_LARK_LIST_BOTS_API_ENABLED ?? '').toLowerCase() === 'true',
+    listBotsApiTimeoutMs: Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS) || 3_000,
+  };
+}
+
 export const config = {
   lark: {
     appId: process.env.LARK_APP_ID ?? '',
@@ -171,6 +189,7 @@ export const config = {
       catch { return {}; }
     })() as Record<string, unknown>,
   },
+  chatBotDiscovery: resolveChatBotDiscoveryConfig(),
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

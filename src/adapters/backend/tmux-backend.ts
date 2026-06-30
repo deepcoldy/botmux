@@ -579,6 +579,11 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID',
   'BOTMUX_TURN_ID',
+  // Experimental Lark chat bot discovery. The daemon injects a canonical
+  // true/false value so `botmux bots list` inside long-lived panes matches the
+  // daemon's `<available_bots>` behavior instead of reading stale rcfile/tmux env.
+  'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
+  'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   // Claude Code 2.1.x resume-summary 菜单的抑制阈值（issue #62）。worker 为
   // claude-code 注入一个极大值绕过菜单；只有进了这条白名单才会被透传进 tmux pane。
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',

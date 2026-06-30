@@ -3,12 +3,56 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ dataDir: '' }));
+const hoisted = vi.hoisted(() => {
+  const state = {
+    dataDir: '',
+    listBotsApiEnabled: false,
+    listBotsApiTimeoutMs: 3000,
+    listBotsApiItems: undefined as Array<{ bot_id: string; bot_name: string }> | undefined,
+    listBotsApiError: undefined as Error | undefined,
+    listBotsApiCode: 0,
+    listBotsApiCalls: 0,
+  };
+
+  class MockClient {
+    appId: string;
+    im: any;
+
+    constructor(opts: { appId: string }) {
+      this.appId = opts.appId;
+      this.im = { v1: {} };
+    }
+
+    // isInChat and members/bots now route through client.request().
+    async request({ url }: { url: string }) {
+      if (url.includes('/members/bots')) {
+        state.listBotsApiCalls++;
+        if (state.listBotsApiError) throw state.listBotsApiError;
+        return {
+          code: state.listBotsApiCode,
+          msg: state.listBotsApiCode === 0 ? 'success' : 'business error',
+          data: { items: state.listBotsApiItems ?? [] },
+        };
+      }
+      if (url.includes('/members/is_in_chat')) {
+        return { code: 0, data: { is_in_chat: true } };
+      }
+      throw new Error(`unexpected GET url in mock: ${url}`);
+    }
+  }
+
+  return { state, MockClient };
+});
+const { state, MockClient } = hoisted;
 
 vi.mock('../src/config.js', () => ({
   config: {
     session: {
       get dataDir() { return state.dataDir; },
+    },
+    chatBotDiscovery: {
+      get listBotsApiEnabled() { return state.listBotsApiEnabled; },
+      get listBotsApiTimeoutMs() { return state.listBotsApiTimeoutMs; },
     },
   },
 }));
@@ -26,35 +70,121 @@ vi.mock('../src/bot-registry.js', () => ({
     { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
     { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
   ]),
+  getBotClient: vi.fn((appId: string) => new MockClient({ appId })),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { error: 4 },
-  Client: class MockClient {
-    appId: string;
-    im: any;
-
-    constructor(opts: { appId: string }) {
-      this.appId = opts.appId;
-      this.im = { v1: {} };
-    }
-
-    // isInChat now routes through client.request() (empty-GET-body 411 guard).
-    async request({ url }: { url: string }) {
-      if (url.includes('/members/is_in_chat')) {
-        return { code: 0, data: { is_in_chat: true } };
-      }
-      throw new Error(`unexpected GET url in mock: ${url}`);
-    }
-  },
+  Client: MockClient,
 }));
 
 describe('listChatBotMembers', () => {
   afterEach(() => {
+    vi.useRealTimers();
     if (state.dataDir) {
       rmSync(state.dataDir, { recursive: true, force: true });
       state.dataDir = '';
     }
+    state.listBotsApiEnabled = false;
+    state.listBotsApiTimeoutMs = 3000;
+    state.listBotsApiItems = undefined;
+    state.listBotsApiError = undefined;
+    state.listBotsApiCode = 0;
+    state.listBotsApiCalls = 0;
+  });
+
+  it('does not call /members/bots when the experimental flag is disabled', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(0);
+    expect(bots.some(b => b.larkAppId === 'cli_self')).toBe(true);
+  });
+
+  it('uses /members/bots as current-chat truth when enabled and does not resurrect stale observed rows', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiItems = [
+      { bot_id: 'ou_self_from_api', bot_name: 'BotSelf' },
+      { bot_id: 'ou_peer_from_api', bot_name: 'BotPeer' },
+    ];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self_self_view', botName: 'BotSelf', cliId: 'codex' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_self_view', botName: 'BotPeer', cliId: 'codex' },
+    ]));
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      ou_stale_peer: { name: 'StalePeer', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(1);
+    expect(bots.map(b => b.openId)).toEqual(['ou_self_from_api', 'ou_peer_from_api']);
+    expect(bots.find(b => b.openId === 'ou_stale_peer')).toBeUndefined();
+    expect(bots.find(b => b.openId === 'ou_peer_from_api')).toMatchObject({
+      larkAppId: 'cli_peer',
+      source: 'configured',
+      mentionable: true,
+      mentionSource: 'observed',
+    });
+  });
+
+  it('treats /members/bots items: [] as authoritative and does not fall back to observed rows', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiItems = [];
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      ou_external: { name: 'External', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(1);
+    expect(bots).toEqual([]);
+  });
+
+  it('caches /members/bots failures for 3 minutes before retrying and falls back to legacy discovery', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-30T00:00:00Z'));
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiError = new Error('gateway unavailable');
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    await listChatBotMembers('cli_self', 'oc_chat');
+    await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(1);
+    vi.setSystemTime(new Date('2026-06-30T00:03:01Z'));
+    await listChatBotMembers('cli_self', 'oc_chat');
+    expect(state.listBotsApiCalls).toBe(2);
+  });
+
+  it('does not cache non-zero /members/bots business errors as capability failures', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiCode = 99992356;
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    await listChatBotMembers('cli_self', 'oc_bad');
+    await listChatBotMembers('cli_self', 'oc_bad');
+
+    expect(state.listBotsApiCalls).toBe(2);
   });
 
   it('returns larkAppId + source="configured" so callers can identify self and provenance', async () => {
