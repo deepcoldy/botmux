@@ -353,6 +353,24 @@ function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string
     }).join('')}</div>
   </div>`;
 }
+/** 验收印 — the signature element: a verified delivery wears a stamp naming WHO
+ *  checked it and HOW MUCH proof they inspected (the anti-Goodhart trail, promoted
+ *  from a muted badge to the page's memorable mark). Only accepted tasks earn it. */
+function sealHtml(t: BoardTask): string {
+  if (t.status !== 'accepted') return '';
+  const by = botName(t.checkedBy);
+  const kind = t.autoReconciled ? '机器对账' : supervisorBridged(t) ? '监管代办' : '自主核验';
+  const checks = t.evidenceChecked?.length ?? 0;
+  const cmds = t.ranCommands?.length ?? 0;
+  const bits = [checks ? `核验 ${checks} 项证据` : '', cmds ? `跑 ${cmds} 条命令` : ''].filter(Boolean).join(' · ');
+  return `<div class="gb-seal" title="验收印 · ${escapeHtml(kind)}">
+    <div class="gb-seal-mark">✓</div>
+    <div class="gb-seal-body">
+      <div class="gb-seal-title">已核验交付<span class="gb-seal-kind">${escapeHtml(kind)}</span></div>
+      <div class="gb-seal-meta">核验人 ${escapeHtml(by)}${bits ? ` · ${bits}` : ' · 无核验痕迹'}</div>
+    </div>
+  </div>`;
+}
 function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
   if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
   return `<div class="gb-detail-head">
@@ -364,6 +382,7 @@ function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
       const nm = t.workerNames?.[i]?.trim();
       return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
     }).join('、')}</p>` : ''}
+    ${sealHtml(t)}
     ${(t.help || t.escalation) ? `<div class="gb-sec gb-sec-help"><h3>求助 / 升级</h3>${helpHtml(t)}</div>` : ''}
     ${goalChatId ? decisionHtml(t, goalChatId) : ''}
     <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
