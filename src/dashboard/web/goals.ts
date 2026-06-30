@@ -104,12 +104,19 @@ function stageState(t: BoardTask, key: string): StageState {
 
 // ── formatters ──────────────────────────────────────────────────────────────
 function shortId(s: string): string { return s.length > 12 ? s.slice(0, 6) + '…' + s.slice(-4) : s; }
+function tailId(s: string): string { return s.length > 4 ? s.slice(-4) : s; }
 /** Charters default to a "Goal charter: <id>" title — strip that noise for display. */
 function cleanTitle(s: string): string { return s.replace(/^Goal charter:\s*/, '').trim() || s; }
+function customGoalTitle(title?: string): string {
+  return title && !/^Goal charter:/.test(title) ? cleanTitle(title) : '';
+}
 /** A goal's human name: custom charter title → real Feishu group name → short id. */
 function goalName(g: BoardGoal): string {
-  const custom = g.title && !/^Goal charter:/.test(g.title) ? cleanTitle(g.title) : '';
-  return custom || chatNameForId(g.goalChatId) || shortId(g.goalChatId);
+  return displayGoalName(g.goalChatId, g.title);
+}
+function displayGoalName(goalChatId: string, title?: string): string {
+  const custom = customGoalTitle(title);
+  return custom || chatNameForId(goalChatId) || `目标 ${tailId(goalChatId)}`;
 }
 /** Resolve an actor field (checkedBy/worker) to a friendly agent name. checkedBy
  *  may be an open_id, a larkAppId (cli_…), or already a plain label (e.g.
@@ -118,7 +125,14 @@ function goalName(g: BoardGoal): string {
 function botName(v?: string): string {
   if (!v) return '—';
   return botNameForOpenId(v) || botNameForAppId(v)
-    || (v.startsWith('ou_') || v.startsWith('cli_') ? shortId(v) : v);
+    || (v.startsWith('ou_') ? `成员 ${tailId(v)}` : v.startsWith('cli_') ? `Bot ${tailId(v)}` : v);
+}
+function displayWorkerName(v?: string): string {
+  if (!v?.trim()) return '';
+  return botName(v.trim());
+}
+function displayWorkerNames(values?: string[]): string[] {
+  return (values ?? []).map(displayWorkerName).filter(Boolean);
 }
 /** A 'supervisor 代办' accept: the worker never filed a genuine report, so L2
  *  bridged the gap — filed a self-report + accept after independent verification.
@@ -160,7 +174,7 @@ function goalRow(g: BoardGoal, selected: boolean): string {
   const name = escapeHtml(goalName(g));
   return `<button class="gb-goal${selected ? ' sel' : ''}" data-goal="${escapeHtml(g.goalChatId)}">
     <div class="gb-goal-top">
-      <span class="gb-goal-name" title="${escapeHtml(g.goalChatId)}">${name}</span>
+      <span class="gb-goal-name" title="${name}">${name}</span>
       <span class="gb-goal-frac">${c.accepted}/${c.total}</span>
     </div>
     <div class="gb-bar" title="${pct}% 已验收">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
@@ -336,7 +350,7 @@ function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string
     <div class="gb-retries-head">⚠️ 关键通知投递异常 <span>${visible.length} 条</span></div>
     <div class="gb-retries-list">${visible.map(r => {
       const dead = r.status === 'dead';
-      const title = r.goalTitle || chatNameForId(r.goalChatId) || shortId(r.goalChatId);
+      const title = displayGoalName(r.goalChatId, r.goalTitle);
       const label = r.kind === 'completion-confirm' ? '完成确认卡' : '升级/需要人拍板';
       const status = dead ? `已停止自动重试 · ${r.deadReason ?? 'dead-letter'}` : `下次重试 ${fmtTs(r.nextAttemptAt)}`;
       return `<div class="gb-retry ${dead ? 'dead' : ''}" data-retry-id="${escapeHtml(r.id)}">
@@ -393,8 +407,9 @@ function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
 
 // ── Operator View attention band (cross-goal first screen) ────────────────────
 function attnRow(t: AttnTask): string {
-  const goal = escapeHtml(t.goalTitle ? cleanTitle(t.goalTitle) : (chatNameForId(t.goalChatId) || shortId(t.goalChatId)));
-  const who = t.workerNames?.length ? `<span class="attn-who">${escapeHtml(t.workerNames.join('、'))}</span>` : '';
+  const goal = escapeHtml(displayGoalName(t.goalChatId, t.goalTitle));
+  const workers = displayWorkerNames(t.workerNames);
+  const who = workers.length ? `<span class="attn-who">${escapeHtml(workers.join('、'))}</span>` : '';
   const src = t.disposition.bucket === 'systemRisk'
     ? (t.source === 'live'
         ? `<span class="attn-src attn-src-live" title="${escapeHtml(t.liveDetail ?? '现场探测，可能瞬时')}">🔴 实时</span>`
@@ -405,7 +420,10 @@ function attnRow(t: AttnTask): string {
   const task = t.taskId
     ? `<span class="attn-task">${escapeHtml(t.title || shortId(t.taskId))}</span>`
     : '<span class="attn-task attn-task-none">—</span>';
-  return `<button type="button" class="attn-row attn-${escapeHtml(t.disposition.bucket)}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(t.taskId || t.goalChatId)}">
+  const title = [t.disposition.next, t.title || t.taskId, displayGoalName(t.goalChatId, t.goalTitle)]
+    .filter(Boolean)
+    .join(' · ');
+  return `<button type="button" class="attn-row attn-${escapeHtml(t.disposition.bucket)}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(title)}">
     <span class="attn-next">${escapeHtml(t.disposition.next)}</span>
     ${task}<span class="attn-goal">${goal}</span>${who}${src}${ev}
     <span class="attn-age">${t.lastActivityAt ? fmtTs(t.lastActivityAt) : ''}</span>
@@ -477,7 +495,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     const g = goalOf(selGoal);
     if (!g) { mainEl.innerHTML = '<div class="gb-main-empty"><p>选择左侧一个目标查看子任务</p></div>'; return; }
     mainEl.innerHTML = `<div class="gb-main-head">
-        <span class="gb-main-title" title="${escapeHtml(g.goalChatId)}">${escapeHtml(goalName(g))}</span>
+        <span class="gb-main-title" title="${escapeHtml(goalName(g))}">${escapeHtml(goalName(g))}</span>
         <span class="gb-main-counts">已验收 ${g.counts.accepted} · 共 ${g.counts.total}${g.counts.rejected ? ` · 驳回 ${g.counts.rejected}` : ''}</span>
       </div>${gridHtml(g, selTask)}${narrationsHtml(g)}`;
   }
