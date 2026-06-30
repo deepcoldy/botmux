@@ -3106,9 +3106,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // returns so those paths cannot leave stale needs-you rows behind.
   clearAgentAttentionForHumanInbound();
 
-  // Intercept OAuth callback URLs (from /login flow)
-  if (isCallbackUrl(content)) {
-    const result = await handleCallbackUrl(content);
+  // Intercept OAuth callback URLs (from /login flow). Feishu auto-prepends an
+  // @<bot> mention to every reply inside a bot-created topic, so the raw
+  // `content` reads "@bot http://127.0.0.1...". isCallbackUrl is anchored at
+  // ^https?://127.0.0.1, so the mention prefix breaks the match — fall back to
+  // the mention-stripped cmdContent so pasting the callback back into the
+  // topic still works.
+  const callbackText = isCallbackUrl(content) ? content
+    : isCallbackUrl(cmdContent) ? cmdContent : null;
+  if (callbackText) {
+    const result = await handleCallbackUrl(callbackText);
     if (result) {
       // Route through sessionReply so chat-scope (普通群) lands as a plain
       // chat message instead of a forced new thread.
