@@ -22834,3 +22834,109 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .attn-more > summary { cursor: pointer; color: var(--muted); font-size: .76rem; padding: 4px 0; }
 .attn-more .attn-sec { border-top: none; padding-top: 2px; }
 @media (prefers-reduced-motion: reduce) { .attn-src-live { animation: none; } }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   Goal board redesign — "交付对账台" (frontend-design pass, claude 2026-06-30)
+   Thesis: this page answers two questions — who is waiting on YOU, and has
+   "done" actually been verified. So boldness is spent in exactly two strokes and
+   everything else stays quiet:
+     1) a warm "待批" command band (human-action = warm signal; the page's
+        heaviest visual weight, where decisions queue);
+     2) a cool "验收印" stamp on machine-verified deliveries (the anti-Goodhart
+        proof, promoted from a muted badge to a seal).
+   The palette encodes responsibility: WARM = your move, COOL = the machine
+   handled it, amber = waiting on the supervisor, red = alarm. CSS-only: reuses
+   every existing gb-*/attn-* class + DOM, so data contract & interactions are
+   untouched. Colours derive from --surface/--fg via color-mix → theme-aware. */
+.goalboard {
+  --gb-human: #e2613a;          /* signal orange — a human must decide */
+  --gb-human-bright: #f3814f;
+  --gb-machine: #15a394;        /* cool teal — machine-verified / auto-reconciled */
+  --gb-machine-ink: #0c7d71;
+}
+:root[data-theme="dark"] .goalboard {
+  --gb-human: #f3804f;
+  --gb-human-bright: #ff9a72;
+  --gb-machine: #2cc0af;
+  --gb-machine-ink: #57d4c4;
+}
+/* ledger feel: tabular numerics wherever the board shows a count / clock / id */
+.goalboard .gb-goal-frac, .goalboard .gb-main-counts, .goalboard .gb-att-time,
+.goalboard .gb-att-n, .goalboard .gb-tl-delta, .goalboard .gb-goal-time,
+.goalboard .attn-summary, .goalboard .attn-age, .goalboard .attn-sec-n,
+.goalboard .gb-led-id, .goalboard .gb-led-id-sm {
+  font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1;
+}
+
+/* ── stroke 1: the warm 待批 command band ──────────────────────────────────── */
+.attn-band {
+  margin: 0 0 16px;
+  border: 1px solid color-mix(in srgb, var(--gb-human) 36%, var(--border-soft));
+  border-left: 4px solid var(--gb-human);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--gb-human) 9%, var(--surface)), var(--surface) 60%);
+  border-radius: var(--radius);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--gb-human) 12%, transparent);
+}
+.attn-band.attn-quiet { border-left-width: 1px; border-color: var(--border-soft); background: var(--surface); box-shadow: none; }
+.attn-band-head { padding: 11px 15px; border-bottom-color: color-mix(in srgb, var(--gb-human) 22%, var(--border-soft)); }
+.attn-band-title { font-size: .92rem; font-weight: 800; letter-spacing: .01em; color: color-mix(in srgb, var(--gb-human) 52%, var(--fg)); }
+.attn-sec-head { letter-spacing: .07em; }
+.attn-next { letter-spacing: .005em; }
+/* needsHuman = the strongest warm; rows read like documents awaiting a chop */
+.attn-needsHuman { border-left-color: var(--gb-human); }
+.attn-needsHuman .attn-next { color: color-mix(in srgb, var(--gb-human) 58%, var(--fg)); font-weight: 700; }
+.attn-row:hover { background: color-mix(in srgb, var(--gb-human) 7%, transparent); }
+.attn-needsHuman:hover { background: color-mix(in srgb, var(--gb-human) 11%, transparent); }
+/* systemRisk stays an alarm (red), distinct from the orange "decide" signal */
+.attn-systemRisk { border-left-color: var(--danger); }
+.attn-blocked { border-left-color: var(--warning); }
+
+/* ── stroke 2: 验收印 — promote provenance badges to embossed verification seals ─ */
+.gb-via { border-radius: 5px; padding: 2px 8px; letter-spacing: .015em; }
+.gb-via-auto {
+  background: color-mix(in srgb, var(--gb-machine) 15%, var(--surface));
+  color: var(--gb-machine-ink);
+  border: 1px solid color-mix(in srgb, var(--gb-machine) 48%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gb-machine) 16%, transparent);
+}
+.gb-via-agent {
+  background: color-mix(in srgb, var(--gb-machine) 7%, var(--surface));
+  color: var(--gb-machine-ink);
+  border: 1px dashed color-mix(in srgb, var(--gb-machine) 42%, transparent);
+}
+.gb-pill-accepted { background: color-mix(in srgb, var(--gb-machine) 16%, var(--surface)); color: var(--gb-machine-ink); }
+.gb-seg-accepted { background: var(--gb-machine); }
+.gb-st-done .gb-led { color: var(--gb-machine); }
+.gb-tl-dot { background: var(--gb-machine); }
+
+/* ── human-action surfaces reskinned warm (escalation / decision / 待你拍) ───── */
+.gb-pill-escalated { background: var(--gb-human); color: #fff; }
+.gb-via-escalated { background: var(--gb-human); color: #fff; }
+.gb-mini-esc { background: var(--gb-human); border-color: var(--gb-human); color: #fff; }
+.gb-seg-escalated { background: var(--gb-human); }
+.gb-sec-decide { border-color: color-mix(in srgb, var(--gb-human) 40%, var(--border-soft)); background: color-mix(in srgb, var(--gb-human) 8%, transparent); }
+.gb-sec-decide h3 { color: color-mix(in srgb, var(--gb-human) 52%, var(--fg)); }
+.gb-decide-send { background: var(--gb-human); }
+.gb-decide-send:hover { background: var(--gb-human-bright); }
+
+/* 验收印 — the signature stamp in the detail panel (accepted deliveries) */
+.gb-seal {
+  display: flex; align-items: center; gap: 11px; margin-top: 12px; padding: 10px 12px;
+  border: 1.5px solid color-mix(in srgb, var(--gb-machine) 55%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--gb-machine) 10%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gb-machine) 16%, transparent);
+}
+.gb-seal-mark {
+  flex: none; width: 34px; height: 34px; display: grid; place-items: center;
+  border-radius: 50%; border: 2px solid var(--gb-machine);
+  color: var(--gb-machine-ink); font-size: 1.05rem; font-weight: 800;
+}
+.gb-seal-body { min-width: 0; }
+.gb-seal-title { font-weight: 700; font-size: .84rem; color: var(--gb-machine-ink); }
+.gb-seal-kind { font-weight: 600; font-size: .66rem; margin-left: 7px; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--gb-machine) 18%, transparent); vertical-align: 1px; }
+.gb-seal-meta { font-size: .74rem; color: var(--muted); margin-top: 3px; }
+
+/* ── quiet polish (selection stays on the cool nav accent — warm is reserved for action) ─ */
+.gb-main-head, .gb-main-title { letter-spacing: .005em; }
+.gb-grid thead th { letter-spacing: .07em; }
