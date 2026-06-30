@@ -23,6 +23,19 @@ function val(id: string): string { return (($(id) as HTMLInputElement).value || 
 
 let bots: BotOpt[] = [];
 let groups: GroupOpt[] = [];
+let editingInstructionId: string | null = null;
+
+export function buildConnectorInstructionUpdateBody(
+  connector: { name: string; promptEnvelope?: { sourceName?: string } },
+  instruction: string,
+): { promptEnvelope: { sourceName: string; instruction: string } } {
+  return {
+    promptEnvelope: {
+      sourceName: connector.promptEnvelope?.sourceName || connector.name,
+      instruction,
+    },
+  };
+}
 
 function pageHtml(): string {
   return `<section class="page">
@@ -148,6 +161,7 @@ function renderList(connectors: Connector[]): void {
         <span class="${c.enabled ? 'ok' : 'muted'}" style="font-size:12px">${c.enabled ? t('connectors.enabled') : t('connectors.disabled')}</span>
         <span class="muted" style="font-size:12px">· ${escapeHtml(bot?.botName || c.target.botId)} · ${kindLabel(c.target.kind)} · ${modeLabel(c.target.mode)}${destLabel} · ${verifyBadge}</span>
         <span style="margin-left:auto;display:flex;gap:6px">
+          <button class="cn-edit ghost" data-id="${escapeHtml(c.id)}" style="font-size:12px">${t('connectors.btnEdit')}</button>
           <button class="cn-toggle ghost" data-id="${escapeHtml(c.id)}" data-on="${c.enabled}" style="font-size:12px">${c.enabled ? t('connectors.btnDisable') : t('connectors.btnEnable')}</button>
           <button class="cn-del ghost" data-id="${escapeHtml(c.id)}" style="font-size:12px">${t('connectors.btnDel')}</button>
         </span>
@@ -155,10 +169,42 @@ function renderList(connectors: Connector[]): void {
       <div style="margin-top:6px;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span class="muted">${t('connectors.webhookUrl')}</span><code style="font-size:12px;word-break:break-all">${escapeHtml(url)}${isToken ? '/&lt;token&gt;' : ''}</code>
         <button class="cn-copy ghost" data-url="${escapeHtml(url)}" style="font-size:12px">${t('connectors.copy')}</button>
-      </div>${isToken ? `<div class="muted" style="font-size:12px;margin-top:4px">${t('connectors.tokenHint')}</div>` : ''}${c.target.mode === 'dynamic' ? `<div class="muted" style="font-size:12px;margin-top:4px">${t('connectors.dynamicReqHint')}</div>` : ''}${c.promptEnvelope?.instruction ? `<div class="muted" style="font-size:12px;margin-top:4px">${t('connectors.instructionPrefix')}${escapeHtml(c.promptEnvelope.instruction)}</div>` : ''}</div>`;
+      </div>${isToken ? `<div class="muted" style="font-size:12px;margin-top:4px">${t('connectors.tokenHint')}</div>` : ''}${c.target.mode === 'dynamic' ? `<div class="muted" style="font-size:12px;margin-top:4px">${t('connectors.dynamicReqHint')}</div>` : ''}${c.promptEnvelope?.instruction ? `<div class="muted" style="font-size:12px;margin-top:4px">${t('connectors.instructionPrefix')}${escapeHtml(c.promptEnvelope.instruction)}</div>` : ''}${editingInstructionId === c.id ? `<div class="cn-edit-box" data-id="${escapeHtml(c.id)}" style="margin-top:8px">
+        <textarea class="cn-edit-instruction" rows="3" style="width:100%;box-sizing:border-box;font-family:inherit;font-size:13px" placeholder="${t('connectors.fInstructionPh')}">${escapeHtml(c.promptEnvelope?.instruction || '')}</textarea>
+        <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <button class="cn-save-instruction primary" data-id="${escapeHtml(c.id)}" style="font-size:12px">${t('connectors.btnSave')}</button>
+          <button class="cn-cancel-instruction ghost" data-id="${escapeHtml(c.id)}" style="font-size:12px">${t('connectors.btnCancel')}</button>
+          <span class="muted cn-edit-out" style="font-size:12px"></span>
+        </div>
+      </div>` : ''}</div>`;
   }).join('');
 
   el.querySelectorAll<HTMLButtonElement>('.cn-copy').forEach(b => { b.onclick = () => { navigator.clipboard?.writeText(b.dataset.url!); b.textContent = t('connectors.copied'); setTimeout(() => b.textContent = t('connectors.copy'), 1200); }; });
+  el.querySelectorAll<HTMLButtonElement>('.cn-edit').forEach(b => {
+    b.onclick = () => { editingInstructionId = b.dataset.id!; renderList(connectors); };
+  });
+  el.querySelectorAll<HTMLButtonElement>('.cn-cancel-instruction').forEach(b => {
+    b.onclick = () => { editingInstructionId = null; renderList(connectors); };
+  });
+  el.querySelectorAll<HTMLButtonElement>('.cn-save-instruction').forEach(b => {
+    b.onclick = async () => {
+      const id = b.dataset.id!;
+      const connector = connectors.find(c => c.id === id);
+      const box = b.closest<HTMLElement>('.cn-edit-box');
+      const out = box?.querySelector<HTMLElement>('.cn-edit-out');
+      const instruction = box?.querySelector<HTMLTextAreaElement>('.cn-edit-instruction')?.value ?? '';
+      if (!connector || !box || !out) return;
+      out.textContent = t('connectors.saving');
+      const r = await jsend('PUT', '/api/connectors/' + encodeURIComponent(id), buildConnectorInstructionUpdateBody(connector, instruction));
+      if (r.status === 200 && r.body?.ok) {
+        editingInstructionId = null;
+        await load();
+      } else {
+        const e = r.body?.error || r.status;
+        out.innerHTML = `<span class="err">${t('connectors.saveFailed', { error: escapeHtml(String(e)) })}</span>`;
+      }
+    };
+  });
   el.querySelectorAll<HTMLButtonElement>('.cn-toggle').forEach(b => {
     b.onclick = async () => { await jsend('PATCH', '/api/connectors/' + encodeURIComponent(b.dataset.id!), { enabled: b.dataset.on !== 'true' }); load(); };
   });

@@ -8,6 +8,7 @@ export interface IdleCleanupSessionRow {
   pendingRepo?: unknown;
   tuiPromptActive?: unknown;
   agentAttention?: unknown;
+  locked?: unknown;
 }
 
 const OPTIONS = new Set<number>(IDLE_CLEANUP_HOUR_OPTIONS);
@@ -34,6 +35,7 @@ export function isIdleCleanupCandidate(
 ): boolean {
   if (!row.sessionId) return false;
   if (row.status !== 'idle') return false;
+  if (row.locked) return false;
   if (row.pendingRepo || row.tuiPromptActive || row.agentAttention) return false;
   const last = numericTime(row.lastMessageAt);
   return last !== null && last < idleCleanupCutoffMs(hours, now);

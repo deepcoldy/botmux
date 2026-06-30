@@ -190,6 +190,39 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
 }
 
+function sessionAgentConfig(
+  ds: DaemonSession,
+  botCfg: { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string },
+): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } {
+  // Freeze the agent launch config (cli / cliPath / wrapper / model) onto the
+  // session the first time a worker forks, so later bot-level edits never
+  // retroactively change a live session — same discipline as `sandbox`.
+  //
+  // Gated on `agentFrozen`, NOT on `resume`: a session created before these
+  // fields existed has `cliId` stamped historically but no frozen wrapper/model,
+  // yet it was launching off the live bot config — so its first post-upgrade
+  // resume must back-fill the still-missing fields from botCfg to keep launching
+  // identically (e.g. a `ttadk codex` wrapper bot must not silently drop to bare
+  // `codex`, losing its gateway). `??` preserves whatever is already frozen and
+  // only fills the gaps; the marker disambiguates "legacy, never frozen" from
+  // "frozen as no-wrapper", so a genuinely wrapper-less session never inherits a
+  // wrapper the bot gains later.
+  if (!ds.session.agentFrozen) {
+    ds.session.cliId = ds.session.cliId ?? botCfg.cliId;
+    ds.session.cliPathOverride = ds.session.cliPathOverride ?? botCfg.cliPathOverride;
+    ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
+    ds.session.model = ds.session.model ?? botCfg.model;
+    ds.session.agentFrozen = true;
+    sessionStore.updateSession(ds.session);
+  }
+  return {
+    cliId: ds.session.cliId ?? botCfg.cliId,
+    cliPathOverride: ds.session.cliPathOverride,
+    wrapperCli: ds.session.wrapperCli,
+    model: ds.session.model,
+  };
+}
+
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
   let crossRef: Record<string, string> = {};
@@ -1604,13 +1637,14 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
   if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
 
-  ensureCliEnv(botCfg.cliId, botCfg.cliPathOverride);
+  const agentCfg = sessionAgentConfig(ds, botCfg);
+  ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
   // Seed CLI (Claude Code fork) has the same dialog — drive both off the
   // adapter's claude-family fields, writing to each variant's own .claude.json
   // (`~/.claude.json` for claude, `.claude-runtime/.claude.json` for seed).
-  const familyAdapter = createCliAdapterSync(botCfg.cliId, botCfg.cliPathOverride);
+  const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
   let skillPluginDir: string | undefined;
@@ -1618,7 +1652,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
   if (!resume && prompt.trim().length > 0) {
     const preparedSkills = prepareSessionSkillPrompt({
       sessionId: ds.session.sessionId,
-      cliId: botCfg.cliId,
+      cliId: agentCfg.cliId,
       workingDir: cwd,
       prompt,
       botPolicy: botCfg.skills,
@@ -1692,11 +1726,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     chatId: ds.chatId,
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
-    cliId: botCfg.cliId,
-    cliPathOverride: botCfg.cliPathOverride,
-    wrapperCli: botCfg.wrapperCli,
+    cliId: agentCfg.cliId,
+    cliPathOverride: agentCfg.cliPathOverride,
+    wrapperCli: agentCfg.wrapperCli,
     launchShell: botCfg.launchShell,
-    model: botCfg.model,
+    model: agentCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
@@ -1733,8 +1767,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
   // even after the session is closed. Do this before installing worker handlers:
   // a fast worker can emit `ready` immediately after init, and card rendering
   // must see the session-level CLI identity rather than the bot default.
-  if (ds.session.cliId !== botCfg.cliId) {
-    ds.session.cliId = botCfg.cliId;
+  if (ds.session.cliId !== agentCfg.cliId) {
+    ds.session.cliId = agentCfg.cliId;
     sessionStore.updateSession(ds.session);
   }
 

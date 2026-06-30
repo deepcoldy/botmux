@@ -23,7 +23,7 @@ import { config } from '../config.js';
 import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
-import { readRawConfig, findEntryIndex, requireConfigPath } from '../services/config-store.js';
+import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
@@ -56,6 +56,7 @@ import { triggerSessionTurn } from './trigger-session.js';
 import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -560,6 +561,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => 
     body: { sessionId: params.sessionId, patch: { title } },
   });
   jsonRes(res, 200, { ok: true, title });
+});
+
+// 会话锁定：保护被锁定会话不被 dashboard「清理空闲」批量关闭。锁定是会话元数据，
+// 不影响用户显式点击关闭/批量关闭，避免把会话变成不可管理状态。
+ipcRoute('POST', '/api/sessions/:sessionId/lock', async (req, res, params) => {
+  let body: { locked?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.locked !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'bad_locked' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (body.locked) session.locked = true;
+  else delete session.locked;
+  sessionStore.updateSession(session);
+  const locked = !!session.locked;
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { locked } },
+  });
+  jsonRes(res, 200, { ok: true, locked });
 });
 
 /**
@@ -1247,6 +1267,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
   let p2pMode: 'thread' | 'chat' = 'thread';
   try { if (getBot(cachedLarkAppId).config.p2pMode === 'chat') p2pMode = 'chat'; } catch { /* default thread */ }
+  let cliId = '';
+  let wrapperCli: string | null = null;
+  let model: string | null = null;
+  let agentSelectionKey = '';
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    cliId = cfg.cliId;
+    wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
+    model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
+    agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
+  } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
   try {
     const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
@@ -1277,6 +1308,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
+    cliId,
+    wrapperCli,
+    model,
+    agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
     autoboundChatCount: autoboundChats.length,
@@ -1417,6 +1452,51 @@ ipcRoute('PUT', '/api/bot-brand-label', async (req, res) => {
   const r = await brandStore.updateBotBrandLabel(cachedLarkAppId, next);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, brandLabel: r.brandLabel });
+});
+
+// Per-bot agent launch settings. Body `{ cliId, model }` where `cliId` is the
+// dashboard selection key (plain adapter id or a wrapper option such as
+// `ttadk-x-codex`). Changes affect the next spawned CLI session.
+ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { cliId?: unknown; model?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
+  if (!key) return jsonRes(res, 400, { ok: false, error: 'cli_required' });
+  let selected: ReturnType<typeof resolveCliSelection>;
+  try {
+    selected = resolveCliSelection(key);
+  } catch (err: any) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
+  }
+  const model = typeof body.model === 'string' ? body.model.trim() : '';
+
+  const r = await rmwBotEntry(cachedLarkAppId, (entry) => {
+    entry.cliId = selected.cliId;
+    if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
+    else delete entry.wrapperCli;
+    if (model) entry.model = model;
+    else delete entry.model;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+
+  const bot = getBot(cachedLarkAppId);
+  bot.config.cliId = selected.cliId;
+  if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
+  else bot.config.wrapperCli = undefined;
+  bot.config.model = model || undefined;
+
+  const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
+  jsonRes(res, 200, {
+    ok: true,
+    cliId: selected.cliId,
+    wrapperCli: selected.wrapperCli ?? null,
+    model: model || null,
+    selectionKey,
+  });
 });
 
 // Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' }`:

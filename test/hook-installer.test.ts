@@ -214,12 +214,21 @@ describe('installHook — opencode-plugin', () => {
     configPath = join(tmpDir, '.config', 'opencode', 'plugin', 'botmux-ask.js');
   });
 
-  it('插件用 argv 形式 spawnSync(cmd, args)，不拆 shell 字符串（Codex P1.2 回归）', () => {
+  it('插件用 argv 形式 spawn(cmd, args)，不拆 shell 字符串（Codex P1.2 回归）', () => {
     installHook('opencode', { configPath, format: 'opencode-plugin' }, hookCommand);
     const content = readFileSync(configPath, 'utf-8');
 
+    // 监听 question.asked 事件并经 event 钩子拦截（OpenCode 插件无专用 question 钩子）
     expect(content).toContain('question.asked');
-    expect(content).toContain('spawnSync(');
+    expect(content).toContain('event:');
+    // 插件导出必须是「函数」（OpenCode 要求；导出对象会报 "Plugin export is not a function"）
+    expect(content).toContain('export const BotmuxAsk = async');
+    // 异步 spawn（绝不能用 spawnSync 同步阻塞 OpenCode 单线程事件总线）
+    expect(content).toContain('spawn(');
+    expect(content).not.toContain('spawnSync(');
+    // 答案 POST 回 OpenCode 的 reply 端点解阻塞
+    expect(content).toContain('/question/');
+    expect(content).toContain('/reply');
     // args 以 JSON 数组嵌入，包含 hook 子命令与 cliId
     expect(content).toContain('"hook"');
     expect(content).toContain('"opencode"');

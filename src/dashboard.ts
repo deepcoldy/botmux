@@ -549,8 +549,30 @@ function configuredCliIds(): Map<string, string> {
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string }>(bot: T, ids: Map<string, string>): T & { cliId?: string } {
-  return bot.cliId ? bot : { ...bot, cliId: ids.get(bot.larkAppId) };
+function configuredBotAgentFields(): Map<string, { cliId?: string; wrapperCli?: string; model?: string }> {
+  try {
+    return new Map(loadBotConfigs().map(b => [b.larkAppId, {
+      cliId: b.cliId,
+      wrapperCli: b.wrapperCli,
+      model: b.model,
+    }]));
+  } catch {
+    return new Map();
+  }
+}
+
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; wrapperCli?: string; model?: string }>(
+  bot: T,
+  ids: Map<string, string> | Map<string, { cliId?: string; wrapperCli?: string; model?: string }>,
+): T & { cliId?: string; wrapperCli?: string; model?: string } {
+  const raw = ids.get(bot.larkAppId);
+  const fallback = typeof raw === 'string' ? { cliId: raw } : raw;
+  return {
+    ...bot,
+    cliId: bot.cliId || fallback?.cliId,
+    wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
+    model: bot.model || fallback?.model,
+  };
 }
 
 function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
@@ -1605,9 +1627,9 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true, entry });
     }
 
-    // 看板放置 / 重命名：带 JSON body 的会话写操作，原样转发给 owner daemon。
+    // 看板放置 / 重命名 / 锁定：带 JSON body 的会话写操作，原样转发给 owner daemon。
     // 不在公开读白名单内 → 只读访客在 decideDashboardAuth 已被 401。
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(board|rename)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(board|rename|lock)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -1974,8 +1996,8 @@ const server = createServer(async (req, res) => {
     // PUT  /api/bots/:appId/default-oncall   — proxy to that bot's daemon
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
-      const cliIds = configuredCliIds();
-      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
+      const agentFields = configuredBotAgentFields();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, agentFields)).sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
@@ -1983,7 +2005,13 @@ const server = createServer(async (req, res) => {
             return botDefaultsPayload(d, undefined, `http_${r.status}`);
           }
           const j = await r.json() as any;
-          return botDefaultsPayload({ ...d, botName: d.botName ?? j.botName }, j);
+          return botDefaultsPayload({
+            ...d,
+            botName: d.botName ?? j.botName,
+            cliId: j.cliId || d.cliId,
+            wrapperCli: j.wrapperCli || d.wrapperCli,
+            model: j.model || d.model,
+          }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));
         }
@@ -2017,6 +2045,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-working-dir-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/agent — proxy to that bot's daemon. Body
+    // `{ cliId, model }`; cliId is the dashboard selection key.
+    let mBotAgent: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotAgent = url.pathname.match(/^\/api\/bots\/([^/]+)\/agent$/))) {
+      const appId = decodeURIComponent(mBotAgent[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

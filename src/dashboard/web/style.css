@@ -919,6 +919,22 @@ button.primary {
   border: 1px solid var(--border-soft);
 }
 
+.session-lock-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  margin-left: 6px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface-muted));
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
 .cli-claude-code { background: #e8f0ff; color: #234fb4; border-color: #c8d9ff; }
 .cli-codex       { background: #fff0df; color: #a14c11; border-color: #ffd8ad; }
 .cli-codex-app   { background: #e9f7ff; color: #11638f; border-color: #bde4fa; }
@@ -1140,6 +1156,10 @@ button.primary {
   background: color-mix(in srgb, var(--accent) 5%, var(--surface-raised));
 }
 
+.session-card.locked {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
 @media (prefers-reduced-motion: reduce) {
   .session-card { animation: none; transition: none; }
   .session-board-needs-you h2::before { animation: none; }
@@ -1195,6 +1215,19 @@ button.primary {
   justify-content: space-between;
   color: var(--muted);
   font-size: 12px;
+}
+
+.session-card-status-group,
+.drawer-status-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.session-card-status-group .session-lock-badge,
+.drawer-status-line .session-lock-badge {
+  margin-left: 0;
 }
 
 .session-signal {
@@ -1485,6 +1518,10 @@ button.primary {
 .kanban-card:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   background: color-mix(in srgb, var(--accent) 4%, var(--surface-raised));
+}
+
+.kanban-card.locked {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
 }
 
 .kanban-card:focus-visible {
@@ -1872,6 +1909,11 @@ button.primary {
   color: var(--danger);
   border-color: var(--danger);
   background: color-mix(in srgb, var(--danger) 9%, var(--surface-raised));
+}
+.card-act.locked {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface-raised));
 }
 .card-act:active { transform: scale(0.9); }
 

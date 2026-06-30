@@ -39,6 +39,7 @@ describe('dashboard idle session cleanup selection', () => {
       row('working', { status: 'working', lastMessageAt: NOW - 48 * hour }),
       row('starting', { status: 'starting', lastMessageAt: NOW - 48 * hour }),
       row('closed', { status: 'closed', lastMessageAt: NOW - 48 * hour }),
+      row('locked', { locked: true, lastMessageAt: NOW - 48 * hour }),
       row('pending-repo', { pendingRepo: true, lastMessageAt: NOW - 48 * hour }),
       row('tui-prompt', { tuiPromptActive: true, lastMessageAt: NOW - 48 * hour }),
       row('agent-attention', { agentAttention: { kind: 'blocked', reason: 'needs input', at: NOW - 48 * hour } }),

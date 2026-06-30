@@ -589,6 +589,13 @@ export interface BotState {
 
 const bots = new Map<string, BotState>();
 
+export function __testOnly_resetBotRegistry(): void {
+  bots.clear();
+  loadedConfigPath = undefined;
+  oncallChatCache = null;
+  brandLabelCache = null;
+}
+
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
 // a hard import cycle between `i18n` and `bot-registry`.
 setBotLookup((id) => bots.get(id));

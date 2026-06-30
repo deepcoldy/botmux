@@ -1,6 +1,5 @@
 import * as pty from 'node-pty';
 import { execSync, execFileSync } from 'node:child_process';
-import { accessSync, constants as fsConstants } from 'node:fs';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
@@ -8,6 +7,7 @@ import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
 import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
+import { isExecutable } from '../../utils/executable.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -727,15 +727,6 @@ function classifyShell(path: string): ShellKind | null {
   if (base === 'zsh') return 'zsh';
   if (base === 'sh' || base === 'dash' || base === 'ash') return 'sh';
   return null;
-}
-
-function isExecutable(path: string): boolean {
-  try {
-    accessSync(path, fsConstants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
