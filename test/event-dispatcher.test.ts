@@ -129,6 +129,13 @@ beforeEach(() => {
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
 });
 
+type TestMention = {
+  key: string;
+  name: string;
+  id: { open_id?: string; app_id?: string } | string;
+  id_type?: string;
+};
+
 async function flushEventWork() {
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -204,7 +211,7 @@ function makeBotMessageEvent(opts: {
   chatId?: string;
   chatType?: string;
   messageId?: string;
-  mentions?: Array<{ key: string; name: string; id: { open_id: string } }>;
+  mentions?: TestMention[];
   /** Override `sender.sender_type`. Defaults to `'app'`. Use `'bot'` to model
    *  飞书在跨 bot 卡片消息场景实测投递的值。 */
   senderType?: string;
@@ -239,7 +246,7 @@ function makeUserMessageEvent(opts: {
   chatId?: string;
   chatType?: string;
   messageId?: string;
-  mentions?: Array<{ key: string; name: string; id: { open_id: string } }>;
+  mentions?: TestMention[];
 }) {
   const threadId = opts.threadId === null
     ? undefined
@@ -338,6 +345,22 @@ describe('isBotMentioned', () => {
     const message = {
       mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID, id_type: 'union_id' }],
       content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
+  });
+
+  it('detects @mention via app_id mention payload', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_APP_ID, id_type: 'app_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('does not treat another app_id as this bot mention', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'Other', id: 'app-other', id_type: 'app_id' }],
+      content: JSON.stringify({ text: '@Other hello' }),
     };
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
   });
@@ -3252,7 +3275,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
 
   function makeIntroduceEvent(opts: {
     extraText?: string;
-    mentions: Array<{ key: string; name: string; id: { open_id: string } }>;
+    mentions: TestMention[];
     chatId?: string;
     messageId?: string;
   }) {

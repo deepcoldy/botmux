@@ -241,6 +241,87 @@ describe('webhook token mode', () => {
     expect(captured[0].instruction).toBe('Summarize and notify oncall.');
     expect(captured[0].envelope.instruction).toBeUndefined();
   });
+
+  it('wait mode does not require a dynamic chatId and forwards wait options', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, triggerId: 'trg_wait', action: 'completed', output: { content: 'answer' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_wait_dynamic',
+      name: 'Wait Dynamic',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1' },
+      promptEnvelope: { sourceName: 'wait', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-06-06T00:00:00.000Z',
+      updatedAt: '2026-06-06T00:00:00.000Z',
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_wait_dynamic/tok_plain_value?wait=1&timeoutMs=120000`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hello: 'world' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, action: 'completed', output: { content: 'answer' } });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].target).toEqual({ kind: 'turn', botId: 'app1' });
+    expect(captured[0].options).toEqual({ waitForFinalOutput: true, timeoutMs: 120000 });
+  });
+
+  it('wait mode forwards sessionId so callers can continue a headless session', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return {
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          triggerId: 'trg_wait_2',
+          action: 'completed',
+          target: { kind: 'turn', sessionId: 'sess_headless' },
+          output: { content: 'answer' },
+        }),
+      };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_wait_session',
+      name: 'Wait Session',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1' },
+      promptEnvelope: { sourceName: 'wait', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-06-06T00:00:00.000Z',
+      updatedAt: '2026-06-06T00:00:00.000Z',
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_wait_session/tok_plain_value?wait=1&sessionId=sess_headless`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: '{"hello":"world"}',
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, action: 'completed', output: { content: 'answer' } });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].target).toEqual({ kind: 'turn', botId: 'app1', sessionId: 'sess_headless' });
+    expect(captured[0].options).toEqual({ waitForFinalOutput: true });
+  });
 });
 
 describe('webhook new-group lifecycle', () => {

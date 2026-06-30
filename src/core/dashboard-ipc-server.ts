@@ -55,7 +55,7 @@ import {
 import { triggerSessionTurn } from './trigger-session.js';
 import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
-import { validateTriggerRequest } from '../services/trigger-types.js';
+import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -258,6 +258,47 @@ function findSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
 }
 
+function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds) {
+    return { ok: false, errorCode: 'session_not_found', error: `active session not found: ${sessionId}` };
+  }
+  const resolvedTriggerId = triggerId || ds.latestAsyncTriggerId;
+  if (!resolvedTriggerId) {
+    return { ok: false, errorCode: 'bad_request', error: 'no async trigger recorded for this session' };
+  }
+  const state = ds.asyncTriggerResults?.get(resolvedTriggerId);
+  if (!state) {
+    return { ok: false, errorCode: 'bad_request', error: `async trigger not found for session: ${resolvedTriggerId}` };
+  }
+  if (state.status === 'completed') {
+    return {
+      ok: true,
+      triggerId: resolvedTriggerId,
+      action: 'completed',
+      target: { kind: 'turn', sessionId, chatId: ds.chatId },
+      output: state.content ? { content: state.content } : undefined,
+      async: {
+        status: 'completed',
+        sessionId,
+        completedAt: state.completedAt ? new Date(state.completedAt).toISOString() : undefined,
+      },
+      message: 'async trigger completed',
+    };
+  }
+  return {
+    ok: true,
+    triggerId: resolvedTriggerId,
+    action: 'queued',
+    target: { kind: 'turn', sessionId, chatId: ds.chatId },
+    async: {
+      status: 'pending',
+      sessionId,
+    },
+    message: 'async trigger pending',
+  };
+}
+
 // 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
 // 改完广播 session.update，所有打开的 dashboard 实时同步。
 ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
@@ -380,6 +421,18 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });
   }
+});
+
+ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const triggerId = url.searchParams.get('triggerId') ?? undefined;
+  const result = buildAsyncTriggerLookupResponse(params.sessionId, triggerId);
+  const status = result.ok
+    ? 200
+    : result.errorCode === 'session_not_found'
+      ? 404
+      : 400;
+  jsonRes(res, status, result);
 });
 
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
@@ -917,6 +970,8 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
         ? 403
         : result.errorCode === 'session_not_found'
           ? 404
+        : result.errorCode === 'wait_timeout'
+          ? 504
         : result.errorCode === 'target_required' || result.errorCode === 'bad_request'
           ? 400
           : 500;

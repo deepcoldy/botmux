@@ -111,6 +111,19 @@ export interface DaemonSession {
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
+  /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
+   *  webhook triggers waiting for a response in this session. Key is turnId. */
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
+   *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
+   *  pass the triggerId returned by the initial async activation response. */
+  asyncTriggerResults?: Map<string, {
+    status: 'pending' | 'completed';
+    createdAt: number;
+    completedAt?: number;
+    content?: string;
+  }>;
+  latestAsyncTriggerId?: string;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */

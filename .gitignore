@@ -4,6 +4,7 @@ dist/
 data/
 log/
 .DS_Store
+.idea/
 *.tsbuildinfo
 .env
 .npmrc

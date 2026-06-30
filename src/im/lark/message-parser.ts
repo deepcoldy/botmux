@@ -32,8 +32,8 @@ interface RawEventData {
       // (im.message.get / list) delivers a bare STRING ("ou_xxx") plus a
       // sibling `id_type`. Always read the open_id via mentionOpenId() so both
       // forms are handled — see its doc-comment for why this matters.
-      id?: { open_id?: string; user_id?: string; union_id?: string } | string;
-      id_type?: string;  // present only in the REST string form, e.g. "open_id"
+      id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string;
+      id_type?: string;  // present only in the REST string form, e.g. "open_id" / "app_id"
       tenant_key?: string;
     }>;
   };
@@ -60,7 +60,7 @@ interface RawEventData {
  * return when the app lacks the open_id scope) yields `undefined` rather than
  * being mis-compared against a botOpenId.
  */
-export function mentionOpenId(m: { id?: { open_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+export function mentionOpenId(m: { id?: { open_id?: string; app_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
   const id = m?.id;
   if (id == null) return undefined;
   if (typeof id === 'object') return id.open_id || undefined;
@@ -310,6 +310,7 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
           key: m.key,
           name: m.name,
           openId: mentionOpenId(m),
+          idType: m.id_type,
         }))
       : undefined;
 

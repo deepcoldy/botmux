@@ -765,7 +765,7 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
     warnedStringMentionShape = true;
     logger.warn(`[${larkAppId}] mention.id arrived in string form on the event path — Lark may have converged the WS event onto the REST shape. mentionOpenId() absorbs it, but verify group @-routing. (logged once per process)`);
   }
-  if (mentions.some((m: any) => mentionOpenId(m) === botOpenId)) {
+  if (mentions.some((m: any) => mentionMatchesBot(m, larkAppId, botOpenId))) {
     return true;
   }
 
@@ -829,6 +829,35 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
   } catch { /* ignore parse errors */ }
 
   return false;
+}
+
+function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
+  const openId = mentionOpenId(m);
+  if (botOpenId && openId === botOpenId) return true;
+
+  // Some Lark event payloads identify bot mentions by app_id:
+  //   { id_type: "app_id", id: "cli_xxx" }
+  // Treat that as an explicit mention of this daemon, but do not let app_id
+  // flow through mentionOpenId(), which is persisted and used as an open_id.
+  const appId = mentionAppId(m);
+  return Boolean(larkAppId && appId === larkAppId);
+}
+
+function mentionIdType(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.id_type === 'string') return m.id_type;
+  if (typeof m.idType === 'string') return m.idType;
+  return undefined;
+}
+
+function mentionAppId(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.appId === 'string') return m.appId;
+  if (typeof m.app_id === 'string') return m.app_id;
+  const idType = mentionIdType(m);
+  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
+  return undefined;
 }
 
 // ─── Permission gates ────────────────────────────────────────────────────

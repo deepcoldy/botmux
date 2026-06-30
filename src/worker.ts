@@ -42,6 +42,7 @@ import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/t
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
+import { drainPiTranscript, findPiTranscriptByPid, findPiTranscriptBySessionId } from './services/pi-transcript.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -1636,7 +1637,7 @@ function emitReadyTurns(): void {
           type: 'final_output',
           content: fields.content,
           lastUuid,
-          turnId: turn.turnId,
+          turnId: currentBotmuxTurnId ?? turn.turnId,
           kind: 'local-turn',
           userText: fields.userText,
         });
@@ -1649,13 +1650,13 @@ function emitReadyTurns(): void {
         type: 'final_output',
         content: headlessContent,
         lastUuid,
-        turnId: turn.turnId,
+        turnId: currentBotmuxTurnId ?? turn.turnId,
         kind: 'local-turn-headless',
       });
       continue;
     }
 
-    send({ type: 'final_output', content: assistantText, lastUuid, turnId: turn.turnId });
+    send({ type: 'final_output', content: assistantText, lastUuid, turnId: currentBotmuxTurnId ?? turn.turnId });
   }
 }
 
@@ -1685,7 +1686,7 @@ function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
   // when the model forgets to call `botmux send`.
   const id = lastInitConfig?.cliId;
-  if (id === 'codex' || id === 'traex' || id === 'coco' || id === 'hermes' || id === 'mtr') return true;
+  if (id === 'codex' || id === 'traex' || id === 'coco' || id === 'hermes' || id === 'mtr' || id === 'pi') return true;
   // Cursor only harvests its transcript in adopt mode: a botmux-spawned
   // cursor session carries the botmux skill and replies via `botmux send`,
   // and we never resolve a transcript path for it — so leave that flow
@@ -1708,6 +1709,10 @@ function structuredBridgeIsMtr(): boolean {
   return lastInitConfig?.cliId === 'mtr';
 }
 
+function structuredBridgeIsPi(): boolean {
+  return lastInitConfig?.cliId === 'pi';
+}
+
 function codexBridgeIsCursor(): boolean {
   return lastInitConfig?.cliId === 'cursor';
 }
@@ -1715,6 +1720,7 @@ function codexBridgeIsCursor(): boolean {
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
+  if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
   if (structuredBridgeIsHermes()) {
     const result = drainHermesStateDb(offset);
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
@@ -1799,11 +1805,14 @@ function codexBridgeStartTimer(): void {
         // sid, so the lookup is just a path computation + existence check.
         const isCoco = lastInitConfig?.cliId === 'coco';
         const isTraex = lastInitConfig?.cliId === 'traex';
+        const isPi = lastInitConfig?.cliId === 'pi';
         let path: string | undefined;
         if (codexBridgePendingSessionId) {
           if (isCoco) {
             path = cocoEventsPathForSession(codexBridgePendingSessionId);
             if (path && !existsSync(path)) path = undefined;
+          } else if (isPi) {
+            path = findPiTranscriptBySessionId(codexBridgePendingSessionId, lastInitConfig?.workingDir);
           } else if (isTraex) {
             path = findTraexRolloutBySessionId(codexBridgePendingSessionId);
           } else {
@@ -1814,6 +1823,9 @@ function codexBridgeStartTimer(): void {
           if (isCoco) {
             const probed = findCocoSessionByPid(codexAdoptPendingPid);
             if (probed && existsSync(probed.eventsPath)) path = probed.eventsPath;
+          } else if (isPi) {
+            const probed = findPiTranscriptByPid(codexAdoptPendingPid);
+            if (probed) path = probed.path;
           } else if (isTraex) {
             const probed = findTraexRolloutByPid(codexAdoptPendingPid);
             if (probed) path = probed.path;
@@ -2039,7 +2051,9 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   }
   const path = lastInitConfig?.cliId === 'traex'
     ? findTraexRolloutBySessionId(cliSessionId)
-    : findCodexRolloutBySessionId(cliSessionId);
+    : lastInitConfig?.cliId === 'pi'
+      ? findPiTranscriptBySessionId(cliSessionId, lastInitConfig?.workingDir)
+      : findCodexRolloutBySessionId(cliSessionId);
   if (path) {
     codexBridgePendingSessionId = undefined;
     codexBridgeAttach(path, 'fresh-empty');
@@ -2132,13 +2146,13 @@ function emitReadyCodexTurns(): void {
         type: 'final_output',
         content: fields.content,
         lastUuid: turn.turnId,
-        turnId: turn.turnId,
+        turnId: currentBotmuxTurnId ?? turn.turnId,
         kind: 'local-turn',
         userText: fields.userText,
       });
       continue;
     }
-    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: currentBotmuxTurnId ?? turn.turnId });
   }
 }
 
@@ -3658,19 +3672,36 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       codexAdoptPendingPid = cfg.adoptCliPid;
       codexBridgeStartTimer();
     }
+  } else if (cfg.cliId === 'pi') {
+    const adoptStartMs = Date.now();
+    codexAdoptStartMs = adoptStartMs;
+    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+    let path: string | undefined;
+    if (cfg.cliSessionId) path = findPiTranscriptBySessionId(cfg.cliSessionId, cfg.adoptCwd ?? cfg.workingDir);
+    if (!path && cfg.adoptCliPid) {
+      const probed = findPiTranscriptByPid(cfg.adoptCliPid);
+      if (probed) path = probed.path;
+    }
+    if (path) {
+      codexBridgeAttach(path, 'split-live');
+    } else {
+      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+      codexAdoptPendingPid = cfg.adoptCliPid;
+      codexBridgeStartTimer();
+    }
   }
 }
 
 function adoptIdleAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): CliAdapter {
   return cfg.bridgeJsonlPath
     ? createCliAdapterSync('claude-code', undefined)
-    : cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr'
+    : cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr' || cfg.cliId === 'pi'
       ? createCliAdapterSync(cfg.cliId, undefined)
       : ({ completionPattern: undefined, readyPattern: undefined } as CliAdapter);
 }
 
 function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (cfg.cliId === 'codex' || cfg.cliId === 'traex') {
+  if (cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'pi') {
     cliAdapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
   } else if (cfg.cliId === 'mtr') {
     cliAdapter = createCliAdapterSync('mtr', cfg.cliPathOverride);
@@ -4523,6 +4554,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     } else {
       codexBridgeStartTimer();
     }
+  } else if (cfg.cliId === 'pi') {
+    const piSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
+    if (piSessionId) {
+      const transcriptPath = findPiTranscriptBySessionId(piSessionId, cfg.workingDir);
+      if (transcriptPath) {
+        codexBridgeAttach(transcriptPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+      } else {
+        codexBridgePendingSessionId = piSessionId;
+        codexBridgeStartTimer();
+      }
+    } else {
+      codexBridgeStartTimer();
+    }
   }
 
   // Arm the ready-gate for FRESH Claude-family spawns (which inject the
@@ -5329,6 +5373,15 @@ process.on('message', async (raw: unknown) => {
           adoptMode: msg.adoptMode === true,
           passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
         });
+        if (msg.prompt && cliAdapter?.passesInitialPromptViaArgs && !deferInitialPrompt && codexBridgeFallbackActive()) {
+          // Args-baked first prompts (notably Pi) never pass through the normal
+          // 'message' IPC path, so the structured bridge would otherwise see the
+          // transcript final answer with no pending turn to attribute it to.
+          // Mark it here before the CLI starts processing; late-attach is fine
+          // because CodexBridgeQueue is path-agnostic until ingest discovers the
+          // transcript file.
+          codexBridgeMarkPendingTurn(msg.prompt, msg.turnId);
+        }
         if (msg.prompt && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }

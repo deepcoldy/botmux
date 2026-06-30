@@ -36,6 +36,22 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
+  it('allows wait-mode turn triggers without a chatId or sessionId', () => {
+    const req = request();
+    delete (req.target as any).chatId;
+    req.options = { waitForFinalOutput: true, timeoutMs: 120_000 };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(true);
+  });
+
+  it('rejects wait-mode timeout outside the bounded range', () => {
+    const req = request();
+    req.options = { waitForFinalOutput: true, timeoutMs: 999 };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
   it('builds a prompt that labels event data as untrusted', () => {
     const prompt = buildUntrustedEventPrompt(request(), 'trg_1');
     expect(prompt).toContain('untrusted event data');

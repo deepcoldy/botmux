@@ -1504,7 +1504,7 @@ function resolvesToHome(p: string): boolean {
   catch { return p === homedir(); }
 }
 
-export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
+export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: boolean | string = false): void {
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
@@ -1519,6 +1519,15 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
+
+  let resume = false;
+  let initTurnId: string | undefined;
+  if (typeof resumeOrTurnId === 'string') {
+    initTurnId = resumeOrTurnId;
+  } else {
+    resume = resumeOrTurnId;
+  }
+
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
   // home so a stale session workingDir can never take the daemon down.
@@ -1713,7 +1722,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    turnId: ds.currentReplyTarget?.turnId,
+    turnId: initTurnId ?? ds.currentReplyTarget?.turnId,
     skillPluginDir,
     skillReadonlyRoots,
   };
@@ -2500,6 +2509,26 @@ function deliverFinalOutput(
   t: string,
   attempt: number,
 ): void {
+  // Wait Mode / HTTP Sync Override:
+  // If this turn is being waited for by an HTTP webhook request, intercept the
+  // output, resolve the Promise immediately, and DO NOT send it to Lark.
+  const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+  if (waitPromise) {
+    waitPromise.resolve(msg.content);
+    ds.lastBridgeEmittedUuid = msg.lastUuid;
+    logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    return;
+  }
+
+  const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+  if (asyncResult) {
+    asyncResult.status = 'completed';
+    asyncResult.content = msg.content;
+    asyncResult.completedAt = Date.now();
+    ds.lastBridgeEmittedUuid = msg.lastUuid;
+    logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    return;
+  }
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const scopedReply = (content: string, msgType?: string, turnId?: string) =>
