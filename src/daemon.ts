@@ -2562,7 +2562,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // chat-granted users (who only pass canTalk) management commands like
       // /cd /restart /oncall bind. Previously this gate only fired in oncall chats,
       // which left a hole once per-chat grants flow through canTalk.
-      if (!canOperate(larkAppId, chatId, senderOpenId)) {
+      if (!canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -3089,6 +3089,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
   const cmdContent = stripLeadingMentions(content, parsed.mentions);
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+  // Tenant-stable union_id of the thread sender — lets canOperate recognise a
+  // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
+  // operate, parity with same-deployment siblings (option B). undefined for
+  // senders Lark didn't stamp a union_id on → no team-operate, falls back.
+  const threadSenderUnionId = data?.sender?.sender_id?.union_id as string | undefined;
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
@@ -3222,7 +3227,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       }
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
-      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId)) {
+      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadSenderUnionId)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }

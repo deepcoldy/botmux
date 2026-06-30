@@ -25,7 +25,7 @@ import { addMembership, listMemberships, removeMembership } from '../services/fe
 import type { FederatedBot } from '../services/federation-store.js';
 import { listFederatedDeployments } from '../services/federation-store.js';
 import { ensureDefaultTeam, DEFAULT_TEAM_ID, listTeams, createTeam, deleteTeam, getTeam } from '../services/team-store.js';
-import { listTeamGroups } from '../services/team-groups-store.js';
+import { listTeamGroups, recordTeamGroup } from '../services/team-groups-store.js';
 import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js';
 import { removeTeamFederation, removeDeployment } from '../services/federation-store.js';
 import { loadBotConfigs, registerBot, getBot, type BotConfig } from '../bot-registry.js';
@@ -203,11 +203,17 @@ export async function syncAllMemberships(
         body: JSON.stringify({ syncToken: m.syncToken, bots, ownerUnionId: me.ownerUnionId, ownerName: me.ownerName, name: me.name }),
       });
       if (r.ok) synced++; else failed++;
-      if (r.ok && sessionsProvider) {
+      if (r.ok) {
         try {
           const j = await r.json().catch(() => ({} as any));
           const groupChatIds: unknown[] = Array.isArray(j?.groupChatIds) ? j.groupChatIds : [];
-          if (groupChatIds.length) {
+          // Mirror this team's 拉群 groups onto THIS (member) deployment so its
+          // auth gate sees the same trust boundary as the hub — a teammate bot
+          // talking in one of these groups is then learned + trusted locally
+          // (see [[team-bots-store]] / isTeamGroupChat). Recorded regardless of
+          // sessionsProvider; the session-report below is the separate concern.
+          for (const cid of groupChatIds) recordTeamGroup(dataDir, m.teamId, String(cid));
+          if (groupChatIds.length && sessionsProvider) {
             const teamChats = new Set(groupChatIds.map(String));
             const sessions = sessionsProvider()
               .filter(s => teamChats.has(String(s.chatId)))

@@ -33,3 +33,15 @@ export function recordTeamGroup(dataDir: string, teamId: string, chatId: string,
   all.push({ teamId, chatId, createdAt: now });
   atomicWriteFileSync(filePath(dataDir), JSON.stringify(all, null, 2) + '\n');
 }
+
+/** Is `chatId` a team-assembled (拉群) group of ANY team? This is the TRUST ROOT
+ *  for team-bot collaboration: such a group is built by the team (bots added by
+ *  larkAppId from the federated roster), so a bot speaking there is a vouched
+ *  teammate (see [[team-bots-store]]). Recorded on the orchestrating deployment
+ *  by recordTeamGroup, and mirrored onto member deployments when the hub returns
+ *  groupChatIds on federation sync — so every member's auth gate sees the same
+ *  trust boundary. */
+export function isTeamGroupChat(dataDir: string, chatId: string | undefined): boolean {
+  if (!chatId) return false;
+  return listTeamGroups(dataDir).some(b => b.chatId === chatId);
+}
