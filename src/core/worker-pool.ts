@@ -193,31 +193,31 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string },
-  resume: boolean,
 ): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } {
-  if (!resume) {
-    let changed = false;
-    if (!ds.session.cliId) {
-      ds.session.cliId = botCfg.cliId;
-      changed = true;
-    }
-    if (ds.session.cliPathOverride === undefined && botCfg.cliPathOverride !== undefined) {
-      ds.session.cliPathOverride = botCfg.cliPathOverride;
-      changed = true;
-    }
-    if (ds.session.wrapperCli === undefined && botCfg.wrapperCli !== undefined) {
-      ds.session.wrapperCli = botCfg.wrapperCli;
-      changed = true;
-    }
-    if (ds.session.model === undefined && botCfg.model !== undefined) {
-      ds.session.model = botCfg.model;
-      changed = true;
-    }
-    if (changed) sessionStore.updateSession(ds.session);
+  // Freeze the agent launch config (cli / cliPath / wrapper / model) onto the
+  // session the first time a worker forks, so later bot-level edits never
+  // retroactively change a live session — same discipline as `sandbox`.
+  //
+  // Gated on `agentFrozen`, NOT on `resume`: a session created before these
+  // fields existed has `cliId` stamped historically but no frozen wrapper/model,
+  // yet it was launching off the live bot config — so its first post-upgrade
+  // resume must back-fill the still-missing fields from botCfg to keep launching
+  // identically (e.g. a `ttadk codex` wrapper bot must not silently drop to bare
+  // `codex`, losing its gateway). `??` preserves whatever is already frozen and
+  // only fills the gaps; the marker disambiguates "legacy, never frozen" from
+  // "frozen as no-wrapper", so a genuinely wrapper-less session never inherits a
+  // wrapper the bot gains later.
+  if (!ds.session.agentFrozen) {
+    ds.session.cliId = ds.session.cliId ?? botCfg.cliId;
+    ds.session.cliPathOverride = ds.session.cliPathOverride ?? botCfg.cliPathOverride;
+    ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
+    ds.session.model = ds.session.model ?? botCfg.model;
+    ds.session.agentFrozen = true;
+    sessionStore.updateSession(ds.session);
   }
   return {
     cliId: ds.session.cliId ?? botCfg.cliId,
-    cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
     model: ds.session.model,
   };
@@ -1628,7 +1628,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
   if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
 
-  const agentCfg = sessionAgentConfig(ds, botCfg, resume);
+  const agentCfg = sessionAgentConfig(ds, botCfg);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.

@@ -300,11 +300,14 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
-  it('resumes with the session recorded cli wrapper and model even after bot config changes', () => {
+  it('resumes a frozen session with its recorded cli/wrapper/model, ignoring bot config changes', () => {
     const ds = makeDs();
+    // A session that was already frozen on a prior spawn: bot config has since
+    // been switched (codex/ttadk/glm-5.1), but the frozen session must not budge.
     ds.session.cliId = 'claude-code' as any;
     ds.session.wrapperCli = 'aiden x claude';
     ds.session.model = 'opus';
+    ds.session.agentFrozen = true;
 
     forkWorker(ds, '', true);
 
@@ -314,6 +317,29 @@ describe('forkWorker session agent config freeze', () => {
       cliId: 'claude-code',
       wrapperCli: 'aiden x claude',
       model: 'opus',
+      resume: true,
+    }));
+  });
+
+  it('back-fills wrapper/model from bot config on the first resume of a legacy (pre-freeze) session', () => {
+    // Created before agentFrozen/wrapperCli/model existed: cliId was stamped
+    // historically, but wrapper/model are absent and it has no freeze marker.
+    // The bot launches via a `ttadk codex` wrapper — the first post-upgrade resume
+    // must restore that wrapper, not silently relaunch as bare `codex`.
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;
+
+    forkWorker(ds, '', true);
+
+    expect(ds.session.wrapperCli).toBe('ttadk codex');
+    expect(ds.session.model).toBe('glm-5.1');
+    expect(ds.session.agentFrozen).toBe(true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      wrapperCli: 'ttadk codex',
+      model: 'glm-5.1',
       resume: true,
     }));
   });

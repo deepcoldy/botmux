@@ -130,6 +130,16 @@ export interface Session {
   /** Optional model frozen at creation so historical sessions resume with their original model. */
   model?: string;
   /**
+   * True once `cliId`/`cliPathOverride`/`wrapperCli`/`model` have been frozen for
+   * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
+   * exactly once — on a fresh start, or on the first resume of a session created
+   * before these fields existed (back-filling the still-missing ones from the live
+   * bot config). The marker disambiguates "legacy, never frozen" from "frozen as
+   * no-wrapper", so a genuinely wrapper-less session never inherits a wrapper the
+   * bot gains later.
+   */
+  agentFrozen?: boolean;
+  /**
    * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
    * sandbox status is frozen here at creation so a restore/restart never
