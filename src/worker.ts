@@ -1637,7 +1637,7 @@ function emitReadyTurns(): void {
           type: 'final_output',
           content: fields.content,
           lastUuid,
-          turnId: currentBotmuxTurnId ?? turn.turnId,
+          turnId: turn.turnId,
           kind: 'local-turn',
           userText: fields.userText,
         });
@@ -1650,13 +1650,13 @@ function emitReadyTurns(): void {
         type: 'final_output',
         content: headlessContent,
         lastUuid,
-        turnId: currentBotmuxTurnId ?? turn.turnId,
+        turnId: turn.turnId,
         kind: 'local-turn-headless',
       });
       continue;
     }
 
-    send({ type: 'final_output', content: assistantText, lastUuid, turnId: currentBotmuxTurnId ?? turn.turnId });
+    send({ type: 'final_output', content: assistantText, lastUuid, turnId: turn.turnId });
   }
 }
 
@@ -2146,13 +2146,13 @@ function emitReadyCodexTurns(): void {
         type: 'final_output',
         content: fields.content,
         lastUuid: turn.turnId,
-        turnId: currentBotmuxTurnId ?? turn.turnId,
+        turnId: turn.turnId,
         kind: 'local-turn',
         userText: fields.userText,
       });
       continue;
     }
-    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: currentBotmuxTurnId ?? turn.turnId });
+    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
   }
 }
 
