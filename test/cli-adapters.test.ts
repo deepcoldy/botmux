@@ -558,21 +558,26 @@ describe('cursor buildArgs', () => {
 describe('genius buildArgs', () => {
   const adapter = createGeniusAdapter('/usr/bin/genius');
 
-  it('fresh session passes --session-id and default permission mode', () => {
+  it('fresh session passes --session-id and bypasses routine approvals', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-genius', resume: false });
     expect(args).toContain('--session-id');
     expect(args).toContain('sess-genius');
-    expect(args).toContain('--permission-mode');
-    expect(args).toContain('default');
+    expect(args).toContain('--dangerously-skip-permissions');
+    const settings = JSON.parse(args[args.indexOf('--settings') + 1]);
+    expect(settings.skipDangerousModePermissionPrompt).toBe(true);
+    expect(settings.permissions.defaultMode).toBe('bypassPermissions');
     expect(args).not.toContain('--resume');
   });
 
-  it('pre-authorizes botmux send without bypassing all Genius permissions', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-genius', resume: false });
+  it('pre-authorizes botmux send when CLI bypass is disabled', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-genius', resume: false, disableCliBypass: true });
+    expect(args).toContain('--permission-mode');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('default');
     expect(args).toContain('--allowedTools');
     expect(args[args.indexOf('--allowedTools') + 1]).toBe('Bash(botmux send:*)');
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).not.toContain('--allow-dangerously-skip-permissions');
+    expect(args).not.toContain('--settings');
   });
 
   it('resume session passes --resume', () => {

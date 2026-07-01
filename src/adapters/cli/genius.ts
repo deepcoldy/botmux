@@ -100,12 +100,22 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       if (model && model.trim()) args.push('--model', model.trim());
-      // Mirror the project's safer default for new adapters: leave Genius in its
-      // normal permission model, but pre-authorize the one bridge command the
-      // model must use to reply into Feishu. This avoids a human approval prompt
-      // for `botmux send ...` without granting broad `botmux:*` or shell access.
-      args.push('--permission-mode', 'default');
-      args.push('--allowedTools', GENIUS_BOTMUX_SEND_TOOL);
+      if (!disableCliBypass) {
+        // Genius is Claude-family: use the same approval-bypass posture as
+        // Claude Code so routine `botmux send` replies do not block on terminal
+        // confirmation, including shell-risk prompts such as backticks inside
+        // the message text.
+        args.push('--dangerously-skip-permissions');
+        args.push('--settings', JSON.stringify({
+          skipDangerousModePermissionPrompt: true,
+          permissions: { defaultMode: 'bypassPermissions' },
+        }));
+      } else {
+        // Hardened mode keeps normal approvals but still pre-authorizes the one
+        // bridge command the model needs to reply into Feishu.
+        args.push('--permission-mode', 'default');
+        args.push('--allowedTools', GENIUS_BOTMUX_SEND_TOOL);
+      }
       args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       return args;
