@@ -392,6 +392,47 @@ describe('GET /api/events', () => {
       workerPool.setActiveSessionsRegistry(new Map());
     }
   });
+
+  it('replays this-run closed sessions as session.spawned (zombie-close visibility)', async () => {
+    // A restore-time zombie is registered, announced, then immediately
+    // closeSession()'d (evicted from the active Map) — all before a racing
+    // dashboard's SSE subscription exists. By connect time it's gone from the Map,
+    // so the active-only replay can't surface it. The closed-since-process-start
+    // replay must still deliver it as a closed row so the dashboard doesn't lose
+    // it (or keep a stale active entry).
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-sse-closed-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
+
+      const session = sessionStore.createSession('oc_zombie', 'om_zombie', 'zombie topic', 'group');
+      session.larkAppId = '';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId); // closedAt = now ≥ PROCESS_START_MS
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const ev = await readSseEvent(
+        `http://127.0.0.1:${handle.port}/api/events`,
+        e => e.type === 'session.spawned' && e.body?.session?.sessionId === session.sessionId,
+      );
+      expect(ev).not.toBeNull();
+      expect(ev!.body.session.status).toBe('closed');
+      expect(typeof ev!.body.session.closedAt).toBe('number');
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/sessions/:sessionId/write-link', () => {
