@@ -918,6 +918,70 @@ describe('claude-code writeInput submission confirmation', () => {
   });
 });
 
+describe('genius writeInput submission confirmation', () => {
+  function makeGeniusJsonlForSession(sessionId: string, cwd: string): string {
+    const projectHash = cwd.replace(/[^A-Za-z0-9-]/g, '-');
+    const projectDir = join(homedir(), '.genius', 'projects', projectHash);
+    mkdirSync(projectDir, { recursive: true });
+    const path = join(projectDir, `${sessionId}.jsonl`);
+    writeFileSync(path, '');
+    return path;
+  }
+
+  it('accepts queue-operation enqueue as a confirmed type-ahead submit', async () => {
+    const cwd = '/tmp/genius-queue-submit';
+    const sessionId = 'genius-queue-session';
+    const transcriptPath = makeGeniusJsonlForSession(sessionId, cwd);
+    const adapter = createGeniusAdapter('/bin/genius');
+    const pty: PtyHandle = {
+      claudeJsonlPath: transcriptPath,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendFileSync(
+          transcriptPath,
+          JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'queued while busy' }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'queued while busy');
+
+    expect(result).toBeUndefined();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not confirm a queue-operation enqueue for different content', async () => {
+    const cwd = '/tmp/genius-queue-mismatch';
+    const sessionId = 'genius-queue-mismatch-session';
+    const transcriptPath = makeGeniusJsonlForSession(sessionId, cwd);
+    const adapter = createGeniusAdapter('/bin/genius');
+    let appended = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: transcriptPath,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || appended) return;
+        appended = true;
+        appendFileSync(
+          transcriptPath,
+          JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'another prompt' }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'queued while busy');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect((result as any).recheck()).toBe(false);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+  });
+});
+
 describe('codex writeInput submission confirmation', () => {
   it('buildArgs resumes with the persisted Codex thread id', () => {
     resetCodexHistory();

@@ -48,8 +48,17 @@ function deltaHasUserEvent(path: string, fromByte: number, expectedText: string)
     if (!line.trim()) continue;
     try {
       const parsed = JSON.parse(line);
-      if (parsed?.type !== 'user') continue;
-      if (typeof parsed?.message?.content === 'string' && parsed.message.content === expectedText) return true;
+      if (parsed?.type === 'user'
+        && typeof parsed?.message?.content === 'string'
+        && parsed.message.content === expectedText) {
+        return true;
+      }
+      if (parsed?.type === 'queue-operation'
+        && parsed?.operation === 'enqueue'
+        && typeof parsed?.content === 'string'
+        && parsed.content === expectedText) {
+        return true;
+      }
     } catch {
       // Ignore partial / malformed trailing lines; a later poll sees the completed record.
     }
