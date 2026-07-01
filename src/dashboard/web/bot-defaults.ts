@@ -5,6 +5,7 @@
 // once stay user-controlled.
 import { store } from './store.js';
 import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
+import type { PageDisposer } from './react-mount.js';
 
 let cache: { bots: any[] } = { bots: [] };
 let loadError: string | null = null;
@@ -127,26 +128,6 @@ export function renderBotAgentSection(b: any, sessionFallback: string): string {
     </section>`;
 }
 
-function pageHtml(): string {
-  return `<section class="page">
-<div class="page-heading">
-  <div>
-    <p class="eyebrow">${t('nav.botDefaults')}</p>
-    <h1>${t('botDefaults.title')}</h1>
-    <p>${t('botDefaults.subtitle')}</p>
-  </div>
-</div>
-<form id="bd-filters" class="filters sessions-filters">
-  <input type="search" name="q" placeholder="${t('botDefaults.search')}" />
-  <button type="button" id="bd-refresh">${t('botDefaults.refresh')}</button>
-</form>
-<div class="bd-layout">
-  <aside id="bd-roster" class="bd-roster"></aside>
-  <div id="bd-list" class="bd-detail"></div>
-</div>
-</section>`;
-}
-
 async function loadBots(): Promise<void> {
   try {
     const r = await fetch('/api/bots');
@@ -182,35 +163,45 @@ function fmtSince(since: number): string {
   return d.toLocaleString();
 }
 
-export async function renderBotDefaultsPage(root: HTMLElement) {
-  root.innerHTML = pageHtml();
+export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
   const listEl = root.querySelector<HTMLElement>('#bd-list')!;
   const rosterEl = root.querySelector<HTMLElement>('#bd-roster')!;
   const form = root.querySelector<HTMLFormElement>('#bd-filters')!;
   const refreshBtn = root.querySelector<HTMLButtonElement>('#bd-refresh')!;
+  let disposed = false;
+  let readyToRender = false;
 
   refreshBtn.onclick = async () => {
     refreshBtn.disabled = true;
     try {
       botProfileRoleCache.clear();
       await Promise.all([loadBots(), loadCliOptions()]);
-      rerender();
-    } finally { refreshBtn.disabled = false; }
+      safeRerender();
+    } finally {
+      if (!disposed) refreshBtn.disabled = false;
+    }
   };
 
   // 帮助文字默认折叠成一行；点说明文字本身展开/收起（preventDefault 拦掉
   // label 默认行为，避免一点说明就把开关也切了）。只绑一次，委托不随 rerender 重建。
-  listEl.addEventListener('click', e => {
+  const listClickHandler = (e: MouseEvent) => {
     const sm = (e.target as HTMLElement).closest<HTMLElement>('.toggle-tx small, small.bd-help');
     if (sm) {
       e.preventDefault();
       sm.classList.toggle('open');
     }
-  });
+  };
+  listEl.addEventListener('click', listClickHandler);
 
   // /api/bots 要逐 daemon 探活，慢——先亮 loading 占住右侧详情区。
   listEl.innerHTML = loadingHtml();
-  await Promise.all([loadBots(), loadCliOptions()]);
+  void (async () => {
+    await Promise.all([loadBots(), loadCliOptions()]);
+    readyToRender = true;
+    safeRerender();
+    await loadNameMaps(); // 头像表就绪后重绘，让 /api/bots 这边也出真实头像
+    safeRerender();
+  })();
 
   function rerender() {
     const f = new FormData(form);
@@ -238,7 +229,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     rosterEl.querySelectorAll<HTMLElement>('.bd-roster-item').forEach(el => {
       el.onclick = () => {
         selectedAppId = el.dataset.appid!;
-        rerender();
+        safeRerender();
       };
     });
     const sel = filtered.find((b: any) => b.larkAppId === selectedAppId)!;
@@ -1681,7 +1672,18 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     });
   }
 
-  rerender();
-  void loadNameMaps().then(rerender); // 头像表就绪后重绘，让 /api/bots 这边也出真实头像
-  form.addEventListener('input', rerender);
+  function safeRerender() {
+    if (!disposed && readyToRender) rerender();
+  }
+
+  form.addEventListener('input', safeRerender);
+
+  return () => {
+    disposed = true;
+    refreshBtn.onclick = null;
+    form.removeEventListener('input', safeRerender);
+    listEl.removeEventListener('click', listClickHandler);
+    rosterEl.replaceChildren();
+    listEl.replaceChildren();
+  };
 }

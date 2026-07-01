@@ -523,8 +523,12 @@ function renderCreateSessionSuccess(modal: HTMLDialogElement, body: any): void {
   modal.querySelector<HTMLButtonElement>('#cs-done')!.onclick = () => modal.close();
 }
 
-export function renderSessionsPage(root: HTMLElement) {
+export function renderSessionsPage(root: HTMLElement): () => void {
   root.innerHTML = pageHtml();
+  return wireSessionsPage(root);
+}
+
+export function wireSessionsPage(root: HTMLElement): () => void {
   const tbody = root.querySelector<HTMLElement>('#sessions-table tbody')!;
   const filtersForm = root.querySelector<HTMLFormElement>('#filters')!;
   const drawer = root.querySelector<HTMLDialogElement>('#drawer')!;
@@ -2480,7 +2484,7 @@ export function renderSessionsPage(root: HTMLElement) {
   });
 
   filtersForm.addEventListener('input', rerender);
-  store.on(rerender);
+  const unsubscribeStore = store.on(rerender);
   // 团队看板 30s 软刷新（拉对方部署的会话快照与共享编排）；页面切走后
   // kanban 脱离 DOM，定时器自清。
   const teamBoardTimer = setInterval(() => {
@@ -2496,4 +2500,13 @@ export function renderSessionsPage(root: HTMLElement) {
   rerender();
   // bot 友好名 / 群聊标题异步解析，回来后补一次重绘（首帧先显示原值）
   void loadNameMaps().then(rerender);
+  return () => {
+    unsubscribeStore();
+    clearInterval(teamBoardTimer);
+    cancelKanbanOpen();
+    drawer.close();
+    termModal.close();
+    historyModal.close();
+    createSessionModal.close();
+  };
 }

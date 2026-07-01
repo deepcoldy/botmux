@@ -21,7 +21,7 @@ export function __setGroupsSnapshotForTest(snapshot: { chats: any[]; bots: any[]
   groupsSnapshot = snapshot;
 }
 
-async function loadGroupsSnapshot(): Promise<void> {
+export async function loadGroupsSnapshot(): Promise<void> {
   try {
     const r = await fetch('/api/groups');
     if (!r.ok) return;
@@ -31,7 +31,7 @@ async function loadGroupsSnapshot(): Promise<void> {
   }
 }
 
-type BotCard = {
+export type BotCard = {
   botName: string;
   larkAppId?: string;
   botAvatarUrl?: string;

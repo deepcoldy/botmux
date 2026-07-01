@@ -773,6 +773,12 @@ th {
 
 tbody tr:last-child td { border-bottom: 0; }
 
+.schedules-table .schedule-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 /* ── 首尾列固定的横向滚动矩阵（群组与 Bot）─────────────────────────────
    bot 一多中间的成员列就溢出视口，操作按钮被顶出屏幕。把圆角/阴影挪到
    滚动容器上，表格本体放开宽度横向滚，首列（群）和尾列（操作）sticky 钉住。 */
@@ -2111,6 +2117,9 @@ fieldset legend {
 }
 
 .bulk-bar[hidden] { display: none; }
+/* Mobile table rules are author-level and can override the UA hidden style;
+   keep hidden tables invisible across view toggles such as sessions board/table. */
+table[hidden] { display: none !important; }
 .bulk-bar #bulk-count { font-weight: 800; margin-right: 4px; }
 .idle-cleanup-bar {
   display: grid;
@@ -2600,6 +2609,66 @@ input.row-select,
   table {
     display: block;
     overflow-x: auto;
+  }
+  .schedules-table {
+    display: block;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  .schedules-table thead {
+    display: none;
+  }
+  .schedules-table tbody {
+    display: grid;
+    gap: 10px;
+  }
+  .schedules-table tr {
+    display: grid;
+    gap: 8px;
+    padding: 14px;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+  .schedules-table td {
+    display: grid;
+    grid-template-columns: minmax(84px, 0.36fr) minmax(0, 1fr);
+    gap: 10px;
+    align-items: baseline;
+    min-width: 0;
+    padding: 0;
+    border-bottom: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .schedules-table td[data-label]::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1.35;
+    text-transform: uppercase;
+  }
+  .schedules-table td.actions-cell {
+    grid-template-columns: 1fr;
+  }
+  .schedules-table .schedule-actions {
+    gap: 8px;
+  }
+  .schedules-table .schedule-actions button {
+    flex: 1 1 120px;
+  }
+  .schedules-table tr.schedule-empty-row {
+    padding: 0;
+  }
+  .schedules-table tr.schedule-empty-row td {
+    display: block;
+    padding: 18px;
+    text-align: center;
   }
 }
 
@@ -4388,6 +4457,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 }
 
 .skills-install-grid label:first-child,
+.skills-install-grid .skills-source-label,
 .skills-install-field-wide,
 .skills-install-note {
   grid-column: 1 / -1;
@@ -4408,7 +4478,8 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   font-weight: 700;
 }
 
-.skills-install-grid label {
+.skills-install-grid label,
+.skills-install-grid .skills-source-label {
   display: grid;
   gap: 5px;
   color: var(--muted);

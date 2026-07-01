@@ -370,7 +370,7 @@ const INSIGHT_TABS: Array<{ key: InsightTab; label: string }> = [
   { key: 'dist', label: 'insights.tabDist' },
   { key: 'hot', label: 'insights.tabHot' },
 ];
-function renderTabBar(active: InsightTab): string {
+export function renderTabBar(active: InsightTab): string {
   return `<div class="insight-tabs" role="tablist">${INSIGHT_TABS.map(tb =>
     `<button type="button" class="itab${tb.key === active ? ' on' : ''}" data-itab="${tb.key}" role="tab" aria-selected="${tb.key === active}">${escapeHtml(t(tb.label))}</button>`,
   ).join('')}</div>`;
@@ -386,7 +386,7 @@ function projectOptions(records: InsightRecord[]): Array<{ id: string; count: nu
   for (const rec of records) { const p = projectOf(rec); if (p) m.set(p, (m.get(p) ?? 0) + 1); }
   return [...m.entries()].map(([id, count]) => ({ id, count })).sort((a, b) => b.count - a.count || a.id.localeCompare(b.id));
 }
-const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> = [
+export const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> = [
   { key: 'all', label: 'insights.timeAll', days: 0 },
   { key: '1d', label: 'insights.time1d', days: 1 },
   { key: '7d', label: 'insights.time7d', days: 7 },
@@ -979,7 +979,7 @@ function renderEvidence(report: SafeInsightReport, focus: { rec: DiagnosticRecom
   return `<div class="evidence">${work}${reason}<div class="spanfilter">${chips}</div><div class="spantable">${rows}</div></div>`;
 }
 
-function renderDetailShell(rec: InsightRecord | undefined): string {
+export function renderDetailShell(rec: InsightRecord | undefined): string {
   if (!rec) return `<section class="insight-detail"><p class="mut">${escapeHtml(t('insights.selectSession'))}</p></section>`;
   const s = rec.session;
   return `<section class="insight-detail">
@@ -1525,7 +1525,7 @@ async function fetchDetail(sessionId: string): Promise<SafeInsightReport | null>
 // URL state (deep-link + refresh-stable): the insights view state lives in the hash
 // query after #/insights (e.g. #/insights?tab=dist&project=botmux&sess=<id>). Written
 // via history.replaceState (no router re-run), read back on (re)mount.
-function parseInsightsHash(): Record<string, string> {
+export function parseInsightsHash(): Record<string, string> {
   const h = typeof location !== 'undefined' ? (location.hash || '') : '';
   const qi = h.indexOf('?');
   if (qi < 0) return {};
@@ -1543,7 +1543,12 @@ const INSIGHT_FILTERS: InsightFilter[] = ['all', 'review', 'failed', 'slow'];
 const INSIGHT_TAB_KEYS: InsightTab[] = ['overview', 'sessions', 'flow', 'dist', 'hot'];
 const SESS_SORT_KEYS: SessSort[] = ['recent', 'review', 'spans', 'fails', 'slow', 'agent'];
 
-export function renderInsightsPage(root: HTMLElement): () => void {
+export function initialInsightTab(): InsightTab {
+  const hp = parseInsightsHash();
+  return INSIGHT_TAB_KEYS.includes(hp.tab as InsightTab) ? hp.tab as InsightTab : 'overview';
+}
+
+export function wireInsightsPage(root: HTMLElement): () => void {
   const hp = parseInsightsHash();
   let overviewData: SafeInsightOverview | null = null;
   let records: InsightRecord[] = [];
@@ -1579,59 +1584,6 @@ export function renderInsightsPage(root: HTMLElement): () => void {
   let paletteOpen = false;
   let paletteQ = '';
   let paletteIdx = 0;
-
-  root.innerHTML = `
-    <section class="page insights-page">
-      <div class="page-heading">
-        <div>
-          <p class="eyebrow">${escapeHtml(t('nav.insights'))}</p>
-          <h1>${escapeHtml(t('insights.title'))}</h1>
-          <p>${escapeHtml(t('insights.subtitle'))}</p>
-        </div>
-        <div class="insight-head-acts">
-          <button type="button" id="insight-palette-open" class="ins-clear">${escapeHtml(t('insights.paletteOpen'))}</button>
-          <button type="button" id="insight-refresh" class="primary">${escapeHtml(t('insights.refresh'))}</button>
-        </div>
-      </div>
-      <form id="insight-filters" class="filters insights-filters">
-        <input type="search" name="q" placeholder="${escapeHtml(t('insights.search'))}">
-        <select id="insight-project" class="ins-select" aria-label="${escapeHtml(t('insights.projectAll'))}"></select>
-        <select id="insight-time" class="ins-select" aria-label="${escapeHtml(t('insights.timeAll'))}">
-          ${TIME_WINDOWS.map(w => `<option value="${w.key}">${escapeHtml(t(w.label))}</option>`).join('')}
-        </select>
-        <div class="segmented" role="group" aria-label="${escapeHtml(t('insights.filter'))}">
-          <button type="button" data-filter="all">${escapeHtml(t('insights.filterAll'))}</button>
-          <button type="button" data-filter="review">${escapeHtml(t('insights.filterReview'))}</button>
-          <button type="button" data-filter="failed">${escapeHtml(t('insights.filterFailed'))}</button>
-          <button type="button" data-filter="slow">${escapeHtml(t('insights.filterSlow'))}</button>
-        </div>
-        <div id="insight-cli-filter" class="spanfilter cli-filter" role="group" aria-label="${escapeHtml(t('insights.filter'))}"></div>
-        <label class="ins-toggle"><input type="checkbox" id="insight-noise"> ${escapeHtml(t('insights.showAll'))}</label>
-        <button type="button" id="insight-clear" class="ins-clear">${escapeHtml(t('insights.clear'))}</button>
-      </form>
-      <div id="insight-tabbar">${renderTabBar(tab)}</div>
-      <div id="insight-status" class="insight-page-status"></div>
-      <div class="insight-panel" role="tabpanel" data-tabpanel="overview"><div id="insight-overview"></div></div>
-      <div class="insight-panel" role="tabpanel" data-tabpanel="sessions" hidden>
-        <div id="insight-list-view">
-          <div class="insight-list-head">
-            <span id="insight-list-subtitle"></span>
-            <div class="sesssort" id="insight-sort"></div>
-          </div>
-          <div id="insight-list"></div>
-        </div>
-        <div id="insight-detail-view" hidden>
-          <button type="button" id="insight-back" class="ins-back">← ${escapeHtml(t('insights.backToList'))}</button>
-          <div id="insight-detail">${renderDetailShell(undefined)}</div>
-        </div>
-      </div>
-      <div class="insight-panel" role="tabpanel" data-tabpanel="flow" hidden><div id="insight-flow"></div></div>
-      <div class="insight-panel" role="tabpanel" data-tabpanel="dist" hidden><div id="insight-dist"></div></div>
-      <div class="insight-panel" role="tabpanel" data-tabpanel="hot" hidden><div id="insight-hot"></div></div>
-      <div id="insight-modal" class="insight-modal" hidden></div>
-      <div id="insight-palette" class="insight-palette" hidden></div>
-      <div id="insight-tip" class="ins-tip" role="tooltip" hidden></div>
-    </section>`;
 
   const status = root.querySelector<HTMLElement>('#insight-status')!;
   const overviewEl = root.querySelector<HTMLElement>('#insight-overview')!;
@@ -1842,6 +1794,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     const sid = selectedId;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/insight?${params.toString()}`, { cache: 'no-store' });
+      if (disposed || sid !== selectedId) return;
       const d = await r.json().catch(() => ({}));
       if (disposed || sid !== selectedId) return;
       const c = d?.conversation;
@@ -1852,6 +1805,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
         convo.nextOffset = c.nextOffset ?? (convo.nextOffset + (c.messages?.length ?? 0));
       }
     } catch { /* leave what we have */ }
+    if (disposed || sid !== selectedId) return;
     convo.loading = false;
     if (detailTab === 'convo') paintDetailBody();
   }
@@ -1880,11 +1834,12 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     paintModal();
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/insight/turn/${turnIndex}?offset=0&limit=40000`, { cache: 'no-store' });
+      if (req !== modalReq || disposed || sid !== selectedId) return;
       const d = await r.json().catch(() => ({}));
-      if (req !== modalReq || disposed) return;
+      if (req !== modalReq || disposed || sid !== selectedId) return;
       modalPrompt = (d?.turn?.prompt as TurnPromptPreview) ?? { text: '', truncated: false };
     } catch {
-      if (req !== modalReq) return;
+      if (req !== modalReq || disposed || sid !== selectedId) return;
       modalPrompt = { text: t('insights.unavailable'), truncated: false };
     }
     paintModal();
@@ -2044,12 +1999,12 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     if (!body) return;
     try {
       const report = await fetchDetail(sessionId);
-      if (!disposed && report) {
+      if (!disposed && selectedId === sessionId && report) {
         detailReport = report;
         paintDetailBody();
       }
     } catch (e) {
-      if (!disposed) body.innerHTML = `<p class="mut">${escapeHtml(String(e))}</p>`;
+      if (!disposed && selectedId === sessionId) body.innerHTML = `<p class="mut">${escapeHtml(String(e))}</p>`;
     }
   }
 
@@ -2058,7 +2013,9 @@ export function renderInsightsPage(root: HTMLElement): () => void {
     status.textContent = t('insights.loading');
     try {
       const r = await fetch('/api/insights/summary?limit=200', { cache: 'no-store' });
+      if (disposed) return;
       const d = await r.json().catch(() => ({}));
+      if (disposed) return;
       if (!r.ok || d?.ok === false || !d.overview) {
         overviewData = null;
         records = [];
@@ -2069,6 +2026,7 @@ export function renderInsightsPage(root: HTMLElement): () => void {
         status.textContent = t('insights.loaded', { count: overviewData.meta.analyzedSessions });
       }
     } catch (e) {
+      if (disposed) return;
       overviewData = null;
       records = [];
       status.textContent = `${t('insights.unavailable')}: ${String(e)}`;

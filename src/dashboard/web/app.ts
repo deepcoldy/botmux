@@ -1,25 +1,16 @@
 // Dashboard SPA entry: hash router + bootstrap + online indicator.
 import { bootstrap, store } from './store.js';
-import { renderOverviewPage } from './overview.js';
-import { renderSessionsPage } from './sessions.js';
-import { renderSchedulesPage } from './schedules.js';
-import { renderGroupsPage } from './groups.js';
-import { renderBotDefaultsPage } from './bot-defaults.js';
-import { renderSkillsPage } from './skills.js';
-import { renderRoleProfilesPage, renderRolesPage } from './roles.js';
-import { renderTeamFederationPage, renderTeamManagePage } from './team-federation.js';
-import { renderConnectorsPage } from './connectors.js';
-import { renderSettingsPage } from './settings.js';
-import { renderV3RunsPage } from './v3.js';
-import { renderWorkflowsPage } from './workflows.js';
-import { renderOfficePage } from './office.js';
-import { renderWhiteboardsPage } from './whiteboards.js';
-import { renderInsightsPage } from './insights.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
 import { normalizeDashboardLocale, type DashboardLocale } from './i18n.js';
 import { readStoredSidebarMode, writeStoredSidebarMode, type SidebarMode } from './preferences.js';
+import { findDashboardRoute, loadOverviewPage } from './dashboard-routes.js';
+import {
+  beginDashboardRoute,
+  createDashboardRouteState,
+  loadAndRenderDashboardRoute,
+} from './route-lifecycle.js';
 
 const root = document.getElementById('root')!;
 
@@ -235,7 +226,7 @@ function renderAuthRequiredPage(host: HTMLElement): void {
 
 // Pages that own a polling loop / cleanup return a disposer; we run it
 // on the next route switch so timers don't leak across navigations.
-let pageDispose: (() => void) | null = null;
+const routeState = createDashboardRouteState();
 
 function highlightNav(hash: string): void {
   for (const a of document.querySelectorAll<HTMLAnchorElement>('.sidebar-nav a')) {
@@ -248,8 +239,8 @@ function highlightNav(hash: string): void {
   }
 }
 
-function route() {
-  if (pageDispose) { pageDispose(); pageDispose = null; }
+async function route() {
+  const seq = beginDashboardRoute(routeState);
   const hash = location.hash || '#/';
 
   // Read-only hard-guard: a tokenless visitor hitting a management route gets a
@@ -257,6 +248,7 @@ function route() {
   // stuck "link expired" overlay).
   if (!isAuthed && MANAGE_ROUTES.some(r => hash.startsWith('#/' + r))) {
     renderAuthRequiredPage(root);
+    routeState.rerenderOnUiChange = true;
     highlightNav(hash);
     return;
   }
@@ -266,9 +258,7 @@ function route() {
   // upkeep so old bookmarks/pasted links don't 404:
   //   - `#/v3[/<id>]`                                 → `#/workflows[/<id>]` (v3 promoted)
   //   - `#/workflows/catalog`, `#/workflows-catalog`  → `#/workflows` (v2 catalog gone)
-  if (hash.startsWith('#/legacy-workflow')) {
-    pageDispose = renderWorkflowsPage(root);
-  } else if (hash.startsWith('#/v3')) {
+  if (hash.startsWith('#/v3')) {
     window.location.replace(`#/workflows${hash.slice('#/v3'.length)}`);
     return;
   } else if (/^#\/workflows(?:\/|-)catalog(?:[/?].*)?$/.test(hash)) {
@@ -278,28 +268,28 @@ function route() {
     window.location.replace('#/workflows');
     return;
   }
-  else if (hash.startsWith('#/workflows')) pageDispose = renderV3RunsPage(root);
-  else if (hash.startsWith('#/groups')) renderGroupsPage(root);
-  else if (hash.startsWith('#/settings')) void renderSettingsPage(root);
-  else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
-  else if (hash.startsWith('#/skills')) void renderSkillsPage(root);
-  else if (hash.startsWith('#/connectors')) renderConnectorsPage(root);
-  else if (hash.startsWith('#/team/manage')) renderTeamManagePage(root);
-  else if (hash.startsWith('#/team')) renderTeamFederationPage(root);
-  else if (hash.startsWith('#/role-profiles')) {
+  if (hash.startsWith('#/role-profiles')) {
     window.location.replace(`#/roles/profile${hash.slice('#/role-profiles'.length)}`);
     return;
   }
-  else if (hash.startsWith('#/roles/profile')) renderRoleProfilesPage(root);
-  else if (hash.startsWith('#/roles')) renderRolesPage(root);
-  else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
-  else if (hash.startsWith('#/whiteboards')) void renderWhiteboardsPage(root);
-  else if (hash.startsWith('#/sessions')) renderSessionsPage(root);
-  else if (hash.startsWith('#/office')) pageDispose = renderOfficePage(root) ?? null;
-  else if (hash.startsWith('#/insights')) pageDispose = renderInsightsPage(root);
-  else void renderOverviewPage(root);
 
-  highlightNav(hash);
+  try {
+    const matched = findDashboardRoute(hash);
+    await loadAndRenderDashboardRoute(
+      routeState,
+      seq,
+      root,
+      matched ? matched.load : loadOverviewPage,
+      { rerenderOnUiChange: matched ? matched.rerenderOnUiChange : false },
+    );
+  } catch (err) {
+    if (seq !== routeState.seq) return;
+    root.innerHTML = `<section class="page"><div class="empty">Dashboard route failed: ${escapeHtml(String(err))}</div></section>`;
+    routeState.pageDispose = null;
+    routeState.rerenderOnUiChange = true;
+  } finally {
+    if (seq === routeState.seq) highlightNav(hash);
+  }
 }
 
 const statusEl = document.getElementById('status');
@@ -377,7 +367,7 @@ function wireSidebarToggle() {
   });
 }
 
-// esbuild's IIFE bundle does not support top-level await — use an async IIFE.
+// Keep bootstrap sequencing explicit even though the dashboard bundle is ESM.
 void (async () => {
   ui.init();
   wireChromeControls();
@@ -385,7 +375,7 @@ void (async () => {
   ui.on(() => {
     paintChrome();
     paintAttentionStrip();
-    route();
+    if (routeState.rerenderOnUiChange) void route();
   });
   paintChrome();
   paintAttentionStrip();
@@ -401,6 +391,6 @@ void (async () => {
     console.error('botmux dashboard bootstrap failed', err);
     store.setOnline(false);
   }
-  window.addEventListener('hashchange', route);
-  route();
+  window.addEventListener('hashchange', () => void route());
+  void route();
 })();

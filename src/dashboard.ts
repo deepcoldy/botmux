@@ -493,15 +493,14 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
-    // Bundle filenames are fixed (app.js/style.css), so without revalidation
-    // browsers heuristic-cache them and serve a stale build after a deploy
-    // (new JS + old CSS → broken layout). `no-cache` + an mtime/size ETag makes
-    // the browser revalidate every load: 304 when unchanged (cheap), fresh 200
-    // when the build changed. No manual hard-refresh needed after deploy.
+    // Fixed entry filenames (index.html/app.js/style.css) need revalidation so
+    // a deploy never serves new JS with old CSS. Lazy chunks are content-hashed
+    // and can be cached immutably once the current app.js points at them.
+    const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': 'no-cache',
+      'cache-control': immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
     if (req.headers['if-none-match'] === etag) {

@@ -42,57 +42,23 @@ const pickedByTeam = new Map<string, Set<string>>();
 const gnameByTeam = new Map<string, string>(); // group-name draft per team — survives renderTeams() re-render
 const expandedTeams = new Set<string>(); // default empty → all teams collapsed; click a team header to expand
 const expandedDeps = new Set<string>(); // `${team.key}::${dep.id}` — default empty → deployment groups collapsed too
+let activeTeamGeneration = 0;
+
+function nextTeamGeneration(): number {
+  activeTeamGeneration += 1;
+  return activeTeamGeneration;
+}
+
+function isTeamGeneration(generation: number): boolean {
+  return activeTeamGeneration === generation;
+}
 
 function $(id: string): HTMLElement { return document.getElementById(id)!; }
 function allTeams(): Team[] { return [...localTeams, ...remoteTeams]; }
 function pickedSet(key: string): Set<string> { let s = pickedByTeam.get(key); if (!s) { s = new Set(); pickedByTeam.set(key, s); } return s; }
 function teamByKey(key: string): Team | undefined { return allTeams().find(t => t.key === key); }
 
-function subNav(active: 'home' | 'manage'): string {
-  const tab = (href: string, label: string, on: boolean) =>
-    `<a href="${href}" style="padding:6px 14px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600;${on ? 'background:var(--accent);color:var(--on-accent)' : 'color:var(--muted);background:var(--surface-muted)'}">${label}</a>`;
-  return `<div style="display:flex;gap:8px;margin-bottom:14px">${tab('#/team', t('team.navHome'), active === 'home')}${tab('#/team/manage', t('team.navManage'), active === 'manage')}</div>`;
-}
-
 // ─────────────────────────── #/team (my team) ───────────────────────────
-
-function homeHtml(): string {
-  return `<section class="page">
-<div class="page-heading"><div>
-  <p class="eyebrow">${t('team.eyebrow')}</p><h1>${t('team.homeTitle')}</h1>
-  <p class="tf-lede">${t('team.homeLede')}</p>
-</div></div>
-${subNav('home')}
-<div class="card" style="margin-bottom:16px">
-  <h2 style="margin-top:0">${t('team.localDeployTitle')}</h2>
-  <p>${t('team.myIdentity')}<b id="tf-owner">${t('team.unbound')}</b>
-    <button id="tf-autobind" class="primary" style="margin-left:8px">${t('team.bindBtn')}</button>
-    <span class="muted" style="font-size:13px">${t('team.bindHint')}</span></p>
-  <div id="tf-bind-out" style="display:none;margin-top:6px"></div>
-</div>
-<div class="card">
-  <h2 style="margin-top:0">${t('team.myTeams')} <span class="muted" id="tf-count" style="font-size:13px"></span></h2>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;font-size:13px">
-    <input id="tf-search" placeholder="${t('team.searchPh')}" style="padding:5px 9px;min-width:180px">
-    <select id="tf-cli" style="padding:5px"><option value="">${t('team.allCli')}</option></select>
-    <label><input type="checkbox" id="tf-fcap"> ${t('team.hasCap')}</label>
-    <label><input type="checkbox" id="tf-frole"> ${t('team.hasRole')}</label>
-  </div>
-  <p class="muted" style="font-size:13px;margin:0 0 4px">${t('team.teamsHint')}</p>
-  <div id="tf-teams">${t('team.loading')}</div>
-</div>
-<div id="tf-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);align-items:center;justify-content:center;z-index:50">
-  <div style="background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:10px;padding:18px 20px;width:min(560px,92vw)">
-    <h2 id="tf-modal-title" style="margin-top:0">${t('team.roleModalTitle')}</h2>
-    <p class="muted" style="font-size:13px">${t('team.roleModalHint')}</p>
-    <textarea id="tf-modal-text" readonly style="width:100%;min-height:200px;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px;box-sizing:border-box"></textarea>
-    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
-      <button id="tf-modal-cancel">${t('team.close')}</button>
-    </div>
-  </div>
-</div>
-</section>`;
-}
 
 function botMatch(b: RosterBot): boolean {
   const q = ((($('tf-search') as HTMLInputElement).value) || '').trim().toLowerCase();
@@ -178,10 +144,10 @@ function renderTeams(): void {
   const acrossTeams = teams.length > 1 ? t('team.acrossTeams', { n: teams.length }) : '';
   const numStr = shownIds.size === totalIds.size ? `${totalIds.size}` : `${shownIds.size} / ${totalIds.size}`;
   $('tf-count').textContent = `· ${numStr} ${t('team.botsWord')}${acrossTeams}`;
-  wireTeams();
+  wireTeams(activeTeamGeneration);
 }
 
-function wireTeams(): void {
+function wireTeams(generation = activeTeamGeneration): void {
   const el = $('tf-teams');
   el.querySelectorAll<HTMLElement>('.tf-team-h').forEach(h => {
     h.onclick = () => { const k = h.dataset.tk!; if (expandedTeams.has(k)) expandedTeams.delete(k); else expandedTeams.add(k); renderTeams(); };
@@ -199,16 +165,18 @@ function wireTeams(): void {
     inp.onchange = async () => {
       const app = inp.dataset.app!, valv = inp.value;
       await jput('/api/team/local-bots/' + encodeURIComponent(app) + '/capability', { capability: valv });
+      if (!isTeamGeneration(generation)) return;
       allTeams().forEach(t2 => { const bb = t2.bots.find(b => b.larkAppId === app); if (bb) bb.capability = valv.trim() || null; });
     };
   });
-  el.querySelectorAll<HTMLButtonElement>('.tf-role').forEach(btn => { btn.onclick = () => openRoleModal(btn.dataset.app!, btn.dataset.name || ''); });
+  el.querySelectorAll<HTMLButtonElement>('.tf-role').forEach(btn => { btn.onclick = () => openRoleModal(btn.dataset.app!, btn.dataset.name || '', generation); });
   el.querySelectorAll<HTMLButtonElement>('.tf-rmmember').forEach(btn => {
     btn.onclick = async (e) => {
       e.stopPropagation(); // inside the clickable dep header — don't toggle collapse
       if (!confirm(t('team.removeMemberConfirm', { name: btn.dataset.name || '' }))) return;
       await jsend('DELETE', `/api/team/hosted/${encodeURIComponent(btn.dataset.team!)}/members/${encodeURIComponent(btn.dataset.dep!)}`);
-      loadLocal();
+      if (!isTeamGeneration(generation)) return;
+      void loadLocal(generation);
     };
   });
   el.querySelectorAll<HTMLButtonElement>('.tf-grp').forEach(btn => {
@@ -222,14 +190,20 @@ function wireTeams(): void {
       const r = t2.kind === 'local'
         ? await jpost('/api/team/federated-group', { name, larkAppIds: apps, teamId: t2.teamId })
         : await jpost('/api/team/remote-group', { hubUrl: t2.hubUrl, teamId: t2.teamId, name, larkAppIds: apps });
+      if (!isTeamGeneration(generation)) return;
       renderGroupResult(out, r.body as any, r.status);
       if ((r.body as any)?.ok) {
         pickedSet(k).clear(); gnameByTeam.delete(k);
         // Re-render so the form (group name + checkboxes) clears consistently for both
         // local & remote, then restore the success message/link a plain re-render would wipe.
         const resultHtml = out.innerHTML;
-        const restore = () => { const o = el.querySelector<HTMLElement>(`.tf-gout[data-tk="${CSS.escape(k)}"]`); if (o) o.innerHTML = resultHtml; };
-        if (t2.kind === 'local') void loadLocal().then(restore); else { renderTeams(); restore(); }
+        const restore = () => {
+          if (!isTeamGeneration(generation)) return;
+          const o = el.querySelector<HTMLElement>(`.tf-gout[data-tk="${CSS.escape(k)}"]`);
+          if (o) o.innerHTML = resultHtml;
+        };
+        if (t2.kind === 'local') void loadLocal(generation).then(restore);
+        else { renderTeams(); restore(); }
       }
     };
   });
@@ -255,8 +229,9 @@ function renderGroupResult(out: HTMLElement, b: any, status: number): void {
   }
 }
 
-async function openRoleModal(app: string, name: string): Promise<void> {
+async function openRoleModal(app: string, name: string, generation = activeTeamGeneration): Promise<void> {
   const r = await jget('/api/team/local-bots/' + encodeURIComponent(app) + '/role');
+  if (!isTeamGeneration(generation)) return;
   $('tf-modal-title').textContent = t('team.roleModalTitleName', { name });
   ($('tf-modal-text') as HTMLTextAreaElement).value = (r.body as any)?.role || '';
   $('tf-modal').dataset.app = app;
@@ -270,8 +245,9 @@ function refreshCliOptions(): void {
   sel.value = cur;
 }
 
-async function loadLocal(): Promise<void> {
+async function loadLocal(generation = activeTeamGeneration): Promise<void> {
   const r = await jget('/api/team/hosted');
+  if (!isTeamGeneration(generation)) return;
   const b = r.body as any;
   if (!b?.ok) { localTeams = []; renderTeams(); return; }
   myDeploymentId = b.deployment.deploymentId;
@@ -286,8 +262,9 @@ async function loadLocal(): Promise<void> {
   renderTeams();
 }
 
-async function loadRemote(): Promise<void> {
+async function loadRemote(generation = activeTeamGeneration): Promise<void> {
   const r = await jget('/api/team/remote-roster');
+  if (!isTeamGeneration(generation)) return;
   const list = (r.body as any)?.memberships || [];
   remoteTeams = list.map((m: any) => {
     const deployments: RosterDeployment[] = m.roster?.deployments || [];
@@ -302,48 +279,38 @@ async function loadRemote(): Promise<void> {
   renderTeams();
 }
 
-export function renderTeamFederationPage(root: HTMLElement): void {
-  root.innerHTML = homeHtml();
+export function wireTeamFederationPage(root: HTMLElement): () => void {
+  const generation = nextTeamGeneration();
+  const cleanups: Array<() => void> = [];
+  const on = (el: Element | null, type: string, listener: EventListener) => {
+    if (!el) return;
+    el.addEventListener(type, listener);
+    cleanups.push(() => el.removeEventListener(type, listener));
+  };
   pickedByTeam.clear(); gnameByTeam.clear(); expandedTeams.clear(); expandedDeps.clear();
-  ['tf-search', 'tf-cli', 'tf-fcap', 'tf-frole'].forEach(id => { const el = $(id); el.oninput = renderTeams; el.onchange = renderTeams; });
-  $('tf-modal-cancel').onclick = () => { $('tf-modal').style.display = 'none'; };
-  wireBind();
-  void loadLocal();
-  void loadRemote();
+  ['tf-search', 'tf-cli', 'tf-fcap', 'tf-frole'].forEach(id => {
+    const el = document.getElementById(id);
+    on(el, 'input', () => { if (isTeamGeneration(generation)) renderTeams(); });
+    on(el, 'change', () => { if (isTeamGeneration(generation)) renderTeams(); });
+  });
+  on(document.getElementById('tf-modal-cancel'), 'click', () => { if (isTeamGeneration(generation)) $('tf-modal').style.display = 'none'; });
+  wireBind(generation);
+  void loadLocal(generation);
+  void loadRemote(generation);
+
+  return () => {
+    if (isTeamGeneration(generation)) activeTeamGeneration += 1;
+    for (const cleanup of cleanups.splice(0)) cleanup();
+    const modal = root.querySelector<HTMLElement>('#tf-modal');
+    if (modal) modal.style.display = 'none';
+  };
 }
 
 // ───────────────────────── #/team/manage (team management) ─────────────────────────
 
-function manageHtml(): string {
-  return `<section class="page">
-<div class="page-heading"><div>
-  <p class="eyebrow">${t('team.eyebrow')}</p><h1>${t('team.manageTitle')}</h1>
-  <p class="tf-lede">${t('team.manageLede')}</p>
-</div></div>
-${subNav('manage')}
-<div class="card" style="margin-bottom:16px">
-  <h2 style="margin-top:0">${t('team.hostedTitle')}</h2>
-  <p style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
-    <input id="tm-newname" placeholder="${t('team.newTeamPh')}" style="min-width:200px">
-    <button id="tm-create" class="primary">${t('team.createTeamBtn')}</button>
-    <span class="muted tm-cout" style="font-size:13px"></span>
-  </p>
-  <div id="tm-list">${t('team.loading')}</div>
-</div>
-<div class="card">
-  <h2 style="margin-top:0">${t('team.joinTitle')}</h2>
-  <p style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-    <input id="tm-hub" placeholder="${t('team.hubPh')}" style="flex:1;min-width:240px">
-    <input id="tm-code" placeholder="${t('team.codePh')}" style="min-width:160px">
-    <button id="tm-join" class="primary">${t('team.joinBtn')}</button>
-  </p>
-  <div id="tm-join-out" style="display:none;margin-top:6px"></div>
-</div>
-</section>`;
-}
-
-async function loadManageList(): Promise<void> {
+async function loadManageList(generation = activeTeamGeneration): Promise<void> {
   const r = await jget('/api/team/hosted');
+  if (!isTeamGeneration(generation)) return;
   const b = r.body as any;
   const el = $('tm-list');
   suggestedHubUrl = b?.suggestedHubUrl || suggestedHubUrl;
@@ -369,6 +336,7 @@ async function loadManageList(): Promise<void> {
       const out = el.querySelector<HTMLElement>(`.tm-inv-out[data-team="${CSS.escape(team)}"]`)!;
       out.style.display = ''; out.innerHTML = `<span class="muted">${t('team.generating')}</span>`;
       const r2 = await jpost('/api/team/local-invite', { teamId: team });
+      if (!isTeamGeneration(generation)) return;
       if ((r2.body as any)?.code) {
         out.innerHTML = `${t('team.inviteResultLede')}<br>${t('team.inviteHub')}<code>${escapeHtml(suggestedHubUrl)}</code><br>${t('team.inviteCode')}<code style="font-size:15px">${escapeHtml((r2.body as any).code)}</code>`;
       } else { out.innerHTML = `<span class="err">${t('team.genFail')}</span>`; }
@@ -378,47 +346,62 @@ async function loadManageList(): Promise<void> {
     btn.onclick = async () => {
       if (!confirm(t('team.delConfirm', { name: btn.dataset.name || '' }))) return;
       await jsend('DELETE', '/api/team/hosted/' + encodeURIComponent(btn.dataset.team!));
-      loadManageList();
+      if (!isTeamGeneration(generation)) return;
+      void loadManageList(generation);
     };
   });
 }
 
-export function renderTeamManagePage(root: HTMLElement): void {
-  root.innerHTML = manageHtml();
-  $('tm-create').onclick = async () => {
+export function wireTeamManagePage(root: HTMLElement): () => void {
+  const generation = nextTeamGeneration();
+  const cleanups: Array<() => void> = [];
+  const on = (el: Element | null, type: string, listener: EventListener) => {
+    if (!el) return;
+    el.addEventListener(type, listener);
+    cleanups.push(() => el.removeEventListener(type, listener));
+  };
+  on(document.getElementById('tm-create'), 'click', async () => {
     const name = ($('tm-newname') as HTMLInputElement).value.trim();
     const out = root.querySelector<HTMLElement>('.tm-cout')!;
     if (!name) { out.innerHTML = `<span class="err">${t('team.errName')}</span>`; return; }
     out.innerHTML = `<span class="muted">${t('team.creating')}</span>`;
     const r = await jpost('/api/team/hosted', { name });
-    if ((r.body as any)?.ok) { out.innerHTML = `<span class="ok">${t('team.created')}</span>`; ($('tm-newname') as HTMLInputElement).value = ''; loadManageList(); }
+    if (!isTeamGeneration(generation)) return;
+    if ((r.body as any)?.ok) { out.innerHTML = `<span class="ok">${t('team.created')}</span>`; ($('tm-newname') as HTMLInputElement).value = ''; void loadManageList(generation); }
     else { out.innerHTML = `<span class="err">${t('team.createFail', { error: escapeHtml(String((r.body as any)?.error || r.status)) })}</span>`; }
-  };
-  $('tm-join').onclick = async () => {
+  });
+  on(document.getElementById('tm-join'), 'click', async () => {
     const hubUrl = ($('tm-hub') as HTMLInputElement).value.trim();
     const inviteCode = ($('tm-code') as HTMLInputElement).value.trim();
     const out = $('tm-join-out'); out.style.display = '';
     if (!hubUrl || !inviteCode) { out.innerHTML = `<span class="err">${t('team.errHubCode')}</span>`; return; }
     out.innerHTML = `<span class="muted">${t('team.joining')}</span>`;
     const r = await jpost('/api/team/join-remote', { hubUrl, inviteCode });
+    if (!isTeamGeneration(generation)) return;
     if ((r.body as any)?.ok) { out.innerHTML = `<span class="ok">${t('team.joined', { name: escapeHtml((r.body as any).teamName || '') })}</span>`; ($('tm-code') as HTMLInputElement).value = ''; }
     else {
       const e = (r.body as any)?.error || r.status;
       const msg = e === 'cannot_join_self' ? t('team.joinErrSelf') : e === 'deployment_already_joined' ? t('team.joinErrAlready') : e === 'hub_unreachable' ? t('team.joinErrUnreachable') : e === 'hub_timeout' ? t('team.joinErrTimeout') : t('team.joinErrGeneric', { error: String(e) });
       out.innerHTML = `<span class="err">${escapeHtml(String(msg))}</span>`;
     }
+  });
+  void loadManageList(generation);
+
+  return () => {
+    if (isTeamGeneration(generation)) activeTeamGeneration += 1;
+    for (const cleanup of cleanups.splice(0)) cleanup();
   };
-  void loadManageList();
 }
 
 // ───────────────────────────── identity bind ─────────────────────────────
 
-function wireBind(): void {
+function wireBind(generation = activeTeamGeneration): void {
   $('tf-autobind').onclick = async () => {
     const out = $('tf-bind-out'); out.style.display = ''; out.innerHTML = `<span class="muted">${t('team.identifying')}</span>`;
     const r = await jpost('/api/team/identity/auto-bind');
+    if (!isTeamGeneration(generation)) return;
     const b: any = r.body;
-    if (b?.ok && b.owner) { out.innerHTML = `<span class="ok">${t('team.bound2', { name: escapeHtml(b.owner.name || b.owner.unionId) })}</span>`; loadLocal(); return; }
+    if (b?.ok && b.owner) { out.innerHTML = `<span class="ok">${t('team.bound2', { name: escapeHtml(b.owner.name || b.owner.unionId) })}</span>`; void loadLocal(generation); return; }
     if (b?.ok && b.needChoice && Array.isArray(b.candidates)) {
       const opts = b.candidates.map((c: any) => `<button class="tf-pickowner ghost" data-union="${escapeHtml(c.unionId)}" style="margin:2px">${escapeHtml(c.name || c.unionId)}</button>`).join(' ');
       out.innerHTML = `${t('team.multiCandidate')}<br>${opts}`;
@@ -426,8 +409,9 @@ function wireBind(): void {
         btn.onclick = async () => {
           out.innerHTML = `<span class="muted">${t('team.binding')}</span>`;
           const r2 = await jpost('/api/team/identity/auto-bind', { unionId: btn.dataset.union });
+          if (!isTeamGeneration(generation)) return;
           const b2: any = r2.body;
-          if (b2?.ok && b2.owner) { out.innerHTML = `<span class="ok">${t('team.bound2', { name: escapeHtml(b2.owner.name || b2.owner.unionId) })}</span>`; loadLocal(); }
+          if (b2?.ok && b2.owner) { out.innerHTML = `<span class="ok">${t('team.bound2', { name: escapeHtml(b2.owner.name || b2.owner.unionId) })}</span>`; void loadLocal(generation); }
           else { out.innerHTML = `<span class="err">${t('team.bindFail', { error: escapeHtml(String(b2?.error || 'unknown')) })}</span>`; }
         };
       });
