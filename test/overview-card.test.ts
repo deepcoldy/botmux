@@ -14,6 +14,7 @@ import type { DashboardSettingsInput } from '../src/dashboard/settings-card-mode
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildOverviewCard,
+  countSessions,
   handleOverviewCardAction,
   OVERVIEW_ACTION_REFRESH,
   OVERVIEW_ACTION_GOTO_SESSIONS,
@@ -120,6 +121,14 @@ describe('buildOverviewCard', () => {
     // Settings summary line shows ON labels.
     expect(json).toContain('公开只读已开启');
     expect(json).toContain('终端在飞书内打开');
+  });
+
+  it('counts dormant sessions as idle, not active', () => {
+    expect(countSessions([
+      sessionRow({ sessionId: 's1', status: 'dormant' }),
+      sessionRow({ sessionId: 's2', status: 'starting' }),
+      sessionRow({ sessionId: 's3', status: 'closed' }),
+    ])).toEqual({ active: 1, idle: 1, closed: 1 });
   });
 
   it('zh overview localizes all module sections and folder buttons', () => {

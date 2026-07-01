@@ -18,6 +18,7 @@ type SessionRow = Record<string, any> & { sessionId: string };
 type ScheduleRow = Record<string, any> & { id: string };
 
 const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
+const IDLE_STATUSES = new Set(['idle', 'dormant']);
 const TEAM_EXPAND_KEY = 'botmux.overview.teamExpanded';
 const TEAM_CARD_MIN_W = 230;
 const TEAM_GRID_GAP = 13;
@@ -33,6 +34,17 @@ function readTeamExpanded(): boolean {
 
 function persistTeamExpanded(v: boolean): void {
   try { window.localStorage.setItem(TEAM_EXPAND_KEY, v ? '1' : '0'); } catch { /* silent */ }
+}
+
+function statusToken(status: unknown): string {
+  return String(status ?? 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+}
+
+function sessionStatusText(status: unknown, tr: (key: string) => string): string {
+  const raw = String(status ?? 'unknown');
+  const key = `sessions.status.${raw}`;
+  const label = tr(key);
+  return label === key ? raw : label;
 }
 
 function collapsedCardCount(gridEl: HTMLElement | null): number {
@@ -102,7 +114,9 @@ function AttentionCard({ session }: { session: SessionRow }) {
 }
 
 function ActiveSessionRow({ session }: { session: SessionRow }) {
+  const tr = useT();
   const botName = botDisplayName(session);
+  const status = String(session.status ?? 'unknown');
   return (
     <li className="sess-row">
       <Html html={botAvatarHtml({ name: botName, larkAppId: session.larkAppId, size: 'sm' })} />
@@ -110,8 +124,8 @@ function ActiveSessionRow({ session }: { session: SessionRow }) {
         <b>{(stripMentionPrefix(session.title) || session.sessionId).slice(0, 64)}</b>
         <span>{botName} · {chatDisplayTitle(session) ?? session.cliId ?? 'unknown'} · {relTime(session.lastMessageAt)}</span>
       </div>
-      <span className={`status status-${String(session.status ?? 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`}>
-        {session.status ?? 'unknown'}
+      <span className={`status status-${statusToken(status)}`}>
+        {sessionStatusText(status, tr)}
       </span>
     </li>
   );
@@ -190,7 +204,7 @@ function OverviewPage() {
   const onlineBots = cards.filter(c => c.online || c.active.length > 0).length;
   const recent = useMemo(
     () => active
-      .filter(s => BUSY_STATUSES.has(s.status) || s.status === 'idle')
+      .filter(s => BUSY_STATUSES.has(s.status) || IDLE_STATUSES.has(s.status))
       .sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0))
       .slice(0, 7),
     [active],

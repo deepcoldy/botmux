@@ -64,6 +64,10 @@ function toneIcon(tone: string): string {
   }
 }
 
+function displayStatusLabel(status: string, locale: Locale): string {
+  return status === 'dormant' ? t('card.status.dormant', undefined, locale) : status;
+}
+
 function clampPageSize(pageSize: number | undefined): number {
   if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return PAGE_SIZE;
   return Math.min(Math.floor(pageSize), MAX_PAGE_SIZE);
@@ -335,7 +339,7 @@ export function buildSessionsDetailCard(
   infoLines.push(
     t(
       'card.dashboard.sessions.detail.status_label',
-      { status: escapeLarkMd(detail.status) },
+      { status: escapeLarkMd(displayStatusLabel(detail.status, opts.locale)) },
       opts.locale,
     ),
   );

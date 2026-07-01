@@ -31,6 +31,7 @@ export const messages: Record<string, string> = {
   'card.status.starting': '启动中…',
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
+  'card.status.dormant': '休眠',
   'card.status.analyzing': '正在分析…',
   'card.status.limited': '限额已达',
   'card.status.retry_ready': '可重试',

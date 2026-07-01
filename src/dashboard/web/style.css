@@ -975,6 +975,7 @@ button.primary {
 .status-working,
 .status-active { background: var(--accent-soft); color: var(--accent-strong); }
 .status-idle { background: var(--surface-muted); color: var(--muted); }
+.status-dormant { background: var(--surface-muted); color: var(--muted); }
 .status-closed { background: var(--danger-soft); color: var(--danger); }
 .status-analyzing { background: var(--warning-soft); color: var(--warning); }
 .status-starting { background: var(--success-soft); color: var(--success); }
@@ -1576,6 +1577,14 @@ button.primary {
 
 .kanban-card-dot[data-status="limited"] {
   background: var(--danger);
+}
+
+.kanban-card-dot[data-status="idle"] {
+  background: var(--success);
+}
+
+.kanban-card-dot[data-status="dormant"] {
+  background: var(--muted);
 }
 
 .kanban-card-dot[data-status="closed"] {
@@ -3483,6 +3492,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .status-analyzing { background: var(--accent-soft); color: var(--accent); }
 .status-starting { background: var(--info-soft); color: var(--info); }
 .status-idle { background: var(--success-soft); color: var(--success); }
+.status-dormant { background: var(--surface-muted); color: var(--muted); }
 .status-limited { background: var(--danger-soft); color: var(--danger); }
 
 /* ── 玻璃面板（dark 下生效；light 保持实底）─────────────────────────────── */

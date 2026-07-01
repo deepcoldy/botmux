@@ -386,7 +386,7 @@ describe('GET /api/events', () => {
         e => e.type === 'session.spawned' && e.body?.session?.sessionId === 'snap-1',
       );
       expect(ev).not.toBeNull();
-      expect(ev!.body.session.status).toBe('starting'); // worker:null → no screen yet
+      expect(ev!.body.session.status).toBe('dormant'); // restored worker:null → lazily resumes on next input
       expect(ev!.body.session.hasHistory).toBe(true);
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
