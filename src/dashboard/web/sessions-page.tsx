@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { IDLE_CLEANUP_HOUR_OPTIONS } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
-import { renderCliFilterGroup, wireSessionsPage } from './sessions.js';
+import { renderCliFilterGroup, SESSION_STATUS_OPTIONS, sessionStatusText, wireSessionsPage } from './sessions.js';
 import { useT } from './react-hooks.js';
 
 function SortHeader(props: { sort: string; label: string }) {
@@ -52,12 +52,9 @@ function SessionsPage() {
         <input type="search" name="q" placeholder={tr('sessions.search')} />
         <select name="status">
           <option value="">{tr('sessions.anyStatus')}</option>
-          <option>starting</option>
-          <option>working</option>
-          <option>idle</option>
-          <option>analyzing</option>
-          <option>active</option>
-          <option>closed</option>
+          {SESSION_STATUS_OPTIONS.map(status => (
+            <option key={status} value={status}>{sessionStatusText(status)}</option>
+          ))}
         </select>
         <select name="adopt">
           <option value="">{tr('sessions.adoptAny')}</option>

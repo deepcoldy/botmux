@@ -119,7 +119,7 @@ function cssToken(value: unknown): string {
   return String(value ?? 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
 }
 
-const SESSION_STATUS_OPTIONS = [
+export const SESSION_STATUS_OPTIONS = [
   'starting',
   'working',
   'idle',
@@ -130,7 +130,7 @@ const SESSION_STATUS_OPTIONS = [
   'closed',
 ];
 
-function sessionStatusText(status: unknown): string {
+export function sessionStatusText(status: unknown): string {
   const raw = String(status ?? 'unknown');
   const key = `sessions.status.${raw}`;
   const label = t(key);
