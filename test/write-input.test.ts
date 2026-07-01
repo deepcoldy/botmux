@@ -42,6 +42,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
@@ -149,12 +150,13 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, OpenCode, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS: its
+ *  Gemini, Genius, OpenCode, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS: its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
  *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
+  ['genius', createGeniusAdapter('/bin/genius')],
   ['opencode', createOpenCodeAdapter('/bin/opencode')],
   ['mtr', createMtrAdapter('/bin/mtr')],
   ['hermes', createHermesAdapter('/bin/hermes')],
@@ -493,6 +495,10 @@ describe('supportsTypeAhead flag', () => {
     expect(createCodexAdapter('/bin/codex').supportsTypeAhead).toBe(true);
   });
 
+  it('genius: true (Claude-family queue accepts follow-up input after startup)', () => {
+    expect(createGeniusAdapter('/bin/genius').supportsTypeAhead).toBe(true);
+  });
+
   it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
     expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
   });
@@ -513,7 +519,7 @@ describe('supportsTypeAhead flag', () => {
     expect(createCodexAdapter('/bin/codex').mergeQueuedInput).toBeUndefined();
   });
 
-  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex'))('%s: undefined (default behavior)', (_name, adapter) => {
+  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
   });
 });

@@ -13,6 +13,7 @@ import { createCodexAdapter } from './codex.js';
 import { createCodexAppAdapter } from './codex-app.js';
 import { createCursorAdapter } from './cursor.js';
 import { createGeminiAdapter } from './gemini.js';
+import { createGeniusAdapter } from './genius.js';
 import { createOpenCodeAdapter } from './opencode.js';
 import { createAntigravityAdapter } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
@@ -99,7 +100,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -113,6 +114,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'codex-app': return createCodexAppAdapter(pathOverride);
     case 'cursor': return createCursorAdapter(pathOverride);
     case 'gemini': return createGeminiAdapter(pathOverride);
+    case 'genius': return createGeniusAdapter(pathOverride);
     case 'opencode': return createOpenCodeAdapter(pathOverride);
     case 'antigravity': return createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);

@@ -186,6 +186,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'codex-app': 'Codex App',
   'cursor': 'Cursor',
   'gemini': 'Gemini',
+  'genius': 'Genius',
   'opencode': 'OpenCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
