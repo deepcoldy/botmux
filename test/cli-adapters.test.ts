@@ -1010,6 +1010,15 @@ describe('readyPattern', () => {
     expect(adapter.supportsTypeAhead).toBe(true);
   });
 
+  it('hermes defers the first-prompt timeout until its readyPattern appears', () => {
+    // Hermes cold-start initialization may outlive the 15s soft timeout; defer
+    // that timeout to avoid flushing the first Lark message before the composer
+    // exists, while still allowing the worker hard timeout to flush via type-ahead.
+    const adapter = createHermesAdapter('/bin/hermes');
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
   it('genius matches current and legacy prompt indicators', () => {
     const adapter = createGeniusAdapter('/bin/genius');
     expect(adapter.readyPattern).toBeDefined();
