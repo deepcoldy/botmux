@@ -139,6 +139,8 @@ describe('buildCodexReadIsolationArgs (Codex 0.137, verified format)', () => {
     expect(args[2]).toBe('-c');
     const table = args[3];
     expect(table).toContain(`permissions.${CODEX_READ_ISOLATION_PROFILE}.filesystem={`);
+    // read-all base so it's a blocklist (deny list) not an allowlist
+    expect(table).toContain('":root"="read"');
     // each denied path present as exact + /** glob, mapped to "deny"
     expect(table).toContain('"/Users/bot/.botmux/bots.json"="deny"');
     expect(table).toContain('"/Users/bot/.botmux/bots.json/**"="deny"');

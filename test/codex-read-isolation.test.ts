@@ -19,11 +19,12 @@ const ctx: ReadIsolationContext = {
 describe('codex adapter × read isolation', () => {
   const adapter = createCodexAdapter('/usr/bin/codex');
 
-  it('declares read-isolation capability', () => {
-    expect(adapter.supportsReadIsolation).toBe(true);
+  it('reports read-isolation UNsupported (fail-closed pending Codex 0.137 fix)', () => {
+    // codex 0.137 filesystem profile can't do blocklist read-isolation (see codex.ts).
+    expect(adapter.supportsReadIsolation).toBe(false);
   });
 
-  it('emits the permission profile and drops bypass when isolation is on', () => {
+  it('buildArgs still wires the profile+base when a context is passed (kept for future)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, readIsolation: ctx });
     const joined = args.join(' ');
     expect(joined).not.toContain('--dangerously-bypass-approvals-and-sandbox');

@@ -217,7 +217,13 @@ export const CODEX_READ_ISOLATION_PROFILE = 'botmux_read_isolation';
  */
 export function buildCodexReadIsolationArgs(ctx: ReadIsolationContext): string[] {
   const denyPaths = buildReadDenyPaths(ctx);
-  const entries: string[] = [];
+  // `:root`="read" is the "read the whole filesystem" BASE — without it a
+  // filesystem profile is an allowlist (only workspace readable), which would
+  // block the bot's own lark-cli config/session too. Deny entries override the
+  // base (verified via `codex debug prompt-input`: both land in the active
+  // profile, deny is an unupgradable restriction). Write stays workspace-only
+  // via `--sandbox workspace-write`.
+  const entries: string[] = ['":root"="read"'];
   for (const p of denyPaths) {
     entries.push(`"${p}"="deny"`, `"${p}/**"="deny"`);
   }

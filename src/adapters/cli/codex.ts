@@ -126,7 +126,16 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
-    supportsReadIsolation: true,
+    // Read isolation is DISABLED (fail-closed) pending a Codex fix: codex 0.137's
+    // filesystem permission profile cannot express "read all EXCEPT a deny list".
+    // Empirically (e2e verified): with `:root="read"` as the base, path="deny"
+    // entries are IGNORED (read grant wins); without it the profile is an
+    // allowlist that also blocks the bot's OWN lark-cli config/session, and an
+    // explicit path="read" allow does NOT re-open it. Neither yields blocklist
+    // semantics. `buildCodexReadIsolationArgs` + the buildArgs wiring below are
+    // kept, ready to flip back on once Codex supports it. Until then a
+    // codex+readIsolation bot fail-closes (worker gate) rather than run broken.
+    supportsReadIsolation: false,
     authPaths: ['~/.codex/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
