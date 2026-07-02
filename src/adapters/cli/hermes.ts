@@ -59,8 +59,18 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
     // Hermes can take minutes to finish cold-start initialization before its
     // real composer appears. Keep the soft first-prompt timeout from flushing
     // into startup screens, while preserving the worker's hard cap so the first
-    // queued Lark message is not stranded forever if prompt detection regresses.
+    // queued Lark message is not stranded forever if prompt detection regresses
+    // (readyPattern suppresses the IdleDetector's quiescence fallback, so a
+    // stale ❯ pattern would otherwise strand it with no recovery path).
     deferFirstPromptTimeoutUntilReady: true,
+    // Two effects (input-gate.ts / releaseFirstPromptTimeout): the hard cap
+    // above only flushes for type-ahead adapters, AND mid-turn Lark messages
+    // are written immediately instead of queuing until idle. The contract this
+    // asserts: input submitted while Hermes is busy is not dropped. Upstream
+    // advertises non-blocking input + interrupt-and-redirect for the TUI, and
+    // the classic prompt_toolkit CLI consumes tty type-ahead at its next
+    // prompt. If Hermes users report mid-turn messages vanishing or sitting
+    // unsubmitted in the composer, revisit this flag first.
     supportsTypeAhead: true,
     altScreen: false,
   };
