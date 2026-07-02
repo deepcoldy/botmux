@@ -1,5 +1,5 @@
 /**
- * Restore-time zombie-close decision for persistent backends (tmux/zellij/herdr).
+ * Restore-time zombie-close decision for persistent backends (tmux/zellij/herdr/zmx).
  *
  * On daemon restart, restoreActiveSessions() re-registers every persisted active
  * session and then, for persistent backends, probes whether the backing
@@ -33,6 +33,11 @@ let tempDir: string;
 
 // Mutable probe verdict the mocked TmuxBackend returns this test run.
 const probe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'unknown' }));
+const zmxSnapshot = vi.hoisted(() => ({
+  ok: true,
+  sessions: [] as string[],
+  unhealthySessions: [] as string[],
+}));
 // Mutable tmux-SERVER liveness the mocked TmuxBackend returns this test run.
 // Default 'running' so a bare 'missing' is read as a solo zombie (server up).
 const server = vi.hoisted(() => ({ state: 'running' as 'running' | 'down' | 'unknown' }));
@@ -79,6 +84,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
       for (const [k, v] of map) { if (v === prev) { map.delete(k); break; } }
     }
     map.set(key, ds);
+    return true;
   }),
   isRelayableRealSession: (ds: any) =>
     !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
@@ -140,6 +146,22 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
   },
 }));
 
+vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
+  ZmxBackend: {
+    sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
+    probeSession: vi.fn(() => probe.result),
+    probeSessions: vi.fn(() => zmxSnapshot.ok ? {
+      ok: true,
+      sessions: [...zmxSnapshot.sessions],
+      unhealthySessions: [...zmxSnapshot.unhealthySessions],
+      raw: '',
+    } : { ok: false }),
+    hasSession: vi.fn(() => probe.result === 'exists'),
+    serverState: vi.fn(() => server.state),
+    killSession: vi.fn(),
+  },
+}));
+
 vi.mock('../src/core/session-discovery.js', () => ({
   validateAdoptTarget: vi.fn(() => true),
   validateAdoptTargetState: vi.fn(() => 'alive'),
@@ -153,6 +175,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 
 import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/core/session-manager.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import { forkWorker, closeSession } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -164,19 +187,23 @@ beforeEach(() => {
   sessionStore.init();
   wp.registry = null;
   probe.result = 'exists';
+  zmxSnapshot.ok = true;
+  zmxSnapshot.sessions = [];
+  zmxSnapshot.unhealthySessions = [];
   server.state = 'running';
   bot.cliId = 'claude-code';
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
   vi.mocked(announceSessionRow).mockClear();
+  vi.mocked(ZmxBackend.probeSessions).mockClear();
 });
 
 afterEach(() => {
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
-function makeActivePersistentSession(rootMessageId: string) {
+function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' | 'zmx' = 'tmux') {
   const s = sessionStore.createSession('oc_chat1', rootMessageId, 'Topic', 'group');
   s.larkAppId = 'app_test';
   s.workingDir = '/tmp/proj';
@@ -186,7 +213,7 @@ function makeActivePersistentSession(rootMessageId: string) {
   // (Session.backendType); getSessionPersistentBackendType reads it back rather
   // than re-deriving from the daemon default. Stamp it so this fixture models a
   // genuine tmux-backed session.
-  s.backendType = 'tmux';
+  s.backendType = backendType;
   sessionStore.updateSession(s);
   return s; // left active
 }
@@ -229,6 +256,36 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(ds).toBeDefined();              // active record retained…
     expect(ds!.worker).toBeNull();         // …worker-less, resumes on next message
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('missing ZMX session stays lazy-recoverable even when another ZMX daemon is running', async () => {
+    probe.result = 'missing';
+    server.state = 'running';
+    const s = makeActivePersistentSession('om_zmx_missing', 'zmx');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.get(sessionKey('om_zmx_missing', 'app_test'))).toBeDefined();
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('classifies multiple ZMX restore rows from one full-list snapshot', async () => {
+    const first = makeActivePersistentSession('om_zmx_batch_1', 'zmx');
+    const second = makeActivePersistentSession('om_zmx_batch_2', 'zmx');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSession(first.sessionId)!.status).toBe('active');
+    expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
   });
 

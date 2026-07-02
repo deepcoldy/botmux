@@ -242,6 +242,34 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
+  it('doc-native session never posts a TUI prompt card to the virtual doc: chat id', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      chatId: 'doc:doc_token_123',
+      session: {
+        ...makeDs().session,
+        scope: 'chat',
+        chatId: 'doc:doc_token_123',
+        rootMessageId: 'doc:doc_token_123',
+      },
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'tui_prompt',
+      description: 'Approve command?',
+      options: [{ text: 'Yes', selected: false }],
+      multiSelect: false,
+      turnId: 'turn-doc',
+    });
+    await flush();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.tuiPromptCardId).toBeUndefined();
+  });
+
   it('POST path sends set_display_mode when displayMode is screenshot', async () => {
     const fakeWorker = makeFakeWorker();
     // streamCardPending = true forces POST path (no existing card to PATCH)

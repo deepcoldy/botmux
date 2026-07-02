@@ -1760,18 +1760,20 @@ describe('handleCommand', () => {
       expect(sessionStore.updateSession).not.toHaveBeenCalled();
     });
 
-    it('updates the session title without restarting the worker', async () => {
+    it('updates and flattens title metadata without restarting the worker', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
 
-      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  ZMX 后端集成推进  '), deps, LARK_APP_ID);
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  ZMX 后端集成推进\n阶段二  '), deps, LARK_APP_ID);
 
-      expect(ds.session.title).toBe('ZMX 后端集成推进');
+      expect(ds.session.title).toBe('ZMX 后端集成推进 阶段二');
+      expect(ds.session.titleSource).toBe('user');
+      expect(ds.session.titleUpdatedAt).toEqual(expect.any(String));
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('会话标题已更新');
-      expect(replyContent).toContain('ZMX 后端集成推进');
+      expect(replyContent).toContain('ZMX 后端集成推进 阶段二');
       expect(replyContent).toContain('Agent 当前未运行');
     });
 

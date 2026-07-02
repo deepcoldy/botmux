@@ -857,7 +857,7 @@ export interface BotConfig {
    */
   wrapperCli?: string;
   /**
-   * Per-bot launch-shell override for the persistent backends (tmux/zellij).
+   * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
    * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`sh`) or an absolute path
    * (`/usr/bin/zsh`). The escape hatch for a login `$SHELL` (e.g. bash) whose

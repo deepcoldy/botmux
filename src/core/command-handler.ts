@@ -1417,7 +1417,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
           break;
         }
-        const updated = updateSessionTitle(ds.session, rawTitle);
+        const updated = updateSessionTitle(ds.session, rawTitle, 'user');
         if (!updated.ok) {
           await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
           break;
@@ -1437,7 +1437,6 @@ export async function handleCommand(
         logger.info(`[${logTag}] Session renamed by /rename: ${updated.title} (agentSync=${agentSync.status})`);
         break;
       }
-
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
 
@@ -1624,6 +1623,8 @@ export async function handleCommand(
             // the new repo's cwd. The new repo is pinned onto the fresh session
             // below instead.
             const claimedCard = claimCurrentRepoCard(ds!, undefined);
+            const oldSession = ds!.session;
+            const oldSessionId = oldSession.sessionId;
             const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
@@ -1635,7 +1636,12 @@ export async function handleCommand(
               () => sessionReply(rootId, closedCard, 'interactive'),
             );
 
-            const oldSession = ds!.session;
+            const stillOwnsGeneration = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds
+              && ds!.session === oldSession;
+            if (!stillOwnsGeneration) {
+              logger.warn(`[${logTag}] Repo switch cancelled after closing ${oldSessionId.substring(0, 8)}; routing generation changed during card delivery`);
+              return false;
+            }
             // `rootId` is the routing anchor. For chat-scope sessions it is the
             // `oc_...` chat id, not the traceable `om_...` message root stored on
             // Session. Preserve the old identity and explicitly persist scope so

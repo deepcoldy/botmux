@@ -8,7 +8,7 @@
 //     no-ops for non-pending sessions
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
-import { composeRowFromActive } from '../src/core/dashboard-rows.js';
+import { composeRowFromActive, composeRowFromClosed } from '../src/core/dashboard-rows.js';
 import {
   announcePendingRepoSession,
   announceSessionRow,
@@ -141,6 +141,34 @@ describe('attention signals', () => {
     ]);
   });
 
+  it('composeRowFromActive exposes backend metadata for external session bridges', () => {
+    const zmx = makeDs();
+    zmx.session.backendType = 'zmx';
+    zmx.session.titleUpdatedAt = '2026-07-13T10:00:00.000Z';
+    zmx.session.titleSource = 'agent';
+    expect(composeRowFromActive(zmx)).toMatchObject({
+      backendType: 'zmx',
+      backendSessionName: 'bmx-sess-1',
+      titleUpdatedAt: '2026-07-13T10:00:00.000Z',
+      titleSource: 'agent',
+    });
+
+    const adopted = makeDs();
+    adopted.session.backendType = 'zmx';
+    adopted.session.adoptedFrom = { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' };
+    expect(composeRowFromActive(adopted).backendSessionName).toBeUndefined();
+
+    const closed = { ...zmx.session, status: 'closed' as const, closedAt: '2026-07-13T11:00:00.000Z' };
+    expect(composeRowFromClosed(closed)).toMatchObject({
+      status: 'closed',
+      backendType: 'zmx',
+      backendSessionName: 'bmx-sess-1',
+    });
+
+    const legacy = { ...closed, backendType: undefined };
+    expect(composeRowFromClosed(legacy).backendSessionName).toBeUndefined();
+  });
+
   it('publishAttentionPatch emits session.update derived from session state', () => {
     const seen = collectEvents();
     publishAttentionPatch(makeDs({ tuiPromptCardId: 'om_card' }));
@@ -218,10 +246,13 @@ describe('attention signals', () => {
     const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
     const start = src.indexOf('async function handleThreadReply(');
     expect(start).toBeGreaterThanOrEqual(0);
-    // 20000：窗口需罩住函数头到最后一个拦截点 (findPendingAskByAnchor) 的全部
-    // 源码——passthrough 冷启动等合法插入会把后续 marker 往后推，窗口太紧会误报。
-    // 语义断言不变：clear 在所有拦截点之前。
-    const region = src.slice(start, start + 20000);
+    const end = src.indexOf('async function autoCreateDocSession(', start);
+    expect(end).toBeGreaterThan(start);
+    // Bound the source-order assertion by the next top-level handler instead
+    // of a character count. Legitimate additions to handleThreadReply (for
+    // example CAS handoff paths) must not make this regression test silently
+    // inspect only the first part of the function.
+    const region = src.slice(start, end);
     const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     for (const marker of [

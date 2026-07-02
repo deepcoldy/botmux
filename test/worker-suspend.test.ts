@@ -41,7 +41,7 @@ const CLI_IDS: CliId[] = [
   'copilot',
 ];
 
-const BACKENDS: BackendType[] = ['pty', 'tmux', 'herdr', 'zellij'];
+const BACKENDS: BackendType[] = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'];
 
 describe('worker suspend backend gating', () => {
   it.each(BACKENDS)('classifies %s correctly', (backend) => {
@@ -52,6 +52,7 @@ describe('worker suspend backend gating', () => {
     expect(isSuspendableBackendType('tmux')).toBe(true);
     expect(isSuspendableBackendType('herdr')).toBe(true);
     expect(isSuspendableBackendType('zellij')).toBe(true);
+    expect(isSuspendableBackendType('zmx')).toBe(true);
     expect(isSuspendableBackendType('pty')).toBe(false);
   });
 });

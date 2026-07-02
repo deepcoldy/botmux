@@ -40,7 +40,7 @@ describe('shouldArmReadyGate', () => {
   });
 
   it('THE REATTACH REGRESSION: does NOT arm a persistent-backend reattach', () => {
-    // daemon restart re-attaches an already-running tmux/zellij/herdr Claude
+    // daemon restart re-attaches an already-running tmux/zellij/herdr/zmx Claude
     // WITHOUT re-running its bin/args → no new SessionStart hook fires. Arming
     // would hold the first post-recovery message until the fallback timeout.
     expect(shouldArmReadyGate({ ...base, willReattachPersistent: true })).toBe(false);

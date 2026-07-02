@@ -1,6 +1,6 @@
 /**
  * Shared helpers for sessions backed by a persistent multiplexer
- * (tmux / herdr / zellij). These backends keep the CLI alive across worker
+ * (tmux / herdr / zellij / zmx). These backends keep the CLI alive across worker
  * exits BY DESIGN (idle-suspend, lazy restore), so several daemon paths must
  * resolve / name / probe / kill the backing session WITHOUT a live worker:
  * the restore-time zombie sweep and terminal wake (session-manager.ts), and
@@ -15,6 +15,7 @@ import { getBot } from '../bot-registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
+import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
 
@@ -23,7 +24,7 @@ export type PersistentBackendType = Exclude<BackendType, 'pty'>;
 export function isSuspendableBackendType(
   backendType: BackendType | undefined,
 ): backendType is PersistentBackendType {
-  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij';
+  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij' || backendType === 'zmx';
 }
 
 /**
@@ -131,13 +132,61 @@ export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close
 export function persistentSessionName(backendType: PersistentBackendType, sessionId: string): string {
   if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);
   if (backendType === 'zellij') return ZellijBackend.sessionName(sessionId);
+  if (backendType === 'zmx') return ZmxBackend.sessionName(sessionId);
   return HerdrBackend.sessionName(sessionId);
 }
 
 export function probePersistentSession(backendType: PersistentBackendType, name: string): SessionProbe {
   if (backendType === 'tmux') return TmuxBackend.probeSession(name);
   if (backendType === 'zellij') return ZellijBackend.probeSession(name);
+  if (backendType === 'zmx') return ZmxBackend.probeSession(name);
   return HerdrBackend.probeSession(name);
+}
+
+/**
+ * Take one liveness snapshot for a set of backing-session names.
+ *
+ * ZMX and Zellij expose all session states in one command, so probing each row
+ * separately would repeatedly scan the same control plane (and makes `botmux
+ * list` quadratic for ZMX). tmux and Herdr keep their established per-session
+ * probes, but duplicate names are still coalesced here.
+ */
+export function probePersistentSessions(
+  backendType: PersistentBackendType,
+  names: Iterable<string>,
+): ReadonlyMap<string, SessionProbe> {
+  const uniqueNames = [...new Set(names)];
+  const result = new Map<string, SessionProbe>();
+
+  if (backendType === 'zmx') {
+    const snapshot = ZmxBackend.probeSessions();
+    for (const name of uniqueNames) {
+      result.set(
+        name,
+        !snapshot.ok
+          ? 'unknown'
+          : snapshot.sessions.includes(name)
+            ? 'exists'
+            : snapshot.unhealthySessions.includes(name)
+              ? 'unknown'
+              : 'missing',
+      );
+    }
+    return result;
+  }
+
+  if (backendType === 'zellij') {
+    const snapshot = ZellijBackend.probeLiveSessions();
+    for (const name of uniqueNames) {
+      result.set(name, !snapshot.ok ? 'unknown' : snapshot.sessions.includes(name) ? 'exists' : 'missing');
+    }
+    return result;
+  }
+
+  for (const name of uniqueNames) {
+    result.set(name, probePersistentSession(backendType, name));
+  }
+  return result;
 }
 
 /**
@@ -156,6 +205,7 @@ export function probePersistentBackendServer(
 ): 'running' | 'down' | 'unknown' {
   if (backendType === 'tmux') return TmuxBackend.serverState();
   if (backendType === 'zellij') return ZellijBackend.serverState();
+  if (backendType === 'zmx') return ZmxBackend.serverState();
   return 'unknown';
 }
 
@@ -163,5 +213,6 @@ export function probePersistentBackendServer(
 export function killPersistentSession(backendType: PersistentBackendType, name: string): void {
   if (backendType === 'tmux') TmuxBackend.killSession(name);
   else if (backendType === 'zellij') ZellijBackend.killSession(name);
+  else if (backendType === 'zmx') ZmxBackend.killSession(name);
   else HerdrBackend.killSession(name);
 }

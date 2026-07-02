@@ -128,7 +128,7 @@ import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { updateSessionTitle } from './session-title.js';
+import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
@@ -566,6 +566,11 @@ function findSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
 }
 
+/** Mutating IPC routes may only touch this daemon's own bot-partitioned store. */
+function findOwnedSessionRecord(sessionId: string): Session | undefined {
+  return findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId);
+}
+
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
   if (!ds) {
@@ -615,7 +620,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
   const column = normalizeKanbanColumn(body.column);
   const position = normalizeKanbanPosition(body.position);
   if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
-  const session = findSessionRecord(params.sessionId);
+  const session = findOwnedSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   // 待办池(queued)会话被拖到「进行中」= 激活：把暂存内容当首轮发给 CLI 开跑。
   // activateQueuedSession 内部会清 queued + 把列设成 in_progress + forkWorker。
@@ -911,19 +916,26 @@ ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
 // Codex/Claude Code 再收到一条 best-effort 原生 /rename，同步其 resume picker。
 // 飞书话题标题不受影响。全视图（看板/状态板/表格/抽屉）读同一字段。
 ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
-  let body: { title?: unknown };
+  let body: { title?: unknown; source?: unknown };
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const title = normalizeSessionTitle(body.title);
   if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
   const active = findActiveBySessionId(params.sessionId);
-  const session = active?.session ?? sessionStore.getSession(params.sessionId);
+  const session = active?.session ?? sessionStore.getOwnedSession(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const updated = updateSessionTitle(session, title);
+  const source = normalizeSessionTitleSource(body.source, 'dashboard');
+  const updated = updateSessionTitle(session, title, source);
   if (!updated.ok) return jsonRes(res, 400, { ok: false, error: updated.error });
   const agentSync = active
     ? requestAgentSessionRename(active, updated.title)
     : { status: 'not_running' as const };
-  jsonRes(res, 200, { ...updated, agentSync: agentSync.status });
+  jsonRes(res, 200, {
+    ok: true,
+    title: updated.title,
+    titleUpdatedAt: updated.updatedAt,
+    titleSource: updated.source,
+    agentSync: agentSync.status,
+  });
 });
 
 // 会话锁定：保护被锁定会话不被 dashboard「清理空闲」批量关闭。锁定是会话元数据，
@@ -932,7 +944,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lock', async (req, res, params) => {
   let body: { locked?: unknown };
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   if (typeof body.locked !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'bad_locked' });
-  const session = findSessionRecord(params.sessionId);
+  const session = findOwnedSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   if (body.locked) session.locked = true;
   else delete session.locked;
@@ -2680,7 +2692,7 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
   jsonRes(res, 200, { ok: true, readIsolation: r.readIsolation, suspendedSessions });
 });
 
-// Per-bot session backend override (pty | tmux | herdr | zellij), or clear it
+// Per-bot session backend override (pty | tmux | herdr | zellij | zmx), or clear it
 // ('' / 'auto' / null → follow the daemon default). next-session 生效：running
 // sessions keep their spawn-time backend (Session.backendType stamp), only new
 // spawns read the new value — so switching here can't strand live sessions.

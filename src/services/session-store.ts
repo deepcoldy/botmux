@@ -191,6 +191,16 @@ export function getSession(sessionId: string): Session | undefined {
 }
 
 /**
+ * Return a row only when it belongs to this process's currently-initialised
+ * bot store. Mutating daemon endpoints must use this instead of getSession(),
+ * whose cross-file fallback is intentionally read-only discovery.
+ */
+export function getOwnedSession(sessionId: string): Session | undefined {
+  load();
+  return sessions.get(sessionId);
+}
+
+/**
  * Search all session files for a session not found in the current file.
  *
  * Sessions are partitioned per-bot (sessions-<larkAppId>.json), but agent-

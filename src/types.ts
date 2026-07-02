@@ -142,6 +142,10 @@ export interface Session {
     memberEpoch: number;
   };
   title: string;
+  /** Last explicit title update. Undefined means the title is the legacy initial fallback. */
+  titleUpdatedAt?: string;
+  /** Informational origin label for UI/debugging, not a trusted audit identity. */
+  titleSource?: 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
   status: 'active' | 'closed';
   /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
    *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
@@ -284,7 +288,7 @@ export interface Session {
   cliSessionId?: string;
   /**
    * Set true when the idle-worker sweeper suspends this session over the per-bot
-   * live cap: the worker AND the backing tmux/herdr/zellij session (+ CLI) were
+   * live cap: the worker AND the backing tmux/herdr/zellij/zmx session (+ CLI) were
    * intentionally killed to reclaim memory, but the session stays `active` and
    * cold-resumes from its on-disk transcript on the next message. Distinguishes
    * this deliberate state from a real zombie (pane gone while the server runs):
@@ -311,7 +315,7 @@ export interface Session {
    */
   agentFrozen?: boolean;
   /**
-   * Session backend resolved AT SPAWN TIME (tmux/herdr/zellij/pty). Stamped on
+   * Session backend resolved AT SPAWN TIME (tmux/herdr/zellij/zmx/pty). Stamped on
    * fork so restore can resolve the backend authoritatively from the session
    * itself instead of re-deriving it from the live daemon default — which
    * changed when PTY stopped being an automatic fallback (default is now always

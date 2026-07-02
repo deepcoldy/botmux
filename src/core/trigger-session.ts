@@ -9,7 +9,7 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
-import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
+import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setActiveSessionIfActive } from './worker-pool.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
@@ -568,7 +568,15 @@ export async function triggerSessionTurn(
     newDs.pendingCodexAppText = codexAppText;
     newDs.pendingCodexAppApplicationContext = codexAppApplicationContext || undefined;
     newDs.pendingCodexAppMessageContext = codexAppMessageContext;
-    deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+    if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
+      await closeSession(session.sessionId);
+      return {
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: 'another active session claimed this target while the trigger was being prepared',
+      };
+    }
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
       ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
@@ -611,7 +619,15 @@ export async function triggerSessionTurn(
   // Register right before the fork branches (no await between here and forkWorker)
   // so a concurrent inbound message can't observe this session worker-less and
   // race a duplicate re-fork — the set-and-fork atomicity the original path had.
-  deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+  if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
+    await closeSession(session.sessionId);
+    return {
+      ok: false,
+      triggerId,
+      errorCode: 'trigger_failed',
+      error: 'session was closed while the trigger was being prepared',
+    };
+  }
   rememberInput(newDs, prompt, promptInput);
 
   if (req.options?.waitForFinalOutput) {

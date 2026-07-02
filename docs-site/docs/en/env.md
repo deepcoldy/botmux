@@ -9,7 +9,7 @@
 | `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP used in terminal links (for public/intranet-domain access, see [Web Terminal](/en/web-terminal)) |
 | `WEB_EXTERNAL_PORT` | _(local proxy port)_ | External port used in terminal links, overriding the local proxy port (`8800 + botIndex`) so a relay host can listen on a different port number; in a multi-bot setup it's the base port, with the actual port being `WEB_EXTERNAL_PORT + botIndex` (see [Web Terminal](/en/web-terminal)) |
 | `SESSION_DATA_DIR` | `~/.botmux/data` | Session and queue storage directory |
-| `BACKEND_TYPE` | _(auto-detect)_ | `pty` forces a downgrade to pure pty mode |
+| `BACKEND_TYPE` | `tmux` | Deployment-wide session backend: `tmux` / `herdr` / `zellij` / `zmx` / `pty`. `zmx` is explicit opt-in and requires >= 0.6.0; an unavailable persistent backend fails closed instead of falling back to PTY; `pty` is an explicit emergency option only |
 | `BOTMUX_FORWARD_FOLLOWUP_WAIT_MS` | `1500` | Milliseconds to hold a new topic for a root-linked clarification from the same user in the same chat; `0` disables it, maximum `10000` |
 | `DEBUG` | _(unset)_ | Set to `1` to enable debug logging |
 | `GITHUB_TOKEN` | _(unset)_ | Auth token for GitHub Releases API requests made by botmux itself, including dashboard changelog, update checks, and restart-report. Takes precedence over `GH_TOKEN`. |
@@ -27,6 +27,7 @@
 | `BOTMUX_DASHBOARD_EXTERNAL_HOST` | `WEB_EXTERNAL_HOST` or auto-detect | Host used in URLs the CLI prints |
 | `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | Each daemon's IPC port = base + botIndex |
 | `BOTMUX_WORKFLOW_RUNS_DIR` | `~/.botmux/workflow-runs` | Workflow run storage directory |
+| `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | Allow tokenless access to the Dashboard's allow-listed read-only APIs / SSE. Once this switch has been saved in Dashboard Settings, the value persisted in `~/.botmux/config.json` takes precedence over this environment variable |
 
 ## File locations
 

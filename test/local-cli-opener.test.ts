@@ -140,6 +140,25 @@ describe('local-cli-opener', () => {
     expect(adapterFactory).not.toHaveBeenCalled();
   });
 
+  it('attach mode opens a managed ZMX session with an existing-only guard', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/zmx socket');
+    vi.stubEnv('ZMX_SESSION', 'outer');
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: { ...ds().session, sessionId: 'abcdef123456', backendType: 'zmx', cliSessionId: undefined },
+    }), { mode: 'attach', adapterFactory });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.command).toContain('unset ZMX_SESSION ZMX_SESSION_PREFIX');
+      expect(result.command).toContain("export ZMX_DIR='/tmp/zmx socket'");
+      expect(result.command).toContain("grep -Fqx -- 'bmx-abcdef12'");
+      expect(result.command).toContain("exec zmx attach 'bmx-abcdef12' /bin/sh -c 'exit 75'");
+    }
+    expect(adapterFactory).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
   it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {
     const result = buildLocalCliOpenCommand(ds({
       adoptedFrom: { source: 'herdr', herdrSessionName: 'dev', herdrTerminalId: 'terminal_1', cwd: '/repo' },

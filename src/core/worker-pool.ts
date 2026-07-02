@@ -34,6 +34,7 @@ import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentR
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
+import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
@@ -279,6 +280,19 @@ export function isRelayableRealSession(ds: DaemonSession): boolean {
   if (ds.session.cliId) return true;
   if (ds.session.lastCliInput) return true;
   return false;
+}
+
+/** A worker-less row that never represented a CLI and carries no deferred
+ * user intent. Only this narrow class is safe to evict as command scaffolding. */
+export function isDisposableCommandScratch(ds: DaemonSession): boolean {
+  return !ds.worker
+    && !ds.pendingRepo
+    && ds.pendingPrompt === undefined
+    && ds.pendingRawInput === undefined
+    && !ds.adoptedFrom
+    && !ds.session.adoptedFrom
+    && !ds.session.queued
+    && !isRelayableRealSession(ds);
 }
 
 // Per-bot opt-out: when true, botmux never posts/patches the live streaming
@@ -1302,7 +1316,7 @@ export function killWorker(ds: DaemonSession): void {
   ds.managedTurnOrigin = undefined;
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
-    // tears down the persistent backing session (tmux/herdr/zellij) — never
+    // tears down the persistent backing session (tmux/herdr/zellij/zmx) — never
     // fires. Those sessions survive a worker exit BY DESIGN (idle-suspend /
     // lazy-restore keep the CLI alive for later resume), so /close on such a
     // session would leave an orphaned CLI running in tmux that still replies.
@@ -1327,7 +1341,7 @@ export function killWorker(ds: DaemonSession): void {
 }
 
 /**
- * Tear down a persistent backing session (tmux/herdr/zellij) directly from the
+ * Tear down a persistent backing session (tmux/herdr/zellij/zmx) directly from the
  * daemon when there is no live worker to do it via the 'close' IPC. The session
  * name is deterministic from the session UUID, and each killSession() is a no-op
  * if the session is already gone.
@@ -1461,6 +1475,93 @@ function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number
 
 // ─── Idempotent session close (dashboard IPC) ───────────────────────────────
 
+type DocCommentReplyTarget = {
+  fileToken: string;
+  fileType: string;
+  commentId: string;
+  replyToOpenId?: string;
+  replyToName?: string;
+  replyId?: string;
+  reactionId?: string;
+};
+
+function persistedDocCommentTarget(
+  session: Session,
+  turnId: string,
+): DocCommentReplyTarget | undefined {
+  return session.docCommentTargets?.[turnId];
+}
+
+/** Resolve the daemon-local target first, but fill cleanup identifiers from
+ * the persisted per-turn route. After a daemon restart only the latter exists. */
+function resolveDocCommentTarget(
+  ds: DaemonSession,
+  turnId: string,
+): DocCommentReplyTarget | undefined {
+  const memory = ds.docCommentTurns?.get(turnId);
+  const persisted = persistedDocCommentTarget(ds.session, turnId);
+  if (!memory) return persisted;
+  if (!persisted) return memory;
+  return {
+    ...persisted,
+    ...memory,
+    replyId: memory.replyId ?? persisted.replyId,
+    reactionId: memory.reactionId ?? persisted.reactionId,
+  };
+}
+
+/** Consume one successfully-delivered document turn from both runtime and
+ * persisted state. Persistence is best-effort: a reply that already landed
+ * must never be retried (and duplicated) merely because local cleanup failed. */
+function consumeDocCommentTurn(ds: DaemonSession, turnId: string): void {
+  if (ds.docCommentTurns) {
+    ds.docCommentTurns.delete(turnId);
+    if (ds.docCommentTurns.size === 0) ds.docCommentTurns = undefined;
+  }
+  const targets = ds.session.docCommentTargets;
+  if (targets?.[turnId]) {
+    delete targets[turnId];
+    if (Object.keys(targets).length === 0) ds.session.docCommentTargets = undefined;
+    try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
+  }
+}
+
+function collectDocCommentReactionTargets(
+  ds: DaemonSession | undefined,
+  stored: Session | undefined,
+): DocCommentReplyTarget[] {
+  const unique = new Map<string, DocCommentReplyTarget>();
+  const add = (target: DocCommentReplyTarget): void => {
+    if (!target.replyId || !target.reactionId) return;
+    const key = `${target.fileToken}\0${target.commentId}\0${target.replyId}\0${target.reactionId}`;
+    unique.set(key, target);
+  };
+  if (ds?.docCommentTurns) {
+    for (const target of ds.docCommentTurns.values()) add(target);
+  }
+  for (const target of Object.values(ds?.session.docCommentTargets ?? {})) add(target);
+  if (stored && stored !== ds?.session) {
+    for (const target of Object.values(stored.docCommentTargets ?? {})) add(target);
+  }
+  return [...unique.values()];
+}
+
+function clearAllDocCommentTurnState(ds: DaemonSession | undefined, stored: Session | undefined): void {
+  if (ds) {
+    ds.docCommentTurns = undefined;
+    ds.session.docCommentTargets = undefined;
+  }
+  if (stored && stored !== ds?.session) stored.docCommentTargets = undefined;
+}
+
+function sessionAnchorForStoredRow(session: Session): string {
+  return session.scope === 'chat' ? session.chatId : session.rootMessageId;
+}
+
+function isLegacyApiDocSubscription(managedBy: 'subscribe-lark-doc' | 'watch-comment' | undefined): boolean {
+  return managedBy === undefined || managedBy === 'subscribe-lark-doc';
+}
+
 /**
  * Idempotent close: kill worker if alive, mark Session status='closed' + closedAt,
  * publish session.exited (if a live worker was killed) and session.update
@@ -1471,12 +1572,28 @@ function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number
  */
 export async function closeSession(
   sessionId: string,
-): Promise<{ ok: true; alreadyClosed: boolean }> {
+): Promise<{ ok: true; alreadyClosed: boolean; known: boolean }> {
   const ds = findActiveBySessionId(sessionId);
   let killedLive = false;
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
+  // Snapshot ownership + transition state before mutating the live object:
+  // sessionStore commonly holds the very same Session reference as `ds`.
+  const stored = sessionStore.getOwnedSession(sessionId);
+  const known = !!ds || !!stored;
+  const wasOpen = !!stored && stored.status !== 'closed';
+  const storedHadDocCommentTargets = Object.keys(stored?.docCommentTargets ?? {}).length > 0;
+  const docReactionTargets = collectDocCommentReactionTargets(ds, stored);
+  // Per-turn comment routes are transient capabilities. Clear them from both
+  // live and owner-scoped persisted objects inside the synchronous close
+  // critical section, before any best-effort Lark cleanup can yield.
+  clearAllDocCommentTurnState(ds, stored);
+  // An idempotent re-close has no status transition for closeSession() to
+  // persist, but stale per-turn capabilities must still be removed on disk.
+  if (stored && !wasOpen && storedHadDocCommentTargets) {
+    sessionStore.updateSession(stored);
+  }
   if (ds) {
     // Usage ledger: flush the final delta before the worker goes away (a
     // crash/limited turn may never have reached an idle edge).
@@ -1499,6 +1616,11 @@ export async function closeSession(
       logger.warn(`[doc-comment] cleanup on close failed for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
     }
     activeSessionsRegistry?.delete(activeSessionKey(ds));
+    // Mark the captured object too. Async message/card paths may already hold a
+    // reference to `ds`; deleting only the registry entry would not stop one of
+    // those continuations from re-forking the closed session after its await.
+    ds.session.status = 'closed';
+    ds.session.closedAt ??= new Date().toISOString();
     killedLive = true;
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
@@ -1511,11 +1633,19 @@ export async function closeSession(
   }
 
   // Persistence path — load → mark closed → save (delegated to sessionStore).
-  const stored = sessionStore.getSession(sessionId);
-  const wasOpen = !!stored && stored.status !== 'closed';
+  // Mutations are bot-owner scoped. getSession() has a read-only cross-file
+  // fallback for agent CLI discovery; using it here lets the wrong daemon see
+  // another bot's active row, report a false successful close, then write only
+  // its own file (a no-op). The CLI relies on alreadyClosed to decide whether a
+  // legacy local fallback is safe, so owner proof must be real.
   if (wasOpen) {
+    if (!ds && stored) destroyUnregisteredPersistentBacking(stored);
     sessionStore.closeSession(sessionId);
-    const after = sessionStore.getSession(sessionId);
+    const after = sessionStore.getOwnedSession(sessionId);
+    if (ds) {
+      ds.session.status = 'closed';
+      ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
+    }
     dashboardEventBus.publish({
       type: 'session.update',
       body: {
@@ -1529,16 +1659,101 @@ export async function closeSession(
     });
   }
 
+  // All authoritative map/status/store/event state above transitions
+  // synchronously, before the first await. Lark reaction/unsubscribe cleanup is
+  // best-effort and can be slow; it must not leave a resurrection window.
+  const cleanupAppId = ds?.larkAppId ?? stored?.larkAppId;
+  if (cleanupAppId) {
+    for (const target of docReactionTargets) {
+      try {
+        await removeCommentReaction(
+          cleanupAppId,
+          { fileToken: target.fileToken, fileType: target.fileType },
+          target.commentId,
+          target.replyId!,
+          target.reactionId!,
+        );
+      } catch (err: any) {
+        logger.debug(
+          `[doc-comment] close cleanup could not remove reaction ${target.reactionId}: ${err?.message ?? err}`,
+        );
+      }
+    }
+
+    const anchor = ds ? sessionAnchorId(ds) : stored ? sessionAnchorForStoredRow(stored) : undefined;
+    let subs: ReturnType<typeof listDocSubscriptionsForSession> = [];
+    try {
+      if (anchor) {
+        subs = listDocSubscriptionsForSession(config.session.dataDir, cleanupAppId, anchor);
+      }
+    } catch (err: any) {
+      logger.warn(`[doc-comment] failed to list bindings on close for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
+    }
+    for (const sub of subs) {
+      try {
+        // `/subscribe-lark-doc` (and pre-managedBy legacy rows) owns a
+        // per-file remote subscription. `/watch-comment` is app-level event /
+        // poller state and must only remove its local routing binding.
+        if (isLegacyApiDocSubscription(sub.managedBy)) {
+          await unsubscribeDocFile(cleanupAppId, { fileToken: sub.fileToken, fileType: sub.fileType });
+        }
+      } catch (err: any) {
+        logger.warn(
+          `[doc-comment] remote unsubscribe failed for ${sub.fileToken.slice(0, 12)} on close: ${err?.message ?? err}`,
+        );
+      } finally {
+        // Local ownership must always be released, even when one remote API
+        // call fails; each item is isolated so later bindings still clean up.
+        try {
+          removeDocSubscription(config.session.dataDir, cleanupAppId, sub.fileToken);
+        } catch (err: any) {
+          logger.warn(
+            `[doc-comment] local binding removal failed for ${sub.fileToken.slice(0, 12)} on close: ${err?.message ?? err}`,
+          );
+        }
+      }
+    }
+    if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → removed ${subs.length} doc binding(s)`);
+  }
+
   // alreadyClosed = nothing happened on either path.
   const alreadyClosed = !killedLive && !wasOpen;
-  return { ok: true, alreadyClosed };
+  return { ok: true, alreadyClosed, known };
 }
 
 /**
- * Set an entry on an active-sessions Map, but if the key is already occupied
- * by a DIFFERENT DaemonSession, close that occupant first. Replaces bare
- * `activeSessions.set(key, ds)` at sites where a silent overwrite would leak
- * the prior entry's worker + leave its store row stuck in `status='active'`.
+ * Close can arrive through daemon IPC before startup restore has registered the
+ * persisted row. In that window there is no DaemonSession for killWorker(), but
+ * a stamped persistent backing may still be running. Tear down only backends
+ * whose ownership is explicit; never touch adopted user panes, queued rows, or
+ * legacy rows whose backend is unknown.
+ */
+export function destroyUnregisteredPersistentBacking(
+  session: Session,
+  kill: typeof killPersistentSession = killPersistentSession,
+): boolean {
+  if (session.adoptedFrom || session.queued) return false;
+  const backendType = session.backendType;
+  if (!isSuspendableBackendType(backendType)) return false;
+  const backendName = persistentSessionName(backendType, session.sessionId);
+  try {
+    kill(backendType, backendName);
+    logger.info(`[${session.sessionId.substring(0, 8)}] Closed unregistered ${backendType} backing ${backendName}`);
+    return true;
+  } catch (err) {
+    logger.warn(
+      `[${session.sessionId.substring(0, 8)}] Failed to close unregistered ${backendType} backing ${backendName}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Compare-and-set an entry on an active-sessions Map. A different current
+ * occupant always wins; callers must roll back the rejected incoming row.
+ * Replaces bare `activeSessions.set(key, ds)` at sites where a silent overwrite
+ * would leak the prior entry's worker + leave its store row stuck active.
  *
  * The Map is passed explicitly so callers operate on the same instance they
  * already hold (restoreActiveSessions takes the daemon's Map as a parameter;
@@ -1546,28 +1761,78 @@ export async function closeSession(
  * both refer to the same object — the daemon registers its Map at boot — but
  * decoupling avoids module-state assumptions in tests.
  *
- * Canonical collision case: restoreActiveSessions at daemon boot iterating
- * two on-disk active sessions that resolve to the same chat-scope key (e.g.
- * a /relay command's scratch session + the real session that was transferred
- * into the same chat by a prior daemon run). Without this helper the later
- * iterated entry silently wins, the earlier one becomes a ghost-active.
- *
- * Setting the same `ds` at its own key is a no-op (no close).
+ * Registration is compare-and-set: a different current occupant always wins.
+ * The caller owns rollback of its rejected incoming row. This is deliberately
+ * non-destructive because the occupant may be a fresh live session created
+ * while an older async restore/create continuation was in flight.
  */
+function removeInactiveRegistration(
+  map: Map<string, DaemonSession>,
+  key: string,
+  ds: DaemonSession,
+): boolean {
+  if (ds.session.status === 'active') return false;
+  // Only remove our exact stale object. A newer session may already own the
+  // same routing key and must never be evicted by this continuation.
+  if (map.get(key) === ds) map.delete(key);
+  logger.warn(
+    `[${tag(ds)}] Refusing to register an inactive session ` +
+    `(status=${ds.session.status})`,
+  );
+  return true;
+}
+
+/**
+ * Synchronous registration gate for creation paths that previously used a
+ * bare Map.set(). A daemon close can update the shared Session object while
+ * the creator is awaiting Lark/project metadata; never publish that now-closed
+ * row back into the live routing map when the continuation resumes.
+ */
+export function setActiveSessionIfActive(
+  map: Map<string, DaemonSession>,
+  key: string,
+  ds: DaemonSession,
+): boolean {
+  if (removeInactiveRegistration(map, key, ds)) return false;
+  const current = map.get(key);
+  if (current && current !== ds) {
+    logger.warn(
+      `[${tag(ds)}] Refusing to overwrite active routing occupant ` +
+      `${current.session.sessionId.substring(0, 8)}`,
+    );
+    return false;
+  }
+  map.set(key, ds);
+  return true;
+}
+
 export async function setActiveSessionSafe(
   map: Map<string, DaemonSession>,
   key: string,
   ds: DaemonSession,
-): Promise<void> {
-  const prev = map.get(key);
-  if (prev && prev !== ds) {
-    logger.warn(
-      `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
-      `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
-    );
-    await closeSession(prev.session.sessionId);
-  }
-  map.set(key, ds);
+): Promise<boolean> {
+  return setActiveSessionIfActive(map, key, ds);
+}
+
+/**
+ * Roll back a freshly-created row rejected by the registration CAS, then read
+ * the routing winner *after* that asynchronous rollback finishes.
+ *
+ * Message handlers use this to hand an already-deduped inbound event to a
+ * concurrent HTTP/dashboard/restore winner instead of silently dropping it.
+ * The post-await lookup matters: close cleanup must never return a stale object
+ * that another continuation replaced while the rollback was in flight.
+ */
+export async function rollbackRejectedSessionAndGetWinner(
+  map: Map<string, DaemonSession>,
+  key: string,
+  rejected: DaemonSession,
+  rollback: (sessionId: string) => Promise<unknown> = closeSession,
+): Promise<DaemonSession | undefined> {
+  await rollback(rejected.session.sessionId);
+  const winner = map.get(key);
+  if (!winner || winner === rejected || winner.session.status !== 'active') return undefined;
+  return winner;
 }
 
 // ─── Session transfer (cross-chat relay) ────────────────────────────────────
@@ -1658,6 +1923,31 @@ export async function transferSession(
   const sourceAnchor = sessionAnchorId(ds);
   const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
   if (targetAnchor === sourceAnchor) return { ok: false, error: 'same_anchor' };
+  const sourceKey = sessionKey(sourceAnchor, ds.larkAppId);
+  const targetKey = sessionKey(targetAnchor, ds.larkAppId);
+  const validateSourceIdentity = (): { ok: false; error: string } | undefined => {
+    if (
+      ds.session.status !== 'active'
+      || activeSessionsRegistry?.get(sourceKey) !== ds
+    ) {
+      return { ok: false, error: 'session_not_active' };
+    }
+    return undefined;
+  };
+  const validateAfterAwait = (): { ok: false; error: string } | undefined => {
+    const sourceError = validateSourceIdentity();
+    if (sourceError) return sourceError;
+    const targetOccupant = activeSessionsRegistry?.get(targetKey);
+    if (targetOccupant && targetOccupant !== ds) {
+      return { ok: false, error: 'target_chat_has_session' };
+    }
+    return undefined;
+  };
+  // The initial target scan below intentionally permits worker-less command
+  // scratches and closes them. At entry only validate source ownership; after
+  // those awaited closes the strict validator requires the target to be empty.
+  const initialStateError = validateSourceIdentity();
+  if (initialStateError) return initialStateError;
 
   // pendingRepo: the user created a session via M0 but hasn't picked a repo
   // yet, so worker is null and the CLI has never run. Relaying produces an
@@ -1712,7 +2002,7 @@ export async function transferSession(
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
       if (sessionAnchorId(existing) !== targetAnchor) continue;
-      if (!existing.worker) {
+      if (isDisposableCommandScratch(existing)) {
         scratchesToClose.push(existing.session.sessionId);
         continue;
       }
@@ -1722,6 +2012,8 @@ export async function transferSession(
   for (const sid of scratchesToClose) {
     await closeSession(sid);
   }
+  const postScratchStateError = validateAfterAwait();
+  if (postScratchStateError) return postScratchStateError;
 
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
   const kw = opts?.killWorkerImpl ?? killWorker;
@@ -1753,6 +2045,8 @@ export async function transferSession(
     } catch (err) {
       logger.warn(`[${tagPrefix}] freeze source-chat card failed: ${err instanceof Error ? err.message : err}`);
     }
+    const postFreezeStateError = validateAfterAwait();
+    if (postFreezeStateError) return postFreezeStateError;
   }
 
   // Detach worker — TmuxBackend.kill() does NOT destroy the tmux session, so
@@ -1791,7 +2085,9 @@ export async function transferSession(
 
   const newAnchor = sessionAnchorId(ds);
   if (activeSessionsRegistry) {
-    await setActiveSessionSafe(activeSessionsRegistry, sessionKey(newAnchor, ds.larkAppId), ds);
+    if (!setActiveSessionIfActive(activeSessionsRegistry, sessionKey(newAnchor, ds.larkAppId), ds)) {
+      return { ok: false, error: 'session_not_active' };
+    }
   }
 
   dashboardEventBus.publish({
@@ -1827,6 +2123,20 @@ export async function transferSession(
 function resolvesToHome(p: string): boolean {
   try { return realpathSync(p) === realpathSync(homedir()); }
   catch { return p === homedir(); }
+}
+
+function canForkRegisteredSession(ds: DaemonSession): boolean {
+  const key = activeSessionKey(ds);
+  const registered = activeSessionsRegistry ? activeSessionsRegistry.get(key) : ds;
+  if (ds.session.status === 'active' && registered === ds) return true;
+  if (activeSessionsRegistry && ds.session.status !== 'active' && registered === ds) {
+    activeSessionsRegistry.delete(key);
+  }
+  logger.warn(
+    `[${tag(ds)}] Refusing to fork a closed or superseded session ` +
+    `(status=${ds.session.status}, registered=${registered === ds})`,
+  );
+  return false;
 }
 
 function codexAppInputForSession(
@@ -1893,6 +2203,7 @@ export function forkWorker(
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
     return;
   }
+  if (!canForkRegisteredSession(ds)) return;
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
@@ -2915,6 +3226,13 @@ function setupWorkerHandlers(
           logger.info(`[${t}] Managed/silent turn — TUI prompt kept in dashboard/audit only`);
           break;
         }
+        // Document-native sessions have no Lark chat/thread destination. Keep
+        // the dashboard/lifecycle attention state above, but never send a card
+        // to their internal `doc:<token>` routing anchor.
+        if (isDocNativeSession(ds)) {
+          logger.info(`[${t}] Doc-native session — suppressing TUI prompt card`);
+          break;
+        }
         try {
           const cardJson = buildTuiPromptCard(
             sessionAnchorId(ds),
@@ -3575,7 +3893,7 @@ function deliverFinalOutput(
     try {
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
-      const docTurn = managedReceiver ? undefined : ds.docCommentTurns?.get(msg.turnId);
+      const docTurn = managedReceiver ? undefined : resolveDocCommentTarget(ds, msg.turnId);
       if (docTurn) {
         // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
@@ -3583,20 +3901,36 @@ function deliverFinalOutput(
         for (let i = 0; i < chunks.length; i++) {
           await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
         }
-        // 清理 "Typing" reaction（bot 已回复完毕）。
-        if (docTurn.reactionId && docTurn.replyId) {
-          await removeCommentReaction(ds.larkAppId,
-            { fileToken: docTurn.fileToken, fileType: docTurn.fileType },
-            docTurn.commentId, docTurn.replyId, docTurn.reactionId);
-        }
-        ds.docCommentTurns?.delete(msg.turnId);
-        // 同步清理磁盘上的 per-turn 落点，避免 session 文件堆积。
-        if (ds.session.docCommentTargets && ds.session.docCommentTargets[msg.turnId]) {
-          delete ds.session.docCommentTargets[msg.turnId];
-          try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
-        }
+        // The user-visible reply is committed. Consume the route and dedupe
+        // marker BEFORE best-effort reaction cleanup: a missing/expired
+        // reaction must never retry and duplicate the document comment.
+        consumeDocCommentTurn(ds, msg.turnId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        if (docTurn.reactionId && docTurn.replyId) {
+          try {
+            await removeCommentReaction(ds.larkAppId,
+              { fileToken: docTurn.fileToken, fileType: docTurn.fileType },
+              docTurn.commentId, docTurn.replyId, docTurn.reactionId);
+          } catch (err: any) {
+            logger.debug(
+              `[doc-comment] failed to remove completed reaction ${docTurn.reactionId}: ${err?.message ?? err}`,
+            );
+          }
+        }
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        return;
+      }
+
+      // A doc-native session has a virtual `doc:<token>` chat anchor, not a
+      // Feishu chat/thread. If its per-turn target is missing or corrupt there
+      // is no safe fallback destination; suppress instead of trying to post an
+      // interactive card to the virtual id.
+      if (isDocNativeSession(ds)) {
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        logger.error(
+          `[${t}] Suppressed doc-native final_output without comment target ` +
+          `(turn ${msg.turnId.substring(0, 8)})`,
+        );
         return;
       }
 
@@ -3817,6 +4151,7 @@ export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
 export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
+  if (!canForkRegisteredSession(ds)) return;
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
@@ -4150,8 +4485,19 @@ export function reapOrphanWorkers(opts: {
 
 // ─── Kill stale PIDs ────────────────────────────────────────────────────────
 
-export function killStalePids(activeSessions_: Session[]): void {
+export function killStalePids(
+  activeSessions_: Session[],
+  runtimeSessions?: ReadonlyMap<string, DaemonSession>,
+): void {
+  // Startup restore runs concurrently with the already-live dispatcher. A
+  // message may create/register a fresh worker for a snapshot row before this
+  // stale-process sweep starts. Treat the runtime registry as authoritative:
+  // never signal the PID of any logical session that is already registered.
+  const runtimeSessionIds = new Set(
+    runtimeSessions ? [...runtimeSessions.values()].map(ds => ds.session.sessionId) : [],
+  );
   for (const session of activeSessions_) {
+    if (runtimeSessionIds.has(session.sessionId)) continue;
     if (!session.pid) continue;
     try {
       // Check if process exists (signal 0 doesn't kill, just checks)
@@ -4170,32 +4516,44 @@ export function killStalePids(activeSessions_: Session[]): void {
 
   cleanupPersistentBackendSessions('tmux', activeSessions_);
   cleanupPersistentBackendSessions('herdr', activeSessions_);
+  cleanupPersistentBackendSessions('zmx', activeSessions_);
 }
 
-function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeSessions_: Session[]): void {
+function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr' | 'zmx', activeSessions_: Session[]): void {
+  const storedSessions = sessionStore.listSessions();
   const anyBackend = getAllBots().some(b => (b.config.backendType ?? config.daemon.backendType) === backendType)
-    || config.daemon.backendType === backendType;
+    || config.daemon.backendType === backendType
+    || activeSessions_.some(s => s.backendType === backendType)
+    || storedSessions.some(s => s.backendType === backendType);
   if (!anyBackend) return;
 
-  const backend = backendType === 'tmux' ? TmuxBackend : HerdrBackend;
+  const backend = backendType === 'tmux' ? TmuxBackend : backendType === 'zmx' ? ZmxBackend : HerdrBackend;
   const multiBot = getAllBots().length > 1;
   const cliIdFile = join(config.session.dataDir, backendType === 'tmux' ? 'last-cli-id' : `last-cli-id-${backendType}`);
   let lastCliId: string | undefined;
   try { lastCliId = readFileSync(cliIdFile, 'utf-8').trim(); } catch { /* first run */ }
   const currentCliId = config.daemon.cliId;
+  const belongsToBackend = (session: Session) =>
+    session.backendType === backendType ||
+    (session.backendType === undefined && backendType === 'tmux');
+  const activeNames = new Set(
+    activeSessions_.filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
+  );
+  const ownedNames = new Set([
+    ...storedSessions.filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
+    ...activeNames,
+  ]);
 
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
     for (const name of backend.listBotmuxSessions()) {
+      // ZMX_DIR is a user-wide namespace and bmx-* is deterministic, not an
+      // ownership credential. Another checkout/data root can legitimately own
+      // a bmx-* daemon, so never kill a name absent from this bot's store/map.
+      if (backendType === 'zmx' && !ownedNames.has(name)) continue;
       backend.killSession(name);
     }
   } else {
-    const activeNames = new Set(
-      activeSessions_.map(s => backend.sessionName(s.sessionId)),
-    );
-    const ownedNames = new Set(
-      sessionStore.listSessions().map(s => backend.sessionName(s.sessionId)),
-    );
     for (const name of backend.listBotmuxSessions()) {
       if (ownedNames.has(name) && !activeNames.has(name)) {
         logger.info(`Killing orphaned ${backendType} session: ${name}`);
@@ -4203,6 +4561,7 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
       }
     }
     for (const session of activeSessions_) {
+      if (!belongsToBackend(session)) continue;
       const sessionCliId = session.cliId;
       if (!sessionCliId || !session.larkAppId) continue;
       let botCliId: CliId | undefined;

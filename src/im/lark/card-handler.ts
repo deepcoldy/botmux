@@ -566,6 +566,7 @@ export async function commitRepoSelection(
     // the displaced session's stored workingDir (and the closed card), so
     // `claude --resume` later would reopen the old context in the new repo's
     // cwd. The new repo is pinned onto the fresh session below instead.
+    const oldSession = ds.session;
     const closedCard = buildClosedSessionCard(ds, locTarget);
 
     killWorker(ds);
@@ -586,7 +587,13 @@ export async function commitRepoSelection(
       () => sessionReply(rootId, closedCard, 'interactive'),
     );
 
-    const oldSession = ds.session;
+    // The close card delivery yields to inbound routing and dashboard IPC. If
+    // the user closed/replaced this generation during that await, do not mint a
+    // fresh active row from the stale continuation.
+    if (!sessionStillActive() || ds.session !== oldSession) {
+      logger.warn(`[${tag(ds)}] Repo switch cancelled after old-session close; routing generation changed during card delivery`);
+      return;
+    }
     // `rootId` is the routing anchor. For chat-scope sessions it is the
     // `oc_...` chat id, not the traceable `om_...` message root stored on
     // Session. Preserve the old identity and explicitly persist scope so card
@@ -1240,23 +1247,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // collectRelayPickerEntries already filters scratches at render time,
     // but a stale picker (rendered before a scratch was created) could
     // still produce a confirm click; this is the depth defense.
-    {
-      const { isRelayableRealSession } = await import('../../core/worker-pool.js');
-      if (!isRelayableRealSession(sourceDs)) {
-        return { toast: { type: 'error', content: t('card.relay.toast_not_started_yet', undefined, loc) } };
-      }
+    const { isDisposableCommandScratch, isRelayableRealSession } = await import('../../core/worker-pool.js');
+    if (!isRelayableRealSession(sourceDs)) {
+      return { toast: { type: 'error', content: t('card.relay.toast_not_started_yet', undefined, loc) } };
     }
     // Pre-flight target-chat conflict check — done BEFORE sendMessage M1 so
     // a refusal doesn't leave a misleading "已接力" announcement in the
     // target chat (王皓 caught this in testing). Mirror the same predicate
-    // transferSession uses, plus the `!!worker` filter that excludes daemon
-    // command scratch sessions (e.g. the /relay command's own session,
-    // which shares the bot's larkAppId + chatId but has no worker).
+    // transferSession uses. Only a narrowly classified daemon-command scratch
+    // may be ignored; worker-less queued/adopt/deferred/real sessions still own
+    // the anchor and must block before a misleading M1 is sent.
     const targetConflict = [...activeSessions.values()].find(c =>
       c !== sourceDs
       && c.larkAppId === larkAppId
       && sessionAnchorId(c) === targetAnchor
-      && !!c.worker
+      && !isDisposableCommandScratch(c)
     );
     if (targetConflict) {
       const conflictTitle = targetConflict.session.title || targetConflict.session.sessionId.substring(0, 8);
@@ -1692,6 +1697,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, locDsResume));
         } else if (result.error === 'deferred_unmaterialized') {
           await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, locDsResume));
+        } else if (result.error === 'resume_cancelled') {
+          await sessionReply(rootId, t('card.action.resume_cancelled', undefined, locDsResume));
         }
       }
     }

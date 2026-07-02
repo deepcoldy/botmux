@@ -3962,7 +3962,7 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/backend-type — proxy to that bot's daemon. Body
-    // `{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'' }` ('' / 'auto' clears the override).
+    // `{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'' }` ('' / 'auto' clears the override).
     let mBotBackendType: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotBackendType = url.pathname.match(/^\/api\/bots\/([^/]+)\/backend-type$/))) {
       const appId = decodeURIComponent(mBotBackendType[1]);

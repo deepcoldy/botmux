@@ -56,7 +56,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
-| Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
+| Terminal Access | tmux / ZMX attach directly into the CLI process, same as local dev experience | No direct terminal access |
 | Installation | `npm install -g botmux`, 5-min Lark setup | Easy to install, but more configuration needed |
 
 ---
@@ -67,6 +67,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 - **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), `kimi` (Kimi Code), `grok` (Grok Build), or `kiro-cli` (Kiro) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
+- **zmx** >= 0.6.0 (optional, macOS / Linux; explicitly opt in with `backendType: "zmx"` or `BACKEND_TYPE=zmx`; botmux never installs or selects it automatically)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
   - macOS: ships with PingFang / Hiragino, no action needed
   - Debian/Ubuntu: daemon will background-install `fonts-noto-cjk fonts-noto-color-emoji` on first boot if missing (requires passwordless sudo or running as root; restart the daemon after install)
@@ -292,6 +293,18 @@ BACKEND_TYPE=pty botmux start
 | `/close` or close button | Destroyed | Terminated (SIGHUP) |
 | CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
 
+### ZMX Session Backend (Explicit Opt-In)
+
+[ZMX](https://github.com/neurosnap/zmx) is a lightweight persistent-session alternative to tmux. botmux drives it through one real `zmx attach` PTY (not a `tail` / `send` side channel). The deterministic session name is `bmx-<first 8 chars of sessionId>`, so raw ANSI, terminal sizing, input, and the re-attach snapshot all travel over the same I/O path.
+
+- macOS and Linux are supported, with **zmx >= 0.6.0** required. Install with Homebrew using `brew install neurosnap/tap/zmx`; on other hosts, download the matching prebuilt binary from the [official ZMX project](https://github.com/neurosnap/zmx#install) and put it on `PATH`. botmux **does not install ZMX or select it automatically**.
+- Prefer `"backendType": "zmx"` in one bot's `bots.json` entry; use `BACKEND_TYPE=zmx botmux start` to select it deployment-wide. A missing binary, unsupported version, or failed `zmx list` probe **fails closed** and never silently falls back to PTY.
+- Across a daemon restart, the ZMX session and CLI stay alive and botmux re-attaches. If the backing session is gone, botmux retains the recoverable record and lazily resumes it on the next message. `/close` explicitly destroys the ZMX session and terminates the CLI.
+- `botmux list` shows these sessions and Enter attaches in place. On a macOS daemon, you can also explicitly enable **Native CLI opening** in Dashboard settings and use the card button to attach to the same ZMX session.
+- The ZMX backend does not support `/adopt` and cannot enforce botmux's file sandbox or read isolation. A per-bot/global sandbox, or the standalone effective `readIsolation` mode on macOS, is rejected with an actionable notification. On Linux, the bare legacy `readIsolation` flag is a no-op under the worker's unified semantics and does not incorrectly gate ZMX; enable the sandbox and use tmux / PTY when isolation is required.
+
+See the [ZMX backend documentation](https://deepcoldy.github.io/botmux/en/zmx) for the complete operating and troubleshooting notes.
+
 ### Session Adopt
 
 Seamlessly connect Botmux to CLI processes already running in tmux — monitor and interact from your phone via Lark.
@@ -354,6 +367,8 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
   - Create, run, save, and reuse workflows in Lark with natural language or `/workflow`; the v2 Dashboard/Catalog has been retired
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
+
+Dashboard `GET /api/sessions` and SSE `GET /events` expose the optional `backendType`, `backendSessionName`, `titleUpdatedAt`, and `titleSource` fields on session rows/events. `backendSessionName` is only a deterministic name derived from the session id; it is **not proof of liveness**. `titleSource` is display/debug metadata, **not an authenticated caller identity**. When `publicReadOnly` is enabled, these two read surfaces are accessible without a token; every mutation, non-allow-listed read, and raw terminal log still requires the current token issued by `botmux dashboard`. If session metadata should not be visible on the network, turn off **Public read-only** in Dashboard settings (or set `BOTMUX_DASHBOARD_PUBLIC_READONLY=false` before the UI has persisted an override) and enforce access with a firewall or reverse proxy.
 
 ---
 

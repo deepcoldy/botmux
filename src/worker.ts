@@ -40,7 +40,7 @@ import {
   type IsolationCapability,
   type V2IsolationContext,
 } from './adapters/cli/read-isolation.js';
-import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
+import { killPersistentSession, probePersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -168,9 +168,16 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
+import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
-import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
+import {
+  backendGateUserMessage,
+  backendSandboxCompatibilityError,
+  backendSandboxCompatibilityUserMessage,
+  decideBackendGate,
+  selectSessionBackend,
+} from './adapters/backend/session-backend-selector.js';
 import {
   deriveRiffReposFromDirs,
   deriveRiffRepoFromWorkingDir,
@@ -192,8 +199,9 @@ import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
 } from './platform/device-paths.js';
-import type { BackendType, SessionBackend } from './adapters/backend/types.js';
+import type { BackendType, SessionBackend, SessionProbe } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
+import { probeZmxFunctional } from './setup/ensure-zmx.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
@@ -5751,16 +5759,19 @@ async function spawnCli(
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
   // worker re-probes the requested persistent backend here. A requested
-  // tmux/herdr/zellij backend that isn't functional NO LONGER silently
+  // tmux/herdr/zellij/zmx backend that isn't functional NO LONGER silently
   // degrades to raw PTY — that silent fallback was the root of the "secretly
   // running on PTY, then hitting all of PTY's problems" bug class. Instead we
   // refuse to spawn and post an actionable card (user_notify) telling the user
   // to install the backend, or to explicitly opt into PTY with BACKEND_TYPE=pty.
   //
-  // Existing botmux sessions stay authoritative over the disposable "can we
-  // create a new server?" probe: a live session reattaches regardless of a
-  // transient probe failure (PR#249), so it's exempt from the gate.
+  // Existing botmux sessions stay authoritative over a separate capability
+  // probe: a live session reattaches regardless of a transient probe failure
+  // (PR#249), so it is exempt from the gate. tmux/zellij use disposable
+  // sessions; ZMX validates its version plus full-list control plane; Herdr
+  // uses a non-destructive version check.
   let effectiveBackend = cfg.backendType;
+  let resolvedZmxSessionProbe: SessionProbe | undefined;
   {
     let available = true;
     let reason = '';
@@ -5781,6 +5792,19 @@ async function spawnCli(
         available = ZellijBackend.isAvailable();
         reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
       }
+    } else if (effectiveBackend === 'zmx') {
+      // The full list is tri-state: per-session `err=` rows and malformed
+      // output are inconclusive, never permission to create a duplicate CLI.
+      resolvedZmxSessionProbe = ZmxBackend.probeSession(ZmxBackend.sessionName(cfg.sessionId));
+      hasExistingSession = resolvedZmxSessionProbe === 'exists';
+      if (resolvedZmxSessionProbe === 'unknown') {
+        available = false;
+        reason = 'zmx 会话列表探针结果不确定';
+      } else if (!hasExistingSession) {
+        const probe = probeZmxFunctional();
+        available = probe.ok;
+        if (!probe.ok) reason = probe.reason;
+      }
     } else if (effectiveBackend === 'herdr') {
       // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
       // (not a disposable session probe), so it has no PR#249 false-negative
@@ -5800,7 +5824,6 @@ async function spawnCli(
     }
   }
   effectiveBackendType = effectiveBackend;
-
   // For riff (remote HTTP backend), merge botmux session context env + per-bot
   // env into the riff backend config so the remote sandbox has everything the
   // agent needs (e.g. `botmux send` routing). The sandbox installs botmux via
@@ -5879,7 +5902,14 @@ async function spawnCli(
     }
   }
 
-  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend, backendConfig: riffBackendConfig });
+  const selectedBackend = selectSessionBackend({
+    sessionId: cfg.sessionId,
+    backendType: effectiveBackend,
+    backendConfig: riffBackendConfig,
+    hasExistingSession: effectiveBackend === 'zmx'
+      ? resolvedZmxSessionProbe === 'exists'
+      : undefined,
+  });
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
   isZellijMode = selectedBackend.isZellijMode;
@@ -5947,6 +5977,22 @@ async function spawnCli(
   // bwrap sandbox, so it's driven solely by the sandbox toggle there). Keeps
   // FAIL-CLOSED semantics: you asked for read isolation → refuse to start without it.
   const explicitLegacyReadIso = process.platform === 'darwin' && cfg.readIsolation === true && !riffRemoteBackend;
+  const backendSandboxError = backendSandboxCompatibilityError({
+    backendType: effectiveBackendType,
+    fileSandboxRequested: wantsFileSandbox,
+    effectiveReadIsolationRequested: explicitLegacyReadIso,
+  });
+  if (backendSandboxError) {
+    // Unlike type:'error' (worker-pool log only), user_notify reaches the
+    // originating Lark conversation. Send it before throwing so a fail-closed
+    // launch leaves the operator with an actionable recovery path.
+    send({
+      type: 'user_notify',
+      message: backendSandboxCompatibilityUserMessage(backendSandboxError),
+      turnId: cfg.turnId,
+    });
+    throw new Error(`[sandbox] ${backendSandboxError}`);
+  }
   const readIsolationGate = evaluateReadIsolationGate({
     configured: wantsFileSandbox || explicitLegacyReadIso,
     adapterSupports: cliAdapter.supportsReadIsolation === true,
@@ -6077,7 +6123,7 @@ async function spawnCli(
     }
   }
   // Predict reattach vs fresh BEFORE the resume pre-flight. On a persistent
-  // backend (tmux/herdr/zellij) a daemon restart finds the CLI process still
+  // backend (tmux/herdr/zellij/zmx) a daemon restart finds the CLI process still
   // alive in its pane, so the backend will `attach` to the live process and
   // IGNORE the bin/args — there is no spawn, and the live process still holds
   // the full in-memory conversation. In that case the resume-vs-fresh question
@@ -6092,6 +6138,8 @@ async function spawnCli(
       ? HerdrBackend.sessionName(cfg.sessionId)
       : effectiveBackendType === 'zellij'
         ? ZellijBackend.sessionName(cfg.sessionId)
+        : effectiveBackendType === 'zmx'
+          ? ZmxBackend.sessionName(cfg.sessionId)
       : undefined;
   // [read-isolation] Before we decide to reattach a persistent pane: a pane can
   // survive a daemon restart still running a CLI that may NOT be isolated (e.g.
@@ -6103,11 +6151,17 @@ async function spawnCli(
   // policy pane survives daemon restarts and suspend→resume safely because the
   // confinement remains attached to the live process.
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
-    const paneLive = effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName);
+    const paneProbe = probePersistentSession(
+      effectiveBackendType as PersistentBackendType,
+      persistentSessionName,
+    );
+    if (paneProbe === 'unknown') {
+      throw new Error(
+        `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
+    const paneLive = paneProbe === 'exists';
     if (paneLive) {
       let marker: string | null = null;
       marker = readRegularHostFileNoFollow(
@@ -6153,6 +6207,8 @@ async function spawnCli(
       ? TmuxBackend.hasSession(persistentSessionName)
       : effectiveBackendType === 'zellij'
         ? ZellijBackend.hasSession(persistentSessionName)
+        : effectiveBackendType === 'zmx'
+          ? resolvedZmxSessionProbe === 'exists'
         : HerdrBackend.hasSession(persistentSessionName)
     : false;
 
@@ -6809,7 +6865,7 @@ async function spawnCli(
     }
     try {
       if (willReattachPersistent) {
-        // Daemon-restart reattach to a persistent (tmux/herdr/zellij) pane whose
+        // Daemon-restart reattach to a persistent (tmux/herdr/zellij/zmx) pane whose
         // bwrap'd CLI is STILL ALIVE. backend.spawn() ignores bin/args here and
         // just re-attaches, and the live CLI is bound to its own namespace-pinned
         // overlay — so we must NOT unmount/remount (prepareSandbox would leave a
@@ -7125,7 +7181,7 @@ async function spawnCli(
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
         log(`wrapperCli "${cfg.wrapperCli}": resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${targetCliId}); rewiring session discovery + bridge`);
-        (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = realPid;
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
         // module-level bridgeCliPid and re-points to the real CLI's jsonl.
         bridgeCliPid = realPid;
@@ -7146,8 +7202,8 @@ async function spawnCli(
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
   if (cliPid && (claudeDataDir || cfg.cliId === 'grok')) {
-    (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = cliPid;
-    (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
+    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = cliPid;
+    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
   }
 
   // Async pid fallback: tmux/pty resolve the CLI pid synchronously above, but
@@ -7176,8 +7232,8 @@ async function spawnCli(
           }
         }
         if (claudeDataDir || cfg.cliId === 'grok') {
-          (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = pid;
-          (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
+          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = pid;
+          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
@@ -7298,7 +7354,7 @@ async function spawnCli(
   // we hold the first prompt so a cjadk-style startup selector's ❯ can't eat it.
   // shouldArmReadyGate() excludes adopt (pre-existing pane, no fresh hook) AND
   // persistent-backend reattach (daemon restart re-attaches an already-running
-  // tmux/zellij/herdr Claude WITHOUT re-running its bin/args → no new
+  // tmux/zellij/herdr/zmx Claude WITHOUT re-running its bin/args → no new
   // SessionStart hook → arming would hold the first post-recovery message until
   // the timeout).
   //
@@ -8183,6 +8239,38 @@ var term=new Terminal({
   fontSize:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
   cursorBlink:!isTouch,scrollback:50000,allowProposedApi:true
 });
+// ZMX's attach transport has one headless terminal in the worker that answers
+// DA/DSR/CPR/mode/status queries even when no browser exists. A normal xterm.js
+// tab would answer the same queries again (N tabs => N extra replies), so for
+// this backend only, consume reply-producing query families in every browser.
+// They are zero-width control requests; returning true suppresses xterm's
+// built-in response without changing rendered output. Other backends keep the
+// default browser responder because they do not own one server-side.
+var _serverTerminalResponder=${effectiveBackendType === 'zmx'};
+if(_serverTerminalResponder&&term.parser){
+  var _queryParam0=function(p){
+    var v=p&&p.length?p[0]:0;
+    return Array.isArray(v)?(v[0]||0):(v||0);
+  };
+  term.parser.registerCsiHandler({final:'c'},function(p){return _queryParam0(p)<=0});
+  term.parser.registerCsiHandler({prefix:'>',final:'c'},function(p){return _queryParam0(p)<=0});
+  term.parser.registerCsiHandler({final:'n'},function(p){var v=_queryParam0(p);return v===5||v===6});
+  term.parser.registerCsiHandler({prefix:'?',final:'n'},function(p){return _queryParam0(p)===6});
+  term.parser.registerCsiHandler({intermediates:'$',final:'p'},function(){return true});
+  term.parser.registerCsiHandler({prefix:'?',intermediates:'$',final:'p'},function(){return true});
+  term.parser.registerCsiHandler({final:'t'},function(p){return _queryParam0(p)===18});
+  term.parser.registerDcsHandler({intermediates:'$',final:'q'},function(){return true});
+  var _oscColorQuery=function(ident,data){
+    if(ident!==4)return data.split(';').indexOf('?')!==-1;
+    var parts=data.split(';');
+    if(parts.length<2||parts.length%2!==0)return false;
+    for(var i=0;i<parts.length;i+=2){if(/^\d+$/.test(parts[i])&&parts[i+1]==='?')return true;}
+    return false;
+  };
+  [4,10,11,12].forEach(function(ident){
+    term.parser.registerOscHandler(ident,function(data){return _oscColorQuery(ident,data)});
+  });
+}
 var fit=new FitAddon.FitAddon();
 term.loadAddon(fit);
 term.loadAddon(new WebLinksAddon.WebLinksAddon());
@@ -9467,7 +9555,7 @@ process.on('message', async (raw: unknown) => {
       // cold-resumes a FRESH CLI on the next message — bmx-<sid> is absent.)
       destroyCrashDiagnosticTerminal('suspend');
       // Free the CLI's memory, not just the worker's: destroySession kills the
-      // backing tmux/herdr/zellij session AND the CLI process inside it (kill()
+      // backing tmux/herdr/zellij/zmx session AND the CLI process inside it (kill()
       // would only detach the pty viewer and leave the CLI running in the
       // background — defeating the whole point of a session cap, since the CLI
       // is the memory hog). On the next message the session cold-resumes via

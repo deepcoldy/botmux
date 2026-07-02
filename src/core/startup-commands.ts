@@ -61,7 +61,7 @@ export function normalizeStartupCommandList(arr: unknown): string[] {
 
 /**
  * Whether a spawn should (re-)run startupCommands. They run on a genuinely fresh
- * CLI process; a reattach to a LIVE persistent (tmux/zellij/herdr) pane — e.g. a
+ * CLI process; a reattach to a LIVE persistent (tmux/zellij/herdr/zmx) pane — e.g. a
  * daemon restart recovering an existing session — is the SAME CLI with its
  * effort/model/context already established, so re-typing `/effort` (idempotent)
  * or `/clear`,`/compact` (NOT idempotent) would corrupt it. Skip on reattach.
