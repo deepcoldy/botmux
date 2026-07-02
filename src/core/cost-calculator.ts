@@ -234,10 +234,12 @@ function readTokenUsageAggregate(path: string, kind: UsageKind): TokenUsageAggre
   const seenMessageIds = new Set<string>();
 
   try {
+    let scanError: unknown = null;
     const scanned = scanJsonlFromOffset(path, 0, {
       onLine: (line) => foldUsageJsonLine(kind, agg, seenMessageIds, line),
+      onError: (error) => { scanError = error; },
     });
-    if (!scanned) throw new Error('scan failed');
+    if (!scanned) throw scanError instanceof Error ? scanError : new Error('scan failed');
     if (scanned.pendingTail.trim()) {
       foldUsageJsonLine(kind, agg, seenMessageIds, scanned.pendingTail);
     }
@@ -394,12 +396,14 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     baseOffset = 0;
   }
 
+  let scanError: unknown = null;
   const scanned = scanJsonlFromOffset(path, baseOffset, {
     endOffset: st.size,
     onLine: (line) => foldUsageJsonLine(kind, state, seenMessageIds, line),
+    onError: (error) => { scanError = error; },
   });
   if (!scanned) {
-    logger.error(`Failed to read transcript slice ${path}: scan failed`);
+    logger.error(`Failed to read transcript slice ${path}: ${scanError instanceof Error ? scanError.message : String(scanError)}`);
     usageFileCache.delete(key);
     return null;
   }

@@ -45,12 +45,16 @@ export function scanJsonlFromOffset(path: string, fromOffset: number, opts: Json
       const text = carry + decoded;
       let searchFrom = 0;
       let currentLineStart = lineStartOffset;
-      while (true) {
-        const nl = text.indexOf('\n', searchFrom);
-        if (nl < 0) break;
-        opts.onLine?.(text.slice(searchFrom, nl), currentLineStart);
-        currentLineStart += Buffer.byteLength(text.slice(searchFrom, nl), 'utf8') + 1;
+      // carry never contains '\n', so newlines can only appear at or after
+      // carry.length — starting there avoids re-scanning a growing carry on
+      // every chunk when a single record spans many chunks.
+      let nl = text.indexOf('\n', carry.length);
+      while (nl >= 0) {
+        const line = text.slice(searchFrom, nl);
+        opts.onLine?.(line, currentLineStart);
+        currentLineStart += Buffer.byteLength(line, 'utf8') + 1;
         searchFrom = nl + 1;
+        nl = text.indexOf('\n', searchFrom);
       }
       carry = text.slice(searchFrom);
       lineStartOffset = currentLineStart;
