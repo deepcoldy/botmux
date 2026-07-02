@@ -29,9 +29,6 @@ import {
   sendCredFilePath,
   botHomePath,
   buildV2DenyPaths,
-  buildV2AllowPaths,
-  buildV2FinalDenyPaths,
-  buildV2TraverseDirs,
   type ReadIsolationContext,
 } from './adapters/cli/read-isolation.js';
 import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
@@ -4589,45 +4586,21 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // silently fail-open (the /tmp→/private/tmp class of miss). realpath-if-exists:
     // a non-existent path has nothing to read, so its literal form is harmless.
     const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
-    // v2 BOTMUX_HOME model (default-deny allowlist): deny the whole BOTMUX_HOME +
-    // global CLI dirs + system creds, re-allow ONLY this bot's own home + its own
-    // per-appId botmux files (keyed on the immutable appId — no cwd-controllable F1
-    // hole). Every bot's private CLI data lives under its BOT_HOME (redirected via
-    // CLAUDE_CONFIG_DIR/CODEX_HOME above), so "allow own home" covers it.
+    // v2 HYBRID model: whole-deny ~/.claude|~/.codex (F1 fix — own CLI data is redirected
+    // into BOT_HOME, readable) + surgical-deny only the cross-bot-SENSITIVE parts of the
+    // otherwise-readable ~/.botmux (so the agent's `botmux send`/`list` tooling still
+    // works) + system creds. No allow carve-outs / traversal shims needed: own BOT_HOME,
+    // own session/cred, config, registry and the shared skill plugin dir are all readable
+    // by default (never denied), which also lets Codex realpath() its CODEX_HOME cleanly.
     const v2ctx = {
       homeDir: readIsolationCtx.homeDir,
       botmuxHome: dirname(readIsolationCtx.sessionDataDir),
       sessionDataDir: readIsolationCtx.sessionDataDir,
       currentAppId: readIsolationCtx.currentAppId,
+      otherAppIds: readIsolationCtx.otherAppIds ?? [],
       extraDenyPaths: readIsolationCtx.extraDenyPaths,
     };
     const denyPaths = buildV2DenyPaths(v2ctx).map(canonical);
-    // Own carve-outs + the SHARED read-only skill/plugin tooling (built-in botmux
-    // plugin + per-bot skill plugin/readonly roots): these live under BOTMUX_HOME but
-    // hold only skill files (no secrets, all bots read them), so re-allow them or the
-    // agent loses its `botmux send`/skill toolbelt. Delivered via `--plugin-dir`.
-    // HARDENING (review M2): only re-allow skill paths that RESOLVE UNDER an expected
-    // runtime root (the shared plugin dir, or SESSION_DATA_DIR/runtime-skills) — a
-    // poisoned/mis-generated skillPluginDir must NOT be able to re-open an arbitrary
-    // sensitive subtree of BOTMUX_HOME via a last-match allow.
-    const skillRoots = [join(homedir(), '.botmux', 'claude-plugin'), join(process.env.SESSION_DATA_DIR!, 'runtime-skills')].map(canonical);
-    const underSkillRoot = (p: string) => { const c = canonical(p); return skillRoots.some((r) => c === r || c.startsWith(r + '/')); };
-    const skillAllows = [
-      join(homedir(), '.botmux', 'claude-plugin'),
-      ...(cfg.skillPluginDir ? [cfg.skillPluginDir] : []),
-      ...(cfg.skillReadonlyRoots ?? []),
-    ].filter((p) => {
-      if (underSkillRoot(p)) return true;
-      log(`[read-isolation] WARN dropping skill allow-path outside expected roots: ${p}`);
-      return false;
-    });
-    const allowPaths = [...buildV2AllowPaths(v2ctx), ...skillAllows].map(canonical);
-    // Admin readDenyExtraPaths as a FINAL deny (after allows) so it holds even under
-    // the bot's own re-allowed BOT_HOME (review M3).
-    const finalDenyPaths = buildV2FinalDenyPaths(v2ctx).map(canonical);
-    // Ancestor dirs kept stat-traversable so a CLI can realpath() its own config dir
-    // under the denied ~/.botmux (Codex canonicalizes CODEX_HOME on startup).
-    const traverseDirs = buildV2TraverseDirs(v2ctx).map(canonical);
     if (process.platform === 'darwin') {
       if (!locateOnPath('sandbox-exec')) {
         throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
@@ -4635,7 +4608,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
       mkdirSync(profileDir, { recursive: true });
       const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
-      writeFileSync(profilePath, buildSeatbeltProfile(denyPaths, allowPaths, finalDenyPaths, traverseDirs), { mode: 0o600 });
+      writeFileSync(profilePath, buildSeatbeltProfile(denyPaths), { mode: 0o600 });
       seatbeltProfilePath = profilePath;
       spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
       spawnBin = 'sandbox-exec';

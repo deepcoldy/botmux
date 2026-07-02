@@ -127,35 +127,43 @@ export function botHomePath(botmuxHome: string, appId: string): string {
 export interface V2IsolationContext {
   /** The bot user's home directory. */
   homeDir: string;
-  /** BOTMUX_HOME root (e.g. `~/.botmux`) — denied wholesale, own BOT_HOME re-allowed. */
+  /** BOTMUX_HOME root (e.g. `~/.botmux`). NOT denied wholesale — the botmux CLI the
+   *  agent runs (`botmux send`/`list`/`status`) needs broad read access to it (config,
+   *  daemon registry, pm2, session store). Only its cross-bot-SENSITIVE parts are denied. */
   botmuxHome: string;
   /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
   sessionDataDir: string;
-  /** This bot's Feishu app id (the immutable key for its own carve-outs). */
+  /** This bot's Feishu app id. */
   currentAppId: string;
+  /** Every OTHER bot's app id — their per-bot data (lark config, session file, send-cred,
+   *  BOT_HOME) is denied. */
+  otherAppIds: string[];
   /** Per-bot extra deny paths (BotConfig.readDenyExtraPaths). */
   extraDenyPaths?: string[];
 }
 
-/** v2 DENY set (default-deny for sensitive data): the whole BOTMUX_HOME (bots.json,
- *  every bot's data + other bots' homes), the GLOBAL CLI dirs (`~/.claude`,
- *  `~/.codex` — the admin/unisolated bots + any pre-migration data), lark configs,
- *  and system credentials. Everything ELSE (code/repos/system runtime) stays open.
- *  The bot's OWN data is re-opened by {@link buildV2AllowPaths}. */
+/** v2 DENY set (HYBRID). The F1 fix is a WHOLE-deny of the CLI data dirs `~/.claude`
+ *  (+ `~/.claude.json`) and `~/.codex`: this bot's OWN CLI data is redirected into its
+ *  BOT_HOME (readable) via CLAUDE_CONFIG_DIR/CODEX_HOME, so whole-denying the globals
+ *  blocks the admin/other/pre-migration data + kills the per-cwd carve-out + /cd hole,
+ *  while own resume/memory keep working from BOT_HOME. `~/.botmux` is NOT whole-denied
+ *  (the agent's botmux CLI needs its config/registry/pm2/data structure) — instead its
+ *  cross-bot-SENSITIVE parts are denied surgically: bots.json, logs, other bots' lark
+ *  configs / session files / send-creds / BOT_HOMEs, and the shared conversation-content
+ *  dirs. Own BOT_HOME + own session/cred + config/registry stay readable by default.
+ *  Plus the system-credential stores. Everything else (code/repos/runtime) stays open. */
 export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
   const h = ctx.homeDir.replace(/\/+$/, '');
-  // NOTE: extraDenyPaths are NOT included here — they must be emitted as a FINAL deny
-  // (after the allow carve-outs) or a BOT_HOME allow would override an admin deny of a
-  // path under it. See buildV2FinalDenyPaths + buildSeatbeltProfile's finalDeny.
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
+  const others = ctx.otherAppIds ?? [];
   return dedupe(
     [
-      ctx.botmuxHome,
+      // ── F1: whole-deny the CLI data dirs (own is redirected to BOT_HOME) ──
       `${h}/.claude`,
+      `${h}/.claude.json`,
       `${h}/.codex`,
-      `${h}/.lark-cli`,
-      `${h}/.lark-cli-bots`,
-      // System credential / secret stores OUTSIDE BOTMUX_HOME (a fixed, known set —
-      // everything outside BOTMUX_HOME is open by default, so this list must be broad).
+      // ── System credential / secret stores (broad, since outside is open by default) ──
       `${h}/.ssh`,
       `${h}/.aws`,
       `${h}/.azure`,
@@ -164,56 +172,31 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       `${h}/.config/gh`,
       `${h}/.config/glab-cli`,
       `${h}/.config/gcloud`,
-      `${h}/.config/op`,          // 1Password CLI
+      `${h}/.config/op`,
       `${h}/.config/1Password`,
       `${h}/.1password`,
-      `${h}/.password-store`,     // pass
+      `${h}/.password-store`,
       `${h}/.git-credentials`,
       `${h}/.npmrc`,
       `${h}/.pypirc`,
       `${h}/.docker/config.json`,
       `${h}/.kube`,
-      // macOS Keychain files — the login keychain holds the Claude/codex OAuth token
-      // and everything else. (Note: the `security` CLI reaches the keychain via securityd
-      // over mach, which a file-read Seatbelt does NOT cover — a known residual surface.)
       `${h}/Library/Keychains`,
-    ]
-      .map(normalizeIsolationPath)
-      .filter((p): p is string => !!p),
-  );
-}
-
-/** Admin-supplied `readDenyExtraPaths`, emitted as a FINAL deny AFTER all allow
- *  carve-outs so they win even when they target a path under the bot's own BOT_HOME
- *  (Seatbelt applies the last matching rule). Kept separate from {@link buildV2DenyPaths}
- *  for exactly that ordering guarantee. */
-export function buildV2FinalDenyPaths(ctx: V2IsolationContext): string[] {
-  return dedupe((ctx.extraDenyPaths ?? []).map(normalizeIsolationPath).filter((p): p is string => !!p));
-}
-
-/** v2 ALLOW carve-outs, re-opened AFTER the denies (Seatbelt last-match wins): the
- *  bot's OWN home (its redirected CLI data) + its OWN per-appId botmux files (session
- *  store + send-cred) + its OWN lark-cli config dir. ALL keyed on the immutable appId,
- *  so they always resolve to exactly this bot's data and cannot be redirected at a
- *  sibling's by changing cwd. */
-export function buildV2AllowPaths(ctx: V2IsolationContext): string[] {
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const appId = assertSafeAppId(ctx.currentAppId);
-  return dedupe(
-    [
-      botHomePath(ctx.botmuxHome, appId),
-      `${sd}/sessions-${appId}.json`,
-      sendCredFilePath(sd, appId),
-      `${h}/.lark-cli-bots/${appId}`,
-      // Non-secret botmux RUNTIME that the agent's `botmux send`/`botmux history`
-      // legitimately need to reach the daemon — global config + the daemon registry
-      // (ipcPort lookup). No per-bot secrets live here (secrets are in bots.json /
-      // the per-bot .send-cred, both still denied / carved per-appId).
-      `${bh}/config.json`,
-      `${sd}/dashboard-daemons`,
-      `${bh}/.data-dir`,
+      // ── botmux SENSITIVE (surgical — leave config/registry/pm2/data structure readable) ──
+      `${bh}/bots.json`,               // ALL bots' secrets
+      `${bh}/logs`,                    // daemon logs (cross-bot content)
+      `${h}/.lark-cli`,                // default lark config (may hold creds)
+      ...others.map((id) => `${h}/.lark-cli-bots/${id}`),   // other bots' lark configs
+      ...others.map((id) => `${sd}/sessions-${id}.json`),   // other bots' session stores
+      ...others.map((id) => sendCredFilePath(sd, id)),      // other bots' send-creds
+      ...others.map((id) => botHomePath(bh, id)),           // other bots' BOT_HOMEs
+      `${sd}/sessions.json`,           // legacy shared store
+      `${sd}/frozen-cards`,            // conversation content (all bots')
+      `${sd}/turn-sends`,
+      `${sd}/crash-diagnostics`,
+      `${sd}/attachments`,
+      `${sd}/whiteboards`,
+      ...(ctx.extraDenyPaths ?? []),
     ]
       .map(normalizeIsolationPath)
       .filter((p): p is string => !!p),
@@ -403,17 +386,6 @@ export function buildSeatbeltProfile(
   // for a path that falls under the bot's own re-allowed BOT_HOME.
   for (const p of finalDenyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
   return lines.join('\n') + '\n';
-}
-
-/** Ancestor DIRS that must stay stat-traversable so a carve-out under a denied parent
- *  can be realpath()'d (Codex canonicalizes CODEX_HOME on startup). Metadata-only —
- *  listing stays denied. Covers the parents of BOT_HOME + the per-appId botmux files +
- *  the own lark-cli dir. */
-export function buildV2TraverseDirs(ctx: V2IsolationContext): string[] {
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  return dedupe([bh, `${bh}/bots`, sd, `${h}/.lark-cli-bots`].map(normalizeIsolationPath).filter((p): p is string => !!p));
 }
 
 /**

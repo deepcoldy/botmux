@@ -11,9 +11,6 @@ import {
   isolatedPaneReattachSafe,
   botHomePath,
   buildV2DenyPaths,
-  buildV2AllowPaths,
-  buildV2FinalDenyPaths,
-  buildV2TraverseDirs,
   assertSafeAppId,
   type ReadIsolationContext,
 } from '../src/adapters/cli/read-isolation.js';
@@ -256,12 +253,13 @@ describe('evaluateReadIsolationGate (fail-closed)', () => {
   });
 });
 
-describe('v2 BOTMUX_HOME model (buildV2DenyPaths / buildV2AllowPaths)', () => {
+describe('v2 HYBRID model (buildV2DenyPaths)', () => {
   const v2 = (o: Partial<Parameters<typeof buildV2DenyPaths>[0]> = {}) => ({
     homeDir: '/Users/bot',
     botmuxHome: '/Users/bot/.botmux',
     sessionDataDir: '/Users/bot/.botmux/data',
     currentAppId: 'cli_self',
+    otherAppIds: ['cli_other1', 'cli_other2'],
     ...o,
   });
 
@@ -269,83 +267,51 @@ describe('v2 BOTMUX_HOME model (buildV2DenyPaths / buildV2AllowPaths)', () => {
     expect(botHomePath('/Users/bot/.botmux', 'cli_self')).toBe('/Users/bot/.botmux/bots/cli_self');
   });
 
-  it('DENY covers BOTMUX_HOME, the global CLI dirs, lark configs and system creds', () => {
+  it('WHOLE-denies the CLI data dirs (F1): ~/.claude, ~/.claude.json, ~/.codex', () => {
     const d = buildV2DenyPaths(v2());
-    expect(d).toContain('/Users/bot/.botmux');       // all bots + bots.json
-    expect(d).toContain('/Users/bot/.claude');       // global claude (admin + legacy)
-    expect(d).toContain('/Users/bot/.codex');        // global codex (admin + legacy)
-    expect(d).toContain('/Users/bot/.lark-cli-bots');
-    expect(d).toContain('/Users/bot/.ssh');
-    expect(d).toContain('/Users/bot/.aws');
+    expect(d).toContain('/Users/bot/.claude');
+    expect(d).toContain('/Users/bot/.claude.json');
+    expect(d).toContain('/Users/bot/.codex');
   });
 
-  it('ALLOW re-opens ONLY this bot own home + own per-appId files, keyed on appId', () => {
-    const a = buildV2AllowPaths(v2());
-    expect(a).toContain('/Users/bot/.botmux/bots/cli_self');                 // own home
-    expect(a).toContain('/Users/bot/.botmux/data/sessions-cli_self.json');   // own session store
-    expect(a).toContain('/Users/bot/.botmux/data/.send-cred-cli_self');      // own send cred
-    expect(a).toContain('/Users/bot/.lark-cli-bots/cli_self');               // own lark config
-    // never a sibling's
-    expect(a.join('|')).not.toContain('cli_other');
-    expect(a.join('|')).not.toContain('sessions-cli_other');
-  });
-
-  it('a sibling bot appId yields carve-outs pointing only at ITS own data (no cross-open)', () => {
-    const a = buildV2AllowPaths(v2({ currentAppId: 'cli_other' }));
-    // cli_other only re-opens cli_other paths; nothing of cli_self
-    expect(a).toContain('/Users/bot/.botmux/bots/cli_other');
-    expect(a.join('|')).not.toContain('cli_self');
-  });
-
-  it('profile = deny set then allow carve-outs (Seatbelt last-match re-opens own home)', () => {
-    const prof = buildSeatbeltProfile(buildV2DenyPaths(v2()), buildV2AllowPaths(v2()));
-    const denyIdx = prof.indexOf('(deny file-read* (subpath "/Users/bot/.botmux"))');
-    const allowIdx = prof.indexOf('(allow file-read* (subpath "/Users/bot/.botmux/bots/cli_self"))');
-    expect(denyIdx).toBeGreaterThan(-1);
-    expect(allowIdx).toBeGreaterThan(denyIdx);
-  });
-
-  it('DENY covers the broadened secret set — keychain, gnupg, gcloud, 1Password, netrc (review M1)', () => {
+  it('denies the broadened system-credential set (review M1)', () => {
     const d = buildV2DenyPaths(v2());
-    expect(d).toContain('/Users/bot/Library/Keychains');
-    expect(d).toContain('/Users/bot/.gnupg');
-    expect(d).toContain('/Users/bot/.netrc');
-    expect(d).toContain('/Users/bot/.config/gcloud');
-    expect(d).toContain('/Users/bot/.config/1Password');
-    expect(d).toContain('/Users/bot/.password-store');
+    for (const p of ['/Users/bot/.ssh', '/Users/bot/.aws', '/Users/bot/Library/Keychains',
+      '/Users/bot/.gnupg', '/Users/bot/.netrc', '/Users/bot/.config/gcloud',
+      '/Users/bot/.config/1Password', '/Users/bot/.password-store']) expect(d).toContain(p);
   });
 
-  it('extraDenyPaths are NOT in the main deny — they are a FINAL deny that wins over BOT_HOME allow (review M3)', () => {
+  it('SURGICAL on ~/.botmux: denies the cross-bot sensitive parts, NOT the whole tree', () => {
+    const d = buildV2DenyPaths(v2());
+    // denied: secrets + other bots + content
+    expect(d).toContain('/Users/bot/.botmux/bots.json');
+    expect(d).toContain('/Users/bot/.botmux/logs');
+    expect(d).toContain('/Users/bot/.lark-cli-bots/cli_other1');
+    expect(d).toContain('/Users/bot/.botmux/data/sessions-cli_other1.json');
+    expect(d).toContain('/Users/bot/.botmux/data/.send-cred-cli_other2');
+    expect(d).toContain('/Users/bot/.botmux/bots/cli_other1');   // other bot's BOT_HOME
+    expect(d).toContain('/Users/bot/.botmux/data/frozen-cards');
+    expect(d).toContain('/Users/bot/.botmux/data/turn-sends');
+    // NOT denied — the whole tree, own data, and the tooling botmux CLI needs
+    expect(d).not.toContain('/Users/bot/.botmux');                     // never whole-denied
+    expect(d).not.toContain('/Users/bot/.botmux/data');                // data dir listable
+    expect(d).not.toContain('/Users/bot/.botmux/bots/cli_self');       // OWN BOT_HOME readable
+    expect(d).not.toContain('/Users/bot/.botmux/data/sessions-cli_self.json');
+    expect(d).not.toContain('/Users/bot/.botmux/config.json');         // config readable
+    expect(d).not.toContain('/Users/bot/.lark-cli-bots/cli_self');     // own lark readable
+  });
+
+  it('folds extraDenyPaths into the deny set (no allow carve-out to override them)', () => {
     const extra = '/Users/bot/.botmux/bots/cli_self/claude/.credentials.json';
-    const ctx = v2({ extraDenyPaths: [extra] });
-    expect(buildV2DenyPaths(ctx)).not.toContain(extra);          // not in the up-front deny
-    expect(buildV2FinalDenyPaths(ctx)).toContain(extra);          // is a final deny
-    // In the profile the final deny comes AFTER the BOT_HOME allow → it wins.
-    const prof = buildSeatbeltProfile(buildV2DenyPaths(ctx), buildV2AllowPaths(ctx), buildV2FinalDenyPaths(ctx));
-    const allowIdx = prof.indexOf('(allow file-read* (subpath "/Users/bot/.botmux/bots/cli_self"))');
-    const finalIdx = prof.lastIndexOf(`(deny file-read* (subpath "${extra}"))`);
-    expect(finalIdx).toBeGreaterThan(allowIdx);
+    expect(buildV2DenyPaths(v2({ extraDenyPaths: [extra] }))).toContain(extra);
   });
 
-  it('ALLOW re-opens the non-secret botmux runtime botmux send needs (config.json + daemon registry)', () => {
-    const a = buildV2AllowPaths(v2());
-    expect(a).toContain('/Users/bot/.botmux/config.json');
-    expect(a).toContain('/Users/bot/.botmux/data/dashboard-daemons');
-  });
-
-  it('TraverseDirs keeps BOT_HOME/session/lark ANCESTORS stat-traversable (Codex realpath of CODEX_HOME)', () => {
-    const t = buildV2TraverseDirs(v2());
-    expect(t).toContain('/Users/bot/.botmux');
-    expect(t).toContain('/Users/bot/.botmux/bots');
-    expect(t).toContain('/Users/bot/.botmux/data');
-    expect(t).toContain('/Users/bot/.lark-cli-bots');
-  });
-
-  it('profile emits metadata-only allows for traverse dirs (stat yes, listing no)', () => {
-    const prof = buildSeatbeltProfile(buildV2DenyPaths(v2()), buildV2AllowPaths(v2()), [], buildV2TraverseDirs(v2()));
-    expect(prof).toContain('(allow file-read-metadata (literal "/Users/bot/.botmux"))');
-    // it is metadata-only — NOT a full read-data allow of the parent
-    expect(prof).not.toContain('(allow file-read* (subpath "/Users/bot/.botmux"))');
+  it('profile is deny-only over allow-default (no carve-outs / traversal shims needed)', () => {
+    const prof = buildSeatbeltProfile(buildV2DenyPaths(v2()));
+    expect(prof).toContain('(allow default)');
+    expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.claude"))');
+    expect(prof).not.toContain('(allow file-read*');          // no subpath re-allows
+    expect(prof).not.toContain('file-read-metadata');         // no traversal shim
   });
 
   it('assertSafeAppId rejects path-traversal / separators, accepts real Feishu ids (review L2)', () => {
@@ -353,9 +319,9 @@ describe('v2 BOTMUX_HOME model (buildV2DenyPaths / buildV2AllowPaths)', () => {
     expect(() => assertSafeAppId('../evil')).toThrow();
     expect(() => assertSafeAppId('a/b')).toThrow();
     expect(() => assertSafeAppId('')).toThrow();
-    // botHomePath / buildV2AllowPaths must also reject an unsafe id
+    // botHomePath must also reject an unsafe id (used for own + other BOT_HOMEs)
     expect(() => botHomePath('/Users/bot/.botmux', '../x')).toThrow();
-    expect(() => buildV2AllowPaths(v2({ currentAppId: 'a/../b' }))).toThrow();
+    expect(() => buildV2DenyPaths(v2({ otherAppIds: ['a/../b'] }))).toThrow();
   });
 });
 
