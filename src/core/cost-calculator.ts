@@ -1,7 +1,7 @@
 /**
  * Session cost calculator — computes token usage from JSONL logs.
  */
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
+import { existsSync, readFileSync, statSync, type Stats } from 'node:fs';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
@@ -10,6 +10,7 @@ import {
   cachedTranscriptPathLookup,
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
+import { scanJsonlFromOffset } from '../services/jsonl-cursor.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -233,13 +234,12 @@ function readTokenUsageAggregate(path: string, kind: UsageKind): TokenUsageAggre
   const seenMessageIds = new Set<string>();
 
   try {
-    const content = readFileSync(path, 'utf-8');
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        foldUsageLine(kind, agg, seenMessageIds, entry);
-      } catch { /* skip malformed lines */ }
+    const scanned = scanJsonlFromOffset(path, 0, {
+      onLine: (line) => foldUsageJsonLine(kind, agg, seenMessageIds, line),
+    });
+    if (!scanned) throw new Error('scan failed');
+    if (scanned.pendingTail.trim()) {
+      foldUsageJsonLine(kind, agg, seenMessageIds, scanned.pendingTail);
     }
   } catch (err: any) {
     logger.error(`Failed to read session token usage JSONL (${kind}): ${err.message}`);
@@ -316,25 +316,11 @@ function foldUsageText(kind: UsageKind, agg: TokenUsageAggregate, seenMessageIds
   }
 }
 
-function readFileSlice(path: string, start: number, length: number): Buffer | null {
+function foldUsageJsonLine(kind: UsageKind, agg: TokenUsageAggregate, seenMessageIds: Set<string>, line: string): void {
+  if (!line.trim()) return;
   try {
-    const fd = openSync(path, 'r');
-    const buf = Buffer.alloc(length);
-    let bytesRead = 0;
-    try {
-      while (bytesRead < length) {
-        const n = readSync(fd, buf, bytesRead, length - bytesRead, start + bytesRead);
-        if (n <= 0) break;
-        bytesRead += n;
-      }
-    } finally {
-      closeSync(fd);
-    }
-    return buf.subarray(0, bytesRead);
-  } catch (err: any) {
-    logger.error(`Failed to read transcript slice ${path}: ${err.message}`);
-    return null;
-  }
+    foldUsageLine(kind, agg, seenMessageIds, JSON.parse(line));
+  } catch { /* skip malformed lines */ }
 }
 
 interface UsageReadResult {
@@ -408,22 +394,23 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     baseOffset = 0;
   }
 
-  const chunk = readFileSlice(path, baseOffset, st.size - baseOffset);
-  if (!chunk) {
+  const scanned = scanJsonlFromOffset(path, baseOffset, {
+    endOffset: st.size,
+    onLine: (line) => foldUsageJsonLine(kind, state, seenMessageIds, line),
+  });
+  if (!scanned) {
+    logger.error(`Failed to read transcript slice ${path}: scan failed`);
     usageFileCache.delete(key);
     return null;
   }
-
-  const lastNewline = chunk.lastIndexOf(0x0a);
-  const completeBytes = lastNewline >= 0 ? lastNewline + 1 : 0;
-  foldUsageText(kind, state, seenMessageIds, chunk.toString('utf8', 0, completeBytes));
+  const completeBytes = scanned.newOffset - baseOffset;
 
   // The bytes after the last newline may still be a complete JSON record
   // (writer mid-flush). Fold them into a preview copy only — the durable
   // frontier stays at the newline, so the line is folded durably exactly
   // once when its terminator arrives.
   let previewAgg = state;
-  const tailText = chunk.toString('utf8', completeBytes).trim();
+  const tailText = scanned.pendingTail.trim();
   if (tailText) {
     previewAgg = cloneAggregate(state);
     foldUsageText(kind, previewAgg, new Set(seenMessageIds), tailText);

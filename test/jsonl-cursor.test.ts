@@ -3,7 +3,7 @@ import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { baselineJsonlCursor } from '../src/services/jsonl-cursor.js';
+import { baselineJsonlCursor, scanJsonlFromOffset } from '../src/services/jsonl-cursor.js';
 
 let dir: string;
 let path: string;
@@ -20,6 +20,35 @@ afterEach(() => {
 describe('baselineJsonlCursor', () => {
   it('returns zero cursor for a missing file', () => {
     expect(baselineJsonlCursor(path)).toEqual({ newOffset: 0, pendingTail: '' });
+  });
+
+  it('keeps trailing partial tail when the tail probe starts mid-UTF8 codepoint', () => {
+    const totalBytes = 64 * 1024 + 1;
+    const prefix = '你';
+    const pendingTail = '{"uuid":"partial"';
+    const fillerBytes = totalBytes - Buffer.byteLength(prefix, 'utf8') - 1 - Buffer.byteLength(pendingTail, 'utf8');
+    const history = `${prefix}${'a'.repeat(fillerBytes)}\n`;
+    writeFileSync(path, history + pendingTail, 'utf8');
+
+    const cursor = baselineJsonlCursor(path);
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(history, 'utf8'),
+      pendingTail,
+    });
+  });
+
+  it('keeps exact end offset when the tail probe starts mid-UTF8 codepoint and file ends with newline', () => {
+    const totalBytes = 64 * 1024 + 1;
+    const prefix = '你';
+    const fillerBytes = totalBytes - Buffer.byteLength(prefix, 'utf8') - 1;
+    const content = `${prefix}${'a'.repeat(fillerBytes)}\n`;
+    writeFileSync(path, content, 'utf8');
+
+    const cursor = baselineJsonlCursor(path);
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(content, 'utf8'),
+      pendingTail: '',
+    });
   });
 
   it('jumps to the end of complete JSONL history without parsing it', () => {
@@ -43,5 +72,24 @@ describe('baselineJsonlCursor', () => {
     const cursor = baselineJsonlCursor(path);
     expect(cursor.newOffset).toBe(Buffer.byteLength(largeHistory));
     expect(cursor.pendingTail).toBe('{"uuid":"tail"}');
+  });
+});
+
+describe('scanJsonlFromOffset', () => {
+  it('preserves UTF-8 multi-byte characters split across chunk boundaries', () => {
+    const text = '{"text":"ab你cd"}\n';
+    writeFileSync(path, text, 'utf8');
+
+    const lines: Array<{ line: string; lineStart: number }> = [];
+    const cursor = scanJsonlFromOffset(path, 0, {
+      chunkSize: Buffer.byteLength('ab', 'utf8') + 1,
+      onLine: (line, lineStart) => lines.push({ line, lineStart }),
+    });
+
+    expect(lines).toEqual([{ line: '{"text":"ab你cd"}', lineStart: 0 }]);
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(text, 'utf8'),
+      pendingTail: '',
+    });
   });
 });

@@ -44,6 +44,24 @@ vi.mock('../src/services/aiden-checkpoints.js', () => ({
   findAidenLatestCheckpointByBotmuxSessionId: vi.fn(() => undefined),
 }));
 
+vi.mock('../src/services/jsonl-cursor.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../src/services/jsonl-cursor.js')>();
+  return {
+    ...original,
+    scanJsonlFromOffset: vi.fn((path: string, fromOffset: number, opts?: { onLine?: (line: string, lineStart: number) => void }) => {
+      const text = String(vi.mocked(readFileSync)(path, 'utf-8')).slice(Math.max(0, fromOffset));
+      let cursor = Math.max(0, fromOffset);
+      const lines = text.split('\n');
+      const pendingTail = lines.pop() ?? '';
+      for (const line of lines) {
+        opts?.onLine?.(line, cursor);
+        cursor += Buffer.byteLength(line, 'utf8') + 1;
+      }
+      return { newOffset: cursor, pendingTail };
+    }),
+  };
+});
+
 // Seed/Relay data root resolution goes through the adapter (binary realpath →
 // <pkg>/.claude-runtime). Mock it to a deterministic package-local root so the
 // path assertion below proves we no longer read from ~/.claude-runtime.

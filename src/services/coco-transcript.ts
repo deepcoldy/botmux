@@ -13,11 +13,13 @@
  * user messages whose `extra.is_original_user_input === true` so a Lark
  * turn fingerprints against the user's prompt, not injected context.
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
+import { existsSync, statSync, readdirSync, readlinkSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import { cocoCacheRoot } from './coco-paths.js';
+import { scanJsonlFromOffset } from './jsonl-cursor.js';
+import { logger } from '../utils/logger.js';
 
 const COCO_SESSIONS_ROOT = join(cocoCacheRoot(), 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -111,6 +113,40 @@ function messageText(content: unknown): string {
   return typeof content === 'string' ? content : '';
 }
 
+function parseCocoBridgeEvent(path: string, line: string, lineStart: number): CocoBridgeEvent | null {
+  let obj: any;
+  try { obj = JSON.parse(line); } catch { return null; }
+  const msg = obj?.message?.message;
+  if (!msg || typeof msg !== 'object') return null;
+  const ts = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
+  const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+
+  if (msg.role === 'user') {
+    if (msg.extra?.is_original_user_input !== true) return null;
+    const content = messageText(msg.content);
+    if (!content) return null;
+    return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text: content };
+  }
+  if (msg.role === 'assistant') {
+    // CoCo emits two assistant shapes per turn:
+    //   - finish_reason:'tool_calls' — mid-turn "thinking out loud" before
+    //     a tool call. Sometimes carries visible text (e.g. "Let me run
+    //     the tests..."). Treating these as final would close the
+    //     pending Lark turn early with mid-turn narration; the actual
+    //     `stop` message that follows would then drop on the floor
+    //     because the queue's collecting slot is already cleared.
+    //   - finish_reason:'stop' — the model's terminal answer. This is
+    //     what the bridge fallback should forward.
+    // Only the latter becomes assistant_final; everything else is skipped.
+    const finishReason = msg.response_meta?.finish_reason;
+    if (finishReason !== 'stop') return null;
+    const content = messageText(msg.content);
+    if (!content) return null;
+    return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: content };
+  }
+  return null;
+}
+
 /** Increment-read a CoCo events.jsonl from `fromOffset`. */
 export function drainCocoEvents(path: string, fromOffset: number): CocoDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
@@ -120,57 +156,19 @@ export function drainCocoEvents(path: string, fromOffset: number): CocoDrainResu
   if (size < start) start = 0;
   if (size === start) return { events: [], newOffset: start, pendingTail: '' };
 
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  const newOffset = start + Buffer.byteLength(completeText, 'utf8');
-
   const events: CocoBridgeEvent[] = [];
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1;
-      continue;
-    }
-    const lineStart = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-
-    let obj: any;
-    try { obj = JSON.parse(line); } catch { continue; }
-    const msg = obj?.message?.message;
-    if (!msg || typeof msg !== 'object') continue;
-    const ts = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
-    const timestampMs = Number.isFinite(ts) ? ts : Date.now();
-
-    if (msg.role === 'user') {
-      if (msg.extra?.is_original_user_input !== true) continue;
-      const content = messageText(msg.content);
-      if (!content) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text: content });
-    } else if (msg.role === 'assistant') {
-      // CoCo emits two assistant shapes per turn:
-      //   - finish_reason:'tool_calls' — mid-turn "thinking out loud" before
-      //     a tool call. Sometimes carries visible text (e.g. "Let me run
-      //     the tests..."). Treating these as final would close the
-      //     pending Lark turn early with mid-turn narration; the actual
-      //     `stop` message that follows would then drop on the floor
-      //     because the queue's collecting slot is already cleared.
-      //   - finish_reason:'stop' — the model's terminal answer. This is
-      //     what the bridge fallback should forward.
-      // Only the latter becomes assistant_final; everything else is skipped.
-      const finishReason = msg.response_meta?.finish_reason;
-      if (finishReason !== 'stop') continue;
-      const content = messageText(msg.content);
-      if (!content) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: content });
-    }
-  }
-
-  return { events, newOffset, pendingTail };
+  const scanned = scanJsonlFromOffset(path, start, {
+    endOffset: size,
+    onLine: (line, lineStart) => {
+      const event = parseCocoBridgeEvent(path, line, lineStart);
+      if (event) events.push(event);
+    },
+    onError: (error) => {
+      logger.warn(
+        `[coco-transcript] failed to scan ${path}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    },
+  });
+  if (!scanned) return { events: [], newOffset: start, pendingTail: '' };
+  return { events, newOffset: scanned.newOffset, pendingTail: scanned.pendingTail };
 }

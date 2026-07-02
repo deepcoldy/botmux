@@ -7,7 +7,15 @@
  * Run:  pnpm vitest run test/cost-calculator-cache.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, appendFileSync, readFileSync, rmSync } from 'node:fs';
+vi.mock('node:fs', async (importOriginal) => {
+  const original = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...original,
+    readFileSync: vi.fn(original.readFileSync),
+  };
+});
+
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -46,6 +54,7 @@ beforeEach(() => {
   __resetSessionUsageCachesForTest();
   now = 1_000_000_000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
+  vi.mocked(readFileSync).mockClear();
 });
 
 afterEach(() => {
@@ -54,6 +63,17 @@ afterEach(() => {
 });
 
 describe('readSessionTokenUsageFile caching', () => {
+  it('cold reads avoid readFileSync whole-file fallback for large transcripts', () => {
+    const p = join(dir, 'large.jsonl');
+    const hugeId = 'msg_' + 'x'.repeat(70_000);
+    writeFileSync(p, `${claudeLine(hugeId, 123, 45)}\n`);
+
+    const usage = readSessionTokenUsageFile(p, 'claude');
+
+    expect(usage).toMatchObject({ inputTokens: 123, outputTokens: 45, turns: 1 });
+    expect(readFileSync).not.toHaveBeenCalled();
+  });
+
   it('returns the cached result object while the file is unchanged', () => {
     const p = join(dir, 's.jsonl');
     writeFileSync(p, `${claudeLine('msg_a', 100, 10)}\n`);
@@ -113,6 +133,20 @@ describe('readSessionTokenUsageFile caching', () => {
     // msg_b is complete JSON but has no trailing newline yet — and no id, so
     // a double fold would visibly double count it.
     writeFileSync(p, `${claudeLine('msg_a', 100, 10)}\n${claudeLine(null, 200, 20)}`);
+    const first = readSessionTokenUsageFile(p, 'claude');
+    expect(first).toMatchObject({ turns: 2, inputTokens: 300, outputTokens: 30 });
+
+    now += 20_000;
+    appendFileSync(p, `\n${claudeLine('msg_c', 1, 1)}\n`);
+    const second = readSessionTokenUsageFile(p, 'claude');
+    expect(second).toMatchObject({ turns: 3, inputTokens: 301, outputTokens: 31 });
+  });
+
+  it('handles a large unterminated tail line without rereading the whole transcript', () => {
+    const p = join(dir, 'tail.jsonl');
+    const hugeId = 'msg_' + 'y'.repeat(70_000);
+    writeFileSync(p, `${claudeLine('msg_a', 100, 10)}\n${claudeLine(hugeId, 200, 20)}`);
+
     const first = readSessionTokenUsageFile(p, 'claude');
     expect(first).toMatchObject({ turns: 2, inputTokens: 300, outputTokens: 30 });
 
