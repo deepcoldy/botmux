@@ -16,6 +16,7 @@ import * as sandboxStore from '../services/sandbox-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
+import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -1071,6 +1072,26 @@ ipcRoute('POST', '/api/groups/:chatId/leave', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const r = await groupsStore.leaveChat(cachedLarkAppId, p.chatId);
   jsonRes(res, 200, r);
+});
+
+// 平台团队大厅打卡：dashboard 在 team-sync 后让"还没学到自己 union_id"的 bot 往
+// 大厅（bot-only 群）发一条消息 —— 自家消息回声带回 union_id（event-dispatcher
+// 的 isSelfMessage 捕获落盘），随心跳上报平台进团队 roster。学到后幂等跳过。
+ipcRoute('POST', '/api/platform/hall-announce', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { chatId?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const chatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  if (!/^oc_[0-9a-f]+$/i.test(chatId)) return jsonRes(res, 400, { ok: false, error: 'bad_chat_id' });
+  if (getBotUnionId(config.session.dataDir, cachedLarkAppId)) {
+    return jsonRes(res, 200, { ok: true, skipped: 'already_learned' });
+  }
+  try {
+    await sendMessage(cachedLarkAppId, chatId, t('platform.hall_announce', undefined, localeForBot(cachedLarkAppId)), 'text');
+    jsonRes(res, 200, { ok: true });
+  } catch (e) {
+    jsonRes(res, 502, { ok: false, error: `send_failed: ${(e as Error).message}` });
+  }
 });
 
 // ─── Oncall bindings (dashboard) ───────────────────────────────────────────

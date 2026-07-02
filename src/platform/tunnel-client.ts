@@ -15,6 +15,15 @@ export interface PlatformBotInfo {
   cli?: string;
   /** 团队页是否展示这个 bot（默认 true，按 bot 配置 showInTeam 上报）。 */
   showInTeam?: boolean;
+  /** bot 自己的租户稳定 union_id（自家消息回声学到，见 bot-union-ids-store）。
+   *  平台按团队聚合成 roster 随 team-sync 下发，成员机器据此免 /grant 互信。 */
+  unionId?: string;
+}
+
+/** 平台 team-sync 下发的原始负载（校验/落盘在 platform-team-store）。 */
+export interface PlatformTeamSyncMessage {
+  rev: string;
+  teams: unknown[];
 }
 
 export interface TunnelClientOptions {
@@ -26,6 +35,12 @@ export interface TunnelClientOptions {
   getVersion: () => string;
   /** 本机的 bot 清单（每次读最新；随心跳上报） */
   getBots?: () => PlatformBotInfo[];
+  /** 本机已应用的 team-sync rev（每次读最新；随 register/heartbeat 上报，平台
+   *  据此做版本比对：不一致才下发全量 team-sync）。 */
+  getTeamSyncRev?: () => string;
+  /** 平台下发 team-sync（团队 bot roster + 团队群清单）时回调；落盘与公告由
+   *  dashboard 侧处理，tunnel-client 只做传输。 */
+  onTeamSync?: (payload: PlatformTeamSyncMessage) => void;
   log: (msg: string, extra?: Record<string, unknown>) => void;
 }
 
@@ -97,7 +112,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     });
 
     sock.on('message', (data) => {
-      let msg: { type?: string; streamId?: string; teamId?: string; teamName?: string };
+      let msg: { type?: string; streamId?: string; teamId?: string; teamName?: string; rev?: string; teams?: unknown[] };
       try {
         msg = JSON.parse(data.toString());
       } catch {
@@ -109,6 +124,15 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
         joinTeam(msg.teamId, msg.teamName || msg.teamId, sock);
       } else if (msg.type === 'leave-team' && msg.teamId) {
         leaveTeam(msg.teamId, sock);
+      } else if (msg.type === 'team-sync' && typeof msg.rev === 'string') {
+        opts.log('收到 team-sync', { rev: msg.rev, teams: Array.isArray(msg.teams) ? msg.teams.length : 0 });
+        try {
+          opts.onTeamSync?.({ rev: msg.rev, teams: Array.isArray(msg.teams) ? msg.teams : [] });
+        } catch (e) {
+          opts.log('team-sync 应用失败', { err: String(e) });
+        }
+        // 立即回一拍心跳带上新 rev，平台好知道已收敛（否则等下个 30s 周期）。
+        sendHeartbeat(sock);
       } else if (msg.type === 'unbound') {
         handleUnbound(sock);
       }
@@ -155,6 +179,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       directHosts: localDirectHosts(opts.getDashboardPort()),
       memberships: teams,
       bots: opts.getBots?.() ?? [],
+      teamSyncRev: opts.getTeamSyncRev?.() ?? '',
     });
   }
 
@@ -166,6 +191,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       directHosts: localDirectHosts(opts.getDashboardPort()),
       memberships: teams,
       bots: opts.getBots?.() ?? [],
+      teamSyncRev: opts.getTeamSyncRev?.() ?? '',
     });
   }
 

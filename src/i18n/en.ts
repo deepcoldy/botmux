@@ -72,6 +72,9 @@ export const messages: Record<string, string> = {
   'card.repo.worktree_rolled_back': 'Worktree creation failed on {repo}: {error}. Rolled back {count} worktree(s) already created in this batch.',
   'card.repo.toast_worktree_creating': 'Creating worktree — will post in the thread when done…',
 
+  // Platform team hall check-in (bot-only group, visible to bots only)
+  'platform.hall_announce': '🤖 Team check-in: this bot is online (registers its union_id, no reply needed)',
+
   // In-group authorization card
   'card.grant.title': '🔑 Access Request',
   'card.grant.body_request': 'Sender **{name}** is requesting to use me in this chat. <at id={owner}></at> allow them to talk to me here?',

@@ -96,7 +96,9 @@ import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
-import { startPlatformTunnelClient, type PlatformBotInfo } from './platform/tunnel-client.js';
+import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
+import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
+import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
@@ -2711,6 +2713,9 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
           avatar: e.botAvatarUrl || undefined,
           cli: e.cliId,
           showInTeam: cfg?.showInTeam !== false, // default true
+          // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
+          // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。
+          unionId: e.larkAppId ? getBotUnionId(config.session.dataDir, e.larkAppId) : undefined,
         };
       })
       .filter((b) => b.appId);
@@ -2730,11 +2735,79 @@ function startPlatformTunnelIfBound(): void {
       getDashboardToken: () => activeToken,
       getVersion: () => version,
       getBots: () => readPlatformBotsInfo(),
+      getTeamSyncRev: () => getPlatformTeamSyncRev(config.session.dataDir),
+      onTeamSync: handlePlatformTeamSync,
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     });
     logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);
+    // 大厅打卡自愈重试：team-sync 应用时会立即尝试一次；这里的低频周期兜住
+    // "当时 daemon 离线 / bot 还没进大厅 / 发送失败"的漏拍。无平台绑定不启动。
+    const hallTimer = setInterval(() => { void maybeAnnounceHallPresence(); }, 5 * 60 * 1000);
+    hallTimer.unref();
   } catch (e) {
     logger.warn(`[platform-tunnel] 启动失败: ${(e as Error).message}`);
+  }
+}
+
+/** 平台 team-sync 落盘（roster + 团队群镜像），随后触发一轮大厅打卡检查。 */
+function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
+  const applied = applyPlatformTeamSync(config.session.dataDir, payload);
+  if (!applied) {
+    logger.warn('[platform-tunnel] team-sync 负载无效，忽略');
+    return;
+  }
+  logger.info(`[platform-tunnel] team-sync 已应用 rev=${applied.rev} teams=${applied.teams.length}`);
+  void maybeAnnounceHallPresence();
+}
+
+// 大厅打卡（union_id 自学触发）节流：per-bot 最小间隔 + 每进程尝试上限。打卡消息
+// 本身只有 bot 可见（大厅是 bot-only 群），上限只是防御发送持续失败时的无谓重试。
+const hallAnnounceState = new Map<string, { lastAt: number; tries: number }>();
+const HALL_ANNOUNCE_MIN_INTERVAL_MS = 10 * 60 * 1000;
+const HALL_ANNOUNCE_MAX_TRIES = 6;
+
+/**
+ * 让还没学到自己 union_id 的本地 bot 去团队大厅发一条打卡消息：自家消息回声
+ * （event-dispatcher isSelfMessage 分支）带回 sender.sender_id.union_id → 落盘
+ * bot-union-ids → 下个心跳上报平台进 roster。一辈子一次；学到即永久跳过。
+ * 顺带的副作用：大厅在各成员机器的 team-groups 里（team-sync 镜像），其他
+ * daemon 收到这条消息会直接 recordTeamBot 学到该 bot——roster 之外的即时互学。
+ */
+async function maybeAnnounceHallPresence(): Promise<void> {
+  try {
+    const dataDir = config.session.dataDir;
+    const teams = listPlatformTeams(dataDir);
+    if (teams.length === 0) return;
+    const localBotIds = new Set(readPlatformBotsInfo().map(b => b.appId));
+    const now = Date.now();
+    for (const team of teams) {
+      const hallChatId = team.groupChatIds[0];
+      if (!hallChatId) continue;
+      for (const bot of team.bots) {
+        if (!localBotIds.has(bot.appId)) continue;            // 别的机器的 bot
+        if (getBotUnionId(dataDir, bot.appId)) continue;      // 已学到 → 永久跳过
+        const st = hallAnnounceState.get(bot.appId);
+        if (st && (now - st.lastAt < HALL_ANNOUNCE_MIN_INTERVAL_MS || st.tries >= HALL_ANNOUNCE_MAX_TRIES)) continue;
+        hallAnnounceState.set(bot.appId, { lastAt: now, tries: (st?.tries ?? 0) + 1 });
+        try {
+          const r = await proxyToDaemon(bot.appId, '/api/platform/hall-announce', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chatId: hallChatId }),
+          });
+          const j = await r.json().catch(() => ({} as { ok?: boolean; error?: string }));
+          if (!r.ok || !(j as { ok?: boolean }).ok) {
+            logger.warn(`[platform-tunnel] 大厅打卡失败 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}: ${(j as { error?: string }).error ?? r.status}`);
+          } else {
+            logger.info(`[platform-tunnel] 大厅打卡已发 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}（等待回声学 union_id）`);
+          }
+        } catch (e) {
+          logger.warn(`[platform-tunnel] 大厅打卡请求异常 bot=${bot.appId}: ${(e as Error).message}`);
+        }
+      }
+    }
+  } catch (e) {
+    logger.warn(`[platform-tunnel] 大厅打卡检查异常: ${(e as Error).message}`);
   }
 }
 
