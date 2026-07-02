@@ -20,7 +20,7 @@ function ctx(overrides: Partial<ReadIsolationContext> = {}): ReadIsolationContex
     otherAppIds: ['cli_other1', 'cli_other2'],
     sessionDataDir: '/Users/bot/.botmux/data',
     homeDir: HOME,
-    claudeProjectsDir: '/Users/bot/.claude/projects',
+    ownTranscriptRoot: '/Users/bot/.claude/projects',
     ...overrides,
   };
 }
@@ -96,8 +96,8 @@ describe('buildReadDenyPaths', () => {
   });
 
   it('denies foreign CLI transcript roots (cross-CLI chat-history isolation)', () => {
-    // A Codex bot (no own claudeProjectsDir) must still deny Claude's transcripts.
-    const codex = buildReadDenyPaths(ctx({ claudeProjectsDir: undefined, foreignTranscriptDirs: ['/Users/bot/.claude/projects'] }));
+    // A Codex bot (no own ownTranscriptRoot) must still deny Claude's transcripts.
+    const codex = buildReadDenyPaths(ctx({ ownTranscriptRoot: undefined, foreignTranscriptDirs: ['/Users/bot/.claude/projects'] }));
     expect(codex).toContain('/Users/bot/.claude/projects');
     // A Claude bot denies Codex's shared sessions dir.
     const claude = buildReadDenyPaths(ctx({ foreignTranscriptDirs: ['/Users/bot/.codex/sessions'] }));

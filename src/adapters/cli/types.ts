@@ -271,6 +271,15 @@ export interface CliAdapter {
    *  returns. `dataDir` is the EFFECTIVE (post-redirect) data root the worker resolved. */
   readIsolationAllowPaths?(cwd: string, dataDir: string): string[];
 
+  /** The transcript dirs read isolation must deny for THIS CLI: `own` is this CLI's
+   *  OWN transcript root to deny (Claude → `<dataDir>/projects`, denied wholesale then
+   *  carved back per-project via {@link readIsolationAllowPaths}; Codex → undefined,
+   *  its shared `~/.codex/sessions` is left readable so it can resume — a known
+   *  limitation), and `foreign` lists OTHER CLI families' transcript roots this bot
+   *  never uses and must not read (Claude denies Codex's, and vice-versa). Lets the
+   *  worker fill the isolation context without branching on CLI family. */
+  readIsolationTranscriptRoots?(homeDir: string, dataDir?: string): { own?: string; foreign: string[] };
+
   /** When true, the worker's soft first-prompt timeout keeps queued input held
    *  until this adapter's `readyPattern` appears. Use only for CLIs whose startup
    *  screens can accept and swallow stdin before the real composer exists; the

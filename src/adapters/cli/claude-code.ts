@@ -464,6 +464,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     readIsolationAllowPaths(cwd: string, dataDir: string): string[] {
       return [claudeProjectDir(cwd, dataDir)];
     },
+    readIsolationTranscriptRoots(homeDir: string, dataDir?: string) {
+      return {
+        own: dataDir ? join(dataDir, 'projects') : undefined,
+        foreign: [join(homeDir, '.codex', 'sessions')],
+      };
+    },
     claudeDataDir: variant.dataDir,
     claudeStateJsonPath: variant.stateJsonPath,
     spawnEnv: variant.spawnEnv,

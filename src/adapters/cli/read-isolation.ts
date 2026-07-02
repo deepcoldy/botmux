@@ -27,15 +27,15 @@ export interface ReadIsolationContext {
   sessionDataDir: string;
   /** The bot user's home directory. */
   homeDir: string;
-  /** The CLI's transcript root to deny, e.g. Claude's `<home>/.claude/projects`.
-   *  Optional: Codex sessions live in one shared `~/.codex/sessions` (not
-   *  per-bot-separable), so a single-Codex-bot setup omits it to avoid denying
-   *  the bot its own history. */
-  claudeProjectsDir?: string;
+  /** The running CLI's OWN transcript root to deny, e.g. Claude's
+   *  `<home>/.claude/projects`. Optional: Codex sessions live in one shared
+   *  `~/.codex/sessions` (not per-bot-separable), so Codex omits it to avoid denying
+   *  the bot its own history. (Adapter-supplied via readIsolationTranscriptRoots.) */
+  ownTranscriptRoot?: string;
   /** Transcript roots of OTHER CLI families this bot does NOT use — denied fully.
    *  A Codex bot must not read Claude bots' `~/.claude/projects`, and a Claude bot
    *  must not read Codex bots' `~/.codex/sessions`. (The bot's OWN transcript root
-   *  is handled by {@link claudeProjectsDir} for Claude; Codex's own shared
+   *  is handled by {@link ownTranscriptRoot} for Claude; Codex's own shared
    *  `~/.codex/sessions` stays readable so it can resume — a known limitation.) */
   foreignTranscriptDirs?: string[];
   /** Per-bot extra deny paths (BotConfig.readDenyExtraPaths). */
@@ -111,7 +111,7 @@ export function buildReadDenyPaths(ctx: ReadIsolationContext): string[] {
     ...ctx.otherAppIds.map((id) => `${h}/.lark-cli-bots/${id}`),
     ...defaultCredentialDenyPaths(h),
     // Conversation content + other-bot local state (all bots')
-    ...(ctx.claudeProjectsDir ? [ctx.claudeProjectsDir] : []),
+    ...(ctx.ownTranscriptRoot ? [ctx.ownTranscriptRoot] : []),
     // Cross-CLI transcript roots this bot doesn't own (Codex denies Claude's
     // ~/.claude/projects; Claude denies Codex's ~/.codex/sessions).
     ...(ctx.foreignTranscriptDirs ?? []),

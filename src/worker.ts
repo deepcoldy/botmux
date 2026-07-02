@@ -4254,10 +4254,6 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let readIsolationCtx: ReadIsolationContext | undefined;
   {
     const configured = cfg.readIsolation === true;
-    // The version gate is Claude-specific (MIN_CLAUDE_SANDBOX_VERSION). Only
-    // claude-family adapters carry claudeDataDir; other supporting adapters
-    // (Codex) have their own always-on mechanism, so skip the Claude probe.
-    const isClaudeFamily = !!claudeDataDir;
     // The built-in-sandbox VERSION probe only matters for the 'settings' mechanism.
     // Claude now uses the whole-process Seatbelt wrapper ('external-wrapper'), which
     // needs no specific Claude version — so skip the probe (and its flaky --version
@@ -4281,20 +4277,17 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       if (!sessionDataDir) {
         throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: missing SESSION_DATA_DIR`);
       }
+      const transcriptRoots = cliAdapter.readIsolationTranscriptRoots?.(homedir(), claudeDataDir) ?? { foreign: [] };
       readIsolationCtx = {
         currentAppId: cfg.larkAppId,
         otherAppIds: cfg.otherBotAppIds ?? [],
         sessionDataDir,
         homeDir: homedir(),
-        // Claude family denies its per-project transcript root; Codex omits it
-        // (its sessions dir is shared/not per-bot-separable).
-        claudeProjectsDir: claudeDataDir ? join(claudeDataDir, 'projects') : undefined,
-        // Deny the OTHER CLI family's transcript root — this bot doesn't use it,
-        // so reading it would just leak the other bots' chat history. Claude denies
-        // Codex's ~/.codex/sessions; Codex denies Claude's ~/.claude/projects.
-        foreignTranscriptDirs: isClaudeFamily
-          ? [join(homedir(), '.codex', 'sessions')]
-          : [join(homedir(), '.claude', 'projects')],
+        // CLI-agnostic: the adapter says which transcript roots to deny — its OWN
+        // (denied wholesale, carved back per-project by readIsolationAllowPaths; or
+        // undefined if its store isn't per-bot-separable) + the OTHER families' roots.
+        ownTranscriptRoot: transcriptRoots.own,
+        foreignTranscriptDirs: transcriptRoots.foreign,
         extraDenyPaths: cfg.readDenyExtraPaths,
         strict: cfg.readIsolationStrict,
         allowPaths: cfg.readAllowPaths,

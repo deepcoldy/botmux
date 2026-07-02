@@ -132,6 +132,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     supportsReadIsolation: true,
     readIsolationMechanism: 'external-wrapper',
     authPaths: ['~/.codex/auth.json'],
+    // Codex keeps all sessions in ONE shared ~/.codex/sessions (not per-bot-separable),
+    // so it does NOT deny its own transcript root (left readable so codex can resume —
+    // a known limitation). It denies the OTHER family's: Claude's ~/.claude/projects.
+    readIsolationTranscriptRoots(homeDir: string) {
+      return { own: undefined, foreign: [join(homeDir, '.claude', 'projects')] };
+    },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation }) {
