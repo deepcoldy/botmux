@@ -222,6 +222,22 @@ export function buildSeatbeltProfile(denyPaths: string[]): string {
   return lines.join('\n') + '\n';
 }
 
+/**
+ * PLACEHOLDER — Linux equivalent of {@link buildSeatbeltProfile}. Seatbelt is
+ * macOS-only; on Linux the external-wrapper path should use bubblewrap: wrap the
+ * CLI in `bwrap --ro-bind / /` (read-all base) then mask each deny path with an
+ * empty `--tmpfs`/`--bind` (dir) or empty-file bind (file), or an equivalent
+ * landlock policy. Returns the `bwrap` argv prefix to prepend before the CLI.
+ *
+ * NOT YET IMPLEMENTED — the worker fail-closes on Linux until this is filled in
+ * and e2e-verified (bwrap availability, userns/AppArmor caveats, no double-bwrap
+ * with botmux's existing `sandbox` field). Kept as a typed seam so wiring the
+ * platform dispatch doesn't need to change.
+ */
+export function buildLinuxReadIsolationWrap(_denyPaths: string[]): never {
+  throw new Error('read-isolation: Linux bwrap wrapper not implemented yet');
+}
+
 /** Extract the semver from `claude --version` output (e.g. "2.1.197 (Claude Code)"). */
 export function parseClaudeVersion(stdout: string): string | null {
   const m = stdout.match(/(\d+)\.(\d+)\.(\d+)/);

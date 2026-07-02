@@ -130,13 +130,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // e2e verified: codex under `sandbox-exec -f <profile>` (with bypass) is
     // blocked from denied paths and runs normally.
     supportsReadIsolation: true,
-    readIsolationMechanism: 'seatbelt-wrapper',
+    readIsolationMechanism: 'external-wrapper',
     authPaths: ['~/.codex/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper
-      // (readIsolationMechanism='seatbelt-wrapper'), NOT by codex's own profile
+      // (readIsolationMechanism='external-wrapper'), NOT by codex's own profile
       // (codex 0.137 can't express a read blocklist). So spawn args are unchanged
       // — keep bypass so codex's own nested sandbox is OFF and the outer Seatbelt
       // profile is the sole enforcer.

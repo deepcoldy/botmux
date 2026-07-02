@@ -4378,26 +4378,36 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
 
-  // External-wrapper read isolation (Codex etc.): wrap the whole CLI process in a
-  // macOS Seatbelt profile that denies reads of the sensitive paths (blocklist).
-  // The CLI itself bypasses its own sandbox (see adapter) so the outer profile is
-  // the sole enforcer. macOS-only; fail-closed elsewhere.
-  if (readIsolationCtx && cliAdapter.readIsolationMechanism === 'seatbelt-wrapper') {
-    if (process.platform !== 'darwin') {
-      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: seatbelt-wrapper isolation is macOS-only`);
+  // External-wrapper read isolation (Codex + any adapter without a 'settings'
+  // built-in — the DEFAULT): wrap the whole CLI process in an OS sandbox that
+  // denies reads of the sensitive paths (blocklist). The CLI bypasses its OWN
+  // sandbox (see adapter) so the outer wrapper is the sole enforcer. Platform-
+  // dispatched: macOS Seatbelt today; Linux bwrap is a TODO placeholder.
+  const readIsolationMechanism = cliAdapter.readIsolationMechanism ?? 'external-wrapper';
+  if (readIsolationCtx && readIsolationMechanism === 'external-wrapper') {
+    const denyPaths = buildReadDenyPaths(readIsolationCtx);
+    if (process.platform === 'darwin') {
+      if (!locateOnPath('sandbox-exec')) {
+        throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
+      }
+      const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
+      mkdirSync(profileDir, { recursive: true });
+      const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
+      writeFileSync(profilePath, buildSeatbeltProfile(denyPaths), { mode: 0o600 });
+      seatbeltProfilePath = profilePath;
+      spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      spawnBin = 'sandbox-exec';
+      log(`[read-isolation] wrapping ${cliAdapter.id} in Seatbelt: sandbox-exec -f ${profilePath}`);
+    } else if (process.platform === 'linux') {
+      // TODO(read-isolation/linux): wrap in bwrap with `--ro-bind / /` +
+      // `--tmpfs`/empty-bind over each denyPath (or an equivalent landlock/
+      // seccomp policy) so the deny list is enforced kernel-side, mirroring the
+      // macOS Seatbelt profile. Until implemented, fail-closed rather than run
+      // unisolated. See buildLinuxReadIsolationWrap() placeholder.
+      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: Linux external-wrapper isolation not yet implemented (bwrap TODO)`);
+    } else {
+      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: external-wrapper isolation unsupported on ${process.platform}`);
     }
-    if (!locateOnPath('sandbox-exec')) {
-      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
-    }
-    const profile = buildSeatbeltProfile(buildReadDenyPaths(readIsolationCtx));
-    const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
-    mkdirSync(profileDir, { recursive: true });
-    const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
-    writeFileSync(profilePath, profile, { mode: 0o600 });
-    seatbeltProfilePath = profilePath;
-    spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
-    spawnBin = 'sandbox-exec';
-    log(`[read-isolation] wrapping ${cliAdapter.id} in Seatbelt: sandbox-exec -f ${profilePath}`);
   }
   // Sandbox wraps the spawned binary in bwrap. Works for pty (PtyBackend runs
   // bwrap directly) and tmux (the tmux pane's command becomes `bwrap … -- cli`);
