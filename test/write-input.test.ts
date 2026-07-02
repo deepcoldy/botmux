@@ -499,10 +499,6 @@ describe('supportsTypeAhead flag', () => {
     expect(createGeniusAdapter('/bin/genius').supportsTypeAhead).toBe(true);
   });
 
-  it('hermes: true (startup may defer soft first-prompt timeout to the real composer)', () => {
-    expect(createHermesAdapter('/bin/hermes').supportsTypeAhead).toBe(true);
-  });
-
   it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
     expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
   });
@@ -523,7 +519,7 @@ describe('supportsTypeAhead flag', () => {
     expect(createCodexAdapter('/bin/codex').mergeQueuedInput).toBeUndefined();
   });
 
-  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius' && name !== 'hermes'))('%s: undefined (default behavior)', (_name, adapter) => {
+  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
   });
 });

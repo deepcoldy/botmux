@@ -1010,13 +1010,14 @@ describe('readyPattern', () => {
     expect(adapter.supportsTypeAhead).toBe(true);
   });
 
-  it('hermes defers the first-prompt timeout until its readyPattern appears', () => {
+  it('hermes defers the first-prompt timeout without type-ahead', () => {
     // Hermes cold-start initialization may outlive the 15s soft timeout; defer
     // that timeout to avoid flushing the first Lark message before the composer
-    // exists, while still allowing the worker hard timeout to flush via type-ahead.
+    // exists. Unlike Codex/CoCo/Claude/TraeX, Hermes can drop input typed before
+    // the first real prompt, so keep type-ahead disabled.
     const adapter = createHermesAdapter('/bin/hermes');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
-    expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.supportsTypeAhead).toBeUndefined();
   });
 
   it('genius matches current and legacy prompt indicators', () => {
