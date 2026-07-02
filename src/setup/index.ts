@@ -39,7 +39,7 @@ export { botmuxFontDir } from './ensure-fonts.js';
  *     is deterministic and implies there is no tmux server — hence no surviving
  *     session to protect — so refusing to start loses nothing.
  *   - at least one bot actually wants the tmux backend (`anyBotWantsTmux`). A
- *     box whose bots all run pty/herdr/zellij doesn't need tmux at all.
+ *     box whose bots all run pty/herdr/zellij/zmx doesn't need tmux at all.
  *   - the operator hasn't opted into the PTY escape hatch (`BACKEND_TYPE=pty`).
  *
  * Crucially we do NOT hard-fail when the binary IS present but its functional

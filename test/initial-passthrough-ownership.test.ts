@@ -51,6 +51,11 @@ describe('startInitialPassthroughSession ownership', () => {
     expect(region).toContain('session.ownerUnionId = ownerUnionId;');
     expect(region).toContain('session.creatorOpenId = creatorOpenId;');
   });
+
+  it('hands a registration loser to the post-rollback winner with live passthrough semantics', () => {
+    expect(region).toContain('rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds)');
+    expect(region).toContain('deliverPassthroughToExistingSession(winner, cmd, commandContent, anchor, larkAppId)');
+  });
 });
 
 describe('startInitialPassthroughSession call sites', () => {
@@ -66,8 +71,37 @@ describe('startInitialPassthroughSession call sites', () => {
     expect(calls.length).toBeGreaterThanOrEqual(2);
     for (const call of calls) {
       const body = call.slice(0, call.indexOf('});'));
+      expect(body).toContain('cmd,');
       expect(body).toContain('ownerOpenId:');
       expect(body).toContain('creatorOpenId:');
     }
+  });
+});
+
+describe('registration loser command handoff', () => {
+  it('routes new-topic and thread daemon commands through the current winner', () => {
+    expect(src).toContain(
+      'rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, commandDs)',
+    );
+    expect(src).toContain(
+      'rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, threadCommandDs)',
+    );
+    expect(src).toContain(
+      'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId)',
+    );
+    expect(src).toContain(
+      'await handleCommand(cmd, anchor, cmdMessage, commandDeps, larkAppId)',
+    );
+  });
+
+  it('prepared message handoff skips duplicate resolve, identity-learning, and hook effects', () => {
+    const start = src.indexOf('async function handleThreadReply(');
+    const end = src.indexOf('/**\n * 文档评论入口', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const region = src.slice(start, end);
+    expect(region).toContain('if (!prepared) await resolveNonsupportMessage(data, larkAppId);');
+    expect(region).toContain('if (!prepared) learnFromMentions(larkAppId, parsed.mentions);');
+    expect(region).toMatch(/if \(!prepared\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
   });
 });

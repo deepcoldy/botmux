@@ -12,6 +12,24 @@ export interface PendingCliInput {
   codexAppInput?: CodexAppTurnInput;
 }
 
+/**
+ * Run a synchronous CLI/backend reset without losing inputs that have not yet
+ * been dequeued for a PTY write. The reset path intentionally clears the live
+ * queue; restoring the snapshot afterwards keeps those messages distinct from
+ * InflightInputTracker carry-over, which spawnCli prepends ahead of them.
+ */
+export function resetPreservingPendingCliInputs(
+  pending: PendingCliInput[],
+  reset: () => void,
+): void {
+  const queued = pending.splice(0);
+  try {
+    reset();
+  } finally {
+    pending.unshift(...queued);
+  }
+}
+
 export function mergeQueuedCliInput(
   pending: PendingCliInput[],
   next: PendingCliInput,

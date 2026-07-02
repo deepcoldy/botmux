@@ -19,7 +19,7 @@ import { getBot } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 /** Backends an operator may pick from in the dashboard. */
-export const EDITABLE_BACKEND_TYPES: readonly BackendType[] = ['pty', 'tmux', 'herdr', 'zellij'];
+export const EDITABLE_BACKEND_TYPES: readonly BackendType[] = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'];
 
 export function isEditableBackendType(v: unknown): v is BackendType {
   return typeof v === 'string' && (EDITABLE_BACKEND_TYPES as readonly string[]).includes(v);

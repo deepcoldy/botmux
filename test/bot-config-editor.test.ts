@@ -277,6 +277,13 @@ describe('applyBotConfigEdits', () => {
     expect(edited.allowedUsers).toEqual(['13011112222', '+14155550123', 'on_x']);
   });
 
+  it('accepts zmx as a backendType', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
+    }, { backendType: 'zmx' });
+    expect(edited.backendType).toBe('zmx');
+  });
+
   it('keeps fields unchanged on empty input and clears optional fields with dash', () => {
     const updated = applyBotConfigEdits({
       larkAppId: 'app',

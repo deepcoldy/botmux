@@ -1,4 +1,4 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'riff';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff';
 
 /**
  * Durable identity of the backing resource owned by one Botmux session.
@@ -9,7 +9,7 @@ export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'riff';
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  | { backendType: 'tmux' | 'zellij' | 'zmx'; sessionName: string }
   | { backendType: 'herdr'; sessionName: string; agentName?: string };
 
 /**
@@ -34,7 +34,7 @@ export interface SpawnOpts {
   env: Record<string, string>;
   /**
    * Per-bot env (bots.json `env`) to inject into the CLI process ONLY. Kept
-   * separate from `env` on purpose: the persistent backends (tmux/zellij) must
+   * separate from `env` on purpose: the persistent backends (tmux/zellij/zmx) must
    * NOT put these into the shared backing-server global env — they inject them
    * via the per-pane `/usr/bin/env KEY=VAL` prefix so one bot's provider creds
    * can't leak into another bot's panes. The pty backend (no shared server)
@@ -43,7 +43,7 @@ export interface SpawnOpts {
   injectEnv?: Record<string, string>;
   /**
    * Per-bot shell override (BotConfig.launchShell). When set, the persistent
-   * backends (tmux/zellij) launch the CLI under this shell instead of `$SHELL`
+   * backends (tmux/zellij/zmx) launch the CLI under this shell instead of `$SHELL`
    * — the escape hatch for a login `$SHELL` whose rcfile `exec`-trampolines into
    * another shell. Bare name (`zsh`) or absolute path; see resolveUserShell.
    * Ignored by the pty backend (no shell wrapper).

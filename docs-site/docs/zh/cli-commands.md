@@ -11,7 +11,8 @@
 | `botmux logs [--lines N]` | 查看日志 |
 | `botmux status` | 查看 daemon 状态 |
 | `botmux upgrade` | 升级到最新版本 |
-| `botmux list` (别名 `ls`) | 列出所有活跃会话 |
+| `botmux list` (别名 `ls`) | 交互式列出活跃会话；选中受管 tmux / ZMX 会话后按 Enter 可 attach（脚本使用 `--plain`） |
+| `botmux title [--session-id <id或前缀>] <新标题>` | 修改当前或指定会话的标题 |
 | `botmux delete <id>` (别名 `del`/`rm`) | 关闭指定会话，支持 ID 前缀匹配 |
 | `botmux delete all` | 关闭所有活跃会话 |
 | `botmux delete stopped` | 清理进程已退出的僵尸会话 |

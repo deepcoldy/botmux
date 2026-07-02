@@ -3,6 +3,7 @@ import {
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
+  resetPreservingPendingCliInputs,
   shouldDeferArgsBakedDurablePrompt,
   shouldDeferInitialPromptForArgLimit,
   shouldStopPendingBatch,
@@ -238,5 +239,34 @@ describe('durable turn queue boundary', () => {
       codexAppInput: { text: 'clean-2' },
     })).toBe(false);
     expect(ordinaryTail).toEqual([{ content: 'legacy-1', turnId: 't1' }]);
+  });
+});
+
+describe('resetPreservingPendingCliInputs', () => {
+  it('restores unwritten prompts after a reset clears the live queue', () => {
+    const pending = [
+      { content: 'initial hello', turnId: 't1' },
+      { content: 'follow-up', turnId: 't2' },
+    ];
+
+    resetPreservingPendingCliInputs(pending, () => {
+      pending.length = 0;
+    });
+
+    expect(pending).toEqual([
+      { content: 'initial hello', turnId: 't1' },
+      { content: 'follow-up', turnId: 't2' },
+    ]);
+  });
+
+  it('keeps the snapshot ahead of items produced during reset and restores on throw', () => {
+    const pending = [{ content: 'queued' }];
+
+    expect(() => resetPreservingPendingCliInputs(pending, () => {
+      pending.push({ content: 'reset-added' });
+      throw new Error('reset failed');
+    })).toThrow('reset failed');
+
+    expect(pending.map(item => item.content)).toEqual(['queued', 'reset-added']);
   });
 });

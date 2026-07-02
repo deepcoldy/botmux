@@ -134,6 +134,8 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | `sandboxReadonlyPaths` | Extra existing paths mounted read-only inside the sandbox, useful for shared source snapshots, reference repos, or generated docs the bot should inspect but not modify |
 | `sandboxNetwork` | Network policy for sandboxed sessions. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` and blocks normal network egress |
 
+> The ZMX backend cannot currently enforce the file sandbox or read isolation. Combining `backendType: "zmx"` with a per-bot/global sandbox, or with the standalone effective `readIsolation` mode on macOS, fails closed and returns an actionable session notification. On Linux, the bare legacy `readIsolation` flag is a no-op under the worker's unified semantics and does not incorrectly gate ZMX; enable the sandbox and use tmux / PTY when isolation is required. See [ZMX backend boundaries](/en/zmx#unsupported-combinations).
+
 ## Cards and terminal
 
 | Field | Description |

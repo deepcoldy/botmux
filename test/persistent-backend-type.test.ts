@@ -18,11 +18,13 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({ config: { backendType: bot.backendType } })),
 }));
 
+import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import {
   getSessionPersistentBackendType,
   killPersistentBackendTarget,
   managedTargetsForCliChange,
   probePersistentBackendTarget,
+  probePersistentSessions,
   resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
   resolveSpawnBackendType,
@@ -43,6 +45,11 @@ describe('getSessionPersistentBackendType', () => {
 
   it('prefers the live worker initConfig backend', () => {
     expect(getSessionPersistentBackendType(ds({ initBackend: 'tmux', sessionBackend: 'zellij' }))).toBe('tmux');
+  });
+
+  it('keeps the running persistent backend authoritative after bot config hot-switches to PTY', () => {
+    bot.backendType = 'pty';
+    expect(getSessionPersistentBackendType(ds({ initBackend: 'zmx', sessionBackend: 'zmx' }))).toBe('zmx');
   });
 
   it('falls back to the backend stamped on the persisted session', () => {
@@ -161,5 +168,39 @@ describe('shutdownBackendDisposition (shutdown freeze-once)', () => {
   it('closes a frozen pty session even after the bot flips to herdr (never detaches a pane it never had)', () => {
     bot.backendType = 'herdr';
     expect(shutdownBackendDisposition(ds({ sessionBackend: 'pty' }))).toBe('close');
+  });
+});
+
+describe('probePersistentSessions', () => {
+  it('classifies all ZMX names from one full-list snapshot', () => {
+    const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockReturnValue({
+      ok: true,
+      sessions: ['bmx-live'],
+      unhealthySessions: ['bmx-timeout'],
+      raw: '',
+    });
+
+    expect([...probePersistentSessions('zmx', [
+      'bmx-live',
+      'bmx-timeout',
+      'bmx-missing',
+      'bmx-live',
+    ])]).toEqual([
+      ['bmx-live', 'exists'],
+      ['bmx-timeout', 'unknown'],
+      ['bmx-missing', 'missing'],
+    ]);
+    expect(probe).toHaveBeenCalledTimes(1);
+    probe.mockRestore();
+  });
+
+  it('keeps every ZMX name unknown when the shared snapshot fails', () => {
+    const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockReturnValue({ ok: false });
+    expect([...probePersistentSessions('zmx', ['bmx-a', 'bmx-b']).values()]).toEqual([
+      'unknown',
+      'unknown',
+    ]);
+    expect(probe).toHaveBeenCalledTimes(1);
+    probe.mockRestore();
   });
 });

@@ -12,7 +12,7 @@ export type SessionListDisposition = 'keep' | 'prune_real' | 'prune_scratch';
  * process/backing-session probes have already been evaluated by the caller.
  *
  * A cap-suspended session deliberately has neither a process PID nor a backing
- * tmux/herdr/zellij session: that is how its memory is reclaimed. The persisted
+ * tmux/herdr/zellij/zmx session: that is how its memory is reclaimed. The persisted
  * cold-resume marker is therefore authoritative and must beat the generic
  * zombie heuristic.
  */
