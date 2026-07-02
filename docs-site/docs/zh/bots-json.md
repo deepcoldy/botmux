@@ -93,6 +93,15 @@
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 
+## 文件沙盒
+
+| 字段 | 说明 |
+|------|------|
+| `sandbox` | `true` 时，新会话在 Linux 文件沙盒中启动。写入被隔离，需要通过 `/land` 审阅落盘 |
+| `sandboxHidePaths` | 在沙盒内用空目录 / 空文件遮罩的路径，避免机器人读取，例如 `["~/.ssh", "~/.botmux/bots.json"]` |
+| `sandboxReadonlyPaths` | 在沙盒内额外只读挂载的已存在路径，适合共享源码快照、参考仓库或生成文档等只允许查看、不允许修改的输入 |
+| `sandboxNetwork` | 沙盒会话的网络策略。缺省 / `true` 保留当前网络和代理访问；`false` 添加 `--unshare-net`，阻断普通网络出口 |
+
 ## 卡片与终端
 
 | 字段 | 说明 |

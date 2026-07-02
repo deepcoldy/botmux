@@ -136,6 +136,7 @@ import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-l
 import { forkAdoptWorker, forkWorker, initWorkerPool } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { getBot } from '../src/bot-registry.js';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
@@ -265,6 +266,41 @@ describe('session.start lifecycle integration', () => {
 });
 
 describe('forkWorker session agent config freeze', () => {
+  it('freezes sandbox read and network policy on fresh sessions before spawning', () => {
+    vi.mocked(getBot).mockReturnValueOnce({
+      config: {
+        larkAppId: 'app_test',
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        wrapperCli: 'ttadk codex',
+        model: 'glm-5.1',
+        sandbox: true,
+        sandboxHidePaths: ['~/.ssh'],
+        sandboxReadonlyPaths: ['/srv/source-a-readonly', '/srv/source-b-readonly'],
+        sandboxNetwork: false,
+      },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    } as any);
+    const ds = makeDs();
+
+    forkWorker(ds, 'hello', false);
+
+    expect(ds.session.sandbox).toBe(true);
+    expect(ds.session.sandboxHidePaths).toEqual(['~/.ssh']);
+    expect((ds.session as any).sandboxReadonlyPaths).toEqual(['/srv/source-a-readonly', '/srv/source-b-readonly']);
+    expect((ds.session as any).sandboxNetwork).toBe(false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh'],
+      sandboxReadonlyPaths: ['/srv/source-a-readonly', '/srv/source-b-readonly'],
+      sandboxNetwork: false,
+    }));
+  });
+
   it('records cli wrapper and model on fresh sessions before spawning', () => {
     const ds = makeDs();
 

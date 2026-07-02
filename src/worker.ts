@@ -4347,7 +4347,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           hidePaths: cfg.sandboxHidePaths ?? [],
           authPaths: cliAdapter.authPaths,
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
-          readonlyRoots: cfg.skillReadonlyRoots ?? [],
+          readonlyRoots: [...(cfg.skillReadonlyRoots ?? []), ...(cfg.sandboxReadonlyPaths ?? [])],
+          net: cfg.sandboxNetwork !== false,
         });
         if (sbx) {
           spawnBin = sbx.bin;

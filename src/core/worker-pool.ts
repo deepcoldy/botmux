@@ -1606,9 +1606,13 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     if (!resume) {
       ds.session.sandbox = botCfg.sandbox === true;
       ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
+      ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
+      ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
     } else {
       ds.session.sandbox = false;
       ds.session.sandboxHidePaths = [];
+      ds.session.sandboxReadonlyPaths = [];
+      ds.session.sandboxNetwork = true;
     }
     sessionStore.updateSession(ds.session);
   }
@@ -1744,6 +1748,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
     sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
+    sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
+    sandboxNetwork: ds.session.sandboxNetwork !== false,
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,

@@ -294,6 +294,8 @@ export function prepareSandbox(opts: {
   extraExecPaths?: readonly string[];
   /** Runtime-generated roots that should be visible read-only inside bwrap. */
   readonlyRoots?: readonly string[];
+  /** Keep network egress. Defaults to true for backwards compatibility. */
+  net?: boolean;
 }): SandboxSpawn | null {
   if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // overlayfs + bwrap are Linux-only
@@ -383,7 +385,8 @@ export function prepareSandbox(opts: {
   const readonlyRoots: string[] = [];
   for (const raw of opts.readonlyRoots ?? []) {
     if (!raw || typeof raw !== 'string') continue;
-    try { if (existsSync(raw)) readonlyRoots.push(raw); } catch { /* */ }
+    const p = raw.replace(/^~(?=\/|$)/, home);
+    try { if (existsSync(p)) readonlyRoots.push(p); } catch { /* */ }
   }
 
   const plan: SandboxPlan = {
@@ -396,7 +399,7 @@ export function prepareSandbox(opts: {
     hideFiles,
     authReal,
     readonlyRoots,
-    net: true,
+    net: opts.net !== false,
   };
   const args = buildSandboxArgs(plan);
   // Shim bin at a fixed path UNDER the /run tmpfs — the whole real fs is bound

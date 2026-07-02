@@ -81,6 +81,13 @@ function normalizeNonNegativeInt(raw: unknown): number | undefined {
   return raw;
 }
 
+function normalizeStringList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
+    .map((p) => p.trim());
+}
+
 function normalizeSummaryRange(raw: unknown): SummaryRangeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
@@ -306,6 +313,18 @@ export interface BotConfig {
    * listed here. Only meaningful when `sandbox` is true. Linux-only.
    */
   sandboxHidePaths?: string[];
+  /**
+   * Extra paths to expose read-only inside the sandbox. Useful when a bot should
+   * inspect sibling/source repos without being able to write to them. Only
+   * meaningful when `sandbox` is true. Linux-only.
+   */
+  sandboxReadonlyPaths?: string[];
+  /**
+   * Whether the sandbox keeps network access. Missing/true preserves the existing
+   * behavior; false adds bwrap --unshare-net for sessions that can run offline or
+   * rely only on already-mounted local inputs.
+   */
+  sandboxNetwork?: boolean;
   backendType?: BackendType;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
@@ -1099,9 +1118,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       sandbox: entry.sandbox === true,
-      sandboxHidePaths: Array.isArray(entry.sandboxHidePaths)
-        ? entry.sandboxHidePaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
-        : [],
+      sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
+      sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
+      sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
       backendType: entry.backendType,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
