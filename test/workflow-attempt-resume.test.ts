@@ -229,6 +229,28 @@ describe('AttemptResumeManager', () => {
 
   it('rejects CLIs without precise resume support', async () => {
     const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
+    const ids = seedAttempt(tmp, { cliSessionId: null, cliId: 'gemini' });
+    const { factory, spawns } = makeFactory();
+    try {
+      const manager = new AttemptResumeManager({
+        runsDir: tmp,
+        externalHost: 'dash.local',
+        workerPath: '/worker.js',
+        factory,
+        resolveBot: () => ({ ...bot, cliId: 'gemini' }),
+      });
+
+      const result = await manager.start(ids);
+
+      expect(result).toMatchObject({ ok: false, error: 'resume_unsupported_cli' });
+      expect(spawns).toHaveLength(0);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('opencode requires a captured native cliSessionId (no <session_id> block in workflow prompts)', async () => {
+    const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
     const ids = seedAttempt(tmp, { cliSessionId: null, cliId: 'opencode' });
     const { factory, spawns } = makeFactory();
     try {
@@ -242,7 +264,7 @@ describe('AttemptResumeManager', () => {
 
       const result = await manager.start(ids);
 
-      expect(result).toMatchObject({ ok: false, error: 'resume_unsupported_cli' });
+      expect(result).toMatchObject({ ok: false, error: 'missing_cli_session_id' });
       expect(spawns).toHaveLength(0);
     } finally {
       rmSync(tmp, { recursive: true, force: true });

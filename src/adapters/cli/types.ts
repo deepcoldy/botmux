@@ -89,15 +89,23 @@ export interface CliAdapter {
    *  The worker skips queuing the prompt for stdin write. */
   readonly passesInitialPromptViaArgs?: boolean;
 
+  /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
+   *  silently drops its initial-prompt launch flag on a RESUME spawn (e.g.
+   *  OpenCode applies `--prompt` to new sessions only and ignores it with
+   *  `-s <id>`), so the worker routes the initial prompt through the normal
+   *  input queue instead of baking it into args — otherwise the message that
+   *  triggered the resume would be lost. */
+  readonly initialPromptArgsIgnoredOnResume?: boolean;
+
   /** Build a shell command string the user can paste into a terminal to
    *  resume this CLI session locally — independent of botmux. Used by the
    *  "session closed" card so users have an obvious way to keep the
    *  conversation outside the bot.
    *
    *  Returns `null` when the CLI doesn't support precise per-session resume
-   *  from CLI args (e.g. opencode, gemini's "latest only" mode), or when
-   *  the CLI-native session id can't be resolved (e.g. codex history file
-   *  is missing). The card falls back to a static note in those cases.
+   *  from CLI args (e.g. gemini's "latest only" mode), or when the CLI-native
+   *  session id can't be resolved (e.g. codex history file is missing).
+   *  The card falls back to a static note in those cases.
    *
    *  Implementations should print the *default* binary name (`claude`,
    *  `codex`, etc.) rather than `cliPathOverride` — the override is a

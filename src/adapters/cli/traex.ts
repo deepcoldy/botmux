@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -55,13 +56,14 @@ function loadSqlite(): typeof sqliteModule {
   if (sqliteLoadAttempted) return sqliteModule;
   sqliteLoadAttempted = true;
   // node:sqlite is the built-in experimental SQLite binding available in
-  // Node 22+. It requires --experimental-sqlite at the time of writing
-  // (2026-06), but the import succeeds even without the flag; the first
-  // `new DatabaseSync(...)` throws if the runtime didn't opt in. We swallow
-  // that at query time and degrade gracefully.
+  // Node 22+. The runtime may still reject it (older Node without the
+  // feature); we swallow that and degrade gracefully.
+  // 必须走 createRequire：本包是 ESM（"type":"module"），裸 require 是
+  // ReferenceError —— 之前就是被这里的 try/catch 吞掉，导致生产 dist 里
+  // SQLite 提交验证/会话反查整条链路静默失效。
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    sqliteModule = require('node:sqlite') as typeof sqliteModule;
+    const req = createRequire(import.meta.url);
+    sqliteModule = req('node:sqlite') as typeof sqliteModule;
   } catch {
     sqliteModule = null;
   }

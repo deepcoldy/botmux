@@ -4158,11 +4158,14 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // route it through the input queue instead so startupCommands run first
   // (flushPending's hook can't precede an args-baked prompt). The init handler
   // mirrors this when deciding whether to enqueue the prompt.
+  // Also defer on RESUME for adapters whose initial-prompt launch flag is
+  // silently ignored when continuing a session (OpenCode `--prompt` + `-s`):
+  // baking it into args would drop the message that triggered the resume.
   const deferInitialPrompt = shouldDeferInitialPromptForStartup({
     hasStartupCommands: !!cfg.startupCommands?.length,
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
-  });
+  }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true);
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -5432,11 +5435,16 @@ process.on('message', async (raw: unknown) => {
         // NOT bake the prompt (deferInitialPrompt) so the commands can precede it
         // — so we MUST queue it here. shouldDeferInitialPromptForStartup mirrors
         // spawnCli's decision exactly. Bridge mark is deferred to flushPending.
+        // lastSpawnEffectiveResume was just written by spawnCli(msg) above, so
+        // this mirrors spawnCli's resume-defer condition exactly (incl. the
+        // Tier-1/Tier-2 fresh demotion, which clears the flag). Adopt spawns
+        // return from spawnCli before that write — exclude them explicitly so
+        // the stale module-level value can't leak in.
         const deferInitialPrompt = shouldDeferInitialPromptForStartup({
           hasStartupCommands: !!msg.startupCommands?.length,
           adoptMode: msg.adoptMode === true,
           passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
-        });
+        }) || (msg.adoptMode !== true && lastSpawnEffectiveResume && cliAdapter?.initialPromptArgsIgnoredOnResume === true);
         if (msg.prompt && cliAdapter?.passesInitialPromptViaArgs && !deferInitialPrompt && codexBridgeFallbackActive()) {
           // Args-baked first prompts (notably Pi) never pass through the normal
           // 'message' IPC path, so the structured bridge would otherwise see the

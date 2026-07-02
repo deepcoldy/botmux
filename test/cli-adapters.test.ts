@@ -1252,9 +1252,10 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand).toBeUndefined();
   });
 
-  it('opencode does not implement buildResumeCommand', () => {
+  it('opencode emits `opencode -s <cliSessionId>` when known', () => {
     const a = createOpenCodeAdapter('/bin/opencode');
-    expect(a.buildResumeCommand).toBeUndefined();
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-oc', cliSessionId: 'ses_0123abcDEF' }))
+      .toBe('opencode -s ses_0123abcDEF');
   });
 
   it('mtr emits `mtr --session <native-session-id>`', () => {

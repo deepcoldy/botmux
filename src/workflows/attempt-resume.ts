@@ -29,7 +29,10 @@ import { prependBotmuxBin } from '../core/botmux-wrapper.js';
 export const ATTEMPT_RESUME_SCHEMA_VERSION = 1;
 export const ATTEMPT_RESUME_IDLE_MS = 30 * 60 * 1000;
 export const ATTEMPT_RESUME_GRACE_MS = 5000;
-export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'codex-app', 'cursor', 'mira']);
+// opencode 也在此列：它的 --session 需要 DB 里真实存在的 ses_* id。主路径（daemon
+// 会话）有 <session_id> 文本反查兜底，但 workflow attempt 的 prompt 不带该块，
+// 只能依赖 writeInput 捕获到的 cliSessionId；缺失时宁可明确报错也不静默新起会话。
+export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'codex-app', 'cursor', 'mira', 'opencode']);
 export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'seed', 'relay', 'codex', 'mtr', 'hermes', 'pi', 'mir']);
 
 export type AttemptResumeStatus = 'starting' | 'live' | 'closed';
